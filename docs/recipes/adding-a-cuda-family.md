@@ -17,7 +17,9 @@ def cuda_engine(model_dir, *, drafter="", tp=1, rank=0, master="", master_port=2
 ```
 
 Validate supported weights, context and rank settings before allocating model state.
-An optional `CUDA_APP` subclasses `tensorfold.cuda.server.App` for family-specific request handling.
+An optional `CUDA_APP` subclasses `tensorfold.cuda.server.App` for family-specific request handling. A family
+whose app keeps its own HTTP routes also exports `CUDA_SERVE(app, host, port)`, which then serves in place of
+`tensorfold.cuda.server.serve`.
 
 The engine exposes `eos`, `generate(prompt, max_tokens, sampling, on_tokens)` and, for a follower rank,
 `follow()`. `generate` receives token IDs and keyed sampling settings, reports newly committed tokens

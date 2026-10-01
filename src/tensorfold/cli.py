@@ -305,7 +305,7 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
           f"(sampling: {shown}; drafts: {'off' if args.no_drafts else 'on'}; prompts: {prompts}; "
           f"context: {'unlimited' if effective_context is None else effective_context}; "
           f"loaded in {time.perf_counter() - started:.1f}s)", flush=True)
-    serve(app, args.host, int(args.port))
+    (getattr(family.package, "CUDA_SERVE", None) or serve)(app, args.host, int(args.port))   # a family's own HTTP side
     return 0
 
 

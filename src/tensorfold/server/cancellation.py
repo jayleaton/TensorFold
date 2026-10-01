@@ -5,7 +5,11 @@ from typing import Any, Callable
 
 
 class RequestCancelled(Exception):
-    pass
+    """The client left; ``result`` holds what the app's ``run`` had so far (for a request log), or None."""
+
+    def __init__(self, message: str = "request cancelled", result: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.result = result
 
 
 class Cancellation:

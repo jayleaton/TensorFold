@@ -388,3 +388,26 @@ def test_27b_cuda_engine_takes_the_checkpoint_slots_as_its_kept_states(tmp_path,
     options = {"parallel": 2} | ({"checkpoint_slots": slots} if slots is not None else {})
     qwen3_5.cuda_engine(tmp_path, drafter=str(tmp_path), **options)
     assert made[-1]["keep"] == keep and made[-1]["streams"] == 2
+
+
+def test_a_family_can_serve_its_app_through_its_own_http_side(tmp_path, monkeypatch):
+    import tensorfold.cuda.server as server
+
+    served, shared = [], []
+    engine = SimpleNamespace(context_window=4096)
+    app = SimpleNamespace(effective_context_window=4096)
+    family = _family(cuda_engine=lambda *a, **k: engine, CUDA_APP=lambda *a, **k: app,
+                     CUDA_SERVE=lambda *a: served.append(a))
+    family.model_type = "test"
+    monkeypatch.setattr(server, "serve", lambda *a: shared.append(a))
+    command = ["serve", str(tmp_path), "--backend", "cuda", "--no-drafts", "--port", "8123"]
+    assert cli._serve_cuda(cli.build_parser().parse_args(command), family, tmp_path, 4096) == 0
+    assert served == [(app, "127.0.0.1", 8123)] and shared == []
+
+
+def test_a_cancellation_can_carry_the_reply_so_far():
+    from tensorfold.server.cancellation import RequestCancelled
+
+    exc = RequestCancelled("the client left during the reply", result={"completion_tokens": 3})
+    assert str(exc) == "the client left during the reply" and exc.result == {"completion_tokens": 3}
+    assert RequestCancelled().result is None and str(RequestCancelled()) == "request cancelled"
