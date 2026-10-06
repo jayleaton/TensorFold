@@ -207,7 +207,12 @@ fn linearExt(o: dense.Ops, func: []const u8, args: []const Arg, kwargs: []const 
 // tf_dsv41_x3seg_v3 / tf_dsv41_dense3_v1 (x3seg.cpp, dense3.cpp): the tables built as dsv41_*_linear_cuda builds them
 fn segExt(o: dense.Ops, func: []const u8, args: []const Arg, kwargs: []const Kw, lanes: bool) !bool {
     if (is(func, "rot_in") and !lanes) {
-        const c: Call = .{ .args = args, .kwargs = kwargs, .names = &.{ "xs", "suh", "xh", "xh_off", "pdl" } };
+        const c: Call = .{ .args = args, .kwargs = kwargs, .names = &.{ "xs", "suh", "xh", "xh_off", "pdl", "nw", "eps" } };
+        const nws: []const Arg = if (try c.opt(5)) |v| switch (v) {
+            .list => |l| l,
+            else => return error.WrongArgument,
+        } else &.{};
+        const eps: f32 = if ((try c.opt(6)) != null) @floatCast(try c.float(6)) else 0;
         const xs = try c.list(0);
         const suh = try c.list(1);
         const offs = try c.list(3);
@@ -221,6 +226,18 @@ fn segExt(o: dense.Ops, func: []const u8, args: []const Arg, kwargs: []const Kw,
             const x = xa.tensor;
             if (i == 0) M = try dim(x, 0);
             tab.s[i] = .{ .x = x.ptr, .suh = sa.tensor.ptr, .xh = xh + 2 * @as(u64, @intCast(oa.int)), .ld = x.stride[0], .K = @intCast(try dim(x, 1)), .x_dtype = @intFromEnum(try ioType(x.dtype)) };
+            if (i < nws.len) {                                 // R1c: the folded norm (an empty weight: none)
+                const w = switch (nws[i]) {
+                    .tensor => |t| t,
+                    else => return error.WrongArgument,
+                };
+                if (numel(w) != 0) {
+                    tab.s[i].nw = w.ptr;
+                    tab.s[i].nw_dtype = @intFromEnum(try ioType(w.dtype));
+                    tab.s[i].inv_k = dense.invK(try dim(x, 1));
+                    tab.s[i].eps = eps;
+                }
+            }
         }
         try o.segRotIn(tab, M, try c.boolean(4, false));
         return true;
@@ -435,7 +452,7 @@ fn stride0(t: Tensor) i64 {
 // tf_dsv41_attn_cuda_v1 (csa2/attn_cuda.cpp): attn and topk as dsv41_attn_run_cuda / dsv41_topk_run_cuda fill Args
 fn attnExt(o: ops.Ops, func: []const u8, args: []const Arg, kwargs: []const Kw) !bool {
     if (is(func, "attn")) {
-        const c: Call = .{ .args = args, .kwargs = kwargs, .names = &.{ "q", "cv", "csc", "tok", "cnt", "sv", "ssc", "lo", "hi", "pos", "sl", "pt", "sink", "cs", "po", "pm", "pl", "out", "ticket", "ring", "psh", "pts", "kw", "split" } };
+        const c: Call = .{ .args = args, .kwargs = kwargs, .names = &.{ "q", "cv", "csc", "tok", "cnt", "sv", "ssc", "lo", "hi", "pos", "sl", "pt", "sink", "cs", "po", "pm", "pl", "out", "ticket", "ring", "psh", "pts", "kw", "split", "qrope" } };
         const q = try c.tensor(0);
         const cv = try c.tensor(1);
         const csc = try c.tensor(2);
@@ -482,7 +499,13 @@ fn attnExt(o: ops.Ops, func: []const u8, args: []const Arg, kwargs: []const Kw) 
             .int => |x| @intCast(x),
             else => return error.WrongArgument,
         } else 0; // captures before R1 have no split: today's launch
-        try o.attention(a, try c.u(22), numel(sl) > 0, numel(hi) > 0, split);
+        var b = a;
+        const qrope: i64 = if (try c.opt(24)) |v| switch (v) {
+            .int => |n| n,
+            else => return error.WrongArgument,
+        } else 0;
+        b.qrope = @intFromBool(qrope != 0 and split > 0);
+        try o.attention(b, try c.u(22), numel(sl) > 0, numel(hi) > 0, split);
         return true;
     }
     if (is(func, "topk")) {
@@ -610,9 +633,26 @@ fn mhcPfRun(o: ops.Ops, args: []const Arg, kwargs: []const Kw) !bool {
     return true;
 }
 
+/// route's `prune` (R1c): a list of 7 floats, absent or empty = off.
+fn pruneArg(c: Call, i: usize) !ops.rg.Prune {
+    const l = (try c.opt(i)) orelse return .{};
+    const items = switch (l) {
+        .list => |x| x,
+        else => return error.WrongArgument,
+    };
+    var v: [7]f64 = undefined;
+    if (items.len != 0 and items.len != 7) return error.WrongArgument;
+    for (items, 0..) |it, j| v[j] = switch (it) {
+        .float => |f| f,
+        .int => |n| @floatFromInt(n),
+        else => return error.WrongArgument,
+    };
+    return ops.rg.pruneOf(v[0..items.len]);
+}
+
 // tf_dsv41_router_gemv_v2.route (router_gemv.cpp / dsv41_rg_route_cuda)
 fn route(o: ops.Ops, args: []const Arg, kwargs: []const Kw) !bool {
-    const c: Call = .{ .args = args, .kwargs = kwargs, .names = &.{ "X", "W", "B", "pick", "wts", "LG", "cnt", "K", "slots", "scale", "rt", "nw", "ew", "select", "kit", "gid", "gcnt", "gmem", "GE", "group" } };
+    const c: Call = .{ .args = args, .kwargs = kwargs, .names = &.{ "X", "W", "B", "pick", "wts", "LG", "cnt", "K", "slots", "scale", "rt", "nw", "ew", "select", "kit", "gid", "gcnt", "gmem", "GE", "group", "prune" } };
     const x = try c.tensor(0);
     const w = try c.tensor(1);
     const lg = try c.tensor(5);
@@ -642,6 +682,7 @@ fn route(o: ops.Ops, args: []const Arg, kwargs: []const Kw) !bool {
         .gmem = if (group) gmem.ptr else 0,
         .GE = @intCast(try c.int(18)),
         .maxm = if (group) @intCast(try dim(gmem, 1)) else 0,
+        .prune = try pruneArg(c, 20),
     };
     try o.route(a, try c.u(10), try c.u(11), try c.u(12), @intCast(numel(lg)), @intCast(numel(cnt)));
     return true;

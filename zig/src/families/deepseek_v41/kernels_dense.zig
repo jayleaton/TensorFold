@@ -141,7 +141,9 @@ pub fn groupSteps(k2: u32) usize {
 }
 
 // x3seg.cu's tables, passed by value
-pub const RotSeg = extern struct { x: u64, suh: u64, xh: u64, ld: i64, K: c_int, x_dtype: c_int };
+/// R1c: with `nw` set, the segment's input is rmsnorm's row bf16(fp32((x * rn) * w)) of bf16 x (_rms_row's rn,
+/// computed in the kernel); inv_k = fp32(1 / K) and eps as Triton's float arguments round them.
+pub const RotSeg = extern struct { x: u64, suh: u64, xh: u64, ld: i64, K: c_int, x_dtype: c_int, nw: u64 = 0, nw_dtype: c_int = 0, inv_k: f32 = 0, eps: f32 = 0 };
 pub const RotTable = extern struct { s: [max_seg]RotSeg, n: c_int };
 pub const LinSeg = extern struct {
     xh: u64,
@@ -162,7 +164,7 @@ pub const LinSeg = extern struct {
 pub const LinTable = extern struct { s: [max_seg]LinSeg, n: c_int };
 
 comptime {
-    std.debug.assert(@sizeOf(RotSeg) == 40 and @sizeOf(RotTable) == 328);
+    std.debug.assert(@sizeOf(RotSeg) == 64 and @offsetOf(RotSeg, "nw") == 40 and @sizeOf(RotTable) == 520);
     std.debug.assert(@sizeOf(LinSeg) == 88 and @sizeOf(LinTable) == 712);
 }
 
@@ -171,16 +173,28 @@ comptime {
 pub const SegBufs = struct { T: u64, svh: u64, y: u64, ld: usize };
 
 /// One segment's input for the rotation: rows at x + row * ld (elements), its dtype, and the matrix's suh [K].
-pub const RotIn = struct { x: u64, ld: usize, dtype: DType, suh: u64 };
+/// `nw` (R1c's folded q_norm): the [K] norm weight and its dtype, 0 for none; the input is then bf16 un-normed rows.
+pub const RotIn = struct { x: u64, ld: usize, dtype: DType, suh: u64, nw: u64 = 0, nw_dtype: DType = .bf16 };
+
+/// fp32(1 / K): the binding's `static_cast<float>(1.0 / K)`.
+pub fn invK(k: usize) f32 {
+    return @floatCast(1.0 / @as(f64, @floatFromInt(k)));
+}
 
 /// fused_proj._block's rot_in tables: one launch per 8 segments (`first` = 0, 8, ...), each segment's rotated rows
 /// at its xh offset of `lay` (dsv41_x3seg_rot_in_cuda's RotTable).
-pub fn rotTable(lay: Layout, segs: []const Seg, ins: []const RotIn, first: usize, xh: u64) RotTable {
+pub fn rotTable(lay: Layout, segs: []const Seg, ins: []const RotIn, first: usize, xh: u64, eps: f32) RotTable {
     var t = std.mem.zeroes(RotTable);
     const end = @min(segs.len, first + max_seg);
     t.n = @intCast(end - first);
     for (first..end, 0..) |i, j| {
         t.s[j] = .{ .x = ins[i].x, .suh = ins[i].suh, .xh = xh + 2 * lay.xh_off[i], .ld = @intCast(ins[i].ld), .K = @intCast(segs[i].k), .x_dtype = @intFromEnum(ins[i].dtype) };
+        if (ins[i].nw != 0) {
+            t.s[j].nw = ins[i].nw;
+            t.s[j].nw_dtype = @intFromEnum(ins[i].nw_dtype);
+            t.s[j].inv_k = invK(segs[i].k);
+            t.s[j].eps = eps;
+        }
     }
     return t;
 }
@@ -342,6 +356,9 @@ pub const Ops = struct {
     /// dsv41_x3seg_rot_in_cuda: up to 8 (input, suh) pairs into one xh (each at its xh offset), one launch.
     pub fn segRotIn(o: Ops, tab: RotTable, M: usize, pdl: bool) !void {
         if (tab.n < 1 or tab.n > max_seg) return error.Shape;
+        for (tab.s[0..@intCast(tab.n)]) |s| {
+            if (s.nw != 0 and s.x_dtype != @intFromEnum(DType.bf16)) return error.Shape; // the fold takes bf16 rows
+        }
         var kmax: usize = 0;
         for (tab.s[0..@intCast(tab.n)]) |s| kmax = @max(kmax, @as(usize, @intCast(s.K)));
         var a: cuda.Args = .{};
@@ -430,8 +447,8 @@ test "rot_in tables: one launch a group of 8, xh offsets from the layout" {
         r.* = .{ .x = 0x1000 * (i + 1), .ld = 1024, .dtype = .bf16, .suh = 0x100 * (i + 1) };
     }
     const lay = try layout(&segs, 2);
-    const t0 = rotTable(lay, &segs, &ins, 0, 0x10000);
-    const t1 = rotTable(lay, &segs, &ins, 8, 0x10000);
+    const t0 = rotTable(lay, &segs, &ins, 0, 0x10000, 0);
+    const t1 = rotTable(lay, &segs, &ins, 8, 0x10000, 0);
     try std.testing.expectEqual(@as(c_int, 8), t0.n);
     try std.testing.expectEqual(@as(c_int, 2), t1.n);
     try std.testing.expectEqual(@as(u64, 0x10000 + 2 * 8 * 2 * 1024), t1.s[0].xh);

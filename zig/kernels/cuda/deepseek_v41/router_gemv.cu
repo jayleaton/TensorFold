@@ -1,4 +1,4 @@
-// Device code of src/tensorfold/families/deepseek_v41/cuda/router_gemv.cu (git blob 99e72340a2bd at dsv41-quant-e2; the whole file, DSV41_RG_NO_TORCH defined),
+// Device code of src/tensorfold/families/deepseek_v41/cuda/router_gemv.cu (git blob 5841ced53bf5 at 78b703d; the whole file, DSV41_RG_NO_TORCH defined),
 // generated and checked by zig/kernels/cuda/deepseek_v41/sync.py. Do not edit: change the Python source.
 #define DSV41_RG_NO_TORCH
 // SPDX-License-Identifier: MIT
@@ -70,9 +70,81 @@ __device__ __forceinline__ float softplus(float z) {
     return logf(__fadd_rn(1.0f, e));
 }
 
+// R1c (TF_DSV41_RG_PRUNE): prune.py's _prune folded into the selection, its operations in its order on the row's K
+// weights (one lane, K <= 8): total = the fp32 sum in slot order, f = div_rn(w, total), each slot's rank (f desc, slot
+// asc), the exclusive prefix of f in rank order, keep = (excl < topp and f >= min_w) or rank < min_k, ks = the kept
+// weights' sum in slot order, w' = w (orig) or scale x div_rn(w, ks), dropped slots: weight 0 and the drop id (or
+// the rank-0 id: dup). Rows that keep every slot stay as they are (the kernel stores only the others).
+struct Prune {
+    float min_w, topp, scale;
+    int min_k, orig, drop, dup, on;
+};
+
+__device__ __forceinline__ void prune_row(const Prune& P, int K, float (&w)[KMAX], int (&p)[KMAX]) {
+    float total = 0.0f, f[KMAX], excl[KMAX];
+    int rank[KMAX];
+    bool keep[KMAX];
+#pragma unroll
+    for (int i = 0; i < KMAX; ++i) if (i < K) total = __fadd_rn(total, w[i]);
+#pragma unroll
+    for (int i = 0; i < KMAX; ++i) if (i < K) f[i] = __fdiv_rn(w[i], total);
+#pragma unroll
+    for (int i = 0; i < KMAX; ++i) {
+        rank[i] = 0;
+#pragma unroll
+        for (int j = 0; j < KMAX; ++j)
+            if (i < K && j < K) rank[i] += (f[j] > f[i]) || (f[j] == f[i] && j < i);
+    }
+    float acc = 0.0f;
+#pragma unroll
+    for (int r = 0; r < KMAX; ++r)
+#pragma unroll
+        for (int i = 0; i < KMAX; ++i)
+            if (r < K && i < K && rank[i] == r) { excl[i] = acc; acc = __fadd_rn(acc, f[i]); }
+    int nk = 0, top = 0;
+    float ks = 0.0f;
+#pragma unroll
+    for (int i = 0; i < KMAX; ++i) {
+        if (i >= K) break;
+        keep[i] = ((excl[i] < P.topp) && (f[i] >= P.min_w)) || (rank[i] < P.min_k);
+        nk += keep[i];
+        if (rank[i] == 0) top = p[i];
+        ks = __fadd_rn(ks, keep[i] ? w[i] : 0.0f);
+    }
+    if (nk >= K) return;
+#pragma unroll
+    for (int i = 0; i < KMAX; ++i) {
+        if (i >= K) break;
+        w[i] = keep[i] ? (P.orig ? w[i] : __fmul_rn(P.scale, __fdiv_rn(w[i], ks))) : 0.0f;
+        if (!keep[i]) p[i] = P.dup ? top : P.drop;
+    }
+}
+
+// The prune pass of one selected row (lane 0, after select_row stored its unrounded weights): the rule, then the
+// kit rounding, the row's pick / wts / grouping copy rewritten. Apart from select_row so its arrays never share a
+// live range with the selection's (gemv_kernel's instances keep their registers).
+__device__ __noinline__ void prune_pass(const Prune& P, int K, int kit, int* pick, float* wts, int* psh) {
+    float wv[KMAX];
+    int ip[KMAX];
+#pragma unroll
+    for (int t = 0; t < KMAX; ++t) {
+        wv[t] = t < K ? wts[t] : 0.0f;
+        ip[t] = t < K ? pick[t] : 0;
+    }
+    prune_row(P, K, wv, ip);
+#pragma unroll
+    for (int t = 0; t < KMAX; ++t) {
+        if (t >= K) break;
+        pick[t] = ip[t];
+        wts[t] = kit ? __half2float(__float2half_rn(wv[t])) : wv[t];
+        psh[t] = ip[t];
+    }
+}
+
 // One row's selection by one warp (lane l holds experts l + 32 i).
 __device__ __forceinline__ void select_row(const float* lg, const float* __restrict__ bias, int E, int K, int slots,
-                                           float scale, int kit, int* pick, float* wts, int* psh, int lane) {
+                                           float scale, int kit, int* pick, float* wts, int* psh, int lane,
+                                           const Prune& P) {
     float s[EPL], ch[EPL];
 #pragma unroll
     for (int i = 0; i < EPL; ++i) {
@@ -115,7 +187,7 @@ __device__ __forceinline__ void select_row(const float* lg, const float* __restr
         for (int t = 0; t < KMAX; ++t) {
             if (t >= K) break;
             float w = __fmul_rn(scale, __fdiv_rn(sp[t], total));
-            if (kit) w = __half2float(__float2half_rn(w));      // pick.kit_weights: fp32 -> fp16 (RN) -> fp32
+            if (kit && !P.on) w = __half2float(__float2half_rn(w));   // pick.kit_weights (with prune: after it)
             pick[t] = ip[t];
             wts[t] = w;
             psh[t] = ip[t];
@@ -140,6 +212,7 @@ struct Args {
     int* gcnt;              //   in id order, their count, members [., maxm] row * 32 + slot in row order, -1 after
     int* gmem;
     int GE, maxm, group;
+    Prune prune;            // R1c: prune.py's rule folded into the selection (on = 0: off)
 };
 
 constexpr int GE_MAX = 512;         // table entries the folded grouping takes
@@ -219,7 +292,12 @@ __device__ __forceinline__ void tail(const Args& a, int r0, int nr, int tid, int
     __threadfence();
     for (int r = warp; r < nr; r += NW)
         select_row(a.lg + (size_t)(r0 + r) * a.E, a.bias, a.E, a.K, a.slots, a.scale, a.kit,
-                   a.pick + (size_t)(r0 + r) * a.slots, a.wts + (size_t)(r0 + r) * a.slots, psh + r * a.slots, lane);
+                   a.pick + (size_t)(r0 + r) * a.slots, a.wts + (size_t)(r0 + r) * a.slots, psh + r * a.slots, lane,
+                   a.prune);
+    if (a.prune.on && lane == 0)                    // the rule, then the kit rounding (each lane 0: its own rows)
+        for (int r = warp; r < nr; r += NW)
+            prune_pass(a.prune, a.K, a.kit, a.pick + (size_t)(r0 + r) * a.slots, a.wts + (size_t)(r0 + r) * a.slots,
+                       psh + r * a.slots);
     if (GROUP && a.group) {
         __syncthreads();
         group_rows<NW>(a, psh, sh + TAIL_INTS, tid);
@@ -493,8 +571,9 @@ inline cudaError_t dispatch(const Args& a, int rt, int nw, int ew, cudaStream_t 
 void dsv41_rg_route_cuda(const at::Tensor& X, const at::Tensor& W, const at::Tensor& B, at::Tensor& pick,
                          at::Tensor& wts, at::Tensor& LG, at::Tensor& cnt, int64_t K, int64_t slots, double scale,
                          int64_t rt, int64_t nw, int64_t ew, bool select, bool kit, at::Tensor& gid, at::Tensor& gcnt,
-                         at::Tensor& gmem, int64_t GE, bool group) {
+                         at::Tensor& gmem, int64_t GE, bool group, const std::vector<double>& prune) {
     using namespace dsv41_rg;
+    TORCH_CHECK(prune.empty() || prune.size() == 7, "router_gemv: prune = [min_w, topp, scale, min_k, orig, drop, dup]");
     const int64_t R = X.size(0), E = W.size(0);
     TORCH_CHECK(X.size(1) == D && W.size(1) == D, "router_gemv: D must be ", D);
     TORCH_CHECK(X.stride(1) == 1 && X.stride(0) % 8 == 0 && reinterpret_cast<uintptr_t>(X.data_ptr()) % 16 == 0,
@@ -530,6 +609,12 @@ void dsv41_rg_route_cuda(const at::Tensor& X, const at::Tensor& W, const at::Ten
     a.gmem = group ? gmem.data_ptr<int>() : nullptr;
     a.GE = (int)GE;
     a.maxm = group ? (int)gmem.size(1) : 0;          // upstream's Scratch.window: members [maxu, R]
+    a.prune = Prune{};
+    if (!prune.empty()) {                             // fp32 thresholds: the rounding of Triton's float arguments
+        a.prune.min_w = (float)prune[0]; a.prune.topp = (float)prune[1]; a.prune.scale = (float)prune[2];
+        a.prune.min_k = (int)prune[3]; a.prune.orig = (int)prune[4]; a.prune.drop = (int)prune[5];
+        a.prune.dup = (int)prune[6]; a.prune.on = 1;
+    }
     C10_CUDA_CHECK(dispatch(a, (int)rt, (int)nw, (int)ew, at::cuda::getCurrentCUDAStream()));
 }
 #endif

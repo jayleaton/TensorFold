@@ -26,9 +26,10 @@ WORK = "/home/sireggy/Documents/Projects/spark-work"
 SOURCES = {
     "base": (f"{WORK}/tensorfold-dsquant", "dsv41-quant-e2"),
     "x3gm2": (f"{WORK}/tensorfold-x3gm1", "dsv41-x3gm1"),      # x3gm v2 (gm2_kernel), dsq-x3gm-1
-    "r1": (f"{WORK}/tensorfold-decode1", "14310de"),   # R1 decode as handed over (dsv41-decode1 moves on: R1c)
+    "r1": (f"{WORK}/tensorfold-decode1", "78b703d"),   # R1 + R1c decode, final (dsv41-decode1)
 }
-FROM = {"x3gm.cu": "x3gm2", "attn_cuda.cu": "r1", "mhc_cuda.cu": "r1", "exl3_experts.cu": "r1"}
+FROM = {"x3gm.cu": "x3gm2", "attn_cuda.cu": "r1", "topk_cuda.cu": "r1", "mhc_cuda.cu": "r1", "exl3_experts.cu": "r1",
+        "router_gemv.cu": "r1", "x3seg.cu": "r1", "dense3.cu": "r1"}   # dense3.cu includes x3seg.cu: one tree
 EXL3 = "src/tensorfold/cuda/exl3"
 FAM = "src/tensorfold/families/deepseek_v41/cuda"
 
@@ -235,13 +236,13 @@ COPIES: dict[str, tuple[str, tuple[tuple[int, int], ...], dict[int, str], str]] 
     "linear.cu": (f"{EXL3}/linear.cu", ((1, 283), (288, 288)), {14: "namespace tf_exl3_linear {\n",
                                                                   288: "}  // namespace tf_exl3_linear\n"},
                   "footer_linear"),
-    "x3seg.cu": (f"{FAM}/x3seg.cu", ((1, 430),), {}, "footer_x3seg"),
+    "x3seg.cu": (f"{FAM}/x3seg.cu", ((1, 483),), {}, "footer_x3seg"),
     "dense3.cu": (f"{FAM}/dense3.cu", ((1, 402),), {}, "footer_dense3"),
-    "attn_cuda.cu": (f"{FAM}/csa2/attn_cuda.cu", ((1, 1053),), {}, "footer_attn"),
+    "attn_cuda.cu": (f"{FAM}/csa2/attn_cuda.cu", ((1, 1082),), {}, "footer_attn"),
     "topk_cuda.cu": (f"{FAM}/csa2/topk_cuda.cu", ((1, 304),), {}, ""),
     "mhc_cuda.cu": (f"{FAM}/mhc_cuda.cu", ((1, 635),), {}, "footer_mhc"),
     "mhc_pf.cu": (f"{FAM}/mhc_pf.cu", ((1, 341),), {}, "footer_mhc_pf"),
-    "router_gemv.cu": (f"{FAM}/router_gemv.cu", ((1, 532),), {}, "footer_rg"),
+    "router_gemv.cu": (f"{FAM}/router_gemv.cu", ((1, 617),), {}, "footer_rg"),
     "engram_gate.cu": (f"{FAM}/engram_gate.cu", ((1, 60),), {15: "namespace dsv41_engram_gate {\n",
                                                             60: "}  // namespace dsv41_engram_gate\n"}, ""),
     "l2pace.cu": (f"{FAM}/l2pace.cu", ((1, 85),), {}, ""),

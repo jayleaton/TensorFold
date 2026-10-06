@@ -1,4 +1,4 @@
-// Device code of src/tensorfold/families/deepseek_v41/cuda/csa2/attn_cuda.cu (git blob 1448ae39ea94 at 14310de; the whole file, DSV41_ATTN_NO_TORCH defined),
+// Device code of src/tensorfold/families/deepseek_v41/cuda/csa2/attn_cuda.cu (git blob f4be064c7368 at 78b703d; the whole file, DSV41_ATTN_NO_TORCH defined),
 // generated and checked by zig/kernels/cuda/deepseek_v41/sync.py. Do not edit: change the Python source.
 #define DSV41_ATTN_NO_TORCH
 // SPDX-License-Identifier: MIT
@@ -58,6 +58,7 @@ struct Args {
     uint16_t* out;                                // [R, H, 512] bf16
     int* ticket;                                  // [R, H / 16] (self-cleaning)
     int R, H, ring, has_comp;
+    int qrope;                                    // split_kernel: q arrives un-rotated, RoPE'd as it loads (R1c)
 };
 
 __device__ __forceinline__ float ex2(float x) {
@@ -511,6 +512,16 @@ __device__ __forceinline__ uint32_t spair_n(const uint8_t* sm, int k0, int k1, i
 // quad lanes hit 32 distinct banks (the quad lanes vary kp's bits 1-2 at kWidth 4, bits 0-1 at kWidth 2)
 template <int KW> __device__ __forceinline__ int vsw(int kp) { return (KW == 4 ? (kp >> 1) & 3 : kp & 3) << 3; }
 
+// R1c (TF_DSV41_ATTN_ROPE): rope_fused._rope's pair, in place, on q's word (k, k + 1) = (even, odd) of rope pair j:
+// (rn(e c) - rn(o s), rn(o c) + rn(e s)) with no contraction, then bf16 (nearest even); cos / sin the table's row
+__device__ __forceinline__ uint32_t rope_word(uint32_t w, const float* csr, int j) {
+    const float e = __uint_as_float(w << 16), o = __uint_as_float(w & 0xffff0000u);
+    const float c = csr[j], sn = csr[32 + j];
+    const __nv_bfloat162 b = __floats2bfloat162_rn(__fsub_rn(__fmul_rn(e, c), __fmul_rn(o, sn)),
+                                                   __fadd_rn(__fmul_rn(o, c), __fmul_rn(e, sn)));
+    return *reinterpret_cast<const uint32_t*>(&b);
+}
+
 __device__ __forceinline__ void cp16(uint32_t dst, const void* src, bool ok) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(dst), "l"(src), "r"(ok ? 16 : 0));
 }
@@ -665,6 +676,22 @@ __global__ void __launch_bounds__(NT, 1) split_kernel(Args a) {
             qv[u].y = *reinterpret_cast<const uint32_t*>(qb + (gg + 8) * D + k0);
             qv[u].z = *reinterpret_cast<const uint32_t*>(qb + gg * D + k1);
             qv[u].w = *reinterpret_cast<const uint32_t*>(qb + (gg + 8) * D + k1);
+        }
+        if (a.qrope) {                                           // the rope dims (k >= 448): their pair's rotation
+            const float* csr = a.cs + static_cast<long long>(row_pos<ROWS>(a, r)) * a.csst;
+#pragma unroll
+            for (int u = 0; u < 32 * 32 / NT; ++u) {
+                const int i = tid + u * NT, s = i >> 5, tt = (i & 31) & 3;
+                const int k0 = klo<KW>(s, tt), k1 = khi<KW>(s, tt);
+                if (k0 >= NOPE) {
+                    qv[u].x = rope_word(qv[u].x, csr, (k0 - NOPE) >> 1);
+                    qv[u].y = rope_word(qv[u].y, csr, (k0 - NOPE) >> 1);
+                }
+                if (k1 >= NOPE) {
+                    qv[u].z = rope_word(qv[u].z, csr, (k1 - NOPE) >> 1);
+                    qv[u].w = rope_word(qv[u].w, csr, (k1 - NOPE) >> 1);
+                }
+            }
         }
     }
     int* phys = reinterpret_cast<int*>(sm + G::SM_PHYS);
@@ -1021,7 +1048,7 @@ void dsv41_attn_run_cuda(const at::Tensor& q, const at::Tensor& cv, const at::Te
                          const at::Tensor& hi, const at::Tensor& pos, const at::Tensor& sl, const at::Tensor& pt,
                          const at::Tensor& sink, const at::Tensor& cs, at::Tensor& po, at::Tensor& pm,
                          at::Tensor& pl, at::Tensor& out, at::Tensor& ticket, int64_t ring, int64_t psh,
-                         int64_t pts, int64_t kw, int64_t split) {
+                         int64_t pts, int64_t kw, int64_t split, int64_t qrope) {
     using namespace dsv41_attn;
     Args a{};
     a.q = tp<const uint16_t>(q);
@@ -1038,6 +1065,8 @@ void dsv41_attn_run_cuda(const at::Tensor& q, const at::Tensor& cv, const at::Te
     a.po = tp<float>(po); a.pm = tp<float>(pm); a.pl = tp<float>(pl);
     a.out = tp<uint16_t>(out); a.ticket = tp<int>(ticket);
     a.R = static_cast<int>(q.size(0)); a.H = static_cast<int>(q.size(1)); a.ring = static_cast<int>(ring);
+    a.qrope = qrope && split > 0 ? 1 : 0;
+    TORCH_CHECK(!qrope || split > 0, "attn_cuda: q's RoPE folds into the split kernel only");
     C10_CUDA_CHECK(dispatch(a, static_cast<int>(kw), sl.numel() > 0, hi.numel() > 0,
                             at::cuda::getCurrentCUDAStream(), static_cast<int>(split)));
 }

@@ -39,12 +39,12 @@ Copies are read at git refs, never from a working tree.
 | --- | --- | --- |
 | base | `tensorfold-dsquant`, `dsv41-quant-e2` (0cf4ea1) | everything else |
 | x3gm2 | `tensorfold-x3gm1`, `dsv41-x3gm1` (dsq-x3gm-1's x3gm v2, not merged) | `x3gm.cu` |
-| r1 | `tensorfold-decode1`, `14310de` (the R1 decode kernels as handed over, not merged) | `attn_cuda.cu`, `mhc_cuda.cu`, `exl3_experts.cu` |
+| r1 | `tensorfold-decode1`, `78b703d` (R1 + R1c, final; not merged) | `attn_cuda.cu`, `topk_cuda.cu`, `mhc_cuda.cu`, `exl3_experts.cu`, `router_gemv.cu`, `x3seg.cu`, `dense3.cu` (it includes x3seg.cu) |
 
 When a branch lands in `dsv41-quant-e2`, point its files back at `base` (`FROM` in `sync.py`).
 
-`dsv41-decode1` has moved on to R1c (router prune, q RoPE in the split kernel, the RMS fold). Those wait until they
-are handed over.
+`dsv41-perf1` (bb0cff8) carries the same R1 sources plus x3gm v2. Its `roce.cu` wait fix belongs to the TP runtime,
+not to these copies.
 
 `sass_check.sh` exports each source at its ref (`git archive`) before compiling the Python side.
 
@@ -247,6 +247,36 @@ variants give the same bits.
   `.to(bf16)` (`TF_DSV41_MOE_BF16`).
 - **Prune:** `prune._prune`'s new KIT constexpr is a Triton variant. It is the port lead's AOT capture, not a copy.
 
+**R1c** (final at `78b703d`). Every knob is off by default, and each fold gives the bits of its unfused launches.
+
+- **q RoPE** (`TF_DSV41_ATTN_ROPE`):
+  - `attn.Args.qrope` is set and split > 0; Args is now 240 B.
+  - `split_kernel` rotates q's words at k >= 448 as it loads them, with `rope_fused._rope`'s ops.
+  - The host passes un-rotated q and drops the rope launch.
+  - `attention` refuses qrope with split 0, as the binding does.
+- **Router prune** (`TF_DSV41_RG_PRUNE`):
+  - `rg.Args.prune` is router_gemv's `Prune` (32 B at offset 132; Args is now 168 B).
+  - `rg.pruneOf` takes the binding's 7 values (`prune.fold_args`).
+  - The pass runs after the selection, with `_prune`'s ops, then the kit rounding. It has no spills, but it has not been
+    checked on a GPU.
+- **q_norm fold** (`TF_DSV41_RMS_FOLD`):
+  - `dense.RotSeg` gains `nw`, `nw_dtype`, `inv_k` and `eps` (64 B).
+  - `rotTable(..., eps)` fills them for each `RotIn` that has `nw`.
+  - `seg_rot_in` computes `_rms_row`'s rn in Triton's float64 order and feeds bf16(fp32((x rn) w)) to the rotation.
+  - The input must be bf16 rows.
+
+SASS on sm_121 at `78b703d`, all equal to the Python build:
+
+| file | kernels |
+| --- | --- |
+| attention | 24 |
+| top-k | 1 |
+| router_gemv | 40 (0 spills now) |
+| x3seg | 19 |
+| dense3 | 28 |
+| mHC | 15 |
+| experts | 32 |
+
 SASS on sm_121, all equal to the Python build at the source's ref:
 
 | file | kernels | of which new |
@@ -275,15 +305,15 @@ SASS on sm_121, all equal to the Python build at the source's ref:
 | extension | functions |
 | --- | --- |
 | `tensorfold_exl3_linear_v4` | `rot_in`, `linear`, `linear_skip`, `unpack` (cb 2) |
-| `tf_dsv41_x3seg_v3` | `rot_in`, `linear` |
+| `tf_dsv41_x3seg_v3` | `rot_in` (R1c's `nw` / `eps` when captured), `linear` |
 | `tf_dsv41_dense3_v1` | `linear`, `relayout`, `unpack` |
 | `tensorfold_exl3_experts_v1` | `grouped` (cb 2), `group`, `rot_in`, `gateup_epilogue`, `down_epilogue`, `combine`, `down_combine`, `dequant` |
 | `tf_dsv41_x3ld_v1`, `tf_dsv41_x3pf_v1` | `grouped` |
 | `tf_dsv41_x3gm_v1` | `gateup`, `down`, `gateup2`, `down2` (v2), `rot`, `dequant` |
-| `tf_dsv41_attn_cuda_v1` | `attn` (R1's `split` when captured, else 0), `topk` |
+| `tf_dsv41_attn_cuda_v1` | `attn` (R1's `split` and R1c's `qrope` when captured, else 0), `topk` |
 | `tf_dsv41_mhc_cuda_v1` | `run` (R1's `spin` / `defer` when captured, else today's finish), `coef` |
 | `tf_dsv41_mhc_pf_v1` | `run` |
-| `tf_dsv41_router_gemv_v2` | `route` |
+| `tf_dsv41_router_gemv_v2` | `route` (R1c's `prune` when captured, else off) |
 | `tf_dsv41_pfdense_v1` | `gemm`, `dequant` |
 | `tf_dsv41_l2pace_v1`, `tf_dsv41_l2pf_v1` | `paced`, `segments` |
 | not replayed | `tf_dsv41_engram_gate_v1.gate_copy` (host-mapped control words), `info` / `describe` queries |

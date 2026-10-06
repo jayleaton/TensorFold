@@ -1,4 +1,4 @@
-// Device code of src/tensorfold/families/deepseek_v41/cuda/x3seg.cu (git blob a1b18d2b3efe at dsv41-quant-e2; the whole file, DSV41_X3SEG_NO_TORCH defined),
+// Device code of src/tensorfold/families/deepseek_v41/cuda/x3seg.cu (git blob 97123dbc731d at 78b703d; the whole file, DSV41_X3SEG_NO_TORCH defined),
 // generated and checked by zig/kernels/cuda/deepseek_v41/sync.py. Do not edit: change the Python source.
 #define DSV41_X3SEG_NO_TORCH
 // SPDX-License-Identifier: MIT
@@ -151,6 +151,9 @@ struct RotSeg {
     half* xh;               // [M, K] fp16, contiguous
     long long ld;
     int K, x_dtype;
+    const void* nw;         // R1c (TF_DSV41_RMS_FOLD): x is bf16 un-normed; this segment's input is rmsnorm's row
+    int nw_dtype;           //   bf16(fp32((x * rn) * w)), rn from the row as rmsnorm._rms_row computes it (null: off)
+    float inv_k, eps;
 };
 struct RotTable {
     RotSeg s[MAXSEG];
@@ -172,6 +175,35 @@ struct LinTable {
     int n;
 };
 
+// rmsnorm._rms_row's rn for row `xr` (bf16, K) by a CTA of 128 threads, Triton's float64 order (its PTX for sm_120 /
+// sm_121, num_warps 4, BK 512, blocked sizePerThread 1): thread t accumulates the squares of k = c + t + 128 i
+// (i = 0..3) over the 512-wide chunks c ascending from +0.0; ((A0 + A1) + A2) + A3; the warp's xor butterfly 16..1;
+// the 4 warp sums (w0 + w2) + (w1 + w3); rn = rsqrt.approx.f64(ss * fp64(inv_k) + fp64(eps)) (libdevice's rsqrt)
+__device__ __forceinline__ double row_rn(const __nv_bfloat16* xr, int K, float inv_k, float eps) {
+    __shared__ double ws[4];
+    const int t = threadIdx.x;
+    double A[4] = {0.0, 0.0, 0.0, 0.0};
+    for (int c = 0; c < K; c += 512) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int e = c + t + 128 * i;
+            const double v = e < K ? static_cast<double>(__bfloat162float(xr[e])) : 0.0;
+            A[i] = __dadd_rn(A[i], __dmul_rn(v, v));
+        }
+    }
+    double s = __dadd_rn(__dadd_rn(__dadd_rn(A[0], A[1]), A[2]), A[3]);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) s = __dadd_rn(s, __shfl_xor_sync(0xffffffffu, s, o));
+    if ((t & 31) == 0) ws[t >> 5] = s;
+    __syncthreads();
+    const double w0 = __dadd_rn(ws[0], ws[2]), w1 = __dadd_rn(ws[1], ws[3]);
+    const double ss = __dadd_rn(w0, w1);
+    const double a = __dadd_rn(__dmul_rn(ss, static_cast<double>(inv_k)), static_cast<double>(eps));
+    double rn;
+    asm("rsqrt.approx.f64 %0, %1;" : "=d"(rn) : "d"(a));
+    return rn;
+}
+
 __global__ void __launch_bounds__(128) seg_rot_in_kernel(const RotTable tab) {
     pdl_wait();                                               // x belongs to the kernels before (every CTA waits)
     pdl_trigger();
@@ -180,10 +212,22 @@ __global__ void __launch_bounds__(128) seg_rot_in_kernel(const RotTable tab) {
     for (int i = 1; i < MAXSEG; ++i)
         if (i == (int)blockIdx.z) s = tab.s[i];
     const int blk = blockIdx.x * 4 + (threadIdx.x >> 5), row = blockIdx.y, lane = threadIdx.x & 31;
+    double rn = 0.0;
+    if (s.nw != nullptr)                                      // the whole CTA (uniform: its segment and row)
+        rn = row_rn(static_cast<const __nv_bfloat16*>(s.x) + (size_t)row * s.ld, s.K, s.inv_k, s.eps);
     if (blk * 128 >= s.K) return;
     const int k = blk * 128 + 4 * lane;
     float v[4], sc[4];
     load4(s.x, s.x_dtype, (size_t)row * s.ld + k, v);
+    if (s.nw != nullptr) {                                    // _rms_row's y = (x * rn) * w -> fp32 -> bf16
+        float w[4];
+        load4(s.nw, s.nw_dtype, k, w);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const double y = __dmul_rn(__dmul_rn(rn, static_cast<double>(v[j])), static_cast<double>(w[j]));
+            v[j] = __bfloat162float(__float2bfloat16_rn(__double2float_rn(y)));
+        }
+    }
     load4(s.suh, F16, k, sc);
 #pragma unroll
     for (int j = 0; j < 4; ++j) v[j] *= sc[j];
@@ -378,7 +422,8 @@ void launch_ex(K kernel, dim3 grid, dim3 block, int smem, bool pdl, A... args) {
 }  // namespace
 
 void dsv41_x3seg_rot_in_cuda(const std::vector<at::Tensor>& xs, const std::vector<at::Tensor>& suh, at::Tensor& xh,
-                             const std::vector<int64_t>& xh_off, bool pdl) {
+                             const std::vector<int64_t>& xh_off, bool pdl, const std::vector<at::Tensor>& nw,
+                             double eps) {
     RotTable tab{};
     tab.n = (int)xs.size();
     const int M = (int)xs[0].size(0);
@@ -387,7 +432,15 @@ void dsv41_x3seg_rot_in_cuda(const std::vector<at::Tensor>& xs, const std::vecto
         const int K = (int)xs[i].size(1);
         tab.s[i] = RotSeg{xs[i].data_ptr(), reinterpret_cast<const half*>(suh[i].data_ptr()),
                           reinterpret_cast<half*>(xh.data_ptr()) + xh_off[i], (long long)xs[i].stride(0), K,
-                          dtype_of(xs[i])};
+                          dtype_of(xs[i]), nullptr, 0, 0.f, 0.f};
+        if (i < (int)nw.size() && nw[i].numel()) {             // fp32 1 / K and eps: Triton's float arguments
+            TORCH_CHECK(xs[i].scalar_type() == at::kBFloat16 && nw[i].numel() == K && nw[i].is_contiguous(),
+                        "x3seg rot_in: the folded norm takes bf16 rows and a [K] weight");
+            tab.s[i].nw = nw[i].data_ptr();
+            tab.s[i].nw_dtype = dtype_of(nw[i]);
+            tab.s[i].inv_k = static_cast<float>(1.0 / K);
+            tab.s[i].eps = static_cast<float>(eps);
+        }
         kmax = std::max(kmax, K);
     }
     dim3 grid((unsigned)((kmax / 128 + 3) / 4), (unsigned)M, (unsigned)tab.n);

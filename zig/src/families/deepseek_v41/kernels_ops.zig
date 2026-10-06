@@ -55,10 +55,11 @@ pub const attn = struct {
         H: c_int = 0,
         ring: c_int = 0,
         has_comp: c_int = 0,
+        qrope: c_int = 0, // R1c (split_kernel only): q arrives un-rotated and is RoPE'd as it loads
     };
 
     comptime {
-        std.debug.assert(@offsetOf(Args, "psh") == 144 and @offsetOf(Args, "sink") == 152 and @sizeOf(Args) == 232);
+        std.debug.assert(@offsetOf(Args, "psh") == 144 and @offsetOf(Args, "sink") == 152 and @offsetOf(Args, "qrope") == 232 and @sizeOf(Args) == 240);
     }
 
     pub fn symbol(comptime kw: u32, comptime rows: bool, comptime hi: bool) [:0]const u8 {
@@ -284,10 +285,22 @@ pub const rg = struct {
         GE: c_int = 0,
         maxm: c_int = 0,
         group: c_int = 0,
+        prune: Prune = .{}, // R1c: prune.py's rule folded into the selection (on 0: off)
     };
 
+    /// router_gemv.cu Prune: [min_w, topp, scale, min_k, orig, drop, dup] (prune.fold_args) in fp32 / int, on = 1.
+    pub const Prune = extern struct { min_w: f32 = 0, topp: f32 = 0, scale: f32 = 0, min_k: c_int = 0, orig: c_int = 0, drop: c_int = 0, dup: c_int = 0, on: c_int = 0 };
+
+    /// The binding's prune vector (7 doubles, empty: off) as the kernel's struct (fp32 thresholds, as it rounds them).
+    pub fn pruneOf(v: []const f64) error{Shape}!Prune {
+        if (v.len == 0) return .{};
+        if (v.len != 7) return error.Shape;
+        return .{ .min_w = @floatCast(v[0]), .topp = @floatCast(v[1]), .scale = @floatCast(v[2]), .min_k = @intFromFloat(v[3]), .orig = @intFromFloat(v[4]), .drop = @intFromFloat(v[5]), .dup = @intFromFloat(v[6]), .on = 1 };
+    }
+
     comptime {
-        std.debug.assert(@offsetOf(Args, "gid") == 96 and @offsetOf(Args, "group") == 128 and @sizeOf(Args) == 136);
+        std.debug.assert(@sizeOf(Prune) == 32);
+        std.debug.assert(@offsetOf(Args, "gid") == 96 and @offsetOf(Args, "group") == 128 and @offsetOf(Args, "prune") == 132 and @sizeOf(Args) == 168);
     }
 
     pub fn gemvSymbol(comptime rt: u32, comptime nw: u32, comptime ew: u32) [:0]const u8 {
@@ -522,6 +535,7 @@ pub const Ops = struct {
     /// the same bits; with split > 0 the ticket holds R H / 16 * attn.MAXP ints.
     pub fn attention(o: Ops, a: attn.Args, kw: u32, rows: bool, has_hi: bool, split: u32) !void {
         const i = try attn.instance(a, kw, rows, has_hi);
+        if (a.qrope != 0 and split == 0) return error.Unsupported; // "q's RoPE folds into the split kernel only"
         var args: cuda.Args = .{};
         args.add(a);
         const hb: usize = @intCast(@divTrunc(a.H, attn.BMQ));
