@@ -57,6 +57,14 @@ SASS on sm_121 (NGC 26.07, nvcc 13.3.73; the e1e2 runtime image has the same nvc
 | `dsv41_l2pace` | `tf_dsv41_l2pace_v1` | 1 |
 | `dsv41_l2pf` | `tf_dsv41_l2pf_v1` (`G/l2pf.cu`) | 4 |
 
+On sm_120 (the PRO 6000) the first pod run showed x3ld 15/15, x3pf 6/6, upstream experts 31/31 and x3gm 130/130
+SASS-equal to the Python engine's `.so` built on that GPU.
+
+**Shared memory opt-in.** `Kernels.load` checks each instance's static + dynamic shared memory against the device's
+per-block opt-in (101,376 B on sm_120 / sm_121). Instances above it are refused one by one: x3gm's gate/up cfg 3
+with two rotated inputs (107-123 KB) is never picked by `x3gm.fits` anyway. Python sets the attribute at a launch,
+so it never meets them.
+
 Upstream EXL3 (`linear.cu`, `experts.cu`) is built for the mul1 codebook only. Every DeepSeek-V4.1 matrix is mul1;
 the replay returns "no binding" for the others.
 
@@ -110,11 +118,11 @@ The tables mark each kernel **prod** (on in prod.env), **default** (on by the kn
 | index selection, >= 4,096 visible keys | `_stream` + torch top-k merge | `F/csa2/stream_topk.py` | Triton + torch | prod (`INDEX_STREAM_MIN=4096`) | AOT + top-k `.cu` (section 3.2) |
 | index selection, other rows | `_scores`, `_keys`, `_block_keys` + torch topk / sort | `F/csa2/index.py` | Triton + torch | prod | AOT + `.cu` |
 | router | `gemv_kernel<16,8,2>` | `F/router_gemv.cu` | .cu | prod | ported |
-| shared expert | 3 dense GEMMs + torch `clamp` / `silu` / `mul` | — | — | prod | pfdense + a small pointwise `.cu` (section 3.2) |
+| shared expert | 3 dense GEMMs + torch `clamp` / `silu` / `mul` | — | — | prod | pfdense + **`Z/pointwise.cu`** (ours) |
 | routed rotation | `rot_kernel<bf16, XM>` | `F/x3gm.cu` | .cu | prod (`FAST_EXPERTS=gm`) | ported |
 | routed gate / up | `gm_kernel<2,XM,K2,cfg 0 (XM 1) / 1 (XM 2)>` | `F/x3gm.cu` | .cu | prod | ported, all 119 instances (+ 4K's cfgs 2-5) |
 | routed down | `gm_kernel<1,1,K2,cfg 0>` | `F/x3gm.cu` | .cu | prod | ported |
-| x3gm passes | `x3gm.plan`: torch `argsort(stable)`, `bincount`, `cumsum`, `searchsorted` | `F/x3gm.py` | torch | prod | **to write**: `.cu` plan (section 3.2) |
+| x3gm passes | `x3gm.plan`: torch `argsort(stable)`, `bincount`, `cumsum`, `searchsorted` | `F/x3gm.py` | torch | prod | **`Z/x3gm_plan.cu`** (ours, section 3.2) |
 | routed combine | `combine_kernel` | `X/experts.cu` | .cu | prod | ported |
 | (off) | `pf_kernel<2,NT,MTL,LO,HI>` | `F/x3pf.cu` | .cu | off (`EXPERT_PREFILL=0`) | ported (6 instances) |
 
@@ -167,10 +175,11 @@ Each item gets a small `.cu` here (ours, checked bit-equal to torch on fixtures)
 
 | op | where | plan |
 | --- | --- | --- |
-| `x3gm.plan`: stable argsort by expert, bincount, cumsum, searchsorted, clamps | prefill, per row block and width | `.cu`: a counting sort over at most 24,576 pairs and 384 experts (count, scan, stable scatter by row order), then pass tables. Stable order = pair index order within an expert, which a scatter in index order gives exactly. |
-| `pick.top` / `kit_logits`, candidate `torch.topk` on int32 / int64 keys + `gather`, `vsample.merge` `torch.sort` | sampling, drafter candidates | reuse `zig/kernels/cuda/torch_ops/topk` (Nemotron's copy of torch's topk) if its key and tie rules match `pick.keys`; else a `.cu` per `pick.keys` (keys are unique by construction, so any exact sort gives torch's order) |
+| `x3gm.plan`: stable argsort by expert, bincount, cumsum, searchsorted, clamps | prefill, per row block and width | **done**: `Z/x3gm_plan.cu`, `exl3.Ops.gmPlan`. One CTA: histogram, scan, stable scatter in index order, pass tables (E < 512). Integers: checked equal to torch on every x3gm fixture's plans and on prod-sized picks. |
+| `pick.top` (topk on `pick.keys` + `gather`) | sampling, gate | **done**: `Z/topk_keys.cu`, `ops.Ops.topKeys`. Keys are unique, so any exact selection is torch's: radix select, then a bitonic sort. C <= 65,536 columns (a rank's 64,640), k <= 1,024. Checked against `pick.top` with heavy ties. |
+| drafter candidates (`index.sort_keys` + `torch.topk` + `gather`), `vsample.merge` `torch.sort` | drafter | the same kernel once the key builder (`_keys`, Triton) is AOT; `vsample.merge` sorts unique keys too |
 | index fallback `top_positions`: topk on int64 keys, sort, bit ops | prefill selection | as above |
-| shared expert at prefill: `clamp_`, `silu`, `mul_`, add into bf16 | prefill | `.cu` pointwise with torch's formulas (torch_ops style: `--fmad=false`) |
+| shared expert at prefill: `clamp_`, `silu`, `mul_`, `out += shared`, `torch.add(out=bf16)` | prefill | **done**: `Z/pointwise.cu` (`--fmad=false`; torch's `x / (1 + exp(-x))`, NaN-propagating clamps), `ops.Ops.swiglu / addInto / addBf16`, checked against torch |
 | embedding: `index_select`, `where`, `clamp`, rank all-sum | every window | port lead (`forward.zig`); a gather `.cu` |
 | casts: `q.to(fp32)` before `_rope`, partials `.to(bf16)`, `kit_weights` fp32 -> fp16 -> fp32 | decode | folded into the consumers where the Python path allows, else torch_ops pointwise |
 | staging ring `index_copy_`, replay stash `cat` / `clone`, shadow-slot `copy_` | prefill, tree verify | device memcpy (`cuMemcpyAsync`); no kernel |
