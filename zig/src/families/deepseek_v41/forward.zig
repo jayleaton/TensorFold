@@ -133,3 +133,53 @@ pub const Forward = struct {
         return glueMissing(step);
     }
 };
+
+/// M2a's peer: world 2, rank 0 alone on one GPU, the peer's half of every all-gather zeros (dsv41_m1_capture.py's
+/// ZeroPeer, the Python reference's). Only the all-gather the forward uses is implemented.
+pub const ZeroPeer = struct {
+    d: *const cuda.Driver,
+
+    const C = tp.collective;
+
+    fn rank(_: *anyopaque) u32 {
+        return 0;
+    }
+    fn world(_: *anyopaque) u32 {
+        return 2;
+    }
+    fn allGather(ptr: *anyopaque, send: C.DevicePtr, recv: C.DevicePtr, count: usize, t: C.DType, stream: C.Stream) C.Error!void {
+        const z: *ZeroPeer = @ptrCast(@alignCast(ptr));
+        const n = count * t.size();
+        z.d.check(z.d.api.cuMemcpyDtoDAsync_v2(recv, send, n, stream), "cuMemcpyDtoDAsync") catch return error.BackendFailed;
+        z.d.check(z.d.api.cuMemsetD8Async(recv + n, 0, n, stream), "cuMemsetD8Async") catch return error.BackendFailed;
+    }
+    fn unsupported(_: *anyopaque, _: C.DevicePtr, _: C.DevicePtr, _: usize, _: C.DType, _: C.Op, _: C.Stream) C.Error!void {
+        return error.Unsupported;
+    }
+    fn exchange(_: *anyopaque, _: C.DevicePtr, _: C.DevicePtr, _: usize, _: C.DType, _: u32, _: C.Stream) C.Error!void {
+        return error.Unsupported;
+    }
+    fn p2p(_: *anyopaque, _: C.DevicePtr, _: usize, _: C.DType, _: u32, _: C.Stream) C.Error!void {
+        return error.Unsupported;
+    }
+    fn none(_: *anyopaque) C.Error!void {}
+    fn abort(_: *anyopaque) void {}
+
+    const vtable: C.Collective.VTable = .{
+        .kind = .host,
+        .rank = rank,
+        .world = world,
+        .all_reduce = unsupported,
+        .all_gather = allGather,
+        .exchange = exchange,
+        .send = p2p,
+        .recv = p2p,
+        .barrier = none,
+        .check = none,
+        .abort = abort,
+    };
+
+    pub fn collective(z: *ZeroPeer) C.Collective {
+        return .{ .ptr = z, .vtable = &vtable };
+    }
+};

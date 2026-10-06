@@ -21,6 +21,7 @@ comptime {
     _ = &@import("forward.zig").Forward.window;
     _ = &@import("forward.zig").Forward.keep;
     _ = &@import("forward.zig").Forward.plan;
+    _ = &@import("forward.zig").ZeroPeer.collective;
 }
 
 const usage =
