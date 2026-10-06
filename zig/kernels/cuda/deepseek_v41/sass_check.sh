@@ -3,6 +3,8 @@
 # (torch headers, the extension's extra_cuda_cflags, -gencode for one SM) and our copy the way zig/build/cuda.zig
 # does, then compares the SASS of every kernel of ours with sass_check.py.
 # usage: OUT=<dir under ~/Documents> SM=121 TF_DSV41_PY_SRC=<tensorfold-dsquant> bash sass_check.sh [name ...]
+# FATBINS=<zig-out/fatbin>: also compares the built fatbins (what a kit ships) against the Python build, kernel by
+# kernel, besides the fresh compile (which gives the ptxas spill report).
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 OUT="${OUT:?set OUT}"
@@ -78,10 +80,22 @@ script="$script
 wait"
 docker run --rm --network none --memory 16g -u "$(id -u):$(id -g)" -e SM="$SM" -e HOME=/tmp \
   -v "$OUT:/src:ro" -v "$HERE:/k:ro" -v "$OUT:/out" --entrypoint bash "$IMAGE" -c "$script" 2>&1 | grep -v "No CUDA runtime" || true
+fat() { case $1 in attn_cuda) echo attn;; topk_cuda) echo topk;; mhc_cuda) echo mhc;; *) echo "$1";; esac; }
+if [ -n "${FATBINS:-}" ]; then
+  mkdir -p "$OUT/fat"
+  dump=""
+  for n in "${names[@]}"; do dump="$dump cuobjdump -sass /f/dsv41_$(fat "$n").fatbin > /out/fat/$n.sass;"; done
+  docker run --rm --network none -u "$(id -u):$(id -g)" -v "$FATBINS:/f:ro" -v "$OUT:/out" --entrypoint bash "$IMAGE" \
+    -c "set -e; $dump" 2>&1 | grep -v "No CUDA runtime" | grep -iE "error|fatal" || true
+fi
 rc=0
 for n in "${names[@]}"; do
   echo "== $n"
   python3 "$HERE/sass_check.py" "$OUT/py/$n.sass" "$OUT/zig/$n.sass" --sm "$SM" | tail -4 || rc=1
+  if [ -n "${FATBINS:-}" ]; then
+    echo -n "built fatbin: "
+    python3 "$HERE/sass_check.py" "$OUT/py/$n.sass" "$OUT/fat/$n.sass" --sm "$SM" | tail -1 || rc=1
+  fi
   spill=$(grep -E "bytes spill" "$OUT/zig/$n.ptxas" | grep -vc " 0 bytes spill stores, 0 bytes spill loads" || true)
   echo "$n: $(grep -c 'Compiling entry' "$OUT/zig/$n.ptxas") entry functions, $spill with spills (sm_$SM)"
 done
