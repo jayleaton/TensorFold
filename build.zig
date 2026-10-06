@@ -86,11 +86,28 @@ pub fn build(b: *std.Build) void {
         else => {},
     }
     cuda_build.hostTests(b, draft_ids, test_step);
+    dsv41HostTests(b, test_step);
     const flash_host = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/flashnext_host.zig"), .target = target, .optimize = optimize, .link_libc = true }) });
     b.step("compile-flashnext-host", "Compile FlashNext CPU metadata contracts without running them").dependOn(&flash_host.step);
     const flash_host_run = b.addRunArtifact(flash_host);
     b.step("test-flashnext-host", "Run FlashNext CPU metadata contracts without Metal").dependOn(&flash_host_run.step);
     test_step.dependOn(&flash_host_run.step);
+}
+
+/// DeepSeek-V4.1's host side (config, pack headers, the rank's weight plan) on any host; TF_DSV41_HEADERS adds real header dumps.
+fn dsv41HostTests(b: *std.Build, test_step: *std.Build.Step) void {
+    const host = b.graph.host;
+    const core = b.createModule(.{ .root_source_file = b.path("zig/src/core/root.zig"), .target = host, .optimize = .debug, .link_libc = true });
+    const family = b.createModule(.{
+        .root_source_file = b.path("zig/src/families/deepseek_v41/deepseek_v41.zig"),
+        .target = host,
+        .optimize = .debug,
+        .link_libc = true,
+        .imports = &.{.{ .name = "core", .module = core }},
+    });
+    const run = b.addRunArtifact(b.addTest(.{ .root_module = family }));
+    b.step("test-dsv41", "DeepSeek-V4.1's host-side unit tests (no GPU work)").dependOn(&run.step);
+    test_step.dependOn(&run.step);
 }
 
 /// `zig build native -Dcpu=apple_m1`: tensorfold-native with the Metal engines for the Python package's bundle (a native M5 build traps on M1-M4).
