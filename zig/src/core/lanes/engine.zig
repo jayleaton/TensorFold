@@ -12,6 +12,7 @@ const shape = @import("shape.zig");
 const plan_lanes = @import("plan_lanes.zig");
 const fill = @import("fill.zig");
 const trail = @import("trail.zig");
+const trim = @import("trim.zig");
 const Stream = sm.Stream;
 const Feed = be.Feed;
 const Plan = win.Plan;
@@ -29,6 +30,7 @@ pub const Engine = struct {
     backend: be.Backend,
     clock: be.Clock,
     log: ?*ev.Log = null,
+    trim: ?trim.Trim = null, // a family's row policy in place of the built-in allocation (lanes/trim.zig)
     rule: depth.Rule,
     live: std.ArrayList(*Stream) = .empty, // admitted streams in admission order (Python `_live`)
     drafted: u64 = 0,
@@ -234,7 +236,7 @@ pub const Engine = struct {
         s.priced = null;
         const a = e.arena.allocator();
         var plans = [_]Plan{try win.plan(e, s, copied)};
-        if (plans[0].kind == .head and e.cfg.node_probabilities) try win.allocate(e, &plans);
+        if (plans[0].kind == .head and (e.cfg.node_probabilities or e.trim != null)) try win.allocate(e, &plans);
         const plan = plans[0];
         const early = e.cfg.family_mtp and s.drafts and plan.kind != .forced and e.cfg.speculate_early and plan.parents == null;
         const windows = [_]be.Window{try win.build(e, plan, early)};
@@ -380,6 +382,10 @@ pub const Engine = struct {
                 }
             }
         }
+        if (e.trim) |t| if (p.kind != .forced) {
+            const chain = parents.len == 0 or accept.isChain(parents);
+            try t.commit(.{ .stream = s, .drafted = p.kind == .head, .rows = @intCast(rows), .parents = if (chain) null else parents, .path = path, .bonus = sampled[path[path.len - 1]] });
+        };
         const budget_cut = s.thinkCut(committed.items);
         const loop_cut = sm.loopCut(s, committed.items);
         const loop_wins = if (loop_cut) |c| budget_cut == null or c < budget_cut.? else false;
