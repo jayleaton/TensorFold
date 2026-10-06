@@ -1,10 +1,12 @@
-//! `tf-dsv41-m1 check`: block.zig's calls for every captured decode window against the capture's launches, on the host:
+//! `tf-dsv41-m1 check`: block.zig's calls for every captured decode window (block_prefill.zig's for every prefill
+//! segment) against the capture's launches, on the host:
 //! each call's kernel, grid, scalars, tensor shapes / strides / dtypes / offsets, weights by name, and its roles' storage
 //! (a role is one captured storage for its scope, two roles in one launch are two storages).
 
 const std = @import("std");
 const calls = @import("calls.zig");
 const block = @import("block.zig");
+const block_prefill = @import("block_prefill.zig");
 const Config = @import("config.zig").Config;
 const buffers = @import("buffers.zig");
 const cuda = @import("cuda");
@@ -170,9 +172,11 @@ pub const Flow = struct {
     }
 };
 
-pub const Window = struct { set: []const u8, phase: []const u8, layers: []const u32, n: i64, start: i64, ops: []std.json.ObjectMap };
+/// A captured phase: a decode window ("w<n>") or a prefill segment ("p<n>", `prefill`).
+pub const Window = struct { set: []const u8, phase: []const u8, layers: []const u32, n: i64, start: i64, ops: []std.json.ObjectMap, prefill: bool = false };
 
-/// The capture's decode windows in order: each set's windows (meta.json "windows") from the prompt's end.
+/// The capture's phases in order: each set's decode windows (meta.json "windows") from the prompt's end, then its
+/// prefill segment after them (dsv41_m1_capture.py: positions prompt + every window's rows).
 pub fn windows(a: std.mem.Allocator, io: std.Io, dir: []const u8) ![]Window {
     const cwd = std.Io.Dir.cwd();
     const meta = try std.json.parseFromSliceLeaky(Value, a, try cwd.readFileAlloc(io, try std.fs.path.join(a, &.{ dir, "meta.json" }), a, .limited(1 << 24)), .{});
@@ -187,25 +191,43 @@ pub fn windows(a: std.mem.Allocator, io: std.Io, dir: []const u8) ![]Window {
         const op = (try std.json.parseFromSliceLeaky(Value, a, line, .{})).object;
         const set = op.get("set").?.string;
         const phase = op.get("phase").?.string;
-        if (phase.len < 2 or phase[0] != 'w') continue;
+        if (phase.len < 2 or (phase[0] != 'w' and phase[0] != 'p')) continue;
         if (cur == null or !std.mem.eql(u8, cur.?.set, set) or !std.mem.eql(u8, cur.?.phase, phase)) {
             if (cur) |c| c.ops = try ops.toOwnedSlice(a);
             const n = try std.fmt.parseInt(i64, phase[1..], 10);
             var start = prompt;
             for (sizes) |s| {
-                if (s.integer == n) break;
+                if (phase[0] == 'w' and s.integer == n) break;
                 start += s.integer;
             }
             const ls = meta.object.get("sets").?.object.get(set).?.object.get("layers").?.array.items;
             const layers = try a.alloc(u32, ls.len);
             for (ls, layers) |x, *y| y.* = @intCast(x.integer);
-            try out.append(a, .{ .set = set, .phase = phase, .layers = layers, .n = n, .start = start, .ops = &.{} });
+            try out.append(a, .{ .set = set, .phase = phase, .layers = layers, .n = n, .start = start, .ops = &.{}, .prefill = phase[0] == 'p' });
             cur = &out.items[out.items.len - 1];
         }
         try ops.append(a, op);
     }
     if (cur) |c| c.ops = try ops.toOwnedSlice(a);
     return out.items;
+}
+
+/// The routed experts' K2s present per layer (Widths.gm) from the prefill phases' x3gm launches: weights.json holds
+/// each ragged stack as one blob, so the per-expert widths are the plan's (a run's loader has them); the check takes
+/// the widths the capture launched (gate/up: arg 16 of `gateup`, down: arg 12 of `down`, the layer from its svh).
+fn gmWidths(a: std.mem.Allocator, w: *block.Widths, ws: []const Window) !void {
+    for (ws) |win| for (win.ops) |op| {
+        const name = op.get("name").?.string;
+        const down = std.mem.eql(u8, name, "tf_dsv41_x3gm_v1.down");
+        if (!down and !std.mem.eql(u8, name, "tf_dsv41_x3gm_v1.gateup")) continue;
+        const args = op.get("args").?.array.items;
+        const svh = args[if (down) 8 else 10].object.get("weight").?.string;
+        const L = try std.fmt.parseInt(u32, svh[1..std.mem.indexOfScalar(u8, svh, '.').?], 10);
+        const k2: u5 = @intCast(args[if (down) 12 else 16].object.get("v").?.integer);
+        const gop = try w.gm.getOrPut(a, L);
+        if (!gop.found_existing) gop.value_ptr.* = .{ 0, 0 };
+        gop.value_ptr[@intFromBool(down)] |= @as(u32, 1) << k2;
+    };
 }
 
 /// M2's Triton variant choice on the host: each Triton call split into runtime arguments and constexprs over its
@@ -248,9 +270,10 @@ pub fn checkAll(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, experts: []
     defer arena.deinit();
     const a = arena.allocator();
     const cwd = std.Io.Dir.cwd();
-    const w = try widthsFromCapture(a, try cwd.readFileAlloc(io, try std.fs.path.join(a, &.{ dir, "weights.json" }), a, .limited(1 << 28)), experts);
+    var w = try widthsFromCapture(a, try cwd.readFileAlloc(io, try std.fs.path.join(a, &.{ dir, "weights.json" }), a, .limited(1 << 28)), experts);
     const cfg: Config = .{};
     const ws = try windows(a, io, dir);
+    try gmWidths(a, &w, ws);
     var bad: usize = 0;
     // the variant gate when the capture's AOT set carries the specialization (dsv41_m1_capture.py pack_aot, 2026-10-06+)
     var variants: ?Variants = null;
@@ -266,7 +289,10 @@ pub fn checkAll(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, experts: []
             flow.last = .empty;
         }
         last_set = win.set;
-        const cs = try calls.launches(a, try block.emit(a, &cfg, &w, .{}, win.layers, win.n, win.start, true));
+        const cs = try calls.launches(a, if (win.prefill)
+            try block_prefill.emitPrefill(a, &cfg, &w, .{}, win.layers, win.n, win.start, true)
+        else
+            try block.emit(a, &cfg, &w, .{}, win.layers, win.n, win.start, true));
         var equal: usize = 0;
         var shown: usize = 0;
         const m = @min(cs.len, win.ops.len);

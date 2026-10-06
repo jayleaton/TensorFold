@@ -22,6 +22,9 @@ const dense = dk.dense;
 pub const Widths = struct {
     dense: std.StringHashMapUnmanaged(u32) = .empty,
     experts: std.AutoHashMapUnmanaged(u32, [2][2]u32) = .empty,
+    /// each routed layer's expert K2s present (bit k2 set), gate/up and down: a prefill segment's x3gm runs one launch
+    /// a width present (x3gm.Ragged). From the plan in a run; the M1 check reads the capture's x3gm launches
+    gm: std.AutoHashMapUnmanaged(u32, [2]u32) = .empty,
 
     pub fn k2(w: *const Widths, name: []const u8) !u32 {
         return w.dense.get(name) orelse error.NoWidth;
@@ -54,6 +57,8 @@ pub const Options = struct {
     /// DSpark's taps (Forward(taps=True)): the boundaries entering the DSpark target layers (37-39) write the streams'
     /// mean into "w.taps" bf16 [n, 3 x hidden] (a column block a target, dspark.py), which draft/iface.zig's Taps names
     taps: bool = false,
+    /// rows a prefill segment holds at most (forward.pchunk): sizes the SWA staging ring (block_prefill.zig)
+    prefill_rows: i64 = 2048,
 };
 
 pub const Emitter = struct {
