@@ -106,7 +106,14 @@ fn layers(a: std.mem.Allocator, io: std.Io, capture: []const u8) ![]u32 {
     var it = root.object.get("sets").?.object.iterator();
     while (it.next()) |e| for (e.value_ptr.object.get("layers").?.array.items) |l| try out.append(a, @intCast(l.integer));
     std.mem.sort(u32, out.items, {}, std.sort.asc(u32));
-    return out.items;
+    // sets may share a block (P and B both hold layer 20): each loads once
+    var k: usize = 0;
+    for (out.items) |l| {
+        if (k > 0 and out.items[k - 1] == l) continue;
+        out.items[k] = l;
+        k += 1;
+    }
+    return out.items[0..k];
 }
 
 const Mode = enum { none, replay, forward, both };
