@@ -33,8 +33,11 @@ pub const Forward = struct {
     arena: std.heap.ArenaAllocator,
     programs: std.AutoHashMapUnmanaged(u32, []const calls.Call) = .empty,
     slot: Slot = .{},
-    /// pinned staging of the window's positions (pos, pos64, lo)
+    /// pinned staging of the window's token ids, and their device copy (int64, the embedding step reads them)
     host: ?cuda.HostBuffer = null,
+    dev_ids: ?cuda.DeviceBuffer = null,
+    /// a bf16 [rows, hidden] send buffer for the exchanges whose partial is not bf16 already (embedding, MoE)
+    send: ?cuda.DeviceBuffer = null,
     /// the window's token ids (the embedding step reads them)
     ids: []const u32 = &.{},
 
@@ -44,6 +47,8 @@ pub const Forward = struct {
 
     pub fn deinit(f: *Forward) void {
         if (f.host) |*h| h.free();
+        if (f.dev_ids) |*b| b.free();
+        if (f.send) |*b| b.free();
         f.programs.deinit(f.gpa);
         f.arena.deinit();
     }
@@ -87,7 +92,14 @@ pub const Forward = struct {
         const p = f.slot.pending orelse return error.BadWindow;
         if (accepted >= p.n) return error.BadWindow;
         // the ratio-2 KV sources' carry: fp32 of the accepted row of the window's compressor projection
-        for (f.cfg.kv_sources.items()) |L| if (f.cfg.compressRatio(L) == 2) return glueMissing("carry");
+        const r = f.runner;
+        var nb: [64]u8 = undefined;
+        for (f.cfg.kv_sources.items()) |L| if (f.cfg.compressRatio(L) == 2) {
+            const w = 2 * @as(usize, f.cfg.head_dim);
+            const src = r.addressOf(try std.fmt.bufPrint(&nb, "w.L{d}.comp", .{L})) orelse return error.Unbound;
+            const dst = r.addressOf(try std.fmt.bufPrint(&nb, "s.L{d}.carry", .{L})) orelse return error.Unbound;
+            try r.kernels.others(r.stream).carry(src, w, 0, accepted, w, dst);
+        };
         f.slot.pos = p.start + accepted + 1;
         f.slot.pending = null;
     }
@@ -97,40 +109,71 @@ pub const Forward = struct {
         return error.GlueNotBuilt;
     }
 
+    fn numel(t: calls.Tensor) usize {
+        var n: usize = 1;
+        for (t.shape) |x| n *= @intCast(x);
+        return n;
+    }
+
+    fn sendBuffer(f: *Forward, r: *run.Runner, bytes: usize) !u64 {
+        if (f.send == null or f.send.?.len < bytes) {
+            if (f.send) |*b| b.free();
+            f.send = try cuda.DeviceBuffer.alloc(r.d, bytes);
+        }
+        return f.send.?.ptr;
+    }
+
     fn glueFn(ctx: *anyopaque, r: *run.Runner, c: *const calls.Call) anyerror!void {
         const f: *Forward = @ptrCast(@alignCast(ctx));
         const step = c.name["glue.".len..];
         const s = r.stream.handle;
+        const k = r.kernels.others(r.stream);
+        const p = f.slot.pending.?;
+        const D: usize = f.cfg.hidden;
+        const W: usize = f.comm.world();
         if (std.mem.eql(u8, step, "positions")) {
-            const n = f.slot.pending.?.n;
-            const start = f.slot.pending.?.start;
-            const bytes = 4 + 8 * n + 4 * n;
-            if (f.host == null or f.host.?.bytes.len < bytes) {
+            const t = [_]calls.Tensor{ c.args[0].arg.t, c.args[1].arg.t, c.args[2].arg.t };
+            return k.positions(@intCast(p.start), p.n, try r.tensorAddr(t[0]), try r.tensorAddr(t[1]), try r.tensorAddr(t[2]));
+        }
+        if (std.mem.eql(u8, step, "embed")) {
+            // this rank's vocabulary rows (others +0), their all-sum (the window's first exchange), x4 into the streams
+            const n: usize = p.n;
+            if (f.host == null or f.host.?.bytes.len < 8 * n) {
                 if (f.host) |*h| h.free();
-                f.host = try cuda.HostBuffer.alloc(r.d, @max(bytes, 4096));
+                f.host = try cuda.HostBuffer.alloc(r.d, @max(8 * n, 4096));
+            }
+            if (f.dev_ids == null or f.dev_ids.?.len < 8 * n) {
+                if (f.dev_ids) |*b| b.free();
+                f.dev_ids = try cuda.DeviceBuffer.alloc(r.d, @max(8 * n, 256));
             }
             const h = f.host.?.bytes;
-            std.mem.writeInt(i32, h[0..4], @intCast(start), .little);
-            for (0..n) |i| std.mem.writeInt(i64, h[4 + 8 * i ..][0..8], @intCast(start + i), .little);
-            @memset(h[4 + 8 * n ..][0 .. 4 * n], 0);
-            const dsts = [_][]const u8{ "w.pos", "w.pos64", "w.lo" };
-            const offs = [_]usize{ 0, 4, 4 + 8 * n };
-            const lens = [_]usize{ 4, 8 * n, 4 * n };
-            for (dsts, offs, lens) |role, o, len| {
-                const dst = r.addressOf(role) orelse return error.Unbound;
-                try r.d.check(r.d.api.cuMemcpyHtoDAsync_v2(dst, h[o..].ptr, len, s), "cuMemcpyHtoDAsync");
-            }
-            return;
+            for (f.ids, 0..) |id, i| std.mem.writeInt(i64, h[8 * i ..][0..8], id, .little);
+            try r.d.check(r.d.api.cuMemcpyHtoDAsync_v2(f.dev_ids.?.ptr, h.ptr, 8 * n, s), "cuMemcpyHtoDAsync");
+            const embed = r.weights.get("embed") orelse return error.MissingWeight;
+            const V: usize = f.cfg.vocab / W;
+            const rows = try f.sendBuffer(r, 2 * n * D);
+            try k.embedSend(f.dev_ids.?.ptr, n, embed.ptr, @intCast(f.comm.rank() * V), V, D, rows);
+            const recv = try r.tensorAddr(c.args[1].arg.t);
+            try f.comm.allGather(rows, recv, n * D, .bf16, s);
+            return k.embedSum(recv, W, n, D, try r.tensorAddr(c.args[0].arg.t));
         }
         if (std.mem.eql(u8, step, "exchange")) {
             // attention's bf16 partial gathered into the receive buffer, rank 0's first
             const send = c.args[0].arg.t;
-            const recv = c.args[1].arg.t;
-            var count: usize = 1;
-            for (send.shape) |x| count *= @intCast(x);
-            return f.comm.allGather(try r.tensorAddr(send), try r.tensorAddr(recv), count, .bf16, s);
+            return f.comm.allGather(try r.tensorAddr(send), try r.tensorAddr(c.args[1].arg.t), numel(send), .bf16, s);
         }
-        return glueMissing(step);
+        if (std.mem.eql(u8, step, "exchange_f32")) {
+            // the MoE's fp32 partial rounded to bf16, then gathered
+            const part = c.args[0].arg.t;
+            const n = numel(part);
+            const half = try f.sendBuffer(r, 2 * n);
+            try k.castBf16(try r.tensorAddr(part), half, n);
+            return f.comm.allGather(half, try r.tensorAddr(c.args[1].arg.t), n, .bf16, s);
+        }
+        if (std.mem.eql(u8, step, "kit_weights"))
+            return k.kitWeights(try r.tensorAddr(c.args[0].arg.t), try r.tensorAddr(c.args[1].arg.t), numel(c.args[0].arg.t));
+        if (std.mem.eql(u8, step, "kit_logits")) return k.kitLogits(try r.tensorAddr(c.args[0].arg.t), numel(c.args[0].arg.t));
+        return glueMissing(step); // engram_rows: the host hashing (NgramHasher) and the rows' source (EngramSource)
     }
 };
 
