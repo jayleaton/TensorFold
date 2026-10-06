@@ -32,7 +32,7 @@ Rules for every owner:
 - **GPU budget:** the RunPod account balance (about $78, no further top-ups) is the limit, and about $50 of it is for pods across all agents.
   - Batch GPU checks into as few pods as possible; the port lead's `zigm1` pod carries other agents' checks.
   - Use short hard maxima, and don't re-run pods to re-confirm what's already proven.
-  - Log every pod in `dsv41-exl3-quant/results/zig-pod-ledger.md`.
+  - Launch with `DSQ_AGENT=<agent id> DSQ_PURPOSE="<what the pod checks>" bash runpod/session.sh ...` (or `hold.sh`). Since quant repo 0240dbf, both refuse to launch without `DSQ_AGENT` and write their own row in `dsv41-exl3-quant/results/zig-pod-ledger.md`. Do not add manual rows for pods launched this way.
 
 **Shared types.**
 - **Weights by name.** The loader names every tensor the way the M1 capture names the Python engine's tree: `L<layer>.attn.wq_a.trellis`, `L<layer>.attn.wo_a.<j>.suh`, `L<layer>.moe.w1.data` (ragged) or `.trellis` (stack), `L<layer>.moe.shared.0.w2.svh`, `L<layer>.engram.qk`, `embed`, `norm`, `head.trellis`.
@@ -133,7 +133,7 @@ Rules from `ZIG-PREVIEW.md`:
   - the capture
   - the replay
 
-  Pods are logged in the quant repo's `results/zig-pod-ledger.md`.
+  Launch it with `DSQ_AGENT=dsq-zig-arch-1 DSQ_PURPOSE="M1 run N ..."`. The script writes the ledger row (section 0).
 - **Block forward** (`tf-dsv41-m1 check CAPTURE` on the host; `tf-dsv41-m1 both PACK CAPTURE OUT` on the GPU, which runs the replay and then the forward on one load; files `block.zig`, `block_moe.zig`, `calls.zig`, `m1_check.zig`, `m1_forward.zig`). See M1's second half in section 5.
 - **Results on the prod path (pod 8, `M1_KNOBS=prod`, 41ce3ed):**
   - **Replay: PASS.**
