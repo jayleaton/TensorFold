@@ -378,6 +378,34 @@ instances out of x3gm3.cu), all with the same mma chains and epilogue:
 included x3gm.cu is still 135 / 135 SASS-equal to Python (fresh compile and built fatbin); the v3 variants have the
 same registers and spills as on sm_120.
 
+**Flag:** `TF_DSV41_GM_V3=1` (`exl3.gmV3()`) puts prefill's x3gm on v3's defaults; off by default (v2).
+
+## 3.2e The DRAM lever on GB10: estimated, not built (under 3 % of prefill)
+
+**What was proposed:** fuse the input rotation into the gate/up operand load, and the combine into the down
+epilogue, keeping v2's bits. The base: the Spark prod prefills 887 ms per 2,048-row chunk (32K replay), and a chunk
+runs 20 x3gm layers. A layer per rank is 12,288 pairs, D 5,120, I 1,152, two rotated inputs (prod).
+
+**Combine into the down epilogue: not bit-identical in any cheap form.**
+- `combine_kernel` sums a row's 6 slots in slot order (`acc = fmaf(w, y, acc)` from +0).
+- The 6 slots of a row come from 6 experts' passes, done by different CTAs at different times.
+- An ordered in-epilogue sum needs slot-phased down launches, so every expert's weights are read 6 times.
+- Atomics change the order; a bf16 Y changes the values. So Y's 252 MB write plus read stays.
+
+**Rotation into the gate/up operand load: bytes against compute.**
+- Bytes removed: the rotation's write (2 × 12,288 × 5,120 × 2 B = 252 MB) and gate/up's read of it (at least 252 MB; the 9 column-block items of a pass run together and share it in L2). Bytes added: the fused path's gathers of the bf16 rows, 21-126 MB. Net 377-482 MB a layer.
+- At 273 GB/s that is 1.38-1.77 ms a layer, or 28-35 ms a chunk: **3.1-4.0 % if every byte were on the critical path**.
+- The GB10 calibration (x3gm ≈ compute + 0.5-0.7 × DRAM time, section 2.1 of the perf doc) puts the rotation kernel fully on it (about 1.0 ms) and gate/up's read only partly (about 0.55 ms). The gathers cost 0.05-0.28 ms. Net about 1.3-1.5 ms a layer: **2.9-3.4 % before the added compute**.
+- The added compute: a pass's rotated rows (655 KB an input) do not fit on chip, so each of a pass's 9 column-block items recomputes the 128-point Hadamard of every member row.
+  - That is about 1.13 G values a layer at about 12 instructions a value, about 0.44 G warp-instructions, roughly 40 % on top of the trellis decode's 1.06 G.
+  - After v2 the issue work is already as large as the tensor work (3.2d), so this lands on compute: +1.3-2.8 ms a layer on GB10.
+- **Net: about -1 % to +1 % of prefill.** Under the 3 % bar: not built.
+
+**What would move GB10's prefill instead.**
+- Weight bytes: weights are about 2.5 GB a layer at about 3 bits, nearly the whole DRAM floor, and the ragged widths already set them.
+- Larger chunks: R6, 4,096 rows, the weights streamed once per 4K, about -22 % x3gm a row, blocked on memory.
+- FP8 on the tensor path: R5, quality-gated.
+
 ## 3.3 Perf notes that touch these launches (docs/DSV41-ZIG-PERF.md)
 
 - **x3gm at 4,096-row blocks.** `exl3.gmTuned` takes Python's tuning table (`tune_default` = `x3gm.TUNE`). Its 4K

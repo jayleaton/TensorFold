@@ -152,6 +152,13 @@ pub fn v3Of(mats: u32, xm: u32, out: []usize) []usize {
     return out[0..n];
 }
 
+/// TF_DSV41_GM_V3=1: prefill's x3gm through v3 (v3_default's variants); unset or 0: v2. Off by default: v3 is bit-identical
+/// and -2.2 % at a 2,048-row chunk on the PRO 6000 (its down tile), not yet measured on GB10.
+pub fn gmV3() bool {
+    const v = std.c.getenv("TF_DSV41_GM_V3") orelse return false;
+    return !std.mem.eql(u8, std.mem.span(v), "0");
+}
+
 /// v3's default variant of a projection (sm_120 pod timing at prod shapes: docs/DSV41-ZIG-KERNELS.md 3.2d).
 pub const v3_default: struct { gu: [2]usize, dn: usize } = .{ .gu = .{ 4, 1 }, .dn = 9 };
 
