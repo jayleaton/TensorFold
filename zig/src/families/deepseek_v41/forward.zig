@@ -114,7 +114,9 @@ pub const Forward = struct {
         // the ratio-2 KV sources' carry: fp32 of the accepted row of the window's compressor projection
         const r = f.runner;
         var nb: [64]u8 = undefined;
-        for (f.cfg.kv_sources.items()) |L| if (f.cfg.compressRatio(L) == 2) {
+        var la = std.heap.ArenaAllocator.init(f.gpa);
+        defer la.deinit();
+        for (try f.backbone(la.allocator())) |L| if (f.cfg.isKvSource(L) and f.cfg.compressRatio(L) == 2) {
             const w = 2 * @as(usize, f.cfg.head_dim);
             const src = r.addressOf(try std.fmt.bufPrint(&nb, "w.L{d}.comp", .{L})) orelse return error.Unbound;
             const dst = r.addressOf(try std.fmt.bufPrint(&nb, "s.L{d}.carry", .{L})) orelse return error.Unbound;
