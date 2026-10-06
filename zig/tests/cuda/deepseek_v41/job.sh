@@ -30,6 +30,27 @@ rm -rf "$OUT/fixtures"
 PYTHONPATH="$PY/src" PYTHONDONTWRITEBYTECODE=1 python -B "$HERE/oracle.py" "$OUT" > "$OUT/oracle.log" 2>&1 \
   || { rc=1; echo "oracle failed"; tail -30 "$OUT/oracle.log"; }
 
+step "capture: the Python engine's own GPU suites, their extension calls recorded (capture.py)"
+# Every allowed extension call the suites make (attention + top-k, mHC decode / prefill, router GEMV incl. R1c's prune,
+# pfdense, dense3 / x3seg / upstream linear, incl. R1 / R1c variants when the twin has them) becomes a replay case.
+# Timing, emulator and real-weight tests are left out. A failing Python test does not fail the job (its calls still
+# replay); the log keeps pytest's summary.
+CAPTURE_TESTS=""
+for t in attn_cuda mhc_cuda mhc_pf router_gemv router_gemv_narrow pfdense dense3 fused_proj; do
+  f="$PY/tests/cuda/test_dsv41_${t}_gpu.py"
+  [ -f "$f" ] && CAPTURE_TESTS="$CAPTURE_TESTS $f"
+done
+SKIP_K="not time and not us_ and not sweep and not cold and not real_layer and not emulator and not device_info and not launch_ms and not chunk_budget and not end_to_end and not kwidth"
+if [ -n "$CAPTURE_TESTS" ]; then
+  (cd "$PY" && PYTHONPATH="$HERE:$PY/src:$PY/tests" PYTHONDONTWRITEBYTECODE=1 TF_DSV41_CAPTURE="$OUT/fixtures" \
+     timeout "${TF_DSV41_CAPTURE_MIN:-25}m" python -m pytest -q -p capture -p no:cacheprovider $CAPTURE_TESTS -k "$SKIP_K") \
+    > "$OUT/capture.log" 2>&1
+  echo "capture: pytest rc $? ($(tail -1 "$OUT/capture.log"))"
+  cp "$OUT/fixtures/capture.json" "$OUT/capture.json" 2>/dev/null
+else
+  echo "capture: no GPU suites under $PY/tests/cuda"
+fi
+
 step "bit checks"
 "$T" all "$OUT/fixtures" 2>&1 | tee "$OUT/bits.log"
 [ "${PIPESTATUS[0]}" -eq 0 ] || rc=1

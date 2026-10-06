@@ -8,6 +8,7 @@ const dsv41 = @import("dsv41_kernels");
 const check = @import("check.zig");
 const experts = @import("deepseek_v41/experts.zig");
 const kvsplit = @import("deepseek_v41/kvsplit.zig");
+const replay_case = @import("deepseek_v41/replay.zig");
 
 const usage =
     \\usage: tf-dsv41-test <command> [fixture dir]
@@ -15,6 +16,7 @@ const usage =
     \\  kvsplit            split KV's exchange copies against kv/split.zig's host reference (no fixture)
     \\  experts <dir>      decode chain: group, rot_in, x3ld (every setting) / upstream grouped / x3pf, epilogues, combine
     \\  x3gm <dir>         fast prefill: rot, gate/up and down at every configuration (uniform and ragged), combine
+    \\  replay <dir>       one recorded Python extension call (capture.py) re-issued and compared, storage by storage
     \\  all <fixtures>     every case directory under <fixtures> by its manifest's "kind"
     \\
 ;
@@ -55,6 +57,10 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "kvsplit")) return kvsplit.run(gpu, &k);
     if (std.mem.eql(u8, cmd, "experts")) return experts.decodeChain(gpu, &k, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "x3gm")) return experts.x3gm(gpu, &k, try arg(rest, 0));
+    if (std.mem.eql(u8, cmd, "replay")) {
+        if (try replay_case.run(gpu, &k, try arg(rest, 0)) == .skipped) std.debug.print("SKIP no binding\n", .{});
+        return;
+    }
     if (std.mem.eql(u8, cmd, "all")) return all(gpu, &k, try arg(rest, 0));
     std.debug.print("{s}", .{usage});
     return error.UnknownCommand;
@@ -79,6 +85,7 @@ fn all(gpu: check.Gpu, k: *const dsv41.Kernels, root: []const u8) !void {
         }
     }.lt);
     var failed: usize = 0;
+    var skipped: usize = 0;
     for (names.items) |n| {
         const path = try std.fs.path.join(gpu.gpa, &.{ root, n });
         defer gpu.gpa.free(path);
@@ -97,13 +104,19 @@ fn all(gpu: check.Gpu, k: *const dsv41.Kernels, root: []const u8) !void {
             experts.topkCases(gpu, k, path)
         else if (std.mem.eql(u8, kind.slice(), "pointwise"))
             experts.pointwiseCases(gpu, k, path)
-        else
-            error.UnknownKind;
+        else if (std.mem.eql(u8, kind.slice(), "replay")) blk: {
+            const o = replay_case.run(gpu, k, path) catch |e| break :blk e;
+            if (o == .skipped) {
+                std.debug.print("SKIP {s}: no Zig binding\n", .{n});
+                skipped += 1;
+            }
+            break :blk {};
+        } else error.UnknownKind;
         r catch |e| {
             std.debug.print("FAIL {s}: {t}\n", .{ n, e });
             failed += 1;
         };
     }
-    std.debug.print("RESULT {d} cases, {d} failed\n", .{ names.items.len, failed });
+    std.debug.print("RESULT {d} cases, {d} failed, {d} skipped (no binding)\n", .{ names.items.len, failed, skipped });
     if (failed > 0) return error.TestFailed;
 }
