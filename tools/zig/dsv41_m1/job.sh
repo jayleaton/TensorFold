@@ -58,6 +58,15 @@ if [[ -f "$Z/r1c.tar.gz" ]] && tar -xzf "$Z/r1c.tar.gz" -C /; then PYTWIN=/opt/r
 echo "kernel job twin: $PYTWIN" | tee -a "$RES/env.txt"
 left() { echo $(( ${M1_BUDGET_MIN:-52} - ($(date +%s) - T0) / 60 )); }
 
+# M1_JOB=x3gm3: the kernel agent's x3gm v3 gate alone (zig/tests/cuda/deepseek_v41/x3gm3_job.sh: the x3gm fixtures,
+# every v3 variant bit for bit, the prod-shape timing bench), in the budget
+if [[ "${M1_JOB:-m1}" == x3gm3 ]]; then
+    (for v in $(compgen -e | grep '^TF_DSV41_'); do unset "$v"; done
+     export TF_DSV41_PY_SRC=$PYTWIN TF_DSV41_TEST=$Z/bin/tf-dsv41-test TORCH_EXTENSIONS_DIR=$PYEXT
+     step x3gm3 "$(left)" bash "$Z/zig/tests/cuda/deepseek_v41/x3gm3_job.sh" "$RES/x3gm3") || rc=1
+    exit $rc
+fi
+
 # M1_JOB=m2a: M2a instead of M1 (the Python reference over layers M2A_LAYERS (0-8) with its slot state, rope tables
 # and AOT set; the Engram host tables; tf-dsv41-m1 m2a; then the kernel job in what is left)
 # M1_JOB=m2b (TWO GPUs): M2b. The pack's shards up to layer M2B_HI (27: ~69 GB a rank; the whole backbone does not
