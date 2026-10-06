@@ -125,7 +125,8 @@ They are speed items for after the first Spark numbers.
 This is Python's `planlink.TcpLink`:
 - One frame per plan: a 4-byte byte length, then little-endian int64s. The length goes out with `MSG_MORE`, so a plan leaves as one segment.
 - Rank 0 sends to every other rank. The others block in `recv` for as long as rank 0 is idle.
-- A frame bigger than the caller's buffer is read and dropped (`error.TooLarge`), so the link stays on frame boundaries.
+- `recv(out)` uses a fixed buffer; a frame bigger than it is read and dropped (`error.TooLarge`), so the link stays on frame boundaries.
+- `recvGrow(gpa, *std.ArrayList(i64))` grows the buffer to the frame, up to `max_frame_words` (64M words, 512 MiB). It covers admissions that carry a prompt (about 1M words for a 1M-token prompt). The buffer is kept, so window plans (20–60 words) allocate nothing. A 1.2M-word frame is in the host tests.
 - A closed rank 0 returns `error.PeerClosed`, and the fate channel ends the process right after.
 
 The RDMA host-mailbox variant (Python's `rdma` mode) will come behind the same API.
