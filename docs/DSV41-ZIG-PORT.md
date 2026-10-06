@@ -29,6 +29,10 @@ Rules for every owner:
 - Tests run the real implementation. A test that only checks its own fixture does not count.
 - No nested per-element loops on hot paths, host or device.
 - Where a CUDA rewrite gives a large speed-up, take the time to write it rather than port the old kernel as is.
+- **GPU budget:** the RunPod account balance (about $78, no further top-ups) is the limit, and about $50 of it is for pods across all agents.
+  - Batch GPU checks into as few pods as possible; the port lead's `zigm1` pod carries other agents' checks.
+  - Use short hard maxima, and don't re-run pods to re-confirm what's already proven.
+  - Log every pod in `dsv41-exl3-quant/results/zig-pod-ledger.md`.
 
 **Shared types.**
 - **Weights by name.** The loader names every tensor the way the M1 capture names the Python engine's tree: `L<layer>.attn.wq_a.trellis`, `L<layer>.attn.wo_a.<j>.suh`, `L<layer>.moe.w1.data` (ragged) or `.trellis` (stack), `L<layer>.moe.shared.0.w2.svh`, `L<layer>.engram.qk`, `embed`, `norm`, `head.trellis`.
