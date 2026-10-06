@@ -18,6 +18,9 @@ const run = @import("run.zig");
 comptime {
     _ = &run.Runner.bind;
     _ = &run.Runner.window;
+    _ = &@import("forward.zig").Forward.window;
+    _ = &@import("forward.zig").Forward.keep;
+    _ = &@import("forward.zig").Forward.plan;
 }
 
 const usage =

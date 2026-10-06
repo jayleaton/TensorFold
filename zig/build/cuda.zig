@@ -158,6 +158,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     dsv41_m1.addImport("cuda", cuda);
     dsv41_m1.addImport("core", mods.core);
     dsv41_m1.addImport("dsv41_kernels", dsv41);
+    dsv41_m1.addImport("tp", @import("tp.zig").module(b, target, optimize, cuda)); // M2's forward: the TP collectives
     b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-m1", .root_module = dsv41_m1 }));
 }
 
