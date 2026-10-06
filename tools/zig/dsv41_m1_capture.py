@@ -34,8 +34,9 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-SETS = {"A": (1, 2, 3), "B": (20, 21, 22, 23, 24)}
+SETS = {"A": (1, 2, 3), "B": (20, 21, 22, 23, 24), "C": (40,)}
 WINDOWS = (1, 3, 16)
+PREFILL = 256               # rows of the recorded prefill segment after the windows (the fast prefill kernels)
 SCAN_MAX = 1 << 20          # int64 elements scanned for device addresses a tensor at most
 
 
@@ -331,6 +332,39 @@ class IndexRows:
         return (((i * 2654435761 + j * 40503) % 511) - 255).to(torch.float32) / 1024.0
 
 
+def run_set(cap, rec, s, loader, W, cfg, embed, norm, head, tmap, dev, a, g, vh, Forward, Seg, Triton, NgramHasher):
+    """One set: its blocks loaded, a prompt, the recorded decode windows, then a recorded prefill segment; returns the
+    set's weight digests (kept only when the whole set ran)."""
+
+    import torch
+
+    layers = [loader.layer(L) for L in SETS[s]]
+    tree = W.RankW(0, 2, 0, embed, layers, norm, head, None, {})
+    digests = cap.name_weights(tree, layers)
+    rows = {L: IndexRows(cfg.engram_head_dim) for L in cfg.engram_layer_ids}
+    fw = Forward(cfg, tree, csa2=Triton(128, cfg.num_attention_heads // 2, dev), comm=ZeroPeer(), device=dev,
+                 limit=a.limit, chunk=128, engram_rows=rows, hasher=NgramHasher(cfg, tmap), slots=1,
+                 contiguous=True, pchunk=2048)
+    # ids in rank 0's vocabulary half (its embedding rows; the peer's are zero)
+    ids = torch.randint(3, vh, (a.prompt + sum(WINDOWS) + PREFILL,), generator=g).tolist()
+    fw.prompt(ids[:a.prompt])
+    pos = a.prompt
+    cap.set = s
+    for n, prefill in [(n, False) for n in WINDOWS] + [(PREFILL, True)]:
+        cap.phase = f"p{n}" if prefill else f"w{n}"
+        cap.recording = True
+        try:
+            with rec.scope(f"{s}-{cap.phase}"):
+                fw.run([Seg(0, fw.slot.pos, tuple(ids[pos:pos + n]))], prefill=prefill)
+        finally:
+            cap.recording = False
+        fw.keep(0, n - 1)
+        pos += n
+    torch.cuda.synchronize()
+    del fw, tree, layers
+    return digests
+
+
 def pack_aot(manifest: Path, cache: Path, out: Path) -> dict:
     """The launched kernels in the Zig engine's aot.json form (cubins by hash); a kernel whose PTX parameters are not
     its runtime arguments plus Triton's two scratch pointers is listed in ``problems`` instead of stopping the pack."""
@@ -376,7 +410,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--pack", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--sets", default="A,B")
+    ap.add_argument("--sets", default="A,B,C")
     ap.add_argument("--prompt", type=int, default=1536, help="prompt tokens before the windows (past the top-512)")
     ap.add_argument("--limit", type=int, default=4096)
     a = ap.parse_args()
@@ -414,31 +448,22 @@ def main() -> int:
     meta["triton"] = triton.__version__
     weights: dict = {}
     g = torch.Generator().manual_seed(4101)
+    meta["failed_sets"] = {}
     for s in a.sets.split(","):
         t0 = time.time()
-        layers = [loader.layer(L) for L in SETS[s]]
-        tree = W.RankW(0, 2, 0, embed, layers, norm, head, None, {})
-        weights.update(cap.name_weights(tree, layers))
-        rows = {L: IndexRows(cfg.engram_head_dim) for L in cfg.engram_layer_ids}
-        fw = Forward(cfg, tree, csa2=Triton(128, cfg.num_attention_heads // 2, dev), comm=ZeroPeer(), device=dev,
-                     limit=a.limit, chunk=128, engram_rows=rows, hasher=NgramHasher(cfg, tmap), slots=1,
-                     contiguous=True, pchunk=2048)
-        # ids in rank 0's vocabulary half (its embedding rows; the peer's are zero)
-        ids = torch.randint(3, vh, (a.prompt + sum(WINDOWS),), generator=g).tolist()
-        fw.prompt(ids[:a.prompt])
-        pos = a.prompt
-        cap.set = s
-        for n in WINDOWS:
-            cap.phase = f"w{n}"
-            cap.recording = True
-            with rec.scope(f"{s}-w{n}"):
-                fw.run([Seg(0, fw.slot.pos, tuple(ids[pos:pos + n]))])
+        try:
+            got = run_set(cap, rec, s, loader, W, cfg, embed, norm, head, tmap, dev, a, g, vh, Forward, Seg, Triton,
+                          NgramHasher)
+        except Exception as e:          # a set that fails leaves the others' records whole
+            import traceback
+
+            traceback.print_exc()
             cap.recording = False
-            fw.keep(0, n - 1)
-            pos += n
-        torch.cuda.synchronize()
+            meta["failed_sets"][s] = repr(e)[:500]
+            torch.cuda.empty_cache()
+            continue
+        weights.update(got)
         meta["sets"][s] = {"layers": list(SETS[s]), "load_and_run_s": round(time.time() - t0, 1), "ops": cap.seq}
-        del fw, tree, layers
         torch.cuda.empty_cache()
     cap.ops.close()
     (out / "weights.json").write_text(json.dumps(weights, indent=0, sort_keys=True) + "\n")

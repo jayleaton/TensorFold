@@ -270,6 +270,7 @@ Effort is in engineering days for this agent team, assuming GPU windows are avai
     - Windows are split into pre-instantiated graph segments that are enqueued ahead of time: the next round's segments are submitted while the current round runs, with device-side ordering through events and the row table updated in place.
     - Fewer nodes come from R1's fusions (about 1,331 down to about 700 per window).
     - `graphs.zig` is designed for this from the first version: per row-bucket and context-bucket segment graphs, updates of node parameters instead of re-capture, and no host sync inside a round.
+  - **Copies in the forward:** stream-ordered `cuMemcpyHtoDAsync` / `DtoHAsync` from pinned memory on the forward's stream only. A plain `cuMemcpyHtoD` from pageable memory can return before its DMA lands, and a non-blocking stream does not wait on the legacy stream; M1 pod 3 caught exactly that race.
   - Kernel-side gains (R1 decode fusions, R2 x3gm v2) land behind the kernel launch interfaces (`dsq-decode-r1-1`, `dsq-x3gm-onelaunch-1`).
   - **Not approved:** R5, FP8 prefill (it changes outputs; the user rejected it before).
   - **Blocked:** R6, 4K-row chunks (memory).

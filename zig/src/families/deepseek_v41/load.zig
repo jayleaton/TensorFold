@@ -33,6 +33,8 @@ pub const Weights = struct {
             try w.map.put(w.gpa, try w.gpa.dupe(u8, n.name), .{ .ptr = buf.ptr, .len = n.bytes.len, .kind = n.kind, .sha256 = sha });
             w.bytes += n.bytes.len;
         }
+        // pageable uploads can still be in flight when cuMemcpyHtoD returns; the weights are whole before any launch
+        try d.check(d.api.cuCtxSynchronize(), "cuCtxSynchronize");
     }
 
     pub fn get(w: *const Weights, name: []const u8) ?Tensor {

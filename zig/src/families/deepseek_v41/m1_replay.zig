@@ -121,6 +121,9 @@ pub const Replay = struct {
             try r.patch(relocs, id, b.addr, host);
             try cuda.DeviceBuffer.upload(.{ .d = r.d, .ptr = b.addr[id], .len = @max(n, 1) }, 0, host);
         }
+        // a pageable upload may return before its DMA lands, and our stream does not wait on the legacy one (pod 3:
+        // the tail of a fresh input read stale in chained mode): every byte is on the device before the launch
+        try r.d.check(r.d.api.cuCtxSynchronize(), "cuCtxSynchronize");
         return b;
     }
 
