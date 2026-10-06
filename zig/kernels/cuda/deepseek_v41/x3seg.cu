@@ -432,7 +432,9 @@ void dsv41_x3seg_linear_cuda(const at::Tensor& xh, const std::vector<at::Tensor>
 }
 #endif  // DSV41_X3SEG_NO_TORCH
 
-// The instantiations dsv41_x3seg_linear_cuda launches (TF_SEG_WIDTH): mul1, (WK, MINB) (4, 3), (4, 2), (8, 1).
+// The instantiations dsv41_x3seg_linear_cuda launches (TF_SEG_WIDTH): mul1, (WK, MINB) (4, 3), (4, 2), (8, 1);
+// not when dense3.cu includes this file for its device code.
+#ifndef DSV41_DENSE3_NO_TORCH
 template __global__ void dsv41_x3seg::seg_linear_kernel<4, 2, 4, 3>(const dsv41_x3seg::LinTable, int, int);
 template __global__ void dsv41_x3seg::seg_linear_kernel<4, 2, 4, 2>(const dsv41_x3seg::LinTable, int, int);
 template __global__ void dsv41_x3seg::seg_linear_kernel<4, 2, 8, 1>(const dsv41_x3seg::LinTable, int, int);
@@ -451,3 +453,4 @@ template __global__ void dsv41_x3seg::seg_linear_kernel<12, 2, 8, 1>(const dsv41
 template __global__ void dsv41_x3seg::seg_linear_kernel<16, 2, 4, 3>(const dsv41_x3seg::LinTable, int, int);
 template __global__ void dsv41_x3seg::seg_linear_kernel<16, 2, 4, 2>(const dsv41_x3seg::LinTable, int, int);
 template __global__ void dsv41_x3seg::seg_linear_kernel<16, 2, 8, 1>(const dsv41_x3seg::LinTable, int, int);
+#endif

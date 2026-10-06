@@ -116,11 +116,13 @@ DENSE3_K2S = (4, 6, 8, 10, 12)
 
 
 def footer_x3seg() -> str:
-    out = ["// The instantiations dsv41_x3seg_linear_cuda launches (TF_SEG_WIDTH): mul1, (WK, MINB) (4, 3), (4, 2), (8, 1).\n"]
+    out = ["// The instantiations dsv41_x3seg_linear_cuda launches (TF_SEG_WIDTH): mul1, (WK, MINB) (4, 3), (4, 2), (8, 1);\n"
+           "// not when dense3.cu includes this file for its device code.\n#ifndef DSV41_DENSE3_NO_TORCH\n"]
     for k2 in X3SEG_K2S:
         for wk, mb in ((4, 3), (4, 2), (8, 1)):
             out.append(f"template __global__ void dsv41_x3seg::seg_linear_kernel<{k2}, 2, {wk}, {mb}>(const dsv41_x3seg::LinTable, "
                        "int, int);\n")
+    out.append("#endif\n")
     return "".join(out)
 
 
