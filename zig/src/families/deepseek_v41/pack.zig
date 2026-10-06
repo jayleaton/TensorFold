@@ -193,6 +193,7 @@ pub const Pack = struct {
         defer file.close(io);
         if (span.count <= 1) {
             if (try file.readPositionalAll(io, out, info.start + span.offset) != out.len) return error.ShortRead;
+            dropCache(file, info.start + span.offset, out.len);
             return;
         }
         // a strided part (a column split): one read of the range that covers every run, then the runs gathered,
@@ -202,9 +203,18 @@ pub const Pack = struct {
         const tmp = try std.heap.page_allocator.alloc(u8, cover);
         defer std.heap.page_allocator.free(tmp);
         if (try file.readPositionalAll(io, tmp, info.start + first) != cover) return error.ShortRead;
+        dropCache(file, info.start + first, cover);
         const len: usize = @intCast(span.len);
         const stride: usize = @intCast(span.stride);
         for (0..@intCast(span.count)) |i| @memcpy(out[i * len ..][0..len], tmp[i * stride ..][0..len]);
+    }
+
+    /// The page cache of bytes just read let go (POSIX_FADV_DONTNEED): on GB10 the page cache is the GPU's memory, and
+    /// a rank's ~110 GB of weights read through it would compete with the same weights on the device.
+    fn dropCache(file: Io.File, offset: u64, len: usize) void {
+        if (@import("builtin").os.tag != .linux) return;
+        const linux = std.os.linux;
+        _ = linux.fadvise(file.handle, @intCast(offset), @intCast(len), linux.POSIX_FADV.DONTNEED);
     }
 
     /// The codebook of the group at `prefix`: its marker's value, else the 3-instruction default.
