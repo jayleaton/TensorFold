@@ -14,6 +14,8 @@ const Pack = @import("pack.zig").Pack;
 const plan = @import("plan.zig");
 const m3 = @import("m3.zig");
 const drive = @import("draft/drive.zig");
+const dspark_emit = @import("dspark_emit.zig");
+const dspark_gpu = @import("dspark_gpu.zig");
 
 const rows_lanes = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8 };
 const named = @import("named.zig");
@@ -50,6 +52,9 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, ref: []con
     }
     const layers = try a.alloc(u32, hi - lo + 1);
     for (layers, 0..) |*l, i| l.* = lo + @as(u32, @intCast(i));
+    // M2B_LANES (M3's gates, below): 1 drafts off, 2 the oracle's drafts, 3 DSpark's GPU pass (its blocks and heads
+    // load too)
+    const lanes_mode: u32 = if (std.c.getenv("M2B_LANES")) |v| try std.fmt.parseInt(u32, std.mem.span(v), 10) else 0;
 
     var driver = try cuda.Driver.open();
     defer driver.close();
@@ -75,7 +80,11 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, ref: []con
     const cfg = try Config.read(gpa, io, pack_dir);
     var pack = try Pack.open(gpa, io, pack_dir);
     defer pack.deinit();
-    var pl = try plan.build(gpa, &cfg, &pack, .{ .rank = rank, .world = 2, .blocks = layers, .top = true });
+    const blocks = if (lanes_mode == 3) blk: {
+        var ds: [8]u32 = undefined;
+        break :blk try std.mem.concat(a, u32, &.{ layers, dspark_emit.blocks(&cfg, &ds) });
+    } else layers;
+    var pl = try plan.build(gpa, &cfg, &pack, .{ .rank = rank, .world = 2, .blocks = blocks, .top = true, .dspark = lanes_mode == 3 });
     defer pl.deinit();
     var w: load.Weights = .{ .gpa = gpa };
     defer w.deinit();
@@ -89,6 +98,7 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, ref: []con
         var b: named.Builder = .{ .gpa = gpa, .io = io, .pack = &pack };
         defer b.deinit();
         try b.top(&pl);
+        try b.dspark(&pl);
         try w.upload(&driver, &b);
     }
     var aot = try cuda.aot.Set.load(gpa, io, &driver, ctx.device, try std.fs.path.join(a, &.{ ref, "aot" }));
@@ -106,7 +116,8 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, ref: []con
         // the plan at both trace settings (the traced program adds one role)
         f.opts.trace = true;
         // M2B_LANES windows hold the pending token + a DSpark block of drafts
-        var p = try f.plan(if (std.c.getenv("M2B_LANES") != null) rows_lanes[0 .. cfg.dspark_block + 1] else &.{1});
+        var p = try f.plan(if (lanes_mode != 0) rows_lanes[0 .. cfg.dspark_block + 1] else &.{1});
+        if (lanes_mode == 3) try dspark_gpu.GpuPass.plan(f.arena.allocator(), &f, &p, cfg.dspark_block + 1);
         f.programs.clearRetainingCapacity();
         f.opts.trace = false;
         try p.add(try f.program(1));
@@ -151,9 +162,12 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, ref: []con
     // M2B_LANES (M3's gates): the same decode through the lanes engine over the GPU target on rank 0, the other rank
     // following rank 0's forward operations over the plan link; tokens only (no digests). 1: drafts off; 2: the
     // reference's tokens as drafts, corrupted on drive.Oracle's schedule (multi-row windows, partial keeps, rejects)
-    if (std.c.getenv("M2B_LANES")) |mode_z| {
-        const mode = try std.fmt.parseInt(u32, std.mem.span(mode_z), 10);
+    if (lanes_mode != 0) {
+        const mode = lanes_mode;
         f.link = &session.plan;
+        // every rank's DSpark pass (followers run it through f.drafter)
+        const gp: ?*dspark_gpu.GpuPass = if (mode == 3) try dspark_gpu.GpuPass.init(gpa, &f, cfg.dspark_block + 1) else null;
+        defer if (gp) |g| g.deinit();
         const tl0 = std.Io.Clock.awake.now(io);
         const want = try a.alloc(u32, want_tokens.len);
         for (want, want_tokens) |*d, v| d.* = @intCast(v.integer);
@@ -165,8 +179,8 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, ref: []con
             for (prompt, pids) |*d, v| d.* = @intCast(v.integer);
             var nd: drive.NoDraft = .{};
             var oracle: drive.Oracle = .{ .serial = want, .prompt_len = prompt.len, .vocab = cfg.vocab };
-            const pass = if (mode == 2) oracle.pass() else nd.pass();
-            r = try m3.generate(gpa, &f, pass, mode == 2, prompt, want[0], @intCast(want.len), cfg.dspark_block + 1);
+            const pass = if (gp) |g| g.pass() else if (mode == 2) oracle.pass() else nd.pass();
+            r = try m3.generate(gpa, &f, pass, mode >= 2, prompt, want[0], @intCast(want.len), cfg.dspark_block + 1);
             r.off_anchor = oracle.off_anchor;
             try f.stop();
             for (r.tokens, want[0..@min(r.tokens.len, want.len)]) |g, wt| {
@@ -176,7 +190,13 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, ref: []con
         } else try f.follow();
         defer if (rank == 0) gpa.free(r.tokens);
         const lanes_s = @as(f64, @floatFromInt(tl0.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds())) / 1e9;
-        const kept_some = mode != 2 or (r.accepted > 0 and r.accepted < r.drafted);
+        // the oracle must see accepts and rejects; DSpark's pass must at least draft (its taps here are not the
+        // trained layers' when the gate runs a backbone prefix)
+        const kept_some = switch (mode) {
+            2 => r.accepted > 0 and r.accepted < r.drafted,
+            3 => r.drafted > 0,
+            else => true,
+        };
         const ok = rank != 0 or (r.tokens.len == want.len and equal == want.len and kept_some);
         try cwd.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}/m3-rank{d}.json", .{ out_dir, rank }), .data = try std.fmt.allocPrint(a, "{{\"rank\": {d}, \"mode\": {d}, \"tokens\": {d}, \"want\": {d}, \"equal_prefix\": {d}, \"drafted\": {d}, \"accepted\": {d}, \"off_anchor\": {d}, \"s\": {d:.1}, \"pass\": {}}}\n", .{ rank, mode, r.tokens.len, want.len, equal, r.drafted, r.accepted, r.off_anchor, lanes_s, ok }) });
         std.debug.print("{s} M3 lanes mode {d} rank {d}: tokens {d}/{d} equal, drafted {d}, accepted {d}, {d:.1} s\n", .{ if (ok) "PASS" else "FAIL", mode, rank, equal, want.len, r.drafted, r.accepted, lanes_s });
