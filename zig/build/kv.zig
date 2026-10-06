@@ -46,4 +46,10 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     gpu.addImport("cuda", rt);
     const gexe = b.addExecutable(.{ .name = "tf-kv-gpu-test", .root_module = gpu });
     b.step("tf-kv-gpu-test", "The device pool on one GPU: tables, a 1M-token session through device memory and the NVMe tier, copy on write").dependOn(&b.addInstallArtifact(gexe, .{}).step);
+    const sg = b.createModule(.{ .root_source_file = b.path("zig/src/families/deepseek_v41/kv/split_gpu.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    sg.addImport("sessions", sessions(b, target, optimize));
+    sg.addImport("cuda", rt);
+    sg.addImport("tp", tp_module(b, target, optimize, rt));
+    const sexe = b.addExecutable(.{ .name = "tf-kv-split-test", .root_module = sg });
+    b.step("tf-kv-split-test", "Split KV's exchange on two GPUs (one process a rank): dense, graph replays, unions vs the replicated rows").dependOn(&b.addInstallArtifact(sexe, .{}).step);
 }
