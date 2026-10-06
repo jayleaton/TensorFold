@@ -225,6 +225,9 @@ an item). It measured 23-38 % faster at 48 SMs.
 - **`gm2Shape`** ports `Smem2` / `Ring2`, the widest width's ring cut to keep 2 CTAs an SM. It is checked equal to the
   compiled constexprs for all five instances.
 - **Spills:** the gate/up instances spill 24-108 B, in Python too, and outside the k loops.
+- **GPU check:** every x3gm fixture runs gm2. With a Python twin that has `gateup2`, it compares against the twin's
+  v2 outputs. Otherwise (the pods' e1e2 image) it compares against the fixture's own `gm_kernel` outputs, with the plan
+  from `x3gm_plan.cu`. Both forms are the same bits by v2's contract.
 
 **R1 decode** (`docs/DSV41-DECODE-R1.md` of the decode1 clone). Every knob off is today's launches, and all
 variants give the same bits.

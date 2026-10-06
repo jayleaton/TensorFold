@@ -341,6 +341,36 @@ pub fn x3gm(gpu: Gpu, k: *const dsv41.Kernels, dir: []const u8) !void {
             v2_launches += 2;
         }
     }
+    if (v2_launches == 0) {
+        // No v2 arrays (the oracle's Python twin predates x3gm v2): gm2 against the fixture's gm_kernel outputs
+        // (run 0, ticket on), the same bits by v2's contract. Its one plan over every pair comes from x3gm_plan.cu
+        // (bit-equal to x3gm.plan, the "plan" case), the width tables from the experts' K2.
+        const E = try size(fx, "E");
+        const T = exl3.planPasses(P, E, 64);
+        const order = try b.zeros(P * 4, 0);
+        const pe = try b.zeros(T * 4, 0);
+        const poff = try b.zeros(T * 4, 0);
+        const pcnt = try b.zeros(T * 4, 0);
+        const npass = try b.zeros(4, 0);
+        try o.gmPlan(pick.ptr, P, E, 64, order.ptr, pe.ptr, poff.ptr, pcnt.ptr, npass.ptr);
+        const k2g = try b.up("k2_g");
+        const k2d = try b.up("k2_d");
+        const cfg = exl3.gmTuned2(null, null, shx);
+        for ([_]bool{ true, false }) |tk| {
+            try xd.fill8(0, null);
+            try y.fill8(0, null);
+            try ticket.fill8(0, null);
+            try o.gm2Gateup(xg, xu, tg.ptr, tu.ptr + base_u, k2g.ptr, order.ptr, pe.ptr, poff.ptr, pcnt.ptr, npass.ptr, ticket.ptr, svh_g.ptr, svh_u.ptr, suh_d.ptr, xd.ptr, D, I, shx, cfg[0], tk, limit, ragged);
+            try ticket.fill8(0, null);
+            try o.gm2Down(xd.ptr, td.ptr + base_d, k2d.ptr, order.ptr, pe.ptr, poff.ptr, pcnt.ptr, npass.ptr, ticket.ptr, svh_d.ptr, y.ptr, I, D, cfg[1], tk, ragged);
+            try o.combine(y.ptr, wts.ptr, out.ptr, R, D, slots);
+            try stream.synchronize();
+            try same(gpu, fx, xd, "run0_xd", "x3gm v2 Xd vs gm_kernel");
+            try same(gpu, fx, y, "run0_y", "x3gm v2 Y vs gm_kernel");
+            try same(gpu, fx, out, "run0_out", "x3gm v2 combine vs gm_kernel");
+            v2_launches += 2;
+        }
+    }
     if (has(fx, "dequant_in")) {
         const t = try b.up("dequant_in");
         const dk: usize = @intCast(try fx.int("dequant_k"));
