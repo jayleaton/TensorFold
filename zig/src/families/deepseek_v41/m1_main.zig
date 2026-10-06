@@ -65,6 +65,17 @@ pub fn main(init: std.process.Init) !u8 {
         out.interface.flush() catch {};
         return 0;
     }
+    if (args.len == 3 and std.mem.eql(u8, args[1], "dcheck")) {
+        var buf: [4096]u8 = undefined;
+        var out = std.Io.File.stdout().writer(init.io, &buf);
+        const bad = @import("dspark_emit.zig").checkDraft(init.gpa, init.io, args[2], @embedFile("fixtures/q28v2-expert-k2.txt"), &out.interface, 12) catch |e| {
+            std.debug.print("FAIL tf-dsv41-m1 dcheck: {t}\n", .{e});
+            return 1;
+        };
+        out.interface.print("dcheck: {d} mismatches\n", .{bad}) catch {};
+        out.interface.flush() catch {};
+        return if (bad == 0) 0 else 1;
+    }
     if (args.len == 3 and std.mem.eql(u8, args[1], "check")) {
         var buf: [4096]u8 = undefined;
         var out = std.Io.File.stdout().writer(init.io, &buf);
