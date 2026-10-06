@@ -170,6 +170,11 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, step: *std.Build.S
     const cuda = runtime(b, host, .debug, &.{});
     const mods = family(b, host, .debug, cuda, draft_ids);
     for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, stagger(b, host, .debug), dsv41Kernels(b, host, .debug, cuda, &.{}) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
+    // the DSV4.1 decode graphs' buckets, statics and floor (R4; the cache itself is in the runtime's tests)
+    const graphs = b.createModule(.{ .root_source_file = b.path("zig/src/families/deepseek_v41/graphs.zig"), .target = host, .optimize = .debug, .link_libc = true });
+    graphs.addImport("cuda", cuda);
+    graphs.addImport("tp", @import("tp.zig").module(b, host, .debug, cuda));
+    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = graphs })).step);
     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = host, .optimize = .debug, .link_libc = true });
     cli.addImport("cuda", cuda);
     cli.addImport("core", mods.core);

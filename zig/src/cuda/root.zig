@@ -15,6 +15,7 @@ pub const Args = launch.Args;
 pub const Config = launch.Config;
 pub const Dim3 = launch.Dim3;
 pub const graph = @import("graph.zig");
+pub const graph_cache = @import("graph_cache.zig");
 pub const cublaslt = @import("cublaslt.zig");
 pub const nccl = @import("nccl.zig");
 pub const triton = @import("triton.zig");
@@ -27,4 +28,5 @@ test {
     _ = abi;
     _ = aot;
     _ = segments;
+    _ = graph_cache;
 }

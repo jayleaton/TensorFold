@@ -438,7 +438,7 @@ pub const Functions = struct {
     add_bf16: cuda.Function,
     kv_dense: cuda.Function,
     kv_gather: cuda.Function,
-    glue: [8]cuda.Function, // glue.syms order
+    glue: [9]cuda.Function, // glue.syms order
 
     /// `pf`: the four pfdense modules (K2 8, 10, 12, 16).
     pub fn resolve(m_attn: cuda.Module, m_topk: cuda.Module, m_mhc: cuda.Module, m_mhc_pf: cuda.Module, m_rg: cuda.Module, pf: [4]cuda.Module, m_gate: cuda.Module, m_pace: cuda.Module, m_l2pf: cuda.Module, m_keys: cuda.Module, m_pw: cuda.Module, m_kv: cuda.Module, m_glue: cuda.Module, optin: u32) !Functions {
@@ -528,8 +528,9 @@ pub const glue = struct {
         "_ZN10dsv41_glue16positions_kernelEiiPiPxS0_",
         "_ZN10dsv41_glue18gather_cols_kernelEPKtiiiPt",
         "_ZN10dsv41_glue12carry_kernelEPKtxPKiiiPf",
+        "_ZN10dsv41_glue20positions_dev_kernelEPKiiPiPxS2_",
     };
-    pub const Kind = enum(u3) { embed_send, embed_sum, cast_bf16, kit_weights, kit_logits, positions, gather_cols, carry };
+    pub const Kind = enum(u4) { embed_send, embed_sum, cast_bf16, kit_weights, kit_logits, positions, gather_cols, carry, positions_dev };
 
     fn grid(n: u64) usize {
         return @intCast(@max(1, @min((n + 255) / 256, 4096)));
@@ -825,6 +826,17 @@ pub const Ops = struct {
         a.add(pos64);
         a.add(lo);
         try o.go(o.f.glue[@intFromEnum(glue.Kind.positions)], .{ (@max(n, 1) + 255) / 256, 1, 1 }, 256, 0, null, &a);
+    }
+
+    /// positions with `start` read from the device (int32 at `start_dev`): a graphed window's form, the same values.
+    pub fn positionsDev(o: Ops, start_dev: u64, n: usize, pos: u64, pos64: u64, lo: u64) !void {
+        var a: cuda.Args = .{};
+        a.add(start_dev);
+        a.add(@as(c_int, @intCast(n)));
+        a.add(pos);
+        a.add(pos64);
+        a.add(lo);
+        try o.go(o.f.glue[@intFromEnum(glue.Kind.positions_dev)], .{ (@max(n, 1) + 255) / 256, 1, 1 }, 256, 0, null, &a);
     }
 
     /// forward.gather_cols after the all-gather: recv [W, n, c] -> out [n, W c] (2-byte elements, rank order).

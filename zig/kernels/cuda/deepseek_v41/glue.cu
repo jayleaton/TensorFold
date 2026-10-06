@@ -10,6 +10,7 @@
 //   kit_weights  y = f32(f16_rn(x))                                                   (pick.kit_weights)
 //   kit_logits   x = f32(bf16_rn(x)) in place                                         (pick.kit_logits)
 //   positions    pos[0] = start; pos64[i] = start + i; lo[i] = 0                       (Win.make)
+//   positions_dev  the same from a device start (a graphed window: staged before each replay)
 //   gather_cols  out[i][w c + j] = recv[w][i][j]                                      (permute(1, 0, 2).reshape)
 //   carry        carry[j] = f32(src[row][j]), row = *accepted (device) or the host's   (the ratio-2 compressor carry)
 
@@ -72,6 +73,18 @@ __global__ void __launch_bounds__(256) positions_kernel(int start, int n, int* _
     if (i == 0) pos[0] = start;
     if (i < n) {
         pos64[i] = (long long)start + i;
+        lo[i] = 0;
+    }
+}
+
+// a graphed window's positions: `start` from the window's staged statics, so one captured graph serves every window
+__global__ void __launch_bounds__(256) positions_dev_kernel(const int* __restrict__ start, int n, int* __restrict__ pos,
+                                                            long long* __restrict__ pos64, int* __restrict__ lo) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int s = *start;
+    if (i == 0) pos[0] = s;
+    if (i < n) {
+        pos64[i] = (long long)s + i;
         lo[i] = 0;
     }
 }

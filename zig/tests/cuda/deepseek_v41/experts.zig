@@ -463,6 +463,13 @@ pub fn glueCases(gpu: Gpu, k: *const dsv41.Kernels, dir: []const u8) !void {
     const pos64 = try b.zeros(n * 8, 0xee);
     const lo = try b.zeros(n * 4, 0xee);
     try o.positions(start, n, pos.ptr, pos64.ptr, lo.ptr);
+    // the graphed window's form: start read from the device, the same values
+    const start_dev = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.asBytes(&start));
+    try b.list.append(gpu.gpa, start_dev);
+    const pos_d = try b.zeros(4, 0xee);
+    const pos64_d = try b.zeros(n * 8, 0xee);
+    const lo_d = try b.zeros(n * 4, 0xee);
+    try o.positionsDev(start_dev.ptr, n, pos_d.ptr, pos64_d.ptr, lo_d.ptr);
     try stream.synchronize();
 
     try same(gpu, fx, send, "send", "glue embed_send");
@@ -483,13 +490,13 @@ pub fn glueCases(gpu: Gpu, k: *const dsv41.Kernels, dir: []const u8) !void {
         p.* = start + @as(i64, @intCast(i));
         l.* = 0;
     }
-    for ([_]struct { cuda.DeviceBuffer, []const u8 }{ .{ pos, std.mem.sliceAsBytes(&want_pos) }, .{ pos64, std.mem.sliceAsBytes(want64) }, .{ lo, std.mem.sliceAsBytes(want_lo) } }) |pw| {
+    for ([_]struct { cuda.DeviceBuffer, []const u8 }{ .{ pos, std.mem.sliceAsBytes(&want_pos) }, .{ pos64, std.mem.sliceAsBytes(want64) }, .{ lo, std.mem.sliceAsBytes(want_lo) }, .{ pos_d, std.mem.sliceAsBytes(&want_pos) }, .{ pos64_d, std.mem.sliceAsBytes(want64) }, .{ lo_d, std.mem.sliceAsBytes(want_lo) } }) |pw| {
         const got = try gpu.gpa.alloc(u8, pw[1].len);
         defer gpu.gpa.free(got);
         try pw[0].download(0, got);
         try check.sameBytes("glue positions", got, pw[1]);
     }
-    check.pass("BITEXACT glue.cu == torch: embed send / sum (W {d}), cast_bf16, kit_weights, kit_logits, gather_cols, carry, positions", .{W});
+    check.pass("BITEXACT glue.cu == torch: embed send / sum (W {d}), cast_bf16, kit_weights, kit_logits, gather_cols, carry, positions (host and device start)", .{W});
 }
 
 /// topk_keys.cu against pick.top (torch.topk on pick.keys) at k 1 / 5 / 64 / 1,024 over 64,640 columns.
