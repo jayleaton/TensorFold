@@ -18,7 +18,7 @@ pub fn run(gpu: Gpu, k: *const dsv41.Kernels) !void {
         .{ .rows = 16, .k = 512, .slots = 5, .pages = 40, .psh = 8, .row_bytes = 584, .world = 2, .stacked = true },
         .{ .rows = 3, .k = 1024, .slots = 3, .pages = 33, .psh = 7, .row_bytes = 136, .world = 3, .stacked = true },
     };
-    var stream = try cuda.Stream.init(gpu.d, true);
+    var stream = try cuda.Stream.init(gpu.d, false); // blocking: ordered after the uploads and memsets on the default stream
     defer stream.deinit();
     const o = k.others(stream);
     var prng = std.Random.DefaultPrng.init(4141);

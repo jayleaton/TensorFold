@@ -95,7 +95,7 @@ pub fn decodeChain(gpu: Gpu, k: *const dsv41.Kernels, dir: []const u8) !void {
     defer fx.deinit();
     var b: Bufs = .{ .gpu = gpu, .fx = &fx };
     defer b.deinit();
-    var stream = try cuda.Stream.init(gpu.d, true);
+    var stream = try cuda.Stream.init(gpu.d, false); // blocking: ordered after the uploads and memsets on the default stream
     defer stream.deinit();
     const o = k.experts(stream);
 
@@ -242,7 +242,7 @@ pub fn x3gm(gpu: Gpu, k: *const dsv41.Kernels, dir: []const u8) !void {
     defer fx.deinit();
     var b: Bufs = .{ .gpu = gpu, .fx = &fx };
     defer b.deinit();
-    var stream = try cuda.Stream.init(gpu.d, true);
+    var stream = try cuda.Stream.init(gpu.d, false); // blocking: ordered after the uploads and memsets on the default stream
     defer stream.deinit();
     const o = k.experts(stream);
 
@@ -340,7 +340,7 @@ pub fn pointwiseCases(gpu: Gpu, k: *const dsv41.Kernels, dir: []const u8) !void 
     defer fx.deinit();
     var b: Bufs = .{ .gpu = gpu, .fx = &fx };
     defer b.deinit();
-    var stream = try cuda.Stream.init(gpu.d, true);
+    var stream = try cuda.Stream.init(gpu.d, false); // blocking: ordered after the uploads and memsets on the default stream
     defer stream.deinit();
     const o = k.others(stream);
     const R = try size(fx, "R");
@@ -369,7 +369,7 @@ pub fn topkCases(gpu: Gpu, k: *const dsv41.Kernels, dir: []const u8) !void {
     defer fx.deinit();
     var b: Bufs = .{ .gpu = gpu, .fx = &fx };
     defer b.deinit();
-    var stream = try cuda.Stream.init(gpu.d, true);
+    var stream = try cuda.Stream.init(gpu.d, false); // blocking: ordered after the uploads and memsets on the default stream
     defer stream.deinit();
     const o = k.others(stream);
     const R = try size(fx, "R");
@@ -394,7 +394,7 @@ pub fn planCases(gpu: Gpu, k: *const dsv41.Kernels, dir: []const u8) !void {
     defer fx.deinit();
     var b: Bufs = .{ .gpu = gpu, .fx = &fx };
     defer b.deinit();
-    var stream = try cuda.Stream.init(gpu.d, true);
+    var stream = try cuda.Stream.init(gpu.d, false); // blocking: ordered after the uploads and memsets on the default stream
     defer stream.deinit();
     const o = k.experts(stream);
     var name_buf: [64]u8 = undefined;
