@@ -22,6 +22,7 @@ comptime {
     _ = &@import("forward.zig").Forward.keep;
     _ = &@import("forward.zig").Forward.plan;
     _ = &@import("forward.zig").ZeroPeer.collective;
+    _ = &@import("target.zig").GpuTarget.target;
 }
 
 const usage =

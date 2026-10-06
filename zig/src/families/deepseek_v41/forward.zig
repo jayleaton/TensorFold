@@ -107,6 +107,44 @@ pub const Forward = struct {
         try f.runner.window(cs);
     }
 
+    /// Greedy choices of the last window's rows (Python's forward.greedy): each rank's max a row (the lowest column on
+    /// ties; -0.0 == +0.0), the float64 (value, global id) pairs all-gathered, the higher value (the lower rank on ties).
+    pub fn greedy(f: *Forward, out: []u32) !void {
+        const r = f.runner;
+        const n = out.len;
+        const W: usize = f.comm.world();
+        const V: usize = f.cfg.vocab / W;
+        const host = try f.gpa.alloc(f32, n * V);
+        defer f.gpa.free(host);
+        try r.stream.synchronize();
+        try cuda.DeviceBuffer.download(.{ .d = r.d, .ptr = r.addressOf("w.logits") orelse return error.Unbound, .len = 4 * n * V }, 0, std.mem.sliceAsBytes(host));
+        const pairs = try f.gpa.alloc(f64, 2 * n * (W + 1));
+        defer f.gpa.free(pairs);
+        for (0..n) |row| {
+            const vals = host[row * V ..][0..V];
+            var best: usize = 0;
+            for (vals, 0..) |x, i| if (x > vals[best]) {
+                best = i;
+            };
+            pairs[2 * row] = vals[best];
+            pairs[2 * row + 1] = @floatFromInt(best + f.comm.rank() * V);
+        }
+        var dev = try cuda.DeviceBuffer.alloc(r.d, 8 * pairs.len);
+        defer dev.free();
+        try cuda.DeviceBuffer.upload(dev, 0, std.mem.sliceAsBytes(pairs[0 .. 2 * n]));
+        try f.comm.allGather(dev.ptr, dev.ptr + 16 * n, 2 * n, .f64, r.stream.handle);
+        try r.stream.synchronize();
+        const all = pairs[2 * n ..];
+        try cuda.DeviceBuffer.download(dev, 16 * n, std.mem.sliceAsBytes(all));
+        for (out, 0..) |*o, row| {
+            var bk: usize = 0;
+            for (1..W) |k| if (all[2 * (k * n + row)] > all[2 * (bk * n + row)]) {
+                bk = k;
+            };
+            o.* = @intFromFloat(all[2 * (bk * n + row) + 1]);
+        }
+    }
+
     /// Commits the pending window's first row + `accepted` drafts (Python's Forward.keep).
     pub fn keep(f: *Forward, accepted: u32) !void {
         const p = f.slot.pending orelse return error.BadWindow;

@@ -148,8 +148,6 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, ref: []con
     const want_logits = mine.get("logits_sha256").?.array.items;
     const V: usize = cfg.vocab / 2;
     const host_logits = try a.alloc(u8, 4 * V);
-    var pair = try cuda.DeviceBuffer.alloc(&driver, 64);
-    defer pair.free();
     var trace: std.AutoArrayHashMapUnmanaged(u32, [64]u8) = .empty;
     defer trace.deinit(gpa);
     var tok: u32 = @intCast(want_tokens[0].integer);
@@ -181,20 +179,9 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, ref: []con
         const ld = sha(host_logits);
         const lok = std.mem.eql(u8, &ld, want_logits[step].string);
         logits_equal += @intFromBool(lok);
-        // this rank's max, the lowest column on ties (pick.argmax); -0.0 == +0.0
-        const vals = std.mem.bytesAsSlice(f32, host_logits);
-        var best: usize = 0;
-        for (vals, 0..) |x, i| if (x > vals[best]) {
-            best = i;
-        };
-        var p: [2]f64 = .{ vals[best], @floatFromInt(best + rank * V) };
-        try cuda.DeviceBuffer.upload(pair, 0, std.mem.asBytes(&p));
-        try comm.allGather(pair.ptr, pair.ptr + 16, 2, .f64, stream.handle);
-        try stream.synchronize();
-        var both: [4]f64 = undefined;
-        try cuda.DeviceBuffer.download(pair, 16, std.mem.asBytes(&both));
-        const r: usize = if (both[2] > both[0]) 1 else 0; // the first rank on ties
-        tok = @intFromFloat(both[2 * r + 1]);
+        var choice: [1]u32 = undefined;
+        try f.greedy(&choice);
+        tok = choice[0];
         const want: u32 = @intCast(want_tokens[step + 1].integer);
         const tok_ok = tok == want;
         tokens_equal += @intFromBool(tok_ok);
