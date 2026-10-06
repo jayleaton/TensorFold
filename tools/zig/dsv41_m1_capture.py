@@ -35,7 +35,9 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 SETS = {"A": (1, 2, 3), "B": (20, 21, 22, 23, 24), "C": (40,), "D": (13, 14, 15),
-        "P": (36, 37, 38, 39)}   # P: DSpark's drafting pass (taps entering 37-39, then the drafter's ingest / propose)   # D: Engram mid-stack (post, Engram, site2)
+        "P": (20, 36, 37, 38, 39)}
+# D: Engram mid-stack (post, Engram, site2). P: DSpark's drafting pass (taps entering 37-39, then the drafter's ingest /
+# propose); 20 is 36-39's KV and candidate source (pod 15 failed with KeyError 20 without it)
 WINDOWS = (1, 3, 16)
 PREFILL = int(os.environ.get("M1_PREFILL_ROWS", "256"))   # rows of the recorded prefill segment after the windows
 #   (the fast prefill kernels; 2048 = prod's PREFILL_CHUNK, the Zig prefill's launch list)

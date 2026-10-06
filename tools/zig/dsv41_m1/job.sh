@@ -121,6 +121,13 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
         mb=$(left); (( mb > 16 )) && mb=16
         step m2b "$mb" bash "$Z/tools/zig/dsv41_m1/m2b_ranks.sh" "$Z/bin/tf-dsv41-m1" "$LP" "$REF" "$RES/m2b" \
             || rc=1
+        # M2B_GRAPHS=1: the same gate again with graphed decode windows (TF_DSV41_GRAPHS=1, R4): == the reference
+        if [[ "${M2B_GRAPHS:-0}" == 1 ]]; then
+            mb=$(left); (( mb > 8 )) && mb=8
+            (export TF_DSV41_GRAPHS=1 M2B_PORT=29719
+             step m2b-graphs "$mb" bash "$Z/tools/zig/dsv41_m1/m2b_ranks.sh" "$Z/bin/tf-dsv41-m1" "$LP" "$REF" "$RES/m2b-graphs") \
+                || rc=1
+        fi
         # M2B_LANES ("1 2"): M3's gates, the same reference through lanes on rank 0 (1: drafts off; 2: oracle drafts)
         for k in $LANES_MODES; do
             mb=$(left); (( mb > 8 )) && mb=8
