@@ -224,7 +224,7 @@ pub const Functions = struct {
     gm_plan: cuda.Function,
 
     /// Resolves every instance (a wrong name fails here, not on a rare path) and opts x3gm into its shared memory.
-    pub fn resolve(experts: cuda.Module, x3ld: cuda.Module, x3pf: cuda.Module, x3gm: cuda.Module, x3gm_plan: cuda.Module) !Functions {
+    pub fn resolve(experts: cuda.Module, x3ld: cuda.Module, x3pf: cuda.Module, x3gm: cuda.Module, x3gm_plan: cuda.Module, optin: u32) !Functions {
         var f: Functions = undefined;
         inline for (ld_cfgs, 0..) |c, ci| inline for (ranges, 0..) |r, ri| {
             f.ld[0][ci][ri] = try x3ld.function(ldSymbol(c[0], c[1], r[0], r[1], 0));
@@ -245,9 +245,9 @@ pub const Functions = struct {
         f.down_combine = try experts.function(up_sym.down_combine);
         inline for (gm_k2s, 0..) |k2, ki| {
             inline for (.{ 1, 2 }) |xm| inline for (0..gu_tiles.len) |c| {
-                f.gm_gu[ki][xm - 1][c] = try gmResolve(x3gm, gmGuSymbol(xm, k2, c), GmShape.of(2, xm, k2, gu_tiles[c]));
+                f.gm_gu[ki][xm - 1][c] = try gmResolve(x3gm, gmGuSymbol(xm, k2, c), GmShape.of(2, xm, k2, gu_tiles[c]), optin);
             };
-            inline for (0..dn_tiles.len) |c| f.gm_dn[ki][c] = try gmResolve(x3gm, gmDnSymbol(k2, c), GmShape.of(1, 1, k2, dn_tiles[c]));
+            inline for (0..dn_tiles.len) |c| f.gm_dn[ki][c] = try gmResolve(x3gm, gmDnSymbol(k2, c), GmShape.of(1, 1, k2, dn_tiles[c]), optin);
             f.gm_dequant[ki] = try x3gm.function(gmDequantSymbol(k2));
         }
         f.gm_plan = try x3gm_plan.function("_ZN15dsv41_x3gm_plan11plan_kernelEPKiiiiPiS2_S2_S2_S2_");
@@ -256,11 +256,24 @@ pub const Functions = struct {
     }
 };
 
-/// x3gm.cu launch<>'s first call: the dynamic shared memory attribute, then the CTAs an SM it allows (0: refused).
-fn gmResolve(m: cuda.Module, name: [:0]const u8, shape: GmShape) !Gm {
+/// Opts `f` into `bytes` of dynamic shared memory when its static shared memory plus `bytes` fits the device's
+/// per-block opt-in limit `optin`; false (nothing set) when it does not: the instance is refused, not the load.
+pub fn fitShared(f: cuda.Function, name: []const u8, bytes: u32, optin: u32) !bool {
+    const static: u32 = @intCast(try f.attribute(.shared_size_bytes));
+    if (static + bytes > optin) {
+        std.log.info("dsv41 kernel refused on this GPU ({d} + {d} B shared > {d}): {s}", .{ static, bytes, optin, name });
+        return false;
+    }
+    if (bytes > 0) try f.allowDynamicShared(bytes); // as the Python launchers set it, whatever the size
+    return true;
+}
+
+/// x3gm.cu launch<>'s first call: the dynamic shared memory attribute, then the CTAs an SM it allows (0: refused,
+/// as Python's "the configuration does not fit an SM"; x3gm.fits never picks those: cfg 3 with two inputs).
+fn gmResolve(m: cuda.Module, name: [:0]const u8, shape: GmShape, optin: u32) !Gm {
     const f = try m.function(name);
-    try f.allowDynamicShared(shape.smem);
-    return .{ .f = f, .threads = shape.threads, .smem = shape.smem, .per_sm = try f.occupancy(shape.threads, shape.smem) };
+    const ok = try fitShared(f, name, shape.smem, optin);
+    return .{ .f = f, .threads = shape.threads, .smem = shape.smem, .per_sm = if (ok) try f.occupancy(shape.threads, shape.smem) else 0 };
 }
 
 // ---------------------------------------------------------------------------------------------------------------

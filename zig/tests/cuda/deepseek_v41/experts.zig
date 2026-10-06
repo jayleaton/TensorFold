@@ -334,6 +334,35 @@ pub fn x3gm(gpu: Gpu, k: *const dsv41.Kernels, dir: []const u8) !void {
     check.pass("BITEXACT x3gm {s}: R {d} x {d} slots, D {d}, I {d}, {s}, shx {}: rot, {d} runs ({d} launches), combine", .{ std.fs.path.basename(dir), R, slots, D, I, if (ragged) "ragged" else "stacked", shx, runs, launches });
 }
 
+/// pointwise.cu against torch: the shared expert's SwiGLU with the limit, and the partial adds (fp32, into bf16).
+pub fn pointwiseCases(gpu: Gpu, k: *const dsv41.Kernels, dir: []const u8) !void {
+    var fx = try Fixture.open(gpu.gpa, gpu.io, dir);
+    defer fx.deinit();
+    var b: Bufs = .{ .gpu = gpu, .fx = &fx };
+    defer b.deinit();
+    var stream = try cuda.Stream.init(gpu.d, true);
+    defer stream.deinit();
+    const o = k.others(stream);
+    const R = try size(fx, "R");
+    const n = try size(fx, "n");
+    const D = try size(fx, "D");
+    const g = try b.up("g");
+    const u = try b.up("u");
+    const act = try b.zeros(R * n * 4, 0xee);
+    try o.swiglu(g.ptr, n, u.ptr, n, act.ptr, n, R, n, @floatCast(try fx.float("limit")));
+    try stream.synchronize();
+    try same(gpu, fx, act, "act", "swiglu vs torch clamp_ / silu / mul_");
+    const a = try b.up("a");
+    const bb = try b.up("b");
+    const y16 = try b.zeros(R * D * 2, 0xee);
+    try o.addBf16(a.ptr, bb.ptr, y16.ptr, R * D);
+    try o.addInto(a.ptr, bb.ptr, R * D);
+    try stream.synchronize();
+    try same(gpu, fx, a, "sum32", "out += shared");
+    try same(gpu, fx, y16, "sum16", "torch.add(out=bf16)");
+    check.pass("BITEXACT pointwise.cu == torch: swiglu with limit ({d} x {d}, NaN / inf / -0.0), adds into fp32 and bf16", .{ R, n });
+}
+
 /// topk_keys.cu against pick.top (torch.topk on pick.keys) at k 1 / 5 / 64 / 1,024 over 64,640 columns.
 pub fn topkCases(gpu: Gpu, k: *const dsv41.Kernels, dir: []const u8) !void {
     var fx = try Fixture.open(gpu.gpa, gpu.io, dir);

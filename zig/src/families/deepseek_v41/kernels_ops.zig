@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const cuda = @import("cuda");
+const fitShared = @import("kernels_exl3.zig").fitShared;
 
 fn dim(x: usize) u32 {
     return @intCast(x);
@@ -394,18 +395,23 @@ pub const Functions = struct {
     paced: cuda.Function,
     segments: [2]cuda.Function, // bulk false / true
     topk_keys: cuda.Function,
+    swiglu: cuda.Function,
+    add: cuda.Function,
+    add_bf16: cuda.Function,
 
     /// `pf`: the four pfdense modules (K2 8, 10, 12, 16).
-    pub fn resolve(m_attn: cuda.Module, m_topk: cuda.Module, m_mhc: cuda.Module, m_mhc_pf: cuda.Module, m_rg: cuda.Module, pf: [4]cuda.Module, m_gate: cuda.Module, m_pace: cuda.Module, m_l2pf: cuda.Module, m_keys: cuda.Module) !Functions {
+    pub fn resolve(m_attn: cuda.Module, m_topk: cuda.Module, m_mhc: cuda.Module, m_mhc_pf: cuda.Module, m_rg: cuda.Module, pf: [4]cuda.Module, m_gate: cuda.Module, m_pace: cuda.Module, m_l2pf: cuda.Module, m_keys: cuda.Module, m_pw: cuda.Module, optin: u32) !Functions {
         var f: Functions = undefined;
         inline for (0..8) |i| f.attn[i] = try m_attn.function(attn.symbol(if (i >= 4) 4 else 2, (i & 2) != 0, (i & 1) != 0));
-        for (f.attn) |fun| try fun.allowDynamicShared(attn.SMEM);
+        inline for (f.attn, 0..) |fun, i| {
+            if (!try fitShared(fun, attn.symbol(if (i >= 4) 4 else 2, (i & 2) != 0, (i & 1) != 0), attn.SMEM, optin)) return error.SharedMemoryTooSmall;
+        }
         f.topk = try m_topk.function(topk.symbol);
-        try f.topk.allowDynamicShared(topk.smem(topk.MAXEPT));
+        if (!try fitShared(f.topk, topk.symbol, topk.smem(topk.MAXEPT), optin)) return error.SharedMemoryTooSmall;
         inline for (0..mhc.instances.len) |i| f.mhc[i] = try m_mhc.function(mhc.symbol(i));
         inline for (0..mhc_pf.instances.len) |i| {
             f.mhc_pf[i] = try m_mhc_pf.function(mhc_pf.symbol(i));
-            try f.mhc_pf[i].allowDynamicShared(mhc_pf.smem(mhc_pf.instances[i].fn32));
+            if (!try fitShared(f.mhc_pf[i], mhc_pf.symbol(i), mhc_pf.smem(mhc_pf.instances[i].fn32), optin)) return error.SharedMemoryTooSmall;
         }
         inline for (rg.rts, 0..) |rt, i| {
             inline for (rg.wide, 0..) |c, j| f.gemv[i][j] = try m_rg.function(rg.gemvSymbol(rt, c[0], c[1]));
@@ -417,8 +423,7 @@ pub const Functions = struct {
                     f.pfd[ki][li][c] = null;
                 } else {
                     const fun = try pf[ki].function(pfd.symbol(k2, lanes, c));
-                    try fun.allowDynamicShared(pfd.smem(c, k2));
-                    f.pfd[ki][li][c] = fun;
+                    f.pfd[ki][li][c] = if (try fitShared(fun, pfd.symbol(k2, lanes, c), pfd.smem(c, k2), optin)) fun else null;
                 }
             }
             f.pfd_dequant[ki][li] = if (lanes and k2 == 16) null else try pf[ki].function(pfd.dequantSymbol(k2, lanes));
@@ -427,6 +432,9 @@ pub const Functions = struct {
         f.paced = try m_pace.function("_ZN12dsv41_l2pace12paced_kernelEPKlijmm");
         f.segments = .{ try m_l2pf.function("_ZN6tfl2pf15segments_kernelILb0EEEvPKlij"), try m_l2pf.function("_ZN6tfl2pf15segments_kernelILb1EEEvPKlij") };
         f.topk_keys = try m_keys.function("_ZN15dsv41_topk_keys11topk_kernelEPKfxiiPfPx");
+        f.swiglu = try m_pw.function("_ZN15dsv41_pointwise13swiglu_kernelEPKfxS1_xPfxif");
+        f.add = try m_pw.function("_ZN15dsv41_pointwise10add_kernelEPfPKfx");
+        f.add_bf16 = try m_pw.function("_ZN15dsv41_pointwise15add_bf16_kernelEPKfS1_P13__nv_bfloat16x");
         return f;
     }
 };
@@ -567,6 +575,40 @@ pub const Ops = struct {
         args.add(vals);
         args.add(cols);
         try o.go(o.f.topk_keys, .{ rows, 1, 1 }, 1024, 0, null, &args);
+    }
+
+    /// prefill_moe.shared_expert's pointwise part: act = silu(min(g, limit)) * clamp(u, +-limit) (fp32, row strides
+    /// in elements).
+    pub fn swiglu(o: Ops, g: u64, ldg: usize, u: u64, ldu: usize, act: u64, lda: usize, rows: usize, n: usize, limit: f32) !void {
+        var args: cuda.Args = .{};
+        args.add(g);
+        args.add(@as(i64, @intCast(ldg)));
+        args.add(u);
+        args.add(@as(i64, @intCast(ldu)));
+        args.add(act);
+        args.add(@as(i64, @intCast(lda)));
+        args.add(@as(c_int, @intCast(n)));
+        args.add(limit);
+        try o.go(o.f.swiglu, .{ @min((n + 255) / 256, 64), rows, 1 }, 256, 0, null, &args);
+    }
+
+    /// out += b over n fp32 elements (prefill_moe.forward: the routed partial plus the shared expert's).
+    pub fn addInto(o: Ops, out: u64, b: u64, n: usize) !void {
+        var args: cuda.Args = .{};
+        args.add(out);
+        args.add(b);
+        args.add(@as(i64, @intCast(n)));
+        try o.go(o.f.add, .{ @min((n + 255) / 256, 4096), 1, 1 }, 256, 0, null, &args);
+    }
+
+    /// y = bf16_rn(a + b) over n elements (torch.add(out, shared, out=bf16): TF_DSV41_PF_COPIES).
+    pub fn addBf16(o: Ops, a: u64, b: u64, y: u64, n: usize) !void {
+        var args: cuda.Args = .{};
+        args.add(a);
+        args.add(b);
+        args.add(y);
+        args.add(@as(i64, @intCast(n)));
+        try o.go(o.f.add_bf16, .{ @min((n + 255) / 256, 4096), 1, 1 }, 256, 0, null, &args);
     }
 
     /// tfl2pf launch_segments: (address, bytes) table prefetched to L2 (bulk: cp.async.bulk.prefetch).

@@ -268,6 +268,28 @@ def topk_case(out: Path, g) -> dict:
     return {"rows": R}
 
 
+def pointwise_case(out: Path, g) -> dict:
+    """prefill_moe's torch pointwise ops (shared_expert's clamps / silu / mul, forward's adds) on values that cross
+    the limit, with NaN / inf / -0.0 and silu's extremes."""
+    R, n, limit = 7, 2304, 10.0
+    gg = torch.randn(R, n, generator=g) * 8
+    uu = torch.randn(R, n, generator=g) * 8
+    gg[0, :6] = torch.tensor([float("nan"), float("inf"), -float("inf"), -0.0, 100.0, -100.0])
+    uu[0, :6] = torch.tensor([1.0, float("nan"), 2.0, float("inf"), -float("inf"), -0.0])
+    gg, uu = gg.to(DEV), uu.to(DEV)
+    act = torch.nn.functional.silu(gg.clone().clamp_(max=limit)).mul_(uu.clone().clamp_(min=-limit, max=limit))
+    a = (torch.randn(R, 5120, generator=g) * 3).to(DEV)
+    b = (torch.randn(R, 5120, generator=g) * 3).to(DEV)
+    s32 = a.clone()
+    s32 += b
+    y16 = torch.empty((R, 5120), dtype=torch.bfloat16, device=DEV)
+    torch.add(a, b, out=y16)
+    torch.cuda.synchronize()
+    save(out, {"kind": "pointwise", "R": R, "n": n, "D": 5120, "limit": limit},
+         {"g": gg, "u": uu, "act": act, "a": a, "b": b, "sum32": s32, "sum16": y16})
+    return {"rows": R}
+
+
 def main() -> None:
     out = Path(sys.argv[1]) / "fixtures"
     g = torch.Generator().manual_seed(4141)
@@ -310,6 +332,7 @@ def main() -> None:
                                           dequant=(128, 128, 10))
     report["x3gm_plan"] = plan_case(out / "x3gm_plan", g)
     report["topk_keys"] = topk_case(out / "topk_keys", g)
+    report["pointwise"] = pointwise_case(out / "pointwise", g)
     (out.parent / "oracle.json").write_text(json.dumps({"device": torch.cuda.get_device_name(0), **report}, indent=1))
     print(json.dumps(report, indent=1))
 
