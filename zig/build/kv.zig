@@ -25,7 +25,7 @@ pub fn module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     return m;
 }
 
-pub fn add(b: *std.Build, test_step: *std.Build.Step, tp_module: fn (*std.Build, std.Build.ResolvedTarget, std.builtin.OptimizeMode, *std.Build.Module) *std.Build.Module) void {
+pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, test_step: *std.Build.Step, tp_module: fn (*std.Build, std.Build.ResolvedTarget, std.builtin.OptimizeMode, *std.Build.Module) *std.Build.Module) void {
     const host = b.graph.host;
     const cuda = runtime(b, host, .debug);
     const s = b.addRunArtifact(b.addTest(.{ .root_module = sessions(b, host, .debug) }));
@@ -39,4 +39,11 @@ pub fn add(b: *std.Build, test_step: *std.Build.Step, tp_module: fn (*std.Build,
     bench.addImport("sessions", sessions(b, host, .ReleaseFast));
     const exe = b.addExecutable(.{ .name = "tf-kv-bench", .root_module = bench });
     b.step("tf-kv-bench", "Page ops and a 1M-token session parked to / restored from a real NVMe tier (host pool)").dependOn(&b.addInstallArtifact(exe, .{}).step);
+    if (target.result.os.tag != .linux) return;
+    const rt = runtime(b, target, optimize);
+    const gpu = b.createModule(.{ .root_source_file = b.path("zig/src/families/deepseek_v41/kv/gpu_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    gpu.addImport("sessions", sessions(b, target, optimize));
+    gpu.addImport("cuda", rt);
+    const gexe = b.addExecutable(.{ .name = "tf-kv-gpu-test", .root_module = gpu });
+    b.step("tf-kv-gpu-test", "The device pool on one GPU: tables, a 1M-token session through device memory and the NVMe tier, copy on write").dependOn(&b.addInstallArtifact(gexe, .{}).step);
 }
