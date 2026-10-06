@@ -12,6 +12,7 @@ const tp = @import("tp");
 const Config = @import("config.zig").Config;
 const Pack = @import("pack.zig").Pack;
 const plan = @import("plan.zig");
+const m3 = @import("m3.zig");
 const named = @import("named.zig");
 const load = @import("load.zig");
 const buffers = @import("buffers.zig");
@@ -142,8 +143,33 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, ref: []con
     const load_s = @as(f64, @floatFromInt(t0.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds())) / 1e9;
     std.debug.print("rank {d}: {d} layers, {d:.2} GB, load {d:.1} s, position {d}\n", .{ rank, layers.len, @as(f64, @floatFromInt(w.bytes)) / 1e9, load_s, f.slot.pos });
 
-    // greedy decoding against the reference's tokens
     const want_tokens = meta.object.get("tokens").?.array.items;
+    // M2B_LANES=1 (M3's first gate): the same decode through the lanes engine over the GPU target on rank 0 (drafts
+    // off), the other rank following rank 0's forward operations over the plan link; tokens only (no digests)
+    if (std.c.getenv("M2B_LANES") != null) {
+        f.link = &session.plan;
+        const tl0 = std.Io.Clock.awake.now(io);
+        var got_n: usize = 0;
+        var equal: usize = 0;
+        if (rank == 0) {
+            const prompt = try a.alloc(u32, meta.object.get("prompt_ids").?.array.items.len);
+            for (prompt, meta.object.get("prompt_ids").?.array.items) |*d, v| d.* = @intCast(v.integer);
+            const got = try m3.generate(gpa, &f, prompt, @intCast(want_tokens[0].integer), @intCast(want_tokens.len));
+            defer gpa.free(got);
+            try f.stop();
+            got_n = got.len;
+            for (got, want_tokens[0..@min(got.len, want_tokens.len)]) |g, wt| {
+                if (g != @as(u32, @intCast(wt.integer))) break;
+                equal += 1;
+            }
+        } else try f.follow();
+        const lanes_s = @as(f64, @floatFromInt(tl0.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds())) / 1e9;
+        const ok = rank != 0 or (got_n == want_tokens.len and equal == got_n);
+        try cwd.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}/m3-rank{d}.json", .{ out_dir, rank }), .data = try std.fmt.allocPrint(a, "{{\"rank\": {d}, \"tokens\": {d}, \"want\": {d}, \"equal_prefix\": {d}, \"s\": {d:.1}, \"pass\": {}}}\n", .{ rank, got_n, want_tokens.len, equal, lanes_s, ok }) });
+        std.debug.print("{s} M3 lanes rank {d}: tokens {d}/{d} equal, {d:.1} s\n", .{ if (ok) "PASS" else "FAIL", rank, equal, want_tokens.len, lanes_s });
+        return if (ok) 0 else 1;
+    }
+    // greedy decoding against the reference's tokens
     const mine = meta.object.get("ranks").?.array.items[rank].object;
     const want_logits = mine.get("logits_sha256").?.array.items;
     const V: usize = cfg.vocab / 2;

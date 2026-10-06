@@ -14,6 +14,9 @@ pub const GpuTarget = struct {
     f: *fwd.Forward,
     /// rows a prefill window takes (the decode path's buckets; the forward plans buffers for them)
     prefill_rows: u32 = 16,
+    /// a slot that already holds the prompt (a gate resuming the reference's state): prefill returns this choice
+    /// without running the prompt again
+    resume_first: ?u32 = null,
 
     pub fn target(t: *GpuTarget) iface.Target {
         return .{ .ptr = t, .vtable = &vtable };
@@ -30,6 +33,7 @@ pub const GpuTarget = struct {
         const t = self_(p);
         if (slot != 0) return error.Slots;
         if (sampling != null) return error.Sampling;
+        if (t.resume_first) |first| if (t.f.slot.pos == ids.len and t.f.slot.pending == null) return first;
         var at: usize = 0;
         var choice: [1]u32 = .{0};
         while (at < ids.len) {

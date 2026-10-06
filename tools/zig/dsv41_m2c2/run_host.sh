@@ -6,7 +6,7 @@
 # Start it on both hosts within about a minute (each phase's rendezvous waits up to 30 min for the other host):
 #   dgx-01:  ./run_host.sh 0 OUTDIR
 #   dgx-02:  ./run_host.sh 1 OUTDIR
-# Prod must be stopped first (RUNBOOK.md). Knobs: STEPS (512), SEEDS ("4101"), PROMPT (1536), BACKEND (roce | nccl).
+# Prod must be stopped first (RUNBOOK.md). Knobs: STEPS (512), SEEDS ("4101"), PROMPT (1536), BACKEND (roce | nccl), LANES (1: also M3's lanes gate, about +12 min).
 set -u
 RANK=${1:?rank}; OUT=${2:?outdir}
 KIT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -64,6 +64,19 @@ for seed in $SEEDS; do
         --entrypoint bash "$IMAGE" -c 'export TF_NCCL_LIB=$(python -c "import nvidia.nccl, os; print(os.path.join(os.path.dirname(nvidia.nccl.__file__), \"lib\", \"libnccl.so.2\"))" 2>/dev/null || echo libnccl.so.2); exec /kit/tf-dsv41-m1 m2b /model '"$R/ref"' '"$R/zig" \
         > "$OUT/seed$seed/zig.log" 2>&1
     rc=$?; log "seed $seed: ours rc $rc in $(( $(date +%s) - t0 )) s: $(grep -h '^PASS\|^FAIL' "$OUT/seed$seed/zig.log" | tail -1)"
+    # 3. optional (LANES=1): M3's first gate, the same decode through the lanes engine on rank 0 (drafts off), rank 1
+    #    following over the plan link; tokens == the reference's
+    if [[ "${LANES:-0}" == 1 ]]; then
+        drop_caches
+        log "seed $seed: lanes over the GPU target (M3)"
+        t0=$(date +%s)
+        docker run "${ARGS[@]}" -e TF_TP_WORLD=2 -e TF_TP_RANK="$RANK" -e TF_TP_DEVICE=0 -e TF_TP_MASTER="$MASTER" \
+            -e TF_TP_PORT=$((port + 15)) -e TF_DSV41_PLAN_TIMEOUT=1800 -e TF_COMM_BACKEND="$BACKEND" -e TF_TP_ROCE_FALLBACK=error \
+            -e TF_TP_KERNEL_IMAGE=/kit/tp_mailbox.fatbin -e M2B_TOPP=0.85 -e M2B_LANES=1 -e TF_DSV41_FAILFAST=0 --name "dsv41-zig-m3-r$RANK" \
+            --entrypoint bash "$IMAGE" -c 'export TF_NCCL_LIB=$(python -c "import nvidia.nccl, os; print(os.path.join(os.path.dirname(nvidia.nccl.__file__), \"lib\", \"libnccl.so.2\"))" 2>/dev/null || echo libnccl.so.2); mkdir -p '"$R/zig-lanes"'; exec /kit/tf-dsv41-m1 m2b /model '"$R/ref"' '"$R/zig-lanes" \
+            > "$OUT/seed$seed/lanes.log" 2>&1
+        rc=$?; log "seed $seed: lanes rc $rc in $(( $(date +%s) - t0 )) s: $(grep -h '^PASS\|^FAIL' "$OUT/seed$seed/lanes.log" | tail -1)"
+    fi
     port=$((port + 20))
 done
 drop_caches

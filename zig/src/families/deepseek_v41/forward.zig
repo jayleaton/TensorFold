@@ -51,6 +51,8 @@ pub const Forward = struct {
     ids: []const u32 = &.{},
     /// the backbone layers the forward runs (all of them unless a gate runs a prefix: M2a's 0-24)
     layers: ?[]const u32 = null,
+    /// TP: rank 0 leads (sends each forward operation to the others over the plan link); the others `follow`
+    link: ?*tp.planlink.PlanLink = null,
     /// M2a: each block's traced streams (block.Options.trace) as SHA-256 hex by layer, for the last window
     trace: ?*std.AutoArrayHashMapUnmanaged(u32, [64]u8) = null,
 
@@ -97,6 +99,14 @@ pub const Forward = struct {
     /// One decode window: `ids` at the slot's position. This rank's logits stay in the runner's "w.logits".
     pub fn window(f: *Forward, ids: []const u32) !void {
         if (ids.len == 0 or f.slot.pending != null) return error.BadWindow;
+        if (f.leads()) {
+            var msg: [2 + 128]i64 = undefined;
+            if (ids.len > 128) return error.BadWindow;
+            msg[0] = op_window;
+            msg[1] = @intCast(ids.len);
+            for (ids, 0..) |t, i| msg[2 + i] = t;
+            try f.link.?.send(msg[0 .. 2 + ids.len]);
+        }
         // the window's calls at its position (the indexer's scores and top-k grow with the cache: NK = end / ratio)
         var wa = std.heap.ArenaAllocator.init(f.gpa);
         defer wa.deinit();
@@ -110,6 +120,7 @@ pub const Forward = struct {
     /// Greedy choices of the last window's rows (Python's forward.greedy): each rank's max a row (the lowest column on
     /// ties; -0.0 == +0.0), the float64 (value, global id) pairs all-gathered, the higher value (the lower rank on ties).
     pub fn greedy(f: *Forward, out: []u32) !void {
+        if (f.leads()) try f.link.?.send(&.{ op_greedy, @intCast(out.len) });
         const r = f.runner;
         const n = out.len;
         const W: usize = f.comm.world();
@@ -149,6 +160,7 @@ pub const Forward = struct {
     pub fn keep(f: *Forward, accepted: u32) !void {
         const p = f.slot.pending orelse return error.BadWindow;
         if (accepted >= p.n) return error.BadWindow;
+        if (f.leads()) try f.link.?.send(&.{ op_keep, accepted });
         // the ratio-2 KV sources' carry: fp32 of the accepted row of the window's compressor projection
         const r = f.runner;
         var nb: [64]u8 = undefined;
@@ -180,6 +192,47 @@ pub const Forward = struct {
         }
         f.slot.pos = p.start + accepted + 1;
         f.slot.pending = null;
+    }
+
+    const op_window: i64 = 1;
+    const op_greedy: i64 = 2;
+    const op_keep: i64 = 3;
+    const op_stop: i64 = 4;
+
+    fn leads(f: *const Forward) bool {
+        return f.link != null and f.comm.rank() == 0;
+    }
+
+    /// Rank 0: the followers' loops end (after the last operation they were sent).
+    pub fn stop(f: *Forward) !void {
+        if (f.leads()) try f.link.?.send(&.{op_stop});
+    }
+
+    /// Ranks > 0: run the leader's operations as they arrive, in its order (every collective then pairs up), until
+    /// `stop`. The window's token ids come with it; greedy's choice is computed here too (its all-gather needs every
+    /// rank) and dropped.
+    pub fn follow(f: *Forward) !void {
+        var buf: std.ArrayList(i64) = .empty;
+        defer buf.deinit(f.gpa);
+        var ids: std.ArrayList(u32) = .empty;
+        defer ids.deinit(f.gpa);
+        var picks: [128]u32 = undefined;
+        while (true) {
+            const msg = try f.link.?.recvGrow(f.gpa, &buf);
+            if (msg.len == 0) return error.BadPlan;
+            switch (msg[0]) {
+                op_window => {
+                    const n: usize = @intCast(msg[1]);
+                    ids.clearRetainingCapacity();
+                    for (msg[2 .. 2 + n]) |t| try ids.append(f.gpa, @intCast(t));
+                    try f.window(ids.items);
+                },
+                op_greedy => try f.greedy(picks[0..@intCast(msg[1])]),
+                op_keep => try f.keep(@intCast(msg[1])),
+                op_stop => return,
+                else => return error.BadPlan,
+            }
+        }
     }
 
     fn glueMissing(name: []const u8) Error {
