@@ -336,34 +336,44 @@ pub const Ops = struct {
 
     /// dsv41_x3seg_linear_cuda: one launch of a layout (words in the strips layout).
     pub fn segLinear(o: Ops, tab: LinTable, y_dtype: DType, M: usize, l: Launch, minb: u32, pdl: bool) !void {
-        const ki = std.mem.indexOfScalar(u32, &x3seg_k2s, l.k2) orelse return error.Unsupported;
-        const ci: usize = if (l.wk == 8) 2 else if (l.wk == 4 and minb == 3) 0 else if (l.wk == 4 and minb == 2) 1 else return error.Unsupported;
-        try o.tableLaunch(o.f.seg[ki][ci], tab, y_dtype, M, l, pdl);
+        try o.segLinearRaw(tab, y_dtype, M, l.programs, l.k2, l.wk, minb, pdl);
     }
 
-    /// dsv41_dense3_linear_cuda: the same programs on words in the lanes layout; every segment's k steps a warp must
-    /// split into whole load groups (dense3.why_not).
+    /// segLinear with the binding's own (programs, K2, WK, minb): WK 8 takes any minb (TF_SEG_WIDTH).
+    pub fn segLinearRaw(o: Ops, tab: LinTable, y_dtype: DType, M: usize, programs: usize, k2: u32, wk: usize, minb: u32, pdl: bool) !void {
+        const ki = std.mem.indexOfScalar(u32, &x3seg_k2s, k2) orelse return error.Unsupported;
+        const ci: usize = if (wk == 8) 2 else if (wk == 4 and minb == 3) 0 else if (wk == 4 and minb == 2) 1 else return error.Unsupported;
+        try o.tableLaunch(o.f.seg[ki][ci], tab, y_dtype, M, programs, wk, pdl);
+    }
+
+    /// dsv41_dense3_linear_cuda: the same programs on words in the lanes layout.
     pub fn lanesLinear(o: Ops, tab: LinTable, y_dtype: DType, M: usize, l: Launch, minb: u32, pdl: bool) !void {
-        const ki = std.mem.indexOfScalar(u32, &dense3_k2s, l.k2) orelse return error.Unsupported;
-        const want = [2]u32{ @intCast(l.wk), minb };
+        try o.lanesLinearRaw(tab, y_dtype, M, l.programs, l.k2, l.wk, minb, pdl);
+    }
+
+    /// lanesLinear with the binding's own arguments; every segment's k steps a warp must split into whole load
+    /// groups (dense3.why_not).
+    pub fn lanesLinearRaw(o: Ops, tab: LinTable, y_dtype: DType, M: usize, programs: usize, k2: u32, wk: usize, minb: u32, pdl: bool) !void {
+        const ki = std.mem.indexOfScalar(u32, &dense3_k2s, k2) orelse return error.Unsupported;
+        const want = [2]u32{ @intCast(wk), minb };
         var ci: ?usize = null;
         for (lanes_cfgs, 0..) |c, j| if (std.mem.eql(u32, &c, &want)) {
             ci = j;
         };
         for (tab.s[0..@intCast(tab.n)]) |s| {
             const per_warp: usize = @intCast(@divTrunc(@divTrunc(@divTrunc(s.K, 16), s.SK), s.wk));
-            if (per_warp % groupSteps(l.k2) != 0) return error.Shape;
+            if (per_warp % groupSteps(k2) != 0) return error.Shape;
         }
-        try o.tableLaunch(o.f.lanes[ki][ci orelse return error.Unsupported], tab, y_dtype, M, l, pdl);
+        try o.tableLaunch(o.f.lanes[ki][ci orelse return error.Unsupported], tab, y_dtype, M, programs, wk, pdl);
     }
 
-    fn tableLaunch(o: Ops, f: cuda.Function, tab: LinTable, y_dtype: DType, M: usize, l: Launch, pdl: bool) !void {
-        if (M < 1 or M > rows_max) return error.Shape;
+    fn tableLaunch(o: Ops, f: cuda.Function, tab: LinTable, y_dtype: DType, M: usize, programs: usize, wk: usize, pdl: bool) !void {
+        if (M < 1 or M > rows_max or tab.n < 1 or tab.n > max_seg) return error.Shape;
         var a: cuda.Args = .{};
         a.add(tab);
         a.add(@intFromEnum(y_dtype));
         a.add(int(M));
-        try go(f, o.s, .{ l.programs, 1, 1 }, l.wk * 32, redSmem(l.wk, M), pdl, &a);
+        try go(f, o.s, .{ programs, 1, 1 }, wk * 32, redSmem(wk, M), pdl, &a);
     }
 
     /// dsv41_dense3_relayout_cuda: int32 words of one matrix ([N/128, K/16, 8, 4 K2]) to the lanes layout or back.

@@ -9,6 +9,7 @@ const options = @import("dsv41_kernel_options");
 
 pub const exl3 = @import("kernels_exl3.zig");
 pub const dense = @import("kernels_dense.zig");
+pub const replay = @import("kernels_replay.zig");
 
 fn Blob(comptime import_name: []const u8) type {
     return struct {
@@ -77,4 +78,5 @@ test {
     std.testing.refAllDecls(dense.Ops);
     std.testing.refAllDecls(dense.Functions);
     std.testing.refAllDecls(Kernels);
+    std.testing.refAllDecls(replay);
 }

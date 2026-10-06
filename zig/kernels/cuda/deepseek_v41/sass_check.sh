@@ -18,7 +18,19 @@ x3pf|$F/x3pf.cu|-O3,-lineinfo
 x3gm|$F/x3gm.cu|-O3,-lineinfo
 linear|$X/linear.cu|-O3,--expt-relaxed-constexpr
 x3seg|$F/x3seg.cu|-O3,--expt-relaxed-constexpr
-dense3|$F/dense3.cu|-O3,--expt-relaxed-constexpr"
+dense3|$F/dense3.cu|-O3,--expt-relaxed-constexpr
+attn_cuda|$F/csa2/attn_cuda.cu|-O3,-lineinfo,--fmad=false
+topk_cuda|$F/csa2/topk_cuda.cu|-O3,-lineinfo,--fmad=false
+mhc_cuda|$F/mhc_cuda.cu|-O3,-lineinfo,--fmad=false
+mhc_pf|$F/mhc_pf.cu|-O3,-lineinfo,--fmad=false
+router_gemv|$F/router_gemv.cu|-O3,-lineinfo
+engram_gate|$F/engram_gate.cu|-O3,-lineinfo
+l2pace|$F/l2pace.cu|-O3
+l2pf|families/glm5_next/spark/l2pf.cu|-O3
+pfdense_k8|$F/pfdense_k8.cu|-O3,--expt-relaxed-constexpr
+pfdense_k10|$F/pfdense_k10.cu|-O3,--expt-relaxed-constexpr
+pfdense_k12|$F/pfdense_k12.cu|-O3,--expt-relaxed-constexpr
+pfdense_k16|$F/pfdense_k16.cu|-O3,--expt-relaxed-constexpr"
 names=("$@")
 [ ${#names[@]} -eq 0 ] && names=($(echo "$TABLE" | cut -d'|' -f1))
 mkdir -p "$OUT/py" "$OUT/zig"
@@ -37,7 +49,7 @@ build() {  # name, sources, flags
     cuobjdump -sass /out/py/$name.$(basename $s).o >> /out/py/$name.sass
     rm -f /out/py/$name.$(basename $s).o
   done
-  nvcc -fatbin $TORCH $flags $GEN -o /out/zig/$name.fatbin /k/$name.cu
+  nvcc -fatbin $TORCH $flags $GEN -Xptxas -v -o /out/zig/$name.fatbin /k/$name.cu 2> /out/zig/$name.ptxas
   cuobjdump -sass /out/zig/$name.fatbin > /out/zig/$name.sass
   rm -f /out/zig/$name.fatbin
   echo built $name
@@ -47,7 +59,8 @@ for n in "${names[@]}"; do
   line=$(echo "$TABLE" | grep "^$n|")
   srcs=$(echo "$line" | cut -d'|' -f2); flags=$(echo "$line" | cut -d'|' -f3)
   script="$script
-build $n \"$srcs\" \"$flags\" &"
+build $n \"$srcs\" \"$flags\" &
+while [ \$(jobs -rp | wc -l) -ge 4 ]; do wait -n; done"
 done
 script="$script
 wait"
@@ -57,5 +70,7 @@ rc=0
 for n in "${names[@]}"; do
   echo "== $n"
   python3 "$HERE/sass_check.py" "$OUT/py/$n.sass" "$OUT/zig/$n.sass" --sm "$SM" | tail -4 || rc=1
+  spill=$(grep -E "bytes spill" "$OUT/zig/$n.ptxas" | grep -vc " 0 bytes spill stores, 0 bytes spill loads" || true)
+  echo "$n: $(grep -c 'Compiling entry' "$OUT/zig/$n.ptxas") entry functions, $spill with spills (sm_$SM)"
 done
 exit $rc

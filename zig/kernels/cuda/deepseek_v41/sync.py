@@ -137,9 +137,63 @@ def footer_dense3() -> str:
     return "".join(out)
 
 
-# Files whose torch code is already behind a NO_TORCH macro (the Python tests compile them that way): copied whole,
-# the macro defined first.
-PRELUDE = {"x3seg.cu": "DSV41_X3SEG_NO_TORCH", "dense3.cu": "DSV41_DENSE3_NO_TORCH"}
+def footer_attn() -> str:
+    out = ["// The instantiations dispatch() launches: attn_kernel<KW 2 / 4, ROWS, HAS_HI>.\n"]
+    for kw in (2, 4):
+        for rows in ("false", "true"):
+            for hi in ("false", "true"):
+                out.append(f"template __global__ void dsv41_attn::attn_kernel<{kw}, {rows}, {hi}>(dsv41_attn::Args);\n")
+    return "".join(out)
+
+
+MHC_INST = (("true", 2, "true", "false"), ("false", 1, "true", "false"), ("false", 2, "true", "false"),
+            ("true", 2, "false", "true"))       # (POST, COLL, MIX, ALL4) of modes 0-3; FN32 both except mode 3
+
+
+def footer_mhc() -> str:
+    out = ["// The instantiations dispatch() launches: modes 0-2 at bf16 and fp32 fn, mode 3 (final) at bf16.\n"]
+    for i, (post, coll, mix, all4) in enumerate(MHC_INST):
+        for fn32 in (("false", "true") if i < 3 else ("false",)):
+            out.append(f"template __global__ void dsv41_mhc::boundary_kernel<{post}, {coll}, {mix}, {all4}, {fn32}>("
+                       "const dsv41_mhc::Args);\n")
+    return "".join(out)
+
+
+MHC_PF_INST = (("true", 2, "false", "false"), ("true", 2, "false", "true"), ("true", 2, "true", "false"),
+               ("true", 2, "true", "true"), ("false", 1, "false", "false"), ("false", 1, "true", "false"),
+               ("false", 2, "false", "false"), ("false", 2, "true", "false"))   # (POST, COLL, FN32, TAP)
+
+
+def footer_mhc_pf() -> str:
+    out = ["// The instantiations dispatch() launches: (mode, fn32, tap) as its switch lists them.\n"]
+    for post, coll, fn32, tap in MHC_PF_INST:
+        out.append(f"template __global__ void dsv41_mhc_pf::site_kernel<{post}, {coll}, {fn32}, {tap}>("
+                   "const dsv41_mhc_pf::Args);\n")
+    return "".join(out)
+
+
+RG_RT = (1, 2, 4, 8, 16)
+RG_WIDE = ((8, 1), (4, 1), (8, 2), (4, 2))
+RG_NARROW = (1, 2, 4, 8)
+
+
+def footer_rg() -> str:
+    out = ["// The instantiations dispatch() launches: gemv_kernel<RT, NW, EW> and narrow_kernel<RT, NW>.\n"]
+    for rt in RG_RT:
+        for nw, ew in RG_WIDE:
+            out.append(f"template __global__ void dsv41_rg::gemv_kernel<{rt}, {nw}, {ew}>(const dsv41_rg::Args);\n")
+        for nw in RG_NARROW:
+            out.append(f"template __global__ void dsv41_rg::narrow_kernel<{rt}, {nw}>(const dsv41_rg::Args);\n")
+    return "".join(out)
+
+
+# Files copied whole: their torch code (if any) is behind a NO_TORCH macro the Python compile tests define, which
+# is defined first here (None: a file with no torch code at all, copied as it is).
+PRELUDE = {"x3seg.cu": "DSV41_X3SEG_NO_TORCH", "dense3.cu": "DSV41_DENSE3_NO_TORCH", "attn_cuda.cu": "DSV41_ATTN_NO_TORCH",
+           "topk_cuda.cu": "DSV41_ATTN_NO_TORCH", "mhc_cuda.cu": "DSV41_MHC_NO_TORCH",
+           "mhc_pf.cu": "DSV41_MHC_PF_NO_TORCH", "router_gemv.cu": "DSV41_RG_NO_TORCH", "l2pace.cu": None,
+           "l2pf.cu": None, "pfdense.cuh": None, "pfdense_args.h": None, "pfdense_k8.cu": None, "pfdense_k10.cu": None,
+           "pfdense_k12.cu": None, "pfdense_k16.cu": None}
 
 # name -> (source, kept 1-based inclusive line ranges, {line: replacement}, footer)
 COPIES: dict[str, tuple[str, tuple[tuple[int, int], ...], dict[int, str], str]] = {
@@ -156,11 +210,27 @@ COPIES: dict[str, tuple[str, tuple[tuple[int, int], ...], dict[int, str], str]] 
                   "footer_linear"),
     "x3seg.cu": (f"{FAM}/x3seg.cu", ((1, 430),), {}, "footer_x3seg"),
     "dense3.cu": (f"{FAM}/dense3.cu", ((1, 402),), {}, "footer_dense3"),
+    "attn_cuda.cu": (f"{FAM}/csa2/attn_cuda.cu", ((1, 482),), {}, "footer_attn"),
+    "topk_cuda.cu": (f"{FAM}/csa2/topk_cuda.cu", ((1, 304),), {}, ""),
+    "mhc_cuda.cu": (f"{FAM}/mhc_cuda.cu", ((1, 494),), {}, "footer_mhc"),
+    "mhc_pf.cu": (f"{FAM}/mhc_pf.cu", ((1, 341),), {}, "footer_mhc_pf"),
+    "router_gemv.cu": (f"{FAM}/router_gemv.cu", ((1, 532),), {}, "footer_rg"),
+    "engram_gate.cu": (f"{FAM}/engram_gate.cu", ((1, 60),), {15: "namespace dsv41_engram_gate {\n",
+                                                            60: "}  // namespace dsv41_engram_gate\n"}, ""),
+    "l2pace.cu": (f"{FAM}/l2pace.cu", ((1, 85),), {}, ""),
+    "l2pf.cu": ("src/tensorfold/families/glm5_next/spark/l2pf.cu", ((1, 114),), {}, ""),
+    "pfdense.cuh": (f"{FAM}/pfdense.cuh", ((1, 520),), {}, ""),
+    "pfdense_args.h": (f"{FAM}/pfdense_args.h", ((1, 61),), {}, ""),
+    "pfdense_k8.cu": (f"{FAM}/pfdense_k8.cu", ((1, 16),), {}, ""),
+    "pfdense_k10.cu": (f"{FAM}/pfdense_k10.cu", ((1, 16),), {}, ""),
+    "pfdense_k12.cu": (f"{FAM}/pfdense_k12.cu", ((1, 16),), {}, ""),
+    "pfdense_k16.cu": (f"{FAM}/pfdense_k16.cu", ((1, 13),), {}, ""),
 }
 
 FOOTERS = {"footer_x3ld": footer_x3ld, "footer_x3pf": footer_x3pf, "footer_x3gm": footer_x3gm,
            "footer_exl3_experts": footer_exl3_experts, "footer_linear": footer_linear, "footer_x3seg": footer_x3seg,
-           "footer_dense3": footer_dense3}
+           "footer_dense3": footer_dense3, "footer_attn": footer_attn, "footer_mhc": footer_mhc,
+           "footer_mhc_pf": footer_mhc_pf, "footer_rg": footer_rg}
 
 
 def blob_hash(data: bytes) -> str:
@@ -175,11 +245,13 @@ def render(src_root: Path, name: str) -> str:
     whole = name in PRELUDE
     if whole and (len(ranges) != 1 or ranges[0] != (1, len(src))):
         raise SystemExit(f"{name}: {rel} has {len(src)} lines now; update the range")
-    what = f"the whole file, {PRELUDE[name]} defined" if whole else f"lines {spans}; torch includes and host code cut"
+    macro = PRELUDE.get(name)
+    what = (f"the whole file, {macro} defined" if macro else "the whole file") if whole else \
+        f"lines {spans}; torch includes and host code cut"
     out = [f"// Device code of {rel} (git blob {blob_hash(data)[:12]}; {what}),\n",
            "// generated and checked by zig/kernels/cuda/deepseek_v41/sync.py. Do not edit: change the Python source.\n"]
-    if whole:
-        out.append(f"#define {PRELUDE[name]}\n")
+    if macro:
+        out.append(f"#define {macro}\n")
     shim = False
     for a, b in ranges:
         for n in range(a, b + 1):
