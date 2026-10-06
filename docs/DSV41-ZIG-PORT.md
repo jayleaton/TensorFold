@@ -152,6 +152,10 @@ Rules from `ZIG-PREVIEW.md`:
     - SASS 182/182 equal to the Python build;
     - symbols PASS.
     - The x3gm cases logged "v2 0 launches", so x3gm v2 itself was not exercised.
+  - **The next M1 pod carries** (batched; none planned):
+    - the GPU compare of `prepare.lanes` against Python's dense3 words (pod 8 only compared them as plain strips);
+    - the kernel agent's x3gm v2 check (f97ffde). gm2, with the ticket on and off, is compared bit for bit against the fixture's `gm_kernel` outputs, so each x3gm case should log "v2 4 launches".
+    - Stage from a tree at or after f97ffde. The fatbins are unchanged since 643164c.
 
 ## 3. Python to Zig, component by component
 
