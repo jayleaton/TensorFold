@@ -10,23 +10,40 @@ const named = @import("named.zig");
 const load = @import("load.zig");
 const tri = @import("m1_triton.zig");
 const m1 = @import("m1_replay.zig");
+const check = @import("m1_check.zig");
+const fwd = @import("m1_forward.zig");
 
 const usage =
-    \\usage: tf-dsv41-m1 replay PACK CAPTURE OUT
+    \\usage: tf-dsv41-m1 replay|forward|both PACK CAPTURE OUT
+    \\       tf-dsv41-m1 check CAPTURE   (host only: block.zig's calls against the capture's launches)
     \\  PACK     the EXL3 pack (config.json, index, shards)
     \\  CAPTURE  tools/zig/dsv41_m1_capture.py's output (ops.jsonl, blobs/, weights.json, aot/, meta.json)
-    \\  OUT      weights.jsonl, replay.jsonl, summary.json
+    \\  OUT      weights.jsonl, replay.jsonl, forward.jsonl, summary.json
+    \\replay: every captured launch re-issued and compared, alone and chained; forward: block.zig's calls for every
+    \\captured decode window on our own buffers (m1_forward.zig); both: one load, the replay then the forward
     \\exit 0: every weight equal and every replayed op equal alone (skipped ops are listed, not failures)
     \\
 ;
 
 pub fn main(init: std.process.Init) !u8 {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    if (args.len != 5 or !std.mem.eql(u8, args[1], "replay")) {
+    if (args.len == 3 and std.mem.eql(u8, args[1], "check")) {
+        var buf: [4096]u8 = undefined;
+        var out = std.Io.File.stdout().writer(init.io, &buf);
+        const bad = check.checkAll(init.gpa, init.io, args[2], @embedFile("fixtures/q28v2-expert-k2.txt"), &out.interface, 12) catch |e| {
+            std.debug.print("FAIL tf-dsv41-m1 check: {t}\n", .{e});
+            return 1;
+        };
+        out.interface.print("check: {d} mismatches\n", .{bad}) catch {};
+        out.interface.flush() catch {};
+        return if (bad == 0) 0 else 1;
+    }
+    const mode = std.meta.stringToEnum(Mode, if (args.len > 1) args[1] else "") orelse .none;
+    if (args.len != 5 or mode == .none) {
         std.debug.print("{s}", .{usage});
         return 2;
     }
-    return replay(init.gpa, init.io, args[2], args[3], args[4]) catch |e| {
+    return replay(init.gpa, init.io, args[2], args[3], args[4], mode) catch |e| {
         std.debug.print("FAIL tf-dsv41-m1: {t}\n", .{e});
         return 1;
     };
@@ -43,7 +60,9 @@ fn layers(a: std.mem.Allocator, io: std.Io, capture: []const u8) ![]u32 {
     return out.items;
 }
 
-fn replay(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, capture: []const u8, out_dir: []const u8) !u8 {
+const Mode = enum { none, replay, forward, both };
+
+fn replay(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, capture: []const u8, out_dir: []const u8, mode: Mode) !u8 {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -110,7 +129,7 @@ fn replay(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, capture: []c
     // [mode][status] counts, mode 0 alone, 1 chained
     var counts: [2][4]usize = @splat(@splat(0));
     var chained_in: usize = 0;
-    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    var lines = std.mem.tokenizeScalar(u8, if (mode == .forward) "" else text, '\n');
     while (lines.next()) |line| {
         var parsed = try std.json.parseFromSlice(std.json.Value, gpa, line, .{});
         defer parsed.deinit();
@@ -143,7 +162,27 @@ fn replay(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, capture: []c
     , .{ wn[0], wn[1], wn[2], set.kernels.count(), set.failed.items.len, counts[0][0], counts[0][1], counts[0][2], counts[0][3], counts[1][0], counts[1][1], counts[1][2], counts[1][3], chained_in, load_s });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ out_dir, "summary.json" }), .data = summary });
     std.debug.print("{s}", .{summary});
-    const ok = wn[1] == 0 and wn[2] == 0 and counts[0][1] == 0 and counts[0][3] == 0;
-    std.debug.print("{s} M1 replay\n", .{if (ok) "PASS" else "FAIL"});
-    return if (ok) 0 else 1;
+    var ok = wn[1] == 0 and wn[2] == 0 and counts[0][1] == 0 and counts[0][3] == 0;
+    if (mode != .forward) std.debug.print("{s} M1 replay\n", .{if (ok) "PASS" else "FAIL"});
+    if (mode == .replay) return if (ok) 0 else 1;
+    // the forward gate: our calls on our buffers, the replay's chain freed first
+    r.deinit();
+    r.live = .empty;
+    var f: fwd.Forward = .{ .gpa = gpa, .io = io, .d = &driver, .stream = stream, .kernels = if (kernels) |*k| k else return error.NoKernels, .weights = &w, .triton = &set, .plan = &pl, .dir = capture };
+    defer f.deinit();
+    const c = try fwd.runAll(&f, out_dir, @embedFile("fixtures/q28v2-expert-k2.txt"));
+    var glue: std.Io.Writer.Allocating = .init(gpa);
+    defer glue.deinit();
+    for (f.glue.keys(), f.glue.values()) |k, v| try glue.writer.print("\"{s}\": {d}, ", .{ k, v });
+    const fsum = try std.fmt.allocPrint(a,
+        \\{{"calls": {d}, "equal": {d}, "differ": {d}, "skipped_prefetch": {d}, "failed": {d}, "seeded": {d},
+        \\ "reseeded_glue": {d}, "glue_roles": {{{s}}}, "prepared": {{"equal": {d}, "differ": {d}}}}}
+        \\
+    , .{ c.calls, c.equal, c.differ, c.skipped, c.failed, c.seeded, c.reseeded, if (glue.written().len > 2) glue.written()[0 .. glue.written().len - 2] else "", c.prepared_equal, c.prepared_differ });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ out_dir, "forward-summary.json" }), .data = fsum });
+    std.debug.print("{s}", .{fsum});
+    const fok = c.differ == 0 and c.failed == 0 and c.prepared_differ == 0 and c.equal > 0;
+    std.debug.print("{s} M1 block forward\n", .{if (fok) "PASS" else "FAIL"});
+    if (mode == .forward) ok = true;
+    return if (ok and fok) 0 else 1;
 }
