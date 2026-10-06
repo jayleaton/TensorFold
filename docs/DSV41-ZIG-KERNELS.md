@@ -161,6 +161,7 @@ The tables mark each kernel **prod** (on in prod.env), **default** (on by the kn
 **Prefill chunk sizes (2026-10-07).** Prod runs 2,048-row chunks (`PREFILL_CHUNK` / `ROWS` 2,048, adaptive 1,024 /
 512, a short tail). `oracle.py` has x3gm cases at those sizes:
 - `x3gm_pf2048_ragged`: 2,048 rows x 6 slots over prod's 384 experts, ragged widths 3-10, the shared expert folded (about 32 passes an expert at bm 64);
+- `x3gm_pf2048_prod`: prod's geometry from pod 15's 2,048-row capture: D 5,120, I 1,152, gate / up widths 4 / 6 / 8 / 10, 12,288 slots over 16 experts (about 768 rows an expert);
 - `x3gm_pf1024_k4`: 1,024 rows, uniform K2 4;
 - `x3gm_pf512_shx`: 512 rows, the shared expert folded;
 - `x3gm_pf_tail1337`: 1,337 rows, ragged.

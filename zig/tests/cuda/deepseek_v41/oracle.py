@@ -400,6 +400,11 @@ def main() -> None:
     report["x3gm_pf2048_ragged"] = x3gm_case(out / "x3gm_pf2048_ragged", g, R=2048, slots=6, E=384, D=D, I=I,
                                              k2g=widths_g384, k2d=widths_d384, shx=True, input_dtype=torch.bfloat16,
                                              limit=10.0, runs=["tuned"])
+    # prod's geometry (pod 15's 2,048-row capture: D 5,120, I 1,152, gate / up widths 4 / 6 / 8 / 10), over 16 experts
+    # (~768 rows an expert: many passes each) so the fixture stays near 1 GB
+    report["x3gm_pf2048_prod"] = x3gm_case(out / "x3gm_pf2048_prod", g, R=2048, slots=6, E=16, D=5120, I=1152,
+                                           k2g=[4, 6, 8, 10] * 4, k2d=[6, 4, 10, 8] * 4, shx=False,
+                                           input_dtype=torch.bfloat16, limit=10.0, runs=["tuned"])
     report["x3gm_pf1024_k4"] = x3gm_case(out / "x3gm_pf1024_k4", g, R=1024, slots=6, E=64, D=D, I=I, k2g=[4] * 64,
                                          k2d=[4] * 64, shx=False, input_dtype=torch.bfloat16, limit=10.0, runs=["tuned"])
     report["x3gm_pf512_shx"] = x3gm_case(out / "x3gm_pf512_shx", g, R=512, slots=6, E=64, D=D, I=I, k2g=[6] * 64,
