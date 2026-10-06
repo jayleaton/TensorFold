@@ -40,12 +40,32 @@ pub const Begin = enum { none, window, layer };
 
 pub const Call = struct {
     triton: bool,
+    /// a step of the forward's own (positions, the exchanges, the Engram rows, kit roundings): no captured launch
+    /// matches it (the M1 gates skip it), run.zig hands it to the forward's glue
+    glue: bool = false,
     begin: Begin = .none,
     /// the compiled kernel's name (Triton) or "<extension>.<function>"
     name: []const u8,
     grid: [3]i64 = .{ 1, 1, 1 },
     args: []const Named,
 };
+
+/// The calls a capture records (the glue steps left out), in order; a dropped step's scope start moves to the next.
+pub fn launches(a: std.mem.Allocator, cs: []const Call) ![]const Call {
+    var out: std.ArrayList(Call) = .empty;
+    var pending: Begin = .none;
+    for (cs) |c| {
+        if (c.glue) {
+            if (@intFromEnum(c.begin) > @intFromEnum(pending)) pending = c.begin;
+            continue;
+        }
+        var x = c;
+        if (pending == .window or (pending == .layer and x.begin == .none)) x.begin = pending;
+        pending = .none;
+        try out.append(a, x);
+    }
+    return out.items;
+}
 
 /// Contiguous strides of `shape` (elements).
 pub fn contiguous(a: std.mem.Allocator, shape: []const i64) ![]const i64 {

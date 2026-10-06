@@ -266,7 +266,7 @@ pub fn checkAll(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, experts: []
             flow.last = .empty;
         }
         last_set = win.set;
-        const cs = try block.emit(a, &cfg, &w, .{}, win.layers, win.n, win.start, true);
+        const cs = try calls.launches(a, try block.emit(a, &cfg, &w, .{}, win.layers, win.n, win.start, true));
         var equal: usize = 0;
         var shown: usize = 0;
         const m = @min(cs.len, win.ops.len);

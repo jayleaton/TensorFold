@@ -24,6 +24,13 @@ pub const Runner = struct {
     addrs: std.StringHashMapUnmanaged(u64) = .empty,
     owned: std.ArrayList(cuda.DeviceBuffer) = .empty,
     scratch: ?cuda.DeviceBuffer = null,
+    /// the forward's glue steps (forward.zig: positions, exchanges over the Collective, Engram rows, kit roundings)
+    glue: ?Glue = null,
+
+    pub const Glue = struct {
+        ctx: *anyopaque,
+        run: *const fn (ctx: *anyopaque, r: *Runner, c: *const calls.Call) anyerror!void,
+    };
 
     pub fn deinit(r: *Runner) void {
         for (r.owned.items) |*b| b.free();
@@ -98,6 +105,10 @@ pub const Runner = struct {
     /// (they change no bits; R-perf work).
     pub fn issue(r: *Runner, c: *const calls.Call) !void {
         if (std.mem.startsWith(u8, c.name, "tf_dsv41_l2p")) return;
+        if (c.glue) {
+            const g = r.glue orelse return error.NoGlue;
+            return g.run(g.ctx, r, c);
+        }
         var arena = std.heap.ArenaAllocator.init(r.gpa);
         defer arena.deinit();
         const a = arena.allocator();

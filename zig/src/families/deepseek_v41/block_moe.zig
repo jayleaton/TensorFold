@@ -130,6 +130,7 @@ pub fn moe(e: *E, L: u32) !void {
             .{ .name = "KP", .arg = .{ .i = 8 } },          .{ .name = "DUP", .arg = .{ .b = false } },
             .{ .name = "BR", .arg = .{ .i = 16 } },         .{ .name = "ORIG", .arg = .{ .b = false } },
         });
+        try e.glue("kit_weights", &.{ wts, try e.buf("L.wts16", .{}, .f32, &.{ n, slots }) });
         try e.ext("tensorfold_exl3_experts_v1.group", &.{ pick, uids, ucount, members, .{ .i = n }, .{ .i = slots }, .{ .i = Et } });
     }
     const pre = try e.fmt("s.L{d}.ex", .{L});
@@ -193,6 +194,7 @@ pub fn engram(e: *E, L: u32) !void {
     const K: i64 = @as(i64, e.cfg.hashCols()) * e.cfg.engram_head_dim;
     const N: i64 = (@as(i64, e.cfg.engram_max_ngram) + 1) * D;
     const kv = try e.buf("L.engram.kv", .{}, .bf16, &.{ n, N });
+    try e.glue("engram_rows", &.{ try e.buf("L.engram.rows", .{}, .bf16, &.{ n, K }), .{ .i = L } });
     try e.upstream(try e.fmt("L{d}.engram.wkv", .{L}), try e.buf("L.engram.rows", .{}, .bf16, &.{ n, K }), K, N, kv);
     const qk = try e.weight("L{d}.engram.qk", .{L}, .f32, &.{ e.cfg.hc_mult, D });
     try e.triton("_fuse_dec", .{ n, 1, 1 }, &.{
@@ -212,5 +214,7 @@ pub fn finish(e: *E) !void {
     try mhc(e, null, "", .final);
     const D: i64 = e.cfg.hidden;
     const V: i64 = e.cfg.vocab / e.o.world;
-    try e.upstream("head", try e.buf("w.out", .{}, .bf16, &.{ e.n, D }), D, V, try e.buf("w.logits", .{}, .f32, &.{ e.n, V }));
+    const logits = try e.buf("w.logits", .{}, .f32, &.{ e.n, V });
+    try e.upstream("head", try e.buf("w.out", .{}, .bf16, &.{ e.n, D }), D, V, logits);
+    try e.glue("kit_logits", &.{logits});
 }

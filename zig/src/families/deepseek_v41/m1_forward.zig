@@ -387,7 +387,7 @@ pub fn runAll(f: *Forward, out_dir: []const u8, experts: []const u8) !Counts {
             roles = .{ .a = a };
         }
         last_set = win.set;
-        const cs = try block.emit(a, &cfg, &w, .{}, win.layers, win.n, win.start, true);
+        const cs = try calls.launches(a, try block.emit(a, &cfg, &w, .{}, win.layers, win.n, win.start, true));
         if (cs.len != win.ops.len) return error.CallCount;
         const before = f.counts;
         for (cs, win.ops, 0..) |*c, op, i| {

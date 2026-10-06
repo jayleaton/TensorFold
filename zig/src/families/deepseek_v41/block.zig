@@ -111,6 +111,13 @@ pub const Emitter = struct {
         try e.push(.{ .triton = false, .name = name, .args = l });
     }
 
+    /// A glue step ("glue.<name>"): the roles it reads / writes and its scalars, for the forward to run.
+    pub fn glue(e: *Emitter, name: []const u8, args: []const Arg) !void {
+        const l = try e.a.alloc(Named, args.len);
+        for (args, l) |x, *y| y.* = .{ .arg = x };
+        try e.push(.{ .triton = false, .glue = true, .name = try e.fmt("glue.{s}", .{name}), .args = l });
+    }
+
     pub fn triton(e: *Emitter, name: []const u8, grid: [3]i64, args: []const Named) !void {
         try e.push(.{ .triton = true, .name = name, .grid = grid, .args = try e.a.dupe(Named, args) });
     }
@@ -595,6 +602,9 @@ pub const Emitter = struct {
     /// Every launch of a decode window of `n` rows from position `start` over `layers` (ascending, consecutive), and
     /// the head when `head` (the window ends the model).
     pub fn window(e: *Emitter, layers: []const u32, head: bool) !void {
+        // the window's positions and streams (this rank's embedding rows, their all-sum: the first exchange)
+        try e.glue("positions", &.{ try e.pos(), try e.buf("w.pos64", .{}, .i64, &.{e.n}), try e.buf("w.lo", .{}, .i32, &.{e.n}) });
+        try e.glue("embed", &.{ try e.streams(), try e.buf("w.recv.moe", .{}, .bf16, &.{ e.o.world, e.n, e.cfg.hidden }) });
         for (layers, 0..) |L, i| {
             if (i > 0) e.begin = .layer;
             e.layer_ratio = e.cfg.compressRatio(L);
@@ -607,9 +617,12 @@ pub const Emitter = struct {
             } else try moe.mhc(e, L, "hc_attn", if (i == 0) .site1 else .boundary);
             try e.attention(L);
             try e.prefetchF(L);
+            const D: i64 = e.cfg.hidden;
+            try e.glue("exchange", &.{ try e.buf("L.part", .{}, .bf16, &.{ e.n, D }), try e.buf("w.recv.attn", .{}, .bf16, &.{ e.o.world, e.n, D }) });
             try moe.mhc(e, L, "hc_ffn", .boundary);
             try moe.moe(e, L);
             if (i + 1 < layers.len) try e.prefetchX(layers[i + 1]);
+            try e.glue("exchange_f32", &.{ try e.buf("L.moe", .{}, .f32, &.{ e.n, D }), try e.buf("w.recv.moe", .{}, .bf16, &.{ e.o.world, e.n, D }) });
         }
         if (head) try moe.finish(e);
     }
