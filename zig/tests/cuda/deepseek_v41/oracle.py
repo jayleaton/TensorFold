@@ -174,9 +174,9 @@ def x3gm_case(out: Path, g, *, R, slots, E, D, I, k2g, k2d, shx, input_dtype, li
         k2dw = torch.tensor(L.k2["d"] + [0], dtype=torch.int32, device=DEV)
     else:
         n_gate = E * D * I // 256 * 16 * k2g[0] // 2      # int16 elements of the gate stack
-        tg = L.words[:n_gate].view(torch.int32)
-        tu = L.words[n_gate:2 * n_gate].view(torch.int32)
-        td = L.words[2 * n_gate:].view(torch.int32)
+        tg = L.words[:n_gate].view(torch.int32).view(E, D // 16, I // 16, 4 * k2g[0])
+        tu = L.words[n_gate:2 * n_gate].view(torch.int32).view(E, D // 16, I // 16, 4 * k2g[0])
+        td = L.words[2 * n_gate:].view(torch.int32).view(E, I // 16, D // 16, 4 * k2d[0])
         params.update(base_u=n_gate * 2, base_d=4 * n_gate)
     ticket = torch.zeros(1, dtype=torch.int32, device=DEV)
     base_cfg = gm.config({})
@@ -219,7 +219,7 @@ def x3gm_case(out: Path, g, *, R, slots, E, D, I, k2g, k2d, shx, input_dtype, li
         K, N, k2 = dequant
         t = trellis(g, K, N, k2).to(DEV)
         a = torch.empty(K, N, dtype=torch.float16, device=DEV)
-        ext.dequant(t.view(torch.int32), a, K, N, k2)
+        ext.dequant(t.view(torch.int32), a, k2)
         b = torch.empty_like(a)
         up.dequant(t, b, k2, CB)
         arrays.update(dequant_in=t, dequant_gm=a, dequant_up=b)
