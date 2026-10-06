@@ -222,7 +222,8 @@ fn replay(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, capture: []c
     r.live = .empty;
     var f: fwd.Forward = .{ .gpa = gpa, .io = io, .d = &driver, .stream = stream, .kernels = if (kernels) |*k| k else return error.NoKernels, .weights = &w, .triton = &set, .plan = &pl, .dir = capture };
     defer f.deinit();
-    const c = try fwd.runAll(&f, out_dir, @embedFile("fixtures/q28v2-expert-k2.txt"));
+    _ = try fwd.runAll(&f, out_dir, @embedFile("fixtures/q28v2-expert-k2.txt"));
+    const c = try fwd.runDraft(&f, out_dir, @embedFile("fixtures/q28v2-expert-k2.txt"));
     var glue: std.Io.Writer.Allocating = .init(gpa);
     defer glue.deinit();
     for (f.glue.keys(), f.glue.values()) |k, v| try glue.writer.print("\"{s}\": {d}, ", .{ k, v });

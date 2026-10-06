@@ -60,6 +60,12 @@ pub const GpuTarget = struct {
         if (s.slot != 0) return error.Slots;
         if (s.parents != null) return error.TreeWindow;
         if (s.sampling != null) return error.Sampling;
+        // a chain window never kept keeps every row (iface.Target.window): lanes' undrafted step (queue) sends the
+        // next row without a keep
+        if (t.f.slot.pending) |w| {
+            if (s.start != w.start + w.n) return error.NotAChain;
+            try t.f.keep(w.n - 1);
+        }
         if (s.start != t.f.slot.pos) return error.NotAChain;
         if (s.tokens.len > t.max_rows) return error.WindowRows;
         try t.f.window(s.tokens);

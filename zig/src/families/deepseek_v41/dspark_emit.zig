@@ -372,9 +372,43 @@ pub fn emitPass(a: std.mem.Allocator, cfg: *const Config, w: *const block.Widths
     return e.out.items;
 }
 
-/// M3's host gate of the emitters against a capture's set P (dsv41_m1_capture.py): each drafter phase's launches
-/// (ingest i0 / i1, passes d0 / d1) call for call, the Triton variants and the dataflow, as m1_check does for the
-/// decode windows. The capture's `_keys` and `_chain` (the device candidates and chain the host replaces) are left out.
+/// A capture's set P ops by drafter phase (i0, d0, i1, d1), without `_keys` / `_chain` (the host's), and each phase's
+/// rows and taps row skip as the capture ran them.
+pub const Phase = struct { name: []const u8, n: i64, skip: i64, ops: []std.json.ObjectMap };
+
+pub fn phases(a: std.mem.Allocator, io: std.Io, dir: []const u8, cfg: *const Config) ![]Phase {
+    const cwd = std.Io.Dir.cwd();
+    const meta = try std.json.parseFromSliceLeaky(std.json.Value, a, try cwd.readFileAlloc(io, try std.fs.path.join(a, &.{ dir, "meta.json" }), a, .limited(1 << 24)), .{});
+    const prompt = meta.object.get("prompt").?.integer;
+    var by: std.StringArrayHashMapUnmanaged(std.ArrayList(std.json.ObjectMap)) = .empty;
+    const text = try cwd.readFileAlloc(io, try std.fs.path.join(a, &.{ dir, "ops.jsonl" }), a, .limited(1 << 34));
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const op = (try std.json.parseFromSliceLeaky(std.json.Value, a, line, .{})).object;
+        if (!std.mem.eql(u8, op.get("set").?.string, "P")) continue;
+        const name = op.get("name").?.string;
+        if (std.mem.eql(u8, name, "_keys") or std.mem.eql(u8, name, "_chain")) continue;
+        const g = try by.getOrPut(a, op.get("phase").?.string);
+        if (!g.found_existing) g.value_ptr.* = .empty;
+        try g.value_ptr.append(a, op);
+    }
+    const out = try a.alloc(Phase, by.count());
+    for (out, by.keys(), by.values()) |*p, ph, ops| {
+        // an ingest's rows: the prompt's last `window` (i0) or the decode row (i1); a pass: the block
+        const n: i64 = if (ph[0] == 'i') (if (std.mem.eql(u8, ph, "i0")) cfg.window else 1) else cfg.dspark_block;
+        p.* = .{ .name = ph, .n = n, .skip = if (std.mem.eql(u8, ph, "i0")) prompt - cfg.window else 0, .ops = ops.items };
+    }
+    return out;
+}
+
+/// A phase's launches (glue left out).
+pub fn phaseCalls(a: std.mem.Allocator, cfg: *const Config, w: *const block.Widths, p: Phase) ![]const calls.Call {
+    const all = if (p.name[0] == 'i') try emitIngest(a, cfg, w, .{}, p.n, p.skip) else try emitPass(a, cfg, w, .{}, p.n);
+    return calls.launches(a, all);
+}
+
+/// M3's host gate of the emitters against a capture's set P (dsv41_m1_capture.py): each drafter phase's launches call
+/// for call, the Triton variants and the dataflow, as m1_check does for the decode windows.
 pub fn checkDraft(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, experts: []const u8, log: *std.Io.Writer, show: usize) !usize {
     const check = @import("m1_check.zig");
     const cuda = @import("cuda");
@@ -384,41 +418,22 @@ pub fn checkDraft(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, experts: 
     const cwd = std.Io.Dir.cwd();
     const w = try check.widthsFromCapture(a, try cwd.readFileAlloc(io, try std.fs.path.join(a, &.{ dir, "weights.json" }), a, .limited(1 << 28)), experts);
     const cfg: Config = .{};
-    const meta = try std.json.parseFromSliceLeaky(std.json.Value, a, try cwd.readFileAlloc(io, try std.fs.path.join(a, &.{ dir, "meta.json" }), a, .limited(1 << 24)), .{});
-    const prompt = meta.object.get("prompt").?.integer;
     var variants: ?check.Variants = null;
     if (cwd.readFileAlloc(io, try std.fs.path.join(a, &.{ dir, "aot", "aot.json" }), a, .limited(1 << 26))) |text| {
         variants = .{ .specs = (try cuda.aot.parseSpecs(a, text)).value.kernels };
     } else |_| {}
-    // the phases' ops in order (set P only)
-    var phases: std.StringArrayHashMapUnmanaged(std.ArrayList(std.json.ObjectMap)) = .empty;
-    const text = try cwd.readFileAlloc(io, try std.fs.path.join(a, &.{ dir, "ops.jsonl" }), a, .limited(1 << 34));
-    var lines = std.mem.tokenizeScalar(u8, text, '\n');
-    while (lines.next()) |line| {
-        const op = (try std.json.parseFromSliceLeaky(std.json.Value, a, line, .{})).object;
-        if (!std.mem.eql(u8, op.get("set").?.string, "P")) continue;
-        const name = op.get("name").?.string;
-        if (std.mem.eql(u8, name, "_keys") or std.mem.eql(u8, name, "_chain")) continue;
-        const g = try phases.getOrPut(a, op.get("phase").?.string);
-        if (!g.found_existing) g.value_ptr.* = .empty;
-        try g.value_ptr.append(a, op);
-    }
     var roles: calls.Roles = .{ .a = a };
     var flow: check.Flow = .{ .a = a };
     var bad: usize = 0;
-    for (phases.keys(), phases.values()) |ph, ops| {
-        // an ingest's rows: the prompt's last `window` (i0), or the decode row (i1); a pass: the block
-        const n: i64 = if (ph[0] == 'i') (if (std.mem.eql(u8, ph, "i0")) cfg.window else 1) else cfg.dspark_block;
-        const skip: i64 = if (std.mem.eql(u8, ph, "i0")) prompt - cfg.window else 0;
-        const all = if (ph[0] == 'i') try emitIngest(a, &cfg, &w, .{}, n, skip) else try emitPass(a, &cfg, &w, .{}, n);
-        const cs = try calls.launches(a, all);
+    for (try phases(a, io, dir, &cfg)) |p| {
+        const cs = try phaseCalls(a, &cfg, &w, p);
         var equal: usize = 0;
         var shown: usize = 0;
-        const m = @min(cs.len, ops.items.len);
-        for (cs[0..m], ops.items[0..m], 0..) |*c, op, i| {
+        const m = @min(cs.len, p.ops.len);
+        for (cs[0..m], p.ops[0..m], 0..) |*c, op, i| {
             roles.begin(c.begin);
             flow.begin(c.begin);
-            const where = try std.fmt.allocPrint(a, "P {s} #{d}", .{ ph, i });
+            const where = try std.fmt.allocPrint(a, "P {s} #{d}", .{ p.name, i });
             try flow.call(c, op, log, where);
             const vwhy = if (variants) |*v| try v.check(a, c, op) else null;
             const why = vwhy orelse try calls.check(a, c, op, &roles);
@@ -428,8 +443,8 @@ pub fn checkDraft(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, experts: 
                 shown += 1;
             } else equal += 1;
         }
-        if (cs.len != ops.items.len) bad += 1;
-        try log.print("P {s} (n {d}): {d}/{d} calls equal, {d} emitted\n", .{ ph, n, equal, ops.items.len, cs.len });
+        if (cs.len != p.ops.len) bad += 1;
+        try log.print("P {s} (n {d}): {d}/{d} calls equal, {d} emitted\n", .{ p.name, p.n, equal, p.ops.len, cs.len });
         try log.flush();
     }
     try log.print("dataflow: {d} miswired; glue-written roles:", .{flow.miswired});
