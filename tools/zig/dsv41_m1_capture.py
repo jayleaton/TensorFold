@@ -34,7 +34,8 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-SETS = {"A": (1, 2, 3), "B": (20, 21, 22, 23, 24), "C": (40,), "D": (13, 14, 15)}   # D: Engram mid-stack (post, Engram, site2)
+SETS = {"A": (1, 2, 3), "B": (20, 21, 22, 23, 24), "C": (40,), "D": (13, 14, 15),
+        "P": (36, 37, 38, 39)}   # P: DSpark's drafting pass (taps entering 37-39, then the drafter's ingest / propose)   # D: Engram mid-stack (post, Engram, site2)
 WINDOWS = (1, 3, 16)
 PREFILL = 256               # rows of the recorded prefill segment after the windows (the fast prefill kernels)
 SCAN_MAX = 1 << 20          # int64 elements scanned for device addresses a tensor at most
@@ -105,6 +106,13 @@ class Capture:
                 found[f"{p}.engram.qk"] = lw.engram.qk
         found["embed"], found["norm"] = rank_w.embed, rank_w.norm
         x3("head", rank_w.head)
+        dw = getattr(self, "draft_w", None)          # set P: DSpark's heads by the Zig loader's names (named.dspark)
+        if dw is not None:
+            x3("dspark.main_proj", dw.main_proj)
+            found["dspark.main_norm"], found["dspark.norm"] = dw.main_norm, dw.norm
+            found["dspark.markov.w1"], found["dspark.markov.w2"] = dw.w1, dw.w2
+            if dw.conf is not None:
+                found["dspark.conf"] = dw.conf
         digests, spans = {}, []
         for name, t in found.items():
             t = t.contiguous() if not t.is_contiguous() else t
@@ -332,6 +340,53 @@ class IndexRows:
         return (((i * 2654435761 + j * 40503) % 511) - 255).to(torch.float32) / 1024.0
 
 
+def run_draft(cap, rec, s, loader, cfg, tree, layers, tmap, dev, a, g, vh, Forward, Seg, Triton, NgramHasher):
+    """Set P: the backbone's layers 36-39 with taps (Forward(taps=True)), a prompt, then the drafter (mtp.0-2 and its
+    heads, drafter.load) recorded: ingest of the prompt's taps (phase i0), a drafting pass (d0), one committed decode
+    row, its ingest (i1) and the next pass (d1)."""
+
+    import torch
+    from tensorfold.families.deepseek_v41.cuda import drafter as DR
+    from tensorfold.families.deepseek_v41.cuda.forward import greedy
+
+    dw = DR.load(loader)
+    cap.draft_w = dw
+    digests = cap.name_weights(tree, layers + list(dw.layers))
+    rows = {L: IndexRows(cfg.engram_head_dim) for L in cfg.engram_layer_ids}
+    fw = Forward(cfg, tree, csa2=Triton(128, cfg.num_attention_heads // 2, dev), comm=ZeroPeer(), device=dev,
+                 limit=a.limit, chunk=128, engram_rows=rows, hasher=NgramHasher(cfg, tmap), slots=1,
+                 contiguous=True, pchunk=2048, taps=True)
+    dr = DR.Drafter(fw, dw)
+    dr.reset(0)
+    ids = torch.randint(3, vh, (a.prompt + 1,), generator=g).tolist()
+    logits = fw.prompt(ids[:a.prompt])
+    anchor = int(greedy(fw, logits)[0])
+    cap.set = s
+
+    def rec_phase(name, fn):
+        cap.phase = name
+        cap.recording = True
+        try:
+            with rec.scope(f"{s}-{name}"):
+                return fn()
+        finally:
+            cap.recording = False
+
+    taps = fw.slot.taps
+    n0 = next(iter(taps.values())).shape[0]
+    rec_phase("i0", lambda: dr.ingest(0, fw.slot.pos - n0, taps))
+    rec_phase("d0", lambda: dr.propose([0], [anchor], [fw.slot.pos]))
+    lg = fw.run([Seg(0, fw.slot.pos, (anchor,))])
+    nxt = int(greedy(fw, lg)[0])
+    fw.keep(0, 0)
+    rec_phase("i1", lambda: dr.ingest(0, fw.slot.pos - 1, fw.slot.taps))
+    rec_phase("d1", lambda: dr.propose([0], [nxt], [fw.slot.pos]))
+    torch.cuda.synchronize()
+    cap.draft_w = None
+    del fw, dr, dw, tree, layers
+    return digests
+
+
 def run_set(cap, rec, s, loader, W, cfg, embed, norm, head, tmap, dev, a, g, vh, Forward, Seg, Triton, NgramHasher):
     """One set: its blocks loaded, a prompt, the recorded decode windows, then a recorded prefill segment; returns the
     set's weight digests (kept only when the whole set ran)."""
@@ -340,6 +395,8 @@ def run_set(cap, rec, s, loader, W, cfg, embed, norm, head, tmap, dev, a, g, vh,
 
     layers = [loader.layer(L) for L in SETS[s]]
     tree = W.RankW(0, 2, 0, embed, layers, norm, head, None, {})
+    if s == "P":
+        return run_draft(cap, rec, s, loader, cfg, tree, layers, tmap, dev, a, g, vh, Forward, Seg, Triton, NgramHasher)
     digests = cap.name_weights(tree, layers)
     rows = {L: IndexRows(cfg.engram_head_dim) for L in cfg.engram_layer_ids}
     fw = Forward(cfg, tree, csa2=Triton(128, cfg.num_attention_heads // 2, dev), comm=ZeroPeer(), device=dev,
@@ -493,7 +550,9 @@ def main() -> int:
             torch.cuda.empty_cache()
             continue
         weights.update(got)
-        meta["sets"][s] = {"layers": list(SETS[s]), "load_and_run_s": round(time.time() - t0, 1), "ops": cap.seq}
+        ls = list(SETS[s]) + (list(range(cfg.num_hidden_layers, cfg.num_hidden_layers + cfg.num_nextn_predict_layers))
+                              if s == "P" else [])          # P: the drafter's blocks load too
+        meta["sets"][s] = {"layers": ls, "load_and_run_s": round(time.time() - t0, 1), "ops": cap.seq}
         torch.cuda.empty_cache()
     cap.ops.close()
     (out / "weights.json").write_text(json.dumps(weights, indent=0, sort_keys=True) + "\n")

@@ -147,7 +147,7 @@ fi
 CAP=$LOCAL/capture
 rm -rf "$CAP"
 if step capture "${M1_CAPTURE_MIN:-18}" python -B "$Z/tools/zig/dsv41_m1_capture.py" --pack "$PACK" --out "$CAP" \
-        --sets "${M1_SETS:-A,B,C,D}"; then
+        --sets "${M1_SETS:-A,B,C,D,P}"; then
     du -sh "$CAP" "$CAP/blobs" | tee "$RES/capture-size.txt"
     step m1 "${M1_REPLAY_MIN:-14}" "$Z/bin/tf-dsv41-m1" "${M1_MODE:-both}" "$PACK" "$CAP" "$RES/m1"
 fi

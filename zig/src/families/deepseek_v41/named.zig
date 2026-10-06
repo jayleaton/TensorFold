@@ -223,10 +223,23 @@ pub const Builder = struct {
         if (p.head) |h| try b.group("head", h);
     }
 
+    /// DSpark's heads as drafter.load holds them: main_proj (whole, every rank), main_norm and norm fp32, the Markov
+    /// embed / head bf16 (bf16_param), the confidence head fp32 [D + r].
+    pub fn dspark(b: *Builder, p: *const plan.Plan) !void {
+        const d = p.dspark orelse return;
+        var none: ?[]f32 = null;
+        try b.group("dspark.main_proj", d.main_proj);
+        const out_names = [_][]const u8{ "dspark.main_norm", "dspark.norm", "dspark.markov.w1", "dspark.markov.w2" };
+        const outs = [_]Out{ .f32, .f32, .bf16, .bf16 };
+        for (d.natives, out_names, outs) |v, nm, o| try b.native(nm, .{ .name = nm, .out = o }, v, p.rank, p.world, &none);
+        if (d.confidence) |c| try b.native("dspark.conf", .{ .name = "dspark.conf", .out = .f32 }, c, p.rank, p.world, &none);
+    }
+
     /// Every planned block, then the model-level tensors (a whole-model plan only).
     pub fn all(b: *Builder, p: *const plan.Plan, o_groups: u32) !void {
         for (p.layers) |*l| try b.layer(l, o_groups, p.rank, p.world);
         try b.top(p);
+        try b.dspark(p);
     }
 
     pub fn find(b: *const Builder, name: []const u8) ?*const Named {

@@ -23,6 +23,7 @@ comptime {
     _ = &@import("forward.zig").Forward.plan;
     _ = &@import("forward.zig").ZeroPeer.collective;
     _ = &@import("target.zig").GpuTarget.target;
+    _ = &named.Builder.dspark;
 }
 
 const usage =
@@ -122,7 +123,9 @@ fn replay(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, capture: []c
     var pack = try Pack.open(gpa, io, pack_dir);
     defer pack.deinit();
     const blocks = try layers(a, io, capture);
-    var pl = try plan.build(gpa, &cfg, &pack, .{ .rank = 0, .world = 2, .blocks = blocks, .top = true });
+    // a drafting pass in the capture (set P: blocks past the backbone): DSpark's heads load too
+    const drafting = blocks.len > 0 and blocks[blocks.len - 1] >= cfg.layers;
+    var pl = try plan.build(gpa, &cfg, &pack, .{ .rank = 0, .world = 2, .blocks = blocks, .top = true, .dspark = drafting });
     defer pl.deinit();
     var w: load.Weights = .{ .gpa = gpa };
     defer w.deinit();
@@ -136,6 +139,7 @@ fn replay(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, capture: []c
         var b: named.Builder = .{ .gpa = gpa, .io = io, .pack = &pack };
         defer b.deinit();
         try b.top(&pl);
+        try b.dspark(&pl);
         try w.upload(&driver, &b);
     }
     const load_s = @as(f64, @floatFromInt(t0.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds())) / 1e9;

@@ -114,6 +114,8 @@ pub const Options = struct {
     blocks: ?[]const u32 = null,
     /// with `blocks`: also the vocabulary rows, the final norm and the head (a window's finish)
     top: bool = false,
+    /// with `blocks` and `top`: also DSpark's heads (main_proj, its norms, the Markov and confidence heads)
+    dspark: bool = false,
 };
 
 const Builder = struct {
@@ -280,7 +282,7 @@ pub fn build(gpa: std.mem.Allocator, c: *const Config, pack: *const Pack, o: Opt
         top = try b.a.alloc(NativePlan, tspecs.len);
         for (tspecs.items(), top) |s, *v| v.* = try b.native(s.suffix, s);
         head = try b.group(.wq_a, names.head.suffix, .col, c.hidden, c.vocab);
-        if (full) ds = try b.dspark();
+        if (full or o.dspark) ds = try b.dspark();
     }
     // coverage: every stored name was planned or is knowingly left (vision, image routing, bf16 copies of groups)
     var left: std.ArrayList([]const u8) = .empty;
