@@ -1,4 +1,5 @@
-//! DeepSeek-V4.1's drafting (M3): DSpark's host glue, the cost-derived depth and first-position trees.
+//! DeepSeek-V4.1's drafting (M3): DSpark's host glue, the cost-derived depth, first-position trees, and the lanes
+//! backend over the `Target` / `Pass` contract (iface.zig) that the GPU forward implements; twin.zig is its CPU twin.
 
 pub const costs = @import("costs.zig");
 pub const Costs = costs.Costs;
@@ -8,6 +9,11 @@ pub const depth = @import("depth.zig");
 pub const Depth = depth.Depth;
 pub const tree = @import("tree.zig");
 pub const dspark = @import("dspark.zig");
+pub const iface = @import("iface.zig");
+pub const policy = @import("policy.zig");
+pub const lanes = @import("lanes.zig");
+pub const Lanes = lanes.Lanes;
+pub const twin = @import("twin.zig");
 
 test {
     _ = costs;
@@ -16,4 +22,10 @@ test {
     _ = depth;
     _ = tree;
     _ = dspark;
+    _ = iface;
+    _ = policy;
+    _ = lanes;
+    _ = twin;
+    _ = @import("lanes_test.zig");
+    _ = @import("golden_test.zig");
 }

@@ -1,0 +1,99 @@
+//! The contract between DeepSeek's lanes backend and the model: `Target` (the forward over verify windows, M2's
+//! forward.zig on the GPU, twin.zig on the CPU) and `Pass` (the DSpark pass over its context rings). The drafter
+//! never touches the target's pool: it reads the taps the target hands back and keeps its own rings.
+const std = @import("std");
+const lanes = @import("lanes");
+const dspark = @import("dspark.zig");
+
+/// One slot's rows in a verify window. Row 0 is the pending token at `start` (the slot's cache length); row r > 0
+/// sits at start + its depth, attends the committed cache plus its ancestors in the window (`parents`), and its
+/// choice is keyed at `draws[r]` (= its own position + 1).
+pub const Segment = struct {
+    slot: u32,
+    start: u64,
+    tokens: []const u32,
+    parents: ?[]const i32, // each row's parent row (row 0: -1); null: a chain
+    draws: []const u64,
+    sampling: ?lanes.Sampling,
+};
+
+/// The taps of a slot's last rows (the streams' mean entering the DSpark target layers, bf16 [rows, 3 x hidden] on
+/// the GPU): `address` a device address (a host one on the CPU twin), row i = the window's (or prompt's) row i.
+pub const Taps = struct { address: u64, rows: u32, stride: u32 };
+
+pub const Target = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        /// Run the prompt into the slot's state; the keyed choice after its last row (drawn at `draw`).
+        prefill: *const fn (ptr: *anyopaque, slot: u32, ids: []const u32, sampling: ?lanes.Sampling, draw: u64) anyerror!u32,
+        /// One forward over every segment; `choices[i][r]`: segment i's row r's keyed choice. A segment's rows stay in
+        /// its state until `keep` (a chain window that is never kept keeps every row).
+        window: *const fn (ptr: *anyopaque, segments: []const Segment, choices: [][]u32) anyerror!void,
+        /// Keep the listed rows of the slot's last window (row 0 first, each the next one's parent), drop the rest:
+        /// pool truncation, SWA rings and ratio-2 carries roll back to the kept path.
+        keep: *const fn (ptr: *anyopaque, slot: u32, path: []const u32) anyerror!void,
+        /// The taps of the slot's last window (or its prompt, after prefill).
+        taps: *const fn (ptr: *anyopaque, slot: u32) Taps,
+        release: *const fn (ptr: *anyopaque, slot: u32) void,
+    };
+
+    pub fn prefill(t: Target, slot: u32, ids: []const u32, sampling: ?lanes.Sampling, draw: u64) !u32 {
+        return t.vtable.prefill(t.ptr, slot, ids, sampling, draw);
+    }
+    pub fn window(t: Target, segments: []const Segment, choices: [][]u32) !void {
+        return t.vtable.window(t.ptr, segments, choices);
+    }
+    pub fn keep(t: Target, slot: u32, path: []const u32) !void {
+        return t.vtable.keep(t.ptr, slot, path);
+    }
+    pub fn taps(t: Target, slot: u32) Taps {
+        return t.vtable.taps(t.ptr, slot);
+    }
+    pub fn release(t: Target, slot: u32) void {
+        t.vtable.release(t.ptr, slot);
+    }
+};
+
+/// One slot of a DSpark pass: its anchor (the pending token) at P and the keyed draft parameters.
+pub const Ask = struct { slot: u32, anchor: u32, start: u64, params: dspark.Params };
+
+/// A pass's results for one slot, in caller buffers: `block` drafts and confidences; for trees also the gathered
+/// candidates and base logits [block][candidates] (before the Markov bias), when `cand` is set.
+pub const Proposal = struct { drafts: []u32, conf: []f32, cand: ?[]i32 = null, base: ?[]f32 = null };
+
+pub const Pass = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        /// Committed rows into the slot's context rings: `taps` rows `rows[i]` land at positions start + i.
+        ingest: *const fn (ptr: *anyopaque, slot: u32, start: u64, taps: Taps, rows: []const u32) anyerror!void,
+        /// One pass over every ask (one launch a block over all slots); results into `out`.
+        propose: *const fn (ptr: *anyopaque, asks: []const Ask, out: []Proposal) anyerror!void,
+        /// A new request on the slot: its context restarts at position 0.
+        reset: *const fn (ptr: *anyopaque, slot: u32) void,
+        /// The Markov / confidence heads on the host, for trees (null: no trees).
+        markov: *const fn (ptr: *anyopaque) ?dspark.Markov,
+    };
+
+    pub fn ingest(p: Pass, slot: u32, start: u64, taps: Taps, rows: []const u32) !void {
+        return p.vtable.ingest(p.ptr, slot, start, taps, rows);
+    }
+    pub fn propose(p: Pass, asks: []const Ask, out: []Proposal) !void {
+        return p.vtable.propose(p.ptr, asks, out);
+    }
+    pub fn reset(p: Pass, slot: u32) void {
+        p.vtable.reset(p.ptr, slot);
+    }
+    pub fn markov(p: Pass) ?dspark.Markov {
+        return p.vtable.markov(p.ptr);
+    }
+};
+
+/// Which committed rows an ingest writes: only the last `window` (older ones are never read).
+pub fn ingestSpan(n: usize, window: usize) struct { skip: usize, count: usize } {
+    const skip = n -| window;
+    return .{ .skip = skip, .count = n - skip };
+}
