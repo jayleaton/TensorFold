@@ -47,6 +47,9 @@ pub const Options = struct {
     sms: i64 = 188,
     /// TF_DSV41_EXPERT_TOPP (prod: 0.85; lossy)
     expert_topp: f64 = 0.85,
+    /// M2a: after each block, its streams with the block's last post applied out of place (Python's Forward.trace),
+    /// handed to the glue step "trace" (one more launch a block; never in a served window)
+    trace: bool = false,
 };
 
 pub const Emitter = struct {
@@ -611,7 +614,7 @@ pub const Emitter = struct {
             if (e.cfg.isEngram(L)) {
                 // Python's forward: an Engram block after the first runs the last exchange's post alone, Engram on the
                 // streams, then a site that collapses with the previous coefficients' pre (site2)
-                if (i > 0) try moe.postOnly(e);
+                if (i > 0) try moe.postOnly(e, null);
                 try moe.engram(e, L);
                 try moe.mhc(e, L, "hc_attn", if (i == 0) .site1 else .site2);
             } else try moe.mhc(e, L, "hc_attn", if (i == 0) .site1 else .boundary);
@@ -623,6 +626,11 @@ pub const Emitter = struct {
             try moe.moe(e, L);
             if (i + 1 < layers.len) try e.prefetchX(layers[i + 1]);
             try e.glue("exchange_f32", &.{ try e.buf("L.moe", .{}, .f32, &.{ e.n, D }), try e.buf("w.recv.moe", .{}, .bf16, &.{ e.o.world, e.n, D }) });
+            if (e.o.trace) {
+                const y = try e.buf("w.trace", .{}, .bf16, &.{ e.n, 4 * D });
+                try moe.postOnly(e, y);
+                try e.glue("trace", &.{ y, .{ .i = L } });
+            }
         }
         if (head) try moe.finish(e);
     }

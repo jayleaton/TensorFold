@@ -66,14 +66,15 @@ pub fn mhc(e: *E, layer: ?u32, which: []const u8, mode: Mode) !void {
 
 /// mhc.post_only (Triton `_site`, POST_ON, no collapse or mix): the last exchange's post applied to the streams in
 /// place, before an Engram block that is not the window's first (Python's forward: post, Engram, then a site2).
-pub fn postOnly(e: *E) !void {
+pub fn postOnly(e: *E, out: ?calls.Arg) !void {
     const n = e.n;
     const D: i64 = e.cfg.hidden;
     const x = try e.streams();
+    const xout = out orelse x;
     const prev = try coefs(e, e.coef);
     try e.triton("_site", .{ std.math.divCeil(i64, n, 16) catch unreachable, 40, 1 }, &.{
         .{ .name = "X", .arg = x },                     .{ .name = "x_stride", .arg = .{ .i = 4 * D } },
-        .{ .name = "XOUT", .arg = x },                  .{ .name = "G", .arg = try e.buf("w.recv.moe", .{}, .bf16, &.{ e.o.world, n, D }) },
+        .{ .name = "XOUT", .arg = xout },               .{ .name = "G", .arg = try e.buf("w.recv.moe", .{}, .bf16, &.{ e.o.world, n, D }) },
         .{ .name = "g_rank", .arg = .{ .i = n * D } },  .{ .name = "POST", .arg = prev[1] },
         .{ .name = "COMB", .arg = prev[2] },            .{ .name = "PRE", .arg = x },
         .{ .name = "FN", .arg = x },                    .{ .name = "PART", .arg = x },

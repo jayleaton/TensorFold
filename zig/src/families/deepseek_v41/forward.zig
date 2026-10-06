@@ -49,6 +49,10 @@ pub const Forward = struct {
     send: ?cuda.DeviceBuffer = null,
     /// the window's token ids (the embedding step reads them)
     ids: []const u32 = &.{},
+    /// the backbone layers the forward runs (all of them unless a gate runs a prefix: M2a's 0-24)
+    layers: ?[]const u32 = null,
+    /// M2a: each block's traced streams (block.Options.trace) as SHA-256 hex by layer, for the last window
+    trace: ?*std.AutoArrayHashMapUnmanaged(u32, [64]u8) = null,
 
     pub fn init(gpa: std.mem.Allocator, cfg: *const Config, widths: *const block.Widths, opts: block.Options, runner: *run.Runner, comm: tp.collective.Collective) Forward {
         return .{ .gpa = gpa, .cfg = cfg, .widths = widths, .opts = opts, .runner = runner, .comm = comm, .arena = std.heap.ArenaAllocator.init(gpa) };
@@ -66,6 +70,7 @@ pub const Forward = struct {
 
     /// The backbone's layers, then the head.
     fn backbone(f: *Forward, a: std.mem.Allocator) ![]const u32 {
+        if (f.layers) |ls| return ls;
         const ls = try a.alloc(u32, f.cfg.layers);
         for (ls, 0..) |*l, i| l.* = @intCast(i);
         return ls;
@@ -78,7 +83,8 @@ pub const Forward = struct {
         return p;
     }
 
-    /// The calls of an `n`-row window (positions are the glue's; the program does not change with them).
+    /// The calls of an `n`-row window at the slot's last position: the largest every role gets (the buffer plan sizes
+    /// from it). A window's own calls depend on its position (the indexer's key count), so window() emits them anew.
     pub fn program(f: *Forward, n: u32) ![]const calls.Call {
         if (f.programs.get(n)) |cs| return cs;
         const a = f.arena.allocator();
@@ -91,7 +97,10 @@ pub const Forward = struct {
     /// One decode window: `ids` at the slot's position. This rank's logits stay in the runner's "w.logits".
     pub fn window(f: *Forward, ids: []const u32) !void {
         if (ids.len == 0 or f.slot.pending != null) return error.BadWindow;
-        const cs = try f.program(@intCast(ids.len));
+        // the window's calls at its position (the indexer's scores and top-k grow with the cache: NK = end / ratio)
+        var wa = std.heap.ArenaAllocator.init(f.gpa);
+        defer wa.deinit();
+        const cs = try block.emit(wa.allocator(), f.cfg, f.widths, f.opts, try f.backbone(wa.allocator()), @intCast(ids.len), @intCast(f.slot.pos), true);
         f.ids = ids;
         f.slot.pending = .{ .start = f.slot.pos, .n = @intCast(ids.len) };
         f.runner.glue = .{ .ctx = f, .run = glueFn };
@@ -204,6 +213,17 @@ pub const Forward = struct {
             return k.kitWeights(try r.tensorAddr(c.args[0].arg.t), try r.tensorAddr(c.args[1].arg.t), numel(c.args[0].arg.t));
         if (std.mem.eql(u8, step, "kit_logits")) return k.kitLogits(try r.tensorAddr(c.args[0].arg.t), numel(c.args[0].arg.t));
         if (std.mem.eql(u8, step, "engram_rows")) return f.engramRows(r, c);
+        if (std.mem.eql(u8, step, "trace")) {
+            const map = f.trace orelse return;
+            const t = c.args[0].arg.t;
+            const host = try f.gpa.alloc(u8, 2 * numel(t));
+            defer f.gpa.free(host);
+            try r.stream.synchronize();
+            try cuda.DeviceBuffer.download(.{ .d = r.d, .ptr = try r.tensorAddr(t), .len = host.len }, 0, host);
+            var sha: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(host, &sha, .{});
+            return map.put(f.gpa, @intCast(c.args[1].arg.i), std.fmt.bytesToHex(sha, .lower));
+        }
         return glueMissing(step);
     }
 

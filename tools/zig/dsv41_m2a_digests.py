@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""DeepSeek-V4.1 M2a reference: the Python engine's whole backbone on ONE GPU at rank 0 of TP=2 (the peer's half of
-every exchange zeros, Engram rows a function of the row index: dsv41_m1_capture.py's ZeroPeer / IndexRows), a prompt,
-then decode windows of 1, 3 and 16 rows. Per window: each block's streams after it (``Forward.trace``) as a SHA-256,
+"""DeepSeek-V4.1 M2a reference: the Python engine's backbone layers 0-24 (every layer kind; rank 0's half of the whole
+backbone does not fit one 96 GB GPU) and the head on ONE GPU at rank 0 of TP=2 (the peer's half of every exchange
+zeros, Engram rows a function of the row index: dsv41_m1_capture.py's ZeroPeer / IndexRows), a prompt (Python's own
+prefill), its slot state dumped under our forward's role names (the window inputs M2a starts from: positions below the
+index top-k take other paths), then decode windows of 1, 3 and 16 rows. Per window: each block's streams after it (``Forward.trace``) as a SHA-256,
 and this rank's logits (fp32, raw). No launch is recorded: the digests are what tf-dsv41-m2a compares against our
 forward, layer by layer.
 
     python dsv41_m2a_digests.py --pack PACK --out DIR [--prompt 1536] [--seed 4101]
-Writes DIR/digests.json (meta, windows: ids, per-layer digests, logits file + digest) and DIR/logits-w<n>.bin.
+Writes DIR/digests.json (meta, every id, windows: per-layer digests, logits file + digest), DIR/logits-w<n>.bin,
+DIR/state/ (the slot after the prompt: SWA rings, compressed rows, index keys, ratio-2 carries; state.json maps
+role -> file), DIR/rope.bin (dsv41_rope_tables.py's format, this host's tables) and DIR/aot/ (every Triton variant the run launched, in
+the engine's aot.json form: the Zig forward launches through it).
 """
 from __future__ import annotations
 
@@ -35,12 +40,17 @@ def main() -> int:
     ap.add_argument("--prompt", type=int, default=1536)
     ap.add_argument("--limit", type=int, default=4096)
     ap.add_argument("--seed", type=int, default=4101)
+    ap.add_argument("--layers", default="0-24", help="backbone layers a-b (consecutive from 0: their sources load)")
     a = ap.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     sys.path.insert(0, str(HERE))
+    import struct
+
     import torch
-    from dsv41_m1_capture import IndexRows, ZeroPeer
+    import triton_aot_manifest as aot
+    from dsv41_m1_capture import IndexRows, ZeroPeer, pack_aot, specialization
+    from tensorfold.families.deepseek_v41.cuda import rope as RO
     from tensorfold.families.deepseek_v41.cuda import weights as W
     from tensorfold.families.deepseek_v41.cuda.config import Config
     from tensorfold.families.deepseek_v41.cuda.csa2.backend import Triton
@@ -57,7 +67,8 @@ def main() -> int:
     vh = cfg.vocab_size // 2
     embed = loader._dev(src.rows("embed.weight", 0, vh).to(torch.bfloat16))
     head, norm = loader.x3("head", "col"), loader.native("norm.weight")
-    layers = [loader.layer(L) for L in range(cfg.num_hidden_layers)]
+    lo, hi = (int(v) for v in a.layers.split("-"))
+    layers = [loader.layer(L) for L in range(lo, hi + 1)]
     tree = W.RankW(0, 2, 0, embed, layers, norm, head, None, {})
     load_s = time.time() - t0
     rows = {L: IndexRows(cfg.engram_head_dim) for L in cfg.engram_layer_ids}
@@ -68,10 +79,36 @@ def main() -> int:
     ids = torch.randint(3, vh, (a.prompt + sum(WINDOWS),), generator=g).tolist()
     fw.prompt(ids[:a.prompt])
     pos = a.prompt
+    # the slot after the prompt, by our forward's role names (block.zig: s.L<i>.swa / comp .v .s, .ik, .carry)
+    torch.cuda.synchronize()
+    sd = out / "state"
+    sd.mkdir(exist_ok=True)
+    roles = {}
+    s0 = fw.slot
+
+    def put(role, t):
+        f = sd / f"{role}.bin"
+        f.write_bytes(t.contiguous().view(torch.uint8).cpu().numpy().tobytes())
+        roles[role] = f.name
+
+    for L in range(lo, hi + 1):
+        v, sc = s0.swa[L].kernel()
+        put(f"s.L{L}.swa.v", v)
+        put(f"s.L{L}.swa.s", sc)
+        if L in s0.comp:
+            v, sc = s0.comp[L].kernel()
+            put(f"s.L{L}.comp.v", v)
+            put(f"s.L{L}.comp.s", sc)
+            put(f"s.L{L}.ik", s0.ikeys[L].kernel())
+        if L in s0.carry:
+            put(f"s.L{L}.carry", s0.carry[L])
+    (sd / "state.json").write_text(json.dumps({"pos": s0.pos, "tail": list(s0.tail), "roles": roles}, indent=1) + "\n")
+    rec = aot.Recorder().install()
     meta = {"pack": str(pack), "prompt": a.prompt, "limit": a.limit, "seed": a.seed, "load_s": round(load_s, 1),
             "torch": torch.__version__, "gpu": torch.cuda.get_device_name(0),
             "env": {k: v for k, v in os.environ.items() if k.startswith("TF_DSV41")}, "peer": "zeros",
-            "engram_rows": "index function (dsv41_m1_capture.IndexRows)", "windows": []}
+            "engram_rows": "index function (dsv41_m1_capture.IndexRows)", "layers": list(range(lo, hi + 1)),
+            "ids": ids, "prompt_windows": 16, "windows": []}
     for n in WINDOWS:
         fw.trace = {}
         start = fw.slot.pos
@@ -86,6 +123,14 @@ def main() -> int:
         fw.keep(0, n - 1)
         pos += n
     meta["run_s"] = round(time.time() - t0 - load_s, 1)
+    # the rope tables of this host (torch's CPU cos / sin), and the Triton variants the run launched
+    tabs = RO.tables(cfg, a.limit + 2048)
+    (out / "rope.bin").write_bytes(b"DSV41RP1" + struct.pack("<II", *tabs[0].cs.shape) + tabs[0].cs.contiguous().numpy().tobytes()
+                                   + tabs[1].cs.contiguous().numpy().tobytes())
+    rec.dump(out / "launches.json")
+    cache = Path(os.environ.get("TRITON_CACHE_DIR", Path.home() / ".triton" / "cache"))
+    aot.build(cache, out / "launches.json", out / "manifest.json", None)
+    meta["aot"] = pack_aot(out / "manifest.json", cache, out / "aot", specialization())
     (out / "digests.json").write_text(json.dumps(meta, indent=1) + "\n")
     print(json.dumps({"windows": len(meta["windows"]), "layers": len(meta["windows"][0]["layers"]),
                       "load_s": meta["load_s"], "run_s": meta["run_s"]}))
