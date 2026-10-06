@@ -104,6 +104,14 @@ pub fn gmSmemBytes(t: [5]u32, mats: u32, xm: u32, k2: u32) usize {
 
 pub const GmKind = enum { gu, dn };
 
+/// x3gm_plan.cu takes E < 512 experts.
+pub const plan_max_experts = 512;
+
+/// x3gm.plan's table length: P / bm + E + 1 passes at most.
+pub fn planPasses(pairs: usize, experts: usize, bm: usize) usize {
+    return pairs / bm + experts + 1;
+}
+
 /// x3gm.fits: whether a configuration builds a CTA at this width (gate/up: `xm` rotated inputs) on sm_121.
 pub fn gmFits(kind: GmKind, cfg: usize, k2: u32, xm: u32) bool {
     return switch (kind) {
@@ -213,9 +221,10 @@ pub const Functions = struct {
     gm_dn: [gm_k2s.len][dn_tiles.len]Gm,
     gm_rot: [2][2]cuda.Function, // [bf16, fp16][mats - 1]
     gm_dequant: [gm_k2s.len]cuda.Function,
+    gm_plan: cuda.Function,
 
     /// Resolves every instance (a wrong name fails here, not on a rare path) and opts x3gm into its shared memory.
-    pub fn resolve(experts: cuda.Module, x3ld: cuda.Module, x3pf: cuda.Module, x3gm: cuda.Module) !Functions {
+    pub fn resolve(experts: cuda.Module, x3ld: cuda.Module, x3pf: cuda.Module, x3gm: cuda.Module, x3gm_plan: cuda.Module) !Functions {
         var f: Functions = undefined;
         inline for (ld_cfgs, 0..) |c, ci| inline for (ranges, 0..) |r, ri| {
             f.ld[0][ci][ri] = try x3ld.function(ldSymbol(c[0], c[1], r[0], r[1], 0));
@@ -241,6 +250,7 @@ pub const Functions = struct {
             inline for (0..dn_tiles.len) |c| f.gm_dn[ki][c] = try gmResolve(x3gm, gmDnSymbol(k2, c), GmShape.of(1, 1, k2, dn_tiles[c]));
             f.gm_dequant[ki] = try x3gm.function(gmDequantSymbol(k2));
         }
+        f.gm_plan = try x3gm_plan.function("_ZN15dsv41_x3gm_plan11plan_kernelEPKiiiiPiS2_S2_S2_S2_");
         f.gm_rot = .{ .{ try x3gm.function(gm_sym.rot_bf16_1), try x3gm.function(gm_sym.rot_bf16_2) }, .{ try x3gm.function(gm_sym.rot_f16_1), try x3gm.function(gm_sym.rot_f16_2) } };
         return f;
     }
@@ -477,6 +487,17 @@ pub const Ops = struct {
             a.t1 = td;
         }
         try o.gmLaunch(o.f.gm_dn[ki][cfg], a, use_ticket);
+    }
+
+    /// x3gm.plan on the device (x3gm_plan.cu): the passes of `pairs` picks (values 0..E, E = not this launch) in
+    /// members of `bm`: order [pairs], pe / poff / pcnt [planPasses(pairs, E, bm)], npass [1]; torch's integers.
+    pub fn gmPlan(o: Ops, pick: u64, pairs: usize, E: usize, bm: usize, order: u64, pe: u64, poff: u64, pcnt: u64, npass: u64) !void {
+        if (E < 1 or E >= plan_max_experts or bm < 1 or pairs < 1) return error.Shape;
+        var a: cuda.Args = .{};
+        a.add(pick);
+        for ([_]usize{ pairs, E, bm }) |v| a.add(int(v));
+        for ([_]u64{ order, pe, poff, pcnt, npass }) |v| a.add(v);
+        try go(o.f.gm_plan, o.s, .{ 1, 1, 1 }, 512, 0, false, &a);
     }
 
     /// dsv41_x3gm_dequant_cuda: W_q [K, N] fp16 through the gm kernels' decode_a (tests).

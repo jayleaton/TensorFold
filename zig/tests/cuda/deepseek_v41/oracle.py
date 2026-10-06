@@ -201,6 +201,7 @@ def x3gm_case(out: Path, g, *, R, slots, E, D, I, k2g, k2d, shx, input_dtype, li
                     w = (k2dw if kind == "dn" else k2w)[pick.long()]
                     pk = torch.where(w == k2, pick, torch.full_like(pick, E))
                 order, pe, poff, pcnt, npass = gm.plan(pk, E, gm.bm_of(kind, c))
+                arrays[f"run{r}_{kind}_{k2}_pk"] = pk.contiguous()          # x3gm_plan.cu's input
                 for part, t in zip(("order", "pe", "poff", "pcnt", "npass"), (order, pe, poff, pcnt, npass)):
                     arrays[f"run{r}_{kind}_{k2}_{part}"] = t
                 ticket.zero_()
@@ -227,6 +228,25 @@ def x3gm_case(out: Path, g, *, R, slots, E, D, I, k2g, k2d, shx, input_dtype, li
     torch.cuda.synchronize()
     save(out, params, arrays)
     return {"runs": len(runs), "ragged": ragged}
+
+
+def plan_case(out: Path, g) -> dict:
+    """x3gm.plan at prod sizes (2,048 / 4,096-row blocks over 384 experts, DSpark's 128) with pairs sent past the
+    table (a ragged launch's other widths), for x3gm_plan.cu."""
+    cases = [(2048, 6, 384, 64, 0.0), (4096, 6, 384, 128, 0.3), (1, 6, 384, 64, 0.0), (2048, 6, 128, 64, 0.5),
+             (3, 7, 13, 64, 0.0), (700, 6, 384, 128, 0.9)]
+    arrays, params = {}, {"kind": "plan", "cases": len(cases)}
+    for i, (R, S, E, bm, past) in enumerate(cases):
+        pk = torch.randint(0, E, (R, S), generator=g, dtype=torch.int32)
+        pk[torch.rand(R, S, generator=g) < past] = E
+        pk = pk.to(DEV)
+        order, pe, poff, pcnt, npass = gm.plan(pk, E, bm)
+        params.update({f"c{i}_E": E, f"c{i}_bm": bm, f"c{i}_P": R * S})
+        arrays.update({f"c{i}_pk": pk, f"c{i}_order": order, f"c{i}_pe": pe, f"c{i}_poff": poff, f"c{i}_pcnt": pcnt,
+                       f"c{i}_npass": npass})
+    torch.cuda.synchronize()
+    save(out, params, arrays)
+    return {"cases": len(cases)}
 
 
 def main() -> None:
@@ -269,6 +289,7 @@ def main() -> None:
                                           k2g=widths_g, k2d=widths_d, shx=False, input_dtype=torch.float16,
                                           limit=10.0, runs=["tuned", (1, 0, True), (2, 4, True)],
                                           dequant=(128, 128, 10))
+    report["x3gm_plan"] = plan_case(out / "x3gm_plan", g)
     (out.parent / "oracle.json").write_text(json.dumps({"device": torch.cuda.get_device_name(0), **report}, indent=1))
     print(json.dumps(report, indent=1))
 

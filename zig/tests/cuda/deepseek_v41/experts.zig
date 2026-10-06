@@ -296,6 +296,7 @@ pub fn x3gm(gpu: Gpu, k: *const dsv41.Kernels, dir: []const u8) !void {
         for (exl3.gm_k2s) |k2| {
             const pl = (try plan(&b, fx, r, "gu", k2)) orelse continue;
             const cg: usize = @intCast(try fx.int(try std.fmt.bufPrint(&name_buf, "run{d}_gu_{d}", .{ r, k2 })));
+            try nativePlan(&b, fx, o, stream, r, "gu", k2, P, cg);
             try ticket.fill8(0, null);
             try o.gmGateup(xg, xu, tg.ptr, tu.ptr + base_u, pl[0], pl[1], pl[2], pl[3], pl[4], ticket.ptr, svh_g.ptr, svh_u.ptr, suh_d.ptr, xd.ptr, D, I, k2, shx, cg, tk, limit, ragged);
             launches += 1;
@@ -305,6 +306,7 @@ pub fn x3gm(gpu: Gpu, k: *const dsv41.Kernels, dir: []const u8) !void {
         for (exl3.gm_k2s) |k2| {
             const pl = (try plan(&b, fx, r, "dn", k2)) orelse continue;
             const cd: usize = @intCast(try fx.int(try std.fmt.bufPrint(&name_buf, "run{d}_dn_{d}", .{ r, k2 })));
+            try nativePlan(&b, fx, o, stream, r, "dn", k2, P, cd);
             try ticket.fill8(0, null);
             try o.gmDown(xd.ptr, td.ptr + base_d, pl[0], pl[1], pl[2], pl[3], pl[4], ticket.ptr, svh_d.ptr, y.ptr, I, D, k2, cd, tk, ragged);
             launches += 1;
@@ -330,6 +332,58 @@ pub fn x3gm(gpu: Gpu, k: *const dsv41.Kernels, dir: []const u8) !void {
         try same(gpu, fx, dq, "dequant_up", "upstream dequant");
     }
     check.pass("BITEXACT x3gm {s}: R {d} x {d} slots, D {d}, I {d}, {s}, shx {}: rot, {d} runs ({d} launches), combine", .{ std.fs.path.basename(dir), R, slots, D, I, if (ragged) "ragged" else "stacked", shx, runs, launches });
+}
+
+/// x3gm_plan.cu against torch's x3gm.plan on prod-sized picks (the "plan" case).
+pub fn planCases(gpu: Gpu, k: *const dsv41.Kernels, dir: []const u8) !void {
+    var fx = try Fixture.open(gpu.gpa, gpu.io, dir);
+    defer fx.deinit();
+    var b: Bufs = .{ .gpu = gpu, .fx = &fx };
+    defer b.deinit();
+    var stream = try cuda.Stream.init(gpu.d, true);
+    defer stream.deinit();
+    const o = k.experts(stream);
+    var name_buf: [64]u8 = undefined;
+    const n = try size(fx, "cases");
+    for (0..n) |i| {
+        const P = try size(fx, try std.fmt.bufPrint(&name_buf, "c{d}_P", .{i}));
+        const E = try size(fx, try std.fmt.bufPrint(&name_buf, "c{d}_E", .{i}));
+        const bm = try size(fx, try std.fmt.bufPrint(&name_buf, "c{d}_bm", .{i}));
+        const T = exl3.planPasses(P, E, bm);
+        const pk = try b.up(try std.fmt.bufPrint(&name_buf, "c{d}_pk", .{i}));
+        const order = try b.zeros(P * 4, 0xee);
+        const pe = try b.zeros(T * 4, 0xee);
+        const poff = try b.zeros(T * 4, 0xee);
+        const pcnt = try b.zeros(T * 4, 0xee);
+        const npass = try b.zeros(4, 0xee);
+        try o.gmPlan(pk.ptr, P, E, bm, order.ptr, pe.ptr, poff.ptr, pcnt.ptr, npass.ptr);
+        try stream.synchronize();
+        for ([_][]const u8{ "order", "pe", "poff", "pcnt", "npass" }, [_]cuda.DeviceBuffer{ order, pe, poff, pcnt, npass }) |part, buf| {
+            const name = try std.fmt.bufPrint(&name_buf, "c{d}_{s}", .{ i, part });
+            try same(gpu, fx, buf, name, name);
+        }
+    }
+    check.pass("BITEXACT x3gm_plan.cu == torch x3gm.plan on {d} cases (up to 24,576 pairs, 384 experts)", .{n});
+}
+
+/// x3gm_plan.cu on the plan's input picks against torch's x3gm.plan (the arrays the launches then use).
+fn nativePlan(b: *Bufs, fx: Fixture, o: exl3.Ops, stream: cuda.Stream, r: usize, kind: []const u8, k2: u32, P: usize, cfg: usize) !void {
+    var name_buf: [64]u8 = undefined;
+    const pk = try b.up(try std.fmt.bufPrint(&name_buf, "run{d}_{s}_{d}_pk", .{ r, kind, k2 }));
+    const E = try size(fx, "E");
+    const bm: usize = exl3.gmMembers(if (kind[0] == 'g') .gu else .dn, cfg);
+    const T = exl3.planPasses(P, E, bm);
+    const order = try b.zeros(P * 4, 0xee);
+    const pe = try b.zeros(T * 4, 0xee);
+    const poff = try b.zeros(T * 4, 0xee);
+    const pcnt = try b.zeros(T * 4, 0xee);
+    const npass = try b.zeros(4, 0xee);
+    try o.gmPlan(pk.ptr, P, E, bm, order.ptr, pe.ptr, poff.ptr, pcnt.ptr, npass.ptr);
+    try stream.synchronize();
+    for ([_][]const u8{ "order", "pe", "poff", "pcnt", "npass" }, [_]cuda.DeviceBuffer{ order, pe, poff, pcnt, npass }) |part, buf| {
+        const name = try std.fmt.bufPrint(&name_buf, "run{d}_{s}_{d}_{s}", .{ r, kind, k2, part });
+        try same(b.gpu, fx, buf, name, "x3gm_plan.cu vs x3gm.plan");
+    }
 }
 
 /// The plan arrays of (run, kind, width), uploaded; null when that width has no launch in the run.
