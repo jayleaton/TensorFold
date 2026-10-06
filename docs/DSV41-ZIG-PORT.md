@@ -252,6 +252,16 @@ Effort is in engineering days for this agent team, assuming GPU windows are avai
   - The bits only compare within one architecture, because the SASS differs between sm_120 and sm_121.
   - Either a GB10 window (the Sparks are owned by the Python-engine agent now) or a RunPod RTX PRO 6000 (sm_120) on the Python `tensorfold-dsv41:e1e2-…-sm120` image. RunPod needs approval: about 2 hours a run, roughly $4–5.
 
+- **State (2026-10-06): the M1 replay gate PASSES on one RTX PRO 6000** (sm_120, against the e1e2 runtime's Python engine on the q28-v2 pack). Pods 3 and 4:
+  - **Weights:** our loader's 480 tensors are bit-identical to the Python loader's.
+  - **Ops:** 1,206 launches of blocks 1-3 and 20-24 are bit-exact, both alone and chained on our own outputs:
+    - decode windows of 1, 3 and 16 rows, plus a 256-row prefill segment;
+    - every Triton kernel kind (71 variants);
+    - the EXL3 linears, x3seg, the routed-expert chain, x3gm, the fast-prefill GEMM and the split router.
+  - **Kernel exactness job:** 13/13 cases pass, and the SASS of the ported kernels is identical to the Python extensions'.
+  - Each M1 pod takes about 15-19 min and costs about $0.6.
+  - **Still open for M1:** set C, the DSpark block (layer 40), is running in pod 5. Then M1's second half: our own block forward (`block.zig`) driving these kernels in Python's order on our own buffers, with no captured inputs.
+
 **M2. Whole model, TP=2, greedy token-identical on GB10** (about 15–20 days).
 - **Build:**
   - `forward.zig` (window + prefill), `state.zig`/`pool.zig`, `sampler.zig`, `tp.zig` (bootstrap, follower, exchanges, fate channel).
