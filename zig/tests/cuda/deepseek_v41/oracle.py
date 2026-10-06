@@ -311,6 +311,48 @@ def pointwise_case(out: Path, g) -> dict:
     return {"rows": R}
 
 
+def glue_case(out: Path, g) -> dict:
+    """The window's torch glue (forward.py / pick.py) on edge values: ids out of the rank's range, -0 / +0, NaN,
+    inf, halfway and denormal values."""
+    V, D, lo, W, n = 200, 512, 1000, 3, 7
+    embed = torch.randn(V, D, generator=g).to(torch.bfloat16)
+    embed[3, :4] = torch.tensor([-0.0, float("nan"), float("inf"), 1e-40]).to(torch.bfloat16)
+    embed = embed.to(DEV)
+    ids = torch.tensor([1003, 999, 1199, 1200, 1000, 5, 1003], dtype=torch.long, device=DEV)
+    local = ids - lo                                                       # forward.embed_rows, then the bf16 send
+    ok = (local >= 0) & (local < V)
+    rows = embed.index_select(0, local.clamp(0, V - 1)).to(torch.float32)
+    rows = torch.where(ok[:, None], rows, torch.zeros_like(rows))
+    send = rows.to(torch.bfloat16)
+    recv = torch.randn(W, n, D, generator=g).to(torch.bfloat16)
+    recv[0, :, :8] = -0.0
+    recv[1, :, :4] = 0.0
+    recv[2, 0, :3] = torch.tensor([float("nan"), float("inf"), -float("inf")]).to(torch.bfloat16)
+    recv = recv.to(DEV)
+    parts = recv.float()                                                   # forward.allsum (parts fp32, rank order)
+    acc = parts[0].clone()
+    for r in range(1, W):
+        acc += parts[r]
+    summed = acc.to(torch.bfloat16).repeat(1, 4).contiguous()
+    x = torch.randn(n, D, generator=g) * 3
+    x[0, :8] = torch.tensor([float("nan"), float("inf"), -0.0, 1e-41, 70000.0, -70000.0, 1.0 + 2 ** -8, 1.0 + 3 * 2 ** -9])
+    x[1, :4] = torch.tensor([2 ** -20, 6.1e-5, 5.9e-8, 1.0 + 2 ** -11])
+    x = x.to(DEV)
+    cast = x.to(torch.bfloat16)
+    kw = x.to(torch.float16).to(torch.float32)                             # pick.kit_weights
+    kl = x.to(torch.bfloat16).to(x.dtype)                                  # pick.kit_logits
+    gc = torch.randn(W, n, 24, generator=g).to(torch.bfloat16).to(DEV)
+    cols = gc.view(W, n, 24).permute(1, 0, 2).reshape(n, -1).contiguous()  # forward.gather_cols
+    src = torch.randn(5, 1100, generator=g).to(torch.bfloat16).to(DEV)[:, :1024]
+    carry = src[2].to(torch.float32).contiguous()
+    torch.cuda.synchronize()
+    save(out, {"kind": "glue", "V": V, "D": D, "lo": lo, "W": W, "n": n, "c": 24, "ld": 1100, "row": 2, "start": 3000},
+         {"embed": embed, "ids": ids, "send": send, "recv": recv, "summed": summed, "x": x, "cast": cast, "kw": kw,
+          "kl": kl, "gc": gc, "cols": cols, "src": src.as_strided((5, 1100), (1100, 1)),   # the whole [5, 1100] rows (row stride 1,100)
+          "carry": carry})
+    return {"rows": n}
+
+
 def main() -> None:
     out = Path(sys.argv[1]) / "fixtures"
     g = torch.Generator().manual_seed(4141)
@@ -354,6 +396,7 @@ def main() -> None:
     report["x3gm_plan"] = plan_case(out / "x3gm_plan", g)
     report["topk_keys"] = topk_case(out / "topk_keys", g)
     report["pointwise"] = pointwise_case(out / "pointwise", g)
+    report["glue"] = glue_case(out / "glue", g)
     (out.parent / "oracle.json").write_text(json.dumps({"device": torch.cuda.get_device_name(0), **report}, indent=1))
     print(json.dumps(report, indent=1))
 

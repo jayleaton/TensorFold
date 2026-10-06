@@ -417,6 +417,81 @@ pub fn pointwiseCases(gpu: Gpu, k: *const dsv41.Kernels, dir: []const u8) !void 
     check.pass("BITEXACT pointwise.cu == torch: swiglu with limit ({d} x {d}, NaN / inf / -0.0), adds into fp32 and bf16", .{ R, n });
 }
 
+/// glue.cu against torch: the window's embedding send / sum, the casts, positions, gather_cols and the carry.
+pub fn glueCases(gpu: Gpu, k: *const dsv41.Kernels, dir: []const u8) !void {
+    var fx = try Fixture.open(gpu.gpa, gpu.io, dir);
+    defer fx.deinit();
+    var b: Bufs = .{ .gpu = gpu, .fx = &fx };
+    defer b.deinit();
+    var stream = try cuda.Stream.init(gpu.d, false); // blocking: ordered after the uploads on the default stream
+    defer stream.deinit();
+    const o = k.others(stream);
+    const V = try size(fx, "V");
+    const D = try size(fx, "D");
+    const W = try size(fx, "W");
+    const n = try size(fx, "n");
+    const c = try size(fx, "c");
+
+    const embed = try b.up("embed");
+    const ids = try b.up("ids");
+    const send = try b.zeros(n * D * 2, 0xee);
+    try o.embedSend(ids.ptr, n, embed.ptr, try fx.int("lo"), V, D, send.ptr);
+    const recv = try b.up("recv");
+    const summed = try b.zeros(n * 4 * D * 2, 0xee);
+    try o.embedSum(recv.ptr, W, n, D, summed.ptr);
+    const x = try b.up("x");
+    const cast = try b.zeros(n * D * 2, 0xee);
+    try o.castBf16(x.ptr, cast.ptr, n * D);
+    const kw = try b.zeros(n * D * 4, 0xee);
+    try o.kitWeights(x.ptr, kw.ptr, n * D);
+    const kl = try b.up("x");
+    try o.kitLogits(kl.ptr, n * D);
+    const gc = try b.up("gc");
+    const cols = try b.zeros(n * W * c * 2, 0xee);
+    try o.gatherCols(gc.ptr, W, n, c, cols.ptr);
+    const src = try b.up("src");
+    const row: usize = @intCast(try fx.int("row"));
+    const carry = try b.zeros(1024 * 4, 0xee);
+    try o.carry(src.ptr, @intCast(try fx.int("ld")), 0, row, 1024, carry.ptr);
+    // the device-held row (graph-safe form): the same bits
+    const acc = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.asBytes(&@as(i32, @intCast(row))));
+    try b.list.append(gpu.gpa, acc);
+    const carry2 = try b.zeros(1024 * 4, 0xee);
+    try o.carry(src.ptr, @intCast(try fx.int("ld")), acc.ptr, 0, 1024, carry2.ptr);
+    const start: i32 = @intCast(try fx.int("start"));
+    const pos = try b.zeros(4, 0xee);
+    const pos64 = try b.zeros(n * 8, 0xee);
+    const lo = try b.zeros(n * 4, 0xee);
+    try o.positions(start, n, pos.ptr, pos64.ptr, lo.ptr);
+    try stream.synchronize();
+
+    try same(gpu, fx, send, "send", "glue embed_send");
+    try same(gpu, fx, summed, "summed", "glue embed_sum");
+    try same(gpu, fx, cast, "cast", "glue cast_bf16");
+    try same(gpu, fx, kw, "kw", "glue kit_weights");
+    try same(gpu, fx, kl, "kl", "glue kit_logits");
+    try same(gpu, fx, cols, "cols", "glue gather_cols");
+    try same(gpu, fx, carry, "carry", "glue carry (host row)");
+    try same(gpu, fx, carry2, "carry", "glue carry (device row)");
+    // positions: no torch op to record; Win.make's values
+    var want_pos: [1]i32 = .{start};
+    const want64 = try gpu.gpa.alloc(i64, n);
+    defer gpu.gpa.free(want64);
+    const want_lo = try gpu.gpa.alloc(i32, n);
+    defer gpu.gpa.free(want_lo);
+    for (want64, want_lo, 0..) |*p, *l, i| {
+        p.* = start + @as(i64, @intCast(i));
+        l.* = 0;
+    }
+    for ([_]struct { cuda.DeviceBuffer, []const u8 }{ .{ pos, std.mem.sliceAsBytes(&want_pos) }, .{ pos64, std.mem.sliceAsBytes(want64) }, .{ lo, std.mem.sliceAsBytes(want_lo) } }) |pw| {
+        const got = try gpu.gpa.alloc(u8, pw[1].len);
+        defer gpu.gpa.free(got);
+        try pw[0].download(0, got);
+        try check.sameBytes("glue positions", got, pw[1]);
+    }
+    check.pass("BITEXACT glue.cu == torch: embed send / sum (W {d}), cast_bf16, kit_weights, kit_logits, gather_cols, carry, positions", .{W});
+}
+
 /// topk_keys.cu against pick.top (torch.topk on pick.keys) at k 1 / 5 / 64 / 1,024 over 64,640 columns.
 pub fn topkCases(gpu: Gpu, k: *const dsv41.Kernels, dir: []const u8) !void {
     var fx = try Fixture.open(gpu.gpa, gpu.io, dir);

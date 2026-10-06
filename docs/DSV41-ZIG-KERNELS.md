@@ -206,6 +206,7 @@ Each item gets a small `.cu` here (ours, checked bit-equal to torch on fixtures)
 | embedding: `index_select`, `where`, `clamp`, rank all-sum | every window | port lead (`forward.zig`); a gather `.cu` |
 | casts: `q.to(fp32)` before `_rope`, partials `.to(bf16)`, `kit_weights` fp32 -> fp16 -> fp32 | decode | folded into the consumers where the Python path allows, else torch_ops pointwise |
 | staging ring `index_copy_`, replay stash `cat` / `clone`, shadow-slot `copy_` | prefill, tree verify | device memcpy (`cuMemcpyAsync`); no kernel |
+| the window's glue (block.zig's `glue.*` steps): `embed_rows`' masked send and `allsum` (+ repeat x4), the MoE partial `.to(bf16)`, `kit_weights`, `kit_logits`, `Win.make`'s positions, `gather_cols`, the ratio-2 compressor carry | every window | **done**: `Z/glue.cu` (`--fmad=false`; casts through `__float2bfloat16` / `__float2half`, the intrinsics torch's CUDA casts use), `ops.Ops.embedSend / embedSum / castBf16 / kitWeights / kitLogits / positions / gatherCols / carry`, checked against torch on edge values (oracle kind `glue`) |
 
 ## 3.2b x3gm v2 and the R1 decode kernels
 

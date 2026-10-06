@@ -438,9 +438,10 @@ pub const Functions = struct {
     add_bf16: cuda.Function,
     kv_dense: cuda.Function,
     kv_gather: cuda.Function,
+    glue: [8]cuda.Function, // glue.syms order
 
     /// `pf`: the four pfdense modules (K2 8, 10, 12, 16).
-    pub fn resolve(m_attn: cuda.Module, m_topk: cuda.Module, m_mhc: cuda.Module, m_mhc_pf: cuda.Module, m_rg: cuda.Module, pf: [4]cuda.Module, m_gate: cuda.Module, m_pace: cuda.Module, m_l2pf: cuda.Module, m_keys: cuda.Module, m_pw: cuda.Module, m_kv: cuda.Module, optin: u32) !Functions {
+    pub fn resolve(m_attn: cuda.Module, m_topk: cuda.Module, m_mhc: cuda.Module, m_mhc_pf: cuda.Module, m_rg: cuda.Module, pf: [4]cuda.Module, m_gate: cuda.Module, m_pace: cuda.Module, m_l2pf: cuda.Module, m_keys: cuda.Module, m_pw: cuda.Module, m_kv: cuda.Module, m_glue: cuda.Module, optin: u32) !Functions {
         var f: Functions = undefined;
         inline for (0..8) |i| f.attn[i] = try m_attn.function(attn.symbol(if (i >= 4) 4 else 2, (i & 2) != 0, (i & 1) != 0));
         inline for (f.attn, 0..) |fun, i| {
@@ -485,6 +486,7 @@ pub const Functions = struct {
         f.add_bf16 = try m_pw.function("_ZN15dsv41_pointwise15add_bf16_kernelEPKfS1_P13__nv_bfloat16x");
         f.kv_dense = try m_kv.function("_ZN13dsv41_kvsplit12dense_kernelENS_9DenseArgsE");
         f.kv_gather = try m_kv.function("_ZN13dsv41_kvsplit13gather_kernelEPKhjPKjjPh");
+        inline for (glue.syms, 0..) |name, i| f.glue[i] = try m_glue.function(name);
         return f;
     }
 };
@@ -512,6 +514,25 @@ pub const kvsplit = struct {
 
     fn grid(words: u64) usize {
         return @intCast(@max(1, @min((words + 255) / 256, 4096)));
+    }
+};
+
+/// glue.cu: the window's torch glue (forward.py / pick.py), torch's arithmetic bit for bit.
+pub const glue = struct {
+    pub const syms = [_][:0]const u8{
+        "_ZN10dsv41_glue17embed_send_kernelEPKxiPKtxiiPt",
+        "_ZN10dsv41_glue16embed_sum_kernelEPKtiiiPt",
+        "_ZN10dsv41_glue16cast_bf16_kernelEPKfPtx",
+        "_ZN10dsv41_glue18kit_weights_kernelEPKfPfx",
+        "_ZN10dsv41_glue17kit_logits_kernelEPfx",
+        "_ZN10dsv41_glue16positions_kernelEiiPiPxS0_",
+        "_ZN10dsv41_glue18gather_cols_kernelEPKtiiiPt",
+        "_ZN10dsv41_glue12carry_kernelEPKtxPKiiiPf",
+    };
+    pub const Kind = enum(u3) { embed_send, embed_sum, cast_bf16, kit_weights, kit_logits, positions, gather_cols, carry };
+
+    fn grid(n: u64) usize {
+        return @intCast(@max(1, @min((n + 255) / 256, 4096)));
     }
 };
 
@@ -733,6 +754,100 @@ pub const Ops = struct {
         args.add(n);
         args.add(send);
         try o.go(o.f.kv_gather, .{ kvsplit.grid(words), 1, 1 }, 256, 0, null, &args);
+    }
+
+    fn glueGo(o: Ops, kind: glue.Kind, n: u64, args: *cuda.Args) !void {
+        try o.go(o.f.glue[@intFromEnum(kind)], .{ glue.grid(n), 1, 1 }, 256, 0, null, args);
+    }
+
+    /// forward.embed_rows' send: rows [n, D] bf16 = embed[ids - vocab_lo] where 0 <= ids - vocab_lo < V, else +0
+    /// (`ids` int64 [n], `embed` this rank's bf16 [V, D] slice).
+    pub fn embedSend(o: Ops, ids: u64, n: usize, embed: u64, vocab_lo: i64, V: usize, D: usize, rows: u64) !void {
+        if (n == 0) return;
+        var a: cuda.Args = .{};
+        a.add(ids);
+        a.add(@as(c_int, @intCast(n)));
+        a.add(embed);
+        a.add(vocab_lo);
+        a.add(@as(c_int, @intCast(V)));
+        a.add(@as(c_int, @intCast(D)));
+        a.add(rows);
+        try o.glueGo(.embed_send, @as(u64, n) * D, &a);
+    }
+
+    /// forward.allsum then .to(bf16).repeat(1, 4): recv [W, n, D] bf16 -> out [n, 4 D] bf16 (fp32 adds in rank order
+    /// from rank 0's value, one rounding).
+    pub fn embedSum(o: Ops, recv: u64, W: usize, n: usize, D: usize, out: u64) !void {
+        if (n == 0) return;
+        if (W < 1) return error.Shape;
+        var a: cuda.Args = .{};
+        a.add(recv);
+        for ([_]usize{ W, n, D }) |v| a.add(@as(c_int, @intCast(v)));
+        a.add(out);
+        try o.glueGo(.embed_sum, @as(u64, n) * D, &a);
+    }
+
+    /// y bf16 = x.to(bf16) over n elements (the MoE partial into the exchange).
+    pub fn castBf16(o: Ops, x: u64, y: u64, n: usize) !void {
+        if (n == 0) return;
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(y);
+        a.add(@as(i64, @intCast(n)));
+        try o.glueGo(.cast_bf16, n, &a);
+    }
+
+    /// pick.kit_weights: y = x.to(fp16).to(fp32) over n elements (y may be x).
+    pub fn kitWeights(o: Ops, x: u64, y: u64, n: usize) !void {
+        if (n == 0) return;
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(y);
+        a.add(@as(i64, @intCast(n)));
+        try o.glueGo(.kit_weights, n, &a);
+    }
+
+    /// pick.kit_logits in place: x = x.to(bf16).to(fp32) over n elements.
+    pub fn kitLogits(o: Ops, x: u64, n: usize) !void {
+        if (n == 0) return;
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(@as(i64, @intCast(n)));
+        try o.glueGo(.kit_logits, n, &a);
+    }
+
+    /// Win.make's tensors: pos int32 [1] = start, pos64 int64 [n] = start + i, lo int32 [n] = 0.
+    pub fn positions(o: Ops, start: i32, n: usize, pos: u64, pos64: u64, lo: u64) !void {
+        var a: cuda.Args = .{};
+        a.add(start);
+        a.add(@as(c_int, @intCast(n)));
+        a.add(pos);
+        a.add(pos64);
+        a.add(lo);
+        try o.go(o.f.glue[@intFromEnum(glue.Kind.positions)], .{ (@max(n, 1) + 255) / 256, 1, 1 }, 256, 0, null, &a);
+    }
+
+    /// forward.gather_cols after the all-gather: recv [W, n, c] -> out [n, W c] (2-byte elements, rank order).
+    pub fn gatherCols(o: Ops, recv: u64, W: usize, n: usize, c: usize, out: u64) !void {
+        if (n == 0 or c == 0) return;
+        var a: cuda.Args = .{};
+        a.add(recv);
+        for ([_]usize{ W, n, c }) |v| a.add(@as(c_int, @intCast(v)));
+        a.add(out);
+        try o.glueGo(.gather_cols, @as(u64, W) * n * c, &a);
+    }
+
+    /// The compressor's carry: carry fp32 [cols] = bf16 row of src (row stride ld elements); the row is *accepted
+    /// (int32 on the device, graph-safe) when `accepted` != 0, else `row`.
+    pub fn carry(o: Ops, src: u64, ld: usize, accepted: u64, row: usize, cols: usize, out: u64) !void {
+        var a: cuda.Args = .{};
+        a.add(src);
+        a.add(@as(i64, @intCast(ld)));
+        a.add(accepted);
+        a.add(@as(c_int, @intCast(row)));
+        a.add(@as(c_int, @intCast(cols)));
+        a.add(out);
+        try o.glueGo(.carry, cols, &a);
     }
 
     /// tfl2pf launch_segments: (address, bytes) table prefetched to L2 (bulk: cp.async.bulk.prefetch).
