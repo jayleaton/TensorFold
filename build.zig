@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const cuda_build = @import("zig/build/cuda.zig");
+const server_build = @import("zig/build/server.zig");
 
 comptime {
     const required = std.mem.trim(u8, @embedFile(".zig-version"), "\r\n");
@@ -87,6 +88,7 @@ pub fn build(b: *std.Build) void {
     }
     cuda_build.hostTests(b, draft_ids, test_step);
     dsv41HostTests(b, test_step);
+    server_build.tests(b, test_step);
     const flash_host = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/flashnext_host.zig"), .target = target, .optimize = optimize, .link_libc = true }) });
     b.step("compile-flashnext-host", "Compile FlashNext CPU metadata contracts without running them").dependOn(&flash_host.step);
     const flash_host_run = b.addRunArtifact(flash_host);
@@ -123,12 +125,13 @@ fn nativeServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
     // the HTTP side keeps its safety checks; the engine below it runs at `optimize`
     const tokenizer = b.createModule(.{ .root_source_file = b.path("zig/src/core/tokenizer/tokenizer.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true });
     const template = b.createModule(.{ .root_source_file = b.path("zig/src/core/template/template.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true });
+    const json = b.createModule(.{ .root_source_file = b.path("zig/src/server/json.zig"), .target = target, .optimize = .ReleaseSafe });
     const exe = b.addExecutable(.{ .name = "tensorfold-native", .root_module = b.createModule(.{
         .root_source_file = b.path("zig/src/server/main.zig"),
         .target = target,
         .optimize = .ReleaseSafe,
         .link_libc = true,
-        .imports = &.{ .{ .name = "engine_api", .module = api }, .{ .name = "tokenizer", .module = tokenizer }, .{ .name = "template", .module = template }, .{ .name = "native_engines", .module = engines } },
+        .imports = &.{ .{ .name = "engine_api", .module = api }, .{ .name = "tokenizer", .module = tokenizer }, .{ .name = "template", .module = template }, .{ .name = "json", .module = json }, .{ .name = "native_engines", .module = engines } },
     }) });
     const install = b.addInstallArtifact(exe, .{ .dest_dir = .{ .override = .{ .custom = "native/bin" } } });
     b.step("native", "tensorfold-native with the Metal engines into zig-out/native/bin (bundles: -Dcpu=apple_m1)").dependOn(&install.step);
@@ -137,7 +140,7 @@ fn nativeServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
         .target = target,
         .optimize = .Debug, // the server's unit tests run with safety checks, as zig_test.sh builds them
         .link_libc = true,
-        .imports = &.{ .{ .name = "engine_api", .module = api }, .{ .name = "tokenizer", .module = tokenizer }, .{ .name = "template", .module = template } },
+        .imports = &.{ .{ .name = "engine_api", .module = api }, .{ .name = "tokenizer", .module = tokenizer }, .{ .name = "template", .module = template }, .{ .name = "json", .module = json } },
     });
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests })).step);
     // the engine seam's own tests (lane_host.zig), as zig/tests/server/zig_test.sh runs them
