@@ -175,7 +175,18 @@ Rules from `ZIG-PREVIEW.md`:
   - the 14 oracle cases;
   - `embed_send`'s NaN edge.
 - **M2 next:**
-  - **M2b**, TP=2 on two GPUs in one pod over NCCL: the whole backbone, both ranks, against Python's TP=2. It needs the `tp` session bootstrap in `forward.zig`'s driver and a two-rank Python reference.
+  - **M2b**, as built (a413ce3), is `tf-dsv41-m1 m2b`: one process per rank, run in parallel by `m2b_ranks.sh`.
+    - **Setup:** each rank opens the `tp` runtime's NCCL session and loads its weights for layers 0–27 plus the head. Both start from the Python engine's state after its own 1,536-token prompt.
+    - **Run:** 64 greedy tokens, one per window.
+    - **Greedy,** as Python's `forward.greedy`: each rank's max with the lowest column, then the f64 (value, id) pairs all-gathered. The higher value wins; on ties, the lower rank.
+    - **Compared:** every token, every step's logits digest per rank, and the first window's block streams per rank.
+    - **Reference:** `tools/zig/dsv41_m2b_ref.py`, the Python engine at TP=2 over `tensorfold.cuda.comm` NCCL.
+    - **Expert top-p is off** (`Options.expert_topp = null`). With no prune, the router's tail folds the kit rounding and grouping itself, as for DSpark.
+    - **Why layers 0–27:** the whole backbone needs about 110 GB a rank, and a PRO 6000 has 96 GB. 0–27 is about 69 GB a rank and includes every layer kind: SWA, both Engram positions, ratio-2 and ratio-1 KV sources, the candidate source, Reindex, and reuse. The whole model is a Spark run (M2c).
+    - **Pod job (`M1_JOB=m2b`, 2 GPUs):**
+      - those shards copied to local NVMe in parallel (`Pack.open` now skips index shards the folder lacks);
+      - the prod twin's extensions prebuilt for sm_120 (`e1e2x.tar.gz`; pods 10–11 JIT-built them each time);
+      - the reference, both ranks, then the kernel job.
   - Graphs and the R3/R4 work come after M2b.
   - **The superseded "next pod" list:**
 
