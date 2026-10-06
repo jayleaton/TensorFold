@@ -285,11 +285,14 @@ pub const Forward = struct {
 
     /// Ours for a seeded role we know how to build (null: not one of ours).
     fn build(f: *Forward, a: std.mem.Allocator, role: []const u8) !?[]const u8 {
-        if (std.mem.endsWith(u8, role, ".T")) { // strips of "<prefix>.trellis" (int16 [kt, nt, words])
-            const w = role[2 .. role.len - 2];
+        // strips of "<prefix>.trellis" (int16 [kt, nt, words]), and dense3's lanes layout of them
+        const lanes = std.mem.endsWith(u8, role, ".lanes");
+        if (lanes or std.mem.endsWith(u8, role, ".T")) {
+            const w = role[2 .. role.len - (if (lanes) ".lanes".len else ".T".len)];
             const tr = try f.download(a, try std.fmt.allocPrint(a, "{s}.trellis", .{w}));
             const g = try f.groupShape(w);
-            return try prepare.strips(a, tr, g[0], g[1], g[2]);
+            const st = try prepare.strips(a, tr, g[0], g[1], g[2]);
+            return if (lanes) try prepare.lanes(a, st, g[0], g[2] / 8) else st;
         }
         if (std.mem.endsWith(u8, role, ".fn16")) { // the mHC weights rounded to bf16
             const src = try f.download(a, try std.fmt.allocPrint(a, "{s}.fn", .{role[2 .. role.len - 5]}));

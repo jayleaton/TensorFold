@@ -136,10 +136,15 @@ pub const Emitter = struct {
     // -----------------------------------------------------------------------------------------------------------
     // dense EXL3 projections
 
-    /// A trellis's run-time strips (int32 [N/128, K/16, 8, 4 K2]): "s.<weight>.T".
+    /// A trellis's run-time words (int32 [N/128, K/16, 8, 4 K2]): upstream's strips "s.<weight>.T", or dense3's lanes
+    /// layout of them "s.<weight>.lanes" (prepare.strips, prepare.lanes).
     pub fn strips(e: *Emitter, w: []const u8, k: i64, n: i64) !Arg {
+        return e.words(w, k, n, "T");
+    }
+
+    fn words(e: *Emitter, w: []const u8, k: i64, n: i64, form: []const u8) !Arg {
         const k2: i64 = try e.w.k2(w);
-        return e.t(.{ .buf = try e.fmt("s.{s}.T", .{w}) }, .i32, &.{ @divExact(n, 128), @divExact(k, 16), 8, 4 * k2 });
+        return e.t(.{ .buf = try e.fmt("s.{s}.{s}", .{ w, form }) }, .i32, &.{ @divExact(n, 128), @divExact(k, 16), 8, 4 * k2 });
     }
 
     /// Bytes of a group's trellis (= its strips).
@@ -181,7 +186,7 @@ pub const Emitter = struct {
             for (l.segs[0..l.count], 0..) |si, j| {
                 const s = segs[si];
                 const p = ps[si];
-                T[j] = try e.strips(p.w, @intCast(p.k), @intCast(p.n));
+                T[j] = try e.words(p.w, @intCast(p.k), @intCast(p.n), "lanes");
                 svh[j] = try e.weight("{s}.svh", .{p.w}, .f16, &.{@intCast(p.n)});
                 ys[j] = p.y;
                 const st = dense.strides(s.k, s.k2);

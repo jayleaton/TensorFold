@@ -295,8 +295,36 @@ Effort is in engineering days for this agent team, assuming GPU windows are avai
     9. `mhc_cuda.run`, `router_gemv.route`, `_prune` (top-p 0.85).
     10. Experts: `group`, `rot_in`, `x3ld` gate/up, `gateup_epilogue`, `x3ld` down, `down_combine`.
   - Every `.cu` op has a typed launcher in `dsv41_kernels` (`kernels_ops.zig`, `kernels_dense.zig`, `kernels_exl3.zig`). The Triton ops go through the M1 AOT set. Pod 6's capture, with every argument, is the per-op spec (`dsv41-zig-ref/prod-block-L2.txt`).
-  - **`block.zig`** issues the launches on our own buffers. `state.zig` holds the per-slot SWA ring, compressed rows, index keys and ratio-2 carry, through the KV agent's `DevicePool` once it lands.
-  - **Gate:** `tf-dsv41-m1 forward` runs our block on the capture's window inputs only (ids, positions, the prompt's KV state) and compares each of our launches, in order, with the capture's op at the same position: the same kernel, the same scalar arguments, and bit-equal buffers. Derived weights are compared byte for byte with the capture's copies.
+  - **As built (41ce3ed):**
+    - `block.zig` + `block_moe.zig` emit a decode window (`block.emit(cfg, widths, options, layers, n, start, head)`) as `calls.Call`s:
+      - each call is a Triton function and grid with named arguments, or an extension function with its arguments;
+      - every tensor is named by role: `s.` persists (run-time weight forms, pools, scratch), `w.` is the window's, `L.` is the layer's.
+    - `Widths` is the interface to the loader: the dense K2s by weight prefix, and each routed layer's expert K2 range.
+      - A run fills it from the plan. The M1 check fills it from the capture's `weights.json` and `fixtures/q28v2-expert-k2.txt`.
+    - `Options` holds the sizes Python fixes at load (pool positions, rope rows, expert scratch rows) and the prod L2 prefetch settings.
+    - The same calls are M2's forward: M2 replaces `m1_forward.zig`'s seeding with `state.zig` and the glue below.
+  - **Host gate, `tf-dsv41-m1 check CAPTURE`:** compares every captured decode window. On pod 6's prod capture (sets A/B/C at 1, 3 and 16 rows), 789/789 calls are equal:
+    - kernel, grid, every scalar (floats by bits);
+    - every tensor's dtype, shape, strides and offset, and weights by name;
+    - each role is one captured storage within its scope, and two roles in one launch are two storages;
+    - by content, no role's first read holds another role's last bytes. This caught `pos`: top-k and attention read the stores' `pos` tensor.
+  - **The glue the forward runs**, i.e. what the capture shows changing between launches with no recorded op:
+    - the two exchanges (`w.recv.attn` before the FFN site; `w.recv.moe` before the next attention site and the final norm);
+    - `kit_weights`' fp16 rounding of the pruned expert weights (`L.wts16`);
+    - positions (`w.pos` i32, `w.pos64` i64 per row, `w.lo` the SWA lower bounds);
+    - Engram's hashed rows;
+    - the streams' input (`w.x0`);
+    - the ratio-2 compressor's carry between windows (`s.L2.carry`);
+    - zero-initialised counters (dense3/linear `cnt`, `w.mhc.cnt`).
+  - **GPU gate, `tf-dsv41-m1 forward|both PACK CAPTURE OUT`** (`m1_forward.zig`):
+    - Runs the same calls on our own buffers, one per role, with weights bound by name to our loader's.
+    - After each launch, compares every buffer the launch touches bit for bit.
+    - Seeds come from the capture: a role's first touch in its scope, and the glue points above (re-seeded and counted).
+    - Everything else a call reads is what our earlier calls left.
+    - Our run-time forms are compared with the seeds Python built: `prepare.strips`, the mHC bf16 weights, the expert `suh`/`svh` stacks and K2 tables.
+    - The expert address tables are relocated, not rebuilt (M2: `prepare.tables`).
+    - The Triton variant is picked from the captured op's hash. M2 picks it from name, constexprs and specialization (`manifest.json`).
+    - The L2 prefetchers are skipped (their tables are checked for shape only).
 
 **M2. Whole model, TP=2, greedy token-identical on GB10** (about 15–20 days).
 - **Build:**

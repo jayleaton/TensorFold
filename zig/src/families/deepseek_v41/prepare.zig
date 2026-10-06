@@ -17,6 +17,35 @@ pub fn strips(gpa: std.mem.Allocator, src: []const u8, kt: usize, nt: usize, wor
     return out;
 }
 
+/// Strips words -> dense3's lanes layout (dense3.cu to_lanes_kernel; tests/dsv41_dense3_emu.py to_lanes): inside each
+/// 128-column strip, a load group of G k steps (2; 1 at K2 16) holds lane L's own bits of the group's 8 G tiles in
+/// (step, tile) order, the 4 K2 bits at 4 K2 L of each tile, as G K2 words laid out [G K2 / 4 chunks][32 lanes][4].
+/// Bits run from each word's top bit (decode.cuh), so stream byte b is memory byte 4 (b / 4) + 3 - b % 4; a lane's
+/// run of one tile is whole bytes (K2 even).
+pub fn lanes(gpa: std.mem.Allocator, strip_words: []const u8, kt: usize, k2: usize) ![]align(16) u8 {
+    const G: usize = if (k2 == 16) 1 else 2;
+    const nb = k2 / 2; // bytes of a lane's run of one tile (4 K2 bits)
+    const strip = 4 * kt * 32 * k2; // bytes a strip
+    if (k2 < 4 or k2 % 2 != 0 or kt % G != 0 or strip_words.len % strip != 0) return error.BadStrips;
+    const out = try gpa.alignedAlloc(u8, .@"16", strip_words.len);
+    const tile = 16 * k2; // bytes a tile (4 K2 words)
+    for (0..strip_words.len / strip) |s| {
+        const src = strip_words[s * strip ..][0..strip];
+        const dst = out[s * strip ..][0..strip];
+        for (0..kt / G) |gi| {
+            const g0 = gi * G * 8 * tile; // the group's first byte (src and dst)
+            for (0..32) |L| for (0..8 * G) |tt| for (0..nb) |j| {
+                const sb = g0 + tt * tile + L * nb + j; // stream byte in the source
+                const lb = tt * nb + j; // stream byte in the lane's run
+                const w = lb / 4; // the lane's word
+                const db = g0 + 4 * (((w / 4) * 32 + L) * 4 + w % 4) + (lb % 4); // stream byte in the destination
+                dst[4 * (db / 4) + 3 - db % 4] = src[4 * (sb / 4) + 3 - sb % 4];
+            };
+        }
+    }
+    return out;
+}
+
 /// One expert of a projection: its trellis's device address and K2, its scales as stored (fp16).
 pub const Expert = struct { trellis: u64, k2: i32, suh: []const u8, svh: []const u8 };
 
@@ -82,6 +111,26 @@ test "strips: each 128-column block's tiles in K order" {
         try testing.expectEqual(@as(u8, @intCast(16 * k + 8 * nb + j)), out[((nb * kt + k) * 8 + j) * words * 2]);
     };
     try testing.expectError(error.BadTrellis, strips(a, src[0..8], kt, nt, words));
+}
+
+test "lanes: the numpy reference's layout (tests/dsv41_dense3_emu.py to_lanes) at every dense3 width" {
+    // fixtures/lanes-ref.bin: for K2 4, 6, 8, 10, 12, 16: u32 K2, u32 NB, u32 KT, strips words, lanes words
+    const a = testing.allocator;
+    var rest: []const u8 = @embedFile("fixtures/lanes-ref.bin");
+    var cases: usize = 0;
+    while (rest.len > 0) : (cases += 1) {
+        const k2 = std.mem.readInt(u32, rest[0..4], .little);
+        const nb = std.mem.readInt(u32, rest[4..8], .little);
+        const kt = std.mem.readInt(u32, rest[8..12], .little);
+        const bytes = 4 * nb * kt * 32 * k2;
+        const src = rest[12..][0..bytes];
+        const want = rest[12 + bytes ..][0..bytes];
+        const got = try lanes(a, src, kt, k2);
+        defer a.free(got);
+        try testing.expectEqualSlices(u8, want, got);
+        rest = rest[12 + 2 * bytes ..];
+    }
+    try testing.expectEqual(@as(usize, 6), cases);
 }
 
 test "expert tables: addresses, K2s and stacked scales in order, the width range" {
