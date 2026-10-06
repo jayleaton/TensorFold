@@ -371,6 +371,39 @@ pub fn x3gm(gpu: Gpu, k: *const dsv41.Kernels, dir: []const u8) !void {
             v2_launches += 2;
         }
     }
+    // x3gm v3 (gm3_kernel): every variant of this case's projections against the fixture's gm_kernel outputs (run 0),
+    // both ticket modes; down reads the fixture's Xd, so a variant is checked alone. One plan (x3gm_plan.cu, bm 64).
+    var v3_launches: usize = 0;
+    {
+        const E = try size(fx, "E");
+        const T = exl3.planPasses(P, E, 64);
+        const order = try b.zeros(P * 4, 0);
+        const pe = try b.zeros(T * 4, 0);
+        const poff = try b.zeros(T * 4, 0);
+        const pcnt = try b.zeros(T * 4, 0);
+        const npass = try b.zeros(4, 0);
+        try o.gmPlan(pick.ptr, P, E, 64, order.ptr, pe.ptr, poff.ptr, pcnt.ptr, npass.ptr);
+        const k2g = try b.up("k2_g");
+        const k2d = try b.up("k2_d");
+        const xd_want = try b.up("run0_xd");
+        var vb: [exl3.v3_variants.len]usize = undefined;
+        for (exl3.v3Of(2, @intCast(mats_x), &vb)) |v| for ([_]bool{ true, false }) |tk| {
+            try xd.fill8(0, null);
+            try ticket.fill8(0, null);
+            try o.gm3Gateup(v, xg, xu, tg.ptr, tu.ptr + base_u, k2g.ptr, order.ptr, pe.ptr, poff.ptr, pcnt.ptr, npass.ptr, ticket.ptr, svh_g.ptr, svh_u.ptr, suh_d.ptr, xd.ptr, D, I, shx, tk, limit, ragged);
+            try stream.synchronize();
+            try same(gpu, fx, xd, "run0_xd", try std.fmt.bufPrint(&name_buf, "x3gm v3 gate/up variant {d} Xd vs gm_kernel", .{v}));
+            v3_launches += 1;
+        };
+        for (exl3.v3Of(1, 1, &vb)) |v| for ([_]bool{ true, false }) |tk| {
+            try y.fill8(0, null);
+            try ticket.fill8(0, null);
+            try o.gm3Down(v, xd_want.ptr, td.ptr + base_d, k2d.ptr, order.ptr, pe.ptr, poff.ptr, pcnt.ptr, npass.ptr, ticket.ptr, svh_d.ptr, y.ptr, I, D, tk, ragged);
+            try stream.synchronize();
+            try same(gpu, fx, y, "run0_y", try std.fmt.bufPrint(&name_buf, "x3gm v3 down variant {d} Y vs gm_kernel", .{v}));
+            v3_launches += 1;
+        };
+    }
     if (has(fx, "dequant_in")) {
         const t = try b.up("dequant_in");
         const dk: usize = @intCast(try fx.int("dequant_k"));
@@ -385,7 +418,7 @@ pub fn x3gm(gpu: Gpu, k: *const dsv41.Kernels, dir: []const u8) !void {
         try stream.synchronize();
         try same(gpu, fx, dq, "dequant_up", "upstream dequant");
     }
-    check.pass("BITEXACT x3gm {s}: R {d} x {d} slots, D {d}, I {d}, {s}, shx {}: rot, {d} runs ({d} launches), v2 {d} launches, combine", .{ std.fs.path.basename(dir), R, slots, D, I, if (ragged) "ragged" else "stacked", shx, runs, launches, v2_launches });
+    check.pass("BITEXACT x3gm {s}: R {d} x {d} slots, D {d}, I {d}, {s}, shx {}: rot, {d} runs ({d} launches), v2 {d} launches, v3 {d} launches, combine", .{ std.fs.path.basename(dir), R, slots, D, I, if (ragged) "ragged" else "stacked", shx, runs, launches, v2_launches, v3_launches });
 }
 
 /// pointwise.cu against torch: the shared expert's SwiGLU with the limit, and the partial adds (fp32, into bf16).
@@ -470,7 +503,21 @@ pub fn glueCases(gpu: Gpu, k: *const dsv41.Kernels, dir: []const u8) !void {
     const pos64_d = try b.zeros(n * 8, 0xee);
     const lo_d = try b.zeros(n * 4, 0xee);
     try o.positionsDev(start_dev.ptr, n, pos_d.ptr, pos64_d.ptr, lo_d.ptr);
+    // widen_f32: the recv rows (bf16, NaN / inf / -0 among them) to fp32, against the bits shifted up on the host
+    const wide = try b.zeros(W * n * D * 4, 0xee);
+    try o.widenF32(recv.ptr, wide.ptr, W * n * D);
     try stream.synchronize();
+    {
+        const recv_host = try fx.bytes("recv");
+        defer gpu.gpa.free(recv_host);
+        const want = try gpu.gpa.alloc(u32, recv_host.len / 2);
+        defer gpu.gpa.free(want);
+        for (want, 0..) |*w, i| w.* = @as(u32, std.mem.readInt(u16, recv_host[2 * i ..][0..2], .little)) << 16;
+        const got = try gpu.gpa.alloc(u8, 4 * want.len);
+        defer gpu.gpa.free(got);
+        try wide.download(0, got);
+        try check.sameBytes("glue widen_f32", got, std.mem.sliceAsBytes(want));
+    }
 
     try same(gpu, fx, send, "send", "glue embed_send");
     try same(gpu, fx, summed, "summed", "glue embed_sum");
@@ -496,7 +543,7 @@ pub fn glueCases(gpu: Gpu, k: *const dsv41.Kernels, dir: []const u8) !void {
         try pw[0].download(0, got);
         try check.sameBytes("glue positions", got, pw[1]);
     }
-    check.pass("BITEXACT glue.cu == torch: embed send / sum (W {d}), cast_bf16, kit_weights, kit_logits, gather_cols, carry, positions (host and device start)", .{W});
+    check.pass("BITEXACT glue.cu == torch: embed send / sum (W {d}), cast_bf16, kit_weights, kit_logits, gather_cols, carry, positions (host and device start), widen_f32", .{W});
 }
 
 /// topk_keys.cu against pick.top (torch.topk on pick.keys) at k 1 / 5 / 64 / 1,024 over 64,640 columns.

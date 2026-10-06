@@ -92,7 +92,8 @@ def footer_x3gm() -> str:
             out.append(f"DSV41_X3GM_ROT({t}, {m})\n")
     for k2 in X3GM_K2S:
         out.append(f"template __global__ void dsv41_x3gm::dequant_kernel<{k2}>(const uint32_t*, half*, int);\n")
-    return "".join(out)
+    # x3gm3.cu (v3) includes this copy for its device code, without these instances
+    return "#ifndef DSV41_X3GM_NO_INSTANCES\n" + "".join(out) + "#endif  // DSV41_X3GM_NO_INSTANCES\n"
 
 
 def footer_exl3_experts() -> str:

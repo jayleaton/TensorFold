@@ -121,6 +121,40 @@ pub fn gm2Shape(mats: u32, xm: u32, t: [5]u32) GmShape {
     return .{ .threads = four.threads, .smem = smem };
 }
 
+/// x3gm v3 (x3gm3.cu's gm3_kernel, ours): v2's items, chains and epilogue with the next item claimed and read ahead,
+/// LEAN's 32-bit window reads and 1-column-tile warps. Its variants, in x3gm3.cu's instance order.
+pub const V3 = struct { mats: u32, xm: u32, t: [5]u32, lean: u32 };
+pub const v3_variants = [_]V3{
+    .{ .mats = 2, .xm = 2, .t = .{ 2, 8, 2, 4, 4 }, .lean = 0 }, // v2's GU1 + claim-ahead
+    .{ .mats = 2, .xm = 2, .t = .{ 2, 8, 2, 4, 4 }, .lean = 1 },
+    .{ .mats = 2, .xm = 2, .t = .{ 1, 8, 2, 4, 4 }, .lean = 1 }, // 16-warp CTAs
+    .{ .mats = 2, .xm = 2, .t = .{ 1, 8, 4, 3, 4 }, .lean = 1 },
+    .{ .mats = 2, .xm = 1, .t = .{ 2, 8, 4, 3, 4 }, .lean = 1 }, // v2's GU0 (one input) + claim-ahead + LEAN
+    .{ .mats = 2, .xm = 1, .t = .{ 1, 8, 4, 3, 4 }, .lean = 1 },
+    .{ .mats = 1, .xm = 1, .t = .{ 2, 8, 4, 4, 8 }, .lean = 0 }, // v2's DN0 + claim-ahead
+    .{ .mats = 1, .xm = 1, .t = .{ 2, 8, 4, 4, 8 }, .lean = 1 },
+    .{ .mats = 1, .xm = 1, .t = .{ 1, 8, 4, 4, 8 }, .lean = 0 }, // 8-warp CTAs: 16 warps an SM
+    .{ .mats = 1, .xm = 1, .t = .{ 1, 8, 4, 4, 8 }, .lean = 1 },
+    .{ .mats = 1, .xm = 1, .t = .{ 1, 8, 2, 6, 8 }, .lean = 1 },
+};
+
+pub fn gm3Symbol(comptime v: V3) [:0]const u8 {
+    return std.fmt.comptimePrint("_ZN10dsv41_x3gm10gm3_kernelILi{d}ELi{d}ELi{d}ELi{d}ELi{d}ELi{d}ELi{d}ELi{d}EEEvNS_4ArgsE", .{ v.mats, v.xm, v.t[0], v.t[1], v.t[2], v.t[3], v.t[4], v.lean });
+}
+
+/// v3's variants for one projection: gate / up at one or two inputs (xm), or down.
+pub fn v3Of(mats: u32, xm: u32, out: []usize) []usize {
+    var n: usize = 0;
+    for (v3_variants, 0..) |v, i| if (v.mats == mats and v.xm == xm) {
+        out[n] = i;
+        n += 1;
+    };
+    return out[0..n];
+}
+
+/// v3's default variant of a projection (sm_120 pod timing at prod shapes: docs/DSV41-ZIG-KERNELS.md 3.2d).
+pub const v3_default: struct { gu: [2]usize, dn: usize } = .{ .gu = .{ 5, 2 }, .dn = 9 };
+
 /// x3gm.tuned2: (gate/up cfg, down cfg) of a v2 block: forced ids where gm2_kernel is built at them, else G6's (0 with
 /// one rotated input, 1 with two; down 0) at any row count.
 pub fn gmTuned2(force_gu: ?usize, force_dn: ?usize, shx: bool) [2]usize {
@@ -273,9 +307,10 @@ pub const Functions = struct {
     gm_plan: cuda.Function,
     gm2_gu: [2][v2_gu.len]Gm, // [xm - 1][cfg]
     gm2_dn: Gm,
+    gm3: [v3_variants.len]Gm,
 
     /// Resolves every instance (a wrong name fails here, not on a rare path) and opts x3gm into its shared memory.
-    pub fn resolve(experts: cuda.Module, x3ld: cuda.Module, x3pf: cuda.Module, x3gm: cuda.Module, x3gm_plan: cuda.Module, optin: u32) !Functions {
+    pub fn resolve(experts: cuda.Module, x3ld: cuda.Module, x3pf: cuda.Module, x3gm: cuda.Module, x3gm_plan: cuda.Module, x3gm3: cuda.Module, optin: u32) !Functions {
         var f: Functions = undefined;
         inline for (ld_cfgs, 0..) |c, ci| inline for (ranges, 0..) |r, ri| {
             f.ld[0][ci][ri] = try x3ld.function(ldSymbol(c[0], c[1], r[0], r[1], 0));
@@ -305,6 +340,7 @@ pub const Functions = struct {
             f.gm2_gu[xm - 1][ci] = try gmResolve(x3gm, gm2GuSymbol(xm, c), gm2Shape(2, xm, gu_tiles[c]), optin);
         };
         f.gm2_dn = try gmResolve(x3gm, gm2DnSymbol(0), gm2Shape(1, 1, dn_tiles[0]), optin);
+        inline for (v3_variants, 0..) |v, i| f.gm3[i] = try gmResolve(x3gm3, gm3Symbol(v), gm2Shape(v.mats, v.xm, v.t), optin);
         f.gm_plan = try x3gm_plan.function("_ZN15dsv41_x3gm_plan11plan_kernelEPKiiiiPiS2_S2_S2_S2_");
         f.gm_rot = .{ .{ try x3gm.function(gm_sym.rot_bf16_1), try x3gm.function(gm_sym.rot_bf16_2) }, .{ try x3gm.function(gm_sym.rot_f16_1), try x3gm.function(gm_sym.rot_f16_2) } };
         return f;
@@ -587,6 +623,38 @@ pub const Ops = struct {
             a.t1 = td;
         }
         try o.gmLaunch(o.f.gm2_dn, a, use_ticket);
+    }
+
+    /// x3gm v3 gate/up (gm3_kernel), variant `v` of v3_variants (mats 2, its xm): gm2Gateup's arguments and bits.
+    pub fn gm3Gateup(o: Ops, v: usize, xg: u64, xu: u64, tg: u64, tu: u64, k2e: u64, order: u64, pe: u64, poff: u64, pcnt: u64, npass: u64, ticket: u64, svh_g: u64, svh_u: u64, suh_d: u64, xd: u64, K: usize, N: usize, shx: bool, use_ticket: bool, limit: f32, tables: bool) !void {
+        const vv = v3_variants[v];
+        if (vv.mats != 2 or vv.xm != @as(u32, if (shx) 1 else 2)) return error.Unsupported;
+        if ((K / 16) % vv.t[2] != 0 or N % 128 != 0) return error.Shape;
+        var a: GmArgs = .{ .x0 = xg, .x1 = xu, .k2e = k2e, .order = order, .pe = pe, .poff = poff, .pcnt = pcnt, .npass = npass, .ticket = ticket, .sv0 = svh_g, .sv1 = svh_u, .sd = suh_d, .xd = xd, .K = int(K), .N = int(N), .limit = limit };
+        if (tables) {
+            a.tp0 = tg;
+            a.tp1 = tu;
+        } else {
+            a.t0 = tg;
+            a.t1 = tu;
+        }
+        try o.gmLaunch(o.f.gm3[v], a, use_ticket);
+    }
+
+    /// x3gm v3 down (gm3_kernel), variant `v` (mats 1): gm2Down's arguments and bits.
+    pub fn gm3Down(o: Ops, v: usize, xd: u64, td: u64, k2e: u64, order: u64, pe: u64, poff: u64, pcnt: u64, npass: u64, ticket: u64, svh_d: u64, y: u64, K: usize, N: usize, use_ticket: bool, tables: bool) !void {
+        const vv = v3_variants[v];
+        if (vv.mats != 1) return error.Unsupported;
+        if ((K / 16) % vv.t[2] != 0 or N % 128 != 0) return error.Shape;
+        var a: GmArgs = .{ .x0 = xd, .x1 = xd, .k2e = k2e, .order = order, .pe = pe, .poff = poff, .pcnt = pcnt, .npass = npass, .ticket = ticket, .sv0 = svh_d, .y = y, .K = int(K), .N = int(N) };
+        if (tables) {
+            a.tp0 = td;
+            a.tp1 = td;
+        } else {
+            a.t0 = td;
+            a.t1 = td;
+        }
+        try o.gmLaunch(o.f.gm3[v], a, use_ticket);
     }
 
     /// x3gm.plan on the device (x3gm_plan.cu): the passes of `pairs` picks (values 0..E, E = not this launch) in

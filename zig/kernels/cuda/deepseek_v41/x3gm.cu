@@ -644,6 +644,7 @@ __global__ void __launch_bounds__(32) dequant_kernel(const uint32_t* __restrict_
 
 }  // namespace dsv41_x3gm
 
+#ifndef DSV41_X3GM_NO_INSTANCES
 // The instantiations x3gm's bindings launch: gate/up (shared input XM 1, own inputs XM 2) at GM_GU0-5,
 // down at GM_DN0-4, every width K2 3-8, 10; the rotation (bf16 / fp16 input, one or two matrices); dequant.
 #define DSV41_X3GM_GU(XM, K2, CFG) template __global__ void dsv41_x3gm::gm_kernel<2, XM, K2, CFG>(const dsv41_x3gm::Args);
@@ -787,3 +788,4 @@ template __global__ void dsv41_x3gm::dequant_kernel<6>(const uint32_t*, half*, i
 template __global__ void dsv41_x3gm::dequant_kernel<7>(const uint32_t*, half*, int);
 template __global__ void dsv41_x3gm::dequant_kernel<8>(const uint32_t*, half*, int);
 template __global__ void dsv41_x3gm::dequant_kernel<10>(const uint32_t*, half*, int);
+#endif  // DSV41_X3GM_NO_INSTANCES

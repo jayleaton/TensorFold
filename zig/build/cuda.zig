@@ -34,6 +34,7 @@ const dsv41_kernels = [_]Kernel{
     .{ .name = "dsv41_x3ld", .src = "deepseek_v41/x3ld", .flags = &.{ "-O3", "-lineinfo" } }, // tf_dsv41_x3ld_v1
     .{ .name = "dsv41_x3pf", .src = "deepseek_v41/x3pf", .flags = &.{ "-O3", "-lineinfo" } }, // tf_dsv41_x3pf_v1
     .{ .name = "dsv41_x3gm", .src = "deepseek_v41/x3gm", .flags = &.{ "-O3", "-lineinfo" } }, // tf_dsv41_x3gm_v1
+    .{ .name = "dsv41_x3gm3", .src = "deepseek_v41/x3gm3", .flags = &.{ "-O3", "-lineinfo" } }, // ours: x3gm v3 (x3gm.cu's device code)
     .{ .name = "dsv41_x3gm_plan", .src = "deepseek_v41/x3gm_plan", .flags = &.{"-O3"} }, // ours: x3gm.plan's torch ops
     .{ .name = "dsv41_topk_keys", .src = "deepseek_v41/topk_keys", .flags = &.{"-O3"} }, // ours: pick.top's torch.topk
     .{ .name = "dsv41_kvsplit", .src = "deepseek_v41/kvsplit", .flags = &.{"-O3"} }, // ours: split KV's exchange copies

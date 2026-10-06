@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import re
 import sys
 from pathlib import Path
 
@@ -353,6 +355,12 @@ def glue_case(out: Path, g) -> dict:
     return {"rows": n}
 
 
+def want(name: str) -> bool:
+    """TF_DSV41_ORACLE_ONLY: a regex of the case names to write (unset: every case)."""
+    pat = os.environ.get("TF_DSV41_ORACLE_ONLY")
+    return pat is None or re.match(pat, name) is not None
+
+
 def main() -> None:
     out = Path(sys.argv[1]) / "fixtures"
     g = torch.Generator().manual_seed(4141)
@@ -365,31 +373,31 @@ def main() -> None:
         report[f"experts_e1_r{R}"] = experts_case(out / f"experts_e1_r{R}", g, R=R, slots=7, E=E, D=D, I=I,
                                                   k2g=mixed_g, k2d=mixed_d, input_dtype=torch.bfloat16, limit=10.0,
                                                   skip_every=2 if R > 1 else 0)
-    report["experts_k210_r8"] = experts_case(out / "experts_k210_r8", g, R=8, slots=7, E=E, D=D, I=I,
+    if want("experts_k210_r8"): report["experts_k210_r8"] = experts_case(out / "experts_k210_r8", g, R=8, slots=7, E=E, D=D, I=I,
                                              k2g=[4] * 12 + [10], k2d=[6] * 12 + [8], input_dtype=torch.float16,
                                              limit=math.inf)
-    report["experts_dspark_r4"] = experts_case(out / "experts_dspark_r4", g, R=4, slots=7, E=E, D=D, I=I,
+    if want("experts_dspark_r4"): report["experts_dspark_r4"] = experts_case(out / "experts_dspark_r4", g, R=4, slots=7, E=E, D=D, I=I,
                                                k2g=[8] * E, k2d=[8] * E, input_dtype=torch.bfloat16, limit=10.0)
     # prefill windows (x3pf beside x3ld / upstream)
-    report["experts_pf_r64"] = experts_case(out / "experts_pf_r64", g, R=64, slots=7, E=E, D=D, I=I, k2g=mixed_g,
+    if want("experts_pf_r64"): report["experts_pf_r64"] = experts_case(out / "experts_pf_r64", g, R=64, slots=7, E=E, D=D, I=I, k2g=mixed_g,
                                             k2d=mixed_d, input_dtype=torch.bfloat16, limit=10.0, prefill=True)
     # x3gm: uniform (one launch a projection) and ragged (one a width), every configuration that fits
     E2 = 16
     cfgs = ["tuned", (0, 0, True), (1, 1, False), (2, 2, True), (3, 3, True), (4, 4, True), (5, 0, False)]
-    report["x3gm_k6_shx"] = x3gm_case(out / "x3gm_k6_shx", g, R=128, slots=6, E=E2, D=D, I=I, k2g=[6] * E2,
+    if want("x3gm_k6_shx"): report["x3gm_k6_shx"] = x3gm_case(out / "x3gm_k6_shx", g, R=128, slots=6, E=E2, D=D, I=I, k2g=[6] * E2,
                                       k2d=[6] * E2, shx=True, input_dtype=torch.bfloat16, limit=10.0, runs=cfgs,
                                       dequant=(256, 256, 6))
-    report["x3gm_k4_two"] = x3gm_case(out / "x3gm_k4_two", g, R=128, slots=6, E=E2, D=D, I=I, k2g=[4] * E2,
+    if want("x3gm_k4_two"): report["x3gm_k4_two"] = x3gm_case(out / "x3gm_k4_two", g, R=128, slots=6, E=E2, D=D, I=I, k2g=[4] * E2,
                                       k2d=[4] * E2, shx=False, input_dtype=torch.bfloat16, limit=10.0,
                                       runs=["tuned", (0, 0, True), (1, 1, True), (2, 2, False), (4, 4, True),
                                             (5, 3, True)], dequant=(128, 256, 4))
     widths_g = [3, 4, 5, 6, 7, 8, 10, 4, 3, 5, 6, 7, 8, 10, 4, 6]
     widths_d = [10, 8, 7, 6, 5, 4, 3, 6, 4, 4, 3, 5, 7, 8, 10, 6]
-    report["x3gm_ragged_shx"] = x3gm_case(out / "x3gm_ragged_shx", g, R=256, slots=6, E=E2, D=D, I=I, k2g=widths_g,
+    if want("x3gm_ragged_shx"): report["x3gm_ragged_shx"] = x3gm_case(out / "x3gm_ragged_shx", g, R=256, slots=6, E=E2, D=D, I=I, k2g=widths_g,
                                           k2d=widths_d, shx=True, input_dtype=torch.bfloat16, limit=10.0,
                                           runs=["tuned", (0, 0, True), (2, 2, True), (5, 1, False)],
                                           dequant=(256, 128, 3))
-    report["x3gm_ragged_two"] = x3gm_case(out / "x3gm_ragged_two", g, R=200, slots=6, E=E2, D=D, I=I,
+    if want("x3gm_ragged_two"): report["x3gm_ragged_two"] = x3gm_case(out / "x3gm_ragged_two", g, R=200, slots=6, E=E2, D=D, I=I,
                                           k2g=widths_g, k2d=widths_d, shx=False, input_dtype=torch.float16,
                                           limit=10.0, runs=["tuned", (1, 0, True), (2, 4, True)],
                                           dequant=(128, 128, 10))
@@ -397,25 +405,25 @@ def main() -> None:
     # reference) and v2 at both tickets; 2,048 rows over prod's 384 experts (~32 passes an expert at bm 64)
     widths_g384 = [widths_g[i % len(widths_g)] for i in range(384)]
     widths_d384 = [widths_d[(i * 7) % len(widths_d)] for i in range(384)]
-    report["x3gm_pf2048_ragged"] = x3gm_case(out / "x3gm_pf2048_ragged", g, R=2048, slots=6, E=384, D=D, I=I,
+    if want("x3gm_pf2048_ragged"): report["x3gm_pf2048_ragged"] = x3gm_case(out / "x3gm_pf2048_ragged", g, R=2048, slots=6, E=384, D=D, I=I,
                                              k2g=widths_g384, k2d=widths_d384, shx=True, input_dtype=torch.bfloat16,
                                              limit=10.0, runs=["tuned"])
     # prod's geometry (pod 15's 2,048-row capture: D 5,120, I 1,152, gate / up widths 4 / 6 / 8 / 10), over 16 experts
     # (~768 rows an expert: many passes each) so the fixture stays near 1 GB
-    report["x3gm_pf2048_prod"] = x3gm_case(out / "x3gm_pf2048_prod", g, R=2048, slots=6, E=16, D=5120, I=1152,
+    if want("x3gm_pf2048_prod"): report["x3gm_pf2048_prod"] = x3gm_case(out / "x3gm_pf2048_prod", g, R=2048, slots=6, E=16, D=5120, I=1152,
                                            k2g=[4, 6, 8, 10] * 4, k2d=[6, 4, 10, 8] * 4, shx=False,
                                            input_dtype=torch.bfloat16, limit=10.0, runs=["tuned"])
-    report["x3gm_pf1024_k4"] = x3gm_case(out / "x3gm_pf1024_k4", g, R=1024, slots=6, E=64, D=D, I=I, k2g=[4] * 64,
+    if want("x3gm_pf1024_k4"): report["x3gm_pf1024_k4"] = x3gm_case(out / "x3gm_pf1024_k4", g, R=1024, slots=6, E=64, D=D, I=I, k2g=[4] * 64,
                                          k2d=[4] * 64, shx=False, input_dtype=torch.bfloat16, limit=10.0, runs=["tuned"])
-    report["x3gm_pf512_shx"] = x3gm_case(out / "x3gm_pf512_shx", g, R=512, slots=6, E=64, D=D, I=I, k2g=[6] * 64,
+    if want("x3gm_pf512_shx"): report["x3gm_pf512_shx"] = x3gm_case(out / "x3gm_pf512_shx", g, R=512, slots=6, E=64, D=D, I=I, k2g=[6] * 64,
                                          k2d=[6] * 64, shx=True, input_dtype=torch.bfloat16, limit=10.0, runs=["tuned"])
-    report["x3gm_pf_tail1337"] = x3gm_case(out / "x3gm_pf_tail1337", g, R=1337, slots=6, E=64, D=D, I=I,
+    if want("x3gm_pf_tail1337"): report["x3gm_pf_tail1337"] = x3gm_case(out / "x3gm_pf_tail1337", g, R=1337, slots=6, E=64, D=D, I=I,
                                            k2g=widths_g384[:64], k2d=widths_d384[:64], shx=False,
                                            input_dtype=torch.bfloat16, limit=10.0, runs=["tuned"])
-    report["x3gm_plan"] = plan_case(out / "x3gm_plan", g)
-    report["topk_keys"] = topk_case(out / "topk_keys", g)
-    report["pointwise"] = pointwise_case(out / "pointwise", g)
-    report["glue"] = glue_case(out / "glue", g)
+    if want("x3gm_plan"): report["x3gm_plan"] = plan_case(out / "x3gm_plan", g)
+    if want("topk_keys"): report["topk_keys"] = topk_case(out / "topk_keys", g)
+    if want("pointwise"): report["pointwise"] = pointwise_case(out / "pointwise", g)
+    if want("glue"): report["glue"] = glue_case(out / "glue", g)
     (out.parent / "oracle.json").write_text(json.dumps({"device": torch.cuda.get_device_name(0), **report}, indent=1))
     print(json.dumps(report, indent=1))
 

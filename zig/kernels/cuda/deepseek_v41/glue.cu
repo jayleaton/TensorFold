@@ -11,6 +11,7 @@
 //   kit_logits   x = f32(bf16_rn(x)) in place                                         (pick.kit_logits)
 //   positions    pos[0] = start; pos64[i] = start + i; lo[i] = 0                       (Win.make)
 //   positions_dev  the same from a device start (a graphed window: staged before each replay)
+//   widen_f32    y = f32(x) of bf16 x                                                (q.float(): exact, the DSpark pass)
 //   gather_cols  out[i][w c + j] = recv[w][i][j]                                      (permute(1, 0, 2).reshape)
 //   carry        carry[j] = f32(src[row][j]), row = *accepted (device) or the host's   (the ratio-2 compressor carry)
 
@@ -106,6 +107,13 @@ __global__ void __launch_bounds__(256) carry_kernel(const uint16_t* __restrict__
     const int r = accepted ? *accepted : row;
     for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < cols; j += gridDim.x * blockDim.x)
         carry[j] = bf(src[(long long)r * ld + j]);
+}
+
+// bf16 -> fp32 (exact: the bits shifted into the high half), n elements
+__global__ void __launch_bounds__(256) widen_f32_kernel(const uint16_t* __restrict__ x, float* __restrict__ y,
+                                                        long long n) {
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x)
+        y[i] = bf(x[i]);
 }
 
 }  // namespace dsv41_glue
