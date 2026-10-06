@@ -8,6 +8,7 @@ const cuda = @import("cuda");
 const kernels = @import("kernels.zig");
 const exl3 = @import("kernels_exl3.zig");
 const dense = @import("kernels_dense.zig");
+const ops = @import("kernels_ops.zig");
 
 const Kernels = kernels.Kernels;
 
@@ -165,7 +166,14 @@ pub fn call(k: *const Kernels, s: cuda.Stream, ext: []const u8, func: []const u8
     if (is(ext, "tensorfold_exl3_experts_v1")) return expertsExt(k.experts(s), func, args, kwargs);
     if (is(ext, "tf_dsv41_x3ld_v1") or is(ext, "tf_dsv41_x3pf_v1")) return groupedExt(k.experts(s), ext, func, args, kwargs);
     if (is(ext, "tf_dsv41_x3gm_v1")) return x3gmExt(k.experts(s), func, args, kwargs);
-    return false;
+    if (is(ext, "tf_dsv41_attn_cuda_v1")) return attnExt(k.others(s), func, args, kwargs);
+    if (is(ext, "tf_dsv41_mhc_cuda_v1") and is(func, "run")) return mhcRun(k.others(s), args, kwargs);
+    if (is(ext, "tf_dsv41_mhc_pf_v1") and is(func, "run")) return mhcPfRun(k.others(s), args, kwargs);
+    if (is(ext, "tf_dsv41_router_gemv_v2") and is(func, "route")) return route(k.others(s), args, kwargs);
+    if (is(ext, "tf_dsv41_pfdense_v1")) return pfdenseExt(k.others(s), func, args, kwargs);
+    if (is(ext, "tf_dsv41_l2pace_v1") and is(func, "paced")) return paced(k.others(s), args, kwargs);
+    if (is(ext, "tf_dsv41_l2pf_v1") and is(func, "segments")) return segments(k.others(s), args, kwargs);
+    return false; // engram_gate.gate_copy reads host-mapped words a capture cannot relocate: not replayed
 }
 
 // tensorfold_exl3_linear_v4 (linear.cpp)
@@ -400,6 +408,240 @@ fn x3gmExt(o: exl3.Ops, func: []const u8, args: []const Arg, kwargs: []const Kw)
         return true;
     }
     return false;
+}
+
+/// The bindings' `tp<T>(t)`: an empty tensor is nullptr.
+fn tp(t: Tensor) u64 {
+    return if (numel(t) == 0) 0 else t.ptr;
+}
+
+fn stride0(t: Tensor) i64 {
+    return if (numel(t) == 0 or t.stride.len == 0) 0 else t.stride[0];
+}
+
+// tf_dsv41_attn_cuda_v1 (csa2/attn_cuda.cpp): attn and topk as dsv41_attn_run_cuda / dsv41_topk_run_cuda fill Args
+fn attnExt(o: ops.Ops, func: []const u8, args: []const Arg, kwargs: []const Kw) !bool {
+    if (is(func, "attn")) {
+        const c: Call = .{ .args = args, .kwargs = kwargs, .names = &.{ "q", "cv", "csc", "tok", "cnt", "sv", "ssc", "lo", "hi", "pos", "sl", "pt", "sink", "cs", "po", "pm", "pl", "out", "ticket", "ring", "psh", "pts", "kw" } };
+        const q = try c.tensor(0);
+        const cv = try c.tensor(1);
+        const csc = try c.tensor(2);
+        const tok = try c.tensor(3);
+        const sv = try c.tensor(5);
+        const ssc = try c.tensor(6);
+        const hi = try c.tensor(8);
+        const sl = try c.tensor(10);
+        const cs = try c.tensor(13);
+        const a: ops.attn.Args = .{
+            .q = tp(q),
+            .has_comp = @intFromBool(numel(cv) != 0),
+            .cv = tp(cv),
+            .csc = tp(csc),
+            .cvs = stride0(cv),
+            .css = stride0(csc),
+            .tok = tp(tok),
+            .ts = stride0(tok),
+            .cnt = tp(try c.tensor(4)),
+            .sv = tp(sv),
+            .ssc = tp(ssc),
+            .svs = sv.stride[0],
+            .sss = ssc.stride[0],
+            .lo = tp(try c.tensor(7)),
+            .hi = tp(hi),
+            .pos = (try c.tensor(9)).ptr,
+            .sl = tp(sl),
+            .pt = tp(try c.tensor(11)),
+            .pts = try c.int(21),
+            .psh = @intCast(try c.int(20)),
+            .sink = tp(try c.tensor(12)),
+            .cs = tp(cs),
+            .csst = cs.stride[0],
+            .po = tp(try c.tensor(14)),
+            .pm = tp(try c.tensor(15)),
+            .pl = tp(try c.tensor(16)),
+            .out = tp(try c.tensor(17)),
+            .ticket = tp(try c.tensor(18)),
+            .R = @intCast(try dim(q, 0)),
+            .H = @intCast(try dim(q, 1)),
+            .ring = @intCast(try c.int(19)),
+        };
+        try o.attention(a, try c.u(22), numel(sl) > 0, numel(hi) > 0);
+        return true;
+    }
+    if (is(func, "topk")) {
+        const c: Call = .{ .args = args, .kwargs = kwargs, .names = &.{ "s0", "c0", "o0", "n0", "nk0", "k0", "m0", "e0", "s1", "c1", "o1", "n1", "nk1", "k1", "m1", "e1", "jobs", "pos", "ratio", "bs", "R", "CL" } };
+        const jobs = try c.usz(16);
+        const pos = try c.tensor(17);
+        var a: ops.topk.Args = .{ .job = undefined, .pos = pos.ptr, .pos64 = @intFromBool(pos.dtype == .i64), .ratio = @intCast(try c.int(18)), .bs = @intCast(try c.int(19)) };
+        a.job[0] = try topkJob(c, 0);
+        a.job[1] = if (jobs > 1) try topkJob(c, 8) else a.job[0];
+        const e0 = try c.usz(7);
+        const ept = if (jobs > 1) @max(e0, try c.usz(15)) else e0;
+        try o.topK(a, jobs, try c.usz(20), try c.usz(21), ept);
+        return true;
+    }
+    return false;
+}
+
+fn topkJob(c: Call, at: usize) !ops.topk.Job {
+    const sc = try c.tensor(at);
+    const cand = try c.tensor(at + 1);
+    const out = try c.tensor(at + 2);
+    return .{ .s = sc.ptr, .ss = sc.stride[0], .cand = tp(cand), .cs = stride0(cand), .out = out.ptr, .os = out.stride[0], .cnt = tp(try c.tensor(at + 3)), .nk = @intCast(try c.int(at + 4)), .k = @intCast(try c.int(at + 5)), .mode = @intCast(try c.int(at + 6)), .ept = @intCast(try c.int(at + 7)) };
+}
+
+// tf_dsv41_mhc_cuda_v1.run (mhc_cuda.cpp / dsv41_mhc_run_cuda)
+fn mhcRun(o: ops.Ops, args: []const Arg, kwargs: []const Kw) !bool {
+    const c: Call = .{ .args = args, .kwargs = kwargs, .names = &.{ "x", "xout", "g", "post", "comb", "pre", "fn", "base", "scale", "part", "c", "tap", "nw", "out", "opre", "opost", "ocomb", "cnt", "R", "mode", "eps", "hc_eps", "post_alpha", "iters" } };
+    const x = try c.tensor(0);
+    const g = try c.tensor(2);
+    const f = try c.tensor(6);
+    const tap = try c.tensor(11);
+    const nw = try c.tensor(12);
+    const a: ops.mhc.Args = .{
+        .x = tp(x),
+        .xs = x.stride[0],
+        .xout = tp(try c.tensor(1)),
+        .g = tp(g),
+        .gr = stride0(g),
+        .world = if (numel(g) != 0) @intCast(try dim(g, 0)) else 1,
+        .gbf16 = @intFromBool(g.dtype == .bf16),
+        .post = tp(try c.tensor(3)),
+        .comb = tp(try c.tensor(4)),
+        .pre = tp(try c.tensor(5)),
+        .@"fn" = tp(f),
+        .base = tp(try c.tensor(7)),
+        .scale = tp(try c.tensor(8)),
+        .part = tp(try c.tensor(9)),
+        .c = tp(try c.tensor(10)),
+        .tap = tp(tap),
+        .ts = stride0(tap),
+        .nw = nw.ptr,
+        .nwbf16 = @intFromBool(nw.dtype == .bf16),
+        .out = tp(try c.tensor(13)),
+        .opre = tp(try c.tensor(14)),
+        .opost = tp(try c.tensor(15)),
+        .ocomb = tp(try c.tensor(16)),
+        .cnt = tp(try c.tensor(17)),
+        .R = @intCast(try c.int(18)),
+        .eps = @floatCast(try c.float(20)),
+        .hc_eps = @floatCast(try c.float(21)),
+        .post_alpha = @floatCast(try c.float(22)),
+        .iters = @intCast(try c.int(23)),
+    };
+    try o.mhcBoundary(a, try c.u(19), numel(f) != 0 and f.dtype == .f32);
+    return true;
+}
+
+// tf_dsv41_mhc_pf_v1.run (mhc_pf.cpp / dsv41_mhc_pf_run_cuda)
+fn mhcPfRun(o: ops.Ops, args: []const Arg, kwargs: []const Kw) !bool {
+    const c: Call = .{ .args = args, .kwargs = kwargs, .names = &.{ "x", "xout", "g", "post", "comb", "pre", "fn", "part", "c", "tap", "R", "mode" } };
+    const x = try c.tensor(0);
+    const g = try c.tensor(2);
+    const f = try c.tensor(6);
+    const tap = try c.tensor(9);
+    const a: ops.mhc_pf.Args = .{
+        .x = tp(x),
+        .xs = x.stride[0],
+        .xout = tp(try c.tensor(1)),
+        .g = tp(g),
+        .gr = stride0(g),
+        .world = if (numel(g) != 0) @intCast(try dim(g, 0)) else 1,
+        .gbf16 = @intFromBool(g.dtype == .bf16),
+        .post = tp(try c.tensor(3)),
+        .comb = tp(try c.tensor(4)),
+        .pre = tp(try c.tensor(5)),
+        .@"fn" = f.ptr,
+        .part = tp(try c.tensor(7)),
+        .c = tp(try c.tensor(8)),
+        .tap = tp(tap),
+        .ts = stride0(tap),
+        .R = @intCast(try c.int(10)),
+    };
+    try o.mhcSite(a, try c.u(11), f.dtype == .f32, numel(tap) > 0);
+    return true;
+}
+
+// tf_dsv41_router_gemv_v2.route (router_gemv.cpp / dsv41_rg_route_cuda)
+fn route(o: ops.Ops, args: []const Arg, kwargs: []const Kw) !bool {
+    const c: Call = .{ .args = args, .kwargs = kwargs, .names = &.{ "X", "W", "B", "pick", "wts", "LG", "cnt", "K", "slots", "scale", "rt", "nw", "ew", "select", "kit", "gid", "gcnt", "gmem", "GE", "group" } };
+    const x = try c.tensor(0);
+    const w = try c.tensor(1);
+    const lg = try c.tensor(5);
+    const cnt = try c.tensor(6);
+    const group = try c.boolean(19, false);
+    const gmem = try c.tensor(17);
+    if (try dim(x, 1) != ops.rg.D or try dim(w, 1) != ops.rg.D) return error.WrongArgument;
+    const a: ops.rg.Args = .{
+        .x = x.ptr,
+        .xs = x.stride[0],
+        .w = w.ptr,
+        .bias = try c.ptr(2),
+        .pick = try c.ptr(3),
+        .wts = try c.ptr(4),
+        .lg = lg.ptr,
+        .cnt = cnt.ptr,
+        .R = @intCast(try dim(x, 0)),
+        .E = @intCast(try dim(w, 0)),
+        .K = @intCast(try c.int(7)),
+        .slots = @intCast(try c.int(8)),
+        .select = @intFromBool(try c.boolean(13, false)),
+        .scale = @floatCast(try c.float(9)),
+        .kit = @intFromBool(try c.boolean(14, false)),
+        .group = @intFromBool(group),
+        .gid = if (group) try c.ptr(15) else 0,
+        .gcnt = if (group) try c.ptr(16) else 0,
+        .gmem = if (group) gmem.ptr else 0,
+        .GE = @intCast(try c.int(18)),
+        .maxm = if (group) @intCast(try dim(gmem, 1)) else 0,
+    };
+    try o.route(a, try c.u(10), try c.u(11), try c.u(12), @intCast(numel(lg)), @intCast(numel(cnt)));
+    return true;
+}
+
+// tf_dsv41_pfdense_v1 (pfdense.cpp)
+fn pfdenseExt(o: ops.Ops, func: []const u8, args: []const Arg, kwargs: []const Kw) !bool {
+    if (is(func, "gemm")) {
+        const c: Call = .{ .args = args, .kwargs = kwargs, .names = &.{ "xh", "T", "stride_k", "stride_nb", "svh", "bias", "out", "K2", "lanes", "cfg", "group" } };
+        const xh = try c.tensor(0);
+        const T = try c.tensor(1);
+        const out = try c.tensor(6);
+        const ot: ops.pfd.OutType = switch (out.dtype) {
+            .f32 => .f32,
+            .bf16 => .bf16,
+            .f16 => .f16,
+            else => return error.WrongArgument,
+        };
+        const a: ops.pfd.Args = .{ .xh = xh.ptr, .T = T.ptr, .stride_k = try c.int(2), .stride_nb = try c.int(3), .svh = try c.ptr(4), .bias = try c.ptrOrNull(5), .out = out.ptr, .o_stride = out.stride[0], .M = @intCast(try dim(xh, 0)), .K = @intCast(try dim(xh, 1)), .N = @intCast(try dim(out, 1)), .group = @intCast(try c.int(10)), .out_type = @intFromEnum(ot) };
+        try o.pfdGemm(a, try c.u(7), try c.boolean(8, false), try c.usz(9), @intCast(numel(T)));
+        return true;
+    }
+    if (is(func, "dequant")) {
+        const c: Call = .{ .args = args, .kwargs = kwargs, .names = &.{ "T", "W", "stride_k", "stride_nb", "K2", "lanes" } };
+        const w = try c.tensor(1);
+        try o.pfdDequant(try c.ptr(0), try c.int(2), try c.int(3), w.ptr, try dim(w, 0), try dim(w, 1), try c.u(4), try c.boolean(5, false));
+        return true;
+    }
+    return false;
+}
+
+// tf_dsv41_l2pace_v1.paced / tf_dsv41_l2pf_v1.segments: L2 prefetch only (no outputs; replayed for timing parity)
+fn paced(o: ops.Ops, args: []const Arg, kwargs: []const Kw) !bool {
+    const c: Call = .{ .args = args, .kwargs = kwargs, .names = &.{ "table", "ctas", "chunk", "ns_per_piece", "delay_ns" } };
+    const t = try c.tensor(0);
+    const n = try dim(t, 0);
+    if (n == 0) return true;
+    try o.l2Paced(t.ptr, n, try c.usz(1), try c.u(2), @intCast(try c.int(3)), @intCast(try c.int(4)));
+    return true;
+}
+
+fn segments(o: ops.Ops, args: []const Arg, kwargs: []const Kw) !bool {
+    const c: Call = .{ .args = args, .kwargs = kwargs, .names = &.{ "table", "grid", "threads", "chunk", "bulk" } };
+    const t = try c.tensor(0);
+    const n = try dim(t, 0);
+    if (n == 0) return true;
+    try o.l2Segments(t.ptr, n, try c.usz(1), try c.usz(2), try c.u(3), try c.boolean(4, false));
+    return true;
 }
 
 test "arguments by position and keyword" {
