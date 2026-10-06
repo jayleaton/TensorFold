@@ -22,7 +22,7 @@ Several agents work on this branch at once. Each one commits only its own paths 
 | KV and sessions (`dsq-zig-kv-1`) | `zig/src/families/deepseek_v41/kv/**`, `zig/src/sessions/**` | paged pool (256-token pages, `comp.*` 584 B rows, `index_k`), per-slot rings and carries, split KV, the session store and NVMe tier |
 | Server (`dsq-zig-srv-1`) | `zig/src/server/**`, `zig/src/core/tokenizer/**`, `zig/src/core/template/**`, sampling, tool parsing | `encoding` (DeepSeek's message encoder), DSML tool calls, reasoning effort, the CUDA engine opened by the server |
 | Performance (`dsq-zig-perf-1`) | `zig/kernels/cuda/deepseek_v41/proto/**` | CUDA rewrites where they beat the port by a lot; each one lands behind the same launch interface and is proven bit-equal (or carries its own session tag) |
-| Drafting (`dsq-zig-draft-1`) | `zig/src/families/deepseek_v41/draft/**`, the lanes adapter | DSpark drafter and the `core/lanes` backend for DeepSeek |
+| Drafting (`dsq-zig-draft-1`) | `zig/src/families/deepseek_v41/draft/**`, `zig/src/core/lanes/trim.zig` and its hooks, the `test-dsv41-draft` step in `build.zig` | DSpark drafter, depth and trees; the `core/lanes` backend for DeepSeek (`draft.Lanes`) over `Target` and `Pass` (below) |
 
 Rules for every owner:
 - Interfaces first, so implementations can change behind them.
@@ -33,6 +33,14 @@ Rules for every owner:
 **Shared types.**
 - **Weights by name.** The loader names every tensor the way the M1 capture names the Python engine's tree: `L<layer>.attn.wq_a.trellis`, `L<layer>.attn.wo_a.<j>.suh`, `L<layer>.moe.w1.data` (ragged) or `.trellis` (stack), `L<layer>.moe.shared.0.w2.svh`, `L<layer>.engram.qk`, `embed`, `norm`, `head.trellis`.
 - **Expert tables.** Per routed projection, an int64 `[E]` table of each expert's trellis device address and an int32 `[E]` K2 table. `suh`/`svh` are stacked `[E, K]`/`[E, N]`.
+- **Drafting** (`draft/iface.zig`; the GPU forward implements both vtables, `draft/twin.zig` is the CPU twin the tests run):
+  - `Target.prefill(slot, ids, sampling, draw) -> u32`: the prompt into the slot's state, the keyed choice after its last row.
+  - `Target.window(segments, choices)`: one forward over every slot's `Segment{slot, start, tokens, parents, draws, sampling}`. Row 0 is the pending token at `start` (the slot's cache length); row r sits at `start` + its depth and attends the committed cache plus its ancestors (`parents[r]`, row 0: -1; null: a chain). `choices[i][r]` is row r's keyed choice at `draws[r]`. The rows stay in the state until `keep`; a chain window that is never kept keeps every row.
+  - `Target.keep(slot, path)`: keep the listed rows of the last window (a tree path, row 0 first), drop the rest: pool truncation, SWA rings and ratio-2 carries roll back to the path.
+  - `Target.taps(slot) -> Taps{address, rows, stride}`: the last window's (or prompt's) taps, bf16 `[rows, 3 x hidden]` (the streams' mean entering layers 37/38/39), row i = window row i.
+  - `Pass.ingest(slot, start, taps, rows)`: taps rows `rows[i]` into the slot's context rings at positions `start + i` (the lanes backend sends only the kept path, last `window` rows). In a shared round the lane core drafts before `keep`, so ingest reads the path, never the pool.
+  - `Pass.propose(asks, out)`: one pass over every `Ask{slot, anchor, start, params}` (anchor = the pending token at `start`, `params` = the chain kernel's keyed sampling); `out[i]` gets `block` drafts and confidences, and with trees the gathered candidates and base logits `[block, K]`. `Pass.reset(slot)` restarts a slot's context; `Pass.markov()` returns host copies of the Markov / confidence heads for trees (null: chains only).
+  - Row cap: 64 rows a forward, 16 a slot (graph buckets 1-8, 12, 16, 24, 32, 48, 64). The depth prices rounds from the measured table (`draft.Costs`, read from Python's `calib-*.json`), never a clock.
 
 ## 1. How the Zig engine is built
 
