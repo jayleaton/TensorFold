@@ -45,6 +45,7 @@ Rules from `ZIG-PREVIEW.md`:
 | `exl3.zig` | `py/weights.py` `X3`, `X3Stack`, `X3Ragged`, `ragged()` | Group geometry (K2 = words / 8) and codebook markers. A rank's TP part as byte spans: rows are contiguous, columns are one run per K-tile row. The routed-expert `Layout` is a stack when there is one width and ragged (back-to-back offsets) when each expert has its own. |
 | `pack.zig` | `py/weights.py` `Shards` | Indexes the pack from its headers with pread and no mmap (on GB10 the page cache is GPU memory). Follows the index's weight map, since real packs hold the same name in two shards. Reads spans and marker values. |
 | `names.zig` | `py/weights.py` `Loader`, `py/drafter.py` | Every block's EXL3 groups, natives, splits and expected shapes, DSpark's heads, and the names the text engine knowingly leaves unread: vision, `image_*`, `gate.bias_vl`, and the bf16 `.weight` copies of EXL3 groups. |
+| `stage.zig` | `py/weights.py` `Loader.x3`, `ragged()`, `torch.stack` | Reads a group's TP part into host images, and packs a routed projection's experts back to back with their int32 K2 table and byte offsets, the format the kernels take. Suh and svh are stacked `[E, K]`/`[E, N]`. The device loader only uploads these and turns offsets into addresses. |
 | `plan.zig` | `py/weights.py` `Loader.load` | A rank's whole weight plan: parts, layouts, byte totals, gate/up width mismatches (x3gm cannot fuse those), and coverage, so a pack with an unplanned name is refused. |
 
 - **Tests:**
@@ -67,7 +68,7 @@ Two things decide how each part is ported:
 | Python (`py/`) | Zig (`zig/src/families/deepseek_v41/`) | State | Kernels |
 |---|---|---|---|
 | `config.py` | `config.zig` | done | — |
-| `weights.py` (`Shards`, `Loader`, `X3*`) | `pack.zig`, `exl3.zig`, `names.zig`, `plan.zig` (host); `load.zig` (device upload: one trellis buffer per projection, suh/svh `[E,K]`/`[E,N]`, int64 address and int32 K2 tables per projection, the format the kernel agent's launches take) | host side done; `load.zig` is M1 | — |
+| `weights.py` (`Shards`, `Loader`, `X3*`) | `pack.zig`, `exl3.zig`, `names.zig`, `plan.zig` (host); `load.zig` (device upload: one trellis buffer per projection, suh/svh `[E,K]`/`[E,N]`, int64 address and int32 K2 tables per projection, the format the kernel agent's launches take) | host side and staging done; `load.zig` (uploads, address tables) is M1 | — |
 | `fastboot.py` (prepared folder) | `prepared.zig`: one `data.bin` per rank, written from the planned device buffers, plus a manifest of offsets. No pickled tree: the plan is rebuilt from headers, which takes milliseconds. | M2 (boot time) | — |
 
 **Forward pass**
@@ -154,7 +155,7 @@ The all-gathers run on the compute stream so they can be captured in CUDA graphs
 Effort is in engineering days for this agent team, assuming GPU windows are available when needed. GPU work is listed where it happens.
 
 **M0. Toolchain and host side** (done, this branch).
-- Zig in user space, `zig build test` green, aarch64 cross-build, the family's host side with 12 tests.
+- Zig in user space, `zig build test` green, aarch64 cross-build, the family's host side with 13 tests.
 
 **M1. One block, bit-exact against its Python twin** (about 10–15 days).
 - **Build:**

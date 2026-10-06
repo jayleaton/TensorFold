@@ -206,8 +206,11 @@ fn lessStr(_: void, x: []const u8, y: []const u8) bool {
 
 const testing = std.testing;
 
+/// One tensor of an in-memory image.
+pub const Spec = struct { name: []const u8, dtype: []const u8, shape: []const usize, fill: u8 = 0 };
+
 /// A safetensors image in memory: tensors in order, each filled with `fill`.
-pub fn image(a: std.mem.Allocator, specs: []const struct { name: []const u8, dtype: []const u8, shape: []const usize, fill: u8 = 0 }) ![]u8 {
+pub fn image(a: std.mem.Allocator, specs: []const Spec) ![]u8 {
     var json: std.Io.Writer.Allocating = .init(a);
     defer json.deinit();
     try json.writer.writeAll("{\"__metadata__\":{\"format\":\"pt\"}");
