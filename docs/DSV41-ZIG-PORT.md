@@ -164,6 +164,15 @@ Rules from `ZIG-PREVIEW.md`:
   - The Python reference over layers 0–24 did not finish loading plus prefill within its 22 minutes. Python loads about 40 s a block from the volume. M2a now runs layers 0–8 (6cef64a): SWA + Engram (layer 1), the ratio-2 KV and index sources 2 and 8 with their carries, and the reuse layers between them.
   - `glue.cu`'s first GPU run: every glue kernel equal to torch except `embed_send` (2 of 1,792 words). That is with dsq-zig-kern-1; the next M2a pod waits for the fix.
   - `session.sh` was replaced while its watcher ran (quant 57e710d), and bash re-read it mid-loop. The port lead fetched the results, deleted the pod and closed the ledger row by hand. Don't edit `session.sh` while a session runs.
+- **Pod 11** (2c500a5, 24 min, $0.85): **M2a PASS.**
+  - Our whole forward on one GPU at rank 0 of TP=2 with the zero peer, over layers 0–8 and the head: `block.zig`'s program run by `run.zig`, with `forward.zig`'s glue on `glue.cu` (`embed_send` fixed), and Triton by name through the AOT set.
+  - It starts from the Python engine's own prefill state at 1,536 positions.
+  - Every block's streams (9/9) and every logit are bit-equal to Python in windows of 1, 3 and 16 rows (64,640 / 193,920 / 1,034,240 logits).
+  - Load: our loader 19.4 GB, plus 206 weight forms built, 284 s. Python's reference is 276 s to load and 474 s to run.
+  - Kernel job: the twin suites' recording works (302 calls, 141 replayed bit-exact). Then `tf-dsv41-test` panicked on an empty tensor's negative offset in its replay (dsq-zig-kern-1), so the oracle cases, glue included, did not run this time.
+- **M2 next:**
+  - **M2b**, TP=2 on two GPUs in one pod over NCCL: the whole backbone, both ranks, against Python's TP=2. It needs the `tp` session bootstrap in `forward.zig`'s driver and a two-rank Python reference.
+  - Graphs and the R3/R4 work come after M2b.
   - **The superseded "next pod" list:**
 
     - the GPU compare of `prepare.lanes` against Python's dense3 words (pod 8 only compared them as plain strips);
