@@ -228,7 +228,7 @@ pub const Forward = struct {
     /// The drafter's operations a follower runs (dspark_gpu.zig): its collectives pair up with the leader's.
     pub const Drafter = struct {
         ptr: *anyopaque,
-        ingest: *const fn (ptr: *anyopaque, start: u64, n: u32, avail: u32) anyerror!void,
+        ingest: *const fn (ptr: *anyopaque, start: u64, row0: u32, n: u32, avail: u32) anyerror!void,
         propose: *const fn (ptr: *anyopaque, anchor: u32, start: u64) anyerror!void,
     };
 
@@ -237,8 +237,8 @@ pub const Forward = struct {
         if (f.leads()) try f.link.?.send(ints);
     }
 
-    pub fn dsIngestOp(start: u64, n: u32, avail: u32) [4]i64 {
-        return .{ op_ds_ingest, @intCast(start), n, avail };
+    pub fn dsIngestOp(start: u64, row0: u32, n: u32, avail: u32) [5]i64 {
+        return .{ op_ds_ingest, @intCast(start), row0, n, avail };
     }
 
     pub fn dsProposeOp(anchor: u32, start: u64) [3]i64 {
@@ -278,7 +278,7 @@ pub const Forward = struct {
                 op_stop => return,
                 op_ds_ingest => {
                     const d = f.drafter orelse return error.BadPlan;
-                    try d.ingest(d.ptr, @intCast(msg[1]), @intCast(msg[2]), @intCast(msg[3]));
+                    try d.ingest(d.ptr, @intCast(msg[1]), @intCast(msg[2]), @intCast(msg[3]), @intCast(msg[4]));
                 },
                 op_ds_propose => {
                     const d = f.drafter orelse return error.BadPlan;

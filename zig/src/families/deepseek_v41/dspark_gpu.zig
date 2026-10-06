@@ -142,36 +142,37 @@ pub const GpuPass = struct {
         return self(p).markov;
     }
 
+    /// `rows`: the taps' rows (the window's or prompt's row indices, lanes already kept the last `window`), landing at
+    /// positions start .. ; a chain's run is contiguous.
     fn ingest(p: *anyopaque, slot: u32, start: u64, taps: iface.Taps, rows: []const u32) anyerror!void {
         const x = self(p);
         if (slot != 0) return error.Slots;
-        for (rows, 0..) |r, i| if (r != i) return error.NotAPrefix; // chains: the window's first rows
+        if (rows.len == 0) return;
+        for (rows, 0..) |r, i| if (r != rows[0] + i) return error.NotAPrefix;
         const n: u32 = @intCast(rows.len);
-        const ops = fwd.Forward.dsIngestOp(start, n, taps.rows);
+        const ops = fwd.Forward.dsIngestOp(start, rows[0], n, taps.rows);
         try x.f.sendDrafter(&ops);
-        try x.doIngest(start, n, taps.rows);
+        try x.doIngest(start, rows[0], n, taps.rows);
     }
 
-    fn followIngest(p: *anyopaque, start: u64, n: u32, avail: u32) anyerror!void {
-        return self(p).doIngest(start, n, avail);
+    fn followIngest(p: *anyopaque, start: u64, row0: u32, n: u32, avail: u32) anyerror!void {
+        return self(p).doIngest(start, row0, n, avail);
     }
 
-    fn doIngest(x: *GpuPass, start: u64, n: u32, avail: u32) !void {
+    fn doIngest(x: *GpuPass, start: u64, row0: u32, n: u32, avail: u32) !void {
         if (n == 0) return;
-        if (n > avail or n > x.ingest_rows) {
+        if (row0 + n > avail or n > x.ingest_rows) {
             // rows not on the device (a resumed slot's prompt): the context restarts after them
             x.valid = start + n;
             return;
         }
-        const W: u32 = x.shape.window;
-        const skip: u32 = n -| W;
         const r = x.f.runner;
         try r.stream.synchronize();
-        const pos: i32 = @intCast(start + skip);
+        const pos: i32 = @intCast(start);
         try cuda.DeviceBuffer.upload(.{ .d = r.d, .ptr = r.addressOf("w.ds.pos") orelse return error.Unbound, .len = 4 }, 0, std.mem.asBytes(&pos));
         var la = std.heap.ArenaAllocator.init(x.gpa);
         defer la.deinit();
-        const cs = try emit.emitIngest(la.allocator(), x.f.cfg, x.f.widths, x.f.opts, n - skip, skip);
+        const cs = try emit.emitIngest(la.allocator(), x.f.cfg, x.f.widths, x.f.opts, n, row0);
         r.glue = .{ .ctx = x, .run = glueFn };
         try r.window(cs);
     }
