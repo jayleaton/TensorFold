@@ -37,6 +37,18 @@ const dsv41_kernels = [_]Kernel{
     .{ .name = "dsv41_linear", .src = "deepseek_v41/linear", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // tensorfold_exl3_linear_v4
     .{ .name = "dsv41_x3seg", .src = "deepseek_v41/x3seg", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // tf_dsv41_x3seg_v3
     .{ .name = "dsv41_dense3", .src = "deepseek_v41/dense3", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // tf_dsv41_dense3_v1
+    .{ .name = "dsv41_attn", .src = "deepseek_v41/attn_cuda", .flags = &.{ "-O3", "-lineinfo", "--fmad=false" } }, // tf_dsv41_attn_cuda_v1
+    .{ .name = "dsv41_topk", .src = "deepseek_v41/topk_cuda", .flags = &.{ "-O3", "-lineinfo", "--fmad=false" } }, // tf_dsv41_attn_cuda_v1
+    .{ .name = "dsv41_mhc", .src = "deepseek_v41/mhc_cuda", .flags = &.{ "-O3", "-lineinfo", "--fmad=false" } }, // tf_dsv41_mhc_cuda_v1
+    .{ .name = "dsv41_mhc_pf", .src = "deepseek_v41/mhc_pf", .flags = &.{ "-O3", "-lineinfo", "--fmad=false" } }, // tf_dsv41_mhc_pf_v1
+    .{ .name = "dsv41_router_gemv", .src = "deepseek_v41/router_gemv", .flags = &.{ "-O3", "-lineinfo" } }, // tf_dsv41_router_gemv_v2
+    .{ .name = "dsv41_pfdense_k8", .src = "deepseek_v41/pfdense_k8", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // tf_dsv41_pfdense_v1
+    .{ .name = "dsv41_pfdense_k10", .src = "deepseek_v41/pfdense_k10", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } },
+    .{ .name = "dsv41_pfdense_k12", .src = "deepseek_v41/pfdense_k12", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } },
+    .{ .name = "dsv41_pfdense_k16", .src = "deepseek_v41/pfdense_k16", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } },
+    .{ .name = "dsv41_engram_gate", .src = "deepseek_v41/engram_gate", .flags = &.{ "-O3", "-lineinfo" } }, // tf_dsv41_engram_gate_v1
+    .{ .name = "dsv41_l2pace", .src = "deepseek_v41/l2pace", .flags = &.{"-O3"} }, // tf_dsv41_l2pace_v1
+    .{ .name = "dsv41_l2pf", .src = "deepseek_v41/l2pf", .flags = &.{"-O3"} }, // tf_dsv41_l2pf_v1 (glm5_next/spark/l2pf.cu)
 };
 
 /// The DeepSeek-V4.1 kernel module (zig/src/families/deepseek_v41/kernels.zig) over `cuda`; empty `images`: host-only.
@@ -138,6 +150,11 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     dsv41_runner.addImport("cuda", cuda);
     dsv41_runner.addImport("dsv41_kernels", dsv41);
     b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-test", .root_module = dsv41_runner }));
+    const dsv41_m1 = b.createModule(.{ .root_source_file = b.path("zig/src/families/deepseek_v41/m1_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    dsv41_m1.addImport("cuda", cuda);
+    dsv41_m1.addImport("core", mods.core);
+    dsv41_m1.addImport("dsv41_kernels", dsv41);
+    b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-m1", .root_module = dsv41_m1 }));
 }
 
 /// Host unit tests of the CUDA runtime, the backend-neutral core, the lane core and the CUDA family (no GPU), on any host.
