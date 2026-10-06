@@ -1,4 +1,4 @@
-//! Replays one recorded Python extension call (capture.py's "replay" fixtures) through kernels_replay.call on the
+//! Replays one recorded Python extension call (dsv41_capture.py's "replay" fixtures) through kernels_replay.call on the
 //! recorded bytes, and compares every storage the call's arguments view with Python's after the call, bit for bit.
 //!
 //! When the Python twin predates R1 (its call has no `split` / `spin`), the same call is also run as R1's variants,
@@ -43,7 +43,7 @@ const Ctx = struct {
         return out;
     }
 
-    /// capture.py's argument node -> a replay Arg.
+    /// dsv41_capture.py's argument node -> a replay Arg.
     fn arg(c: *Ctx, v: Value) !replay.Arg {
         const o = v.object;
         if (o.get("t")) |t| {

@@ -30,7 +30,7 @@ rm -rf "$OUT/fixtures"
 PYTHONPATH="$PY/src" PYTHONDONTWRITEBYTECODE=1 python -B "$HERE/oracle.py" "$OUT" > "$OUT/oracle.log" 2>&1 \
   || { rc=1; echo "oracle failed"; tail -30 "$OUT/oracle.log"; }
 
-step "capture: the Python engine's own GPU suites, their extension calls recorded (capture.py)"
+step "capture: the Python engine's own GPU suites, their extension calls recorded (dsv41_capture.py)"
 # Every allowed extension call the suites make (attention + top-k, mHC decode / prefill, router GEMV incl. R1c's prune,
 # pfdense, dense3 / x3seg / upstream linear, incl. R1 / R1c variants when the twin has them) becomes a replay case.
 # Timing, emulator and real-weight tests are left out. A failing Python test does not fail the job (its calls still
@@ -43,10 +43,17 @@ done
 SKIP_K="not time and not us_ and not sweep and not cold and not real_layer and not emulator and not device_info and not launch_ms and not chunk_budget and not end_to_end and not kwidth"
 if [ -n "$CAPTURE_TESTS" ]; then
   (cd "$PY" && PYTHONPATH="$HERE:$PY/src:$PY/tests" PYTHONDONTWRITEBYTECODE=1 TF_DSV41_CAPTURE="$OUT/fixtures" \
-     timeout "${TF_DSV41_CAPTURE_MIN:-25}m" python -m pytest -q -p capture -p no:cacheprovider $CAPTURE_TESTS -k "$SKIP_K") \
+     timeout "${TF_DSV41_CAPTURE_MIN:-25}m" python -m pytest -q -p dsv41_capture -p no:cacheprovider $CAPTURE_TESTS -k "$SKIP_K") \
     > "$OUT/capture.log" 2>&1
   echo "capture: pytest rc $? ($(tail -1 "$OUT/capture.log"))"
-  cp "$OUT/fixtures/capture.json" "$OUT/capture.json" 2>/dev/null
+  # the plugin writes capture.json at session end, calls or none: its absence means it never loaded
+  if cp "$OUT/fixtures/capture.json" "$OUT/capture.json" 2>/dev/null; then
+    calls=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["calls"])' "$OUT/capture.json")
+    echo "capture: $calls calls recorded"
+    [ "$calls" -gt 0 ] || { rc=1; echo "capture: FAIL no extension call recorded"; }
+  else
+    rc=1; echo "capture: FAIL no capture.json (the plugin did not load)"
+  fi
 else
   echo "capture: no GPU suites under $PY/tests/cuda"
 fi

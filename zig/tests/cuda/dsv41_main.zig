@@ -16,7 +16,7 @@ const usage =
     \\  kvsplit            split KV's exchange copies against kv/split.zig's host reference (no fixture)
     \\  experts <dir>      decode chain: group, rot_in, x3ld (every setting) / upstream grouped / x3pf, epilogues, combine
     \\  x3gm <dir>         fast prefill: rot, gate/up and down at every configuration (uniform and ragged), combine
-    \\  replay <dir>       one recorded Python extension call (capture.py) re-issued and compared, storage by storage
+    \\  replay <dir>       one recorded Python extension call (dsv41_capture.py) re-issued and compared, storage by storage
     \\  all <fixtures>     every case directory under <fixtures> by its manifest's "kind"
     \\
 ;

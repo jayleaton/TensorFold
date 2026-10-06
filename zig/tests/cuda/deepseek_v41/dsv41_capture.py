@@ -8,7 +8,8 @@ Storages, not tensors, are saved, so views that share memory (the pool's 584-byt
 slices of an output) keep their aliasing. Calls are recorded only outside graph capture, only for the extensions
 whose arguments hold no device addresses (ALLOW), and within the size caps below.
 
-usage: TF_DSV41_CAPTURE=<out dir> python -m pytest -p capture <test files>   (this directory on PYTHONPATH)
+usage: TF_DSV41_CAPTURE=<out dir> python -m pytest -p dsv41_capture <test files>   (this directory on PYTHONPATH)
+(not `-p capture`: that names pytest's own output-capture plugin, already loaded, and this one never runs)
 """
 
 from __future__ import annotations
@@ -167,6 +168,7 @@ def pytest_configure(config):
 
     B.load = load
     OUT.mkdir(parents=True, exist_ok=True)
+    print(f"dsv41_capture: recording {len(ALLOW)} extensions to {OUT}", flush=True)
 
 
 def pytest_runtest_setup(item):
