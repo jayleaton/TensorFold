@@ -181,11 +181,20 @@ pub const Pack = struct {
         const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ p.dir, p.files.items[info.file] });
         const file = try Io.Dir.cwd().openFile(io, path, .{});
         defer file.close(io);
-        var i: u64 = 0;
-        while (i < span.count) : (i += 1) {
-            const dst = out[@intCast(i * span.len)..][0..@intCast(span.len)];
-            if (try file.readPositionalAll(io, dst, info.start + span.at(i)) != dst.len) return error.ShortRead;
+        if (span.count <= 1) {
+            if (try file.readPositionalAll(io, out, info.start + span.offset) != out.len) return error.ShortRead;
+            return;
         }
+        // a strided part (a column split): one read of the range that covers every run, then the runs gathered,
+        // instead of a small read a K-tile row (pod 1: 45 MB/s from the network volume run by run)
+        const first = span.at(0);
+        const cover: usize = @intCast(span.at(span.count - 1) + span.len - first);
+        const tmp = try std.heap.page_allocator.alloc(u8, cover);
+        defer std.heap.page_allocator.free(tmp);
+        if (try file.readPositionalAll(io, tmp, info.start + first) != cover) return error.ShortRead;
+        const len: usize = @intCast(span.len);
+        const stride: usize = @intCast(span.stride);
+        for (0..@intCast(span.count)) |i| @memcpy(out[i * len ..][0..len], tmp[i * stride ..][0..len]);
     }
 
     /// The codebook of the group at `prefix`: its marker's value, else the 3-instruction default.

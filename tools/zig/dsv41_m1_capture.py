@@ -55,6 +55,7 @@ class Capture:
         (out / "blobs").mkdir(parents=True, exist_ok=True)
         self.ops = open(out / "ops.jsonl", "w")
         self.weights: list[tuple[int, int, str]] = []      # (base, end, name), sorted
+        self.keep: list = []                                # every named tensor, alive until the end
         self.recording = False
         self.set = ""
         self.phase = ""
@@ -112,8 +113,11 @@ class Capture:
             orig = found[name]
             if orig.is_cuda and orig.numel():
                 spans.append((orig.data_ptr(), orig.data_ptr() + raw.numel(), name))
-        # a name binds the tensor's own bytes (the Zig loader's image of it starts there)
-        self.weights = sorted(spans)
+        # a name binds the tensor's own bytes (the Zig loader's image of it starts there); the tensors stay referenced
+        # for the whole capture: a weight the blocks re-lay out and free would otherwise hand its addresses to the
+        # caching allocator, and a later buffer there would bind as that weight (pod 1: the KV store as ix_wq_b)
+        self.keep.extend(found.values())
+        self.weights = sorted(set(self.weights) | set(spans))
         return digests
 
     def weight_of(self, addr: int):
