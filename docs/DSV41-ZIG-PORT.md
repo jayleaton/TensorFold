@@ -243,6 +243,32 @@ Rules from `ZIG-PREVIEW.md`:
   - A chunk's exchange is n × hidden × 2 B a rank: 2,048 × 5,120 × 2 = 20 MiB. That is over the mailbox's 16 MB ceiling (`TF_TP_MAILBOX_MAX_KB` max 16,384), so prefill exchanges go through NCCL in the hybrid Collective.
   - Raising the mailbox to fit a smaller chunk (1,600 rows = 16 MB) is not worth it. At 16–20 MiB the transfer (about 1 ms at CX7 rates) dwarfs the mailbox's latency gain (8.9 µs vs 21 µs an exchange on the Sparks, under 2 %). The mailbox slots would also hold 16 MB of registered memory a direction, which on GB10 is GPU memory.
   - The default stays at 256 KiB: decode windows up to 25 rows (25 × 10 KiB) use RoCE. For shared lanes rounds up to 64 rows, set `TF_TP_MAILBOX_MAX_KB=640` so they stay on RoCE too (64 × 5,120 × 2 B = 640 KiB).
+- **Pod 16** (6bb4634, 2x PRO 6000, 14 min, $1.02; prod knobs):
+  - **Set P (with layer 20) replays bit-exact:** 176/176 launches alone and chained, weights 469/469, the DSpark heads included. The small files are in `dsv41-zig-ref/cap16`.
+  - **M2b (M2c-1 regression):** PASS on both ranks, 64/64 tokens and logits, 25/25 blocks.
+  - **M2b with `TF_DSV41_GRAPHS=1`:** PASS, but no graph ran. The traced step 0 cached a traced program that `graphs.audit` refused, so every window ran eager. dsq-zig-kern-1 has fixed this; it is not graphs evidence.
+  - **Lanes mode 1 stopped at `NotAChain`.** Lanes' undrafted step (`queue`) sends the next one-row window without a keep. The iface contract says an unkept chain window keeps every row, and GpuTarget refused. Fixed in 288a28e.
+  - **Lanes mode 2 stopped at a missing Triton variant** (`_prune` with R > 1). The reference had only run one-row windows, and Triton specializes a 1. The reference now adds 2–6-row windows after its recorded steps (2c61b24).
+- **The DSpark GPU pass** (`dspark_emit.zig`, `dspark_gpu.zig`):
+  - **Emitter:** ingest (main_proj with split K, main_norm, each block's wkv / kv_norm / ring store) and the pass. The pass is:
+    - the block ids embedded;
+    - the first site on mhc_cuda, then the Triton `_site` + `_finish_k` boundaries;
+    - ring attention on attn_cuda, with Python's DraftInputs statics laid out byte for byte;
+    - the 128-expert MoE (block_moe.moe);
+    - the final norm with `dspark.norm`, then the head.
+  - **Host gate (`tf-dsv41-m1 dcheck cap16`):** 172/172 calls equal (ingest 15 + 15, passes 71 + 71), 58 Triton variants 0 wrong, 0 miswired. The glue inputs are exactly the runtime's steps: statics, taps, the fp32 copy of q, embed, exchanges.
+  - **Not emitted:** Python's `_keys` + torch top-k + `_chain`. The host does them instead: each rank's best 64 columns (`dspark.candidates`), the ranks' lists gathered over the Collective in rank order, then `dspark.chain` (chain_host's rule, golden-tested). Drafts never change a reply, so fp32 summation order is the only difference allowed against the `_chain` kernel.
+  - **Runtime:** `GpuPass` implements `iface.Pass`. The leader sends `op_ds_ingest` / `op_ds_propose` and the followers run them (`Forward.drafter`), so the pass's exchanges pair up. A slot resumed from another engine's prompt state has no taps for that prompt, so its context restarts after it (Python's restore without DSpark rows). q's fp32 copy is done on the host until dsq-zig-kern-1's `widen` kernel lands.
+  - **Gates on the next pod:**
+    1. `M1_MODE=both` on a set P capture runs our emitted drafter launches on our buffers against Python's outputs, bit for bit.
+    2. `M2B_LANES=3` runs lanes with the GPU pass at TP=2: drafted tokens must equal the serial reference, and the pass must draft. On the 0–24 prefix the taps are not the trained layers', so acceptance is not a measure there.
+- **Zig prefill** (`block_prefill.zig`, by a helper agent; 5355e01):
+  - **Emitter:** the fast-prefill launch sequence (mhc_pf, rot_in / unpack / `_gemm`, `_fused` attention, `_keys` / `_block_keys`, x3gm per K2 width, combine, the shared expert, the head over all rows).
+  - **Host gate on cap15:** p2048 320/320 calls equal, 192 Triton variants 0 wrong, 0 miswired. Decode is unchanged (145/145 per window).
+  - **Verified layer modes:** a full KV + candidate source (20), reuse (21–23), reindex (24).
+  - **Emitted but not yet compared:** SWA layers 0–1, the Engram layers, ratio-2 sources 2 / 8 / 14, and row counts other than 2,048. A host smoke ran them, but there is no capture to compare against.
+  - **Refused (`error.Unsupported`):** segments of 16 rows or fewer (they go through the decode kernels) and the streamed top-k for 4,096+ keys.
+  - **What remains before Zig can prefill:** the forward's prefill glue, 15 steps that Python runs in torch between the launches: `topk`, `moe_sum`, `swiglu`, `counts`, `gm_picks`, `gm_plan`, `gm_ticket`, `stage_in` / `stage_out`, `ix_w`, `proj`, `proj_carry`, `cand_keys`, `block_pos`, `zeros`. Several are reductions whose bits depend on torch's order (top-k ties, sums), so they are kernel work for dsq-zig-kern-1, each gated against the capture's buffers. M1's GPU forward re-seeds them from the capture meanwhile, so the next pod gates every launch of the segment on the GPU (`M1_MODE=both` on a p2048 capture).
 - **M3 status:**
   - **Built:**
     - `target.zig`: draft/iface.zig's `Target` over `forward.zig`. It covers one slot, chain verify windows with greedy choices (`forward.greedy`: Python's cross-rank rule), `keep` of a chain prefix, prefill as consecutive decode windows, and the taps.
