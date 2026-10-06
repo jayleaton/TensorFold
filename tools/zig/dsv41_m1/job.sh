@@ -6,6 +6,7 @@
 #      buffers before / after (local NVMe)
 #   3. replay: tf-dsv41-m1 replay, our loader + every launch re-issued and compared bit for bit
 # Each step has its own timeout and log in $RES; a failing step does not stop the next. Exit 0 = every step passed.
+# The step limits (12 + 22 + 18 min) fit the pod's 60-minute hard max with room for the runtime unpack and packing.
 #
 #   Z=<staged tree: bin/ fatbin/ tools/ zig/> PACK=<pack dir> RES=<results dir> LOCAL=<scratch> bash job.sh
 set -u
@@ -37,14 +38,14 @@ fi
 cat "$RES/env.txt"
 
 TF_DSV41_PY_SRC=/dsv41-tf TF_DSV41_TEST=$Z/bin/tf-dsv41-test TF_DSV41_FATBINS=$Z/fatbin \
-    step kernels 25 bash "$Z/zig/tests/cuda/deepseek_v41/job.sh" "$RES/kernels"
+    step kernels "${M1_KERNELS_MIN:-12}" bash "$Z/zig/tests/cuda/deepseek_v41/job.sh" "$RES/kernels"
 
 CAP=$LOCAL/capture
 rm -rf "$CAP"
-if step capture "${M1_CAPTURE_MIN:-35}" python -B "$Z/tools/zig/dsv41_m1_capture.py" --pack "$PACK" --out "$CAP" \
+if step capture "${M1_CAPTURE_MIN:-22}" python -B "$Z/tools/zig/dsv41_m1_capture.py" --pack "$PACK" --out "$CAP" \
         --sets "${M1_SETS:-A,B,C}"; then
     du -sh "$CAP" "$CAP/blobs" | tee "$RES/capture-size.txt"
-    step replay "${M1_REPLAY_MIN:-30}" "$Z/bin/tf-dsv41-m1" replay "$PACK" "$CAP" "$RES/m1"
+    step replay "${M1_REPLAY_MIN:-18}" "$Z/bin/tf-dsv41-m1" replay "$PACK" "$CAP" "$RES/m1"
 fi
 # the capture's small files come back (the blobs stay on the pod: GBs); ops.jsonl compressed
 mkdir -p "$RES/capture"

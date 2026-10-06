@@ -103,6 +103,10 @@ fn replay(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, capture: []c
     defer gpa.free(text);
     var log: std.Io.Writer.Allocating = .init(gpa);
     defer log.deinit();
+    // replay.jsonl grows op by op, so a run cut short still leaves what it checked
+    const log_file = try std.Io.Dir.cwd().createFile(io, try std.fs.path.join(a, &.{ out_dir, "replay.jsonl" }), .{});
+    defer log_file.close(io);
+    var log_at: u64 = 0;
     // [mode][status] counts, mode 0 alone, 1 chained
     var counts: [2][4]usize = @splat(@splat(0));
     var chained_in: usize = 0;
@@ -126,8 +130,11 @@ fn replay(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, capture: []c
             alone.diff_bytes,        alone.first,            chain.status,             chain.why,
             chain.chained_in,        alone.detail,           chain.detail,
         });
+        const fresh = log.written()[log_at..];
+        try log_file.writePositionalAll(io, fresh, log_at);
+        log_at += fresh.len;
     }
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ out_dir, "replay.jsonl" }), .data = log.written() });
+
     const summary = try std.fmt.allocPrint(a,
         \\{{"weights": {{"equal": {d}, "differ": {d}, "missing": {d}}}, "triton_loaded": {d}, "triton_failed": {d},
         \\ "alone": {{"equal": {d}, "differ": {d}, "skipped": {d}, "failed": {d}}},

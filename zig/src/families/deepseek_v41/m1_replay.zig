@@ -216,7 +216,7 @@ pub const Replay = struct {
         var out: Outcome = .{ .status = .equal };
         r.issue(arena.allocator(), op, chained, &out) catch |e| {
             out.why = @errorName(e);
-            const skips = [_][]const u8{ "NoBinding", "NoKernels", "KernelNotLoaded", "HostTensor", "UnsupportedDType", "UnsupportedScalar", "UnresolvedPointer", "MissingWeight" };
+            const skips = [_][]const u8{ "Prefetch", "NoBinding", "NoKernels", "KernelNotLoaded", "HostTensor", "UnsupportedDType", "UnsupportedScalar", "UnresolvedPointer", "MissingWeight" };
             out.status = .failed;
             for (skips) |s| if (std.mem.eql(u8, s, out.why)) {
                 out.status = .skipped;
@@ -237,6 +237,10 @@ pub const Replay = struct {
             defer scratch.free();
             try tri.launch(k, op, r.stream, &ctx, resolveFn, scratch.ptr);
         } else {
+            // the L2 prefetchers only warm the cache (no output a later op reads), and the paced one spins on the
+            // GPU clock: replaying them out of their round can stall (pod 7)
+            const ext = op.get("ext").?.string;
+            if (std.mem.startsWith(u8, ext, "tf_dsv41_l2pace") or std.mem.startsWith(u8, ext, "tf_dsv41_l2pf")) return error.Prefetch;
             const ks = r.kernels orelse return error.NoKernels;
             const given = op.get("args").?.array.items;
             const args = try a.alloc(rp.Arg, given.len);
