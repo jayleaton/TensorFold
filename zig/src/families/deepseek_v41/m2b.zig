@@ -57,7 +57,13 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, ref: []con
     defer kernels.deinit();
     const session = try gpa.create(tp.Session);
     defer gpa.destroy(session);
-    try session.open(&driver, tcfg, &.{});
+    // TF_TP_KERNEL_IMAGE: tp_mailbox.fatbin (the mailbox / RoCE kernels): TF_COMM_BACKEND=roce then takes the small
+    // exchanges over RoCE (the hybrid), NCCL the large ones; unset: NCCL alone
+    const image: []const u8 = if (std.c.getenv("TF_TP_KERNEL_IMAGE")) |p|
+        try cwd.readFileAllocOptions(io, std.mem.span(p), a, .limited(1 << 26), .@"16", null)
+    else
+        &.{};
+    try session.open(&driver, tcfg, image);
     defer session.close();
     const comm = session.comm();
 

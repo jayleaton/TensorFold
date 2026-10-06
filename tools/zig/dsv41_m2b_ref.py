@@ -33,7 +33,8 @@ def rank_main(rank: int, a) -> None:
     sys.path.insert(0, str(HERE))
     import torch
 
-    torch.cuda.set_device(rank)
+    dev_index = rank if a.rank < 0 else 0     # two hosts: each rank on its own GPU 0
+    torch.cuda.set_device(dev_index)
     from dsv41_m1_capture import IndexRows, pack_aot, specialization
     from tensorfold.cuda.comm import open_comm
     from tensorfold.families.deepseek_v41.cuda import rope as RO
@@ -45,8 +46,8 @@ def rank_main(rank: int, a) -> None:
 
     t0 = time.time()
     out = Path(a.out)
-    dev = torch.device(f"cuda:{rank}")
-    comm = open_comm(rank, 2, "127.0.0.1", a.port)
+    dev = torch.device(f"cuda:{dev_index}")
+    comm = open_comm(rank, 2, a.master, a.port)
     pack = Path(a.pack)
     cfg = Config.from_file(pack / "config.json")
     tmap, _ = token_map(pack / "tokenizer.json")
@@ -97,7 +98,7 @@ def rank_main(rank: int, a) -> None:
             put(f"s.L{L}.carry", s0.carry[L])
     (sd / "state.json").write_text(json.dumps({"pos": s0.pos, "tail": list(s0.tail), "roles": roles}, indent=1) + "\n")
     rec = None
-    if rank == 0:
+    if rank == 0 or a.rank >= 0:   # the AOT set and rope tables on each host of a two-host run
         import triton_aot_manifest as aot
 
         rec = aot.Recorder().install()
@@ -117,7 +118,7 @@ def rank_main(rank: int, a) -> None:
     mine = {"rank": rank, "load_s": round(load_s, 1), "run_s": round(run_s, 1), "tokens": tokens,
             "logits_sha256": digests, "layers_first_window": layers_d, "prompt_ids": ids}
     (out / f"rank{rank}.json").write_text(json.dumps(mine) + "\n")
-    if rank == 0:
+    if rank == 0 or a.rank >= 0:   # the AOT set and rope tables on each host of a two-host run
         tabs = RO.tables(cfg, a.limit + 2048)
         (out / "rope.bin").write_bytes(b"DSV41RP1" + struct.pack("<II", *tabs[0].cs.shape)
                                        + tabs[0].cs.contiguous().numpy().tobytes()
@@ -140,8 +141,21 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=4096)
     ap.add_argument("--seed", type=int, default=4101)
     ap.add_argument("--port", type=int, default=29611)
+    ap.add_argument("--rank", type=int, default=-1, help="two hosts: this host's rank (one process); -1: both ranks here")
+    ap.add_argument("--master", default="127.0.0.1", help="rank 0's address (two hosts: the head's CX7 address)")
     a = ap.parse_args()
     Path(a.out).mkdir(parents=True, exist_ok=True)
+    if a.rank >= 0:                         # two hosts: this host's rank alone (the other host runs the other)
+        rank_main(a.rank, a)
+        mine = json.loads((Path(a.out) / f"rank{a.rank}.json").read_text())
+        ranks = [None, None]
+        ranks[a.rank] = {k: mine[k] for k in ("load_s", "run_s", "logits_sha256", "layers_first_window")}
+        meta = {"layers": a.layers, "prompt": a.prompt, "steps": a.steps, "seed": a.seed, "limit": a.limit,
+                "tokens": mine["tokens"], "prompt_ids": mine["prompt_ids"], "host_rank": a.rank,
+                "env": {k: v for k, v in os.environ.items() if k.startswith("TF_DSV41")}, "ranks": ranks}
+        (Path(a.out) / "ref.json").write_text(json.dumps(meta, indent=1) + "\n")
+        print(json.dumps({"rank": a.rank, "tokens": len(mine["tokens"]), "first": mine["tokens"][:8]}), flush=True)
+        return 0
     import torch.multiprocessing as mp
 
     mp.spawn(rank_main, args=(a,), nprocs=2, join=True)
