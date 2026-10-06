@@ -134,6 +134,24 @@ Rules from `ZIG-PREVIEW.md`:
   - the replay
 
   Pods are logged in the quant repo's `results/zig-pod-ledger.md`.
+- **Block forward** (`tf-dsv41-m1 check CAPTURE` on the host; `tf-dsv41-m1 both PACK CAPTURE OUT` on the GPU, which runs the replay and then the forward on one load; files `block.zig`, `block_moe.zig`, `calls.zig`, `m1_check.zig`, `m1_forward.zig`). See M1's second half in section 5.
+- **Results on the prod path (pod 8, `M1_KNOBS=prod`, 41ce3ed):**
+  - **Replay: PASS.**
+    - 1,254/1,254 launches bit-exact, alone and chained (4,389 inputs from our own outputs).
+    - 72 L2 prefetch launches skipped.
+    - Weights 535/535.
+  - **Block forward:**
+    - 789 calls; all 717 launched calls are bit-equal on our own buffers. 0 differ, 0 failed; the 72 prefetches are skipped.
+    - Glue re-seeds are exactly the predicted roles: `w.recv.attn` and `w.recv.moe` (18 each), and `s.L2.carry` (2).
+    - Our run-time forms equal Python's: 103 of 103 we build. That covers upstream strips (Engram `wkv`, head), the mHC bf16 weights, and the expert `suh`/`svh` stacks and K2 tables.
+    - The 78 dense3 groups were compared as plain strips, but dense3 reads the lanes layout.
+    - `prepare.lanes` (03f31dd) builds the lanes form. It equals `tests/dsv41_dense3_emu.py`'s reference at K2 4/6/8/10/12/16. The GPU compare of it rides on the next pod that runs the M1 job.
+  - **Kernel agent's job, in the same pod:**
+    - bits 13/13;
+    - kvsplit 3/3;
+    - SASS 182/182 equal to the Python build;
+    - symbols PASS.
+    - The x3gm cases logged "v2 0 launches", so x3gm v2 itself was not exercised.
 
 ## 3. Python to Zig, component by component
 
