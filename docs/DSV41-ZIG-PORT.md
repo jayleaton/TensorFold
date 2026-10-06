@@ -490,6 +490,36 @@ Effort is in engineering days for this agent team, assuming GPU windows are avai
   - `prefill.zig` with the exact-tag prefill first, then the fast kernels (`x3gm`, `_gemm`) under their own session tag as in Python.
   - `graphs.zig`, `prepared.zig`.
   - A `tensorfold run` path for DeepSeek: `zig/src/cli/dsv41_main.zig`, or a family switch in `cuda_main.zig`.
+- **Plan, as M1 left it (2026-10-06).** M1 proved the spec and the seam. `block.emit` produces a window's launches on the prod path; `tf-dsv41-m1 check` gates them against a capture on the host. `m1_forward.zig` showed those calls reproduce Python's bits on our own buffers once the glue is supplied. M2 is that executor with every seed replaced by our own state and glue. In order:
+  1. **`run.zig`, the call executor** (from `m1_forward.zig` minus seeding):
+     - Roles become a buffer plan. One emit per row bucket at load sizes every role. `s.` roles are persistent allocations, `w.` and `L.` roles one arena reused across layers. No allocation per token.
+     - Extension calls go through the typed launchers (`dsv41_kernels`), not `replay.call`'s argument decoding. Triton calls use the engine's `cuda/aot.zig` `Set.find`: name, constexprs, and the 16-byte specialization of our own arguments, the variant Triton itself would pick. `aot.Set` gains global scratch (it refuses it today; `m1_triton.zig` handles it).
+     - **Gate:** `tf-dsv41-m1 check` keeps gating the emitted calls. The executor reuses M1's GPU forward with seeding off for everything but window inputs.
+  2. **AOT coverage set:** the Triton variants of every row bucket (1–16 decode, the prefill chunk sizes), recorded from a prod-knob Python run without blobs (a launch log is enough). This is a short pod step, and the kernel agent owns the set's build.
+  3. **Glue, as the M1 check listed it:**
+     - positions (`w.pos`, `w.pos64`, the SWA lower bounds `w.lo`);
+     - the stream input (the embedding gather of this rank's vocabulary rows, its exchange, the 4-stream expand);
+     - the two exchanges into `w.recv.attn` / `w.recv.moe` (partial to bf16, then `Collective.allGather` into `[world, R, D]`);
+     - `kit_weights`' fp16 rounding of the pruned weights;
+     - the ratio-2 carry roll between windows;
+     - Engram rows (hashing on the host, `EngramSource` local first);
+     - zeroed counters at allocation.
+     Each glue op is a small kernel next to `pointwise.cu`, written to torch's arithmetic.
+  4. **`state.zig`:**
+     - per slot: the SWA rings, compressed pools and index keys through the session pool (`sessions/pool.zig` residues, `kv/device.zig`), and the ratio-2 carries;
+     - positions, and the rollback `draft/iface.zig` `keep` needs.
+     The M1 forward's `s.L*.swa/comp/ik/carry` roles map one to one.
+  5. **`forward.zig`:** a window is `block.emit` over every layer plus the head, run by `run.zig` with `state.zig`'s buffers bound. Prefill comes later with the exact-tag kernels first, as in Python.
+  6. **Gates:**
+     - **M2a, one GPU, rank 0, a peer of zeros:** the whole model's decode windows against Python on the same pack. Compared: per-layer stream digests and the head's logits, bit for bit, recorded by a capture mode that keeps digests only (no blobs, so all 43 blocks fit). A short PRO 6000 pod.
+     - **M2b, two GPUs on one pod (NCCL):** TP=2 real exchanges against Python's TP=2 on the same pod. Logits bitwise, greedy tokens identical.
+     - **M2c, the two Sparks:** the same on GB10, plus timing.
+  - **Started offline:** `buffers.zig` sizes every role. `tf-dsv41-m1 plan` emits the whole model from the q28-v2 listings: `fixtures/q28v2-dense-k2.txt`, derived from `plans/q28-v2.json` and equal to all 109 trellises the capture holds. Results:
+    - The backbone window is 1,081 launches at every row bucket from 1 to 16 (198 Triton; 883 extension, 119 of them L2 prefetch). Each DSpark block is 22.
+    - Activations are 6.4 MiB (window) + 12.7 MiB (layer) at 16 rows.
+    - Persistent is 3.1 GiB: run-time weight forms, scratch and one slot's pools. Python relayouts the dense trellises in place, so M2 must replace the stored trellis with its strips / lanes form, not hold both.
+    - Not yet captured, so emitted from rules: layer 0, Engram on layer 14 (the order of its glue around the mHC site is unconfirmed), the KV sources 8/14, the index sources 28–36, DSpark 41–42. M2a's digests cover them.
+  - **Ownership:** the port lead owns `run.zig`, `state.zig`, `forward.zig` and the glue. dsq-zig-kern-1 owns the glue kernels' `.cu`, `aot.Set` scratch, and the coverage set. The TP fabric and KV/sessions code is used as is.
 - **Pack:** Mia's 2.9 bpw pack first (one width per layer, so the stack layout only), then ours (q28/v2: ragged).
 - **GPU:** both Sparks for several sessions of about 2 hours. This needs the Python-engine agent to release them, or a planned window like the E1/E2 one.
 

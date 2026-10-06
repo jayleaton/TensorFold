@@ -16,6 +16,7 @@ const fwd = @import("m1_forward.zig");
 const usage =
     \\usage: tf-dsv41-m1 replay|forward|both PACK CAPTURE OUT
     \\       tf-dsv41-m1 check CAPTURE   (host only: block.zig's calls against the capture's launches)
+    \\       tf-dsv41-m1 plan            (host only: the whole model emitted from the q28-v2 listings, M2's buffer plan)
     \\  PACK     the EXL3 pack (config.json, index, shards)
     \\  CAPTURE  tools/zig/dsv41_m1_capture.py's output (ops.jsonl, blobs/, weights.json, aot/, meta.json)
     \\  OUT      weights.jsonl, replay.jsonl, forward.jsonl, summary.json
@@ -27,6 +28,16 @@ const usage =
 
 pub fn main(init: std.process.Init) !u8 {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
+    if (args.len == 2 and std.mem.eql(u8, args[1], "plan")) {
+        var buf: [4096]u8 = undefined;
+        var out = std.Io.File.stdout().writer(init.io, &buf);
+        check.planAll(init.gpa, @embedFile("fixtures/q28v2-dense-k2.txt"), @embedFile("fixtures/q28v2-expert-k2.txt"), &out.interface) catch |e| {
+            std.debug.print("FAIL tf-dsv41-m1 plan: {t}\n", .{e});
+            return 1;
+        };
+        out.interface.flush() catch {};
+        return 0;
+    }
     if (args.len == 3 and std.mem.eql(u8, args[1], "check")) {
         var buf: [4096]u8 = undefined;
         var out = std.Io.File.stdout().writer(init.io, &buf);

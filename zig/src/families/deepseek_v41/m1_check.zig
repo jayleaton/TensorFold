@@ -6,6 +6,7 @@ const std = @import("std");
 const calls = @import("calls.zig");
 const block = @import("block.zig");
 const Config = @import("config.zig").Config;
+const buffers = @import("buffers.zig");
 const Value = std.json.Value;
 
 /// Dense K2s from the capture's weights.json (each "<prefix>.trellis" int16 [K/16, N/16, 8 K2]), the experts' ranges
@@ -23,6 +24,52 @@ pub fn widthsFromCapture(a: std.mem.Allocator, weights_json: []const u8, experts
     }
     try parseExperts(a, &w, experts);
     return w;
+}
+
+/// A "prefix k2" listing (fixtures/q28v2-dense-k2.txt) into the dense widths.
+pub fn parseDense(a: std.mem.Allocator, w: *block.Widths, text: []const u8) !void {
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (line[0] == '#') continue;
+        var f = std.mem.tokenizeScalar(u8, line, ' ');
+        const name = f.next() orelse return error.BadListing;
+        try w.dense.put(a, try a.dupe(u8, name), try std.fmt.parseInt(u32, f.next() orelse return error.BadListing, 10));
+    }
+}
+
+/// The whole model emitted on the host from the q28-v2 listings: the backbone window (layers 0-39 and the head) at
+/// each row bucket and the DSpark blocks, every call's count and the buffer plan's bytes by scope. No capture: it
+/// exercises the emitter on every layer kind (a capture covers 9 blocks) and sizes M2's buffers.
+pub fn planAll(gpa: std.mem.Allocator, dense: []const u8, experts: []const u8, log: *std.Io.Writer) !void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var w: block.Widths = .{};
+    try parseDense(a, &w, dense);
+    try parseExperts(a, &w, experts);
+    const cfg: Config = .{};
+    var backbone: [40]u32 = undefined;
+    for (&backbone, 0..) |*l, i| l.* = @intCast(i);
+    var plan: buffers.Plan = .{ .a = a };
+    for ([_]i64{ 1, 2, 3, 4, 8, 16 }) |n| {
+        const cs = try block.emit(a, &cfg, &w, .{}, &backbone, n, 4096 - 16, true);
+        try plan.add(cs);
+        var tri: usize = 0;
+        var pf: usize = 0;
+        for (cs) |c| {
+            if (c.triton) tri += 1;
+            if (std.mem.startsWith(u8, c.name, "tf_dsv41_l2p")) pf += 1;
+        }
+        try log.print("backbone window, {d} rows: {d} launches ({d} Triton, {d} extension incl. {d} L2 prefetch)\n", .{ n, cs.len, tri, cs.len - tri, pf });
+    }
+    for ([_]u32{ 40, 41, 42 }) |L| {
+        const cs = try block.emit(a, &cfg, &w, .{}, &.{L}, 16, 4096 - 16, false);
+        try plan.add(cs);
+        try log.print("DSpark block {d}, 16 rows: {d} launches\n", .{ L, cs.len });
+    }
+    const t = plan.totals();
+    const names = [_][]const u8{ "persistent (s.)", "window (w.)", "layer (L.)" };
+    for (names, 0..) |nm, i| try log.print("{s}: {d} roles, {d:.1} MiB\n", .{ nm, t.roles[i], @as(f64, @floatFromInt(t.bytes[i])) / (1 << 20) });
 }
 
 pub fn parseExperts(a: std.mem.Allocator, w: *block.Widths, text: []const u8) !void {
