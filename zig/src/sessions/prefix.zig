@@ -82,6 +82,9 @@ pub fn Index(comptime Extra: type) type {
             extra: Extra,
         };
 
+        /// An entry inserted, or the one already there with the same key.
+        pub const Placed = struct { id: u32, new: bool };
+
         gpa: std.mem.Allocator,
         page: u32,
         nodes: std.ArrayList(Node) = .empty,
@@ -145,7 +148,7 @@ pub fn Index(comptime Extra: type) type {
         }
 
         /// Adds an entry for ids (chain: its full pages' digests), or returns the one with the same key.
-        pub fn insert(x: *Self, tag: u32, ids: []const i32, digests: []const Digest, ram: bool, extra: Extra) !struct { id: u32, new: bool } {
+        pub fn insert(x: *Self, tag: u32, ids: []const i32, digests: []const Digest, ram: bool, extra: Extra) !Placed {
             const full: u32 = @intCast(ids.len / x.page);
             std.debug.assert(digests.len >= full);
             const r = root(tag);
@@ -154,8 +157,35 @@ pub fn Index(comptime Extra: type) type {
                 const d = digests[j];
                 n = x.by_digest.get(d) orelse try x.newNode(d, n, @intCast(j + 1));
             }
-            const tail_ids = ids[full * x.page ..];
-            const key = entryKey(x.nodes.items[n].digest, ids.len, tail_ids);
+            const r2 = try x.place(tag, n, ids.len, ids[full * x.page ..], extra);
+            if (r2.new and ram) try x.setRam(r2.id, true, ids);
+            return r2;
+        }
+
+        /// Adds a disk entry whose ids continue from node anchor (a base entry's path; none: the tag's root): suffix holds tokens [depth x page, pos).
+        pub fn insertFrom(x: *Self, tag: u32, anchor: u32, suffix: []const i32, extra: Extra) !Placed {
+            var n = if (anchor != none) anchor else blk: {
+                const r = root(tag);
+                break :blk x.by_digest.get(r) orelse try x.newNode(r, none, 0);
+            };
+            const d0 = x.nodes.items[n].depth;
+            const full: u32 = @intCast(suffix.len / x.page);
+            for (0..full) |j| {
+                const d = step(x.nodes.items[n].digest, suffix[j * x.page ..][0..x.page]);
+                n = x.by_digest.get(d) orelse try x.newNode(d, n, d0 + @as(u32, @intCast(j)) + 1);
+            }
+            return x.place(tag, n, @as(u64, d0) * x.page + suffix.len, suffix[full * x.page ..], extra);
+        }
+
+        /// The node at depth on an entry's path (its first `depth` full pages).
+        pub fn nodeAt(x: *Self, id: u32, depth: u32) ?u32 {
+            var n = x.entries.items[id].node;
+            while (n != none and x.nodes.items[n].depth > depth) n = x.nodes.items[n].parent;
+            return if (n != none and x.nodes.items[n].depth == depth) n else null;
+        }
+
+        fn place(x: *Self, tag: u32, n: u32, pos: u64, tail_ids: []const i32, extra: Extra) !Placed {
+            const key = entryKey(x.nodes.items[n].digest, pos, tail_ids);
             if (x.by_key.get(key)) |e| return .{ .id = e, .new = false };
             const tail = try x.gpa.dupe(i32, tail_ids);
             errdefer x.gpa.free(tail);
@@ -165,11 +195,10 @@ pub fn Index(comptime Extra: type) type {
             };
             try x.by_key.put(x.gpa, key, id);
             const nd = &x.nodes.items[n];
-            x.entries.items[id] = .{ .key = key, .tag = tag, .pos = ids.len, .node = n, .tail = tail, .ram = false, .next_at = nd.first_entry, .extra = extra };
+            x.entries.items[id] = .{ .key = key, .tag = tag, .pos = pos, .node = n, .tail = tail, .ram = false, .next_at = nd.first_entry, .extra = extra };
             if (nd.first_entry != none) x.entries.items[nd.first_entry].prev_at = id;
             nd.first_entry = id;
             x.addPath(n, 1, 0);
-            if (ram) try x.setRam(id, true, ids);
             return .{ .id = id, .new = true };
         }
 

@@ -531,6 +531,29 @@ pub const Store = struct {
         return avail >= need;
     }
 
+    /// Rebuilds the NVMe entries after a restart (an empty store): every valid file indexed, deltas on their bases' paths; returns how many.
+    /// Two ranks then intersect what they hold (the engine's plan link) and drop the rest, so a plan never names an entry one rank lacks.
+    pub fn reconcile(s: *Store) !u32 {
+        const d = s.disk orelse return 0;
+        var found: std.ArrayList(Disk.Found) = .empty;
+        defer {
+            for (found.items) |f| s.gpa.free(f.ids);
+            found.deinit(s.gpa);
+        }
+        try d.scan(&found);
+        for (found.items) |f| {
+            var anchor: u32 = none;
+            if (f.head.hasBase()) {
+                const b = s.index.lookup(f.head.base) orelse return error.NoBase;
+                anchor = s.index.nodeAt(b, f.head.first_page) orelse return error.BadChain;
+            }
+            const r = try s.index.insertFrom(f.head.tag, anchor, f.ids, .{ .file = true, .kind = f.head.kind });
+            s.clock += 1;
+            s.index.get(r.id).extra.used = s.clock;
+        }
+        return @intCast(found.items.len);
+    }
+
     /// Idle resident chats and the pool bytes held by entries alone.
     pub fn resident(s: *Store) struct { chats: u32, bytes: u64 } {
         var n: u32 = 0;

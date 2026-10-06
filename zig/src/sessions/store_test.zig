@@ -163,6 +163,19 @@ fn scenario(gpa: std.mem.Allocator, root: []const u8, world: u32, rank: u32, asy
     while (id != store_mod.none) : (id = r.store.entry(id).extra.newer) for (r.store.entry(id).extra.pages) |pg| try trace.append(gpa, pg);
 }
 
+/// After the scenario: a new process (pool, store) on the same tier finds every file and resumes chat 1 through its delta chain.
+fn restart(gpa: std.mem.Allocator, root: []const u8, world: u32, rank: u32) !void {
+    var r: Rank = undefined;
+    try r.init(gpa, root, world, rank, .{ .chats = 1 });
+    defer r.deinit();
+    try testing.expectEqual(@as(u32, 4), try r.store.reconcile());
+    const s = try r.pool.newSlot(64 * page);
+    const a = try chatIds(gpa, 1, 20 * page);
+    defer gpa.free(a);
+    try testing.expectEqualStrings("disk", try turn(gpa, &r, s, 1, a[0 .. 16 * page]));
+    try testing.expectEqual(@as(u64, 1), r.store.stats.hits_disk);
+}
+
 fn tmpRoot(gpa: std.mem.Allocator, tmp: *std.testing.TmpDir, sub: []const u8) ![:0]u8 {
     try tmp.dir.createDirPath(testing.io, sub);
     return tmp.dir.realPathFileAlloc(testing.io, sub, gpa);
@@ -179,6 +192,7 @@ test "chats over turns: residency to NVMe, bit-identical resumes, deltas, older 
     const r0 = try tmpRoot(gpa, &tmp, "sync");
     defer gpa.free(r0);
     try scenario(gpa, r0, 1, 0, false, &t0);
+    try restart(gpa, r0, 1, 0);
     const r1 = try tmpRoot(gpa, &tmp, "async");
     defer gpa.free(r1);
     try scenario(gpa, r1, 1, 0, true, &t1);
@@ -197,5 +211,7 @@ test "two split ranks make the same decisions on the same calls and each restore
     defer gpa.free(root);
     try scenario(gpa, root, 2, 0, false, &t0);
     try scenario(gpa, root, 2, 1, true, &t1);
+    try restart(gpa, root, 2, 0);
+    try restart(gpa, root, 2, 1);
     try testing.expectEqualSlices(u64, t0.items, t1.items);
 }
