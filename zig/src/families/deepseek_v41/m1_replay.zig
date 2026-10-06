@@ -133,7 +133,8 @@ pub const Replay = struct {
             const x = rl.object;
             if (@as(usize, @intCast(x.get("buf").?.integer)) != id) continue;
             const at: usize = @intCast(x.get("at").?.integer);
-            if (x.get("unresolved") != null) return error.UnresolvedPointer;
+            // an int64 the capture could not place (a sort key's high word looks like an address): left as captured
+            if (x.get("unresolved") != null) continue;
             const delta: u64 = @bitCast(x.get("delta").?.integer);
             const base = if (x.get("weight")) |w| (r.weights.get(w.string) orelse return error.MissingWeight).ptr else addr[@intCast(x.get("target").?.integer)];
             std.mem.writeInt(u64, host[at..][0..8], base + delta, .little);

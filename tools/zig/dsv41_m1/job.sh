@@ -34,7 +34,7 @@ TF_DSV41_PY_SRC=/dsv41-tf TF_DSV41_TEST=$Z/bin/tf-dsv41-test TF_DSV41_FATBINS=$Z
 CAP=$LOCAL/capture
 rm -rf "$CAP"
 if step capture "${M1_CAPTURE_MIN:-35}" python -B "$Z/tools/zig/dsv41_m1_capture.py" --pack "$PACK" --out "$CAP" \
-        --sets "${M1_SETS:-A,B}"; then
+        --sets "${M1_SETS:-A,B,C}"; then
     du -sh "$CAP" "$CAP/blobs" | tee "$RES/capture-size.txt"
     step replay "${M1_REPLAY_MIN:-30}" "$Z/bin/tf-dsv41-m1" replay "$PACK" "$CAP" "$RES/m1"
 fi
