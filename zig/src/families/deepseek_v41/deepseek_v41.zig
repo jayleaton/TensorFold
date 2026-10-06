@@ -11,6 +11,7 @@ pub const Plan = plan.Plan;
 pub const stage = @import("stage.zig");
 pub const named = @import("named.zig");
 pub const rounds = @import("rounds.zig");
+pub const prepare = @import("prepare.zig");
 
 test {
     _ = config;
@@ -21,5 +22,6 @@ test {
     _ = stage;
     _ = named;
     _ = rounds;
+    _ = prepare;
     _ = @import("host_test.zig");
 }
