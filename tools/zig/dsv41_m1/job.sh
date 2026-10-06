@@ -23,6 +23,12 @@ export PYTHONPATH=/dsv41-tf/src TORCH_EXTENSIONS_DIR=${TORCH_EXTENSIONS_DIR:-/op
     TRITON_CACHE_DIR=$LOCAL/triton CUDA_CACHE_PATH=$LOCAL/nv PYTHONDONTWRITEBYTECODE=1
 rc=0
 T0=$(date +%s)
+# results stream to the network volume every 30 s (dsq/results/live/<sid>/): a run the hard max stops keeps what it
+# wrote (pod 12 lost a whole M2b run: the container disk goes with the pod, the tarball comes only at the end)
+VOLRES=${PACK%%/out/*}/results/live/$(basename "$(dirname "$RES")")
+( while sleep 30; do mkdir -p "$VOLRES" && cp -ru "$RES/." "$VOLRES/" 2>/dev/null; done ) &
+LIVE=$!
+trap 'kill $LIVE 2>/dev/null; mkdir -p "$VOLRES" && cp -ru "$RES/." "$VOLRES/" 2>/dev/null' EXIT
 step() { # NAME MINUTES CMD...: output in $RES/NAME.log, rc and seconds in $RES/steps.txt
     local name=$1 min=$2 t0 r; shift 2
     t0=$(date +%s); echo "=== $(date -u +%H:%M:%S) $name: $*"
@@ -59,7 +65,7 @@ left() { echo $(( ${M1_BUDGET_MIN:-52} - ($(date +%s) - T0) / 60 )); }
 # prebuilt sm_120 extensions from e1e2x.tar.gz, expert top-p unset) prompts and decodes greedily; then our two ranks
 # (tf-dsv41-m1 m2b, NCCL through the tp runtime) from its state; then the kernel job in what is left.
 if [[ "${M1_JOB:-m1}" == m2b ]]; then
-    hi=${M2B_HI:-27}
+    hi=${M2B_HI:-24}
     LP=$LOCAL/pack
     mkdir -p "$LP"
     : > "$LOCAL/pack-files"
@@ -68,17 +74,25 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
         [[ "$b" =~ ^layer-([0-9]+)\.safetensors$ ]] && (( 10#${BASH_REMATCH[1]} > hi )) && continue
         echo "$b" >> "$LOCAL/pack-files"
     done
-    (cd "$PACK" && step pack-copy 14 xargs -a "$LOCAL/pack-files" -P 16 -I{} cp {} "$LP/") || rc=1
+    ( while sleep 30; do echo "$(date -u +%H:%M:%S) $(du -sm "$LP" | cut -f1) MB"; done ) > "$RES/pack-copy-progress.log" 2>&1 &
+    prog=$!
+    # the local copy within 10 minutes, else every load reads the volume
+    if ! (cd "$PACK" && step pack-copy "${M2B_COPY_MIN:-10}" xargs -a "$LOCAL/pack-files" -P 16 -I{} cp {} "$LP/"); then
+        echo "pack copy did not finish: loading from the volume" | tee -a "$RES/steps.txt"
+        LP=$PACK
+    fi
+    kill $prog 2>/dev/null
     du -sh "$LP" | tee -a "$RES/steps.txt"
     if [[ -f "$Z/e1e2x.tar.gz" ]]; then tar -xzf "$Z/e1e2x.tar.gz" -C / && export TORCH_EXTENSIONS_DIR=/opt/e1e2-120; fi
     unset TF_DSV41_EXPERT_TOPP
     REF=$LOCAL/m2b-ref
     rm -rf "$REF"
-    if step m2b-ref "${M2B_REF_MIN:-20}" python -u -B "$Z/tools/zig/dsv41_m2b_ref.py" --pack "$LP" --out "$REF" \
+    if step m2b-ref "${M2B_REF_MIN:-18}" python -u -B "$Z/tools/zig/dsv41_m2b_ref.py" --pack "$LP" --out "$REF" \
             --layers "0-$hi" --steps "${M2B_STEPS:-64}" \
        && step engram-host 3 python -B "$Z/tools/zig/dsv41_engram_host.py" --py-src /dsv41-tf/src \
             --config "$LP/config.json" --tokenizer "$LP/tokenizer.json" --out "$REF/engram-host.bin"; then
-        step m2b "${M2B_MIN:-18}" bash "$Z/tools/zig/dsv41_m1/m2b_ranks.sh" "$Z/bin/tf-dsv41-m1" "$LP" "$REF" "$RES/m2b" \
+        mb=$(left); (( mb > 16 )) && mb=16
+        step m2b "$mb" bash "$Z/tools/zig/dsv41_m1/m2b_ranks.sh" "$Z/bin/tf-dsv41-m1" "$LP" "$REF" "$RES/m2b" \
             || rc=1
     else rc=1; fi
     mkdir -p "$RES/m2b-ref"

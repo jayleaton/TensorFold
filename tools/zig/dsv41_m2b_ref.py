@@ -134,7 +134,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--pack", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--layers", default="0-27")
+    ap.add_argument("--layers", default="0-24")
     ap.add_argument("--prompt", type=int, default=1536)
     ap.add_argument("--steps", type=int, default=64)
     ap.add_argument("--limit", type=int, default=4096)
