@@ -1,17 +1,138 @@
-//! `tf-dsv41-m1`: DeepSeek-V4.1's M1 gate on one GPU, our loader's weights and the captured block replayed against the Python engine's bits.
+//! `tf-dsv41-m1`: DeepSeek-V4.1's M1 gate on one GPU, our loader's weights and the captured blocks replayed against the Python engine's bits.
 
 const std = @import("std");
 const cuda = @import("cuda");
-const core = @import("core");
-const dsv41_kernels = @import("dsv41_kernels");
+const dk = @import("dsv41_kernels");
+const Config = @import("config.zig").Config;
+const Pack = @import("pack.zig").Pack;
+const plan = @import("plan.zig");
+const named = @import("named.zig");
+const load = @import("load.zig");
+const tri = @import("m1_triton.zig");
+const m1 = @import("m1_replay.zig");
 
-comptime {
-    _ = cuda;
-    _ = core;
-    _ = dsv41_kernels;
+const usage =
+    \\usage: tf-dsv41-m1 replay PACK CAPTURE OUT
+    \\  PACK     the EXL3 pack (config.json, index, shards)
+    \\  CAPTURE  tools/zig/dsv41_m1_capture.py's output (ops.jsonl, blobs/, weights.json, aot/, meta.json)
+    \\  OUT      weights.jsonl, replay.jsonl, summary.json
+    \\exit 0: every weight equal and every replayed op equal alone (skipped ops are listed, not failures)
+    \\
+;
+
+pub fn main(init: std.process.Init) !u8 {
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    if (args.len != 5 or !std.mem.eql(u8, args[1], "replay")) {
+        std.debug.print("{s}", .{usage});
+        return 2;
+    }
+    return replay(init.gpa, init.io, args[2], args[3], args[4]) catch |e| {
+        std.debug.print("FAIL tf-dsv41-m1: {t}\n", .{e});
+        return 1;
+    };
 }
 
-pub fn main() !u8 {
-    std.debug.print("usage: tf-dsv41-m1 weights|replay PACK CAPTURE\n", .{});
-    return 2;
+/// The captured blocks' layer indices (meta.json "sets"), ascending.
+fn layers(a: std.mem.Allocator, io: std.Io, capture: []const u8) ![]u32 {
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ capture, "meta.json" }), a, .limited(1 << 24));
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, a, text, .{});
+    var out: std.ArrayList(u32) = .empty;
+    var it = root.object.get("sets").?.object.iterator();
+    while (it.next()) |e| for (e.value_ptr.object.get("layers").?.array.items) |l| try out.append(a, @intCast(l.integer));
+    std.mem.sort(u32, out.items, {}, std.sort.asc(u32));
+    return out.items;
+}
+
+fn replay(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, capture: []const u8, out_dir: []const u8) !u8 {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.Io.Dir.cwd().createDirPath(io, out_dir);
+    var driver = try cuda.Driver.open();
+    defer driver.close();
+    var ctx = try cuda.Context.init(&driver, 0);
+    defer ctx.deinit();
+    var stream = try cuda.Stream.init(&driver, true);
+    defer stream.deinit();
+    var kernels: ?dk.Kernels = dk.Kernels.load(&ctx) catch |e| blk: {
+        std.debug.print("note: extension kernels unavailable ({t}): extension ops are skipped\n", .{e});
+        break :blk null;
+    };
+    defer if (kernels) |*k| k.deinit();
+
+    // our loader: the captured blocks plus the vocabulary rows, norm and head, rank 0 of 2
+    const t0 = std.Io.Clock.awake.now(io);
+    const cfg = try Config.read(gpa, io, pack_dir);
+    var pack = try Pack.open(gpa, io, pack_dir);
+    defer pack.deinit();
+    const blocks = try layers(a, io, capture);
+    var pl = try plan.build(gpa, &cfg, &pack, .{ .rank = 0, .world = 2, .blocks = blocks, .top = true });
+    defer pl.deinit();
+    var w: load.Weights = .{ .gpa = gpa };
+    defer w.deinit();
+    for (pl.layers) |*l| {
+        var b: named.Builder = .{ .gpa = gpa, .io = io, .pack = &pack };
+        defer b.deinit();
+        try b.layer(l, cfg.o_groups, 0, 2);
+        try w.upload(&driver, &b);
+    }
+    {
+        var b: named.Builder = .{ .gpa = gpa, .io = io, .pack = &pack };
+        defer b.deinit();
+        try b.top(&pl);
+        try w.upload(&driver, &b);
+    }
+    const load_s = @as(f64, @floatFromInt(t0.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds())) / 1e9;
+    std.debug.print("loaded {d} layers, {d} tensors, {d:.2} GB in {d:.1} s\n", .{ blocks.len, w.map.count(), @as(f64, @floatFromInt(w.bytes)) / 1e9, load_s });
+
+    var wlog: std.Io.Writer.Allocating = .init(gpa);
+    defer wlog.deinit();
+    const wn = try m1.checkWeights(gpa, io, &w, capture, &wlog.writer);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ out_dir, "weights.jsonl" }), .data = wlog.written() });
+    std.debug.print("weights: {d} equal, {d} differ, {d} missing\n", .{ wn[0], wn[1], wn[2] });
+
+    var set = try tri.Set.load(gpa, io, &driver, ctx.device, try std.fs.path.join(a, &.{ capture, "aot" }));
+    defer set.deinit();
+    std.debug.print("triton: {d} kernels loaded, {d} failed\n", .{ set.kernels.count(), set.failed.items.len });
+    var r: m1.Replay = .{ .gpa = gpa, .io = io, .d = &driver, .stream = stream, .kernels = if (kernels) |*k| k else null, .weights = &w, .triton = &set, .dir = capture };
+    defer r.deinit();
+
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ capture, "ops.jsonl" }), gpa, .limited(1 << 32));
+    defer gpa.free(text);
+    var log: std.Io.Writer.Allocating = .init(gpa);
+    defer log.deinit();
+    // [mode][status] counts, mode 0 alone, 1 chained
+    var counts: [2][4]usize = @splat(@splat(0));
+    var chained_in: usize = 0;
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, gpa, line, .{});
+        defer parsed.deinit();
+        const op = parsed.value.object;
+        const alone = r.run(op, false);
+        const chain = r.run(op, true);
+        counts[0][@backingInt(alone.status)] += 1;
+        counts[1][@backingInt(chain.status)] += 1;
+        chained_in += chain.chained_in;
+        try log.writer.print("{{\"seq\": {d}, \"set\": \"{s}\", \"phase\": \"{s}\", \"kind\": \"{s}\", \"name\": \"{s}\", " ++
+            "\"alone\": \"{t}\", \"why\": \"{s}\", \"differ\": {d}, \"diff_bytes\": {d}, \"first\": {d}, " ++
+            "\"chained\": \"{t}\", \"chained_why\": \"{s}\", \"chained_in\": {d}}}\n", .{
+            op.get("seq").?.integer, op.get("set").?.string, op.get("phase").?.string, op.get("kind").?.string,
+            op.get("name").?.string, alone.status,           alone.why,                alone.differ,
+            alone.diff_bytes,        alone.first,            chain.status,             chain.why,
+            chain.chained_in,
+        });
+    }
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ out_dir, "replay.jsonl" }), .data = log.written() });
+    const summary = try std.fmt.allocPrint(a,
+        \\{{"weights": {{"equal": {d}, "differ": {d}, "missing": {d}}}, "triton_loaded": {d}, "triton_failed": {d},
+        \\ "alone": {{"equal": {d}, "differ": {d}, "skipped": {d}, "failed": {d}}},
+        \\ "chained": {{"equal": {d}, "differ": {d}, "skipped": {d}, "failed": {d}, "inputs_from_our_outputs": {d}}}, "load_s": {d:.1}}}
+        \\
+    , .{ wn[0], wn[1], wn[2], set.kernels.count(), set.failed.items.len, counts[0][0], counts[0][1], counts[0][2], counts[0][3], counts[1][0], counts[1][1], counts[1][2], counts[1][3], chained_in, load_s });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ out_dir, "summary.json" }), .data = summary });
+    std.debug.print("{s}", .{summary});
+    const ok = wn[1] == 0 and wn[2] == 0 and counts[0][1] == 0 and counts[0][3] == 0;
+    std.debug.print("{s} M1 replay\n", .{if (ok) "PASS" else "FAIL"});
+    return if (ok) 0 else 1;
 }

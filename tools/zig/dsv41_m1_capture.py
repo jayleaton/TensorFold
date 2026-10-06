@@ -1,0 +1,453 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""DeepSeek-V4.1's M1 capture: the Python engine's blocks on one GPU at rank 0's TP=2 shapes, every Triton launch and
+every CUDA extension call of their decode windows recorded with the bytes of each buffer before and after it.
+
+The Zig gate (``tf-dsv41-m1 replay``) re-issues each launch on its own buffers, with the weights bound by name to its
+own loader's, and compares every buffer bit for bit (alone, and chained on its own outputs where nothing ran between).
+
+- Blocks: set A = layers 1-3 (SWA + Engram, the ratio-2 KV and index source, a reuse layer), set B = layers 20-24
+  (the ratio-1 KV source and candidate source, reuse layers, a reindex layer). A prompt fills the KV state past the
+  index top-k, then decode windows of 1, 3 and 16 rows are recorded.
+- The exchange: a world-2 communicator whose peer contributes zeros (rank 1's partials, Engram heads and vocabulary
+  rows are zero), so every buffer is reproducible from rank 0's work alone.
+- Engram rows: a deterministic function of the row index (the tables are not needed: rows enter the recorded ops as
+  captured inputs).
+
+Output (``--out``): ops.jsonl (one launch a line), blobs/ (content-addressed buffer bytes), weights.json (name ->
+dtype, shape, sha256 of every weight tensor the blocks hold), launches.json + manifest.json + aot/ (the launched
+Triton cubins in the Zig engine's aot.json form), meta.json.
+
+    PYTHONPATH=<tensorfold src> TRITON_CACHE_DIR=<dir> python -B dsv41_m1_capture.py --pack PACK --out OUT
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import inspect
+import json
+import os
+import struct
+import sys
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+SETS = {"A": (1, 2, 3), "B": (20, 21, 22, 23, 24)}
+WINDOWS = (1, 3, 16)
+SCAN_MAX = 1 << 20          # int64 elements scanned for device addresses a tensor at most
+
+
+def fbits(v: float) -> dict:
+    return {"t": "float", "v": v, "f32": "0x%08x" % struct.unpack("<I", struct.pack("<f", v))[0],
+            "f64": "0x%016x" % struct.unpack("<Q", struct.pack("<d", v))[0]}
+
+
+class Capture:
+    """Buffers by storage, weights by name, blobs by content; the op log."""
+
+    def __init__(self, out: Path) -> None:
+        import torch
+
+        self.torch = torch
+        self.out = out
+        (out / "blobs").mkdir(parents=True, exist_ok=True)
+        self.ops = open(out / "ops.jsonl", "w")
+        self.weights: list[tuple[int, int, str]] = []      # (base, end, name), sorted
+        self.recording = False
+        self.set = ""
+        self.phase = ""
+        self.seq = 0
+        self.blob_bytes = 0
+        self.counts: dict[str, int] = {}
+
+    # -- weights ---------------------------------------------------------------------------------------------------
+    def name_weights(self, rank_w, layers) -> dict:
+        """Every tensor of the rank's tree by the Zig loader's names (``L<i>.attn.wq_a.trellis`` ...); returns the
+        digests for weights.json."""
+
+        torch = self.torch
+        found: dict[str, torch.Tensor] = {}
+
+        def x3(prefix, v) -> None:
+            for f in ("trellis", "suh", "svh", "data"):
+                if hasattr(v, f) and isinstance(getattr(v, f), torch.Tensor):
+                    found[f"{prefix}.{f}"] = getattr(v, f)
+
+        for lw in layers:
+            p = f"L{lw.index}"
+            found[f"{p}.attn_norm"], found[f"{p}.ffn_norm"] = lw.attn_norm, lw.ffn_norm
+            for which, hc in (("hc_attn", lw.hc_attn), ("hc_ffn", lw.hc_ffn)):
+                for f in ("fn", "base", "scale"):
+                    found[f"{p}.{which}.{f}"] = getattr(hc, f)
+            a = lw.attn
+            for f in ("wq_a", "wkv", "wq_b", "wo_b", "comp_wkv", "comp_wgate", "ix_wq_b", "ix_wk"):
+                if getattr(a, f) is not None:
+                    x3(f"{p}.attn.{f}", getattr(a, f))
+            for j, g in enumerate(a.wo_a):
+                x3(f"{p}.attn.wo_a.{j}", g)
+            for f, n in (("q_norm", "q_norm"), ("kv_norm", "kv_norm"), ("sink", "sink"), ("comp_norm", "comp_norm"),
+                         ("ix_wp", "ix_wp"), ("ix_knorm", "ix_knorm")):
+                if getattr(a, f) is not None:
+                    found[f"{p}.attn.{n}"] = getattr(a, f)
+            m = lw.moe
+            found[f"{p}.moe.gate"], found[f"{p}.moe.bias"] = m.gate, m.bias
+            for f in ("w1", "w2", "w3"):
+                x3(f"{p}.moe.{f}", getattr(m, f))
+            for i, (w1, w2, w3) in enumerate(m.shared):
+                for f, v in (("w1", w1), ("w2", w2), ("w3", w3)):
+                    x3(f"{p}.moe.shared.{i}.{f}", v)
+            if lw.engram is not None:
+                x3(f"{p}.engram.wkv", lw.engram.wkv)
+                found[f"{p}.engram.qk"] = lw.engram.qk
+        found["embed"], found["norm"] = rank_w.embed, rank_w.norm
+        x3("head", rank_w.head)
+        digests, spans = {}, []
+        for name, t in found.items():
+            t = t.contiguous() if not t.is_contiguous() else t
+            raw = t.view(torch.uint8).reshape(-1) if t.numel() else torch.empty(0, dtype=torch.uint8)
+            digests[name] = {"dtype": str(t.dtype).replace("torch.", ""), "shape": list(t.shape),
+                             "nbytes": int(raw.numel()), "sha256": hashlib.sha256(raw.cpu().numpy().tobytes()).hexdigest()}
+            orig = found[name]
+            if orig.is_cuda and orig.numel():
+                spans.append((orig.data_ptr(), orig.data_ptr() + raw.numel(), name))
+        # a name binds the tensor's own bytes (the Zig loader's image of it starts there)
+        self.weights = sorted(spans)
+        return digests
+
+    def weight_of(self, addr: int):
+        for b, e, n in self.weights:
+            if b <= addr < e:
+                return b, n
+        return None
+
+    # -- blobs -----------------------------------------------------------------------------------------------------
+    def blob(self, storage) -> str:
+        torch = self.torch
+        n = storage.nbytes()
+        t = torch.empty(0, dtype=torch.uint8, device=storage.device)
+        t.set_(storage, 0, (n,))
+        data = t.cpu().numpy().tobytes()
+        h = hashlib.sha256(data).hexdigest()
+        p = self.out / "blobs" / h[:2] / f"{h}.bin"
+        if not p.exists():
+            p.parent.mkdir(exist_ok=True)
+            p.write_bytes(data)
+            self.blob_bytes += n
+        return h
+
+    # -- arguments -------------------------------------------------------------------------------------------------
+    def describe(self, v, bufs: dict, tensors: list):
+        """An argument as the replay reads it; tensors register their storage (``bufs``: key -> entry)."""
+
+        torch = self.torch
+        if isinstance(v, torch.Tensor):
+            st = v.untyped_storage()
+            base, off = st.data_ptr(), v.data_ptr() - st.data_ptr()
+            d = {"t": "tensor", "dtype": str(v.dtype).replace("torch.", ""), "shape": list(v.shape),
+                 "stride": list(v.stride())}
+            w = self.weight_of(v.data_ptr()) if v.is_cuda else None
+            if w is not None:
+                d.update(weight=w[1], offset=v.data_ptr() - w[0])
+                return d
+            if not v.is_cuda:
+                d.update(host=True)
+                return d
+            key = f"{base}:{st.nbytes()}"
+            if key not in bufs:
+                bufs[key] = {"id": len(bufs), "key": key, "base": base, "nbytes": st.nbytes(), "storage": st}
+            d.update(buf=bufs[key]["id"], offset=off)
+            tensors.append((v, bufs[key]))
+            return d
+        if isinstance(v, bool):
+            return {"t": "bool", "v": v}
+        if isinstance(v, int):
+            d = {"t": "int", "v": v}
+            w = self.weight_of(v) if v > 1 << 32 else None
+            if w is not None:
+                d.update(ptr={"weight": w[1], "delta": v - w[0]})
+            return d
+        if isinstance(v, float):
+            return fbits(v)
+        if v is None:
+            return {"t": "none"}
+        if isinstance(v, (list, tuple)):
+            return {"t": "list", "items": [self.describe(x, bufs, tensors) for x in v]}
+        if type(v).__name__ == "constexpr":
+            return self.describe(v.value, bufs, tensors)
+        return {"t": "other", "repr": repr(v)[:200]}
+
+    def relocs(self, tensors: list, bufs: dict) -> list:
+        """Device addresses stored in int64 tensors: each points into a weight or a buffer of this op."""
+
+        torch = self.torch
+        out, seen = [], set()
+        ranges = sorted((b["base"], b["base"] + b["nbytes"], b["id"]) for b in bufs.values())
+        for v, b in tensors:
+            if v.dtype not in (torch.int64, torch.uint64) or v.numel() > SCAN_MAX or (b["id"], v.data_ptr()) in seen:
+                continue
+            seen.add((b["id"], v.data_ptr()))
+            vals = v.detach().reshape(-1).cpu().tolist()
+            starts = [v.data_ptr() - b["base"] + i * 8 * v.stride(-1) for i in range(len(vals))] if v.dim() == 1 \
+                else None
+            for i, x in enumerate(vals):
+                if x < 1 << 32:
+                    continue
+                at = starts[i] if starts is not None else None
+                if at is None:                      # non-1-D tables: element offset of a contiguous tensor only
+                    if not v.is_contiguous():
+                        continue
+                    at = v.data_ptr() - b["base"] + 8 * i
+                w = self.weight_of(x)
+                if w is not None:
+                    out.append({"buf": b["id"], "at": at, "weight": w[1], "delta": x - w[0]})
+                    continue
+                for lo, hi, bid in ranges:
+                    if lo <= x < hi:
+                        out.append({"buf": b["id"], "at": at, "target": bid, "delta": x - lo})
+                        break
+                else:
+                    out.append({"buf": b["id"], "at": at, "unresolved": x})
+        return out
+
+    # -- one launch ------------------------------------------------------------------------------------------------
+    def record(self, row: dict, args: list, kwargs: dict, call, named: bool = False):
+        """Dump every buffer the arguments touch, run ``call``, dump them again; log the op. ``named``: ``args`` are
+        (parameter name, value) pairs (Triton's)."""
+
+        torch = self.torch
+        bufs: dict = {}
+        tensors: list = []
+        row["args"] = [{"name": v[0], **self.describe(v[1], bufs, tensors)} if named else self.describe(v, bufs, tensors)
+                       for v in args]
+        row["kwargs"] = {k: self.describe(v, bufs, tensors) for k, v in kwargs.items()}
+        row["relocs"] = self.relocs(tensors, bufs)
+        torch.cuda.synchronize()
+        before = {k: self.blob(b["storage"]) for k, b in bufs.items()}
+        ret = call()
+        torch.cuda.synchronize()
+        rbufs, rtensors = {}, []
+        if isinstance(ret, torch.Tensor):
+            row["ret"] = self.describe(ret, rbufs, rtensors)
+            for k, b in rbufs.items():          # a returned tensor's storage: new, unless an argument's
+                if k in bufs:
+                    row["ret"]["buf"] = bufs[k]["id"]
+                else:
+                    b["id"] = len(bufs)
+                    row["ret"]["buf"] = b["id"]
+                    bufs[k] = b
+                    before[k] = None
+        row["buffers"] = [{"id": b["id"], "key": k, "nbytes": b["nbytes"], "before": before[k],
+                           "after": self.blob(b["storage"])} for k, b in bufs.items()]
+        row.update(seq=self.seq, set=self.set, phase=self.phase)
+        self.seq += 1
+        self.counts[row["name"]] = self.counts.get(row["name"], 0) + 1
+        self.ops.write(json.dumps(row) + "\n")
+        return ret
+
+
+def install(cap: Capture, rec) -> None:
+    """Triton's JITFunction.run and every extension module tensorfold.cuda.build.load returns, wrapped."""
+
+    from triton.runtime.jit import JITFunction
+    import tensorfold.cuda.build as build
+
+    original = JITFunction.run
+
+    def run(fn, *args, grid, warmup, **kwargs):
+        if warmup or not cap.recording:
+            return original(fn, *args, grid=grid, warmup=warmup, **kwargs)
+        names = fn.arg_names
+        bound = inspect.signature(fn.fn).bind_partial(*args, **{k: v for k, v in kwargs.items() if k in names})
+        bound.apply_defaults()
+        g = grid(dict(bound.arguments)) if callable(grid) else grid
+        g = [int(x) for x in (tuple(g) + (1, 1, 1))[:3]]
+        row = {"kind": "triton", "name": fn.fn.__name__, "function": f"{fn.fn.__module__}.{fn.fn.__qualname__}",
+               "grid": g, "options": {k: (v if isinstance(v, (int, bool, str)) or v is None else repr(v))
+                                      for k, v in kwargs.items() if k not in names}}
+        got = {}
+
+        def call():
+            k = got["k"] = original(fn, *args, grid=grid, warmup=warmup, **kwargs)
+            row["hash"], row["name"] = k.hash, k.name
+            rec._triton(fn, k, args, kwargs, grid)
+
+        cap.record(row, [(n, bound.arguments[n]) for n in names if n in bound.arguments], {}, call, named=True)
+        return got.get("k")
+
+    JITFunction.run = run
+    loads = build.load
+
+    def load(name, *a, **kw):
+        mod = loads(name, *a, **kw)
+        for f in dir(mod):
+            fnc = getattr(mod, f)
+            if f.startswith("_") or not callable(fnc) or getattr(fnc, "_m1", False):
+                continue
+
+            def wrapper(*args, _f=fnc, _name=f, **kwargs):
+                if not cap.recording:
+                    return _f(*args, **kwargs)
+                row = {"kind": "ext", "ext": name, "func": _name, "name": f"{name}.{_name}"}
+                return cap.record(row, list(args), kwargs, lambda: _f(*args, **kwargs))
+
+            wrapper._m1 = True
+            setattr(mod, f, wrapper)
+        return mod
+
+    build.load = load
+
+
+class ZeroPeer:
+    """World 2, rank 0: the peer's half of every all-gather is zeros."""
+
+    rank, world = 0, 2
+
+    def all_gather(self, send, recv) -> None:
+        n = send.numel()
+        recv[:n].copy_(send.reshape(-1))
+        recv[n:].zero_()
+
+    def barrier(self) -> None:
+        pass
+
+
+class IndexRows:
+    """Engram rows as a function of the row index: fp32 [N, 256] in (-0.25, 0.25), multiples of 1/1024."""
+
+    def __init__(self, dim: int) -> None:
+        self.dim = dim
+
+    def rows(self, index):
+        import torch
+
+        i = index.to(torch.int64).reshape(-1, 1)
+        j = torch.arange(self.dim, dtype=torch.int64, device=i.device).reshape(1, -1)
+        return (((i * 2654435761 + j * 40503) % 511) - 255).to(torch.float32) / 1024.0
+
+
+def pack_aot(manifest: Path, cache: Path, out: Path) -> dict:
+    """The launched kernels in the Zig engine's aot.json form (cubins by hash); a kernel whose PTX parameters are not
+    its runtime arguments plus Triton's two scratch pointers is listed in ``problems`` instead of stopping the pack."""
+
+    import shutil
+
+    (out / "cubins").mkdir(parents=True, exist_ok=True)
+    kernels, problems = [], []
+    for k in json.loads(manifest.read_text())["kernels"]:
+        runtime = [n for n, t in k["signature"].items() if t != "constexpr"]
+        ptx = [x["name"] for x in k["abi"]]
+        if ptx and ptx != runtime + ["global_scratch", "profile_scratch"]:
+            problems.append({"hash": k["hash"], "name": k["name"], "ptx": ptx, "runtime": runtime})
+            continue
+        shutil.copyfile(cache / k["cubin"], out / "cubins" / f"{k['hash']}.cubin")
+        md = k["metadata"]
+        kernels.append({"fn": k["name"], "hash": k["hash"], "name": md["name"], "num_warps": md["num_warps"],
+                        "num_ctas": md.get("num_ctas", 1), "shared": md.get("shared", 0),
+                        "global_scratch": md.get("global_scratch_size", 0) or 0,
+                        "global_align": md.get("global_scratch_align", 1) or 1,
+                        "profile_scratch": md.get("profile_scratch_size", 0) or 0,
+                        "pdl": bool(md.get("launch_pdl", False)),
+                        "params": [{"name": n, "type": k["signature"][n]} for n in runtime]})
+    (out / "aot.json").write_text(json.dumps({"generator": "tools/zig/dsv41_m1_capture.py", "kernels": kernels},
+                                             indent=1) + "\n")
+    return {"kernels": len(kernels), "problems": problems}
+
+
+def specialization() -> dict:
+    from triton.runtime.jit import JITFunction
+    import gc
+
+    out = {}
+    for fn in gc.get_objects():
+        if isinstance(fn, JITFunction):
+            out[f"{fn.fn.__module__}.{fn.fn.__qualname__}"] = {
+                "params": [p.name for p in fn.params], "do_not_specialize": [p.name for p in fn.params if p.do_not_specialize],
+                "no_align": [p.name for p in fn.params if p.do_not_specialize_on_alignment]}
+    return out
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--pack", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--sets", default="A,B")
+    ap.add_argument("--prompt", type=int, default=1536, help="prompt tokens before the windows (past the top-512)")
+    ap.add_argument("--limit", type=int, default=4096)
+    a = ap.parse_args()
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    sys.path.insert(0, str(HERE))
+    import triton_aot_manifest as aot
+
+    cap = Capture(out)
+    rec = aot.Recorder()
+    install(cap, rec)
+    import torch
+    from tensorfold.families.deepseek_v41.cuda import weights as W
+    from tensorfold.families.deepseek_v41.cuda.config import Config
+    from tensorfold.families.deepseek_v41.cuda.csa2.backend import Triton
+    from tensorfold.families.deepseek_v41.cuda.engram_host import NgramHasher, token_map
+    from tensorfold.families.deepseek_v41.cuda.forward import Forward, Seg
+
+    dev = torch.device("cuda:0")
+    pack = Path(a.pack)
+    cfg = Config.from_file(pack / "config.json")
+    tmap, _ = token_map(pack / "tokenizer.json")
+    src = W.Shards(pack)
+    loader = W.Loader(cfg, src, 0, 2, dev)
+    vh = cfg.vocab_size // 2
+    embed = loader._dev(src.rows("embed.weight", 0, vh).to(torch.bfloat16))
+    head, norm = loader.x3("head", "col"), loader.native("norm.weight")
+    meta = {"pack": str(pack), "sets": {}, "windows": list(WINDOWS), "prompt": a.prompt, "limit": a.limit,
+            "torch": torch.__version__, "gpu": torch.cuda.get_device_name(0),
+            "capability": list(torch.cuda.get_device_capability(0)),
+            "env": {k: v for k, v in os.environ.items() if k.startswith(("TF_DSV41", "GLM53_TF", "TRITON"))},
+            "peer": "zeros", "engram_rows": "index function"}
+    import triton
+
+    meta["triton"] = triton.__version__
+    weights: dict = {}
+    g = torch.Generator().manual_seed(4101)
+    for s in a.sets.split(","):
+        t0 = time.time()
+        layers = [loader.layer(L) for L in SETS[s]]
+        tree = W.RankW(0, 2, 0, embed, layers, norm, head, None, {})
+        weights.update(cap.name_weights(tree, layers))
+        rows = {L: IndexRows(cfg.engram_head_dim) for L in cfg.engram_layer_ids}
+        fw = Forward(cfg, tree, csa2=Triton(128, cfg.num_attention_heads // 2, dev), comm=ZeroPeer(), device=dev,
+                     limit=a.limit, chunk=128, engram_rows=rows, hasher=NgramHasher(cfg, tmap), slots=1,
+                     contiguous=True, pchunk=2048)
+        # ids in rank 0's vocabulary half (its embedding rows; the peer's are zero)
+        ids = torch.randint(3, vh, (a.prompt + sum(WINDOWS),), generator=g).tolist()
+        fw.prompt(ids[:a.prompt])
+        pos = a.prompt
+        cap.set = s
+        for n in WINDOWS:
+            cap.phase = f"w{n}"
+            cap.recording = True
+            with rec.scope(f"{s}-w{n}"):
+                fw.run([Seg(0, fw.slot.pos, tuple(ids[pos:pos + n]))])
+            cap.recording = False
+            fw.keep(0, n - 1)
+            pos += n
+        torch.cuda.synchronize()
+        meta["sets"][s] = {"layers": list(SETS[s]), "load_and_run_s": round(time.time() - t0, 1), "ops": cap.seq}
+        del fw, tree, layers
+        torch.cuda.empty_cache()
+    cap.ops.close()
+    (out / "weights.json").write_text(json.dumps(weights, indent=0, sort_keys=True) + "\n")
+    rec.dump(out / "launches.json")
+    (out / "jit.json").write_text(json.dumps(specialization(), indent=1, sort_keys=True) + "\n")
+    cache = Path(os.environ.get("TRITON_CACHE_DIR", Path.home() / ".triton" / "cache"))
+    aot.build(cache, out / "launches.json", out / "manifest.json", None)
+    meta["aot"] = pack_aot(out / "manifest.json", cache, out / "aot")
+    meta.update(ops=cap.seq, blob_bytes=cap.blob_bytes, counts=cap.counts)
+    (out / "meta.json").write_text(json.dumps(meta, indent=1) + "\n")
+    print(json.dumps({"ops": cap.seq, "blob_MB": round(cap.blob_bytes / 1e6, 1), "kernels": len(rec.kernels)}))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

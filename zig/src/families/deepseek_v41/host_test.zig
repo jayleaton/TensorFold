@@ -7,6 +7,7 @@ const Config = config.Config;
 const exl3 = @import("exl3.zig");
 const Pack = @import("pack.zig").Pack;
 const plan = @import("plan.zig");
+const named = @import("named.zig");
 
 test "the release config.json: topology, routing and rope" {
     const c = try Config.parse(testing.allocator, @embedFile("fixtures/config.json"));
@@ -41,6 +42,12 @@ test "the release config.json: topology, routing and rope" {
 
 /// Header JSON of a pack for `c`, named as the release packs are (their index, pattern by pattern), header only.
 fn tinyPack(a: std.mem.Allocator, c: *const Config, extra: []const u8, skip: []const u8) ![]u8 {
+    var n: u64 = 0;
+    return tinyPackLen(a, c, extra, skip, &n);
+}
+
+/// `tinyPack`, and the data bytes its header describes.
+fn tinyPackLen(a: std.mem.Allocator, c: *const Config, extra: []const u8, skip: []const u8, data_len: *u64) ![]u8 {
     var w: std.Io.Writer.Allocating = .init(a);
     errdefer w.deinit();
     var at: u64 = 0;
@@ -135,6 +142,7 @@ fn tinyPack(a: std.mem.Allocator, c: *const Config, extra: []const u8, skip: []c
     try T.put(wr, &at, &first, skip, "image_start", "BF16", &.{D});
     if (extra.len > 0) try T.put(wr, &at, &first, skip, extra, "BF16", &.{4});
     try wr.writeAll("}");
+    data_len.* = at;
     return w.toOwnedSlice();
 }
 
@@ -194,6 +202,47 @@ test "a synthetic pack: unknown names are leftovers, missing ones and wrong shap
     var wide = c;
     wide.q_lora = 48;
     try testing.expectError(error.UnexpectedShape, tinyPlanOf(a, &wide, &c, "", "", 0));
+}
+
+test "a synthetic pack on disk: every planned tensor named in the Python loader's form" {
+    const a = testing.allocator;
+    const io = testing.io;
+    const c = config.tiny();
+    var n: u64 = 0;
+    const json = try tinyPackLen(a, &c, "", "", &n);
+    defer a.free(json);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var f = try tmp.dir.createFile(io, "model.safetensors", .{});
+        defer f.close(io);
+        var len: [8]u8 = undefined;
+        std.mem.writeInt(u64, &len, json.len, .little);
+        try f.writePositionalAll(io, &len, 0);
+        try f.writePositionalAll(io, json, 8);
+        try f.setLength(io, 8 + json.len + n);
+    }
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    var p = try Pack.open(a, io, dir);
+    defer p.deinit();
+    var pl = try plan.build(a, &c, &p, .{ .rank = 1, .world = 2 });
+    defer pl.deinit();
+    var b: named.Builder = .{ .gpa = a, .io = io, .pack = &p };
+    defer b.deinit();
+    try b.all(&pl, c.o_groups);
+    try testing.expectEqual(named.Kind.i16, b.find("L2.moe.w2.data").?.kind);
+    try testing.expect(b.find("L3.moe.w2.trellis") != null and b.find("L3.moe.w2.data") == null);
+    try testing.expectEqualSlices(usize, &.{ 8, 8, 16, 32 }, b.find("L3.moe.w2.trellis").?.shape[0..4]);
+    const qk = b.find("L1.engram.qk").?;
+    try testing.expect(qk.kind == .f32 and qk.bytes.len == 4 * c.hc_mult * c.hidden);
+    try testing.expectEqual(named.Kind.bf16, b.find("L0.moe.gate").?.kind);
+    try testing.expectEqual(named.Kind.f32, b.find("L2.attn.ix_wp").?.kind);
+    // rank 1 of 2: half the heads' sinks, half the vocabulary rows, wo_a's one local group
+    try testing.expectEqual(@as(usize, 4 * c.heads / 2), b.find("L4.attn.sink").?.bytes.len);
+    try testing.expectEqual(@as(usize, 2 * c.vocab / 2 * c.hidden), b.find("embed").?.bytes.len);
+    try testing.expect(b.find("L4.attn.wo_a.0.svh") != null and b.find("L4.attn.wo_a.1.svh") == null);
+    try testing.expect(b.find("head.trellis") != null and b.find("norm") != null);
 }
 
 /// One fixture histogram ("4:383,6:1") as rank-0 parts of a TP=2 projection with full shape `kn`.

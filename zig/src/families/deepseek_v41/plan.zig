@@ -17,6 +17,8 @@ pub const GroupPlan = struct {
     part: exl3.Part,
     /// marker tensor (mul1 / mcg) whose value picks the codebook at load; null: the 3-instruction default
     marker: ?[]const u8,
+    /// wo_a: the global group index this slice is
+    slice: u32 = 0,
 };
 
 pub const NativePlan = struct {
@@ -110,6 +112,8 @@ pub const Options = struct {
     world: u32,
     /// plan only these blocks (single-layer M1 runs, header dumps): no top tensors, head, DSpark or coverage; null: the whole model
     blocks: ?[]const u32 = null,
+    /// with `blocks`: also the vocabulary rows, the final norm and the head (a window's finish)
+    top: bool = false,
 };
 
 const Builder = struct {
@@ -191,6 +195,7 @@ const Builder = struct {
         for (specs.items(), groups) |s, *g| {
             var nb: [128]u8 = undefined;
             g.* = try b.group(s.proj, try names.groupName(s, block, &nb), s.split, s.k, s.n);
+            g.slice = s.slice;
         }
         const nspecs = try names.blockNatives(b.c, index);
         const natives = try b.a.alloc(NativePlan, nspecs.len);
@@ -270,12 +275,12 @@ pub fn build(gpa: std.mem.Allocator, c: *const Config, pack: *const Pack, o: Opt
     var top: []NativePlan = &.{};
     var head: ?GroupPlan = null;
     var ds: ?Dspark = null;
-    if (full) {
+    if (full or o.top) {
         const tspecs = try names.topNatives(c);
         top = try b.a.alloc(NativePlan, tspecs.len);
         for (tspecs.items(), top) |s, *v| v.* = try b.native(s.suffix, s);
         head = try b.group(.wq_a, names.head.suffix, .col, c.hidden, c.vocab);
-        ds = try b.dspark();
+        if (full) ds = try b.dspark();
     }
     // coverage: every stored name was planned or is knowingly left (vision, image routing, bf16 copies of groups)
     var left: std.ArrayList([]const u8) = .empty;

@@ -9,6 +9,7 @@ pub const Pack = pack.Pack;
 pub const plan = @import("plan.zig");
 pub const Plan = plan.Plan;
 pub const stage = @import("stage.zig");
+pub const named = @import("named.zig");
 
 test {
     _ = config;
@@ -17,5 +18,6 @@ test {
     _ = pack;
     _ = plan;
     _ = stage;
+    _ = named;
     _ = @import("host_test.zig");
 }
