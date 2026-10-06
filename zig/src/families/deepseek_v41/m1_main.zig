@@ -12,6 +12,13 @@ const tri = @import("m1_triton.zig");
 const m1 = @import("m1_replay.zig");
 const check = @import("m1_check.zig");
 const fwd = @import("m1_forward.zig");
+const run = @import("run.zig");
+
+// M2's executor is built (and type-checked) with the M1 binary until forward.zig drives it
+comptime {
+    _ = &run.Runner.bind;
+    _ = &run.Runner.window;
+}
 
 const usage =
     \\usage: tf-dsv41-m1 replay|forward|both PACK CAPTURE OUT
