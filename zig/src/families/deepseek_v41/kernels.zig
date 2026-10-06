@@ -45,7 +45,7 @@ pub const images = struct {
 };
 
 pub const Kernels = struct {
-    mods: [20]cuda.Module,
+    mods: [19]cuda.Module,
     exl3: exl3.Functions,
     dense: dense.Functions,
     ops: ops.Functions,
@@ -57,6 +57,7 @@ pub const Kernels = struct {
         const d = ctx.d;
         var k: Kernels = undefined;
         const list = [_][]const u8{ images.exl3_experts, images.x3ld, images.x3pf, images.x3gm, images.linear, images.x3seg, images.dense3, images.attn, images.topk, images.mhc, images.mhc_pf, images.router_gemv, images.pfdense_k8, images.pfdense_k10, images.pfdense_k12, images.pfdense_k16, images.engram_gate, images.l2pace, images.l2pf };
+        comptime std.debug.assert(list.len == @typeInfo(@FieldType(Kernels, "mods")).array.len);
         var loaded: usize = 0;
         errdefer for (k.mods[0..loaded]) |*m| m.unload();
         for (list, 0..) |img, i| {
