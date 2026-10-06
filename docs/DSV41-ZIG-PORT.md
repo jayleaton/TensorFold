@@ -249,6 +249,17 @@ Rules from `ZIG-PREVIEW.md`:
   - **M2b with `TF_DSV41_GRAPHS=1`:** PASS, but no graph ran. The traced step 0 cached a traced program that `graphs.audit` refused, so every window ran eager. dsq-zig-kern-1 has fixed this; it is not graphs evidence.
   - **Lanes mode 1 stopped at `NotAChain`.** Lanes' undrafted step (`queue`) sends the next one-row window without a keep. The iface contract says an unkept chain window keeps every row, and GpuTarget refused. Fixed in 288a28e.
   - **Lanes mode 2 stopped at a missing Triton variant** (`_prune` with R > 1). The reference had only run one-row windows, and Triton specializes a 1. The reference now adds 2–6-row windows after its recorded steps (2c61b24).
+- **Pod 17** (fcd1ea5, 19 min, $1.34):
+  - **Graphs evidence (R4):** M2b with `TF_DSV41_GRAPHS=1` passes on both ranks (64/64 tokens and logits) with 1 capture and 62 replays.
+  - **The M1 step stopped at load** (`DuplicateWeight`): sets P and B both hold layer 20. The loader now loads a shared block once.
+  - **Lanes modes 1 and 2 diverged at tokens 2 and 6.** `Forward.window` borrowed the caller's ids, and `keep()` reads them for Engram's tail. Lanes hands a stack row (queue) or a scratch arena that is reset before the keep (verify). The forward now owns a copy.
+  - **Mode 3 stopped at `MissingWeight`.** A DSpark block stores its routed experts as one uniform stack (`L40.moe.w1.trellis`), and forms.zig only knew the ragged `.data` form. The expert tables now take the stack's base, size-checked against the layout.
+- **Pod 18** (ff34389, 21 min, $1.49):
+  - **M1 replay of P + B(2048) passes:** 693/693 weights, every launch equal. The GPU forward of the decode windows is 131/131 equal per window (14 L2-prefetch launches skipped).
+  - **The prefill segment stopped at a structure check.** This capture gave Python's MoE exchange new storage each layer (cap15 had reused one). block_prefill now layer-scopes it as it already did the attention's; cap15 and cap18 both host-check 320/320.
+  - **Lanes mode 1 PASS:** 65/65 tokens equal, drafts off.
+  - **Lanes mode 2 PASS:** 65/65 tokens equal, 79 drafted, 47 accepted. Multi-row verify windows, partial keeps and rejects all ran through the GPU target and the leader/follower plan ops at TP=2.
+  - **Mode 3 stopped at the pass's own guard (`NotAPrefix`).** Lanes trims the prompt to the window itself and hands the taps' row indices (1408..1535), so the pass now ingests a contiguous run from any first row.
 - **The DSpark GPU pass** (`dspark_emit.zig`, `dspark_gpu.zig`):
   - **Emitter:** ingest (main_proj with split K, main_norm, each block's wkv / kv_norm / ring store) and the pass. The pass is:
     - the block ids embedded;
