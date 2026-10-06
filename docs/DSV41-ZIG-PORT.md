@@ -212,6 +212,31 @@ Rules from `ZIG-PREVIEW.md`:
     1. Greedy tokens identical to Python over long runs (thousands of tokens, several prompts), top-p 0.85.
     2. Per-window time against Python prod. Eager, with no graphs, is informational; R4 graphs come before the speed gate.
   - **Kit:** like `zig-tp-spark-kit` (binaries, `SHA256SUMS`, one script per host), with the Spark window's runbook row.
+- **The M2c-2 kit, as built** (`tools/zig/dsv41_m2c2/`: `run_host.sh`, `build-kit.sh`, `RUNBOOK.md`):
+  - **Per host:**
+    - The Python reference: prod's engine tree 8474f31, in prod's image and cache volume, one rank per Spark (`dsv41_m2b_ref.py --rank / --master`), all 40 layers, top-p 0.85, M1's prod kernel knobs (R1 off; it is bit-identical by design). It records the tokens, logits digests and first-window blocks, plus each host's AOT set and rope tables.
+    - Then our rank: `tf-dsv41-m1 m2b` over the hybrid collective (`TF_COMM_BACKEND=roce`, `TF_TP_KERNEL_IMAGE` = `tp_mailbox.fatbin` built by the e1e2 image's nvcc for sm_120 / sm_121, `TF_TP_ROCE_FALLBACK=error`).
+  - **Prod on the Sparks:** stopped with `serve.sh stop` and restored with `scripts/v2-rollback.sh perf1`, about 45–60 min for one seed.
+  - **Built for GB10:**
+    - `Pack.read` drops the page cache of what it read (`POSIX_FADV_DONTNEED`: the page cache is GPU memory there);
+    - the kit drops caches between phases;
+    - the aarch64 build is cross-compiled on the dev box (1 min);
+    - the sm_121 fatbins are dsq-zig-kern-1's.
+  - **Not in M2c-2:** DSpark, our own prefill, graphs, timing as a gate.
+- **M3 status:**
+  - **Built:**
+    - `target.zig`: draft/iface.zig's `Target` over `forward.zig`. It covers one slot, chain verify windows with greedy choices (`forward.greedy`: Python's cross-rank rule), `keep` of a chain prefix, prefill as consecutive decode windows, and the taps.
+    - `block.Options.taps`: the boundaries entering layers 37–39 write `w.taps` `[n, 3 × hidden]`, as `dspark.py`.
+  - **Next:**
+    1. **The DSpark pass on the GPU** (draft/iface.zig `Pass`):
+       - `main_proj` + RMS norm of the taps;
+       - each block's ring (`wkv_b` → `kv_norm` → rope → ratio-0 store, 128 positions);
+       - the 3 blocks over [anchor, noise × (N−1)] with the non-causal attention metadata (the ring as the compressed list plus the block rows, `lo` = P, `hi` = P+N−1);
+       - the head's candidates (`topk_keys`), gathered across ranks;
+       - the Markov / confidence chain kernel (a `.cu` for dsq-zig-kern-1).
+       Its gate is a capture of Python's drafting pass, drafts compared bit for bit.
+    2. **Trees and sampling in the target** (`parents`, keyed `lanes.Sampling`).
+    3. **Several slots** through `state.zig` and the session pool.
 - **Ahead of M2c-2 (offline, then pods as needed):**
   - our own prefill (exact-tag kernels first), so a run does not start from Python's state dump;
   - CUDA graphs per row bucket (R4), with `run.zig`'s calls already fixed per window;
