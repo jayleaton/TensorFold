@@ -14,8 +14,7 @@ const block = @import("block.zig");
 const check = @import("m1_check.zig");
 const load = @import("load.zig");
 const tri = @import("m1_triton.zig");
-const prepare = @import("prepare.zig");
-const named = @import("named.zig");
+const forms = @import("forms.zig");
 const plan = @import("plan.zig");
 const Config = @import("config.zig").Config;
 const rp = dk.replay;
@@ -45,8 +44,6 @@ pub const Forward = struct {
     triton: *const tri.Set,
     plan: *const plan.Plan,
     dir: []const u8,
-    /// int16 trellis shapes [K/16, N/16, words] by weight name (the capture's weights.json, our loader's equal)
-    shapes: std.StringHashMapUnmanaged([3]usize) = .empty,
     bufs: std.StringHashMapUnmanaged(Buf) = .empty,
     counts: Counts = .{},
     /// roles re-seeded for glue, and how often
@@ -60,9 +57,6 @@ pub const Forward = struct {
         }
         f.bufs.deinit(f.gpa);
         for (f.glue.keys()) |k| f.gpa.free(k);
-        var si = f.shapes.keyIterator();
-        while (si.next()) |k| f.gpa.free(k.*);
-        f.shapes.deinit(f.gpa);
         f.glue.deinit(f.gpa);
     }
 
@@ -205,8 +199,10 @@ pub const Forward = struct {
                 @memset(z, 0);
                 break :blk z;
             };
+            if (has_reloc) try f.patch(relocs, b.id, bound.items, host);
             if (fresh) {
                 f.counts.seeded += 1;
+                // our forms against Python's (pointer tables after the capture's addresses became ours)
                 try f.prepared(a, b.role, host, log);
             } else {
                 f.counts.reseeded += 1;
@@ -217,7 +213,6 @@ pub const Forward = struct {
                 }
                 g.value_ptr.* += 1;
             }
-            if (has_reloc) try f.patch(relocs, b.id, bound.items, host);
             try cuda.DeviceBuffer.upload(.{ .d = f.d, .ptr = buf.dev.ptr, .len = @max(n, 1) }, 0, host);
             buf.live = true;
             seeds += 1;
@@ -273,76 +268,10 @@ pub const Forward = struct {
         if (!try rp.call(f.kernels, f.stream, c.name[0..dot], c.name[dot + 1 ..], args, &.{}, &scratch)) return error.NoBinding;
     }
 
-    // -----------------------------------------------------------------------------------------------------------
-    // run-time forms we build, against the Python engine's (the seeds)
-
-    fn download(f: *Forward, a: std.mem.Allocator, name: []const u8) ![]u8 {
-        const t = f.weights.get(name) orelse return error.MissingWeight;
-        const host = try a.alloc(u8, t.len);
-        try cuda.DeviceBuffer.download(.{ .d = f.d, .ptr = t.ptr, .len = t.len }, 0, host);
-        return host;
-    }
-
-    /// Ours for a seeded role we know how to build (null: not one of ours).
-    fn build(f: *Forward, a: std.mem.Allocator, role: []const u8) !?[]const u8 {
-        // strips of "<prefix>.trellis" (int16 [kt, nt, words]), and dense3's lanes layout of them
-        const lanes = std.mem.endsWith(u8, role, ".lanes");
-        if (lanes or std.mem.endsWith(u8, role, ".T")) {
-            const w = role[2 .. role.len - (if (lanes) ".lanes".len else ".T".len)];
-            const tr = try f.download(a, try std.fmt.allocPrint(a, "{s}.trellis", .{w}));
-            const g = try f.groupShape(w);
-            const st = try prepare.strips(a, tr, g[0], g[1], g[2]);
-            return if (lanes) try prepare.lanes(a, st, g[0], g[2] / 8) else st;
-        }
-        if (std.mem.endsWith(u8, role, ".fn16")) { // the mHC weights rounded to bf16
-            const src = try f.download(a, try std.fmt.allocPrint(a, "{s}.fn", .{role[2 .. role.len - 5]}));
-            const out = try a.alloc(u8, src.len / 2);
-            for (0..src.len / 4) |i| std.mem.writeInt(u16, out[2 * i ..][0..2], named.bf16Round(@bitCast(std.mem.readInt(u32, src[4 * i ..][0..4], .little))), .little);
-            return out;
-        }
-        // the routed experts' scale stacks and K2 table, the shared expert last: "s.L<i>.ex.<suh|svh>_<g|u|d>", "k2_*"
-        if (!std.mem.startsWith(u8, role, "s.L")) return null;
-        const ex = std.mem.indexOf(u8, role, ".ex.") orelse return null;
-        const layer = role[2..ex];
-        const what = role[ex + 4 ..];
-        const proj: usize = switch (what[what.len - 1]) {
-            'g' => 0,
-            'u' => 2,
-            'd' => 1,
-            else => return null,
-        };
-        const projs = [_][]const u8{ "w1", "w2", "w3" };
-        const w = projs[proj];
-        if (std.mem.startsWith(u8, what, "suh") or std.mem.startsWith(u8, what, "svh")) {
-            const kind = what[0..3];
-            const routed = try f.download(a, try std.fmt.allocPrint(a, "{s}.moe.{s}.{s}", .{ layer, w, kind }));
-            const shared = try f.download(a, try std.fmt.allocPrint(a, "{s}.moe.shared.0.{s}.{s}", .{ layer, w, kind }));
-            return try std.mem.concat(a, u8, &.{ routed, shared });
-        }
-        if (std.mem.startsWith(u8, what, "k2")) {
-            const L = try std.fmt.parseInt(u32, layer[1..], 10);
-            const lp = for (f.plan.layers) |*l| {
-                if (l.index == L) break l;
-            } else return null;
-            const lay = &lp.experts[proj].layout;
-            const out = try a.alloc(u8, 4 * (lay.words.len + 1));
-            for (lay.words, 0..) |words, i| std.mem.writeInt(i32, out[4 * i ..][0..4], @intCast(words / 8), .little);
-            const sh = try f.groupShape(try std.fmt.allocPrint(a, "{s}.moe.shared.0.{s}", .{ layer, w }));
-            std.mem.writeInt(i32, out[4 * lay.words.len ..][0..4], @intCast(sh[2] / 8), .little);
-            return out;
-        }
-        return null;
-    }
-
-    /// (K tiles, N tiles, words) of a group's trellis weight.
-    fn groupShape(f: *Forward, w: []const u8) ![3]usize {
-        var b: [256]u8 = undefined;
-        return f.shapes.get(try std.fmt.bufPrint(&b, "{s}.trellis", .{w})) orelse error.MissingWeight;
-    }
-
     fn prepared(f: *Forward, a: std.mem.Allocator, role: []const u8, seed: []const u8, log: *std.Io.Writer) !void {
         if (!std.mem.startsWith(u8, role, "s.")) return;
-        const ours = f.build(a, role) catch |e| {
+        const src: forms.Source = .{ .d = f.d, .weights = f.weights, .plan = f.plan };
+        const ours = forms.build(a, &src, role) catch |e| {
             f.counts.prepared_differ += 1;
             try log.print("{{\"prepared\": \"{s}\", \"status\": \"failed\", \"why\": \"{t}\"}}\n", .{ role, e });
             return;
@@ -367,15 +296,6 @@ pub fn runAll(f: *Forward, out_dir: []const u8, experts: []const u8) !Counts {
     const log = &fw.interface;
     const listing = try cwd.readFileAlloc(f.io, try std.fs.path.join(a, &.{ f.dir, "weights.json" }), a, .limited(1 << 28));
     const w = try check.widthsFromCapture(a, listing, experts);
-    {
-        const root = try std.json.parseFromSliceLeaky(Value, a, listing, .{});
-        var it = root.object.iterator();
-        while (it.next()) |e| {
-            const sh = e.value_ptr.object.get("shape").?.array.items;
-            if (std.mem.endsWith(u8, e.key_ptr.*, ".trellis") and sh.len == 3)
-                try f.shapes.put(f.gpa, try f.gpa.dupe(u8, e.key_ptr.*), .{ @intCast(sh[0].integer), @intCast(sh[1].integer), @intCast(sh[2].integer) });
-        }
-    }
     const cfg: Config = .{};
     const ws = try check.windows(a, f.io, f.dir);
     var last_set: []const u8 = "";

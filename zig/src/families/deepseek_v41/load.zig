@@ -4,7 +4,18 @@ const std = @import("std");
 const cuda = @import("cuda");
 const named = @import("named.zig");
 
-pub const Tensor = struct { ptr: u64, len: usize, kind: named.Kind, sha256: [32]u8 };
+pub const Tensor = struct {
+    ptr: u64,
+    len: usize,
+    kind: named.Kind,
+    sha256: [32]u8,
+    shape: [4]usize = @splat(1),
+    rank: u8 = 0,
+
+    pub fn dims(t: *const Tensor) []const usize {
+        return t.shape[0..t.rank];
+    }
+};
 
 pub const Weights = struct {
     gpa: std.mem.Allocator,
@@ -30,7 +41,7 @@ pub const Weights = struct {
             var buf = try cuda.DeviceBuffer.fromHost(d, n.bytes);
             errdefer buf.free();
             try w.bufs.append(w.gpa, buf);
-            try w.map.put(w.gpa, try w.gpa.dupe(u8, n.name), .{ .ptr = buf.ptr, .len = n.bytes.len, .kind = n.kind, .sha256 = sha });
+            try w.map.put(w.gpa, try w.gpa.dupe(u8, n.name), .{ .ptr = buf.ptr, .len = n.bytes.len, .kind = n.kind, .sha256 = sha, .shape = n.shape, .rank = n.rank });
             w.bytes += n.bytes.len;
         }
         // pageable uploads can still be in flight when cuMemcpyHtoD returns; the weights are whole before any launch
