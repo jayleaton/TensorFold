@@ -14,6 +14,9 @@ pub const lanes = @import("lanes.zig");
 pub const format = @import("format.zig");
 pub const disk = @import("disk.zig");
 pub const Disk = disk.Disk;
+pub const jobs = @import("jobs.zig");
+pub const store = @import("store.zig");
+pub const Store = store.Store;
 
 test {
     _ = freeset;
@@ -23,5 +26,8 @@ test {
     _ = lanes;
     _ = format;
     _ = disk;
+    _ = jobs;
+    _ = store;
     _ = @import("disk_test.zig");
+    _ = @import("store_test.zig");
 }

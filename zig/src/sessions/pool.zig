@@ -62,6 +62,12 @@ pub fn span(k0: u32, k1: u32, w: u32, out: []u32) void {
 
 pub const max_world = 8;
 
+/// A file whose logical pages [0, pages) hold the same rows as a slot's or entry's (an NVMe restore's source): a later park writes only past it.
+pub const Origin = struct {
+    key: [16]u8,
+    pages: u32,
+};
+
 /// One slot's page table: logical page i -> physical page; the device tables follow through the dirty range.
 pub const Slot = struct {
     pool: *Pool,
@@ -78,6 +84,8 @@ pub const Slot = struct {
     /// table entries changed since the device side last synced them: [lo, hi)
     dirty_lo: u32 = std.math.maxInt(u32),
     dirty_hi: u32 = 0,
+    /// the file the leading pages came from (truncation shortens it, release clears it)
+    origin: ?Origin = null,
 
     pub fn mapped(s: *const Slot) []const u32 {
         return s.pages[0..s.len];
@@ -190,6 +198,8 @@ pub const Slot = struct {
     /// Lets go of the pages past position keep (rows nothing reads again); returns how many.
     pub fn truncate(s: *Slot, keep: u64) Error!u32 {
         const p = s.pool;
+        // positions >= keep get written again: a page holding one no longer equals the origin file's
+        if (s.origin) |*o| o.pages = @min(o.pages, @as(u32, @intCast(keep / p.page)));
         const k = pagesFor(keep, p.page);
         if (k >= s.len) return 0;
         var before: [max_world]u32 = undefined;
@@ -221,6 +231,7 @@ pub const Slot = struct {
     pub fn releaseAll(s: *Slot) Error!u32 {
         s.reserve(null);
         s.over = 0;
+        s.origin = null;
         return s.truncate(0);
     }
 };

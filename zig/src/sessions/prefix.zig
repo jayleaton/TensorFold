@@ -296,6 +296,25 @@ pub fn Index(comptime Extra: type) type {
             return false;
         }
 
+        /// How many RAM entries extend a RAM entry (strictly longer, same tag, its ids their prefix): a branch point has more than its own chat's.
+        pub fn extensions(x: *Self, id: u32) u32 {
+            const e = &x.entries.items[id];
+            const nd = &x.nodes.items[e.node];
+            var n: u32 = 0;
+            var f = nd.first_entry;
+            while (f != none) : (f = x.entries.items[f].next_at) {
+                const o = &x.entries.items[f];
+                if (f != id and o.ram and o.pos > e.pos and std.mem.startsWith(i32, o.tail, e.tail)) n += 1;
+            }
+            var c = nd.first_child;
+            while (c != none) : (c = x.nodes.items[c].next_sib) {
+                const ch = &x.nodes.items[c];
+                if (ch.sub_ram == 0) continue;
+                if (std.mem.startsWith(i32, ch.tokens.?, e.tail)) n += ch.sub_ram;
+            }
+            return n;
+        }
+
         /// A RAM entry no other RAM entry extends: a chat's newest state.
         pub fn isLeaf(x: *Self, id: u32) bool {
             return x.entries.items[id].ram and !x.covered(id, .ram);
@@ -391,6 +410,8 @@ test "longest strict prefix, ties, tags and coverage" {
     try std.testing.expect(x.covered(t4, .any) and x.covered(t4, .ram));
     x.remove(t4);
     try std.testing.expect(x.isLeaf(t2) and !x.isLeaf(t1));
+    try std.testing.expectEqual(@as(u32, 1), x.extensions(t1));
+    try std.testing.expectEqual(@as(u32, 0), x.extensions(t2));
     var m: std.ArrayList(u32) = .empty;
     defer m.deinit(gpa);
     try std.testing.expectEqual(@as(u64, 2), try x.members(t2, &m, usedOf));
