@@ -435,7 +435,8 @@ pub const Emitter = struct {
         const qa = try e.buf("L.qa", .{}, .bf16, &.{ n, e.cfg.q_lora });
         const kv = try e.buf("L.kv", .{}, .bf16, &.{ n, hd });
         const cw: i64 = if (ratio == 2) 2 * hd else hd;
-        const comp = try e.buf("L.comp", .{}, .bf16, &.{ n, cw });
+        // a KV source's compressor projection outlives its layer: keep() carries the accepted row (ratio 2)
+        const comp = if (ratio == 2) try e.buf("w.L{d}.comp", .{L}, .bf16, &.{ n, cw }) else try e.buf("L.comp", .{}, .bf16, &.{ n, cw });
         var ps: [4]Proj = undefined;
         for (xg.ws, 0..) |w, i| ps[i] = .{ .w = w, .x = x, .k = @intCast(D), .n = @intCast(xg.ns[i]), .y = switch (i) {
             0 => qa,
@@ -597,8 +598,13 @@ pub const Emitter = struct {
         for (layers, 0..) |L, i| {
             if (i > 0) e.begin = .layer;
             e.layer_ratio = e.cfg.compressRatio(L);
-            if (e.cfg.isEngram(L)) try moe.engram(e, L);
-            try moe.mhc(e, L, "hc_attn", if (i == 0) .site1 else .boundary);
+            if (e.cfg.isEngram(L)) {
+                // Python's forward: an Engram block after the first runs the last exchange's post alone, Engram on the
+                // streams, then a site that collapses with the previous coefficients' pre (site2)
+                if (i > 0) try moe.postOnly(e);
+                try moe.engram(e, L);
+                try moe.mhc(e, L, "hc_attn", if (i == 0) .site1 else .site2);
+            } else try moe.mhc(e, L, "hc_attn", if (i == 0) .site1 else .boundary);
             try e.attention(L);
             try e.prefetchF(L);
             try moe.mhc(e, L, "hc_ffn", .boundary);

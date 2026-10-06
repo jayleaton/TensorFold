@@ -34,7 +34,7 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-SETS = {"A": (1, 2, 3), "B": (20, 21, 22, 23, 24), "C": (40,)}
+SETS = {"A": (1, 2, 3), "B": (20, 21, 22, 23, 24), "C": (40,), "D": (13, 14, 15)}   # D: Engram mid-stack (post, Engram, site2)
 WINDOWS = (1, 3, 16)
 PREFILL = 256               # rows of the recorded prefill segment after the windows (the fast prefill kernels)
 SCAN_MAX = 1 << 20          # int64 elements scanned for device addresses a tensor at most

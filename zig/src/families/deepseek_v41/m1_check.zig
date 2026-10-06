@@ -152,8 +152,10 @@ pub const Flow = struct {
                 if (!g.found_existing) g.value_ptr.* = 0;
                 g.value_ptr.* += 1;
             }
+            // a first touch that writes overwrites whatever a freed storage held; only a read can be miswired
+            const read = std.mem.eql(u8, before.string, o.get("after").?.string);
             var it = f.last.iterator();
-            while (it.next()) |e| if (std.mem.eql(u8, e.value_ptr[0], key) and std.mem.eql(u8, e.value_ptr[1], before.string)) {
+            while (it.next()) |e| if (read and std.mem.eql(u8, e.value_ptr[0], key) and std.mem.eql(u8, e.value_ptr[1], before.string)) {
                 f.miswired += 1;
                 try log.print("  {s} {s}: {s} first read holds what {s} last held\n", .{ where, c.name, b.role, e.key_ptr.* });
                 break;

@@ -497,7 +497,18 @@ Effort is in engineering days for this agent team, assuming GPU windows are avai
      - **Triton variant choice is done offline.** `triton_call.zig` splits a call's named arguments into the engine's runtime args and constexprs over the function's variants. The capture's `pack_aot` now writes the engine's `aot.json` form: constexprs (floats as fp32 bits), `div16` from the compiled signature, `nospec` from `jit.json`. The engine's own `aot.zig` matcher (`specMatches`, now public with `parseSpecs`) runs on that. `tf-dsv41-m1 check` gates it: on pod 8's prod capture, 153/153 Triton calls pick exactly the variant Python launched, so M2 launches Triton by name, not by a captured hash. The job now returns the capture's AOT set whole (`aot.tar.gz`).
      - **Gate:** `tf-dsv41-m1 check` keeps gating the emitted calls. The executor reuses M1's GPU forward with seeding off for everything but window inputs.
   2. **AOT coverage set:** the Triton variants of every row bucket (1–16 decode, the prefill chunk sizes), recorded from a prod-knob Python run without blobs (a launch log is enough). This is a short pod step, and the kernel agent owns the set's build.
-  3. **Glue, as the M1 check listed it:**
+  3. **Glue, from Python's `forward.py` (each is one small kernel, written to torch's arithmetic):**
+     - **Window start:**
+       - `w.pos` = the first position (i32). `w.pos64` = `arange(start, start + n)` (i64). `w.lo` = zeros (i32, `Context.lo`).
+       - The streams: this rank's embedding rows (`ids - vocab_lo`, masked to zero outside the rank's range, bf16 to fp32). Then the all-sum, the window's first exchange: fp32 to bf16, a gather into the pair of receive buffers, back to fp32, `parts[0] + parts[1] + …` in rank order, then to bf16. Then repeat ×4 into `w.x0`. A faithful sum matters: 0 + (-0) is +0.
+     - **Exchanges:** each takes the next of the two alternating receive buffers. In decode the embedding takes one and the MoE partials share it (`w.recv.moe`); attention's partials take the other (`w.recv.attn`).
+       - Attention's `wo_b` partial is already bf16 (`TF_DSV41_PARTIAL_BF16`): gather only.
+       - The MoE's fp32 partial is cast to bf16 (RNE), then gathered.
+     - **`kit_weights`:** the pruned expert weights fp32 to fp16 to fp32 (`L.wts16`), backbone layers only (DSpark's router folds it).
+     - **Engram rows (layers 1, 14):** the host hashes the ids (with the slot's tail), reads this rank's columns of the table rows, then `gather_cols` (an all-gather, permuted to `[n, world · c]`) into `L.engram.rows`.
+     - **Head:** `kit_logits` (fp32 to bf16 to fp32) on this rank's logits, then sampling (`serve/sampling.zig`).
+     - **`keep(slot, accepted)`:** the ratio-2 carry ← fp32 of row `accepted` of the window's compressor projection. That projection is the role `w.L<i>.comp` for ratio-2 sources, so it outlives its layer as `ctx.proj` does. Positions and the Engram tail advance.
+     - **Mid-stack Engram (layer 14):** Python runs the last exchange's post alone (Triton `_site`, `POST_ON`, no collapse or mix), then Engram, then a site2. `block.zig` emits that (1,083 launches a window). Capture set D (layers 13–15) checks it on the next pod.
      - positions (`w.pos`, `w.pos64`, the SWA lower bounds `w.lo`);
      - the stream input (the embedding gather of this rank's vocabulary rows, its exchange, the 4-stream expand);
      - the two exchanges into `w.recv.attn` / `w.recv.moe` (partial to bf16, then `Collective.allGather` into `[world, R, D]`);

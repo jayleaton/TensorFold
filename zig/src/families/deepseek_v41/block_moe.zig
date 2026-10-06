@@ -9,7 +9,7 @@ const Arg = calls.Arg;
 
 /// mhc_cuda.run modes: a sublayer's site without post-processing (the window's first), a boundary between sublayers
 /// (post of the last, collapse 2, mix), the final norm (post, collapse 2, no mix).
-pub const Mode = enum(i64) { boundary = 0, site1 = 1, final = 3 };
+pub const Mode = enum(i64) { boundary = 0, site1 = 1, site2 = 2, final = 3 };
 
 fn coefs(e: *E, set: u1) ![3]Arg {
     return .{
@@ -23,7 +23,7 @@ fn coefs(e: *E, set: u1) ![3]Arg {
 pub fn mhc(e: *E, layer: ?u32, which: []const u8, mode: Mode) !void {
     const n = e.n;
     const D: i64 = e.cfg.hidden;
-    const post = mode != .site1;
+    const post = mode == .boundary or mode == .final;
     const mix = mode != .final;
     const f0 = try e.empty(.f32);
     const b0 = try e.empty(.bf16);
@@ -41,7 +41,7 @@ pub fn mhc(e: *E, layer: ?u32, which: []const u8, mode: Mode) !void {
         nw = try e.weight("L{d}.{s}", .{ L, if (std.mem.eql(u8, which, "hc_attn")) "attn_norm" else "ffn_norm" }, .f32, &.{D});
     } else nw = try e.weight("norm", .{}, .f32, &.{D});
     const xout: Arg = switch (mode) {
-        .site1 => b0,
+        .site1, .site2 => b0,
         .final => x,
         .boundary => try e.spare(),
     };
@@ -49,7 +49,7 @@ pub fn mhc(e: *E, layer: ?u32, which: []const u8, mode: Mode) !void {
         x,                                                               xout,
         // the exchange that ran last: the attention's partials at the FFN site, the MoE's at the next attention / final
         if (post) try e.buf("w.recv.{s}", .{if (std.mem.eql(u8, which, "hc_ffn")) "attn" else "moe"}, .bf16, &.{ e.o.world, n, D }) else b0, if (post) prev[1] else f0,
-        if (post) prev[2] else f0,                                       if (post) prev[0] else f0,
+        if (post) prev[2] else f0,                                       if (post or mode == .site2) prev[0] else f0,
         hc[0],                                                           hc[1],
         hc[2],                                                           try e.buf("L.mhc.part", .{}, .f32, &.{ n, 4, 40, 32 }),
         try e.buf("L.mhc.c", .{}, .bf16, &.{ n, D }),                    b0,
@@ -62,6 +62,29 @@ pub fn mhc(e: *E, layer: ?u32, which: []const u8, mode: Mode) !void {
     });
     if (mix) e.coef = 1 - e.coef;
     if (mode == .boundary) e.cur = 1 - e.cur;
+}
+
+/// mhc.post_only (Triton `_site`, POST_ON, no collapse or mix): the last exchange's post applied to the streams in
+/// place, before an Engram block that is not the window's first (Python's forward: post, Engram, then a site2).
+pub fn postOnly(e: *E) !void {
+    const n = e.n;
+    const D: i64 = e.cfg.hidden;
+    const x = try e.streams();
+    const prev = try coefs(e, e.coef);
+    try e.triton("_site", .{ std.math.divCeil(i64, n, 16) catch unreachable, 40, 1 }, &.{
+        .{ .name = "X", .arg = x },                     .{ .name = "x_stride", .arg = .{ .i = 4 * D } },
+        .{ .name = "XOUT", .arg = x },                  .{ .name = "G", .arg = try e.buf("w.recv.moe", .{}, .bf16, &.{ e.o.world, n, D }) },
+        .{ .name = "g_rank", .arg = .{ .i = n * D } },  .{ .name = "POST", .arg = prev[1] },
+        .{ .name = "COMB", .arg = prev[2] },            .{ .name = "PRE", .arg = x },
+        .{ .name = "FN", .arg = x },                    .{ .name = "PART", .arg = x },
+        .{ .name = "C", .arg = x },                     .{ .name = "TAP", .arg = x },
+        .{ .name = "tap_stride", .arg = .{ .i = 0 } },  .{ .name = "R", .arg = .{ .i = n } },
+        .{ .name = "D", .arg = .{ .i = D } },           .{ .name = "NB", .arg = .{ .i = 40 } },
+        .{ .name = "BM", .arg = .{ .i = 16 } },         .{ .name = "BK", .arg = .{ .i = 16 } },
+        .{ .name = "WORLD", .arg = .{ .i = e.o.world } }, .{ .name = "POST_ON", .arg = .{ .b = true } },
+        .{ .name = "COLLAPSE", .arg = .{ .i = 0 } },    .{ .name = "MIX", .arg = .{ .b = false } },
+        .{ .name = "TAP_ON", .arg = .{ .b = false } },  .{ .name = "SPLIT", .arg = .{ .b = false } },
+    });
 }
 
 /// Router GEMV, the top-p prune and upstream's group (a DSpark block's router groups itself), then the routed + shared
