@@ -52,15 +52,15 @@ pub const DevicePool = struct {
         for (fams, 0..) |f, i| {
             t[i] = try cuda.DeviceBuffer.alloc(d, @as(usize, pool.familyTensorPages(f)) * f.pageBytes(pool.page));
             made += 1;
-            try t[i].fill8(0, null);
+            try t[i].fill8(0, compute.handle);
         }
         const n = @as(usize, slots) * max_pages;
         var table = try cuda.DeviceBuffer.alloc(d, n * 4);
         errdefer table.free();
-        try table.fill32(pool.null_page, null);
+        try table.fill32(pool.null_page, compute.handle);
         var local = try cuda.DeviceBuffer.alloc(d, n * 4);
         errdefer local.free();
-        try local.fill32(pool.local_null, null);
+        try local.fill32(pool.local_null, compute.handle);
         const ht = try gpa.alloc(i32, n);
         errdefer gpa.free(ht);
         @memset(ht, @intCast(pool.null_page));
@@ -71,6 +71,9 @@ pub const DevicePool = struct {
         errdefer io.deinit();
         var ev: [fences]cuda.Event = undefined;
         for (&ev) |*e| e.* = try cuda.Event.init(d, false);
+        // the fills ran on the compute stream (a blocking-API memset is asynchronous on the legacy stream and races with a
+        // non-blocking stream's later table upload): done before anything else touches the tensors or tables
+        try compute.synchronize();
         return .{ .gpa = gpa, .d = d, .ctx = ctx, .pool = pool, .tensors = t, .table = table, .local = local, .host_table = ht, .host_local = hl, .pts = max_pages, .slots = slots, .io = io, .events = ev, .compute = compute };
     }
 
