@@ -52,13 +52,9 @@ if [[ -f "$Z/r1c.tar.gz" ]] && tar -xzf "$Z/r1c.tar.gz" -C /; then PYTWIN=/opt/r
 echo "kernel job twin: $PYTWIN" | tee -a "$RES/env.txt"
 left() { echo $(( ${M1_BUDGET_MIN:-52} - ($(date +%s) - T0) / 60 )); }
 
-# M1_JOB=m2a: M2a instead of M1 (the kernel job first: glue.cu's first GPU run; then the Python reference over layers
-# M2A_LAYERS (0-24) with its slot state, rope tables and AOT set; the Engram host tables; tf-dsv41-m1 m2a)
+# M1_JOB=m2a: M2a instead of M1 (the Python reference over layers M2A_LAYERS (0-8) with its slot state, rope tables
+# and AOT set; the Engram host tables; tf-dsv41-m1 m2a; then the kernel job in what is left)
 if [[ "${M1_JOB:-m1}" == m2a ]]; then
-    (for v in $(compgen -e | grep '^TF_DSV41_'); do unset "$v"; done
-     export TF_DSV41_PY_SRC=$PYTWIN TF_DSV41_TEST=$Z/bin/tf-dsv41-test TF_DSV41_FATBINS=$Z/fatbin \
-            TORCH_EXTENSIONS_DIR=$PYEXT TF_DSV41_CAPTURE_MIN=8
-     step kernels 13 bash "$Z/zig/tests/cuda/deepseek_v41/job.sh" "$RES/kernels") || rc=1
     REF=$LOCAL/m2a-ref
     rm -rf "$REF"
     # pod 10: layers 0-24 did not finish loading + prefill in 22 min (Python loads ~40 s a block from the volume);
@@ -67,12 +63,23 @@ if [[ "${M1_JOB:-m1}" == m2a ]]; then
             --layers "${M2A_LAYERS:-0-8}" \
        && step engram-host 3 python -B "$Z/tools/zig/dsv41_engram_host.py" --py-src /dsv41-tf/src \
             --config "$PACK/config.json" --tokenizer "$PACK/tokenizer.json" --out "$REF/engram-host.bin"; then
-        step m2a "$(( $(left) > 4 ? $(left) - 2 : 2 ))" "$Z/bin/tf-dsv41-m1" m2a "$PACK" "$REF" "$RES/m2a"
+        step m2a 14 "$Z/bin/tf-dsv41-m1" m2a "$PACK" "$REF" "$RES/m2a"
     else rc=1; fi
     mkdir -p "$RES/m2a-ref"
     for f in digests.json manifest.json; do [[ -f "$REF/$f" ]] && cp "$REF/$f" "$RES/m2a-ref/"; done
     [[ -f "$REF/state/state.json" ]] && cp "$REF/state/state.json" "$RES/m2a-ref/"
     [[ -d "$REF/aot" ]] && tar -czf "$RES/m2a-ref/aot.tar.gz" -C "$REF" aot
+    # the kernel job last, in what is left (up to 15 min): pod 10 ran it first on a cold Triton cache and its twin
+    # suites (Triton JIT) did not fit 6 minutes; after the reference, the shared kernels are compiled
+    km=$(left); (( km > 15 )) && km=15
+    if (( km >= 6 )); then
+        (for v in $(compgen -e | grep '^TF_DSV41_'); do unset "$v"; done
+         export TF_DSV41_PY_SRC=$PYTWIN TF_DSV41_TEST=$Z/bin/tf-dsv41-test TF_DSV41_FATBINS=$Z/fatbin \
+                TORCH_EXTENSIONS_DIR=$PYEXT TF_DSV41_CAPTURE_MIN=$(( km - 3 ))
+         step kernels "$km" bash "$Z/zig/tests/cuda/deepseek_v41/job.sh" "$RES/kernels") || rc=1
+    else
+        echo "kernels skipped: $km min left" | tee -a "$RES/steps.txt"; rc=1
+    fi
     echo "=== rc=$rc"
     exit $rc
 fi
