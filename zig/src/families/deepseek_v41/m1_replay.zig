@@ -170,7 +170,13 @@ pub const Replay = struct {
         if (std.mem.eql(u8, t, "int")) return @bitCast(o.get("v").?.integer);
         if (!std.mem.eql(u8, t, "tensor")) return error.WrongArgument;
         if (o.get("host") != null) return error.HostTensor;
-        const off: u64 = @intCast(o.get("offset").?.integer);
+        // an empty tensor's data pointer can be 0 inside a live storage (a negative offset): a null pointer, as the
+        // launchers expect for numel 0
+        const raw = o.get("offset").?.integer;
+        var numel: i64 = 1;
+        for (o.get("shape").?.array.items) |d| numel *= d.integer;
+        if (raw < 0 or numel == 0) return 0;
+        const off: u64 = @intCast(raw);
         if (o.get("weight")) |w| return (r.weights.get(w.string) orelse return error.MissingWeight).ptr + off;
         return b.addr[@intCast(o.get("buf").?.integer)] + off;
     }
