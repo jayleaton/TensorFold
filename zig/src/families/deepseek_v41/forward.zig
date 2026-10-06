@@ -54,6 +54,8 @@ pub const Forward = struct {
     layers: ?[]const u32 = null,
     /// TP: rank 0 leads (sends each forward operation to the others over the plan link); the others `follow`
     link: ?*tp.planlink.PlanLink = null,
+    /// a follower's drafter (the leader's lanes ask its pass; every rank runs it)
+    drafter: ?Drafter = null,
     /// M2a: each block's traced streams (block.Options.trace) as SHA-256 hex by layer, for the last window
     trace: ?*std.AutoArrayHashMapUnmanaged(u32, [64]u8) = null,
     /// the largest row bucket plan() sized the buffers for (a graphed window never has more rows)
@@ -211,6 +213,28 @@ pub const Forward = struct {
     const op_greedy: i64 = 2;
     const op_keep: i64 = 3;
     const op_stop: i64 = 4;
+    const op_ds_ingest: i64 = 5;
+    const op_ds_propose: i64 = 6;
+
+    /// The drafter's operations a follower runs (dspark_gpu.zig): its collectives pair up with the leader's.
+    pub const Drafter = struct {
+        ptr: *anyopaque,
+        ingest: *const fn (ptr: *anyopaque, start: u64, n: u32, avail: u32) anyerror!void,
+        propose: *const fn (ptr: *anyopaque, anchor: u32, start: u64) anyerror!void,
+    };
+
+    /// Rank 0: a drafter operation to the followers (before running it).
+    pub fn sendDrafter(f: *Forward, ints: []const i64) !void {
+        if (f.leads()) try f.link.?.send(ints);
+    }
+
+    pub fn dsIngestOp(start: u64, n: u32, avail: u32) [4]i64 {
+        return .{ op_ds_ingest, @intCast(start), n, avail };
+    }
+
+    pub fn dsProposeOp(anchor: u32, start: u64) [3]i64 {
+        return .{ op_ds_propose, anchor, @intCast(start) };
+    }
 
     fn leads(f: *const Forward) bool {
         return f.link != null and f.comm.rank() == 0;
@@ -243,6 +267,14 @@ pub const Forward = struct {
                 op_greedy => try f.greedy(picks[0..@intCast(msg[1])]),
                 op_keep => try f.keep(@intCast(msg[1])),
                 op_stop => return,
+                op_ds_ingest => {
+                    const d = f.drafter orelse return error.BadPlan;
+                    try d.ingest(d.ptr, @intCast(msg[1]), @intCast(msg[2]), @intCast(msg[3]));
+                },
+                op_ds_propose => {
+                    const d = f.drafter orelse return error.BadPlan;
+                    try d.propose(d.ptr, @intCast(msg[1]), @intCast(msg[2]));
+                },
                 else => return error.BadPlan,
             }
         }
@@ -425,6 +457,7 @@ pub const Forward = struct {
                 errdefer f.gpa.destroy(g);
                 try g.init(f, s);
                 f.graphed = g;
+                std.log.scoped(.dsv41).info("graphs: on, windows of up to {d} rows, context buckets of {d}", .{ g.rows_max, s.bucket });
             }
         }
         return f.graphed;
@@ -434,6 +467,9 @@ pub const Forward = struct {
     /// graphable here (graphs off, more rows than planned, past the slot's limit, a traced program), run eagerly.
     fn graphedWindow(f: *Forward, ids: []const u32) !bool {
         const g = (try f.graphState()) orelse return false;
+        // a traced window (M2a / M2b's first step) is never graphed, and its program is not the key's: it is never
+        // emitted or cached here (pod 16: a cached traced program kept every later window eager)
+        if (f.opts.trace) return false;
         const n: u32 = @intCast(ids.len);
         const limit: u64 = @intCast(f.opts.limit);
         if (n > g.rows_max or f.slot.pos + n > limit) return false;
@@ -453,7 +489,9 @@ pub const Forward = struct {
         defer g.active = false;
         r.glue = .{ .ctx = f, .run = glueFn };
         g.current = cs;
-        _ = try g.cache.run(key, r.stream, f.fingerprint(g), .{ .ctx = f, .run = graphBody });
+        const outcome = try g.cache.run(key, r.stream, f.fingerprint(g), .{ .ctx = f, .run = graphBody });
+        if (outcome == .captured and g.cache.stats.captured == 1)
+            std.log.scoped(.dsv41).info("graphs: first capture ({d} rows, context bucket {d})", .{ key.rows, key.ctx });
         return true;
     }
 
@@ -542,6 +580,8 @@ pub const Graphed = struct {
     }
 
     fn deinit(g: *Graphed) void {
+        const cs = g.cache.stats;
+        std.log.scoped(.dsv41).info("graphs: {d} captured, {d} replayed, {d} eager, {d} keys held, {d} evicted, {d} dropped{s}", .{ cs.captured, cs.replayed, cs.eager, g.cache.count(), cs.evicted, cs.dropped, if (g.cache.failed) " (off after a failed capture)" else "" });
         g.cache.deinit();
         for (g.stages.items) |*st| st.deinit();
         g.stages.deinit(g.gpa);
