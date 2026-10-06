@@ -88,6 +88,7 @@ pub fn build(b: *std.Build) void {
     }
     cuda_build.hostTests(b, draft_ids, test_step);
     dsv41HostTests(b, test_step);
+    dsv41DraftTests(b, test_step);
     server_build.tests(b, test_step);
     const flash_host = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/flashnext_host.zig"), .target = target, .optimize = optimize, .link_libc = true }) });
     b.step("compile-flashnext-host", "Compile FlashNext CPU metadata contracts without running them").dependOn(&flash_host.step);
@@ -109,6 +110,22 @@ fn dsv41HostTests(b: *std.Build, test_step: *std.Build.Step) void {
     });
     const run = b.addRunArtifact(b.addTest(.{ .root_module = family }));
     b.step("test-dsv41", "DeepSeek-V4.1's host-side unit tests (no GPU work)").dependOn(&run.step);
+    test_step.dependOn(&run.step);
+}
+
+/// DeepSeek-V4.1's drafting (DSpark depth, trees, the lanes backend) on the CPU twin and the Python golden traces.
+fn dsv41DraftTests(b: *std.Build, test_step: *std.Build.Step) void {
+    const host = b.graph.host;
+    const lanes = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = host, .optimize = .debug, .link_libc = true });
+    const draft = b.createModule(.{
+        .root_source_file = b.path("zig/src/families/deepseek_v41/draft/draft.zig"),
+        .target = host,
+        .optimize = .debug,
+        .link_libc = true,
+        .imports = &.{.{ .name = "lanes", .module = lanes }},
+    });
+    const run = b.addRunArtifact(b.addTest(.{ .root_module = draft }));
+    b.step("test-dsv41-draft", "DeepSeek-V4.1's drafting and lanes backend on the CPU twin (no GPU work)").dependOn(&run.step);
     test_step.dependOn(&run.step);
 }
 
