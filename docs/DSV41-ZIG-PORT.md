@@ -152,7 +152,16 @@ Rules from `ZIG-PREVIEW.md`:
     - SASS 182/182 equal to the Python build;
     - symbols PASS.
     - The x3gm cases logged "v2 0 launches", so x3gm v2 itself was not exercised.
-  - **The next M1 pod carries** (batched; none planned):
+- **Pod 9** (bf2340b, `M1_KNOBS=prod`, 24 min, $0.84; ledger row by `session.sh`):
+  - **Replay:** PASS, 1,254/1,254 bit-exact alone and chained.
+  - **Block forward:** PASS, 717/717 launched calls bit-equal; glue re-seeds as before.
+  - **Prepared forms:** 181/181 equal to Python's, including the 78 dense3 groups through `prepare.lanes`. The open item from pod 8 is closed.
+  - **Kernel job:**
+    - on the decode1 78b703d twin, prebuilt for sm_120 in the e1e2 image and shipped as `r1c.tar.gz`: bits 13/13, kvsplit 3/3, SASS equal;
+    - x3gm v2 ran ("v2 4 launches" every x3gm case);
+    - the twin's suites ran under pytest (367 passed, 1 twin-side failure), but their recorded calls did not reach the replay (no `capture.json`). This is with dsq-zig-kern-1.
+  - **The superseded "next pod" list:**
+
     - the GPU compare of `prepare.lanes` against Python's dense3 words (pod 8 only compared them as plain strips);
     - the kernel agent's x3gm v2 check (f97ffde). gm2, with the ticket on and off, is compared bit for bit against the fixture's `gm_kernel` outputs, so each x3gm case should log "v2 4 launches".
     - Stage from a tree at or after 6ff3472, with the fatbins rebuilt at 22:44 (R1c: SASS equal to decode1 78b703d).
