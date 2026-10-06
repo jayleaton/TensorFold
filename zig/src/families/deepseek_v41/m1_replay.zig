@@ -76,7 +76,11 @@ pub const Replay = struct {
             const n: usize = @intCast(o.get("nbytes").?.integer);
             const before = o.get("before").?;
             @memcpy(&b.hex_after[id], o.get("after").?.string[0..64]);
-            fresh[id] = true;
+            fresh[id] = n > 0;
+            if (n == 0) { // an empty tensor: a null pointer, as the launchers expect
+                b.addr[id] = 0;
+                continue;
+            }
             if (!chained) {
                 b.own[id] = try cuda.DeviceBuffer.alloc(r.d, @max(n, 1));
                 b.addr[id] = b.own[id].ptr;
@@ -233,6 +237,7 @@ pub const Replay = struct {
             const o = bv.object;
             const id: usize = @intCast(o.get("id").?.integer);
             const n: usize = @intCast(o.get("nbytes").?.integer);
+            if (n == 0) continue;
             const got = try a.alloc(u8, n);
             try cuda.DeviceBuffer.download(.{ .d = r.d, .ptr = b.addr[id], .len = @max(n, 1) }, 0, got);
             var sha: [32]u8 = undefined;
