@@ -48,7 +48,7 @@ pub fn mhc(e: *E, layer: ?u32, which: []const u8, mode: Mode) !void {
     try e.ext("tf_dsv41_mhc_cuda_v1.run", &.{
         x,                                                               xout,
         // the exchange that ran last: the attention's partials at the FFN site, the MoE's at the next attention / final
-        if (post) try e.buf("w.recv.{s}", .{if (std.mem.eql(u8, which, "hc_ffn")) "attn" else "moe"}, .bf16, &.{ 2, n, D }) else b0, if (post) prev[1] else f0,
+        if (post) try e.buf("w.recv.{s}", .{if (std.mem.eql(u8, which, "hc_ffn")) "attn" else "moe"}, .bf16, &.{ e.o.world, n, D }) else b0, if (post) prev[1] else f0,
         if (post) prev[2] else f0,                                       if (post) prev[0] else f0,
         hc[0],                                                           hc[1],
         hc[2],                                                           try e.buf("L.mhc.part", .{}, .f32, &.{ n, 4, 40, 32 }),
@@ -73,7 +73,7 @@ pub fn moe(e: *E, L: u32) !void {
     const ex = e.cfg.expertsOf(L);
     const slots: i64 = ex.topk + 1;
     const Et: i64 = ex.count + 1;
-    const I: i64 = e.cfg.expert_width / 2;
+    const I: i64 = e.cfg.expert_width / e.o.world;
     const P = n * slots;
     const rows: i64 = if (backbone) e.o.expert_rows else e.o.dspark_rows;
     const sc: []const u8 = if (backbone) "s.ex" else "s.dx";
@@ -188,6 +188,6 @@ pub fn engram(e: *E, L: u32) !void {
 pub fn finish(e: *E) !void {
     try mhc(e, null, "", .final);
     const D: i64 = e.cfg.hidden;
-    const V: i64 = e.cfg.vocab / 2;
+    const V: i64 = e.cfg.vocab / e.o.world;
     try e.upstream("head", try e.buf("w.out", .{}, .bf16, &.{ e.n, D }), D, V, try e.buf("w.logits", .{}, .f32, &.{ e.n, V }));
 }

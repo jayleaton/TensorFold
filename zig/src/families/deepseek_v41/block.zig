@@ -30,6 +30,8 @@ pub const Widths = struct {
 
 /// Run-time sizes the Python engine fixes at load (its scratch and pools), and the prod L2 prefetch settings.
 pub const Options = struct {
+    /// TP ranks (a boot constant): every per-rank width below is the model's / world; the plan checked divisibility
+    world: u32 = 2,
     /// KV positions a slot holds (pool rows = limit / ratio + 1)
     limit: i64 = 4096,
     /// rope table rows (cos / sin pairs of 32)
@@ -245,7 +247,7 @@ pub const Emitter = struct {
     /// Site "o" (after wq_b): wo_a's groups, then wo_b; l2pf segments.
     pub fn prefetchO(e: *Emitter, L: u32) !void {
         const D: i64 = e.cfg.hidden;
-        const g = e.cfg.o_groups / 2;
+        const g = e.cfg.o_groups / e.o.world;
         const ki: i64 = @divExact(@as(i64, e.cfg.heads) * e.cfg.head_dim, @as(i64, e.cfg.o_groups));
         var sizes: std.ArrayList(u64) = .empty;
         const ws = try e.a.alloc([]const u8, g);
@@ -280,7 +282,7 @@ pub const Emitter = struct {
     /// Site "f" (after the attention sublayer): the router's gate, then the shared expert's gate and up trellises.
     pub fn prefetchF(e: *Emitter, L: u32) !void {
         const D: i64 = e.cfg.hidden;
-        const I: i64 = e.cfg.expert_width / 2;
+        const I: i64 = e.cfg.expert_width / e.o.world;
         const ex = e.cfg.expertsOf(L);
         const sh = try e.fmt("L{d}.moe.shared.0.w1", .{L});
         const k2: u64 = try e.w.k2(sh);
@@ -327,7 +329,7 @@ pub const Emitter = struct {
         const ws = try e.a.alloc([]const u8, if (ix) 2 else 1);
         const ns = try e.a.alloc(i64, ws.len);
         ws[0] = try e.fmt("L{d}.attn.wq_b", .{L});
-        ns[0] = @as(i64, e.cfg.heads / 2) * e.cfg.head_dim;
+        ns[0] = @as(i64, e.cfg.heads / e.o.world) * e.cfg.head_dim;
         if (ix) {
             ws[1] = try e.fmt("L{d}.attn.ix_wq_b", .{L});
             ns[1] = @as(i64, e.cfg.index_heads) * e.cfg.index_dim;
@@ -412,7 +414,7 @@ pub const Emitter = struct {
         const md = e.cfg.mode(L);
         const ratio: i64 = e.cfg.compressRatio(L);
         const kv_src = e.cfg.kvSource(L);
-        const H: i64 = e.cfg.heads / 2;
+        const H: i64 = e.cfg.heads / e.o.world;
         const hd: i64 = e.cfg.head_dim;
         const IH: i64 = e.cfg.index_heads;
         const ID: i64 = e.cfg.index_dim;
@@ -518,7 +520,7 @@ pub const Emitter = struct {
             .{ .i = 0 },                                                        .{ .i = 4 },
         });
         // o: wo_a's groups over the heads' columns, then wo_b (this rank's partial)
-        const g: usize = e.cfg.o_groups / 2;
+        const g: usize = e.cfg.o_groups / e.o.world;
         const gk: i64 = @divExact(H * hd, @as(i64, @intCast(g)));
         const oa = try e.buf("L.oa", .{}, .bf16, &.{ n, @as(i64, @intCast(g)) * e.cfg.o_lora });
         var po: [8]Proj = undefined;
