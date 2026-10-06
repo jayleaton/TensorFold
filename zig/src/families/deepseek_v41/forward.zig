@@ -48,8 +48,9 @@ pub const Forward = struct {
     rows_host: ?cuda.HostBuffer = null,
     /// a bf16 [rows, hidden] send buffer for the exchanges whose partial is not bf16 already (embedding, MoE)
     send: ?cuda.DeviceBuffer = null,
-    /// the window's token ids (the embedding step reads them)
+    /// the window's token ids (the embedding step reads them; window() copies them into ids_own)
     ids: []const u32 = &.{},
+    ids_own: std.ArrayList(u32) = .empty,
     /// the backbone layers the forward runs (all of them unless a gate runs a prefix: M2a's 0-24)
     layers: ?[]const u32 = null,
     /// TP: rank 0 leads (sends each forward operation to the others over the plan link); the others `follow`
@@ -80,6 +81,7 @@ pub const Forward = struct {
         if (f.gathered) |*b| b.free();
         if (f.rows_host) |*b| b.free();
         f.programs.deinit(f.gpa);
+        f.ids_own.deinit(f.gpa);
         f.arena.deinit();
     }
 
@@ -111,7 +113,14 @@ pub const Forward = struct {
     }
 
     /// One decode window: `ids` at the slot's position. This rank's logits stay in the runner's "w.logits".
-    pub fn window(f: *Forward, ids: []const u32) !void {
+    pub fn window(f: *Forward, ids_in: []const u32) !void {
+        // the forward's own copy: keep() reads the ids (Engram's tail) after the caller's slice may be gone (lanes
+        // hands a stack row or a scratch arena reset before the keep)
+        if (ids_in.ptr != f.ids_own.items.ptr) {
+            f.ids_own.clearRetainingCapacity();
+            try f.ids_own.appendSlice(f.gpa, ids_in);
+        }
+        const ids = f.ids_own.items;
         if (ids.len == 0 or f.slot.pending != null) return error.BadWindow;
         if (f.leads()) {
             var msg: [2 + 128]i64 = undefined;

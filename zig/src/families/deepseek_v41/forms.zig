@@ -81,8 +81,14 @@ pub fn build(a: std.mem.Allocator, s: *const Source, role: []const u8) !?[]const
         return out;
     }
     if (std.mem.startsWith(u8, what, "tp")) {
-        // each expert's trellis address: the ragged data's base + its offset; the shared expert's own tensor last
-        const data = s.weights.get(try std.fmt.allocPrint(a, "{s}.moe.{s}.data", .{ layer, w })) orelse return error.MissingWeight;
+        // each expert's trellis address: the ragged data's base + its offset; the shared expert's own tensor last. A
+        // DSpark block stores its routed experts as one uniform stack ("<w>.trellis", the experts back to back): the
+        // same offsets from its base
+        const data = s.weights.get(try std.fmt.allocPrint(a, "{s}.moe.{s}.data", .{ layer, w })) orelse uniform: {
+            const t = s.weights.get(try std.fmt.allocPrint(a, "{s}.moe.{s}.trellis", .{ layer, w })) orelse return error.MissingWeight;
+            if (t.len != lay.trellisBytes()) return error.ExpertStackSize;
+            break :uniform t;
+        };
         const sh = s.weights.get(try std.fmt.allocPrint(a, "{s}.trellis", .{shared})) orelse return error.MissingWeight;
         const out = try a.alloc(u8, 8 * (E + 1));
         for (0..E) |e| std.mem.writeInt(u64, out[8 * e ..][0..8], data.ptr + lay.byteOffset(e), .little);
