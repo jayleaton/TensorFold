@@ -665,6 +665,8 @@ pub const Stream = struct {
     close_blk: Finder = .{},
     body_at: usize = 0,
     done: std.ArrayList(Call) = .empty, // every invoke read to its fixed end, usable or not
+    settled: usize = 0, // done calls before this one are sent whole (or unusable)
+    settled_known: usize = 0, // the usable calls among them
     resume_at: usize = 0,
     open: ?Open = null,
     scratch: std.ArrayList(u8) = .empty,
@@ -734,10 +736,18 @@ pub const Stream = struct {
         const close = s.close_blk.block(text, true);
         const to = if (close) |c| c.start else text.len;
         try s.readCalls(text, to);
-        // the calls in order: the finished ones, then the one still open
-        var k: usize = 0;
+        // the calls in order: the finished ones, then the one still open; finished calls already sent whole are
+        // skipped, so a token costs the calls still open, not every call of the reply
+        while (s.settled < s.done.items.len) : (s.settled += 1) {
+            const c = &s.done.items[s.settled];
+            const i = s.tools.known(c.name) orelse continue;
+            if (s.settled_known == s.calls.items.len or !s.sent_close.items[s.settled_known]) break;
+            c.name = s.tools.names[i];
+            s.settled_known += 1;
+        }
+        var k: usize = s.settled_known;
         const total = s.done.items.len + @intFromBool(s.open != null);
-        for (0..total) |j| {
+        for (s.settled..total) |j| {
             const c: *Call = if (j < s.done.items.len) &s.done.items[j] else &s.open.?.call;
             const i = s.tools.known(c.name) orelse continue;
             c.name = s.tools.names[i];
