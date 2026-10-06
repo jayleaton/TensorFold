@@ -169,11 +169,13 @@ const Seg = struct {
         return try e.view(.{ .buf = "w.taps" }, .bf16, &.{ e.n, D }, &.{ @as(i64, @intCast(t.len)) * D, 1 }, @as(i64, @intCast(j)) * D * 2);
     }
 
-    /// The exchange a post reads: the attention's partials at the FFN site, the MoE's anywhere else.
+    /// The exchange a post reads: the attention's partials at the FFN site, the MoE's anywhere else. Both are
+    /// layer-scoped: Python's allocator gives each exchange its own storage (pod 18's capture moved the MoE's between
+    /// layers); the role stays one buffer here, read by the next layer's first site.
     fn gathered(e: *E, which: []const u8) !Arg {
         const D: i64 = e.cfg.hidden;
         if (std.mem.eql(u8, which, "hc_ffn")) return e.buf("L.recv.attn", .{}, .bf16, &.{ e.o.world, e.n, D });
-        return e.buf("w.recv.moe", .{}, .bf16, &.{ e.o.world, e.n, D });
+        return e.buf("L.recv.moe", .{}, .bf16, &.{ e.o.world, e.n, D });
     }
 
     /// One mixing site of layer L (`which`: hc_attn / hc_ffn): mhc.site / mhc.boundary, then `_finish_k`.
@@ -805,7 +807,7 @@ const Seg = struct {
             try e.glue("exchange", &.{ try e.buf("L.part", .{}, .bf16, &.{ n, D }), try e.buf("L.recv.attn", .{}, .bf16, &.{ e.o.world, n, D }) });
             try s.site(L, "hc_ffn", .boundary);
             try s.moeBlock(L);
-            try e.glue("exchange", &.{ try e.buf("L.moe16", .{}, .bf16, &.{ n, D }), try e.buf("w.recv.moe", .{}, .bf16, &.{ e.o.world, n, D }) });
+            try e.glue("exchange", &.{ try e.buf("L.moe16", .{}, .bf16, &.{ n, D }), try e.buf("L.recv.moe", .{}, .bf16, &.{ e.o.world, n, D }) });
             if (e.o.trace) {
                 const y = try e.buf("w.trace", .{}, .bf16, &.{ n, 4 * D });
                 try s.postOnly(y);
