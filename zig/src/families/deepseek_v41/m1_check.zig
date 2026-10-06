@@ -7,6 +7,8 @@ const calls = @import("calls.zig");
 const block = @import("block.zig");
 const Config = @import("config.zig").Config;
 const buffers = @import("buffers.zig");
+const cuda = @import("cuda");
+const tc = @import("triton_call.zig");
 const Value = std.json.Value;
 
 /// Dense K2s from the capture's weights.json (each "<prefix>.trellis" int16 [K/16, N/16, 8 K2]), the experts' ranges
@@ -204,6 +206,40 @@ pub fn windows(a: std.mem.Allocator, io: std.Io, dir: []const u8) ![]Window {
     return out.items;
 }
 
+/// M2's Triton variant choice on the host: each Triton call split into runtime arguments and constexprs over its
+/// function's compiled variants (aot.json with constexprs, div16, nospec), matched by the engine's own aot.zig test.
+/// Exactly one variant may match, and it must be the one the capture launched.
+pub const Variants = struct {
+    specs: []const cuda.aot.Spec,
+    checked: usize = 0,
+    wrong: usize = 0,
+
+    fn base(_: *anyopaque, t: calls.Tensor) anyerror!u64 {
+        var numel: i64 = 1;
+        for (t.shape) |n| numel *= n;
+        return if (numel == 0) 0 else 0x7f00_0000_0000 + @as(u64, @intCast(t.offset)); // a 256-aligned buffer + the view
+    }
+
+    pub fn check(v: *Variants, a: std.mem.Allocator, c: *const calls.Call, op: std.json.ObjectMap) !?[]const u8 {
+        if (!c.triton) return null;
+        var mine: std.ArrayList(cuda.aot.Spec) = .empty;
+        for (v.specs) |s| if (std.mem.eql(u8, s.@"fn", c.name)) try mine.append(a, s);
+        var dummy: u8 = 0;
+        const sp = try tc.split(a, c, mine.items, .{ .ctx = &dummy, .of = base });
+        v.checked += 1;
+        var hit: ?[]const u8 = null;
+        var n: usize = 0;
+        for (mine.items) |s| if (cuda.aot.specMatches(s, sp.args, sp.consts)) {
+            n += 1;
+            hit = s.hash;
+        };
+        const want = op.get("hash").?.string;
+        if (n == 1 and std.mem.eql(u8, hit.?, want)) return null;
+        v.wrong += 1;
+        return try std.fmt.allocPrint(a, "{d} of {d} variants match (want {s})", .{ n, mine.items.len, want[0..12] });
+    }
+};
+
 /// Checks every window; one line a window plus each mismatch (up to `show` a window) on `log`. Returns mismatches.
 pub fn checkAll(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, experts: []const u8, log: *std.Io.Writer, show: usize) !usize {
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -214,6 +250,11 @@ pub fn checkAll(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, experts: []
     const cfg: Config = .{};
     const ws = try windows(a, io, dir);
     var bad: usize = 0;
+    // the variant gate when the capture's AOT set carries the specialization (dsv41_m1_capture.py pack_aot, 2026-10-06+)
+    var variants: ?Variants = null;
+    if (cwd.readFileAlloc(io, try std.fs.path.join(a, &.{ dir, "aot", "aot.json" }), a, .limited(1 << 26))) |text| {
+        if (std.mem.indexOf(u8, text, "\"consts\"") != null) variants = .{ .specs = (try cuda.aot.parseSpecs(a, text)).value.kernels };
+    } else |_| {}
     var roles: calls.Roles = .{ .a = a };
     var flow: Flow = .{ .a = a };
     var last_set: []const u8 = "";
@@ -231,6 +272,12 @@ pub fn checkAll(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, experts: []
             roles.begin(c.begin);
             flow.begin(c.begin);
             try flow.call(c, op, log, try std.fmt.allocPrint(a, "{s} {s} #{d}", .{ win.set, win.phase, i }));
+            const vwhy = if (variants) |*v| try v.check(a, c, op) else null;
+            if (vwhy) |why| {
+                bad += 1;
+                if (shown < show) try log.print("  {s} {s} #{d} {s}: variant: {s}\n", .{ win.set, win.phase, i, c.name, why });
+                shown += 1;
+            }
             if (try calls.check(a, c, op, &roles)) |why| {
                 bad += 1;
                 if (shown < show) try log.print("  {s} {s} #{d} {s}: {s}\n", .{ win.set, win.phase, i, c.name, why });
@@ -243,6 +290,7 @@ pub fn checkAll(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, experts: []
     }
     try log.print("dataflow: {d} first reads hold another role's bytes; roles written between calls by uncaptured ops (reads):", .{flow.miswired});
     for (flow.glue.keys(), flow.glue.values()) |k, v| try log.print(" {s}={d}", .{ k, v });
+    if (variants) |v| try log.print("\nTriton variants: {d} calls, {d} picked wrong", .{ v.checked, v.wrong }) else try log.print("\nTriton variants: not checked (no aot.json with constexprs)", .{});
     try log.print("\nread-only first touches (inputs glue fills; in-place updates not listed):", .{});
     for (flow.inputs.keys(), flow.inputs.values()) |k, v| try log.print(" {s}={d}", .{ k, v });
     try log.print("\n", .{});

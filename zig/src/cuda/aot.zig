@@ -25,6 +25,20 @@ const KernelJson = struct {
 };
 const SetJson = struct { kernels: []KernelJson };
 
+/// A variant's description in aot.json, and a whole set's: what `Set.find` matches launches against.
+pub const Spec = KernelJson;
+pub const SpecSet = SetJson;
+
+/// aot.json parsed without loading any cubin (host-side checks of variant selection).
+pub fn parseSpecs(gpa: std.mem.Allocator, text: []const u8) !std.json.Parsed(SpecSet) {
+    return std.json.parseFromSlice(SpecSet, gpa, text, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+}
+
+/// Whether variant `k` is the one Triton would launch for these arguments and constexprs (`Set.find`'s test).
+pub fn specMatches(k: Spec, args: []const Arg, consts: []const Const) bool {
+    return matches(k, args, consts);
+}
+
 /// One argument of a launch, by the kernel's parameter name.
 pub const Arg = struct {
     name: []const u8,

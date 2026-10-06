@@ -365,12 +365,41 @@ def run_set(cap, rec, s, loader, W, cfg, embed, norm, head, tmap, dev, a, g, vh,
     return digests
 
 
-def pack_aot(manifest: Path, cache: Path, out: Path) -> dict:
-    """The launched kernels in the Zig engine's aot.json form (cubins by hash); a kernel whose PTX parameters are not
-    its runtime arguments plus Triton's two scratch pointers is listed in ``problems`` instead of stopping the pack."""
+def aot_consts(k: dict) -> dict:
+    """A kernel's constexprs as zig/src/cuda/aot.zig matches them: ints and bools as int, floats as fp32 bits (None and
+    other kinds are left out: a caller passes no constexpr for them)."""
+
+    out = {}
+    for name, v in k.get("constexprs", {}).items():
+        if isinstance(v, bool):
+            out[name] = {"int": int(v)}
+        elif isinstance(v, int):
+            out[name] = {"int": v}
+        elif isinstance(v, float):
+            out[name] = {"f32": struct.unpack("<I", struct.pack("<f", v))[0]}
+        elif isinstance(v, dict) and "fp32_bits" in v:      # triton_aot_manifest's float form
+            out[name] = {"f32": int(v["fp32_bits"], 16)}
+    return out
+
+
+def aot_params(k: dict, runtime: list, jit: dict) -> list:
+    """Runtime parameters with Triton's specialization: div16 from the compiled signature's divisibility, nospec from
+    the function's do_not_specialize (jit.json)."""
+
+    div = {x["name"]: bool(x.get("divisibility_16", False)) for x in k.get("abi", [])}
+    nospec = set(jit.get(k.get("function", ""), {}).get("do_not_specialize", []))
+    return [{"name": n, "type": k["signature"][n], "div16": div.get(n, False), "nospec": n in nospec} for n in runtime]
+
+
+def pack_aot(manifest: Path, cache: Path | None, out: Path, jit: dict | None = None) -> dict:
+    """The launched kernels in the Zig engine's aot.json form (cubins by hash; the constexprs, div16 and nospec the
+    engine's aot.Set picks a variant by, so M2 launches by name); a kernel whose PTX parameters are not its runtime
+    arguments plus Triton's two scratch pointers is listed in ``problems`` instead of stopping the pack. ``cache``
+    None: aot.json only (from a manifest whose cubins stayed elsewhere)."""
 
     import shutil
 
+    jit = jit or {}
     (out / "cubins").mkdir(parents=True, exist_ok=True)
     kernels, problems = [], []
     for k in json.loads(manifest.read_text())["kernels"]:
@@ -379,7 +408,8 @@ def pack_aot(manifest: Path, cache: Path, out: Path) -> dict:
         if ptx and ptx != runtime + ["global_scratch", "profile_scratch"]:
             problems.append({"hash": k["hash"], "name": k["name"], "ptx": ptx, "runtime": runtime})
             continue
-        shutil.copyfile(cache / k["cubin"], out / "cubins" / f"{k['hash']}.cubin")
+        if cache is not None:
+            shutil.copyfile(cache / k["cubin"], out / "cubins" / f"{k['hash']}.cubin")
         md = k["metadata"]
         kernels.append({"fn": k["name"], "hash": k["hash"], "name": md["name"], "num_warps": md["num_warps"],
                         "num_ctas": md.get("num_ctas", 1), "shared": md.get("shared", 0),
@@ -387,7 +417,7 @@ def pack_aot(manifest: Path, cache: Path, out: Path) -> dict:
                         "global_align": md.get("global_scratch_align", 1) or 1,
                         "profile_scratch": md.get("profile_scratch_size", 0) or 0,
                         "pdl": bool(md.get("launch_pdl", False)),
-                        "params": [{"name": n, "type": k["signature"][n]} for n in runtime]})
+                        "params": aot_params(k, runtime, jit), "consts": aot_consts(k)})
     (out / "aot.json").write_text(json.dumps({"generator": "tools/zig/dsv41_m1_capture.py", "kernels": kernels},
                                              indent=1) + "\n")
     return {"kernels": len(kernels), "problems": problems}
@@ -471,7 +501,7 @@ def main() -> int:
     (out / "jit.json").write_text(json.dumps(specialization(), indent=1, sort_keys=True) + "\n")
     cache = Path(os.environ.get("TRITON_CACHE_DIR", Path.home() / ".triton" / "cache"))
     aot.build(cache, out / "launches.json", out / "manifest.json", None)
-    meta["aot"] = pack_aot(out / "manifest.json", cache, out / "aot")
+    meta["aot"] = pack_aot(out / "manifest.json", cache, out / "aot", json.loads((out / "jit.json").read_text()))
     meta.update(ops=cap.seq, blob_bytes=cap.blob_bytes, counts=cap.counts)
     (out / "meta.json").write_text(json.dumps(meta, indent=1) + "\n")
     print(json.dumps({"ops": cap.seq, "blob_MB": round(cap.blob_bytes / 1e6, 1), "kernels": len(rec.kernels)}))

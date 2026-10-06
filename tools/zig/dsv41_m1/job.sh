@@ -97,7 +97,8 @@ fi
 # the capture's small files come back (the blobs stay on the pod: GBs); ops.jsonl compressed
 mkdir -p "$RES/capture"
 for f in meta.json weights.json manifest.json jit.json; do [[ -f "$CAP/$f" ]] && cp "$CAP/$f" "$RES/capture/"; done
-[[ -f "$CAP/aot/aot.json" ]] && cp "$CAP/aot/aot.json" "$RES/capture/"
+# the AOT set whole (aot.json + cubins, a few MB): M2 launches Triton through it (zig/src/cuda/aot.zig)
+[[ -d "$CAP/aot" ]] && tar -czf "$RES/capture/aot.tar.gz" -C "$CAP" aot
 [[ -f "$CAP/ops.jsonl" ]] && gzip -c "$CAP/ops.jsonl" > "$RES/capture/ops.jsonl.gz"
 [[ -f "$CAP/launches.json" ]] && gzip -c "$CAP/launches.json" > "$RES/capture/launches.json.gz"
 echo "=== rc=$rc"
