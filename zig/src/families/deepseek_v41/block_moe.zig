@@ -40,6 +40,16 @@ pub fn mhc(e: *E, layer: ?u32, which: []const u8, mode: Mode) !void {
         };
         nw = try e.weight("L{d}.{s}", .{ L, if (std.mem.eql(u8, which, "hc_attn")) "attn_norm" else "ffn_norm" }, .f32, &.{D});
     } else nw = try e.weight("norm", .{}, .f32, &.{D});
+    // DSpark's tap: the mean of the new streams at a boundary entering a target layer (forward._layers: only with the
+    // last sublayer's partials, i.e. not the window's first site)
+    var tap: Arg = b0;
+    if (e.o.taps and mode == .boundary and std.mem.eql(u8, which, "hc_attn")) if (layer) |L| {
+        const t = e.cfg.dspark_targets.items();
+        if (std.mem.indexOfScalar(u32, t, L)) |j| {
+            const w: i64 = @as(i64, @intCast(t.len)) * D;
+            tap = try e.view(.{ .buf = "w.taps" }, .bf16, &.{ n, D }, &.{ w, 1 }, @as(i64, @intCast(j)) * D * 2);
+        }
+    };
     const xout: Arg = switch (mode) {
         .site1, .site2 => b0,
         .final => x,
@@ -52,7 +62,7 @@ pub fn mhc(e: *E, layer: ?u32, which: []const u8, mode: Mode) !void {
         if (post) prev[2] else f0,                                       if (post or mode == .site2) prev[0] else f0,
         hc[0],                                                           hc[1],
         hc[2],                                                           try e.buf("L.mhc.part", .{}, .f32, &.{ n, 4, 40, 32 }),
-        try e.buf("L.mhc.c", .{}, .bf16, &.{ n, D }),                    b0,
+        try e.buf("L.mhc.c", .{}, .bf16, &.{ n, D }),                    tap,
         nw,                                                              try e.buf("w.out", .{}, .bf16, &.{ n, D }),
         if (mix) next[0] else f0,                                        if (mix) next[1] else f0,
         if (mix) next[2] else f0,                                        try e.buf("w.mhc.cnt", .{}, .i32, &.{4}),

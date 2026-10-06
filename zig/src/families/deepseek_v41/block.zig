@@ -51,6 +51,9 @@ pub const Options = struct {
     /// M2a: after each block, its streams with the block's last post applied out of place (Python's Forward.trace),
     /// handed to the glue step "trace" (one more launch a block; never in a served window)
     trace: bool = false,
+    /// DSpark's taps (Forward(taps=True)): the boundaries entering the DSpark target layers (37-39) write the streams'
+    /// mean into "w.taps" bf16 [n, 3 x hidden] (a column block a target, dspark.py), which draft/iface.zig's Taps names
+    taps: bool = false,
 };
 
 pub const Emitter = struct {
