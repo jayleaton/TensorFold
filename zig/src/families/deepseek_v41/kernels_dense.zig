@@ -170,6 +170,21 @@ comptime {
 /// segment's columns from `y`), the call's xh / Z / counters bases.
 pub const SegBufs = struct { T: u64, svh: u64, y: u64, ld: usize };
 
+/// One segment's input for the rotation: rows at x + row * ld (elements), its dtype, and the matrix's suh [K].
+pub const RotIn = struct { x: u64, ld: usize, dtype: DType, suh: u64 };
+
+/// fused_proj._block's rot_in tables: one launch per 8 segments (`first` = 0, 8, ...), each segment's rotated rows
+/// at its xh offset of `lay` (dsv41_x3seg_rot_in_cuda's RotTable).
+pub fn rotTable(lay: Layout, segs: []const Seg, ins: []const RotIn, first: usize, xh: u64) RotTable {
+    var t = std.mem.zeroes(RotTable);
+    const end = @min(segs.len, first + max_seg);
+    t.n = @intCast(end - first);
+    for (first..end, 0..) |i, j| {
+        t.s[j] = .{ .x = ins[i].x, .suh = ins[i].suh, .xh = xh + 2 * lay.xh_off[i], .ld = @intCast(ins[i].ld), .K = @intCast(segs[i].k), .x_dtype = @intFromEnum(ins[i].dtype) };
+    }
+    return t;
+}
+
 /// dsv41_x3seg_linear_cuda / dsv41_dense3_linear_cuda's table of one launch.
 pub fn linTable(lay: Layout, l: Launch, segs: []const Seg, bufs: []const SegBufs, y_dtype: DType, xh: u64, z: u64, counters: u64) LinTable {
     var t = std.mem.zeroes(LinTable);
@@ -405,6 +420,22 @@ test "linear.plan as upstream" {
     try std.testing.expectEqual([2]usize{ 1, 8 }, plan(1024, 128 * 64));
     try std.testing.expectEqual([2]usize{ 8, 4 }, plan(4096, 1024));
     try std.testing.expectEqual([2]usize{ 1, 4 }, plan(512, 4096));
+}
+
+test "rot_in tables: one launch a group of 8, xh offsets from the layout" {
+    var segs: [10]Seg = undefined;
+    var ins: [10]RotIn = undefined;
+    for (&segs, &ins, 0..) |*s, *r, i| {
+        s.* = .{ .k = 1024, .n = 256, .k2 = 10, .sk = 1, .wk = 4 };
+        r.* = .{ .x = 0x1000 * (i + 1), .ld = 1024, .dtype = .bf16, .suh = 0x100 * (i + 1) };
+    }
+    const lay = try layout(&segs, 2);
+    const t0 = rotTable(lay, &segs, &ins, 0, 0x10000);
+    const t1 = rotTable(lay, &segs, &ins, 8, 0x10000);
+    try std.testing.expectEqual(@as(c_int, 8), t0.n);
+    try std.testing.expectEqual(@as(c_int, 2), t1.n);
+    try std.testing.expectEqual(@as(u64, 0x10000 + 2 * 8 * 2 * 1024), t1.s[0].xh);
+    try std.testing.expectEqual(@as(c_int, @intFromEnum(DType.bf16)), t1.s[1].x_dtype);
 }
 
 test "fused_proj.layout: offsets, one launch a width, 8 segments a launch" {
