@@ -120,7 +120,11 @@ pub const UnionIn = struct {
 };
 
 /// Plans a segment's union exchange: blocks of rows whose (W + 1) x M rows fit the cap; O(n log n) in the block's entries.
+/// Ranks a split exchange plans for (the session pool's bound: sessions.pool.max_world).
+pub const max_world = 8;
+
 pub fn planUnion(gpa: std.mem.Allocator, in: UnionIn, out: *std.ArrayList(Block)) !void {
+    if (in.world < 1 or in.world > max_world or in.rank >= in.world) return error.BadWorld;
     const rows: u32 = @intCast(in.sel.len / in.k);
     try planRange(gpa, in, 0, rows, out);
 }
@@ -139,7 +143,7 @@ fn planRange(gpa: std.mem.Allocator, in: UnionIn, a: u32, b: u32, out: *std.Arra
     };
     uniq.shrinkRetainingCapacity(n);
     // stable partition by owner: each owner's rows stay sorted, so a row's index in its list is a binary search
-    var sizes: [8]u32 = @splat(0);
+    var sizes: [max_world]u32 = @splat(0);
     for (uniq.items) |t| sizes[ownerOf(t, in.psh, in.world)] += 1;
     var m: u32 = 1;
     for (sizes[0..in.world]) |sz| m = @max(m, sz);
@@ -150,7 +154,7 @@ fn planRange(gpa: std.mem.Allocator, in: UnionIn, a: u32, b: u32, out: *std.Arra
     }
     const lists = try gpa.alloc(u32, uniq.items.len);
     defer gpa.free(lists);
-    var at: [8]u32 = undefined;
+    var at: [max_world]u32 = undefined;
     var acc: u32 = 0;
     for (0..in.world) |r| {
         at[r] = acc;

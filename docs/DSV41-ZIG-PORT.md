@@ -253,6 +253,123 @@ The all-gathers run on the compute stream so they can be captured in CUDA graphs
 
 **Exactness across ranks.** Both ranks run identical plans, page tables and kernels. M2 compares a hash of the stream state per layer between ranks on the first rounds.
 
+### 4a. TP=N: one boot constant, TP=2 unchanged
+
+**Requirement** (user, conditional): TP is N ranks instead of a hardcoded 2, *only if TP=2 performance is unchanged*.
+- TP=2 output stays bit-identical to the Python engine (the M1/M2 gates).
+- N>2 gets its own gates once hardware exists. A third Spark is only being considered.
+
+**Rule: N is a boot constant.** `--tp N` / `TF_TP` fixes `Topology{ world, rank }` before load. Everything that depends on N is computed once from it: the plan, the run-time weight forms, the window's calls (`block.Options.world`), the KV page ownership, the collective's backend, and buffer sizes. The per-token path is the same launch sequence with the same integer arguments for a given N; it never branches on N. CUDA graphs capture that fixed sequence.
+
+**Why TP=2 performance cannot change:**
+1. **Shard math is load time.** `plan.build` (`exl3.part`, `names.blockGroups`, `named`) has taken `world` since the start. `block.emit` now takes `Options.world` (cf18035): at world 2 it emits the identical 789 calls of pod 6's prod capture (`tf-dsv41-m1 check`: 789/789). Kernels receive the same `N`, `K`, `H` ints, so the GPU does the same work instruction for instruction.
+2. **Kernels are already world-generic where a rank count reaches them, and TP=2 runs that code today:**
+   - The mHC boundary/prefill kernels (`mhc_cuda.cu`, `mhc_pf.cu`) take `world` (1–8) as an argument and add the gathered partials in rank order. TP=2 is this same loop; Python's twin is the same code.
+   - The split-KV exchange (`kvsplit.cu`) takes `world` (page k on rank k % world). Its GPU test already covers world 3.
+   - Nothing is re-instantiated or re-branched for TP=2.
+3. **Collectives keep their TP=2 implementations.** `Collective` (fabric/tp/collective.zig) is one vtable call per exchange (about 80 a window, host side, captured into graphs), as today.
+   - The 2-rank backends are untouched and remain TP=2's fast path: the mailbox and RoCE exchanges, and the hybrid. Their 2-rank specialisations are listed below.
+   - N>2 is a separate backend behind the same vtable: NCCL first (any N), then an N-rank mailbox/RoCE all-gather where each rank writes its piece into the N-1 peers' receive slots with one doorbell each.
+   - The 2-rank code is never generalised in place.
+4. **Exchanges stay equal-sized.** Every DSV4.1 exchange is an all-gather of an equal count per rank:
+   - full-width bf16 partials after `wo_b` and the MoE;
+   - the embedding's partial rows;
+   - the head's `[R, 2k]` candidates.
+   Uneven shards at N>2 (below) therefore never need an uneven (v-sized) collective.
+5. **Where a generalisation would cost TP=2, TP=2 stays hardwired.** A survey of fabric/tp, kv and sessions found the 2-rank hot-path code below, and every item stays as it is:
+   - **Mailbox** (`mailbox.zig`, `mailbox.cu`): two inboxes, peer = 1 - rank, and a gather into `[2, n]`. The sum is rank0 + rank1, one fp32 add and one bf16 rounding. It refuses world ≠ 2 at init.
+   - **RoCE** (`roce.zig`, `roce_verbs.zig`): one RC queue pair to a single peer, and a 2-rank setup vote. It refuses world ≠ 2.
+   - **Hybrid** (`hybrid.zig`): its small path is the 2-rank backend. At N>2, `Session.comm()` already falls back to NCCL on every rank.
+   - **N>2 is new code beside these:** an N-way gather kernel (N inboxes, rank r writes slot `r·n`, waits on N-1 flags) and an N-peer RoCE mesh, under new `Kind`s.
+6. **The exactness rule at N>2: no float `all_reduce`.**
+   - Every float sum stays gather-then-sum: all-gather the partials, then the consuming kernel adds ranks 0..N-1 in order in fp32 and rounds once. The mHC kernels already do this.
+   - NCCL's ring all-reduce has no rank order and rounds at each hop, and the 2-rank mailbox/RoCE sum is order-free only because two operands commute. So model float sums never go through `all_reduce`.
+   - `reference.reduce` (the host test oracle) rounds after each add. It matches the GPU only at N=2 and must round once before any N>2 test.
+7. **Already generic, nothing to change:**
+   - bootstrap (star, up to 64 ranks), NCCL, the plan link (rank 0 to N-1 followers), and the fate channel;
+   - the split-KV ownership (`k % world`), its dense and union exchanges (one all-gather each, `recv [W, …]`), and its budget;
+   - the session pool (one free set per residue, owned page = `local·W + r`) and the disk tier (per-rank directories, with `world` in the header; a file from another world is `Foreign`);
+   - the head-candidate merge (`serve/sampling.zig`, rank order);
+   - the replay bindings.
+   - Limits: the session pool and the split planner stop at 8 ranks. `kv/split.zig` indexed `[8]` arrays by rank without a check; it now refuses `world > max_world` at plan time.
+   - `kvsplit.cu` does a runtime `% world` per selected token. TP=2 runs exactly that code today; a `& 1` instance is optional and not needed for "unchanged".
+
+**Shard sizes for DSV4.1 at N ranks.** Splits stay on 128-value blocks (EXL3 Hadamard blocks), so `width / N` is not always possible. A dimension that doesn't divide evenly gets block-balanced ranges: the first `blocks % N` ranks take one extra block. These are per-rank constants at load. TP=2 is the even case, with exactly today's shapes.
+
+| Dimension | N = 2 (today) | N = 3 | N = 4 |
+|---|---|---|---|
+| query heads (attention runs 16-head tiles; heads follow `wo_a` groups of 8) | 32 / 32 | 24 / 24 / 16 (groups 3/3/2), **not runnable on 16-head tiles**: needs an 8-head-tile attention instance (a separate kernel instance, TP=2's untouched) | 16 each (groups 2) |
+| routed + shared expert width 2304 (18 blocks) | 9 / 9 | 6 each | 5 / 5 / 4 / 4 |
+| vocabulary 129,280 (1,010 blocks; embedding rows, head columns) | 505 / 505 | 337 / 337 / 336 | 253 / 253 / 252 / 252 |
+| `wo_b`, `w2` rows (partial sums) | follow the heads / experts above | | |
+| whole on every rank | `wq_a`, `wkv`, compressor, indexer, norms, `hc_*`, router, Engram `wkv`, DSpark | same | same |
+
+What the uneven splits cost N>2 (not TP=2):
+- The slowest rank sets the pace. At N=4 that is +11 % expert width on 2 of 4 ranks (5 blocks vs 4.5 ideal).
+- At N=3 the attention is unbalanced (24 vs 21.3 ideal heads) and needs a new attention instance.
+- Expert parallelism (whole experts per rank, 384/N) would balance the MoE but changes the sum order and adds an all-to-all; it is not planned.
+- So N=4 is the natural next size for this model. N=3 Sparks are better used as TP=2 plus a service node (4c).
+
+**What else changes with N (all load time):**
+- **KV:** split-KV pages are owned k % N. `DevicePool` capacity is per rank, ⌈pages / N⌉, and `kv.budget` prices every rank.
+- **Sessions:** park/restore files record `world`. A restore needs the same world (part of the compat key, as the pack fingerprint is).
+- **Plan link and fate channel:** rank 0 sends a round's plan to N-1 followers. The fate channel is a star around rank 0, and any rank's failure ends all. Both already work this way.
+- **DSpark candidates:** `draft/dspark.zig` caps `candidates` at 128 / world. It is a boot constant.
+
+**Exactness gates for N>2** (later; no hardware):
+- **Bit-exact:** an N-rank emulator on one GPU. It runs the N shards' forwards in sequence and gathers their partials in rank order, and its output is compared with the real N-rank run.
+- **Agreement, not bits:** greedy token agreement against TP=2 over long runs. The sums differ from TP=2's, so bits cannot match.
+- TP=2 keeps M1/M2 against the Python engine.
+
+### 4b. Remote drafter and remote Engram (interfaces only)
+
+The aim: a third Spark hosts services the model calls over the fabric, without the forward knowing.
+- **DSpark drafter:** frees about 3.6 GiB a rank.
+- **Engram table:** rows are prefetched over CX7 instead of read from local NVMe.
+
+Both fit behind seams that already exist.
+
+**Remote drafter = another `draft/iface.zig` `Pass`.** `Pass` is already the drafter's whole contract (`ingest`, `propose`, `reset`, `markov`), and the target never sees the drafter's state. `RemotePass` implements the vtable over a fabric connection from rank 0 only, since drafts are plan data and the plan link carries them to the followers.
+- `ingest(slot, start, taps, rows)`: sends the committed taps rows to the drafter host.
+  - Each row is bf16 `[3 × hidden]`, 30 KiB. The send is a device-to-device RDMA write from the `Taps` address (GPUDirect over CX7), so there is no host copy.
+  - It is asynchronous; the next `propose` orders after it.
+- `propose(asks, out)`: one request a round, for all slots' `Ask`s. The response is drafts and confidences, plus candidates and base logits for trees. The caller's `Proposal` buffers are unchanged.
+- `reset(slot)` and `markov()`: requests. `markov()` can return null (no trees) until the Markov heads move too.
+- **Latency:** one round trip (about 10 µs RDMA on CX7) plus the pass on the remote GB10. With several lanes, the lane core runs other slots' verify windows while a slot waits, so the round trip leaves the critical path once more than one slot is active.
+- **Failure:** the fate channel marks the drafter down and the lane core drafts nothing (chains of 1). Output is unchanged because verification is exact, and only the speed drops.
+
+**Remote Engram = an `EngramSource`** (`engram_host.zig`, the R3 seam). Both the local and remote implementations produce exactly the forward's existing glue input (`L.engram.rows`, bf16 `[R, 24 × 256]` for layers 1 and 14) and an event:
+```zig
+pub const EngramSource = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+    pub const VTable = struct {
+        /// Start fetching the rows of a window's tokens (hashes per Engram layer) into the slot's staging; returns at once.
+        issue: *const fn (ptr: *anyopaque, window: u64, hashes: []const [2][24]u64, rows: u32) Error!Ticket,
+        /// The rows' device view for layer `l` (1 or 14) and the event the window's graph waits on before that layer.
+        ready: *const fn (ptr: *anyopaque, t: Ticket, l: u32) Error!struct { rows: u64, event: cuda.abi.Event },
+        release: *const fn (ptr: *anyopaque, t: Ticket) void,
+    };
+};
+```
+- **Local (R3):** io_uring reads from the local NVMe shards into pinned staging, then an async H2D copy.
+- **Remote:** the service holds the tables and RDMA-writes the rows straight into every rank's staging. Every rank needs them, because Engram `wkv` is whole.
+  - The traffic is about 12 KiB a token a layer, 2 layers, multicast to N ranks.
+  - It is issued at draft time, as R3 plans, so it overlaps the previous window.
+- The rows are table bytes either way, so output is bit-identical whichever source serves them.
+
+**Who changes what:**
+- **dsq-zig-kern-1:** for TP=2, nothing. For N>2:
+  - an 8-head-tile attention instance (N=3 only);
+  - the uneven expert widths (5/4 blocks) through x3ld/x3seg's existing per-call N.
+- **KV / sessions** (the port lead's now that dsq-zig-kv-1 is settled):
+  - ⌈pages / N⌉ per-rank capacity;
+  - `world` in the session compat key.
+- **TP fabric** (the port lead's now that dsq-zig-tp-1 is settled):
+  - an N-rank backend behind `Collective` (NCCL first);
+  - a star plan link and fate channel.
+  The 2-rank backends are unchanged.
+
 ## 5. Milestones
 
 Effort is in engineering days for this agent team, assuming GPU windows are available when needed. GPU work is listed where it happens.
