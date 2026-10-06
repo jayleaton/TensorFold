@@ -24,6 +24,9 @@ OUT = Path(os.environ.get("TF_DSV41_CAPTURE", "capture"))
 CALL_MAX = int(os.environ.get("TF_DSV41_CAPTURE_CALL_MB", "96")) << 20      # storages a call
 TOTAL_MAX = int(os.environ.get("TF_DSV41_CAPTURE_TOTAL_MB", "3072")) << 20   # every call (before + after)
 PER_FUNC = int(os.environ.get("TF_DSV41_CAPTURE_PER_FUNC", "48"))            # calls an (extension, function)
+FUNC_MAX = int(os.environ.get("TF_DSV41_CAPTURE_FUNC_MB", "320")) << 20      # bytes an (extension, function)
+PER_TEST = int(os.environ.get("TF_DSV41_CAPTURE_PER_TEST", "3"))             # calls a (test, extension, function):
+                                                                             # every parametrization, not one test's loop
 
 # extension -> functions recorded (their arguments hold no device addresses: a replay on new buffers is exact)
 ALLOW = {
@@ -38,7 +41,7 @@ ALLOW = {
     "tensorfold_exl3_experts_v1": {"down_combine", "combine"},
 }
 
-_state = {"bytes": 0, "seq": 0, "per": {}, "test": "setup"}
+_state = {"bytes": 0, "seq": 0, "per": {}, "per_bytes": {}, "per_test": {}, "test": "setup"}
 
 
 def _storage(t: torch.Tensor):
@@ -85,13 +88,16 @@ def _snapshot(storages) -> dict[int, bytes]:
 def _record(ext: str, func: str, fn, args, kwargs):
     capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
     key = (ext, func)
-    if capturing or func not in ALLOW.get(ext, ()) or _state["per"].get(key, 0) >= PER_FUNC:
+    tkey = (_state["test"], ext, func)
+    if (capturing or func not in ALLOW.get(ext, ()) or _state["per"].get(key, 0) >= PER_FUNC
+            or _state["per_test"].get(tkey, 0) >= PER_TEST):
         return fn(*args, **kwargs)
     rec = _Rec()
     a = [rec.arg(v) for v in args]
     kw = {k: rec.arg(v) for k, v in kwargs.items()}
     size = sum(s.nbytes() for s in rec.storages.values())
-    if not rec.ok or size > CALL_MAX or _state["bytes"] + 2 * size > TOTAL_MAX:
+    if (not rec.ok or size > CALL_MAX or _state["bytes"] + 2 * size > TOTAL_MAX
+            or _state["per_bytes"].get(key, 0) + 2 * size > FUNC_MAX):
         return fn(*args, **kwargs)
     before = _snapshot(rec.storages)
     out = fn(*args, **kwargs)
@@ -99,6 +105,8 @@ def _record(ext: str, func: str, fn, args, kwargs):
         return out                                     # a returned tensor is not an in-place output: not replayed
     after = _snapshot(rec.storages)
     _state["per"][key] = _state["per"].get(key, 0) + 1
+    _state["per_bytes"][key] = _state["per_bytes"].get(key, 0) + 2 * size
+    _state["per_test"][tkey] = _state["per_test"].get(tkey, 0) + 1
     _state["bytes"] += 2 * size
     _state["seq"] += 1
     d = OUT / f"{_state['seq']:05d}_{ext}_{func}"
