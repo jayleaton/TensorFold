@@ -84,7 +84,9 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
     kill $prog 2>/dev/null
     du -sh "$LP" | tee -a "$RES/steps.txt"
     if [[ -f "$Z/e1e2x.tar.gz" ]]; then tar -xzf "$Z/e1e2x.tar.gz" -C / && export TORCH_EXTENSIONS_DIR=/opt/e1e2-120; fi
+    # M2B_TOPP unset: top-p off (M2b); set (prod: 0.85): the same gate with prod's expert prune (M2c's first stage)
     unset TF_DSV41_EXPERT_TOPP
+    [[ -n "${M2B_TOPP:-}" ]] && export TF_DSV41_EXPERT_TOPP=$M2B_TOPP
     REF=$LOCAL/m2b-ref
     rm -rf "$REF"
     if step m2b-ref "${M2B_REF_MIN:-18}" python -u -B "$Z/tools/zig/dsv41_m2b_ref.py" --pack "$LP" --out "$REF" \

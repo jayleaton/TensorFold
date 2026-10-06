@@ -187,7 +187,36 @@ Rules from `ZIG-PREVIEW.md`:
       - those shards copied to local NVMe in parallel (`Pack.open` now skips index shards the folder lacks);
       - the prod twin's extensions prebuilt for sm_120 (`e1e2x.tar.gz`; pods 10–11 JIT-built them each time);
       - the reference, both ranks, then the kernel job.
-  - Graphs and the R3/R4 work come after M2b.
+  - **M2b PASS** (pod 13, 449e857, 2x PRO 6000, 5 min, $0.40):
+    - Our forward at real TP=2 matched the Python engine's TP=2 from its prompt state at 1,536: two processes over NCCL through the `tp` runtime, layers 0–24 plus the head, expert top-p off.
+    - **Each rank:** 64/64 greedy tokens, 64/64 per-step logits digests (bit-equal), and 25/25 first-window block streams.
+    - **Times:** our load 99 s a rank (57.7 GB from local NVMe); decode of 64 tokens 0.5 s. Python: load 56 s, run 17 s.
+    - **Pack copy:** 115 GB of shards in 23 s. The volume's host cache was warm from pod 12, so a cold copy can take far longer.
+    - **The kernel job in the same pod:** 316 cases, 0 failed. That is all 302 recorded twin-suite replays (R1/R1c kernels through Zig) and the oracle cases, `glue.cu` with `embed_send`'s NaN edge included.
+  - **Pod 12** (the first M2b attempt, 60 min, $4.21) **produced nothing.**
+    - The M2b mode's step limits summed past the hard max, and results reached the volume only at the end.
+    - Fixes (449e857): the job streams `$RES` to `dsq/results/live/<sid>/` every 30 s and at exit; M2b's steps fit the budget (the copy gets 10 min, else loads read the volume); the copy logs its progress.
+    - Pod 13 also showed both Python ranks waiting on one extension's build lock at start, harmless with the prebuilt dir. Pod 12's long stall is unexplained, since its logs are lost.
+
+**M2c plan: prod top-p, then the Spark run.**
+- **M2c-1, prod expert top-p on the same gate.** The prune path (`_prune`, `group`, the kit-weights glue) is already in `block.zig` and bit-checked by M1 on the prod captures.
+  - The run: `--env M1_JOB=m2b --env M2B_TOPP=0.85` on 2x PRO 6000. It is one environment flag, passed to Python's reference and to our ranks.
+  - Expected: about 6 min, about $0.45. The gate is the same (tokens, logits, blocks).
+- **M2c-2, the whole model on the two Sparks** (needs a Spark window; prod runs there now):
+  - **Build first, all offline:**
+    - The aarch64 `tf-dsv41-m1` with sm_121 fatbins (dsq-zig-kern-1 builds them).
+    - The reference: Python's prod engine at TP=2 on the Sparks dumping its state and greedy tokens (`dsv41_m2b_ref.py` over all 40 layers, `--layers 0-39`).
+    - Our ranks over the hybrid collective (`TF_COMM_BACKEND=roce`). The Spark window measured RoCE's decode window at 767 µs against NCCL's 1,804 µs.
+    - Prefill's all-gathers on the same path.
+  - **In the window:**
+    1. Greedy tokens identical to Python over long runs (thousands of tokens, several prompts), top-p 0.85.
+    2. Per-window time against Python prod. Eager, with no graphs, is informational; R4 graphs come before the speed gate.
+  - **Kit:** like `zig-tp-spark-kit` (binaries, `SHA256SUMS`, one script per host), with the Spark window's runbook row.
+- **Ahead of M2c-2 (offline, then pods as needed):**
+  - our own prefill (exact-tag kernels first), so a run does not start from Python's state dump;
+  - CUDA graphs per row bucket (R4), with `run.zig`'s calls already fixed per window;
+  - the RoCE / hybrid backend in `forward.zig`'s driver;
+  - Engram rows through `EngramSource` (R3).
   - **The superseded "next pod" list:**
 
     - the GPU compare of `prepare.lanes` against Python's dense3 words (pod 8 only compared them as plain strips);

@@ -86,8 +86,10 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, ref: []con
     const wd = try m2a.widths(a, &w, &pl);
     var runner: run.Runner = .{ .gpa = gpa, .d = &driver, .stream = stream, .kernels = &kernels, .triton = &aot, .weights = &w };
     defer runner.deinit();
-    // top-p off (the gate's first stage): no prune, the router's tail folds kit rounding and grouping
-    var f = fwd.Forward.init(gpa, &cfg, &wd, .{ .expert_topp = null }, &runner, comm);
+    // M2B_TOPP (the reference's TF_DSV41_EXPERT_TOPP): unset = top-p off (no prune; the router's tail folds kit
+    // rounding and grouping), else prod's prune at that mass
+    const topp: ?f64 = if (std.c.getenv("M2B_TOPP")) |v| try std.fmt.parseFloat(f64, std.mem.span(v)) else null;
+    var f = fwd.Forward.init(gpa, &cfg, &wd, .{ .expert_topp = topp }, &runner, comm);
     defer f.deinit();
     f.layers = layers;
     var bp = blk: {
