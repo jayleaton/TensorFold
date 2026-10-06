@@ -40,7 +40,7 @@ def main() -> int:
     ap.add_argument("--prompt", type=int, default=1536)
     ap.add_argument("--limit", type=int, default=4096)
     ap.add_argument("--seed", type=int, default=4101)
-    ap.add_argument("--layers", default="0-24", help="backbone layers a-b (consecutive from 0: their sources load)")
+    ap.add_argument("--layers", default="0-8", help="backbone layers a-b (consecutive from 0: their sources load)")
     a = ap.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -68,7 +68,10 @@ def main() -> int:
     embed = loader._dev(src.rows("embed.weight", 0, vh).to(torch.bfloat16))
     head, norm = loader.x3("head", "col"), loader.native("norm.weight")
     lo, hi = (int(v) for v in a.layers.split("-"))
-    layers = [loader.layer(L) for L in range(lo, hi + 1)]
+    layers = []
+    for L in range(lo, hi + 1):
+        layers.append(loader.layer(L))
+        print(f"loaded layer {L} at {time.time() - t0:.0f} s", flush=True)
     tree = W.RankW(0, 2, 0, embed, layers, norm, head, None, {})
     load_s = time.time() - t0
     rows = {L: IndexRows(cfg.engram_head_dim) for L in cfg.engram_layer_ids}
@@ -78,6 +81,8 @@ def main() -> int:
     g = torch.Generator().manual_seed(a.seed)
     ids = torch.randint(3, vh, (a.prompt + sum(WINDOWS),), generator=g).tolist()
     fw.prompt(ids[:a.prompt])
+    torch.cuda.synchronize()
+    print(f"prompt of {a.prompt} at {time.time() - t0:.0f} s", flush=True)
     pos = a.prompt
     # the slot after the prompt, by our forward's role names (block.zig: s.L<i>.swa / comp .v .s, .ik, .carry)
     torch.cuda.synchronize()
@@ -122,6 +127,7 @@ def main() -> int:
         fw.trace = None
         fw.keep(0, n - 1)
         pos += n
+        print(f"window {n} at {time.time() - t0:.0f} s", flush=True)
     meta["run_s"] = round(time.time() - t0 - load_s, 1)
     # the rope tables of this host (torch's CPU cos / sin), and the Triton variants the run launched
     tabs = RO.tables(cfg, a.limit + 2048)

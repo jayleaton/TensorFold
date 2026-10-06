@@ -57,12 +57,14 @@ left() { echo $(( ${M1_BUDGET_MIN:-52} - ($(date +%s) - T0) / 60 )); }
 if [[ "${M1_JOB:-m1}" == m2a ]]; then
     (for v in $(compgen -e | grep '^TF_DSV41_'); do unset "$v"; done
      export TF_DSV41_PY_SRC=$PYTWIN TF_DSV41_TEST=$Z/bin/tf-dsv41-test TF_DSV41_FATBINS=$Z/fatbin \
-            TORCH_EXTENSIONS_DIR=$PYEXT TF_DSV41_CAPTURE_MIN=6
-     step kernels 10 bash "$Z/zig/tests/cuda/deepseek_v41/job.sh" "$RES/kernels") || rc=1
+            TORCH_EXTENSIONS_DIR=$PYEXT TF_DSV41_CAPTURE_MIN=8
+     step kernels 13 bash "$Z/zig/tests/cuda/deepseek_v41/job.sh" "$RES/kernels") || rc=1
     REF=$LOCAL/m2a-ref
     rm -rf "$REF"
-    if step m2a-ref "${M2A_REF_MIN:-22}" python -B "$Z/tools/zig/dsv41_m2a_digests.py" --pack "$PACK" --out "$REF" \
-            --layers "${M2A_LAYERS:-0-24}" \
+    # pod 10: layers 0-24 did not finish loading + prefill in 22 min (Python loads ~40 s a block from the volume);
+    # 0-8 holds SWA + Engram (1), a ratio-2 KV + index source with its carry (2, 8) and the reuse layers between
+    if step m2a-ref "${M2A_REF_MIN:-20}" python -u -B "$Z/tools/zig/dsv41_m2a_digests.py" --pack "$PACK" --out "$REF" \
+            --layers "${M2A_LAYERS:-0-8}" \
        && step engram-host 3 python -B "$Z/tools/zig/dsv41_engram_host.py" --py-src /dsv41-tf/src \
             --config "$PACK/config.json" --tokenizer "$PACK/tokenizer.json" --out "$REF/engram-host.bin"; then
         step m2a "$(( $(left) > 4 ? $(left) - 2 : 2 ))" "$Z/bin/tf-dsv41-m1" m2a "$PACK" "$REF" "$RES/m2a"
