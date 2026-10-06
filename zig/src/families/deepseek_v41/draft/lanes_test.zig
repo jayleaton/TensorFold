@@ -11,9 +11,9 @@ const gpa = std.testing.allocator;
 
 const Case = struct { prompt: []const u32, max_new: u32 = 60, sampling: ?lanes.Sampling = null, drafts: bool = true, copies: bool = false };
 
-const Setup = struct { siblings: u32 = 0, joint: u2 = 1, skip: bool = true, costs: Prices = .prod, slots: u32 = 4, dims: twin.Dims = .{} };
+const Setup = struct { siblings: u32 = 0, joint: u2 = 1, skip: bool = true, costs: Prices = .prod, slots: u32 = 4, dims: twin.Dims = .{}, depth: depth.Settings = .{} };
 
-const Prices = enum { prod, flat };
+const Prices = enum { prod, flat, cheap };
 
 /// The G15 boot's table (GB10, TP=2): rows 1-16 measured, the wide buckets 24/32/48/64, the pass and slot ms.
 pub fn prodCosts(alloc: std.mem.Allocator) !costs_mod.Costs {
@@ -32,6 +32,7 @@ const Run = struct {
     sib_wins: u64,
     joint: u64,
     kept: [16]u64, // drafts kept by position (depth.Stats)
+    widest: usize, // the most rows one forward held
 
     fn deinit(r: Run) void {
         for (r.out) |o| gpa.free(o);
@@ -47,9 +48,19 @@ fn run(cases: []const Case, setup: Setup) !Run {
     var c = switch (setup.costs) {
         .prod => try prodCosts(gpa),
         .flat => try costs_mod.defaults(gpa, 64),
+        .cheap => cheap: { // rows nearly free: every draft pays, so windows fill
+            const v = try gpa.alloc(f64, 64);
+            for (v, 0..) |*x, r| x.* = 20.0 + 0.01 * @as(f64, @floatFromInt(r));
+            break :cheap costs_mod.Costs{ .verify = v, .draft = 1.0 };
+        },
     };
     defer c.deinit(gpa);
-    const x = try ln.Lanes.init(gpa, t.target(), d.pass(), c, .{ .shape = d.shape, .siblings = setup.siblings, .slots = setup.slots, .depth = .{ .joint = setup.joint, .skip = setup.skip } });
+    const x = try ln.Lanes.init(gpa, t.target(), d.pass(), c, .{ .shape = d.shape, .siblings = setup.siblings, .slots = setup.slots, .depth = d: {
+        var set = setup.depth;
+        set.joint = setup.joint;
+        set.skip = setup.skip;
+        break :d set;
+    } });
     defer x.deinit();
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -75,7 +86,7 @@ fn run(cases: []const Case, setup: Setup) !Run {
     while (e.activeCount() > 0) try e.step();
     const out = try gpa.alloc([]u32, cases.len);
     for (out, streams) |*o, *s| o.* = try gpa.dupe(u32, s.emitted());
-    return .{ .out = out, .drafted = e.drafted, .accepted = e.accepted, .zero = x.policy.depth.stats.zero, .trees = x.policy.trees, .sib_wins = x.policy.sib_wins, .joint = x.policy.depth.stats.joint[0], .kept = x.policy.depth.stats.kept };
+    return .{ .out = out, .drafted = e.drafted, .accepted = e.accepted, .zero = x.policy.depth.stats.zero, .trees = x.policy.trees, .sib_wins = x.policy.sib_wins, .joint = x.policy.depth.stats.joint[0], .kept = x.policy.depth.stats.kept, .widest = t.widest };
 }
 
 /// The twin's own serial decode of a case (no lanes at all).
@@ -158,4 +169,14 @@ test "zero depth under an overconfident head keeps the serial decode" {
         defer shared.deinit();
         try expectSerial(&cases, shared, dims);
     }
+}
+
+test "shared forwards past 32 rows (Python's 64) keep every stream serial" {
+    const dims: twin.Dims = .{ .bigram = 8.0, .head = 0.08, .block = 10 }; // a wider block than V4.1's 5 fills the rows
+    const flat = [_]u32{ 7, 3, 9, 1 };
+    const cases = [_]Case{ .{ .prompt = &p1, .max_new = 90 }, .{ .prompt = &p2, .max_new = 90 }, .{ .prompt = &p3, .max_new = 90 }, .{ .prompt = &flat, .max_new = 90 }, .{ .prompt = &p1, .sampling = warm, .max_new = 90 }, .{ .prompt = &p2, .sampling = hot, .max_new = 90 } };
+    const r = try run(&cases, .{ .dims = dims, .slots = 6, .costs = .cheap, .depth = .{ .cap = 10 } });
+    defer r.deinit();
+    try expectSerial(&cases, r, dims);
+    try std.testing.expect(r.widest > 32 and r.widest <= 64);
 }

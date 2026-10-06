@@ -10,7 +10,7 @@ const dspark = @import("dspark.zig");
 
 extern "c" fn exp(x: f64) f64;
 
-pub const Dims = struct { vocab: u32 = 48, dim: u32 = 16, seed: u64 = 1, bigram: f32 = 6.0, head: f32 = 0.12, conf: f32 = 0.03, window: u32 = 16 };
+pub const Dims = struct { vocab: u32 = 48, dim: u32 = 16, seed: u64 = 1, bigram: f32 = 6.0, head: f32 = 0.12, conf: f32 = 0.03, window: u32 = 16, block: u32 = 5 };
 
 const Slot = struct {
     k: std.ArrayList(f32) = .empty, // committed rows' keys [len][dim]
@@ -44,7 +44,8 @@ pub const Twin = struct {
     wo: []f32,
     bigram: []f32,
     slots: []Slot,
-    windows: u64 = 0, // forwards run (tests)
+    windows: u64 = 0, // rows' passes run (tests)
+    widest: usize = 0, // the most rows one forward held
 
     pub fn init(gpa: Allocator, dims: Dims, slots: usize) !*Twin {
         var prng = std.Random.DefaultPrng.init(dims.seed);
@@ -210,6 +211,9 @@ pub const Twin = struct {
 
     fn window(ptr: *anyopaque, segments: []const iface.Segment, choices: [][]u32) anyerror!void {
         const t = self(ptr);
+        var rows: usize = 0;
+        for (segments) |g| rows += g.tokens.len;
+        t.widest = @max(t.widest, rows);
         for (segments, choices) |g, c| {
             const s = &t.slots[g.slot];
             if (!s.live or g.start != s.len(t.dims.dim)) return error.PositionMismatch;
@@ -282,7 +286,7 @@ pub const Drafter = struct {
     pub fn init(gpa: Allocator, t: *Twin, slots: usize) !*Drafter {
         const v = t.dims.vocab;
         const rank = std.math.ceilPowerOfTwo(u32, v) catch unreachable;
-        const shape: dspark.Shape = .{ .block = 5, .noise = v - 1, .window = t.dims.window, .rank = rank, .hidden = t.dims.dim, .candidates = v };
+        const shape: dspark.Shape = .{ .block = t.dims.block, .noise = v - 1, .window = t.dims.window, .rank = rank, .hidden = t.dims.dim, .candidates = v };
         const x = try gpa.create(Drafter);
         x.* = .{ .gpa = gpa, .t = t, .shape = shape, .rings = try gpa.alloc([]f32, slots), .tags = try gpa.alloc([]i64, slots), .w1 = try gpa.alloc(u16, @as(usize, v) * rank), .w2 = try gpa.alloc(u16, @as(usize, v) * rank), .cw = try gpa.alloc(f32, t.dims.dim + rank) };
         const ring = shape.ring();
