@@ -184,6 +184,20 @@ Each item gets a small `.cu` here (ours, checked bit-equal to torch on fixtures)
 | casts: `q.to(fp32)` before `_rope`, partials `.to(bf16)`, `kit_weights` fp32 -> fp16 -> fp32 | decode | folded into the consumers where the Python path allows, else torch_ops pointwise |
 | staging ring `index_copy_`, replay stash `cat` / `clone`, shadow-slot `copy_` | prefill, tree verify | device memcpy (`cuMemcpyAsync`); no kernel |
 
+## 3.3 Perf notes that touch these launches (docs/DSV41-ZIG-PERF.md)
+
+- **x3gm at 4,096-row blocks.** `exl3.gmTuned` takes Python's tuning table (`tune_default` = `x3gm.TUNE`). Its 4K
+  entry (128-member cfg 2 / 3) is provisional in Python too. The perf study measured cfg 0 (64-member) about 30 %
+  faster at 4,096 rows (15.96 vs 22.2-23.7 ms on 48 SMs). Every configuration gives the same bits, so the table is a
+  speed choice: pass a measured table to `gmTuned`. Prod's 2,048-row blocks use cfg 0 / 1 + 0 either way.
+- **Lazy module loading.** `Kernels.load` resolves every instance (`cuModuleGetFunction`) and reads its attributes
+  at load. That loads each kernel before any persistent or spinning kernel (x3gm's ticket loop, the Engram gate,
+  L2 pacing) can occupy the GPU. Lazy loading deadlocks a first launch queued behind such a kernel; keep the
+  resolve-everything load, or set `CUDA_MODULE_LOADING=EAGER`.
+- **attn_cuda merge.** The perf study's `proto/attn_fastmerge.cuh` issues every (m, l) and partial load before the
+  chains: bit-identical, 33.6 -> 29.8 us at 1 row (48-SM emulation). It would land in the Python source
+  (`F/csa2/attn_cuda.cu`), and `sync.py` regenerates this copy from there.
+
 ## 4. Replay bindings (`kernels_replay.call`)
 
 | extension | functions |
