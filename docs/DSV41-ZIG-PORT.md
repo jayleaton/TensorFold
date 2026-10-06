@@ -202,7 +202,10 @@ Rules from `ZIG-PREVIEW.md`:
 - **M2c-1 PASS** (pod 14, 60c0af7, 2x PRO 6000, 6 min, $0.44): the M2b gate with prod's expert top-p 0.85 (`M2B_TOPP=0.85`, Python `TF_DSV41_EXPERT_TOPP=0.85`).
   - Both ranks: tokens 64/64, logits 64/64, first-window blocks 25/25.
   - Kernel job: 316/0. The experts SASS line is clean (32/32: the build now ships the exact fatbin dir).
-  - The x3gm SASS line differs (119 of 135) against the decode1 78b703d twin, whose x3gm predates the sources the fatbins come from (8474f31). It is a twin-version mismatch; bits are unaffected.
+  - The x3gm SASS line differs (119 of 135, 5 not in Python) against the decode1 78b703d twin. That twin's `x3gm.cu` predates v2, which added `k2e` to `Args` and the `gm2` kernels.
+    - dsq-zig-kern-1 checked ours against the v2 source (8474f31) offline: 135/135 SASS-equal for sm_120, the same for sm_121.
+    - Pods 9–13 showed 130/130 only because they shipped stale pre-v2 fatbins.
+    - With the 78b703d twin, read this line as expected. The next twin rebuilt for any reason comes from 8474f31, and then the line is clean.
 - **The M2c-2 kit** is `~/Documents/Projects/spark-work/zig-m2c2-kit` (tree 312480d; sm_121 fatbins from dsq-zig-kern-1's 07935cc, SASS-equal to Spark prod's 8474f31 build). It is for the user's morning run: `RUNBOOK.md`.
 - **M2c-1, prod expert top-p on the same gate.** The prune path (`_prune`, `group`, the kit-weights glue) is already in `block.zig` and bit-checked by M1 on the prod captures.
   - The run: `--env M1_JOB=m2b --env M2B_TOPP=0.85` on 2x PRO 6000. It is one environment flag, passed to Python's reference and to our ranks.
