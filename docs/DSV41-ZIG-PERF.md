@@ -1,0 +1,275 @@
+# DeepSeek-V4.1 on the Zig engine: where a CUDA rewrite pays (2026-10-06)
+
+This study asks which DeepSeek-V4.1-Flash kernel paths are worth rewriting in CUDA for the Zig engine, instead of porting the Python engine's kernels as they are. The target is 2 DGX Sparks: GB10, sm_121, 48 SMs, 273 GB/s, TP=2 over CX7.
+
+It has three parts:
+- a time budget for decode and prefill;
+- measurements of the current kernels on an RTX PRO 6000 (sm_120) under a GB10 emulation;
+- two prototypes:
+  - a bit-exact attention merge;
+  - an x3gm ablation set that locates its time.
+
+Code is in `zig/kernels/cuda/deepseek_v41/proto/` and builds standalone with `../nvcc-docker.sh`. The `.cu` copies it includes are pinned at kernel commit `2537e81`.
+
+## 0. Bottom line
+
+1. **Decode: the weight streamers are already at the DRAM floor.** In the prod 1-row window, the experts (x3ld) and the dense EXL3 projections (with L2PF) read about 3.5 GB a rank in 14.3 ms. At 240 GB/s that floor is about 14.5 ms. The rest of the window is latency-bound glue:
+   - mHC boundaries;
+   - exchanges (mostly the wait for the other rank);
+   - the Engram host wait;
+   - the attention core;
+   - about 2 ms of small ops.
+
+   No streamer rewrite (better GEMV, megakernel prefetch, fused verify) can buy much. A fused set of glue kernels can take **3-4.5 ms off every round**. That is about **+9-14% decode tok/s** at today's acceptance. The Zig host's own wins (Engram wait, graph submission) add **+4-7%** on top.
+2. **Prefill: x3gm (routed experts, about 45% of a replay chunk) runs at about half its roofline. Neither bandwidth nor tensor rate is the limit.** On 48 SMs with unlimited DRAM it takes 10.3 ms a layer (2 bits, 2,048 rows):
+   - Removing the mma saves 4.0 ms. That matches its full-rate time of 3.8 ms, so the mma does not overlap with anything.
+   - Removing the trellis decode saves 0.8 ms; activation loads 0.5 ms; weight loads 0.1 ms.
+
+   The kernel is bound by instruction issue: ring, sync, ldmatrix and bookkeeping. A rewrite that brings its compute under its DRAM time (7.1 ms at 2 bits, 10.6 ms at 3 bits) and overlaps the two is worth **-35-45% on x3gm**, about **+17-22% prefill tok/s**, with the same bits. Data movement does not change a chain.
+3. **The big precision lever is FP8 on the tensor cores.** sm_120's `mma.sync ... kind::f8f6f4` e4m3 m16n8k32 runs at **2.0x** the fp16/bf16 rate (measured 1,943 vs 957 FLOP/SM/clk). fp16 accumulate is **not** faster than fp32 accumulate on this part. FP8 activations and decoded weights in prefill could give another +15-25% prefill. It changes quality, so it needs the user's sign-off and the quality gate.
+4. **Not worth it:**
+   - A persistent whole-window megakernel: in-graph gaps are 0.27 ms a window, and the streamers are at the floor.
+   - Fused verify for 6-24 rows: the verify slope is the new experts' bytes at the floor.
+   - fp16 accumulation.
+5. **Prototype:** the attention core's merge, with every load issued before its chains:
+   - **bit-identical** to `attn_cuda.cu`: 0 differing outputs at 1, 4 and 16 rows;
+   - **33.6 to 29.8 us at 1 row (-11%)**, 36.5 to 31.2 us at 4 rows.
+
+**Recommendation for the Zig engine's primary path:**
+- Port the kernels as they are, to pass the M1/M2 exactness gates.
+- Then make three things the primary path:
+  - (a) the decode glue family of section 4 (R1);
+  - (b) the Zig host's Engram and graph-submission fixes (R3, R4);
+  - (c) x3gm v2 for prefill (R2).
+- Keep FP8 prefill (R5) as a quality-gated option.
+- Do not start a megakernel.
+
+**Cost:** one RTX PRO 6000 hold pod for 59 min, **$2.07** (ledger: quant repo `results/zig-pod-ledger.md`). The Sparks were not touched.
+
+## 1. The decode budget
+
+### 1.1 Floor, from first principles (per rank, one 1-row window, Mia's pack, prod top-p 0.85)
+
+| reads a token | GB | ms @ 273 GB/s | ms @ 240 GB/s (achievable) |
+| --- | ---: | ---: | ---: |
+| routed (~5.9 after pruning) + shared experts, 40 layers | 1.35 | 4.9 | 5.6 |
+| dense EXL3 (attention 5-bit, head 6-bit, Engram wkv) | 2.14 | 7.8 | 8.9 |
+| router bf16 (replicated) | 0.17 | 0.6 | 0.7 |
+| mHC `fn`, KV rows, norms | ~0.1 | 0.4 | 0.4 |
+| **total** | **~3.8** | **13.9** | **15.8** |
+
+Fixed latency on top of the bytes:
+- **Exchanges:** 83 a window at ~7.5 us of one-way transfer, about 0.6 ms.
+- **Kernel boundaries:** 1,331 kernels a window graph at ~0.2 us each, about 0.27 ms.
+
+Two other costs fall outside the window:
+- **Graph submission** on the host: ~1.27 ms a round (REWRITE-PLAN 1.2).
+- **The DSpark draft pass:** 3.52 ms, plus 0.65 ms a slot.
+
+Our q28-v2 pack decodes within -2.6..+8.5% of Mia's (E1/E2 window), so the same budget holds.
+
+### 1.2 Measured: the prod 1-row window, by class
+
+Source: G14a's hardware-traced nsys of prod's kernels:
+- MHC_CUDA, ATTN_CUDA, DENSE_V3, L2PF;
+- `nsys-g14mn-off.sqlite`, graph 2: 26 one-row windows, 25.2 ms span under the trace;
+- parsed by `proto/nsys_classes.py`.
+
+Prod's calibration reads 21.4 ms for the same window: G15-G19 changes, plus best-of-3 calibration against the trace.
+
+| class | ms / window (traced) | launches | floor | gap | rewrite? |
+| --- | ---: | ---: | ---: | ---: | --- |
+| dense EXL3 (lanes_linear 5.51, linear 1.88, seg_rot_in 0.31) | 7.70 | 327 | shared with experts (below) | | no |
+| routed + shared experts `ld_kernel` | 6.62 | 80 | shared | | no |
+| *dense + experts together* | *14.32* | | *14.5 @ 240 GB/s* | *~0* | L2PF's side-stream reads (7.5 ms of `segments_kernel`) already overlap |
+| exchanges `gather_kernel` | 2.65 | 83 | 0.6 transfer | 2.0 | mostly the rank-skew wait (DECODE-ROOFLINE 5); balance ranks, not kernels |
+| mHC `boundary_kernel` (28 us each) | 2.30 | 81 | ~0.4 | 1.9 | **yes (R1a)** |
+| Engram `gate_copy_kernel` (GPU waits on the host's NVMe reads) | 1.65 | 2 | 0 | 1.65 | host (R3) |
+| attention core `attn_kernel` (30.6 us each, **10 CTAs**) | 1.24 | 40 | ~0.1 | 1.1 | **yes (R1b)** |
+| router `narrow_kernel` (16 us, 3.9 MB) | 0.73 | 40 | 0.7 | ~0 | no |
+| MoE small: prune, group, gate/up epilogue, down_combine | 0.64 | 160 | 0 | 0.64 | **yes (R1c)** |
+| other small: rms2 0.27, `_plain` 0.22, rot_in 0.15, kv_store 0.15, Engram fuse 0.14, copies 0.21, topk + scores 0.13, rope 0.07 | ~1.36 | ~330 | ~0.05 | 1.3 | **yes (R1c)** |
+| in-graph gaps | ~0.27 | | 0 | 0.27 | megakernel only |
+| **total** | **~25.0** | **1,331** | **~15.8** | **~9.2** | |
+
+**Verify rows.** The calibration is verify 1 / 2 / 4 / 6 / 8 / 16 / 24 / 32 / 48 / 64 rows = 21.4 / 25.8 / 34.5 / 42.6 / 48.7 / 69.0 / 96.9 / 109.1 / 143.1 / 185.8 ms.
+- The marginal cost per row is 4.4, 4.35, 4.05, 3.05 and 2.5 ms up to 16 rows, then 1.5-3.5.
+- That is the new distinct experts' bytes. G15b's expert map: U(1) ≈ 5.9, U(16) ≈ 36 a layer, at ~6.4 MB an expert a layer a rank, ≈ 2.1 ms a row at 240 GB/s for rows 8-16.
+- So the verify curve is at the floor above its fixed part.
+- A fused 6-24-row verify kernel cannot flatten it. Only fewer expert bytes can (a lower-bit pack, or slot-aware row pricing).
+
+### 1.3 Measured on the PRO 6000 under the GB10 emulation (proto/glue_bench.cu, 48 SMs, cold L2)
+
+| rows | `attn_kernel` us | mHC boundary (mode 0) us |
+| ---: | ---: | ---: |
+| 1 | 34.5 | 16.9 |
+| 2 | 34.5 | 19.2 |
+| 4 | 35.0 | 30.1 |
+| 8 | 55.3 | 37.6 |
+| 16 | 94.2 | 63.5 |
+
+**Attention.**
+- A CTA takes about 31 us whatever its key count. With 16, 32, 64 or 128 keys in its chunk: 30.7 / 30.9 / 30.7 / 30.7 us.
+- 1 row and 4 rows (10 vs 40 CTAs) take the same time.
+- So the kernel is a fixed latency chain a CTA. Phase timestamps of the 1-row launch (`proto/attn_phases.cuh`, us):
+
+| phase | us |
+| --- | ---: |
+| row map + q fragments | 2.4 |
+| key rows land (cp.async, 8-byte pieces) | 3.3 |
+| S = qK^T (dequant from shared memory per element) | 6.2 |
+| softmax | 0.9 |
+| PV (dequant again) | 5.3 |
+| partials + ticket | 1.5 |
+| last CTA's merge | 9.5 |
+
+**mHC.** 17 us under the emulation, against 28 us in the prod trace, where it also waits on the gathered partials. The finish (Sinkhorn + norm) runs on the last CTA after a ticket.
+
+## 2. The prefill budget
+
+Prod at 32K replay prefills 2,310 tok/s. That is 887 ms per 2,048-row chunk. A replay chunk runs the 20 encoder layers; the decoder replays the last 128 tokens once a prompt.
+
+| part of a replay chunk (per rank) | ms | source | floor |
+| --- | ---: | --- | --- |
+| routed experts, x3gm, 20 layers | ~360-400 | GB10 gmbench: Mia 18.1 ms a layer, ours 15.4 (2-bit L3) to 29-30 (ragged 4-5-bit L22 / L39) | DRAM: 7.1 (2-bit) / 10.6 (3-bit) ms a layer, ~210 ms a chunk |
+| dense GEMMs (pfdense, 57-78 TFLOP/s) | ~190 | G17: 375-386 ms for 40 layers | ~65 ms at ~115 TFLOP/s fp16, ~35 at FP8 |
+| attention, indexer, mHC, router, exchanges, host | ~300-335 | by difference | ~60-80 (compute + CX7) |
+
+**The third row is the biggest unknown.**
+- The only prefill trace with today's kernels (G14a, a short prompt) shows the GPU busy for **36%** of the eager Python prefill span.
+- For 2,048-row chunks the host share is unmeasured.
+- The Zig engine launches natively, so part of this goes away with the port itself.
+- A 32K prefill nsys on the Sparks would size the rest: it is the first item of the next Spark window.
+
+### 2.1 x3gm on the PRO 6000 (proto/x3gm_bench.cu: 384 experts, top-6, D 5,120, I 1,152, uniform routing)
+
+Full chip (188 SMs), 2,048 rows:
+- K2 4 (2 bits): 2.87 ms;
+- K2 6 (3 bits): 3.01 ms.
+
+The time does not move with the weight bytes, so the kernel is compute-bound there.
+
+GB10 emulation (48 SMs, unlimited DRAM, ms):
+
+| variant (K2 4 / K2 6) | rot + gate/up + down | what it removes |
+| --- | ---: | --- |
+| x3gm as it is | **10.30 / 10.67** | |
+| no trellis decode | 9.53 / 9.86 | -0.8 |
+| no mma | 6.32 / 6.88 | **-4.0** (mma at full rate: 3.75 ms) |
+| no weight loads | 10.22 / 10.23 | ~0 |
+| no activation (member-row) loads | 9.83 | -0.5 |
+| epilogue without scale loads / without Hadamard | 10.25 / 10.10 | ~0 |
+| 4,096 rows, 64-member tiles (cfg 0), per 2,048 rows | 7.98 / 8.19 | **-22% a row** |
+| 4,096 rows, G16's provisional 128-member tiles (cfg 2 / 3) | 11.1-11.9 a 2,048 rows | +8-15%: worse than cfg 0 |
+| skewed routing (Zipf 0.8, 460 passes) | 12.09 | +17% |
+
+The no-epilogue variant (ABL 5) is not used: it compiled to 64-77 registers, so it also dropped mma chains.
+
+**Calibration to GB10.**
+- 2-bit L3: 15.4 ms measured with plan and combine, against 10.3 ms emulated compute + 7.1 ms DRAM.
+- Mia's 3-bit layers: 18.1 ms measured, against 10.7 + 10.6.
+- On GB10, x3gm ≈ compute + ~0.5-0.7 × DRAM time: the two barely overlap.
+
+### 2.2 Tensor-core rates (proto/mma_rate.cu, sm_120 at 2,430 MHz)
+
+| mma.sync | FLOP / SM / clock | 48 SMs at 2.5 GHz |
+| --- | ---: | ---: |
+| f16 x f16 -> f32, m16n8k16 | 957 | 115 TFLOP/s |
+| bf16 x bf16 -> f32 | 956 | 115 |
+| f16 x f16 -> f16 | 973 | 117 (no gain) |
+| e4m3 x e4m3 -> f32, m16n8k32 (`kind::f8f6f4` or plain) | 1,855-1,949 | 223-233 |
+
+**GB10 cross-check.**
+- A GB10 report measured 48.8 TFLOP/s for bf16 `mma.sync` and 4x that for NVFP4 ([dgpp PR #50](https://github.com/HawkBearPig/dgpp/pull/50)).
+- [StorageReview](https://www.storagereview.com/review/nvidia-dgx-spark-review-the-ai-appliance-bringing-datacenter-capabilities-to-desktops) measured 99.8 (BF16) / 207.7 (FP8) TFLOP/s through a library matmul.
+- Our own pfdense reaches 78 TFLOP/s on GB10, so the per-SM rate above holds to within GB10's sustained clock.
+- `mma_rate` run once on a Spark would settle it: 10 s, no model.
+
+## 3. The GB10 emulation (proto/gb10emu.cuh)
+
+How it works:
+- One 99 KB blocker CTA an SM parks every SM but 48 before the kernel under test is launched.
+- The kernel then gets the GB10's SM count with its own occupancy (2 CTAs an SM for x3gm, as on GB10).
+- Same code, same bits.
+
+Two lessons:
+- **Lazy module loading deadlocks behind the parked blockers.** `gb10::eager()` sets `CUDA_MODULE_LOADING=EAGER` before any CUDA call.
+- **The DRAM hog did not work.** A hog on the other 140 SMs could only take a 48-SM stream read from 1,291 down to ~800 GB/s, never to 240. So bandwidth is modelled analytically and calibrated against GB10's measured gmbench, not emulated.
+
+Caveats:
+- GB10's per-SM tensor and issue rates are assumed equal to sm_120's (the same consumer-Blackwell SM).
+- The PRO 6000's 128 MB L2 is larger than GB10's 24 MB.
+
+## 4. Ranked rewrite candidates
+
+Expected gains apply to the calibrated 21.4 ms window and today's acceptance:
+- code ≈ 3.9 tokens a round, ~46 ms a round;
+- prose ≈ 1.7 tokens a round, ~36 ms a round.
+
+A saving of D ms a window is D ms a round: it is row-independent.
+
+| # | candidate | expected | confidence | effort | exactness |
+| ---: | --- | --- | --- | --- | --- |
+| R1 | **Decode glue family** (a-d below), one CUDA kernel set for the latency-bound boundaries | **-3 to -4.5 ms a round: code +7-11%, prose +9-14%** | high: every term is a measured per-kernel latency, and the streamers are at the floor | 3-5 weeks | per-row chains kept: row-invariant, batched == alone; bits vs Python change only where a reduction is regrouped (own tag) |
+| R2 | **x3gm v2**: issue-reduced, mma overlapped with decode / loads (warp-specialised producer, wider items, fewer stage syncs); compute under DRAM time | x3gm -35-45%: **prefill +17-22%** (32K replay ~2,310 -> ~2,750) | medium: the ablations say where the time is; the target is DRAM-bound | 2-3 weeks | **same bits** (only data movement changes, as x3gm's own configs prove) |
+| R3 | Engram reads off the window (Zig host: issue at draft time, io_uring, GPU-side event before layers 1 / 14 only) | -1.0 to -1.6 ms a round: +3-5% | high | 3-5 days | exact (I/O only) |
+| R4 | Graph submission hidden (Zig: split or pre-enqueued window graphs, or device launch) | -0.9 to -1.2 ms a round: +2-3% | high | 3-5 days | exact |
+| R5 | FP8 (e4m3) tensor path for prefill: pfdense + x3gm (activations per-row scaled, decoded weights cast) | prefill +15-25% on top of R2 | medium | 2-3 weeks | **precision trade**: quality gate (top-1 >= 96%, MMLU within 1) |
+| R6 | 4,096-row prefill chunks with cfg 0 tiles | x3gm -22% a row; weights streamed once per 4K | high on speed, blocked on memory | memory work | exact (segmentation-invariant) |
+| R7 | Exchange skew (rank 1 ~11 us a layer late) | -1 to -1.5 ms a round | medium | find the cause first | exact |
+| — | Whole-window megakernel | +0.3-1 ms beyond R1 | low | months | — |
+| — | Fused verify 6-24 rows / flatter verify curve | ~0: the slope is expert bytes | high | — | — |
+| — | fp16 accumulation | 0: same rate as fp32 accumulate | measured | — | — |
+
+**R1 in detail:**
+
+| part | today (traced, a window) | design | expected |
+| --- | --- | --- | --- |
+| a. mHC boundary + the next sublayer's input | 81 x 28 us = 2.3 ms | The finish's norm and the collapsed row move into the consumer's input loader (the x-group / router `rot_in`): their CTAs compute `bf16((c x rn) x w)` from c and rn. The finish keeps only the scalars; Sinkhorn is 20 iterations on 4 x 4. No 5,120-wide single-CTA pass. | -1.0 to -1.6 ms |
+| b. attention core | 40 x 30.6 us = 1.24 ms | Split each 128-key chunk across 4 CTAs (S and PV dequant scale with keys: 11.5 us -> ~3); 16-byte key loads; a merge spread over the head tile's CTAs (thread-block cluster / DSMEM, or the consumer's `wo_a` loader). **Prototype done for the merge alone: -11%, bit-exact (section 5).** | -0.6 to -0.8 ms |
+| c. MoE small ops + other small kernels | ~2.0 ms, ~490 launches | Prune / group / rot_in into the router's last CTA (b1 of REWRITE-PLAN); gate/up epilogue and down_combine into x3ld's tails; rms2 / rope / kv_store into the x-group's epilogue; copies written at final offsets. | -1.2 to -1.6 ms |
+| d. fewer nodes | 1,331 -> ~700 a window | follows from a-c | -0.5 ms of host submission (R4's share) |
+
+For the drafter (dsq-zig-draft-1):
+- None of R1-R4 adds a row-count step.
+- The attention split is by keys, a fixed partition per row, so per-row arithmetic does not depend on the window.
+- The mHC CUDA boundary already covers R <= 16 (`MAXR`); above that, Python falls back to Triton. If the Zig glue kernel keeps that limit, verify[17..64] keeps its own curve. The depth table reads it either way.
+
+## 5. Prototype: the latency-hiding attention merge (proto/attn_fastmerge.cuh)
+
+**The change.** The last CTA's merge in `attn_cuda.cu`:
+- loads each chunk's (m, l) inside its dependent chain;
+- loads each float4 unit's 5 chunk partials one L2 round trip at a time, 8 units a thread.
+
+The copy issues every (m, l) and all 8 x 5 partial loads first, then runs the same per-element chains in the same order. The kernel body is untouched.
+
+| rows | attn_cuda | fast merge | outputs differing |
+| ---: | ---: | ---: | ---: |
+| 1 | 33.6 us | **29.8 us** | 0 of 16,384 |
+| 4 | 36.5 | **31.2** | 0 of 65,536 |
+| 16 | 92.3 | 90.1 | 0 of 262,144 |
+
+That is -0.15 ms a 1-row window on its own. It is the first, exact step of R1b. Since it is bit-exact, it can go into the Python source (sync.py regenerates the copy) as well as into the Zig twin.
+
+## 6. Files
+
+All under `zig/kernels/cuda/deepseek_v41/proto/`:
+
+| file | what |
+| --- | --- |
+| `gb10emu.cuh` | the 48-SM emulation (`gb10::Emu`: `init(mode)`, `begin()`, `end()`, `stream_gbps`), plus `gb10::eager()` |
+| `x3gm_bench.cu` | x3gm at real shapes, production configs, `--abl 0..7`, `--rows`, `--zipf`, `--mode full\|sms\|gb10` |
+| `x3gm_ablate.cuh` | gm_kernel with switches for decode / mma / weight loads / row loads / epilogue parts |
+| `mma_rate.cu` | mma.sync throughput by type |
+| `glue_bench.cu` | attention core + mHC boundary at 1-16 rows, cold L2; `ATTN_KEYS=1` (time vs keys), `ATTN_PHASES=1` (phase stamps); the fast-merge bit check |
+| `attn_phases.cuh` | attn_cuda.cu with globaltimer stamps |
+| `attn_fastmerge.cuh` | the merge prototype |
+| `nsys_classes.py` | per-class times of window graph instances from an nsys SQLite export |
+
+Build, for example:
+
+```
+../nvcc-docker.sh -O3 -lineinfo -std=c++17 -gencode arch=compute_120a,code=sm_120a -o x3gm_bench x3gm_bench.cu
+```
+
+`glue_bench` needs `--fmad=false` (attn / mHC's flags). Use `sm_121a` for a Spark.
