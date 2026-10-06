@@ -1,0 +1,61 @@
+#!/bin/bash
+# Offline bit-identity evidence (no GPU): builds each Python extension source the way torch's cpp_extension does
+# (torch headers, the extension's extra_cuda_cflags, -gencode for one SM) and our copy the way zig/build/cuda.zig
+# does, then compares the SASS of every kernel of ours with sass_check.py.
+# usage: OUT=<dir under ~/Documents> SM=121 TF_DSV41_PY_SRC=<tensorfold-dsquant> bash sass_check.sh [name ...]
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+OUT="${OUT:?set OUT}"
+SM="${SM:-121}"
+PYSRC="${TF_DSV41_PY_SRC:-/home/sireggy/Documents/Projects/spark-work/tensorfold-dsquant}/src/tensorfold"
+IMAGE="${TF_ZIG_IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}"
+X=cuda/exl3
+F=families/deepseek_v41/cuda
+# name|Python sources (under src/tensorfold)|extra_cuda_cflags (comma separated)
+TABLE="exl3_experts|$X/experts.cu $X/experts_cb2.cu|-O3,-lineinfo
+x3ld|$F/x3ld.cu|-O3,-lineinfo
+x3pf|$F/x3pf.cu|-O3,-lineinfo
+x3gm|$F/x3gm.cu|-O3,-lineinfo
+linear|$X/linear.cu|-O3,--expt-relaxed-constexpr
+x3seg|$F/x3seg.cu|-O3,--expt-relaxed-constexpr
+dense3|$F/dense3.cu|-O3,--expt-relaxed-constexpr"
+names=("$@")
+[ ${#names[@]} -eq 0 ] && names=($(echo "$TABLE" | cut -d'|' -f1))
+mkdir -p "$OUT/py" "$OUT/zig"
+script='set -e
+TI=$(python -c "import torch.utils.cpp_extension as c; print(\" \".join(\"-I\"+p for p in c.include_paths()))" 2>/dev/null)
+PY=$(python -c "import sysconfig;print(sysconfig.get_paths()[\"include\"])")
+TORCH="-D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -std=c++20"
+GEN="-gencode=arch=compute_${SM},code=sm_${SM}"
+build() {  # name, sources, flags
+  local name=$1 srcs=$2 flags=${3//,/ }
+  : > /out/py/$name.sass
+  for s in $srcs; do
+    nvcc -c $TI -I$PY -I/t/cuda/exl3 -I/t/families/deepseek_v41/cuda $TORCH -DTORCH_API_INCLUDE_EXTENSION_H \
+      -DTORCH_EXTENSION_NAME=$name -D_GLIBCXX_USE_CXX11_ABI=1 --compiler-options -fPIC $flags $GEN \
+      -o /out/py/$name.$(basename $s).o /t/$s
+    cuobjdump -sass /out/py/$name.$(basename $s).o >> /out/py/$name.sass
+    rm -f /out/py/$name.$(basename $s).o
+  done
+  nvcc -fatbin $TORCH $flags $GEN -o /out/zig/$name.fatbin /k/$name.cu
+  cuobjdump -sass /out/zig/$name.fatbin > /out/zig/$name.sass
+  rm -f /out/zig/$name.fatbin
+  echo built $name
+}
+'
+for n in "${names[@]}"; do
+  line=$(echo "$TABLE" | grep "^$n|")
+  srcs=$(echo "$line" | cut -d'|' -f2); flags=$(echo "$line" | cut -d'|' -f3)
+  script="$script
+build $n \"$srcs\" \"$flags\" &"
+done
+script="$script
+wait"
+docker run --rm --network none --memory 16g -u "$(id -u):$(id -g)" -e SM="$SM" -e HOME=/tmp \
+  -v "$PYSRC:/t:ro" -v "$HERE:/k:ro" -v "$OUT:/out" --entrypoint bash "$IMAGE" -c "$script" 2>&1 | grep -v "No CUDA runtime" || true
+rc=0
+for n in "${names[@]}"; do
+  echo "== $n"
+  python3 "$HERE/sass_check.py" "$OUT/py/$n.sass" "$OUT/zig/$n.sass" --sm "$SM" | tail -4 || rc=1
+done
+exit $rc

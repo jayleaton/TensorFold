@@ -27,6 +27,29 @@ const kernels = [_]Kernel{
     .{ .name = "torch_nemotron_constants", .src = "torch_ops/nemotron_constants", .flags = torch_ops },
 };
 
+/// DeepSeek-V4.1's kernels (zig/kernels/cuda/deepseek_v41, copies its sync.py keeps equal to the Python engine's),
+/// each with its extension's `extra_cuda_cflags`; embedded by the `dsv41_kernels` module.
+const dsv41_kernels = [_]Kernel{
+    .{ .name = "dsv41_exl3_experts", .src = "deepseek_v41/exl3_experts", .flags = &.{ "-O3", "-lineinfo" } }, // tensorfold_exl3_experts_v1
+    .{ .name = "dsv41_x3ld", .src = "deepseek_v41/x3ld", .flags = &.{ "-O3", "-lineinfo" } }, // tf_dsv41_x3ld_v1
+    .{ .name = "dsv41_x3pf", .src = "deepseek_v41/x3pf", .flags = &.{ "-O3", "-lineinfo" } }, // tf_dsv41_x3pf_v1
+    .{ .name = "dsv41_x3gm", .src = "deepseek_v41/x3gm", .flags = &.{ "-O3", "-lineinfo" } }, // tf_dsv41_x3gm_v1
+};
+
+/// The DeepSeek-V4.1 kernel module (zig/src/families/deepseek_v41/kernels.zig) over `cuda`; empty `images`: host-only.
+pub fn dsv41Kernels(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, images: []const ?std.Build.LazyPath) *std.Build.Module {
+    const options = b.addOptions();
+    var with = images.len > 0;
+    for (images) |i| with = with and i != null;
+    options.addOption(bool, "with_kernels", with);
+    options.addOption(usize, "dsv41_images", dsv41_kernels.len); // also keeps this options file apart from the runtime's
+    const m = b.createModule(.{ .root_source_file = b.path("zig/src/families/deepseek_v41/kernels.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    m.addImport("cuda", cuda);
+    m.addOptions("dsv41_kernel_options", options);
+    if (with) for (dsv41_kernels, images) |k, image| m.addAnonymousImport(b.fmt("dsv41_fatbin_{s}", .{k.name}), .{ .root_source_file = image.? });
+    return m;
+}
+
 /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.
 const torch_flags = [_][]const u8{
     "-D__CUDA_NO_HALF_OPERATORS__",
@@ -88,6 +111,16 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
         if (image.*) |file| fatbin_step.dependOn(&b.addInstallFile(file, b.fmt("fatbin/{s}.fatbin", .{k.name})).step);
     }
     const cuda = runtime(b, target, optimize, if (nvcc != null or prebuilt != null) &images else &.{});
+    var dsv41_images: [dsv41_kernels.len]?std.Build.LazyPath = @splat(null);
+    for (dsv41_kernels, &dsv41_images) |k, *image| {
+        if (prebuilt) |dir| {
+            image.* = b.graph.cwdRelativePath(b.pathJoin(&.{ dir, b.fmt("{s}.fatbin", .{k.name}) }));
+        } else if (nvcc) |tool| {
+            image.* = fatbin(b, tool, version.?, k, sms);
+        }
+        if (image.*) |file| fatbin_step.dependOn(&b.addInstallFile(file, b.fmt("fatbin/{s}.fatbin", .{k.name})).step);
+    }
+    const dsv41 = dsv41Kernels(b, target, optimize, cuda, if (nvcc != null or prebuilt != null) &dsv41_images else &.{});
     const mods = family(b, target, optimize, cuda, draft_ids);
     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     cli.addImport("cuda", cuda);
@@ -98,6 +131,10 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const runner = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     runner.addImport("cuda", cuda);
     b.installArtifact(b.addExecutable(.{ .name = "tf-cuda-test", .root_module = runner }));
+    const dsv41_runner = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/dsv41_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    dsv41_runner.addImport("cuda", cuda);
+    dsv41_runner.addImport("dsv41_kernels", dsv41);
+    b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-test", .root_module = dsv41_runner }));
 }
 
 /// Host unit tests of the CUDA runtime, the backend-neutral core, the lane core and the CUDA family (no GPU), on any host.
@@ -105,7 +142,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, step: *std.Build.S
     const host = b.graph.host;
     const cuda = runtime(b, host, .debug, &.{});
     const mods = family(b, host, .debug, cuda, draft_ids);
-    for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
+    for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, stagger(b, host, .debug), dsv41Kernels(b, host, .debug, cuda, &.{}) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = host, .optimize = .debug, .link_libc = true });
     cli.addImport("cuda", cuda);
     cli.addImport("core", mods.core);
