@@ -572,6 +572,15 @@ Effort is in engineering days for this agent team, assuming GPU windows are avai
 - **Pack:** Mia's 2.9 bpw pack first (one width per layer, so the stack layout only), then ours (q28/v2: ragged).
 - **GPU:** both Sparks for several sessions of about 2 hours. This needs the Python-engine agent to release them, or a planned window like the E1/E2 one.
 
+- **Spark results that set M2's design** (quant repo `docs/E1E2-SPARK-WINDOW.md` §9, a7330a1; the Sparks now serve prod q28-v2 on the Python perf1 engine, 8474f31, and are not available to the port):
+  - **The Zig two-Spark TP gate passed on real CX7:** RoCE suite 378/0, NCCL 189/0, fail-fast OK.
+    - RoCE latency is 8.3 / 8.9 / 10.4 µs at 4 / 8 / 16 KiB, against NCCL's ~20.3 µs.
+    - The 86-exchange decode window takes 767 µs on RoCE against 1,804 µs on NCCL.
+    - So M2c's decode exchanges go through the hybrid (RoCE small, NCCL large) from the start; M2b's NCCL is only the pod's wire.
+  - **Python's decode exchange wait is about 0.5 ms, fixed:** rank 1 waits at exchange 3 while rank 0 reads Engram rows from NVMe. That confirms R3 (Engram rows prefetched off the window, `EngramSource`).
+    - Per-exchange jitter on both ranks adds to it. Fewer and faster exchanges help; rank balancing won't.
+  - **A 32K prefill chunk is GPU-bound** (idle 3–5 %). It runs prefill attention, then 172 NCCL all-gathers a chunk, then the mHC site and the router / combine.
+    - Prefill does not use RoCE in Python. In Zig, prefill's all-gathers go through the same RoCE / hybrid path as decode's from the start.
 - **Performance designed in from the start** (`docs/DSV41-ZIG-PERF.md`, owned by the port lead):
   - **R3, Engram reads off the window** (+3-5 %, exact).
     - The Engram row reads for the next window are issued at draft time, through io_uring on the host, into pinned staging.
