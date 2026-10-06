@@ -23,6 +23,14 @@ step() { # NAME MINUTES CMD...: output in $RES/NAME.log, rc and seconds in $RES/
     (( r == 0 )) || rc=1
     return $r
 }
+# M1_KNOBS=prod: the prod config's kernel knobs (prod-knobs.env) for the capture; default: the engine's code defaults
+if [[ "${M1_KNOBS:-}" == prod ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$Z/tools/zig/dsv41_m1/prod-knobs.env"
+    set +a
+    echo "knobs: prod ($(grep -c '^TF_' "$Z/tools/zig/dsv41_m1/prod-knobs.env") TF_DSV41_* settings)"
+fi
 { cat "$Z/COMMIT" 2>/dev/null; nvidia-smi --query-gpu=name,compute_cap,driver_version,memory.total --format=csv,noheader
   python -c "import torch, triton; print('torch', torch.__version__, 'triton', triton.__version__)"
   free -g | head -2; df -h "$LOCAL" | tail -1; } > "$RES/env.txt" 2>&1
