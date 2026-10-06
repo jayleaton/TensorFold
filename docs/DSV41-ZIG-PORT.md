@@ -10,7 +10,29 @@ The long-context features live on two sibling branches:
 
 The quant repo's `docs/ENGINE-E1E2.md`, `LONG-CONTEXT.md` and `RESULTS.md` give the numbers to match.
 
-Kernel work is split with the kernel agent. It owns `zig/kernels/cuda/deepseek_v41/**`, `zig/src/families/deepseek_v41/kernels*.zig`, the `dsv41_kernels` list in `zig/build/cuda.zig` and `zig/tests/cuda/deepseek_v41/**`. Its inventory is `docs/DSV41-ZIG-KERNELS.md`. Everything else under `zig/src/families/deepseek_v41/`, and this document, belongs to the port lead.
+## 0. Ownership and interfaces (source of truth)
+
+Several agents work on this branch at once. Each one commits only its own paths (`git add <paths>`, never `-A`) and asks the port lead about any interface change. This section is updated whenever an interface changes.
+
+| Owner | Paths | Interface it provides |
+|---|---|---|
+| Port lead (`dsq-zig-lead`) | `zig/src/families/deepseek_v41/*.zig` except `kernels*.zig`, `m1_*`, this document, `tools/zig/dsv41_*`, the root `build.zig` hook | `config.Config`, `pack.Pack`, `plan.Plan` (a rank's TP weight plan), `stage` (host images), `named` (the loader's tensors by name), `load` (device upload), the M1 gate `tf-dsv41-m1` |
+| Kernels (`dsq-zig-kern-1`) | `zig/kernels/cuda/deepseek_v41/**`, `zig/src/families/deepseek_v41/kernels*.zig`, the DeepSeek parts of `zig/build/cuda.zig`, `zig/tests/cuda/deepseek_v41/**`, `docs/DSV41-ZIG-KERNELS.md` | `dsv41_kernels.Kernels` (`load`, `experts(stream)`, `linears(stream)`, ...); `dsv41_kernels.replay.call` (one captured extension call re-issued through its Ops) |
+| TP (`dsq-zig-tp-1`) | `zig/src/fabric/tp/**` | NCCL bootstrap across two hosts (unique id over TCP), the communicator: `allGather(send, recv, stream)` in rank order, the plan link and fate channel |
+| KV and sessions (`dsq-zig-kv-1`) | `zig/src/families/deepseek_v41/kv/**`, `zig/src/sessions/**` | paged pool (256-token pages, `comp.*` 584 B rows, `index_k`), per-slot rings and carries, split KV, the session store and NVMe tier |
+| Server (`dsq-zig-srv-1`) | `zig/src/server/**`, `zig/src/core/tokenizer/**`, `zig/src/core/template/**`, sampling, tool parsing | `encoding` (DeepSeek's message encoder), DSML tool calls, reasoning effort, the CUDA engine opened by the server |
+| Performance (`dsq-zig-perf-1`) | `zig/kernels/cuda/deepseek_v41/proto/**` | CUDA rewrites where they beat the port by a lot; each one lands behind the same launch interface and is proven bit-equal (or carries its own session tag) |
+| Drafting (`dsq-zig-draft-1`) | `zig/src/families/deepseek_v41/draft/**`, the lanes adapter | DSpark drafter and the `core/lanes` backend for DeepSeek |
+
+Rules for every owner:
+- Interfaces first, so implementations can change behind them.
+- Tests run the real implementation. A test that only checks its own fixture does not count.
+- No nested per-element loops on hot paths, host or device.
+- Where a CUDA rewrite gives a large speed-up, take the time to write it rather than port the old kernel as is.
+
+**Shared types.**
+- **Weights by name.** The loader names every tensor the way the M1 capture names the Python engine's tree: `L<layer>.attn.wq_a.trellis`, `L<layer>.attn.wo_a.<j>.suh`, `L<layer>.moe.w1.data` (ragged) or `.trellis` (stack), `L<layer>.moe.shared.0.w2.svh`, `L<layer>.engram.qk`, `embed`, `norm`, `head.trellis`.
+- **Expert tables.** Per routed projection, an int64 `[E]` table of each expert's trellis device address and an int32 `[E]` K2 table. `suh`/`svh` are stacked `[E, K]`/`[E, N]`.
 
 ## 1. How the Zig engine is built
 
