@@ -3,8 +3,8 @@
 //!
 //! - **Thinking** on by default (``--no-thinking`` or TF_DSV41_THINKING=0: off); ``chat_template_kwargs.enable_thinking``
 //!   / ``thinking`` per request; ``reasoning_effort`` (top level, then ``chat_template_kwargs``): ``none`` / ``minimal``
-//!   thinking off, ``low`` 50, ``medium`` 62, ``high`` 75, ``xhigh`` / ``max`` 100 (the release template's map), or an
-//!   int 1-100; default TF_DSV41_DEFAULT_EFFORT (high).
+//!   thinking off, ``low`` 50, ``medium`` / ``high`` 75, ``xhigh`` / ``max`` 100 (the Python app's map; the release
+//!   template's medium is 62, but prompts must equal prod's), or an int 1-100; default TF_DSV41_DEFAULT_EFFORT (high).
 //! - **Tools**: all offered tools (``tool_choice`` none: none) join the system block; replies' DSML calls are parsed
 //!   and streamed as they complete (``serve/tools.zig``); ``parallel_tool_calls: false`` keeps the first call.
 //! - **Reasoning memory**: the reasoning of replies this server gave, by tool-call id and content digest, restored
@@ -31,9 +31,6 @@ const tools_mod = serve.tools;
 pub const model_type = "deepseek_v41";
 
 pub const image_text = "[image omitted: this server does not pass images to the model, so the model cannot see this image. Do not guess what it shows; say that it could not be seen.]";
-
-/// The OpenAI ``reasoning_effort`` names: none / minimal turn thinking off.
-const field_efforts = [_]struct { []const u8, ?u8 }{ .{ "none", null }, .{ "minimal", null }, .{ "low", 50 }, .{ "medium", 62 }, .{ "high", 75 }, .{ "xhigh", 100 }, .{ "max", 100 } };
 
 pub const Images = enum { placeholder, reject };
 
@@ -64,7 +61,7 @@ pub const Options = struct {
             const t = std.mem.trim(u8, v, " ");
             if (t.len > 0) {
                 if (level(t) == null or level(t).? == null) {
-                    problem.* = "TF_DSV41_DEFAULT_EFFORT: expected low (50), medium (62), high (75), max (100) or an integer 1-100";
+                    problem.* = "TF_DSV41_DEFAULT_EFFORT: expected low (50), medium (75), high (75), max (100) or an integer 1-100";
                     return error.Invalid;
                 }
                 o.default_effort = t;
@@ -82,18 +79,8 @@ pub const Options = struct {
     }
 };
 
-/// A ``reasoning_effort`` value as a budget: null for an unknown value, ``.{null}`` (thinking off) for none / minimal.
-fn level(s: []const u8) ??u8 {
-    var buf: [16]u8 = undefined;
-    if (s.len > buf.len) return null;
-    const t = std.ascii.lowerString(&buf, std.mem.trim(u8, s, " \t\n\r"));
-    for (field_efforts) |e| if (std.mem.eql(u8, e[0], t)) return e[1];
-    if (t.len == 0) return null;
-    for (t) |c| if (!std.ascii.isDigit(c)) return null; // str.isdigit: no sign
-    const n = std.fmt.parseInt(i64, t, 10) catch return null;
-    if (n < 1 or n > 100) return null;
-    return @as(?u8, @intCast(n));
-}
+/// A ``reasoning_effort`` value as a budget (``template.effortOf``: the Python app's names).
+const level = template.effortOf;
 
 /// The budget an effort label renders (defaults to high).
 pub fn budget(label: []const u8) u8 {
@@ -559,7 +546,7 @@ test "reasoning_effort and the thinking switches read as the Python app reads th
     try std.testing.expect(got.enable.?);
     const off = try DeepSeek.thinkingFn(undefined, &cx, (try json.parseText(cx.a, "{\"reasoning_effort\": \"none\"}")).ok);
     try std.testing.expect(!off.enable.?);
-    try std.testing.expectEqual(@as(u8, 62), budget("medium"));
+    try std.testing.expectEqual(@as(u8, 75), budget("medium"));
     try std.testing.expectEqual(@as(u8, 100), budget("xhigh"));
     try std.testing.expectError(error.Refused, DeepSeek.thinkingFn(undefined, &cx, (try json.parseText(cx.a, "{\"reasoning_effort\": 101}")).ok));
     try std.testing.expectError(error.Refused, DeepSeek.thinkingFn(undefined, &cx, (try json.parseText(cx.a, "{\"chat_template_kwargs\": {\"thinking\": 1}}")).ok));

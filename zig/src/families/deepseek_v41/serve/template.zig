@@ -30,8 +30,9 @@ pub const IMAGE = "<｜deepseek_image｜>";
 /// A zero-width space after ``<``: the same text, ordinary BPE tokens, never the image id.
 pub const IMAGE_ESCAPED = "<\u{200b}｜deepseek_image｜>";
 
-/// The release template's named efforts (``effort_map``); ints 1-100 are budgets as given.
-pub const efforts = [_]struct { []const u8, u8 }{ .{ "low", 50 }, .{ "medium", 62 }, .{ "high", 75 }, .{ "max", 100 } };
+/// ``reasoning_effort`` names as the Python app reads them (``app.py`` ``FIELD_EFFORTS``; the prompt must be the
+/// one prod renders): none / minimal turn thinking off. The release chat_template.jinja maps medium to 62 instead.
+pub const efforts = [_]struct { []const u8, ?u8 }{ .{ "none", null }, .{ "minimal", null }, .{ "low", 50 }, .{ "medium", 75 }, .{ "high", 75 }, .{ "xhigh", 100 }, .{ "max", 100 } };
 pub const default_budget: u8 = 75;
 
 pub const Error = error{ Refused, OutOfMemory };
@@ -59,20 +60,26 @@ pub const Options = struct {
 /// A refusal's message (HTTP 400), set when ``render`` returns error.Refused.
 pub const Problem = struct { message: []const u8 = "" };
 
-/// ``reasoning_effort`` as the release template reads it: "low" / "medium" / "high" / "max", or an int 1-100.
+/// A ``reasoning_effort`` value (``app._level``): null for one the app refuses, ``.{null}`` (thinking off) for
+/// none / minimal, else the 1-100 budget. Names are read stripped and lower-cased; digits only, as ``str.isdigit``.
+pub fn effortOf(s: []const u8) ??u8 {
+    var buf: [16]u8 = undefined;
+    const trimmed = std.mem.trim(u8, s, " \t\n\r");
+    if (trimmed.len == 0 or trimmed.len > buf.len) return null;
+    const t = std.ascii.lowerString(&buf, trimmed);
+    for (efforts) |e| if (std.mem.eql(u8, e[0], t)) return e[1];
+    for (t) |c| if (!std.ascii.isDigit(c)) return null;
+    const n = std.fmt.parseInt(i64, t, 10) catch return null;
+    if (n < 1 or n > 100) return null;
+    return @as(?u8, @intCast(n));
+}
+
+/// A budget from a JSON value: an effort name or an int 1-100; null for thinking off or a value the app refuses.
 pub fn budgetOf(v: Value) ?u8 {
-    switch (v) {
-        .string => |s| {
-            for (efforts) |e| if (std.mem.eql(u8, e[0], s)) return e[1];
-            const n = std.fmt.parseInt(u8, s, 10) catch return null;
-            return if (n >= 1 and n <= 100) n else null;
-        },
-        .int => |t| {
-            const n = std.fmt.parseInt(i64, t, 10) catch return null;
-            return if (n >= 1 and n <= 100) @intCast(n) else null;
-        },
-        else => return null,
-    }
+    return switch (v) {
+        .string, .int => |t| (effortOf(t) orelse return null) orelse null,
+        else => null,
+    };
 }
 
 const Block = struct { tool: bool, text: []const u8, rank: usize };
@@ -466,6 +473,7 @@ test "a thinking conversation with a tool call and an out-of-order result" {
     try std.testing.expect(std.mem.startsWith(u8, got, BOS ++ SYSTEM ++ "Reasoning Effort: 62 (range"));
     try std.testing.expect(std.mem.endsWith(u8, got, "plan</think>\n\n" ++ CALLS_OPEN ++ "\n<" ++ DSML ++ " invoke name=\"f\">\n<" ++ DSML ++ " parameter name=\"q\" string=\"false\">1</" ++ DSML ++ " parameter>\n</" ++ DSML ++ " invoke>\n<" ++
         DSML ++ " invoke name=\"g\">\n<" ++ DSML ++ " parameter name=\"s\" string=\"true\">x</" ++ DSML ++ " parameter>\n</" ++ DSML ++ " invoke>\n" ++ CALLS_CLOSE ++ EOS ++ USER ++ "<tool_result>A</tool_result>\n\n<tool_result>B</tool_result>" ++ ASSISTANT ++ THINK_OPEN));
-    try std.testing.expectEqual(@as(?u8, 62), budgetOf(.{ .string = "medium" }));
+    try std.testing.expectEqual(@as(?u8, 75), budgetOf(.{ .string = "medium" }));
+    try std.testing.expectEqual(@as(?u8, null), budgetOf(.{ .string = "none" }));
     try std.testing.expectEqual(@as(?u8, null), budgetOf(.{ .int = "101" }));
 }

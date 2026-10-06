@@ -256,7 +256,7 @@ fn check(h: *Harness, a: Allocator) !void {
         try testing.expectEqualStrings("{\"city\":\"東京\"}", args[1].items);
         try testing.expectEqualStrings("tool_calls", finish);
         try testing.expect(usage != null and usage.?.get("prompt_tokens_details").?.get("cached_tokens").?.int64().? == 3);
-        try testing.expect(std.mem.indexOf(u8, try h.lastPrompt(a), "Reasoning Effort: 62 (range") != null);
+        try testing.expect(std.mem.indexOf(u8, try h.lastPrompt(a), "Reasoning Effort: 75 (range") != null);
         try testing.expect(std.mem.indexOf(u8, try h.lastPrompt(a), "\"name\": \"get_weather\"") != null);
     }
     // 3. the same reply whole, one call kept (parallel_tool_calls false); a later turn gets its reasoning back

@@ -12,7 +12,10 @@ pub fn readGolden(a: std.mem.Allocator, name: []const u8) !?[]u8 {
     const dir = env("TF_DSV41_GOLDEN") orelse return null;
     const path = try std.fs.path.join(a, &.{ dir, name });
     defer a.free(path);
-    return try std.Io.Dir.cwd().readFileAlloc(testing.io, path, a, .limited(1 << 30));
+    return std.Io.Dir.cwd().readFileAlloc(testing.io, path, a, .limited(1 << 30)) catch |e| switch (e) {
+        error.FileNotFound => null, // that generator was not run
+        else => e,
+    };
 }
 
 const Reader = struct {
@@ -120,6 +123,7 @@ fn checkTemplates(lines: []const u8) !void {
     var cases: usize = 0;
     var bad: usize = 0;
     var jinja: usize = 0;
+    var efforts: usize = 0;
     while (it.next()) |line| {
         if (line.len == 0) continue;
         _ = arena.reset(.retain_capacity);
@@ -133,6 +137,18 @@ fn checkTemplates(lines: []const u8) !void {
             .drop_thinking = c.get("drop_thinking").?.bool,
             .add_generation_prompt = c.get("generation").?.bool,
         };
+        if (c.get("effort_field")) |field| {
+            // the request's reasoning_effort resolved here, as the server resolves it, must give the app's choice
+            const text: []const u8 = switch (field) {
+                .string, .int => |t| t,
+                else => unreachable,
+            };
+            const level = template.effortOf(text) orelse return error.TestUnexpectedRefusal;
+            opts.thinking = level != null;
+            opts.budget = level orelse 75;
+            try testing.expectEqual(c.get("thinking").?.bool, opts.thinking);
+            efforts += 1;
+        }
         if (c.get("tools")) |t| if (t == .array) {
             opts.tools = t.array;
         };
@@ -164,7 +180,7 @@ fn checkTemplates(lines: []const u8) !void {
             }
         }
     }
-    if (bad > 0 or env("TF_DSV41_GOLDEN") != null) std.debug.print("template golden: {d}/{d} equal to encoding.encode ({d} of them also the release chat_template.jinja's text)\n", .{ cases - bad, cases, jinja });
+    if (bad > 0 or env("TF_DSV41_GOLDEN") != null) std.debug.print("template golden: {d}/{d} equal to encoding.encode ({d} reasoning_effort values resolved as app.options does; {d} also the release chat_template.jinja's text)\n", .{ cases - bad, cases, efforts, jinja });
     try testing.expectEqual(@as(usize, 0), bad);
 }
 
