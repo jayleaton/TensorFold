@@ -21,6 +21,8 @@ pub const Outcome = struct {
     first: u64 = 0,
     /// chained mode: buffers fed from our own earlier outputs
     chained_in: u32 = 0,
+    /// per buffer: "id:fresh|chained:equal|differ N@first" (r.gpa-owned, the caller frees it)
+    detail: []u8 = &.{},
 };
 
 const Live = struct { buf: cuda.DeviceBuffer, after: Hex, used: u64 };
@@ -39,6 +41,9 @@ pub const Replay = struct {
     live_bytes: usize = 0,
     live_cap: usize = 24 << 30,
     tick: u64 = 0,
+    /// where differing buffers are saved (null: not saved)
+    diff_dir: ?[]const u8 = null,
+    diff_saved: usize = 0,
 
     pub fn deinit(r: *Replay) void {
         var it = r.live.iterator();
@@ -57,18 +62,20 @@ pub const Replay = struct {
     }
 
     /// The op's buffers as device addresses (index = buffer id), loaded with the capture's inputs unless chained.
-    const Bound = struct { addr: []u64, own: []cuda.DeviceBuffer, hex_after: []Hex };
+    const Bound = struct { addr: []u64, own: []cuda.DeviceBuffer, hex_after: []Hex, fresh: []bool, has_reloc: []bool };
 
     fn bind(r: *Replay, a: std.mem.Allocator, op: std.json.ObjectMap, chained: bool, out: *Outcome) !Bound {
         const bufs = op.get("buffers").?.array.items;
         const relocs = op.get("relocs").?.array.items;
-        var b: Bound = .{ .addr = try a.alloc(u64, bufs.len), .own = try a.alloc(cuda.DeviceBuffer, bufs.len), .hex_after = try a.alloc(Hex, bufs.len) };
+        var b: Bound = .{ .addr = try a.alloc(u64, bufs.len), .own = try a.alloc(cuda.DeviceBuffer, bufs.len), .hex_after = try a.alloc(Hex, bufs.len), .fresh = &.{}, .has_reloc = &.{} };
         @memset(b.own, .{ .d = r.d, .ptr = 0, .len = 0 });
         errdefer for (b.own) |*x| if (x.ptr != 0) x.free();
         var has_reloc = try a.alloc(bool, bufs.len);
         @memset(has_reloc, false);
         for (relocs) |rl| has_reloc[@intCast(rl.object.get("buf").?.integer)] = true;
         var fresh = try a.alloc(bool, bufs.len);
+        b.fresh = fresh;
+        b.has_reloc = has_reloc;
         r.tick += 1;
         for (bufs) |bv| {
             const o = bv.object;
@@ -111,18 +118,23 @@ pub const Replay = struct {
             const before = o.get("before").?;
             const host = if (before == .string) try r.blob(a, before.string, n) else try a.alloc(u8, n);
             if (before != .string) @memset(host, 0);
-            for (relocs) |rl| {
-                const x = rl.object;
-                if (@as(usize, @intCast(x.get("buf").?.integer)) != id) continue;
-                const at: usize = @intCast(x.get("at").?.integer);
-                if (x.get("unresolved") != null) return error.UnresolvedPointer;
-                const delta: u64 = @bitCast(x.get("delta").?.integer);
-                const base = if (x.get("weight")) |w| (r.weights.get(w.string) orelse return error.MissingWeight).ptr else b.addr[@intCast(x.get("target").?.integer)];
-                std.mem.writeInt(u64, host[at..][0..8], base + delta, .little);
-            }
+            try r.patch(relocs, id, b.addr, host);
             try cuda.DeviceBuffer.upload(.{ .d = r.d, .ptr = b.addr[id], .len = @max(n, 1) }, 0, host);
         }
         return b;
+    }
+
+    /// Buffer `id`'s device addresses (pointer tables) rewritten to our weights' and buffers' addresses.
+    fn patch(r: *Replay, relocs: []const Value, id: usize, addr: []const u64, host: []u8) !void {
+        for (relocs) |rl| {
+            const x = rl.object;
+            if (@as(usize, @intCast(x.get("buf").?.integer)) != id) continue;
+            const at: usize = @intCast(x.get("at").?.integer);
+            if (x.get("unresolved") != null) return error.UnresolvedPointer;
+            const delta: u64 = @bitCast(x.get("delta").?.integer);
+            const base = if (x.get("weight")) |w| (r.weights.get(w.string) orelse return error.MissingWeight).ptr else addr[@intCast(x.get("target").?.integer)];
+            std.mem.writeInt(u64, host[at..][0..8], base + delta, .little);
+        }
     }
 
     /// Frees chained buffers not used by the current op (the simplest bound on what the chain keeps).
@@ -233,6 +245,9 @@ pub const Replay = struct {
     }
 
     fn compare(r: *Replay, a: std.mem.Allocator, op: std.json.ObjectMap, b: *const Bound, chained: bool, out: *Outcome) !void {
+        var detail: std.Io.Writer.Allocating = .init(r.gpa);
+        defer detail.deinit();
+        const relocs = op.get("relocs").?.array.items;
         for (op.get("buffers").?.array.items) |bv| {
             const o = bv.object;
             const id: usize = @intCast(o.get("id").?.integer);
@@ -240,24 +255,59 @@ pub const Replay = struct {
             if (n == 0) continue;
             const got = try a.alloc(u8, n);
             try cuda.DeviceBuffer.download(.{ .d = r.d, .ptr = b.addr[id], .len = @max(n, 1) }, 0, got);
-            var sha: [32]u8 = undefined;
-            std.crypto.hash.sha2.Sha256.hash(got, &sha, .{});
-            const hex = std.fmt.bytesToHex(sha, .lower);
             if (chained) r.live.getPtr(o.get("key").?.string).?.after = b.hex_after[id];
-            if (std.mem.eql(u8, &hex, &b.hex_after[id])) continue;
+            // a pointer table holds our addresses where the capture holds Python's: the expected bytes get the same relocations
+            var same: bool = undefined;
+            var want: ?[]u8 = null;
+            if (b.has_reloc[id]) {
+                want = try r.blob(a, &b.hex_after[id], n);
+                try r.patch(relocs, id, b.addr, want.?);
+                same = std.mem.eql(u8, got, want.?);
+            } else {
+                var sha: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(got, &sha, .{});
+                same = std.mem.eql(u8, &std.fmt.bytesToHex(sha, .lower), &b.hex_after[id]);
+            }
+            const how = if (b.fresh[id]) "fresh" else "chained";
+            if (same) {
+                try detail.writer.print("{d}:{s}:equal ", .{ id, how });
+                continue;
+            }
             out.status = .differ;
             out.differ += 1;
-            if (out.differ > 1) continue;
-            const want = try r.blob(a, &b.hex_after[id], n);
+            const w = want orelse try r.blob(a, &b.hex_after[id], n);
+            var count: u64 = 0;
             var first: ?usize = null;
-            for (got, want, 0..) |x, y, i| if (x != y) {
-                out.diff_bytes += 1;
+            for (got, w, 0..) |x, y, i| if (x != y) {
+                count += 1;
                 if (first == null) first = i;
             };
-            out.first = first orelse 0;
+            if (out.differ == 1) {
+                out.diff_bytes = count;
+                out.first = first orelse 0;
+            }
+            try detail.writer.print("{d}:{s}:differ {d}@{d} ", .{ id, how, count, first orelse 0 });
+            r.saveDiff(op, id, chained, got, w);
+        }
+        out.detail = try r.gpa.dupe(u8, detail.written());
+    }
+
+    /// Our bytes and the capture's of a differing buffer (up to 4 MB each, 400 MB in all) into `diff_dir`, for offline study.
+    fn saveDiff(r: *Replay, op: std.json.ObjectMap, id: usize, chained: bool, got: []const u8, want: []const u8) void {
+        const dir = r.diff_dir orelse return;
+        if (got.len > 4 << 20 or r.diff_saved + 2 * got.len > 400 << 20) return;
+        r.diff_saved += 2 * got.len;
+        var buf: [Io_max_path]u8 = undefined;
+        const seq = op.get("seq").?.integer;
+        const mode = if (chained) "chained" else "alone";
+        inline for (.{ .{ "ours", 0 }, .{ "want", 1 } }) |kind| {
+            const path = std.fmt.bufPrint(&buf, "{s}/{d}-{s}-{d}-{s}.bin", .{ dir, seq, mode, id, kind[0] }) catch return;
+            std.Io.Dir.cwd().writeFile(r.io, .{ .sub_path = path, .data = if (kind[1] == 0) got else want }) catch {};
         }
     }
 };
+
+const Io_max_path = 1024;
 
 /// Our loader's digests against the capture's weights.json: (equal, differ, missing here).
 pub fn checkWeights(gpa: std.mem.Allocator, io: std.Io, w: *const load.Weights, dir: []const u8, log: *std.Io.Writer) ![3]usize {

@@ -277,6 +277,16 @@ Effort is in engineering days for this agent team, assuming GPU windows are avai
 - Grammar: the Zig server's structured-output fields and the engine's grammar enforcement. Python uses xgrammar; this needs a decision (R9).
 - **GPU:** both Sparks, then a soak.
 
+- **State:** the server side is done (`deepseek_v41/serve/**`, `zig/src/server/**`, commits `ad44e18..f66c019`).
+  - Tokenizer, encoding, tool calls and sampling are byte-identical to Python on large golden sets.
+  - 43/43 HTTP tests pass on a stub engine; the tokenizer is about 23x faster than HF's.
+  - The real engine plugs in by implementing `engine_api.Engine`.
+- **Open items:**
+  1. Native image input (`TF_DSV41_IMAGES=native`) is not supported.
+  2. Structured-output grammar (R9) waits for the engine.
+  3. `tool_choice` required or named offers all tools, as Python does without grammar.
+  4. Stop strings match only the answer, but Python's non-streamed no-tools path also matches the reasoning. **Decision: match Python exactly**, because reply text must equal prod's.
+
 **M5. Long context** (about 15–20 days).
 - `sessions.zig` and `sessdisk.zig` (streamed NVMe, residency budget, priced restores, as on `dsv41-sessres`).
 - `kvsplit.zig` (as on `dsv41-kvsplit`), at the 1M context.

@@ -94,7 +94,9 @@ fn replay(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, capture: []c
     var set = try tri.Set.load(gpa, io, &driver, ctx.device, try std.fs.path.join(a, &.{ capture, "aot" }));
     defer set.deinit();
     std.debug.print("triton: {d} kernels loaded, {d} failed\n", .{ set.kernels.count(), set.failed.items.len });
-    var r: m1.Replay = .{ .gpa = gpa, .io = io, .d = &driver, .stream = stream, .kernels = if (kernels) |*k| k else null, .weights = &w, .triton = &set, .dir = capture };
+    const diff_dir = try std.fs.path.join(a, &.{ out_dir, "diff" });
+    try std.Io.Dir.cwd().createDirPath(io, diff_dir);
+    var r: m1.Replay = .{ .gpa = gpa, .io = io, .d = &driver, .stream = stream, .kernels = if (kernels) |*k| k else null, .weights = &w, .triton = &set, .dir = capture, .diff_dir = diff_dir };
     defer r.deinit();
 
     const text = try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ capture, "ops.jsonl" }), gpa, .limited(1 << 32));
@@ -110,17 +112,19 @@ fn replay(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, capture: []c
         defer parsed.deinit();
         const op = parsed.value.object;
         const alone = r.run(op, false);
+        defer gpa.free(alone.detail);
         const chain = r.run(op, true);
+        defer gpa.free(chain.detail);
         counts[0][@backingInt(alone.status)] += 1;
         counts[1][@backingInt(chain.status)] += 1;
         chained_in += chain.chained_in;
         try log.writer.print("{{\"seq\": {d}, \"set\": \"{s}\", \"phase\": \"{s}\", \"kind\": \"{s}\", \"name\": \"{s}\", " ++
             "\"alone\": \"{t}\", \"why\": \"{s}\", \"differ\": {d}, \"diff_bytes\": {d}, \"first\": {d}, " ++
-            "\"chained\": \"{t}\", \"chained_why\": \"{s}\", \"chained_in\": {d}}}\n", .{
+            "\"chained\": \"{t}\", \"chained_why\": \"{s}\", \"chained_in\": {d}, \"alone_bufs\": \"{s}\", \"chained_bufs\": \"{s}\"}}\n", .{
             op.get("seq").?.integer, op.get("set").?.string, op.get("phase").?.string, op.get("kind").?.string,
             op.get("name").?.string, alone.status,           alone.why,                alone.differ,
             alone.diff_bytes,        alone.first,            chain.status,             chain.why,
-            chain.chained_in,
+            chain.chained_in,        alone.detail,           chain.detail,
         });
     }
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ out_dir, "replay.jsonl" }), .data = log.written() });
