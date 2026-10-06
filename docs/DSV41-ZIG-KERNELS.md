@@ -151,11 +151,25 @@ The tables mark each kernel **prod** (on in prod.env), **default** (on by the kn
 | router | `gemv_kernel<16,8,2>` | `F/router_gemv.cu` | .cu | prod | ported |
 | shared expert | 3 dense GEMMs + torch `clamp` / `silu` / `mul` | — | — | prod | pfdense + **`Z/pointwise.cu`** (ours) |
 | routed rotation | `rot_kernel<bf16, XM>` | `F/x3gm.cu` | .cu | prod (`FAST_EXPERTS=gm`) | ported |
-| routed gate / up | `gm_kernel<2,XM,K2,cfg 0 (XM 1) / 1 (XM 2)>` | `F/x3gm.cu` | .cu | prod | ported, all 119 instances (+ 4K's cfgs 2-5) |
-| routed down | `gm_kernel<1,1,K2,cfg 0>` | `F/x3gm.cu` | .cu | prod | ported |
+| routed gate / up | `gm_kernel<2,XM,K2,cfg 0 (XM 1) / 1 (XM 2)>` | `F/x3gm.cu` | .cu | v1 | ported, all 119 instances (+ 4K's cfgs 2-5) |
+| routed down | `gm_kernel<1,1,K2,cfg 0>` | `F/x3gm.cu` | .cu | v1 | ported |
+| routed gate / up, down (v2) | `gm2_kernel`: one launch a projection over every width, one plan (bm 64) a row block | `F/x3gm.cu` | .cu | prod (`GM_V2=1`) | ported: `exl3.Ops.gmPlan` + `gm2Gateup` / `gm2Down` (+ `gmRot`) |
 | x3gm passes | `x3gm.plan`: torch `argsort(stable)`, `bincount`, `cumsum`, `searchsorted` | `F/x3gm.py` | torch | prod | **`Z/x3gm_plan.cu`** (ours, section 3.2) |
 | routed combine | `combine_kernel` | `X/experts.cu` | .cu | prod | ported |
 | (off) | `pf_kernel<2,NT,MTL,LO,HI>` | `F/x3pf.cu` | .cu | off (`EXPERT_PREFILL=0`) | ported (6 instances) |
+
+**Prefill chunk sizes (2026-10-07).** Prod runs 2,048-row chunks (`PREFILL_CHUNK` / `ROWS` 2,048, adaptive 1,024 /
+512, a short tail). `oracle.py` has x3gm cases at those sizes:
+- `x3gm_pf2048_ragged`: 2,048 rows x 6 slots over prod's 384 experts, ragged widths 3-10, the shared expert folded (about 32 passes an expert at bm 64);
+- `x3gm_pf1024_k4`: 1,024 rows, uniform K2 4;
+- `x3gm_pf512_shx`: 512 rows, the shared expert folded;
+- `x3gm_pf_tail1337`: 1,337 rows, ragged.
+
+Each runs the tuned v1 launches (v2's reference), the device plan, and v2 at both tickets, all bit for bit, in
+`job.sh` (sm_120 on the pods; the same sources are SASS-equal on sm_121). Every other prefill launch is a copy
+whose Zig wrapper checks the same limits as the Python extension's own checks: a chunk is launched as Python's
+prefill launches it (the port lead's emitter). Pod 15's 2,048-row prod recapture replays the whole prefill
+segment.
 
 ### 2.3 Drafter (DSpark, 3 blocks, 5 rows a slot)
 
@@ -295,6 +309,34 @@ SASS on sm_121, all equal to the Python build at the source's ref:
 | `attn_cuda.cu` | 24 | 16 split |
 | `mhc_cuda.cu` | 15 | 7 tail + coef |
 | `exl3_experts.cu` | 32 | down_combine fp32 / bf16 |
+
+## 3.2c R4: CUDA graphs for decode windows
+
+The decode path's graphs are captured from the same launches `run.zig` issues eagerly (Python graphs.py's
+contract: replay == eager, bit for bit).
+- `cuda/graph_cache.zig`: family-agnostic keyed capture / replay. It has an LRU cap (48), a fingerprint of the baked-in addresses, the memory floor's eviction, and graphs off after a capture fails.
+  - Every decision a rank could take alone is AND-ed over the ranks (`Agree`), so TP=N and lanes stay in step.
+  - The policy is host-tested with a fake engine.
+- `deepseek_v41/graphs.zig`: Python's context buckets (2,048 to 32K, then 1.25x rounded up to 2,048), the key (rows, context bucket), `Statics`, `EngramStage`, and the agreement over the Collective (an i32 all-gather, any world).
+- `forward.zig`: window() runs the graphed path when `TF_DSV41_GRAPHS=1`. It is off by default until a pod shows graphed == eager at TP=2.
+
+**Inside a graph**
+- Every launch of the window, the exchanges included. NCCL, the mailbox, RoCE and the hybrid all enqueue on the stream with device-side sequence words, so a replay pairs up like the eager run.
+- The indexer scores the bucket's keys: the program is emitted at `bucketEnd + 1 - n`. Keys past a row's end score -inf and never reach its attention.
+- `glue.cu`'s `positions_dev_kernel` reads the window's start from the statics. The glue GPU case checks it against the host form.
+
+**Outside, on the host, each step**
+- The inputs, by one copy each before the launch, with no synchronize:
+  - the ids and the start (`Statics`);
+  - each Engram layer's rows, hashed on the host (`EngramStage`). The graph keeps their all-gather and `gather_cols`.
+- The choices: greedy, sampling and top-p read the logits on the host.
+- `keep`'s accepted count and carry.
+- The trace gate's downloads: a traced program is never graphed.
+
+**Shapes**
+- One slot, rows exact (Python's per-width graphs), up to the largest planned bucket.
+- Row-mode padding to the row buckets (1-8, 12, 16, 24, 32, 48, 64) needs the stacked multi-slot state and comes with it.
+- Graphs read state at fixed addresses: every buffer they touch is allocated once (bind; send and gathered at the planned rows). A change in any of them drops every graph.
 
 ## 3.3 Perf notes that touch these launches (docs/DSV41-ZIG-PERF.md)
 

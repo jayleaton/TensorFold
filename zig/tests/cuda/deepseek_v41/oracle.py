@@ -393,6 +393,20 @@ def main() -> None:
                                           k2g=widths_g, k2d=widths_d, shx=False, input_dtype=torch.float16,
                                           limit=10.0, runs=["tuned", (1, 0, True), (2, 4, True)],
                                           dequant=(128, 128, 10))
+    # prefill chunks (TF_DSV41_PREFILL_CHUNK / ROWS 2,048, adaptive 1,024 / 512, a short tail): the tuned v1 run (v2's
+    # reference) and v2 at both tickets; 2,048 rows over prod's 384 experts (~32 passes an expert at bm 64)
+    widths_g384 = [widths_g[i % len(widths_g)] for i in range(384)]
+    widths_d384 = [widths_d[(i * 7) % len(widths_d)] for i in range(384)]
+    report["x3gm_pf2048_ragged"] = x3gm_case(out / "x3gm_pf2048_ragged", g, R=2048, slots=6, E=384, D=D, I=I,
+                                             k2g=widths_g384, k2d=widths_d384, shx=True, input_dtype=torch.bfloat16,
+                                             limit=10.0, runs=["tuned"])
+    report["x3gm_pf1024_k4"] = x3gm_case(out / "x3gm_pf1024_k4", g, R=1024, slots=6, E=64, D=D, I=I, k2g=[4] * 64,
+                                         k2d=[4] * 64, shx=False, input_dtype=torch.bfloat16, limit=10.0, runs=["tuned"])
+    report["x3gm_pf512_shx"] = x3gm_case(out / "x3gm_pf512_shx", g, R=512, slots=6, E=64, D=D, I=I, k2g=[6] * 64,
+                                         k2d=[6] * 64, shx=True, input_dtype=torch.bfloat16, limit=10.0, runs=["tuned"])
+    report["x3gm_pf_tail1337"] = x3gm_case(out / "x3gm_pf_tail1337", g, R=1337, slots=6, E=64, D=D, I=I,
+                                           k2g=widths_g384[:64], k2d=widths_d384[:64], shx=False,
+                                           input_dtype=torch.bfloat16, limit=10.0, runs=["tuned"])
     report["x3gm_plan"] = plan_case(out / "x3gm_plan", g)
     report["topk_keys"] = topk_case(out / "topk_keys", g)
     report["pointwise"] = pointwise_case(out / "pointwise", g)
