@@ -160,6 +160,10 @@ Rules from `ZIG-PREVIEW.md`:
     - on the decode1 78b703d twin, prebuilt for sm_120 in the e1e2 image and shipped as `r1c.tar.gz`: bits 13/13, kvsplit 3/3, SASS equal;
     - x3gm v2 ran ("v2 4 launches" every x3gm case);
     - the twin's suites ran under pytest (367 passed, 1 twin-side failure), but their recorded calls did not reach the replay (no `capture.json`). This is with dsq-zig-kern-1.
+- **Pod 10** (M2a's first run, 40519d5, 35 min, $1.22): no M2a verdict yet.
+  - The Python reference over layers 0–24 did not finish loading plus prefill within its 22 minutes. Python loads about 40 s a block from the volume. M2a now runs layers 0–8 (6cef64a): SWA + Engram (layer 1), the ratio-2 KV and index sources 2 and 8 with their carries, and the reuse layers between them.
+  - `glue.cu`'s first GPU run: every glue kernel equal to torch except `embed_send` (2 of 1,792 words). That is with dsq-zig-kern-1; the next M2a pod waits for the fix.
+  - `session.sh` was replaced while its watcher ran (quant 57e710d), and bash re-read it mid-loop. The port lead fetched the results, deleted the pod and closed the ledger row by hand. Don't edit `session.sh` while a session runs.
   - **The superseded "next pod" list:**
 
     - the GPU compare of `prepare.lanes` against Python's dense3 words (pod 8 only compared them as plain strips);
