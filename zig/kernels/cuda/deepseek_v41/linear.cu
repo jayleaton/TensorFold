@@ -1,4 +1,4 @@
-// Device code of src/tensorfold/cuda/exl3/linear.cu (git blob 83a8dd081226 at dsv41-x3gm1; lines 1-283, 288; torch includes and host code cut),
+// Device code of src/tensorfold/cuda/exl3/linear.cu (git blob 83a8dd081226 at dsv41-quant-e2; lines 1-283, 288; torch includes and host code cut),
 // generated and checked by zig/kernels/cuda/deepseek_v41/sync.py. Do not edit: change the Python source.
 // EXL3 linear, any codebook and width, 1-128 rows: a row's bits depend only on it (mma keeps rows apart, K ranges fixed by (K, N), fixed-order sums).
 

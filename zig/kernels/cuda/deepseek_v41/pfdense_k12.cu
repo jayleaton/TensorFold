@@ -1,4 +1,4 @@
-// Device code of src/tensorfold/families/deepseek_v41/cuda/pfdense_k12.cu (git blob 5905afbd762d at dsv41-x3gm1; the whole file),
+// Device code of src/tensorfold/families/deepseek_v41/cuda/pfdense_k12.cu (git blob 5905afbd762d at dsv41-quant-e2; the whole file),
 // generated and checked by zig/kernels/cuda/deepseek_v41/sync.py. Do not edit: change the Python source.
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Jay Leaton. The DeepSeek-V4.1-Flash family of TensorFold (Apache-2.0): see THIRD_PARTY_NOTICES.md.

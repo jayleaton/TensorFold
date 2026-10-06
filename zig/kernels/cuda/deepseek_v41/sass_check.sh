@@ -7,7 +7,17 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 OUT="${OUT:?set OUT}"
 SM="${SM:-121}"
-PYSRC="${TF_DSV41_PY_SRC:-/home/sireggy/Documents/Projects/spark-work/tensorfold-dsquant}/src/tensorfold"
+# each copy's Python source at its git ref (sync.py SOURCES), exported per source key under $OUT/src-<key>
+declare -A SRCKEY DONE
+mkdir -p "$OUT"
+while read -r copy key repo ref; do
+  SRCKEY[${copy%.*}]=$key
+  if [ -z "${DONE[$key]:-}" ]; then            # fresh each run: a ref may have moved
+    rm -rf "$OUT/src-$key" && mkdir -p "$OUT/src-$key"
+    git -C "$repo" archive "$ref" src/tensorfold | tar -x -C "$OUT/src-$key"
+    DONE[$key]=1
+  fi
+done < <(python3 "$HERE/sync.py" --sources)
 IMAGE="${TF_ZIG_IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}"
 X=cuda/exl3
 F=families/deepseek_v41/cuda
@@ -39,13 +49,13 @@ TI=$(python -c "import torch.utils.cpp_extension as c; print(\" \".join(\"-I\"+p
 PY=$(python -c "import sysconfig;print(sysconfig.get_paths()[\"include\"])")
 TORCH="-D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -std=c++20"
 GEN="-gencode=arch=compute_${SM},code=sm_${SM}"
-build() {  # name, sources, flags
-  local name=$1 srcs=$2 flags=${3//,/ }
+build() {  # name, sources, flags, the Python tree
+  local name=$1 srcs=$2 flags=${3//,/ } t=$4
   : > /out/py/$name.sass
   for s in $srcs; do
-    nvcc -c $TI -I$PY -I/t/cuda/exl3 -I/t/families/deepseek_v41/cuda $TORCH -DTORCH_API_INCLUDE_EXTENSION_H \
+    nvcc -c $TI -I$PY -I$t/cuda/exl3 -I$t/families/deepseek_v41/cuda $TORCH -DTORCH_API_INCLUDE_EXTENSION_H \
       -DTORCH_EXTENSION_NAME=$name -D_GLIBCXX_USE_CXX11_ABI=1 --compiler-options -fPIC $flags $GEN \
-      -o /out/py/$name.$(basename $s).o /t/$s
+      -o /out/py/$name.$(basename $s).o $t/$s
     cuobjdump -sass /out/py/$name.$(basename $s).o >> /out/py/$name.sass
     rm -f /out/py/$name.$(basename $s).o
   done
@@ -58,14 +68,16 @@ build() {  # name, sources, flags
 for n in "${names[@]}"; do
   line=$(echo "$TABLE" | grep "^$n|")
   srcs=$(echo "$line" | cut -d'|' -f2); flags=$(echo "$line" | cut -d'|' -f3)
+  key=${SRCKEY[$n]:-base}
+  [ "$n" = topk_cuda ] && key=${SRCKEY[attn_cuda]:-base}   # one extension, one source
   script="$script
-build $n \"$srcs\" \"$flags\" &
+build $n \"$srcs\" \"$flags\" /src/src-$key/src/tensorfold &
 while [ \$(jobs -rp | wc -l) -ge 4 ]; do wait -n; done"
 done
 script="$script
 wait"
 docker run --rm --network none --memory 16g -u "$(id -u):$(id -g)" -e SM="$SM" -e HOME=/tmp \
-  -v "$PYSRC:/t:ro" -v "$HERE:/k:ro" -v "$OUT:/out" --entrypoint bash "$IMAGE" -c "$script" 2>&1 | grep -v "No CUDA runtime" || true
+  -v "$OUT:/src:ro" -v "$HERE:/k:ro" -v "$OUT:/out" --entrypoint bash "$IMAGE" -c "$script" 2>&1 | grep -v "No CUDA runtime" || true
 rc=0
 for n in "${names[@]}"; do
   echo "== $n"

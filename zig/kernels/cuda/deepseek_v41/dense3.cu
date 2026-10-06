@@ -1,4 +1,4 @@
-// Device code of src/tensorfold/families/deepseek_v41/cuda/dense3.cu (git blob 21c3bed265fe at dsv41-x3gm1; the whole file, DSV41_DENSE3_NO_TORCH defined),
+// Device code of src/tensorfold/families/deepseek_v41/cuda/dense3.cu (git blob 21c3bed265fe at dsv41-quant-e2; the whole file, DSV41_DENSE3_NO_TORCH defined),
 // generated and checked by zig/kernels/cuda/deepseek_v41/sync.py. Do not edit: change the Python source.
 #define DSV41_DENSE3_NO_TORCH
 // SPDX-License-Identifier: MIT

@@ -168,6 +168,7 @@ pub fn call(k: *const Kernels, s: cuda.Stream, ext: []const u8, func: []const u8
     if (is(ext, "tf_dsv41_x3gm_v1")) return x3gmExt(k.experts(s), func, args, kwargs);
     if (is(ext, "tf_dsv41_attn_cuda_v1")) return attnExt(k.others(s), func, args, kwargs);
     if (is(ext, "tf_dsv41_mhc_cuda_v1") and is(func, "run")) return mhcRun(k.others(s), args, kwargs);
+    if (is(ext, "tf_dsv41_mhc_cuda_v1") and is(func, "coef")) return mhcCoef(k.others(s), args, kwargs);
     if (is(ext, "tf_dsv41_mhc_pf_v1") and is(func, "run")) return mhcPfRun(k.others(s), args, kwargs);
     if (is(ext, "tf_dsv41_router_gemv_v2") and is(func, "route")) return route(k.others(s), args, kwargs);
     if (is(ext, "tf_dsv41_pfdense_v1")) return pfdenseExt(k.others(s), func, args, kwargs);
@@ -355,7 +356,9 @@ fn expertsExt(o: exl3.Ops, func: []const u8, args: []const Arg, kwargs: []const 
     }
     if (is(func, "down_combine")) {
         const c: Call = .{ .args = args, .kwargs = kwargs, .names = &.{ "Z", "pick", "svh_d", "y", "wts", "out", "rows", "P", "D", "SK", "slots", "E" } };
-        try o.downCombine(try c.ptr(0), try c.ptr(1), try c.ptr(2), try c.ptr(3), try c.ptr(4), try c.ptr(5), try c.usz(6), try c.usz(7), try c.usz(8), try c.usz(9), try c.usz(10), try c.usz(11));
+        const out = try c.tensor(5);
+        if (out.dtype != .f32 and out.dtype != .bf16) return error.WrongArgument;
+        try o.downCombine(try c.ptr(0), try c.ptr(1), try c.ptr(2), try c.ptr(3), try c.ptr(4), out.ptr, try c.usz(6), try c.usz(7), try c.usz(8), try c.usz(9), try c.usz(10), try c.usz(11), out.dtype == .bf16);
         return true;
     }
     if (is(func, "dequant")) {
@@ -432,7 +435,7 @@ fn stride0(t: Tensor) i64 {
 // tf_dsv41_attn_cuda_v1 (csa2/attn_cuda.cpp): attn and topk as dsv41_attn_run_cuda / dsv41_topk_run_cuda fill Args
 fn attnExt(o: ops.Ops, func: []const u8, args: []const Arg, kwargs: []const Kw) !bool {
     if (is(func, "attn")) {
-        const c: Call = .{ .args = args, .kwargs = kwargs, .names = &.{ "q", "cv", "csc", "tok", "cnt", "sv", "ssc", "lo", "hi", "pos", "sl", "pt", "sink", "cs", "po", "pm", "pl", "out", "ticket", "ring", "psh", "pts", "kw" } };
+        const c: Call = .{ .args = args, .kwargs = kwargs, .names = &.{ "q", "cv", "csc", "tok", "cnt", "sv", "ssc", "lo", "hi", "pos", "sl", "pt", "sink", "cs", "po", "pm", "pl", "out", "ticket", "ring", "psh", "pts", "kw", "split" } };
         const q = try c.tensor(0);
         const cv = try c.tensor(1);
         const csc = try c.tensor(2);
@@ -475,7 +478,11 @@ fn attnExt(o: ops.Ops, func: []const u8, args: []const Arg, kwargs: []const Kw) 
             .H = @intCast(try dim(q, 1)),
             .ring = @intCast(try c.int(19)),
         };
-        try o.attention(a, try c.u(22), numel(sl) > 0, numel(hi) > 0);
+        const split: u32 = if (try c.opt(23)) |v| switch (v) {
+            .int => |x| @intCast(x),
+            else => return error.WrongArgument,
+        } else 0; // captures before R1 have no split: today's launch
+        try o.attention(a, try c.u(22), numel(sl) > 0, numel(hi) > 0, split);
         return true;
     }
     if (is(func, "topk")) {
@@ -502,7 +509,7 @@ fn topkJob(c: Call, at: usize) !ops.topk.Job {
 
 // tf_dsv41_mhc_cuda_v1.run (mhc_cuda.cpp / dsv41_mhc_run_cuda)
 fn mhcRun(o: ops.Ops, args: []const Arg, kwargs: []const Kw) !bool {
-    const c: Call = .{ .args = args, .kwargs = kwargs, .names = &.{ "x", "xout", "g", "post", "comb", "pre", "fn", "base", "scale", "part", "c", "tap", "nw", "out", "opre", "opost", "ocomb", "cnt", "R", "mode", "eps", "hc_eps", "post_alpha", "iters" } };
+    const c: Call = .{ .args = args, .kwargs = kwargs, .names = &.{ "x", "xout", "g", "post", "comb", "pre", "fn", "base", "scale", "part", "c", "tap", "nw", "out", "opre", "opost", "ocomb", "cnt", "R", "mode", "eps", "hc_eps", "post_alpha", "iters", "spin", "defer" } };
     const x = try c.tensor(0);
     const g = try c.tensor(2);
     const f = try c.tensor(6);
@@ -539,7 +546,38 @@ fn mhcRun(o: ops.Ops, args: []const Arg, kwargs: []const Kw) !bool {
         .post_alpha = @floatCast(try c.float(22)),
         .iters = @intCast(try c.int(23)),
     };
-    try o.mhcBoundary(a, try c.u(19), numel(f) != 0 and f.dtype == .f32);
+    // R1: spin < 0 (or no spin: a capture before R1) is today's finish; defer only with the tail
+    var b = a;
+    b.spin = if (try c.opt(24)) |v| switch (v) {
+        .int => |n| n,
+        else => return error.WrongArgument,
+    } else -1;
+    b.@"defer" = @intFromBool(b.spin >= 0 and (if (try c.opt(25)) |v| switch (v) {
+        .int => |n| n != 0,
+        .boolean => |t| t,
+        else => return error.WrongArgument,
+    } else false));
+    try o.mhcBoundary(b, try c.u(19), numel(f) != 0 and f.dtype == .f32);
+    return true;
+}
+
+// tf_dsv41_mhc_cuda_v1.coef (R1: dsv41_mhc_coef_cuda): a deferred boundary's coefficients
+fn mhcCoef(o: ops.Ops, args: []const Arg, kwargs: []const Kw) !bool {
+    const c: Call = .{ .args = args, .kwargs = kwargs, .names = &.{ "part", "base", "scale", "opre", "opost", "ocomb", "R", "eps", "hc_eps", "post_alpha", "iters" } };
+    const a: ops.mhc.Args = .{
+        .part = try c.ptr(0),
+        .base = try c.ptr(1),
+        .scale = try c.ptr(2),
+        .opre = try c.ptr(3),
+        .opost = try c.ptr(4),
+        .ocomb = try c.ptr(5),
+        .R = @intCast(try c.int(6)),
+        .eps = @floatCast(try c.float(7)),
+        .hc_eps = @floatCast(try c.float(8)),
+        .post_alpha = @floatCast(try c.float(9)),
+        .iters = @intCast(try c.int(10)),
+    };
+    try o.mhcCoef(a);
     return true;
 }
 

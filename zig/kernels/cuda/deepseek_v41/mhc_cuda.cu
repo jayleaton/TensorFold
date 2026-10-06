@@ -1,4 +1,4 @@
-// Device code of src/tensorfold/families/deepseek_v41/cuda/mhc_cuda.cu (git blob c792c1251be6 at dsv41-x3gm1; the whole file, DSV41_MHC_NO_TORCH defined),
+// Device code of src/tensorfold/families/deepseek_v41/cuda/mhc_cuda.cu (git blob caa24ba4bb72 at 14310de; the whole file, DSV41_MHC_NO_TORCH defined),
 // generated and checked by zig/kernels/cuda/deepseek_v41/sync.py. Do not edit: change the Python source.
 #define DSV41_MHC_NO_TORCH
 // SPDX-License-Identifier: MIT
@@ -51,9 +51,11 @@ struct Args {
     const void* nw; int nwbf16;                  // norm weight [D] bf16 / fp32
     uint16_t* out;                               // the next sublayer's input [R, D] bf16
     float* opre; float* opost; float* ocomb;     // the next site's coefficients (MIX)
-    int* cnt;                                    // the ticket (self-cleaning)
+    int* cnt;                                    // [0] the ticket, [1] the tail's items, [2] exits (self-cleaning)
     int R;
     float eps, hc_eps, post_alpha; int iters;
+    long long spin;                              // TAIL: SM cycles a CTA waits for the last arrival (0: it leaves)
+    int defer;                                   // TAIL: the coefficient items run in coef_kernel (a side stream)
 };
 
 __device__ __forceinline__ uint4 ld_stream(const void* p) {
@@ -168,8 +170,7 @@ __device__ __forceinline__ void chains(const Args& a, const uint16_t* xs, const 
 
 // the finish's coefficients of row r, 16 lanes (element (i, j) of comb at lane bits (3..2, 1..0)): _finish_k's
 // instructions and its butterfly order (row sums xor 2 then 1, column sums xor 8 then 4)
-__device__ __forceinline__ void coefs(const Args& a, const float* rowv, int r, bool store, int e) {
-    const float* mx = rowv + r * (ROWB / 4);
+__device__ __forceinline__ void coefs_of(const Args& a, const float* mx, int r, bool store, int e) {
     const float rinv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(mx[24], 4.0f * D), a.eps)));
     const float LOG2E = __int_as_float(0x3FB8AA3B), NLOG2E = __int_as_float(0xBFB8AA3B);
     if (e < 4) {
@@ -198,6 +199,9 @@ __device__ __forceinline__ void coefs(const Args& a, const float* rowv, int r, b
         cm = divf(cm, __fadd_rn(a.hc_eps, s));
     }
     if (store) a.ocomb[r * 16 + e] = cm;
+}
+__device__ __forceinline__ void coefs(const Args& a, const float* rowv, int r, bool store, int e) {
+    coefs_of(a, rowv + r * (ROWB / 4), r, store, e);
 }
 
 __host__ __device__ constexpr int chunk_entries(int R) {      // partial entries a finish stage holds a row
@@ -288,9 +292,119 @@ __device__ void finish(const Args& a, float* rowv, float4* st, int t) {
     }
 }
 
+// ---- R1a: the parallel tail (TF_DSV41_MHC_TAIL=1) -------------------------------------------------------------------
+// finish() runs on the one CTA that arrives last: at 1 row its partial sums, Sinkhorn and normed input are ~7 us of
+// a ~12 us launch on GB10 (16 rows: ~20 us), with the other 159 CTAs gone. TAIL: every CTA that has written its
+// partials waits (up to Args::spin SM cycles) for the last arrival, then the live CTAs claim the tail's items from a
+// counter: R coefficient items (row r's 26 sums, each one chain over the entries in finish()'s order, then coefs()),
+// then R x 5 items of the normed input (1,024 columns each; rn from stream 0's 40 square sums in order). Every value
+// is the same chain of the same operations as finish(): the same bits. A CTA that times out leaves; the last
+// arrival claims whatever is left, so the tail never waits on a CTA that is not resident. The last CTA to leave
+// resets the three counters (self-cleaning across graph replays).
+constexpr int F2C = NT * 8;                       // columns a normed-input item
+constexpr int F2N = D / F2C;                      // items a row
+static_assert(D % F2C == 0 && NE * NQ * 16 <= 2 * STAGE4 * 16, "tail items");
+
+__device__ __forceinline__ int ld_acquire(const int* p) {
+    int v;
+    asm volatile("ld.acquire.gpu.b32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+    return v;
+}
+__device__ __forceinline__ float rn_of(float ssc, float eps) {
+    return __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(ssc, 1.0f * D), eps)));
+}
+
+// row r's 25 sums over its 160 entries and the square sum over stream 0's 40 (finish()'s chains), then coefs()
+__device__ void coef_item(const Args& a, int r, float4* st, float* mx, int t) {
+    for (int i = t; i < NE * NQ; i += NT)
+        cp16(st + i, a.part + (static_cast<long long>(r) * NE + i / NQ) * PW + (i % NQ) * 4);
+    cp_commit();
+    cp_wait<0>();
+    __syncthreads();
+    if (t < 26) {
+        const float* sf = reinterpret_cast<const float*>(st);
+        const int n = t == 25 ? NB : NE;
+        float acc = 0.0f;
+#pragma unroll 8
+        for (int e = 0; e < n; ++e) acc = __fadd_rn(acc, sf[e * (NQ * 4) + t]);
+        mx[t] = t == 25 ? rn_of(acc, a.eps) : acc;
+    }
+    __syncthreads();
+    if (t < 32) coefs_of(a, mx, r, t < 16, t & 15);
+}
+
+// normed input of row r, columns [F2C q, F2C q + F2C): bf16((c * rn) * w)
+__device__ void norm_item(const Args& a, int r, int q, float* buf, int t) {
+    const int d0 = q * F2C + t * 8;
+    const bool nwbf = a.nwbf16 != 0;
+    float c[8], w[8], o[8];
+    widen8(__ldcg(reinterpret_cast<const uint4*>(a.c + static_cast<long long>(r) * D + d0)), c);
+    load8f(static_cast<const char*>(a.nw) + d0 * (nwbf ? 2 : 4), nwbf, w);
+    if (t < NB) buf[t] = __ldcg(a.part + (static_cast<long long>(r) * NE + t) * PW + 25);
+    __syncthreads();
+    if (t == 0) {
+        float ssc = 0.0f;
+#pragma unroll 8
+        for (int e = 0; e < NB; ++e) ssc = __fadd_rn(ssc, buf[e]);
+        buf[NB] = rn_of(ssc, a.eps);
+    }
+    __syncthreads();
+    const float rn = buf[NB];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) o[k] = __fmul_rn(__fmul_rn(c[k], rn), w[k]);
+    *reinterpret_cast<uint4*>(a.out + static_cast<long long>(r) * D + d0) = pack8(o);
+}
+
+template <bool MIX>
+__device__ void tail(const Args& a, float* rowv, float4* st, int t) {
+    __shared__ int live, item;
+    __shared__ float nbuf[NB + 1];                           // a normed-input item's 40 square sums + rn
+    const int total = static_cast<int>(gridDim.x * gridDim.y), R = a.R;
+    if (t == 0) {
+        int n = atomicAdd(a.cnt, 1) + 1;
+        if (n < total && a.spin > 0) {
+            const long long t0 = clock64();
+            while ((n = ld_acquire(a.cnt)) < total && clock64() - t0 < a.spin) __nanosleep(32);
+        }
+        live = n >= total;
+    }
+    __syncthreads();
+    if (live) {
+        __threadfence();
+        const int nc = MIX && !a.defer ? R : 0, nitems = nc + R * F2N;
+        for (;;) {
+            if (t == 0) item = atomicAdd(a.cnt + 1, 1);
+            __syncthreads();
+            const int it = item;
+            if (it >= nitems) break;
+            if (it < nc) {
+                coef_item(a, it, st, rowv, t);
+            } else {
+                const int f = it - nc;
+                norm_item(a, f / F2N, f % F2N, nbuf, t);
+            }
+            __syncthreads();
+        }
+    }
+    if (t == 0 && atomicAdd(a.cnt + 2, 1) == total - 1) {     // the last to leave: every counter back at 0
+        atomicExch(a.cnt, 0);
+        atomicExch(a.cnt + 1, 0);
+        atomicExch(a.cnt + 2, 0);
+    }
+}
+
+// DEFER: a row's coefficient item on its own CTA, after the boundary (the next site reads them, the normed input
+// does not): launched on a side stream that joins before the next boundary
+__global__ void __launch_bounds__(NT) coef_kernel(const Args a) {
+    __shared__ __align__(16) float4 st[NE * NQ];
+    __shared__ float mx[32];
+    coef_item(a, blockIdx.x, st, mx, threadIdx.x);
+}
+
 // POST: the post from the gathered partials; COLL 1 = c is stream 0, 2 = the pre-mix; MIX: the next site (mixes,
-// coefficients); ALL4: a CTA a block writes all 4 streams (grid NB x 1: in place is safe; final, no MIX)
-template <bool POST, int COLL, bool MIX, bool ALL4, bool FN32>
+// coefficients); ALL4: a CTA a block writes all 4 streams (grid NB x 1: in place is safe; final, no MIX); TAIL: the
+// parallel tail instead of the last CTA's finish
+template <bool POST, int COLL, bool MIX, bool ALL4, bool FN32, bool TAIL = false>
 __global__ void __launch_bounds__(NT, 4) boundary_kernel(const Args a) {
     extern __shared__ float4 dyn[];                          // R x ROWB: the finish's row sums
     __shared__ __align__(16) unsigned char sm[Smem<FN32>::BYTES];
@@ -402,6 +516,10 @@ __global__ void __launch_bounds__(NT, 4) boundary_kernel(const Args a) {
     // ---- the ticket: the last CTA runs the finish ----
     __threadfence();
     __syncthreads();
+    if (TAIL) {
+        tail<MIX>(a, reinterpret_cast<float*>(dyn), reinterpret_cast<float4*>(sm), t);
+        return;
+    }
     if (t == 0) last = atomicAdd(a.cnt, 1) == static_cast<int>(gridDim.x * gridDim.y) - 1;
     __syncthreads();
     if (!last) return;
@@ -411,23 +529,31 @@ __global__ void __launch_bounds__(NT, 4) boundary_kernel(const Args a) {
 }
 
 template <bool POST, int COLL, bool MIX, bool ALL4, bool FN32>
-cudaError_t launch_one(const Args& a, cudaStream_t stream) {
+cudaError_t launch_one(const Args& a, cudaStream_t stream, bool tail = false) {
     const dim3 grid(NB, ALL4 ? 1 : 4);
-    boundary_kernel<POST, COLL, MIX, ALL4, FN32><<<grid, NT, a.R * ROWB, stream>>>(a);
+    if (tail) boundary_kernel<POST, COLL, MIX, ALL4, FN32, true><<<grid, NT, a.R * ROWB, stream>>>(a);
+    else boundary_kernel<POST, COLL, MIX, ALL4, FN32><<<grid, NT, a.R * ROWB, stream>>>(a);
     return cudaGetLastError();
 }
 
 // mode: 0 boundary (POST, pre-mix collapse, MIX), 1 site from stream 0, 2 site with a carried pre-mix, 3 final
-inline cudaError_t dispatch(const Args& a, int mode, bool fn32, cudaStream_t stream) {
+inline cudaError_t coef_launch(const Args& a, cudaStream_t stream) {
+    if (a.R < 1 || a.R > MAXR) return cudaErrorInvalidValue;
+    coef_kernel<<<a.R, NT, 0, stream>>>(a);
+    return cudaGetLastError();
+}
+
+// tail: the parallel tail (R1a) instead of the last CTA's finish (the same bits)
+inline cudaError_t dispatch(const Args& a, int mode, bool fn32, cudaStream_t stream, bool tail = false) {
     if (a.R < 1 || a.R > MAXR || a.world < 1 || a.world > 8) return cudaErrorInvalidValue;
     switch (mode * 2 + (fn32 ? 1 : 0)) {
-    case 0: return launch_one<true, 2, true, false, false>(a, stream);
-    case 1: return launch_one<true, 2, true, false, true>(a, stream);
-    case 2: return launch_one<false, 1, true, false, false>(a, stream);
-    case 3: return launch_one<false, 1, true, false, true>(a, stream);
-    case 4: return launch_one<false, 2, true, false, false>(a, stream);
-    case 5: return launch_one<false, 2, true, false, true>(a, stream);
-    case 6: case 7: return launch_one<true, 2, false, true, false>(a, stream);
+    case 0: return launch_one<true, 2, true, false, false>(a, stream, tail);
+    case 1: return launch_one<true, 2, true, false, true>(a, stream, tail);
+    case 2: return launch_one<false, 1, true, false, false>(a, stream, tail);
+    case 3: return launch_one<false, 1, true, false, true>(a, stream, tail);
+    case 4: return launch_one<false, 2, true, false, false>(a, stream, tail);
+    case 5: return launch_one<false, 2, true, false, true>(a, stream, tail);
+    case 6: case 7: return launch_one<true, 2, false, true, false>(a, stream, tail);
     default: return cudaErrorInvalidValue;
     }
 }
@@ -448,7 +574,7 @@ void dsv41_mhc_run_cuda(const at::Tensor& x, at::Tensor& xout, const at::Tensor&
                         const at::Tensor& scale, at::Tensor& part, at::Tensor& c, at::Tensor& tap,
                         const at::Tensor& nw, at::Tensor& out, at::Tensor& opre, at::Tensor& opost,
                         at::Tensor& ocomb, at::Tensor& cnt, int64_t R, int64_t mode, double eps, double hc_eps,
-                        double post_alpha, int64_t iters) {
+                        double post_alpha, int64_t iters, int64_t spin, int64_t defer) {
     using namespace dsv41_mhc;
     Args a{};
     a.x = ptr<const uint16_t>(x); a.xs = x.stride(0);
@@ -467,8 +593,23 @@ void dsv41_mhc_run_cuda(const at::Tensor& x, at::Tensor& xout, const at::Tensor&
     a.R = static_cast<int>(R);
     a.eps = static_cast<float>(eps); a.hc_eps = static_cast<float>(hc_eps);
     a.post_alpha = static_cast<float>(post_alpha); a.iters = static_cast<int>(iters);
+    a.spin = spin;                                           // < 0: today's finish; >= 0: the parallel tail
+    a.defer = spin >= 0 && defer ? 1 : 0;
     const bool fn32 = fn.numel() && fn.scalar_type() == at::kFloat;
-    C10_CUDA_CHECK(dispatch(a, static_cast<int>(mode), fn32, at::cuda::getCurrentCUDAStream()));
+    C10_CUDA_CHECK(dispatch(a, static_cast<int>(mode), fn32, at::cuda::getCurrentCUDAStream(), spin >= 0));
+}
+
+void dsv41_mhc_coef_cuda(const at::Tensor& part, const at::Tensor& base, const at::Tensor& scale, at::Tensor& opre,
+                         at::Tensor& opost, at::Tensor& ocomb, int64_t R, double eps, double hc_eps, double post_alpha,
+                         int64_t iters) {
+    using namespace dsv41_mhc;
+    Args a{};
+    a.part = ptr<float>(part); a.base = ptr<const float>(base); a.scale = ptr<const float>(scale);
+    a.opre = ptr<float>(opre); a.opost = ptr<float>(opost); a.ocomb = ptr<float>(ocomb);
+    a.R = static_cast<int>(R);
+    a.eps = static_cast<float>(eps); a.hc_eps = static_cast<float>(hc_eps);
+    a.post_alpha = static_cast<float>(post_alpha); a.iters = static_cast<int>(iters);
+    C10_CUDA_CHECK(coef_launch(a, at::cuda::getCurrentCUDAStream()));
 }
 
 std::vector<int64_t> dsv41_mhc_info_cuda(int64_t device) {   // what GB10 offers for cross-CTA reductions
@@ -496,11 +637,19 @@ std::vector<int64_t> dsv41_mhc_info_cuda(int64_t device) {   // what GB10 offers
 }
 #endif
 
-// The instantiations dispatch() launches: modes 0-2 at bf16 and fp32 fn, mode 3 (final) at bf16.
-template __global__ void dsv41_mhc::boundary_kernel<true, 2, true, false, false>(const dsv41_mhc::Args);
-template __global__ void dsv41_mhc::boundary_kernel<true, 2, true, false, true>(const dsv41_mhc::Args);
-template __global__ void dsv41_mhc::boundary_kernel<false, 1, true, false, false>(const dsv41_mhc::Args);
-template __global__ void dsv41_mhc::boundary_kernel<false, 1, true, false, true>(const dsv41_mhc::Args);
-template __global__ void dsv41_mhc::boundary_kernel<false, 2, true, false, false>(const dsv41_mhc::Args);
-template __global__ void dsv41_mhc::boundary_kernel<false, 2, true, false, true>(const dsv41_mhc::Args);
-template __global__ void dsv41_mhc::boundary_kernel<true, 2, false, true, false>(const dsv41_mhc::Args);
+// The instantiations dispatch() launches: modes 0-2 at bf16 and fp32 fn, mode 3 (final) at bf16, each with
+// R1's parallel tail off and on (coef_kernel is not a template: always emitted).
+template __global__ void dsv41_mhc::boundary_kernel<true, 2, true, false, false, false>(const dsv41_mhc::Args);
+template __global__ void dsv41_mhc::boundary_kernel<true, 2, true, false, false, true>(const dsv41_mhc::Args);
+template __global__ void dsv41_mhc::boundary_kernel<true, 2, true, false, true, false>(const dsv41_mhc::Args);
+template __global__ void dsv41_mhc::boundary_kernel<true, 2, true, false, true, true>(const dsv41_mhc::Args);
+template __global__ void dsv41_mhc::boundary_kernel<false, 1, true, false, false, false>(const dsv41_mhc::Args);
+template __global__ void dsv41_mhc::boundary_kernel<false, 1, true, false, false, true>(const dsv41_mhc::Args);
+template __global__ void dsv41_mhc::boundary_kernel<false, 1, true, false, true, false>(const dsv41_mhc::Args);
+template __global__ void dsv41_mhc::boundary_kernel<false, 1, true, false, true, true>(const dsv41_mhc::Args);
+template __global__ void dsv41_mhc::boundary_kernel<false, 2, true, false, false, false>(const dsv41_mhc::Args);
+template __global__ void dsv41_mhc::boundary_kernel<false, 2, true, false, false, true>(const dsv41_mhc::Args);
+template __global__ void dsv41_mhc::boundary_kernel<false, 2, true, false, true, false>(const dsv41_mhc::Args);
+template __global__ void dsv41_mhc::boundary_kernel<false, 2, true, false, true, true>(const dsv41_mhc::Args);
+template __global__ void dsv41_mhc::boundary_kernel<true, 2, false, true, false, false>(const dsv41_mhc::Args);
+template __global__ void dsv41_mhc::boundary_kernel<true, 2, false, true, false, true>(const dsv41_mhc::Args);

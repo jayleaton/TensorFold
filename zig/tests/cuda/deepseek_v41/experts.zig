@@ -194,7 +194,7 @@ pub fn decodeChain(gpu: Gpu, k: *const dsv41.Kernels, dir: []const u8) !void {
     try same(gpu, fx, out, "out", "combine");
     try y.fill8(0, null);
     try out.fill8(0, null);
-    try o.downCombine(z.ptr, pick.ptr, svh_d.ptr, y.ptr, wts.ptr, out.ptr, R, P, D, sk_d, slots, E);
+    try o.downCombine(z.ptr, pick.ptr, svh_d.ptr, y.ptr, wts.ptr, out.ptr, R, P, D, sk_d, slots, E, false);
     try stream.synchronize();
     try same(gpu, fx, out, "out", "down_combine");
     dn.z = 0;

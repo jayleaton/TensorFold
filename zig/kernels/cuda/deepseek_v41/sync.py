@@ -1,12 +1,13 @@
 """Writes (--write) or checks (default) zig/kernels/cuda/deepseek_v41: verbatim copies of the Python engine's
-DeepSeek-V4.1 device code (tensorfold-dsquant, branch dsv41-quant-e2), torch host code cut, plus the explicit
+DeepSeek-V4.1 device code at git refs (SOURCES: dsv41-quant-e2, and the branches built on it that are not merged yet:
+x3gm v2 and the R1 decode kernels; each copy names its source), torch host code cut, plus the explicit
 instantiations the Python wrappers launch.
 
 Same lines, same namespaces (so the same mangled symbols and the same SASS as the Python extensions), same nvcc flags
 (zig/build/cuda.zig). Each copy's header names its source and the source's git blob hash; `--check` regenerates every
 copy from the Python tree and fails on any difference.
 
-usage: python3 sync.py [--write] [--src <tensorfold-dsquant checkout>]   (default $TF_DSV41_PY_SRC)
+usage: python3 sync.py [--write] [--base <repo>:<ref>]   (the base source; the others: SOURCES)
 """
 
 from __future__ import annotations
@@ -15,11 +16,19 @@ import argparse
 import hashlib
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-DEFAULT_SRC = "/home/sireggy/Documents/Projects/spark-work/tensorfold-dsquant"
+WORK = "/home/sireggy/Documents/Projects/spark-work"
+# (repo, ref) by source key. When a branch lands in dsv41-quant-e2, point its files back at "base".
+SOURCES = {
+    "base": (f"{WORK}/tensorfold-dsquant", "dsv41-quant-e2"),
+    "x3gm2": (f"{WORK}/tensorfold-x3gm1", "dsv41-x3gm1"),      # x3gm v2 (gm2_kernel), dsq-x3gm-1
+    "r1": (f"{WORK}/tensorfold-decode1", "14310de"),   # R1 decode as handed over (dsv41-decode1 moves on: R1c)
+}
+FROM = {"x3gm.cu": "x3gm2", "attn_cuda.cu": "r1", "mhc_cuda.cu": "r1", "exl3_experts.cu": "r1"}
 EXL3 = "src/tensorfold/cuda/exl3"
 FAM = "src/tensorfold/families/deepseek_v41/cuda"
 
@@ -63,6 +72,12 @@ def footer_x3gm() -> str:
                "const dsv41_x3gm::Args);\n")
     out.append("#define DSV41_X3GM_DN(K2, CFG) template __global__ void dsv41_x3gm::gm_kernel<1, 1, K2, CFG>("
                "const dsv41_x3gm::Args);\n")
+    out.append("// v2 (gm2_kernel: every width in one launch), the tiles launch2 takes: gate/up GM_GU0 / GM_GU1 at either\n"
+               "// input mode, down GM_DN0\n")
+    for xm in (1, 2):
+        for c in (0, 1):
+            out.append(f"template __global__ void dsv41_x3gm::gm2_kernel<2, {xm}, GM_GU{c}>(const dsv41_x3gm::Args);\n")
+    out.append("template __global__ void dsv41_x3gm::gm2_kernel<1, 1, GM_DN0>(const dsv41_x3gm::Args);\n")
     for k2 in X3GM_K2S:
         for xm in (1, 2):
             for c in range(6):
@@ -90,6 +105,10 @@ def footer_exl3_experts() -> str:
             out.append(f"TF_EXL3X_INST({nt}, {w}, {pf}, {lo}, {hi})\n")
     for k2 in range(2, 17):
         out.append(f"template __global__ void tf_exl3x::dequant_kernel<2, {k2}>(const uint32_t*, half*, int, int);\n")
+    out.append("// down_combine_kernel at both outputs the binding takes (fp32, bf16: R1's TF_DSV41_MOE_BF16)\n")
+    for t in ("float", "__nv_bfloat16"):
+        out.append(f"template __global__ void tf_exl3_experts::down_combine_kernel<{t}>(const float*, const int*, "
+                   f"const half*, float*, \\\n    const float*, {t}*, int, int, int, int, int);\n")
     out.append("// rot_in_kernel for both inputs the binding takes\n")
     for t in ("__nv_bfloat16", "half"):
         out.append(f"template __global__ void tf_exl3_experts::rot_in_kernel<{t}>(const {t}*, int, const int*, "
@@ -143,6 +162,12 @@ def footer_attn() -> str:
         for rows in ("false", "true"):
             for hi in ("false", "true"):
                 out.append(f"template __global__ void dsv41_attn::attn_kernel<{kw}, {rows}, {hi}>(dsv41_attn::Args);\n")
+    out.append("// R1: dispatch_split's split_kernel<KW, ROWS, HAS_HI, P> at P 1 and 4 (a cluster of 4)\n")
+    for p in (1, 4):
+        for kw in (2, 4):
+            for rows in ("false", "true"):
+                for hi in ("false", "true"):
+                    out.append(f"template __global__ void dsv41_attn::split_kernel<{kw}, {rows}, {hi}, {p}>(dsv41_attn::Args);\n")
     return "".join(out)
 
 
@@ -151,11 +176,13 @@ MHC_INST = (("true", 2, "true", "false"), ("false", 1, "true", "false"), ("false
 
 
 def footer_mhc() -> str:
-    out = ["// The instantiations dispatch() launches: modes 0-2 at bf16 and fp32 fn, mode 3 (final) at bf16.\n"]
+    out = ["// The instantiations dispatch() launches: modes 0-2 at bf16 and fp32 fn, mode 3 (final) at bf16, each with\n"
+           "// R1's parallel tail off and on (coef_kernel is not a template: always emitted).\n"]
     for i, (post, coll, mix, all4) in enumerate(MHC_INST):
         for fn32 in (("false", "true") if i < 3 else ("false",)):
-            out.append(f"template __global__ void dsv41_mhc::boundary_kernel<{post}, {coll}, {mix}, {all4}, {fn32}>("
-                       "const dsv41_mhc::Args);\n")
+            for tail in ("false", "true"):
+                out.append(f"template __global__ void dsv41_mhc::boundary_kernel<{post}, {coll}, {mix}, {all4}, {fn32}, "
+                           f"{tail}>(const dsv41_mhc::Args);\n")
     return "".join(out)
 
 
@@ -199,20 +226,20 @@ PRELUDE = {"x3seg.cu": "DSV41_X3SEG_NO_TORCH", "dense3.cu": "DSV41_DENSE3_NO_TOR
 COPIES: dict[str, tuple[str, tuple[tuple[int, int], ...], dict[int, str], str]] = {
     "decode.cuh": (f"{EXL3}/decode.cuh", ((1, 162),), {}, ""),
     "experts_grouped.cuh": (f"{EXL3}/experts_grouped.cuh", ((1, 307), (356, 356)), {}, ""),
-    "exl3_experts.cu": (f"{EXL3}/experts.cu", ((1, 239),), {11: "namespace tf_exl3_experts {\n",
-                                                            239: "}  // namespace tf_exl3_experts\n"},
+    "exl3_experts.cu": (f"{EXL3}/experts.cu", ((1, 244),), {11: "namespace tf_exl3_experts {\n",
+                                                            244: "}  // namespace tf_exl3_experts\n"},
                         "footer_exl3_experts"),
     "x3ld.cu": (f"{FAM}/x3ld.cu", ((1, 251), (297, 297)), {}, "footer_x3ld"),
     "x3pf.cu": (f"{FAM}/x3pf.cu", ((1, 204), (240, 240)), {}, "footer_x3pf"),
-    "x3gm.cu": (f"{FAM}/x3gm.cu", ((1, 39), (45, 353), (374, 391), (423, 424)), {}, "footer_x3gm"),
+    "x3gm.cu": (f"{FAM}/x3gm.cu", ((1, 39), (45, 628), (649, 666), (732, 733)), {}, "footer_x3gm"),
     "linear.cu": (f"{EXL3}/linear.cu", ((1, 283), (288, 288)), {14: "namespace tf_exl3_linear {\n",
                                                                   288: "}  // namespace tf_exl3_linear\n"},
                   "footer_linear"),
     "x3seg.cu": (f"{FAM}/x3seg.cu", ((1, 430),), {}, "footer_x3seg"),
     "dense3.cu": (f"{FAM}/dense3.cu", ((1, 402),), {}, "footer_dense3"),
-    "attn_cuda.cu": (f"{FAM}/csa2/attn_cuda.cu", ((1, 482),), {}, "footer_attn"),
+    "attn_cuda.cu": (f"{FAM}/csa2/attn_cuda.cu", ((1, 1053),), {}, "footer_attn"),
     "topk_cuda.cu": (f"{FAM}/csa2/topk_cuda.cu", ((1, 304),), {}, ""),
-    "mhc_cuda.cu": (f"{FAM}/mhc_cuda.cu", ((1, 494),), {}, "footer_mhc"),
+    "mhc_cuda.cu": (f"{FAM}/mhc_cuda.cu", ((1, 635),), {}, "footer_mhc"),
     "mhc_pf.cu": (f"{FAM}/mhc_pf.cu", ((1, 341),), {}, "footer_mhc_pf"),
     "router_gemv.cu": (f"{FAM}/router_gemv.cu", ((1, 532),), {}, "footer_rg"),
     "engram_gate.cu": (f"{FAM}/engram_gate.cu", ((1, 60),), {15: "namespace dsv41_engram_gate {\n",
@@ -237,9 +264,15 @@ def blob_hash(data: bytes) -> str:
     return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
 
 
-def render(src_root: Path, name: str) -> str:
+def read(src_root: Path, ref: str, rel: str) -> bytes:
+    """A file's bytes at `ref` (never the working tree: the copies follow a branch, not whatever is checked out)."""
+    return subprocess.run(["git", "-C", str(src_root), "show", f"{ref}:{rel}"], check=True, capture_output=True).stdout
+
+
+def render(base: tuple[str, str], name: str) -> str:
     rel, ranges, replace, footer = COPIES[name]
-    data = (src_root / rel).read_bytes()
+    src_root, ref = base if FROM.get(name, "base") == "base" else SOURCES[FROM[name]]
+    data = read(Path(src_root), ref, rel)
     src = lines_of(data.decode())
     spans = ", ".join(f"{a}-{b}" if a != b else f"{a}" for a, b in ranges)
     whole = name in PRELUDE
@@ -248,7 +281,7 @@ def render(src_root: Path, name: str) -> str:
     macro = PRELUDE.get(name)
     what = (f"the whole file, {macro} defined" if macro else "the whole file") if whole else \
         f"lines {spans}; torch includes and host code cut"
-    out = [f"// Device code of {rel} (git blob {blob_hash(data)[:12]}; {what}),\n",
+    out = [f"// Device code of {rel} (git blob {blob_hash(data)[:12]} at {ref}; {what}),\n",
            "// generated and checked by zig/kernels/cuda/deepseek_v41/sync.py. Do not edit: change the Python source.\n"]
     if macro:
         out.append(f"#define {macro}\n")
@@ -272,12 +305,20 @@ def render(src_root: Path, name: str) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--write", action="store_true")
-    ap.add_argument("--src", default=os.environ.get("TF_DSV41_PY_SRC", DEFAULT_SRC))
+    ap.add_argument("--base", default=":".join(SOURCES["base"]))
+    ap.add_argument("--sources", action="store_true", help="print 'copy key repo ref' a line (sass_check.sh reads it)")
     args = ap.parse_args()
-    root = Path(args.src)
+    repo, _, ref = args.base.rpartition(":")
+    base = (repo, ref)
+    if args.sources:
+        for name in COPIES:
+            key = FROM.get(name, "base")
+            r, f = base if key == "base" else SOURCES[key]
+            print(name, key, r, f)
+        return 0
     bad = 0
     for name in COPIES:
-        text = render(root, name)
+        text = render(base, name)
         path = HERE / name
         if args.write:
             path.write_text(text)

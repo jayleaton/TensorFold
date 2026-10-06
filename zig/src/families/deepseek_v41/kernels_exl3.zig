@@ -66,7 +66,9 @@ const up_sym = struct {
     const gateup_epilogue = "_ZN15tf_exl3_experts22gateup_epilogue_kernelEPKfPKiPK6__halfS6_S6_PS4_iiiifi";
     const down_epilogue = "_ZN15tf_exl3_experts20down_epilogue_kernelEPKfPKiPK6__halfPfiiii";
     const combine = "_ZN15tf_exl3_experts14combine_kernelEPKfS1_Pfii";
-    const down_combine = "_ZN15tf_exl3_experts19down_combine_kernelEPKfPKiPK6__halfPfS1_S7_iiiii";
+    // templated on the output (R1: fp32, or bf16 rounded as stored = fp32 then .to(bf16))
+    const down_combine_f32 = "_ZN15tf_exl3_experts19down_combine_kernelIfEEvPKfPKiPK6__halfPfS2_PT_iiiii";
+    const down_combine_bf16 = "_ZN15tf_exl3_experts19down_combine_kernelI13__nv_bfloat16EEvPKfPKiPK6__halfPfS3_PT_iiiii";
 };
 
 /// x3gm's widths (x3gm.K2S) and tile tables (MTL, NG, KS, NSA, NGR) by configuration id (x3gm.cu GM_GU* / GM_DN*).
@@ -263,7 +265,7 @@ pub const Functions = struct {
     gateup_epilogue: cuda.Function,
     down_epilogue: cuda.Function,
     combine: cuda.Function,
-    down_combine: cuda.Function,
+    down_combine: [2]cuda.Function, // fp32, bf16 out
     gm_gu: [gm_k2s.len][2][gu_tiles.len]Gm, // [k2][xm - 1][cfg]
     gm_dn: [gm_k2s.len][dn_tiles.len]Gm,
     gm_rot: [2][2]cuda.Function, // [bf16, fp16][mats - 1]
@@ -291,7 +293,7 @@ pub const Functions = struct {
         f.gateup_epilogue = try experts.function(up_sym.gateup_epilogue);
         f.down_epilogue = try experts.function(up_sym.down_epilogue);
         f.combine = try experts.function(up_sym.combine);
-        f.down_combine = try experts.function(up_sym.down_combine);
+        f.down_combine = .{ try experts.function(up_sym.down_combine_f32), try experts.function(up_sym.down_combine_bf16) };
         inline for (gm_k2s, 0..) |k2, ki| {
             inline for (.{ 1, 2 }) |xm| inline for (0..gu_tiles.len) |c| {
                 f.gm_gu[ki][xm - 1][c] = try gmResolve(x3gm, gmGuSymbol(xm, k2, c), GmShape.of(2, xm, k2, gu_tiles[c]), optin);
@@ -483,12 +485,13 @@ pub const Ops = struct {
     }
 
     /// exl3x_down_combine_cuda: down_epilogue then combine in one launch, the same bits.
-    pub fn downCombine(o: Ops, z: u64, pick: u64, svh_d: u64, y: u64, wts: u64, out: u64, rows: usize, P: usize, D: usize, SK: usize, slots: usize, E: usize) !void {
+    /// `out_bf16`: out is bf16, each sum rounded to nearest even as stored (the binding dispatches on out's dtype).
+    pub fn downCombine(o: Ops, z: u64, pick: u64, svh_d: u64, y: u64, wts: u64, out: u64, rows: usize, P: usize, D: usize, SK: usize, slots: usize, E: usize, out_bf16: bool) !void {
         if (slots > 32) return error.Shape;
         var a: cuda.Args = .{};
         for ([_]u64{ z, pick, svh_d, y, wts, out }) |v| a.add(v);
         for ([_]usize{ P, D, SK, E, slots }) |v| a.add(int(v));
-        try go(o.f.down_combine, o.s, .{ rows, D / 128, 1 }, 32 * slots, 0, false, &a);
+        try go(o.f.down_combine[@intFromBool(out_bf16)], o.s, .{ rows, D / 128, 1 }, 32 * slots, 0, false, &a);
     }
 
     /// exl3x_dequant_cuda at cb 2: W_q [K, N] fp16 through the grouped kernels' lane decode (tests).

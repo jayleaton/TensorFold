@@ -65,6 +65,24 @@ pub const attn = struct {
         return std.fmt.comptimePrint("_ZN10dsv41_attn11attn_kernelILi{d}ELb{d}ELb{d}EEEvNS_4ArgsE", .{ kw, @intFromBool(rows), @intFromBool(hi) });
     }
 
+    /// R1 split_kernel<KW, ROWS, HAS_HI, P>: P CTAs a chunk, a cluster of P (P 4); the same bits as attn_kernel.
+    pub fn splitSymbol(comptime kw: u32, comptime rows: bool, comptime hi: bool, comptime p: u32) [:0]const u8 {
+        return std.fmt.comptimePrint("_ZN10dsv41_attn12split_kernelILi{d}ELb{d}ELb{d}ELi{d}EEEvNS_4ArgsE", .{ kw, @intFromBool(rows), @intFromBool(hi), p });
+    }
+
+    /// Split<P>::SMEM: P 1 the same as attn_kernel's, P 4 the S rows' B pairs beside the PV slice.
+    pub fn splitSmem(p: u32) u32 {
+        return if (p == 4) 100864 else SMEM;
+    }
+
+    /// The ticket's ranks a (row, head tile) once any launch splits: the ticket buffer must hold R H / 16 * MAXP.
+    pub const MAXP = 4;
+
+    /// attn_cuda.split(R) (TF_DSV41_ATTN_SPLIT on): P 4 up to `split_rows` rows (2), P 1 above.
+    pub fn splitFor(rows: usize, split_rows: usize) u32 {
+        return if (rows <= split_rows) 4 else 1;
+    }
+
     /// dispatch(): the instance index (kw 4 | rows | has_hi), after its checks.
     pub fn instance(a: Args, kw: u32, rows: bool, has_hi: bool) Error!usize {
         if (a.R < 1 or @rem(a.H, BMQ) != 0 or a.ring < WINDOW or (a.ring & (a.ring - 1)) != 0) return error.Shape;
@@ -131,11 +149,15 @@ pub const mhc = struct {
         hc_eps: f32 = 0,
         post_alpha: f32 = 0,
         iters: c_int = 0,
+        spin: i64 = -1, // R1 tail: SM cycles a CTA waits for the last arrival (the binding's -1: today's finish)
+        @"defer": c_int = 0, // R1 tail: the coefficient items run in coef_kernel on a side stream
     };
 
     comptime {
-        std.debug.assert(@offsetOf(Args, "post") == 48 and @offsetOf(Args, "nwbf16") == 136 and @offsetOf(Args, "R") == 184 and @sizeOf(Args) == 208);
+        std.debug.assert(@offsetOf(Args, "post") == 48 and @offsetOf(Args, "nwbf16") == 136 and @offsetOf(Args, "R") == 184 and @offsetOf(Args, "spin") == 208 and @sizeOf(Args) == 224);
     }
+
+    pub const coef_symbol = "_ZN9dsv41_mhc11coef_kernelENS_4ArgsE";
 
     /// (POST, COLL, MIX, ALL4, FN32) of dispatch's cases, by mode * 2 + fn32 (mode 3 ignores fn32).
     pub const instances = [_]struct { post: bool, coll: u32, mix: bool, all4: bool, fn32: bool }{
@@ -148,9 +170,10 @@ pub const mhc = struct {
         .{ .post = true, .coll = 2, .mix = false, .all4 = true, .fn32 = false },
     };
 
-    pub fn symbol(comptime i: usize) [:0]const u8 {
+    /// boundary_kernel<POST, COLL, MIX, ALL4, FN32, TAIL> (TAIL: R1's parallel tail, default false: still mangled)
+    pub fn symbol(comptime i: usize, comptime tail: bool) [:0]const u8 {
         const s = instances[i];
-        return std.fmt.comptimePrint("_ZN9dsv41_mhc15boundary_kernelILb{d}ELi{d}ELb{d}ELb{d}ELb{d}EEEvNS_4ArgsE", .{ @intFromBool(s.post), s.coll, @intFromBool(s.mix), @intFromBool(s.all4), @intFromBool(s.fn32) });
+        return std.fmt.comptimePrint("_ZN9dsv41_mhc15boundary_kernelILb{d}ELi{d}ELb{d}ELb{d}ELb{d}ELb{d}EEEvNS_4ArgsE", .{ @intFromBool(s.post), s.coll, @intFromBool(s.mix), @intFromBool(s.all4), @intFromBool(s.fn32), @intFromBool(tail) });
     }
 
     /// dispatch(): mode 0 boundary, 1 site from stream 0, 2 site with a carried pre-mix, 3 final.
@@ -384,8 +407,10 @@ pub const pfd = struct {
 
 pub const Functions = struct {
     attn: [8]cuda.Function,
+    attn_split: [2][8]cuda.Function, // [P 1, P 4][instance]
     topk: cuda.Function,
-    mhc: [mhc.instances.len]cuda.Function,
+    mhc: [2][mhc.instances.len]cuda.Function, // [tail][instance]
+    mhc_coef: cuda.Function,
     mhc_pf: [mhc_pf.instances.len]cuda.Function,
     gemv: [rg.rts.len][rg.wide.len]cuda.Function,
     narrow: [rg.rts.len][rg.narrow.len]cuda.Function,
@@ -408,9 +433,17 @@ pub const Functions = struct {
         inline for (f.attn, 0..) |fun, i| {
             if (!try fitShared(fun, attn.symbol(if (i >= 4) 4 else 2, (i & 2) != 0, (i & 1) != 0), attn.SMEM, optin)) return error.SharedMemoryTooSmall;
         }
+        inline for (.{ 1, 4 }, 0..) |p, pi| inline for (0..8) |i| {
+            const name = attn.splitSymbol(if (i >= 4) 4 else 2, (i & 2) != 0, (i & 1) != 0, p);
+            f.attn_split[pi][i] = try m_attn.function(name);
+            if (!try fitShared(f.attn_split[pi][i], name, attn.splitSmem(p), optin)) return error.SharedMemoryTooSmall;
+        };
         f.topk = try m_topk.function(topk.symbol);
         if (!try fitShared(f.topk, topk.symbol, topk.smem(topk.MAXEPT), optin)) return error.SharedMemoryTooSmall;
-        inline for (0..mhc.instances.len) |i| f.mhc[i] = try m_mhc.function(mhc.symbol(i));
+        inline for (.{ false, true }, 0..) |tail, ti| inline for (0..mhc.instances.len) |i| {
+            f.mhc[ti][i] = try m_mhc.function(mhc.symbol(i, tail));
+        };
+        f.mhc_coef = try m_mhc.function(mhc.coef_symbol);
         inline for (0..mhc_pf.instances.len) |i| {
             f.mhc_pf[i] = try m_mhc_pf.function(mhc_pf.symbol(i));
             if (!try fitShared(f.mhc_pf[i], mhc_pf.symbol(i), mhc_pf.smem(mhc_pf.instances[i].fn32), optin)) return error.SharedMemoryTooSmall;
@@ -485,11 +518,20 @@ pub const Ops = struct {
 
     /// dsv41_attn_run_cuda: `rows` = the slots table is given (sl), `has_hi` = window ends are given; kw: the Triton
     /// layout's k width (attn_cuda.py reads it from Triton: 4 on Triton 3.8).
-    pub fn attention(o: Ops, a: attn.Args, kw: u32, rows: bool, has_hi: bool) !void {
+    /// `split`: 0 attn_kernel (today's launch), 1 / 4 R1's split_kernel with that many CTAs a chunk (a cluster of 4),
+    /// the same bits; with split > 0 the ticket holds R H / 16 * attn.MAXP ints.
+    pub fn attention(o: Ops, a: attn.Args, kw: u32, rows: bool, has_hi: bool, split: u32) !void {
         const i = try attn.instance(a, kw, rows, has_hi);
         var args: cuda.Args = .{};
         args.add(a);
-        try o.go(o.f.attn[i], .{ attn.NCH, @intCast(@divTrunc(a.H, attn.BMQ)), @intCast(a.R) }, attn.NT, attn.SMEM, null, &args);
+        const hb: usize = @intCast(@divTrunc(a.H, attn.BMQ));
+        const R: usize = @intCast(a.R);
+        switch (split) {
+            0 => try o.go(o.f.attn[i], .{ attn.NCH, hb, R }, attn.NT, attn.SMEM, null, &args),
+            1 => try o.go(o.f.attn_split[0][i], .{ attn.NCH, hb, R }, attn.NT, attn.splitSmem(1), null, &args),
+            4 => try o.go(o.f.attn_split[1][i], .{ attn.NCH * 4, hb, R }, attn.NT, attn.splitSmem(4), .{ .x = 4 }, &args),
+            else => return error.Unsupported,
+        }
     }
 
     /// dsv41_topk_run_cuda: `jobs` 1-2 selections, R rows, CL CTAs a cluster, ept entries a thread.
@@ -501,11 +543,24 @@ pub const Ops = struct {
     }
 
     /// dsv41_mhc_run_cuda: `fn32` = fn is fp32.
+    /// `a.spin` >= 0: R1's parallel tail (cnt holds 3 self-resetting ints); `a.defer` = 1 then leaves the
+    /// coefficients to mhcCoef on a side stream, joined before any reader of opre / opost / ocomb.
     pub fn mhcBoundary(o: Ops, a: mhc.Args, mode: u32, fn32: bool) !void {
         const i = try mhc.instance(a, mode, fn32);
+        var b = a;
+        if (b.spin < 0) b.@"defer" = 0; // as the binding: defer only with the tail
+        var args: cuda.Args = .{};
+        args.add(b);
+        try o.go(o.f.mhc[@intFromBool(b.spin >= 0)][i], .{ mhc.NB, if (mhc.instances[i].all4) 1 else 4, 1 }, mhc.NT, @intCast(@as(u32, @intCast(a.R)) * mhc.ROWB), null, &args);
+    }
+
+    /// dsv41_mhc_coef_cuda (R1): the next site's coefficients of a deferred boundary, a CTA a row; reads part, base,
+    /// scale, R, eps, hc_eps, post_alpha, iters and writes opre / opost / ocomb.
+    pub fn mhcCoef(o: Ops, a: mhc.Args) !void {
+        if (a.R < 1 or a.R > mhc.MAXR) return error.Shape;
         var args: cuda.Args = .{};
         args.add(a);
-        try o.go(o.f.mhc[i], .{ mhc.NB, if (mhc.instances[i].all4) 1 else 4, 1 }, mhc.NT, @intCast(@as(u32, @intCast(a.R)) * mhc.ROWB), null, &args);
+        try o.go(o.f.mhc_coef, .{ @intCast(a.R), 1, 1 }, mhc.NT, 0, null, &args);
     }
 
     /// dsv41_mhc_pf_run_cuda: `tap` = a tap buffer is given.

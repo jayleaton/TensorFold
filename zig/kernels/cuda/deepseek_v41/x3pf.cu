@@ -1,4 +1,4 @@
-// Device code of src/tensorfold/families/deepseek_v41/cuda/x3pf.cu (git blob 3617e7173522 at dsv41-x3gm1; lines 1-204, 240; torch includes and host code cut),
+// Device code of src/tensorfold/families/deepseek_v41/cuda/x3pf.cu (git blob 3617e7173522 at dsv41-quant-e2; lines 1-204, 240; torch includes and host code cut),
 // generated and checked by zig/kernels/cuda/deepseek_v41/sync.py. Do not edit: change the Python source.
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Jay Leaton. The DeepSeek-V4.1-Flash family of TensorFold (Apache-2.0): see THIRD_PARTY_NOTICES.md.

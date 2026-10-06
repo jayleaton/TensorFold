@@ -1,4 +1,4 @@
-// Device code of src/tensorfold/cuda/exl3/experts.cu (git blob 28c88af332c6 at dsv41-x3gm1; lines 1-239; torch includes and host code cut),
+// Device code of src/tensorfold/cuda/exl3/experts.cu (git blob 8ce66ca83bce at 14310de; lines 1-244; torch includes and host code cut),
 // generated and checked by zig/kernels/cuda/deepseek_v41/sync.py. Do not edit: change the Python source.
 // EXL3 routed experts, any codebook and a width per expert: fixed-order splits, slots and butterflies, no atomics; 4-bit mcg matches GLM's kernel bit for bit.
 
@@ -191,9 +191,14 @@ __global__ void combine_kernel(const float* __restrict__ y, const float* __restr
 }
 
 // down_epilogue_kernel then combine_kernel in one launch, the same arithmetic in the same order (the same bits).
+__device__ __forceinline__ void store_out(float* o, float v) { *o = v; }
+__device__ __forceinline__ void store_out(__nv_bfloat16* o, float v) { *o = __float2bfloat16_rn(v); }
+
+// OutT bf16: the fp32 sum rounded to nearest even as it is stored, the bits of an fp32 out then .to(bfloat16)
+template <typename OutT>
 __global__ void down_combine_kernel(const float* __restrict__ Z, const int* __restrict__ pick,
                                     const half* __restrict__ svh_d, float* __restrict__ y,
-                                    const float* __restrict__ wts, float* __restrict__ out, int P, int D, int SK,
+                                    const float* __restrict__ wts, OutT* __restrict__ out, int P, int D, int SK,
                                     int E, int slots) {
     __shared__ float4 part[32][32];                 // [slot][lane]: the slot's 4 outputs of the lane
     const int r = blockIdx.x, blk = blockIdx.y;
@@ -233,7 +238,7 @@ __global__ void down_combine_kernel(const float* __restrict__ Z, const int* __re
         acc[3] = fmaf(w, u.w, acc[3]);
     }
 #pragma unroll
-    for (int j = 0; j < 4; ++j) out[(size_t)r * D + n + j] = acc[j];
+    for (int j = 0; j < 4; ++j) store_out(out + (size_t)r * D + n + j, acc[j]);
 }
 
 }  // namespace tf_exl3_experts
@@ -267,6 +272,11 @@ template __global__ void tf_exl3x::dequant_kernel<2, 13>(const uint32_t*, half*,
 template __global__ void tf_exl3x::dequant_kernel<2, 14>(const uint32_t*, half*, int, int);
 template __global__ void tf_exl3x::dequant_kernel<2, 15>(const uint32_t*, half*, int, int);
 template __global__ void tf_exl3x::dequant_kernel<2, 16>(const uint32_t*, half*, int, int);
+// down_combine_kernel at both outputs the binding takes (fp32, bf16: R1's TF_DSV41_MOE_BF16)
+template __global__ void tf_exl3_experts::down_combine_kernel<float>(const float*, const int*, const half*, float*, \
+    const float*, float*, int, int, int, int, int);
+template __global__ void tf_exl3_experts::down_combine_kernel<__nv_bfloat16>(const float*, const int*, const half*, float*, \
+    const float*, __nv_bfloat16*, int, int, int, int, int);
 // rot_in_kernel for both inputs the binding takes
 template __global__ void tf_exl3_experts::rot_in_kernel<__nv_bfloat16>(const __nv_bfloat16*, int, const int*, const half*, const half*, half*, \
     half*, int, int, int);

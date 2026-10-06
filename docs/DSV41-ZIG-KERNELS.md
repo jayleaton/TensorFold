@@ -31,6 +31,23 @@ Paths below: `F` = `src/tensorfold/families/deepseek_v41/cuda`, `X` = `src/tenso
 - **Replay.** `kernels_replay.call(k, stream, ext, func, args, kwargs, scratch)` re-issues a captured pybind call
   through these launches. The M1 block gate uses it to compare every `.cu` call of a real forward with Python's.
 
+### 1.0 Sources (sync.py SOURCES)
+
+Copies are read at git refs, never from a working tree.
+
+| key | repo, ref | files |
+| --- | --- | --- |
+| base | `tensorfold-dsquant`, `dsv41-quant-e2` (0cf4ea1) | everything else |
+| x3gm2 | `tensorfold-x3gm1`, `dsv41-x3gm1` (dsq-x3gm-1's x3gm v2, not merged) | `x3gm.cu` |
+| r1 | `tensorfold-decode1`, `14310de` (the R1 decode kernels as handed over, not merged) | `attn_cuda.cu`, `mhc_cuda.cu`, `exl3_experts.cu` |
+
+When a branch lands in `dsv41-quant-e2`, point its files back at `base` (`FROM` in `sync.py`).
+
+`dsv41-decode1` has moved on to R1c (router prune, q RoPE in the split kernel, the RMS fold). Those wait until they
+are handed over.
+
+`sass_check.sh` exports each source at its ref (`git archive`) before compiling the Python side.
+
 ### 1.1 Exactness evidence
 
 | check | how | where it stands |
@@ -189,6 +206,53 @@ Each item gets a small `.cu` here (ours, checked bit-equal to torch on fixtures)
 | casts: `q.to(fp32)` before `_rope`, partials `.to(bf16)`, `kit_weights` fp32 -> fp16 -> fp32 | decode | folded into the consumers where the Python path allows, else torch_ops pointwise |
 | staging ring `index_copy_`, replay stash `cat` / `clone`, shadow-slot `copy_` | prefill, tree verify | device memcpy (`cuMemcpyAsync`); no kernel |
 
+## 3.2b x3gm v2 and the R1 decode kernels
+
+**x3gm v2** (`gm2_kernel`, dsq-x3gm-1, `ENGINE-X3GM2.md`) is the primary prefill x3gm. It runs one launch a
+projection over every width and is bit-identical to `gm_kernel` (it skips predicated mma and computes addresses once
+an item). It measured 23-38 % faster at 48 SMs.
+
+- **Host contract** (`x3gm._run_v2`):
+  - rot;
+  - ONE plan over all pairs (`gmPlan`, bm 64);
+  - `gm2Gateup` (cfg `gmTuned2`: 0 with one rotated input, else 1);
+  - `gm2Down` (cfg 0);
+  - `combine`.
+- **k2e:** an int32 [E + 1] width table a projection. Uniform: one constant; ragged: per expert, each in K2S
+  (`gm2WidthsOk`).
+- **Ticket:** zeroed before each launch.
+- **Args:** gains `k2e` after `tp1`, so `GmArgs` is now 160 B; gm_kernel launches leave it 0.
+- **`gm2Shape`** ports `Smem2` / `Ring2`, the widest width's ring cut to keep 2 CTAs an SM. It is checked equal to the
+  compiled constexprs for all five instances.
+- **Spills:** the gate/up instances spill 24-108 B, in Python too, and outside the k loops.
+
+**R1 decode** (`docs/DSV41-DECODE-R1.md` of the decode1 clone). Every knob off is today's launches, and all
+variants give the same bits.
+
+- **Attention:** `ops.attention(..., split)`. 0 is `attn_kernel`. 1 / 4 is `split_kernel<KW, ROWS, HAS_HI, P>`:
+  - grid (5 P, H / 16, R); P 4 launches as a cluster of 4;
+  - shared memory 98,816 / 100,864 B;
+  - with split > 0 the ticket holds R H / 16 x `attn.MAXP` ints;
+  - policy `attn.splitFor(R, 2)`: P 4 up to 2 rows, P 1 above.
+- **mHC:**
+  - `mhc.Args` gains `spin` (i64, -1 = today's finish) and `defer`.
+  - `mhcBoundary` picks the TAIL instance when spin >= 0; the counter is then 3 self-resetting ints.
+  - With defer = 1, `mhcCoef` (one CTA a row) runs the coefficients on a side stream forked after the boundary and
+    joined before the next reader of opre / opost / ocomb.
+  - Note: TAIL is a template parameter with a default, so every boundary symbol now carries `ELb0E` / `ELb1E`.
+- **Experts:** `downCombine(..., out_bf16)` stores `bf16_rn(acc)`, the same bits as an fp32 out followed by
+  `.to(bf16)` (`TF_DSV41_MOE_BF16`).
+- **Prune:** `prune._prune`'s new KIT constexpr is a Triton variant. It is the port lead's AOT capture, not a copy.
+
+SASS on sm_121, all equal to the Python build at the source's ref:
+
+| file | kernels | of which new |
+| --- | --- | --- |
+| `x3gm.cu` | 135 | 5 gm2 |
+| `attn_cuda.cu` | 24 | 16 split |
+| `mhc_cuda.cu` | 15 | 7 tail + coef |
+| `exl3_experts.cu` | 32 | down_combine fp32 / bf16 |
+
 ## 3.3 Perf notes that touch these launches (docs/DSV41-ZIG-PERF.md)
 
 - **x3gm at 4,096-row blocks.** `exl3.gmTuned` takes Python's tuning table (`tune_default` = `x3gm.TUNE`). Its 4K
@@ -212,9 +276,10 @@ Each item gets a small `.cu` here (ours, checked bit-equal to torch on fixtures)
 | `tf_dsv41_dense3_v1` | `linear`, `relayout`, `unpack` |
 | `tensorfold_exl3_experts_v1` | `grouped` (cb 2), `group`, `rot_in`, `gateup_epilogue`, `down_epilogue`, `combine`, `down_combine`, `dequant` |
 | `tf_dsv41_x3ld_v1`, `tf_dsv41_x3pf_v1` | `grouped` |
-| `tf_dsv41_x3gm_v1` | `gateup`, `down`, `rot`, `dequant` |
-| `tf_dsv41_attn_cuda_v1` | `attn`, `topk` |
-| `tf_dsv41_mhc_cuda_v1`, `tf_dsv41_mhc_pf_v1` | `run` |
+| `tf_dsv41_x3gm_v1` | `gateup`, `down`, `gateup2`, `down2` (v2), `rot`, `dequant` |
+| `tf_dsv41_attn_cuda_v1` | `attn` (R1's `split` when captured, else 0), `topk` |
+| `tf_dsv41_mhc_cuda_v1` | `run` (R1's `spin` / `defer` when captured, else today's finish), `coef` |
+| `tf_dsv41_mhc_pf_v1` | `run` |
 | `tf_dsv41_router_gemv_v2` | `route` |
 | `tf_dsv41_pfdense_v1` | `gemm`, `dequant` |
 | `tf_dsv41_l2pace_v1`, `tf_dsv41_l2pf_v1` | `paced`, `segments` |

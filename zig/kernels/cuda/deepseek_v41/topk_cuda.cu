@@ -1,4 +1,4 @@
-// Device code of src/tensorfold/families/deepseek_v41/cuda/csa2/topk_cuda.cu (git blob 839ee8a85f0e at dsv41-x3gm1; the whole file, DSV41_ATTN_NO_TORCH defined),
+// Device code of src/tensorfold/families/deepseek_v41/cuda/csa2/topk_cuda.cu (git blob 839ee8a85f0e at dsv41-quant-e2; the whole file, DSV41_ATTN_NO_TORCH defined),
 // generated and checked by zig/kernels/cuda/deepseek_v41/sync.py. Do not edit: change the Python source.
 #define DSV41_ATTN_NO_TORCH
 // SPDX-License-Identifier: MIT
