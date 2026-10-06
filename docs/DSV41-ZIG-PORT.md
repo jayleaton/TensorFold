@@ -199,6 +199,11 @@ Rules from `ZIG-PREVIEW.md`:
     - Pod 13 also showed both Python ranks waiting on one extension's build lock at start, harmless with the prebuilt dir. Pod 12's long stall is unexplained, since its logs are lost.
 
 **M2c plan: prod top-p, then the Spark run.**
+- **M2c-1 PASS** (pod 14, 60c0af7, 2x PRO 6000, 6 min, $0.44): the M2b gate with prod's expert top-p 0.85 (`M2B_TOPP=0.85`, Python `TF_DSV41_EXPERT_TOPP=0.85`).
+  - Both ranks: tokens 64/64, logits 64/64, first-window blocks 25/25.
+  - Kernel job: 316/0. The experts SASS line is clean (32/32: the build now ships the exact fatbin dir).
+  - The x3gm SASS line differs (119 of 135) against the decode1 78b703d twin, whose x3gm predates the sources the fatbins come from (8474f31). It is a twin-version mismatch; bits are unaffected.
+- **The M2c-2 kit** is `~/Documents/Projects/spark-work/zig-m2c2-kit` (tree 312480d; sm_121 fatbins from dsq-zig-kern-1's 07935cc, SASS-equal to Spark prod's 8474f31 build). It is for the user's morning run: `RUNBOOK.md`.
 - **M2c-1, prod expert top-p on the same gate.** The prune path (`_prune`, `group`, the kit-weights glue) is already in `block.zig` and bit-checked by M1 on the prod captures.
   - The run: `--env M1_JOB=m2b --env M2B_TOPP=0.85` on 2x PRO 6000. It is one environment flag, passed to Python's reference and to our ranks.
   - Expected: about 6 min, about $0.45. The gate is the same (tokens, logits, blocks).
