@@ -255,6 +255,20 @@ Effort is in engineering days for this agent team, assuming GPU windows are avai
 - **Pack:** Mia's 2.9 bpw pack first (one width per layer, so the stack layout only), then ours (q28/v2: ragged).
 - **GPU:** both Sparks for several sessions of about 2 hours. This needs the Python-engine agent to release them, or a planned window like the E1/E2 one.
 
+- **Performance designed in from the start** (`docs/DSV41-ZIG-PERF.md`, owned by the port lead):
+  - **R3, Engram reads off the window** (+3-5 %, exact).
+    - The Engram row reads for the next window are issued at draft time, through io_uring on the host, into pinned staging.
+    - The window's graph waits on a GPU-side event only before layers 1 and 14, not at the window's start. Python's `gate_copy_kernel` spins about 1.65 ms waiting on the host.
+    - `engram_host.zig` owns the hashing, the shard reads and the staging ring. `forward.zig` exposes an "Engram rows ready" event per window.
+  - **R4, hidden graph submission** (+2-3 %, exact). The window graph's host launch takes about 1.27 ms.
+    - Windows are split into pre-instantiated graph segments that are enqueued ahead of time: the next round's segments are submitted while the current round runs, with device-side ordering through events and the row table updated in place.
+    - Fewer nodes come from R1's fusions (about 1,331 down to about 700 per window).
+    - `graphs.zig` is designed for this from the first version: per row-bucket and context-bucket segment graphs, updates of node parameters instead of re-capture, and no host sync inside a round.
+  - Kernel-side gains (R1 decode fusions, R2 x3gm v2) land behind the kernel launch interfaces (`dsq-decode-r1-1`, `dsq-x3gm-onelaunch-1`).
+  - **Not approved:** R5, FP8 prefill (it changes outputs; the user rejected it before).
+  - **Blocked:** R6, 4K-row chunks (memory).
+  - **No megakernel.**
+
 **M3. Lanes and drafter** (about 10–15 days).
 - `lanes.zig` (the lane core's backend):
   - `verify` is a window of at most 32 rows, against Python's 16 per slot and 64 in total.
