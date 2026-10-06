@@ -47,9 +47,15 @@ const Ctx = struct {
     fn arg(c: *Ctx, v: Value) !replay.Arg {
         const o = v.object;
         if (o.get("t")) |t| {
-            const off: u64 = @intCast(o.get("off").?.integer);
+            const shape = try c.ints(o.get("shape").?);
+            var numel: i64 = 1;
+            for (shape) |d| numel *= d;
+            // an empty tensor's data pointer can sit before its storage (a negative offset): a null pointer, as the
+            // launchers expect for numel 0
+            const raw = o.get("off").?.integer;
             const base = try c.ptrOf(t.string);
-            return .{ .tensor = .{ .ptr = if (base == 0) 0 else base + off, .dtype = try dtype(o.get("dtype").?.string), .shape = try c.ints(o.get("shape").?), .stride = try c.ints(o.get("stride").?) } };
+            const ptr: u64 = if (base == 0 or raw < 0 or numel == 0) 0 else base + @as(u64, @intCast(raw));
+            return .{ .tensor = .{ .ptr = ptr, .dtype = try dtype(o.get("dtype").?.string), .shape = shape, .stride = try c.ints(o.get("stride").?) } };
         }
         if (o.get("i")) |x| return .{ .int = x.integer };
         if (o.get("f")) |x| return .{ .float = switch (x) {
