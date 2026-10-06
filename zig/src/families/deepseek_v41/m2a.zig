@@ -20,7 +20,7 @@ const eh = @import("engram_host.zig");
 const Value = std.json.Value;
 
 /// The widths block.zig needs, from our loaded weights (each trellis's words) and the plan's expert layouts.
-fn widths(a: std.mem.Allocator, w: *const load.Weights, p: *const plan.Plan) !block.Widths {
+pub fn widths(a: std.mem.Allocator, w: *const load.Weights, p: *const plan.Plan) !block.Widths {
     var out: block.Widths = .{};
     var it = w.map.iterator();
     while (it.next()) |e| {

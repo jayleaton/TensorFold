@@ -54,6 +54,49 @@ left() { echo $(( ${M1_BUDGET_MIN:-52} - ($(date +%s) - T0) / 60 )); }
 
 # M1_JOB=m2a: M2a instead of M1 (the Python reference over layers M2A_LAYERS (0-8) with its slot state, rope tables
 # and AOT set; the Engram host tables; tf-dsv41-m1 m2a; then the kernel job in what is left)
+# M1_JOB=m2b (TWO GPUs): M2b. The pack's shards up to layer M2B_HI (27: ~69 GB a rank; the whole backbone does not
+# fit a 96 GB GPU a rank) copied to local NVMe in parallel; the Python engine at TP=2 (tools/zig/dsv41_m2b_ref.py,
+# prebuilt sm_120 extensions from e1e2x.tar.gz, expert top-p unset) prompts and decodes greedily; then our two ranks
+# (tf-dsv41-m1 m2b, NCCL through the tp runtime) from its state; then the kernel job in what is left.
+if [[ "${M1_JOB:-m1}" == m2b ]]; then
+    hi=${M2B_HI:-27}
+    LP=$LOCAL/pack
+    mkdir -p "$LP"
+    : > "$LOCAL/pack-files"
+    for f in "$PACK"/*; do
+        b=$(basename "$f")
+        [[ "$b" =~ ^layer-([0-9]+)\.safetensors$ ]] && (( 10#${BASH_REMATCH[1]} > hi )) && continue
+        echo "$b" >> "$LOCAL/pack-files"
+    done
+    (cd "$PACK" && step pack-copy 14 xargs -a "$LOCAL/pack-files" -P 16 -I{} cp {} "$LP/") || rc=1
+    du -sh "$LP" | tee -a "$RES/steps.txt"
+    if [[ -f "$Z/e1e2x.tar.gz" ]]; then tar -xzf "$Z/e1e2x.tar.gz" -C / && export TORCH_EXTENSIONS_DIR=/opt/e1e2-120; fi
+    unset TF_DSV41_EXPERT_TOPP
+    REF=$LOCAL/m2b-ref
+    rm -rf "$REF"
+    if step m2b-ref "${M2B_REF_MIN:-20}" python -u -B "$Z/tools/zig/dsv41_m2b_ref.py" --pack "$LP" --out "$REF" \
+            --layers "0-$hi" --steps "${M2B_STEPS:-64}" \
+       && step engram-host 3 python -B "$Z/tools/zig/dsv41_engram_host.py" --py-src /dsv41-tf/src \
+            --config "$LP/config.json" --tokenizer "$LP/tokenizer.json" --out "$REF/engram-host.bin"; then
+        step m2b "${M2B_MIN:-18}" bash "$Z/tools/zig/dsv41_m1/m2b_ranks.sh" "$Z/bin/tf-dsv41-m1" "$LP" "$REF" "$RES/m2b" \
+            || rc=1
+    else rc=1; fi
+    mkdir -p "$RES/m2b-ref"
+    for f in ref.json rank0.json rank1.json manifest.json; do [[ -f "$REF/$f" ]] && cp "$REF/$f" "$RES/m2b-ref/"; done
+    [[ -d "$REF/aot" ]] && tar -czf "$RES/m2b-ref/aot.tar.gz" -C "$REF" aot
+    km=$(left); (( km > 15 )) && km=15
+    if (( km >= 6 )); then
+        (for v in $(compgen -e | grep '^TF_DSV41_'); do unset "$v"; done
+         export TF_DSV41_PY_SRC=$PYTWIN TF_DSV41_TEST=$Z/bin/tf-dsv41-test TF_DSV41_FATBINS=$Z/fatbin \
+                TORCH_EXTENSIONS_DIR=$PYEXT TF_DSV41_CAPTURE_MIN=$(( km - 3 ))
+         step kernels "$km" bash "$Z/zig/tests/cuda/deepseek_v41/job.sh" "$RES/kernels") || rc=1
+    else
+        echo "kernels skipped: $km min left" | tee -a "$RES/steps.txt"; rc=1
+    fi
+    echo "=== rc=$rc"
+    exit $rc
+fi
+
 if [[ "${M1_JOB:-m1}" == m2a ]]; then
     REF=$LOCAL/m2a-ref
     rm -rf "$REF"

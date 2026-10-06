@@ -94,6 +94,8 @@ pub fn moe(e: *E, L: u32) !void {
     const n = e.n;
     const D: i64 = e.cfg.hidden;
     const backbone = e.cfg.isBackbone(L);
+    // the router folds kit rounding + grouping into its tail whenever no prune follows it (moe.py route_fold)
+    const fold = !backbone or e.o.expert_topp == null;
     const ex = e.cfg.expertsOf(L);
     const slots: i64 = ex.topk + 1;
     const Et: i64 = ex.count + 1;
@@ -117,15 +119,15 @@ pub fn moe(e: *E, L: u32) !void {
         .{ .i = slots },                                          .{ .f = scale },
         .{ .i = @intCast(rows_pad) },                             .{ .i = 2 },
         .{ .i = 0 },                                              .{ .b = true },
-        .{ .b = !backbone },                                      if (backbone) try e.empty(.i32) else uids,
-        if (backbone) try e.empty(.i32) else ucount,              if (backbone) try e.t(.empty, .i32, &.{ 0, 1 }) else members,
-        .{ .i = if (backbone) 0 else Et },                        .{ .b = !backbone },
+        .{ .b = fold },                                           if (!fold) try e.empty(.i32) else uids,
+        if (!fold) try e.empty(.i32) else ucount,                 if (!fold) try e.t(.empty, .i32, &.{ 0, 1 }) else members,
+        .{ .i = if (!fold) 0 else Et },                           .{ .b = fold },
     });
-    if (backbone) {
+    if (!fold) {
         try e.triton("_prune", .{ std.math.divCeil(i64, n, 16) catch unreachable, 1, 1 }, &.{
             .{ .name = "PICK", .arg = pick },               .{ .name = "WTS", .arg = wts },
             .{ .name = "R", .arg = .{ .i = n } },           .{ .name = "stride", .arg = .{ .i = slots } },
-            .{ .name = "MIN_W", .arg = .{ .f = 0.0 } },     .{ .name = "TOPP", .arg = .{ .f = e.o.expert_topp } },
+            .{ .name = "MIN_W", .arg = .{ .f = 0.0 } },     .{ .name = "TOPP", .arg = .{ .f = e.o.expert_topp.? } },
             .{ .name = "SCALE", .arg = .{ .f = scale } },   .{ .name = "DROP", .arg = .{ .i = Et } },
             .{ .name = "MIN_K", .arg = .{ .i = 3 } },       .{ .name = "K", .arg = .{ .i = ex.topk } },
             .{ .name = "KP", .arg = .{ .i = 8 } },          .{ .name = "DUP", .arg = .{ .b = false } },
@@ -180,7 +182,7 @@ pub fn moe(e: *E, L: u32) !void {
         z,                                                pick,
         try e.buf("{s}.svh_d", .{pre}, .f16, &.{ Et, D }), try e.buf("{s}.y", .{sc}, .f32, &.{ rows * slots, D }),
         // after a prune, kit_weights' fp16 rounding (a pointwise op the forward runs) gives new weights
-        if (backbone) try e.buf("L.wts16", .{}, .f32, &.{ n, slots }) else wts, try e.buf("L.moe", .{}, .f32, &.{ n, D }),
+        if (!fold) try e.buf("L.wts16", .{}, .f32, &.{ n, slots }) else wts, try e.buf("L.moe", .{}, .f32, &.{ n, D }),
         .{ .i = n },                                      .{ .i = P },
         .{ .i = D },                                      .{ .i = 1 },
         .{ .i = slots },                                  .{ .i = Et },

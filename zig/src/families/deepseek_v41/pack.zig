@@ -32,6 +32,8 @@ pub const Pack = struct {
     arena: std.heap.ArenaAllocator,
     /// the folder, else "" for header-only packs (tests, header dumps)
     dir: []const u8 = "",
+    /// shards the index lists that the folder does not hold
+    missing: u32 = 0,
     files: std.ArrayList([]const u8) = .empty,
     names: std.StringArrayHashMapUnmanaged(Info) = .empty,
     /// the index's weight map (name -> shard); when set, a header's names another shard owns are skipped, as Shards reads them
@@ -76,7 +78,15 @@ pub const Pack = struct {
         std.mem.sort([]const u8, shards.items, {}, lessStr);
         for (shards.items) |name| {
             const path = try std.fs.path.join(a, &.{ dir, name });
-            const file = try cwd.openFile(io, path, .{});
+            // a shard the index lists but the folder lacks (a partial copy: M2b's layers): its tensors stay unknown, and
+            // a plan that needs one fails on it (MissingTensor)
+            const file = cwd.openFile(io, path, .{}) catch |e| switch (e) {
+                error.FileNotFound => {
+                    p.missing += 1;
+                    continue;
+                },
+                else => return e,
+            };
             defer file.close(io);
             var head: [8]u8 = undefined;
             if (try file.readPositionalAll(io, &head, 0) != 8) return error.BadSafetensors;
