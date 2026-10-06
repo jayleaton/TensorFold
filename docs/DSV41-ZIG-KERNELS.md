@@ -406,6 +406,39 @@ runs 20 x3gm layers. A layer per rank is 12,288 pairs, D 5,120, I 1,152, two rot
 - Larger chunks: R6, 4,096 rows, the weights streamed once per 4K, about -22 % x3gm a row, blocked on memory.
 - FP8 on the tensor path: R5, quality-gated.
 
+## 3.2f Decode glue fusion on GB10: estimated, not built (under 3 % of the window)
+
+**Data.** The Zig M2b pods log only a window total ("decode 0.5 s"); they recorded no per-kernel trace. The
+per-kernel numbers here are G14a's hardware-traced GB10 1-row window (DSV41-ZIG-PERF.md 1.2: 1,331 kernels, 21.4 ms in
+prod's calibration) less R1's measured cuts. R1 is in prod since 2026-10-07: the attention split with the q RoPE folded,
+mHC tail / defer, prune / kit / group in the router's tail, the bf16 MoE partial, q_norm in wq_b's input stage. It
+cost -1.4 ms on the 1-row window, which leaves about 20.0 ms.
+
+**What a small kernel costs.** Under graphs the launch is gone but each kernel keeps its ramp, its tail and the
+in-graph gap, about 0.2 us. G14a's small classes average about 4 us a launch on a work floor near zero (0.05 ms
+for about 330 launches). A fusion that keeps the op order saves about 3-4 us for each launch it removes. The gaps
+alone are 0.27 ms a window over all 1,331 kernels, so a few hundred fewer launches save under 0.05 ms of gaps.
+
+**Small kernels left after R1, and which fuse bit-identically.**
+
+| class (G14a ms, launches) | bit-identical fusion | saving |
+| --- | --- | ---: |
+| copies (0.21) | written at their final offsets by the producer | ~0.15 |
+| gate/up epilogue (40) | into x3ld's tail (same ops, same order) | ~0.14 |
+| expert rot_in (0.15, 40) | into the router tail / x3ld's loader | ~0.14 |
+| k RoPE + kv_store (~0.2) | elementwise pair, one launch | ~0.04-0.10 |
+| rms2 0.27, `_plain` (fp64) 0.22, scores 0.13, Engram fuse 0.14 | Triton reductions: bit-identical only by copying Triton's reduction tree into CUDA, one project each | (ceiling ~0.5) |
+
+**Estimate.**
+- **Realistic** (the four exact-and-cheap rows): **-0.47 to -0.55 ms, 2.4-2.8 % of the 1-row window**. Under the 3 % bar: not built.
+- **Ceiling:** every small kernel fused, the reductions included, is about -1.0 ms (~5 %). That needs four Triton reduction trees reproduced exactly.
+
+**The bigger lever, already built.** The Zig decode path (`block.zig`) still follows the pre-R1 knob set
+(`tools/zig/dsv41_m1/prod-knobs.env` has none of ATTN_SPLIT / ATTN_ROPE / MHC_TAIL / MHC_DEFER / MOE_BF16 / PRUNE_KIT /
+RG_PRUNE / RMS_FOLD). R1's kernels are ported here and bit-checked through Zig (302 / 302 recorded twin calls, pods 11-14).
+Wiring them in is worth R1's -1.4 ms (-6.5 %) a 1-row window, with bits unchanged (R1's knobs are bit-identical to
+off): the port lead's `block.zig`, from a prod capture with prod-perf1.env's knobs.
+
 ## 3.3 Perf notes that touch these launches (docs/DSV41-ZIG-PERF.md)
 
 - **x3gm at 4,096-row blocks.** `exl3.gmTuned` takes Python's tuning table (`tune_default` = `x3gm.TUNE`). Its 4K
