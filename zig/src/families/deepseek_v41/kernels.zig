@@ -45,10 +45,11 @@ pub const images = struct {
     pub const x3gm_plan: []const u8 = if (available) &Blob("dsv41_fatbin_dsv41_x3gm_plan").bytes else &.{};
     pub const topk_keys: []const u8 = if (available) &Blob("dsv41_fatbin_dsv41_topk_keys").bytes else &.{};
     pub const pointwise: []const u8 = if (available) &Blob("dsv41_fatbin_dsv41_pointwise").bytes else &.{};
+    pub const kvsplit: []const u8 = if (available) &Blob("dsv41_fatbin_dsv41_kvsplit").bytes else &.{};
 };
 
 pub const Kernels = struct {
-    mods: [22]cuda.Module,
+    mods: [23]cuda.Module,
     exl3: exl3.Functions,
     dense: dense.Functions,
     ops: ops.Functions,
@@ -59,7 +60,7 @@ pub const Kernels = struct {
         if (!available) return error.BuiltWithoutKernels;
         const d = ctx.d;
         var k: Kernels = undefined;
-        const list = [_][]const u8{ images.exl3_experts, images.x3ld, images.x3pf, images.x3gm, images.linear, images.x3seg, images.dense3, images.attn, images.topk, images.mhc, images.mhc_pf, images.router_gemv, images.pfdense_k8, images.pfdense_k10, images.pfdense_k12, images.pfdense_k16, images.engram_gate, images.l2pace, images.l2pf, images.x3gm_plan, images.topk_keys, images.pointwise };
+        const list = [_][]const u8{ images.exl3_experts, images.x3ld, images.x3pf, images.x3gm, images.linear, images.x3seg, images.dense3, images.attn, images.topk, images.mhc, images.mhc_pf, images.router_gemv, images.pfdense_k8, images.pfdense_k10, images.pfdense_k12, images.pfdense_k16, images.engram_gate, images.l2pace, images.l2pf, images.x3gm_plan, images.topk_keys, images.pointwise, images.kvsplit };
         comptime std.debug.assert(list.len == @typeInfo(@FieldType(Kernels, "mods")).array.len);
         var loaded: usize = 0;
         errdefer for (k.mods[0..loaded]) |*m| m.unload();
@@ -72,7 +73,7 @@ pub const Kernels = struct {
         k.exl3 = try exl3.Functions.resolve(k.mods[0], k.mods[1], k.mods[2], k.mods[3], k.mods[19], optin);
         k.dense = try dense.Functions.resolve(k.mods[4], k.mods[5], k.mods[6]);
         const m = k.mods;
-        k.ops = try ops.Functions.resolve(m[7], m[8], m[9], m[10], m[11], .{ m[12], m[13], m[14], m[15] }, m[16], m[17], m[18], m[20], m[21], optin);
+        k.ops = try ops.Functions.resolve(m[7], m[8], m[9], m[10], m[11], .{ m[12], m[13], m[14], m[15] }, m[16], m[17], m[18], m[20], m[21], m[22], optin);
         k.sms = @intCast(try ctx.attribute(.multiprocessor_count));
         return k;
     }

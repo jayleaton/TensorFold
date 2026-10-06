@@ -20,7 +20,10 @@ step() { echo "=== $(date -u +%H:%M:%S) $*"; }
 
 step "device"
 nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv,noheader | tee "$OUT/device.txt"
-"$T" symbols 2>&1 | tee "$OUT/symbols.log" || rc=1
+"$T" symbols 2>&1 | tee "$OUT/symbols.log"
+[ "${PIPESTATUS[0]}" -eq 0 ] || rc=1
+"$T" kvsplit 2>&1 | tee "$OUT/kvsplit.log"
+[ "${PIPESTATUS[0]}" -eq 0 ] || rc=1
 
 step "oracle (the Python engine's extensions, JIT-built for this GPU unless prebuilt in TORCH_EXTENSIONS_DIR)"
 rm -rf "$OUT/fixtures"

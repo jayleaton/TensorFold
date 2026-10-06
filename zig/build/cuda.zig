@@ -36,6 +36,7 @@ const dsv41_kernels = [_]Kernel{
     .{ .name = "dsv41_x3gm", .src = "deepseek_v41/x3gm", .flags = &.{ "-O3", "-lineinfo" } }, // tf_dsv41_x3gm_v1
     .{ .name = "dsv41_x3gm_plan", .src = "deepseek_v41/x3gm_plan", .flags = &.{"-O3"} }, // ours: x3gm.plan's torch ops
     .{ .name = "dsv41_topk_keys", .src = "deepseek_v41/topk_keys", .flags = &.{"-O3"} }, // ours: pick.top's torch.topk
+    .{ .name = "dsv41_kvsplit", .src = "deepseek_v41/kvsplit", .flags = &.{"-O3"} }, // ours: split KV's exchange copies
     .{ .name = "dsv41_pointwise", .src = "deepseek_v41/pointwise", .flags = &.{ "-O3", "--fmad=false" } }, // ours: prefill MoE's torch pointwise ops
     .{ .name = "dsv41_linear", .src = "deepseek_v41/linear", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // tensorfold_exl3_linear_v4
     .{ .name = "dsv41_x3seg", .src = "deepseek_v41/x3seg", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // tf_dsv41_x3seg_v3

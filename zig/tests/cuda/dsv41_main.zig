@@ -7,10 +7,12 @@ const cuda = @import("cuda");
 const dsv41 = @import("dsv41_kernels");
 const check = @import("check.zig");
 const experts = @import("deepseek_v41/experts.zig");
+const kvsplit = @import("deepseek_v41/kvsplit.zig");
 
 const usage =
     \\usage: tf-dsv41-test <command> [fixture dir]
     \\  symbols            load every DeepSeek-V4.1 fatbin and resolve every instance
+    \\  kvsplit            split KV's exchange copies against kv/split.zig's host reference (no fixture)
     \\  experts <dir>      decode chain: group, rot_in, x3ld (every setting) / upstream grouped / x3pf, epilogues, combine
     \\  x3gm <dir>         fast prefill: rot, gate/up and down at every configuration (uniform and ragged), combine
     \\  all <fixtures>     every case directory under <fixtures> by its manifest's "kind"
@@ -50,6 +52,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
         check.pass("dsv41 symbols: every instance resolved ({d} SMs)", .{k.sms});
         return;
     }
+    if (std.mem.eql(u8, cmd, "kvsplit")) return kvsplit.run(gpu, &k);
     if (std.mem.eql(u8, cmd, "experts")) return experts.decodeChain(gpu, &k, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "x3gm")) return experts.x3gm(gpu, &k, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "all")) return all(gpu, &k, try arg(rest, 0));

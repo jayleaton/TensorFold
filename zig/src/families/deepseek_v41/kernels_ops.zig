@@ -398,9 +398,11 @@ pub const Functions = struct {
     swiglu: cuda.Function,
     add: cuda.Function,
     add_bf16: cuda.Function,
+    kv_dense: cuda.Function,
+    kv_gather: cuda.Function,
 
     /// `pf`: the four pfdense modules (K2 8, 10, 12, 16).
-    pub fn resolve(m_attn: cuda.Module, m_topk: cuda.Module, m_mhc: cuda.Module, m_mhc_pf: cuda.Module, m_rg: cuda.Module, pf: [4]cuda.Module, m_gate: cuda.Module, m_pace: cuda.Module, m_l2pf: cuda.Module, m_keys: cuda.Module, m_pw: cuda.Module, optin: u32) !Functions {
+    pub fn resolve(m_attn: cuda.Module, m_topk: cuda.Module, m_mhc: cuda.Module, m_mhc_pf: cuda.Module, m_rg: cuda.Module, pf: [4]cuda.Module, m_gate: cuda.Module, m_pace: cuda.Module, m_l2pf: cuda.Module, m_keys: cuda.Module, m_pw: cuda.Module, m_kv: cuda.Module, optin: u32) !Functions {
         var f: Functions = undefined;
         inline for (0..8) |i| f.attn[i] = try m_attn.function(attn.symbol(if (i >= 4) 4 else 2, (i & 2) != 0, (i & 1) != 0));
         inline for (f.attn, 0..) |fun, i| {
@@ -435,7 +437,35 @@ pub const Functions = struct {
         f.swiglu = try m_pw.function("_ZN15dsv41_pointwise13swiglu_kernelEPKfxS1_xPfxif");
         f.add = try m_pw.function("_ZN15dsv41_pointwise10add_kernelEPfPKfx");
         f.add_bf16 = try m_pw.function("_ZN15dsv41_pointwise15add_bf16_kernelEPKfS1_P13__nv_bfloat16x");
+        f.kv_dense = try m_kv.function("_ZN13dsv41_kvsplit12dense_kernelENS_9DenseArgsE");
+        f.kv_gather = try m_kv.function("_ZN13dsv41_kvsplit13gather_kernelEPKhjPKjjPh");
         return f;
+    }
+};
+
+/// kvsplit.cu: split KV's exchange copies (kv/split.zig's DenseArgs, the same layout; HostKernels the reference).
+pub const kvsplit = struct {
+    pub const DenseArgs = extern struct {
+        sel: u64,
+        rows: u32,
+        k: u32,
+        table: u64,
+        pts: u32,
+        rslot: u64,
+        psh: u32,
+        base: u64,
+        row_bytes: u32,
+        world: u32,
+        send: u64,
+        tok: u64,
+    };
+
+    comptime {
+        std.debug.assert(@sizeOf(DenseArgs) == 80 and @offsetOf(DenseArgs, "rslot") == 32 and @offsetOf(DenseArgs, "send") == 64);
+    }
+
+    fn grid(words: u64) usize {
+        return @intCast(@max(1, @min((words + 255) / 256, 4096)));
     }
 };
 
@@ -609,6 +639,31 @@ pub const Ops = struct {
         args.add(y);
         args.add(@as(i64, @intCast(n)));
         try o.go(o.f.add_bf16, .{ @min((n + 255) / 256, 4096), 1, 1 }, 256, 0, null, &args);
+    }
+
+    /// kvsplit dense: the selected rows of a split family packed for the all-gather, and their remapped tokens.
+    /// `a` is kv/split.zig's DenseArgs (an extern struct of the same layout: pass it through @bitCast).
+    pub fn kvDense(o: Ops, a: kvsplit.DenseArgs) !void {
+        if (a.row_bytes == 0 or a.row_bytes % 8 != 0 or a.k == 0 or a.world == 0 or a.psh > 30) return error.Shape;
+        const words = @as(u64, a.rows) * a.k * (a.row_bytes / 8);
+        if (words == 0) return;
+        var args: cuda.Args = .{};
+        args.add(a);
+        try o.go(o.f.kv_dense, .{ kvsplit.grid(words), 1, 1 }, 256, 0, null, &args);
+    }
+
+    /// kvsplit gather: send[i] = base row phys[i] (uint32 [n]).
+    pub fn kvGather(o: Ops, base: u64, row_bytes: u32, phys: u64, n: u32, send: u64) !void {
+        if (row_bytes == 0 or row_bytes % 8 != 0) return error.Shape;
+        const words = @as(u64, n) * (row_bytes / 8);
+        if (words == 0) return;
+        var args: cuda.Args = .{};
+        args.add(base);
+        args.add(row_bytes);
+        args.add(phys);
+        args.add(n);
+        args.add(send);
+        try o.go(o.f.kv_gather, .{ kvsplit.grid(words), 1, 1 }, 256, 0, null, &args);
     }
 
     /// tfl2pf launch_segments: (address, bytes) table prefetched to L2 (bulk: cp.async.bulk.prefetch).
