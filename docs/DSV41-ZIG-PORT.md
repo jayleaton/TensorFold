@@ -292,7 +292,17 @@ The all-gathers run on the compute stream so they can be captured in CUDA graphs
    - the head-candidate merge (`serve/sampling.zig`, rank order);
    - the replay bindings.
    - Limits: the session pool and the split planner stop at 8 ranks. `kv/split.zig` indexed `[8]` arrays by rank without a check; it now refuses `world > max_world` at plan time.
-   - `kvsplit.cu` does a runtime `% world` per selected token. TP=2 runs exactly that code today; a `& 1` instance is optional and not needed for "unchanged".
+   - `kvsplit.cu` does a runtime `% world` per selected token. TP=2 runs exactly that code today. No `& 1` instance is planned: one modulo per 8-byte word of a copy kernel isn't measurable (dsq-zig-kern-1).
+8. **Kernel limits that bound N** (dsq-zig-kern-1's check; no kernel hardwires 2 ranks):
+   - **`mhc_cuda` / `mhc_pf`:** world 1–8 (the dispatch refuses more than 8; `mhc_pf` `MAXW` is 8). D = 5120 is compiled in, as in `router_gemv`, but D is the model width, never sharded.
+   - **`attn_cuda` (incl. the split kernel):** H % 16 == 0 (16-head tiles; the dispatch refuses otherwise). N=4 fits; N=3 needs the 8-head instance.
+   - **`topk_keys.cu` (head candidates):** at most 65,536 columns a rank (the column is packed into 16 bits, as in Python). Any N ≥ 2 fits (64,640 at N=2, 32,320 at N=4). TP=1's 129,280 doesn't, and Python falls back to a stable sort there too.
+   - **Expert widths:**
+     - x3ld / x3pf / grouped need N % (16 nt) == 0 and K % (16 · SK · 4) == 0;
+     - x3gm / gm2 need width % 128 == 0 and (width / 16) % KS == 0;
+     - the gm plan needs E < 512.
+     Block-balanced 128-value shards (4 or 5 blocks a rank) meet all of these, and every check is per call, so uneven widths are fine.
+   - So the effective bound is N ≤ 8 (mHC, the session pool, the split planner), with N=3 the only size below it that needs a new kernel instance.
 
 **Shard sizes for DSV4.1 at N ranks.** Splits stay on 128-value blocks (EXL3 Hadamard blocks), so `width / N` is not always possible. A dimension that doesn't divide evenly gets block-balanced ranges: the first `blocks % N` ranks take one extra block. These are per-rank constants at load. TP=2 is the even case, with exactly today's shapes.
 
