@@ -66,12 +66,17 @@ left() { echo $(( ${M1_BUDGET_MIN:-52} - ($(date +%s) - T0) / 60 )); }
 # (tf-dsv41-m1 m2b, NCCL through the tp runtime) from its state; then the kernel job in what is left.
 if [[ "${M1_JOB:-m1}" == m2b ]]; then
     hi=${M2B_HI:-24}
+    LANES_MODES=${M2B_LANES:-}; unset M2B_LANES   # the gate's mode list; tf-dsv41-m1 reads M2B_LANES as one mode
     LP=$LOCAL/pack
     mkdir -p "$LP"
     : > "$LOCAL/pack-files"
     for f in "$PACK"/*; do
         b=$(basename "$f")
-        [[ "$b" =~ ^layer-([0-9]+)\.safetensors$ ]] && (( 10#${BASH_REMATCH[1]} > hi )) && continue
+        if [[ "$b" =~ ^layer-([0-9]+)\.safetensors$ ]]; then
+            L=$(( 10#${BASH_REMATCH[1]} ))
+            # M2B_CAPTURE with set P: DSpark's target layers 36-39 come too (the capture's backbone blocks)
+            (( L > hi )) && ! { [[ ",${M2B_CAPTURE:-}," == *,P,* ]] && (( L >= 36 && L <= 39 )); } && continue
+        fi
         echo "$b" >> "$LOCAL/pack-files"
     done
     ( while sleep 30; do echo "$(date -u +%H:%M:%S) $(du -sm "$LP" | cut -f1) MB"; done ) > "$RES/pack-copy-progress.log" 2>&1 &
@@ -84,6 +89,26 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
     kill $prog 2>/dev/null
     du -sh "$LP" | tee -a "$RES/steps.txt"
     if [[ -f "$Z/e1e2x.tar.gz" ]]; then tar -xzf "$Z/e1e2x.tar.gz" -C / && export TORCH_EXTENSIONS_DIR=/opt/e1e2-120; fi
+    # M2B_CAPTURE (sets, e.g. P,B): a capture on GPU 0 first, on prod's knobs + x3gm v2 (TF_DSV41_GM_V2=1, as prod
+    # 8474f31) with an M1_PREFILL_ROWS-row prefill segment (2048: prod's chunk), replayed bit for bit by our loader;
+    # its small files (ops, meta, weights, manifest, AOT set) come back for the offline emitters (DSpark pass, prefill)
+    if [[ -n "${M2B_CAPTURE:-}" ]]; then
+        CAP=$LOCAL/capture
+        rm -rf "$CAP"
+        if (set -a; source "$Z/tools/zig/dsv41_m1/prod-knobs.env"; set +a
+            export TF_DSV41_GM_V2=1 CUDA_VISIBLE_DEVICES=0 M1_PREFILL_ROWS=${M1_PREFILL_ROWS:-2048}
+            step capture "${M1_CAPTURE_MIN:-12}" python -B "$Z/tools/zig/dsv41_m1_capture.py" --pack "$LP" --out "$CAP" \
+                --sets "$M2B_CAPTURE"); then
+            du -sh "$CAP" | tee "$RES/capture-size.txt"
+            CUDA_VISIBLE_DEVICES=0 step m1 "${M1_REPLAY_MIN:-10}" "$Z/bin/tf-dsv41-m1" replay "$LP" "$CAP" "$RES/m1" || rc=1
+        else rc=1; fi
+        mkdir -p "$RES/capture"
+        for f in meta.json weights.json manifest.json jit.json; do [[ -f "$CAP/$f" ]] && cp "$CAP/$f" "$RES/capture/"; done
+        [[ -d "$CAP/aot" ]] && tar -czf "$RES/capture/aot.tar.gz" -C "$CAP" aot
+        [[ -f "$CAP/ops.jsonl" ]] && gzip -c "$CAP/ops.jsonl" > "$RES/capture/ops.jsonl.gz"
+        [[ -f "$CAP/launches.json" ]] && gzip -c "$CAP/launches.json" > "$RES/capture/launches.json.gz"
+        rm -rf "$CAP/blobs"
+    fi
     # M2B_TOPP unset: top-p off (M2b); set (prod: 0.85): the same gate with prod's expert prune (M2c's first stage)
     unset TF_DSV41_EXPERT_TOPP
     [[ -n "${M2B_TOPP:-}" ]] && export TF_DSV41_EXPERT_TOPP=$M2B_TOPP
@@ -96,6 +121,14 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
         mb=$(left); (( mb > 16 )) && mb=16
         step m2b "$mb" bash "$Z/tools/zig/dsv41_m1/m2b_ranks.sh" "$Z/bin/tf-dsv41-m1" "$LP" "$REF" "$RES/m2b" \
             || rc=1
+        # M2B_LANES ("1 2"): M3's gates, the same reference through lanes on rank 0 (1: drafts off; 2: oracle drafts)
+        for k in $LANES_MODES; do
+            mb=$(left); (( mb > 8 )) && mb=8
+            (( mb >= 3 )) || { echo "m3-$k skipped: $mb min left" | tee -a "$RES/steps.txt"; rc=1; continue; }
+            (export M2B_LANES=$k M2B_PORT=$(( 29720 + k ))
+             step "m3-$k" "$mb" bash "$Z/tools/zig/dsv41_m1/m2b_ranks.sh" "$Z/bin/tf-dsv41-m1" "$LP" "$REF" "$RES/m3-$k") \
+                || rc=1
+        done
     else rc=1; fi
     mkdir -p "$RES/m2b-ref"
     for f in ref.json rank0.json rank1.json manifest.json; do [[ -f "$REF/$f" ]] && cp "$REF/$f" "$RES/m2b-ref/"; done

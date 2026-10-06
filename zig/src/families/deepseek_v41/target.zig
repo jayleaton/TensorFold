@@ -8,7 +8,7 @@ const iface = @import("draft/iface.zig");
 const lanes = @import("lanes");
 const fwd = @import("forward.zig");
 
-pub const Error = error{ TreeWindow, Sampling, Slots, NotAChain };
+pub const Error = error{ TreeWindow, Sampling, Slots, NotAChain, WindowRows };
 
 pub const GpuTarget = struct {
     f: *fwd.Forward,
@@ -17,6 +17,8 @@ pub const GpuTarget = struct {
     /// a slot that already holds the prompt (a gate resuming the reference's state): prefill returns this choice
     /// without running the prompt again
     resume_first: ?u32 = null,
+    /// the most rows a window may take: the forward's buffers are planned for its buckets (run.zig has no bounds)
+    max_rows: u32 = 16,
 
     pub fn target(t: *GpuTarget) iface.Target {
         return .{ .ptr = t, .vtable = &vtable };
@@ -37,7 +39,7 @@ pub const GpuTarget = struct {
         var at: usize = 0;
         var choice: [1]u32 = .{0};
         while (at < ids.len) {
-            const n = @min(t.prefill_rows, ids.len - at);
+            const n = @min(@min(t.prefill_rows, t.max_rows), ids.len - at);
             try t.f.window(ids[at .. at + n]);
             if (at + n == ids.len) {
                 // the keyed choice after the prompt's last row: the last row's greedy pick
@@ -59,6 +61,7 @@ pub const GpuTarget = struct {
         if (s.parents != null) return error.TreeWindow;
         if (s.sampling != null) return error.Sampling;
         if (s.start != t.f.slot.pos) return error.NotAChain;
+        if (s.tokens.len > t.max_rows) return error.WindowRows;
         try t.f.window(s.tokens);
         try t.f.greedy(choices[0][0..s.tokens.len]);
     }

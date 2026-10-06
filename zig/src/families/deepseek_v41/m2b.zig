@@ -13,6 +13,9 @@ const Config = @import("config.zig").Config;
 const Pack = @import("pack.zig").Pack;
 const plan = @import("plan.zig");
 const m3 = @import("m3.zig");
+const drive = @import("draft/drive.zig");
+
+const rows_lanes = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8 };
 const named = @import("named.zig");
 const load = @import("load.zig");
 const buffers = @import("buffers.zig");
@@ -102,7 +105,8 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, ref: []con
     var bp = blk: {
         // the plan at both trace settings (the traced program adds one role)
         f.opts.trace = true;
-        var p = try f.plan(&.{1});
+        // M2B_LANES windows hold the pending token + a DSpark block of drafts
+        var p = try f.plan(if (std.c.getenv("M2B_LANES") != null) rows_lanes[0 .. cfg.dspark_block + 1] else &.{1});
         f.programs.clearRetainingCapacity();
         f.opts.trace = false;
         try p.add(try f.program(1));
@@ -144,29 +148,38 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, ref: []con
     std.debug.print("rank {d}: {d} layers, {d:.2} GB, load {d:.1} s, position {d}\n", .{ rank, layers.len, @as(f64, @floatFromInt(w.bytes)) / 1e9, load_s, f.slot.pos });
 
     const want_tokens = meta.object.get("tokens").?.array.items;
-    // M2B_LANES=1 (M3's first gate): the same decode through the lanes engine over the GPU target on rank 0 (drafts
-    // off), the other rank following rank 0's forward operations over the plan link; tokens only (no digests)
-    if (std.c.getenv("M2B_LANES") != null) {
+    // M2B_LANES (M3's gates): the same decode through the lanes engine over the GPU target on rank 0, the other rank
+    // following rank 0's forward operations over the plan link; tokens only (no digests). 1: drafts off; 2: the
+    // reference's tokens as drafts, corrupted on drive.Oracle's schedule (multi-row windows, partial keeps, rejects)
+    if (std.c.getenv("M2B_LANES")) |mode_z| {
+        const mode = try std.fmt.parseInt(u32, std.mem.span(mode_z), 10);
         f.link = &session.plan;
         const tl0 = std.Io.Clock.awake.now(io);
-        var got_n: usize = 0;
+        const want = try a.alloc(u32, want_tokens.len);
+        for (want, want_tokens) |*d, v| d.* = @intCast(v.integer);
+        var r: m3.Result = .{ .tokens = &.{}, .drafted = 0, .accepted = 0 };
         var equal: usize = 0;
         if (rank == 0) {
-            const prompt = try a.alloc(u32, meta.object.get("prompt_ids").?.array.items.len);
-            for (prompt, meta.object.get("prompt_ids").?.array.items) |*d, v| d.* = @intCast(v.integer);
-            const got = try m3.generate(gpa, &f, prompt, @intCast(want_tokens[0].integer), @intCast(want_tokens.len));
-            defer gpa.free(got);
+            const pids = meta.object.get("prompt_ids").?.array.items;
+            const prompt = try a.alloc(u32, pids.len);
+            for (prompt, pids) |*d, v| d.* = @intCast(v.integer);
+            var nd: drive.NoDraft = .{};
+            var oracle: drive.Oracle = .{ .serial = want, .prompt_len = prompt.len, .vocab = cfg.vocab };
+            const pass = if (mode == 2) oracle.pass() else nd.pass();
+            r = try m3.generate(gpa, &f, pass, mode == 2, prompt, want[0], @intCast(want.len), cfg.dspark_block + 1);
+            r.off_anchor = oracle.off_anchor;
             try f.stop();
-            got_n = got.len;
-            for (got, want_tokens[0..@min(got.len, want_tokens.len)]) |g, wt| {
-                if (g != @as(u32, @intCast(wt.integer))) break;
+            for (r.tokens, want[0..@min(r.tokens.len, want.len)]) |g, wt| {
+                if (g != wt) break;
                 equal += 1;
             }
         } else try f.follow();
+        defer if (rank == 0) gpa.free(r.tokens);
         const lanes_s = @as(f64, @floatFromInt(tl0.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds())) / 1e9;
-        const ok = rank != 0 or (got_n == want_tokens.len and equal == got_n);
-        try cwd.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}/m3-rank{d}.json", .{ out_dir, rank }), .data = try std.fmt.allocPrint(a, "{{\"rank\": {d}, \"tokens\": {d}, \"want\": {d}, \"equal_prefix\": {d}, \"s\": {d:.1}, \"pass\": {}}}\n", .{ rank, got_n, want_tokens.len, equal, lanes_s, ok }) });
-        std.debug.print("{s} M3 lanes rank {d}: tokens {d}/{d} equal, {d:.1} s\n", .{ if (ok) "PASS" else "FAIL", rank, equal, want_tokens.len, lanes_s });
+        const kept_some = mode != 2 or (r.accepted > 0 and r.accepted < r.drafted);
+        const ok = rank != 0 or (r.tokens.len == want.len and equal == want.len and kept_some);
+        try cwd.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}/m3-rank{d}.json", .{ out_dir, rank }), .data = try std.fmt.allocPrint(a, "{{\"rank\": {d}, \"mode\": {d}, \"tokens\": {d}, \"want\": {d}, \"equal_prefix\": {d}, \"drafted\": {d}, \"accepted\": {d}, \"off_anchor\": {d}, \"s\": {d:.1}, \"pass\": {}}}\n", .{ rank, mode, r.tokens.len, want.len, equal, r.drafted, r.accepted, r.off_anchor, lanes_s, ok }) });
+        std.debug.print("{s} M3 lanes mode {d} rank {d}: tokens {d}/{d} equal, drafted {d}, accepted {d}, {d:.1} s\n", .{ if (ok) "PASS" else "FAIL", mode, rank, equal, want.len, r.drafted, r.accepted, lanes_s });
         return if (ok) 0 else 1;
     }
     // greedy decoding against the reference's tokens

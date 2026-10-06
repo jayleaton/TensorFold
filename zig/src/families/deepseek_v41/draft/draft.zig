@@ -14,6 +14,7 @@ pub const policy = @import("policy.zig");
 pub const lanes = @import("lanes.zig");
 pub const Lanes = lanes.Lanes;
 pub const twin = @import("twin.zig");
+pub const drive = @import("drive.zig");
 
 test {
     _ = costs;
@@ -26,6 +27,8 @@ test {
     _ = policy;
     _ = lanes;
     _ = twin;
+    _ = drive;
+    _ = @import("drive_test.zig");
     _ = @import("lanes_test.zig");
     _ = @import("golden_test.zig");
 }
