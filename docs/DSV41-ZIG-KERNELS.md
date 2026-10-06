@@ -24,6 +24,10 @@ Paths below: `F` = `src/tensorfold/families/deepseek_v41/cuda`, `X` = `src/tenso
   are ported as pure functions with host tests: `linear.plan`, `fused_proj.layout`, x3gm's tile, fit and tuning
   tables, and the pfdense heuristic. Device pointers are `u64`. Weights tables (trellis address `int64 [E]`, K2
   `int32 [E]`, stacked suh / svh) come from the family's loader (`stage.zig`).
+- **Streams.** Launches take device pointers only and never copy from the host. The caller feeds them with pinned
+  memory and async copies on the launch stream. A pageable `cuMemcpyHtoD` runs on the legacy default stream and can
+  return before its DMA lands, and a non-blocking stream does not wait for it. The M1 replay hit this race. The GPU
+  tests use blocking streams for that reason.
 - **Replay.** `kernels_replay.call(k, stream, ext, func, args, kwargs, scratch)` re-issues a captured pybind call
   through these launches. The M1 block gate uses it to compare every `.cu` call of a real forward with Python's.
 
@@ -32,8 +36,9 @@ Paths below: `F` = `src/tensorfold/families/deepseek_v41/cuda`, `X` = `src/tenso
 | check | how | where it stands |
 | --- | --- | --- |
 | SASS equality | `Z/sass_check.sh`: each Python source compiled the way `torch.utils.cpp_extension` compiles it (torch headers, the extension's flags), against our fatbin. Every kernel of ours must exist in the Python object with identical SASS. | **sm_121, all equal**, see the table below. Run on GPU pods for sm_120 by `zig/tests/cuda/deepseek_v41/job.sh`. |
-| bits on a GPU | `zig/tests/cuda/deepseek_v41/oracle.py` writes fixtures from the Python engine's own extensions on seeded inputs. `tf-dsv41-test all <fixtures>` runs ours and compares every output bit for bit. | Routed experts so far: decode chain at 1, 3, 8, 16 and 64 rows; E1 (2, 12), (2, 10) and DSpark (8, 8) ranges; every x3ld setting with and without PDL; x3pf; x3gm uniform and ragged at every configuration that fits; dequant. Entry: `bash zig/tests/cuda/deepseek_v41/job.sh <out>`. |
-| real forward | the port lead's M1 capture: every extension call of a real block, replayed through `kernels_replay` | bindings for every prod `.cu` call (section 4) |
+| bits on a GPU (PRO 6000, sm_120: **13/13 cases pass**, pod 3) | `zig/tests/cuda/deepseek_v41/oracle.py` writes fixtures from the Python engine's own extensions on seeded inputs. `tf-dsv41-test all <fixtures>` runs ours and compares every output bit for bit. | Routed experts so far: decode chain at 1, 3, 8, 16 and 64 rows; E1 (2, 12), (2, 10) and DSpark (8, 8) ranges; every x3ld setting with and without PDL; x3pf; x3gm uniform and ragged at every configuration that fits; dequant. Entry: `bash zig/tests/cuda/deepseek_v41/job.sh <out>`. |
+| real forward | the port lead's M1 capture: every extension call of a real block, replayed through `kernels_replay` | **pod 3: bit-exact on real blocks of our pack** (linear 54 + 54, x3seg 57 + 75, experts group / rot_in / grouped / gateup_epilogue / down_combine 24 / 24 / 48 / 24 / 24); prefill segments and DSpark next |
+| split KV copies | `tf-dsv41-test kvsplit` and the KV agent's 2-rank NCCL test | 3 / 3 bit-exact; 520,192 entries a rank, 0 mismatches |
 | spills | `-Xptxas -v` per fatbin | equal to the Python build's. x3seg `<K2 6/10/12, 4, 3>` spills 32-68 B and dense3 at MINB 4 / 2 spills, in Python too. Prod's dense3 MINB 3 / 1 has 0 spills. |
 
 SASS on sm_121 (NGC 26.07, nvcc 13.3.73; the e1e2 runtime image has the same nvcc). Kernels compared, all equal:
