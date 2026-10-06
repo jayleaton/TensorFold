@@ -35,8 +35,8 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     step.dependOn(&k.step);
     test_step.dependOn(&s.step);
     test_step.dependOn(&k.step);
-    const bench = b.createModule(.{ .root_source_file = b.path("zig/src/families/deepseek_v41/kv/bench.zig"), .target = host, .optimize = .ReleaseFast, .link_libc = true });
-    bench.addImport("sessions", sessions(b, host, .ReleaseFast));
+    const bench = b.createModule(.{ .root_source_file = b.path("zig/src/families/deepseek_v41/kv/bench.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
+    bench.addImport("sessions", sessions(b, target, .ReleaseFast));
     const exe = b.addExecutable(.{ .name = "tf-kv-bench", .root_module = bench });
     b.step("tf-kv-bench", "Page ops and a 1M-token session parked to / restored from a real NVMe tier (host pool)").dependOn(&b.addInstallArtifact(exe, .{}).step);
     if (target.result.os.tag != .linux) return;
