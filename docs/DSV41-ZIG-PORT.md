@@ -283,6 +283,18 @@ Effort is in engineering days for this agent team, assuming GPU windows are avai
     - x3seg segment tables;
     - the experts' int64 address and int32 K2 tables over 385 entries (384 routed plus the shared expert), with `suh`/`svh` stacked `[385, K]`;
     - dense3's lanes layout for the 8-bit `ix_wk`.
+  - **Target: the prod kernel path** (prod.env's knobs, captured by `M1_KNOBS=prod`), not the engine's code defaults. A full block's prod decode window is:
+    1. `mhc_cuda.run` (the boundary).
+    2. `_plain` (`ix_wp`, on index layers).
+    3. The x group: x3seg `rot_in`, then dense3 lanes launches by K2 (`wq_a` at K2 8; `wkv` + compressor `wkv`/`wgate` at K2 10).
+    4. `_rms2`.
+    5. On KV sources: `_pool_norm` + `_kv_store` (compressed row), the `ix_wk` upstream linear (K2 16), `_index_k`.
+    6. On index sources: the `ix_wq_b` dense3, `_rope` (index q), `_scores`, `attn_cuda.topk`.
+    7. The `wq_b` dense3, `l2pf.segments`, `_rope` (q), `_kv_store` (SWA ring), `attn_cuda.attn`.
+    8. `wo_a` (dense3, 4 segments), `wo_b` (dense3), `l2pace`.
+    9. `mhc_cuda.run`, `router_gemv.route`, `_prune` (top-p 0.85).
+    10. Experts: `group`, `rot_in`, `x3ld` gate/up, `gateup_epilogue`, `x3ld` down, `down_combine`.
+  - Every `.cu` op has a typed launcher in `dsv41_kernels` (`kernels_ops.zig`, `kernels_dense.zig`, `kernels_exl3.zig`). The Triton ops go through the M1 AOT set. Pod 6's capture, with every argument, is the per-op spec (`dsv41-zig-ref/prod-block-L2.txt`).
   - **`block.zig`** issues the launches on our own buffers. `state.zig` holds the per-slot SWA ring, compressed rows, index keys and ratio-2 carry, through the KV agent's `DevicePool` once it lands.
   - **Gate:** `tf-dsv41-m1 forward` runs our block on the capture's window inputs only (ids, positions, the prompt's KV state) and compares each of our launches, in order, with the capture's op at the same position: the same kernel, the same scalar arguments, and bit-equal buffers. Derived weights are compared byte for byte with the capture's copies.
 
