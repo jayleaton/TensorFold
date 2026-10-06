@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Two ranks of tf-tp-test on one two-GPU host (rank r on GPU r), as the RunPod gate runs them.
-#   run_pair.sh BIN OUTDIR
+#   [SUITES="mailbox nccl"] [FAILFAST="nccl mailbox"] run_pair.sh BIN OUTDIR
+# RoCE's GPU path on one host without RDMA: SUITES=roce FAILFAST=roce TF_TP_ROCE_WIRE=shm (the proxy copies through
+# shared memory instead of RDMA writes; the kernel, doorbell, flags and proxy loop are the real ones).
 # suite: every collective bit-exact on NCCL and the mailbox route, graph replays, latency sweeps.
 # failfast: each backend x (the victim's own failure | SIGKILL) x victim rank; both ranks must exit 70, the
 # survivor about TF_DSV41_FAILFAST_GRACE_S after the injection. OUTDIR/failfast.txt has the delays.
@@ -20,10 +22,11 @@ pair() { # NAME BACKEND ARGS...: both ranks, logs OUT/NAME.rR.log ending with an
     done
     wait
 }
-pair suite mailbox suite
-pair suite-nccl nccl suite
+for backend in ${SUITES:-mailbox nccl}; do
+    pair "suite-$backend" "$backend" suite
+done
 : > "$OUT/failfast.txt"
-for backend in nccl mailbox; do
+for backend in ${FAILFAST:-nccl mailbox}; do
     for mode in fatal kill; do
         for victim in 0 1; do
             name=ff-$backend-$mode-$victim

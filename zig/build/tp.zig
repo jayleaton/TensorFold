@@ -13,10 +13,11 @@ fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     return cuda;
 }
 
-/// The `tp` module over `cuda` (an engine passes its own runtime module).
+/// The `tp` module over `cuda` (an engine passes its own runtime module); verbs (zig/src/fabric/verbs.zig) for RoCE.
 pub fn module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module) *std.Build.Module {
     const m = b.createModule(.{ .root_source_file = b.path("zig/src/fabric/tp/tp.zig"), .target = target, .optimize = optimize, .link_libc = true });
     m.addImport("cuda", cuda);
+    m.addImport("verbs", b.createModule(.{ .root_source_file = b.path("zig/src/fabric/verbs.zig"), .target = target, .optimize = optimize, .link_libc = true }));
     return m;
 }
 
@@ -33,7 +34,8 @@ fn kernelModule(b: *std.Build, image: ?std.Build.LazyPath) *std.Build.Module {
     const wf = b.addWriteFiles();
     if (image) |file| {
         _ = wf.addCopyFile(file, "tp_mailbox.fatbin");
-        return b.createModule(.{ .root_source_file = wf.add("tp_kernel.zig", "pub const mailbox: []const u8 = @embedFile(\"tp_mailbox.fatbin\");\n") });
+        // the driver takes 8-byte aligned images (Module.load refuses others); @embedFile alone promises nothing
+        return b.createModule(.{ .root_source_file = wf.add("tp_kernel.zig", "const bytes align(16) = @embedFile(\"tp_mailbox.fatbin\").*;\npub const mailbox: []const u8 = &bytes;\n") });
     }
     return b.createModule(.{ .root_source_file = wf.add("tp_kernel.zig", "pub const mailbox: []const u8 = \"\";\n") });
 }

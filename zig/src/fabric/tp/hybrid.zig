@@ -1,43 +1,91 @@
-//! Small exchanges through the mailbox, the rest through NCCL; the route depends on the call, type and size only, so ranks always agree.
+//! Small exchanges through the mailbox (one host) or RoCE (two hosts), the rest through NCCL; the route depends on the call, type and size only, so ranks always agree.
 const std = @import("std");
 const collective = @import("collective.zig");
 const Mailbox = @import("mailbox.zig").Mailbox;
+const Roce = @import("roce.zig").Roce;
 const Nccl = @import("nccl.zig").Nccl;
 const DevicePtr = collective.DevicePtr;
 const DType = collective.DType;
 const Op = collective.Op;
 const Error = collective.Error;
 
+/// The one-kernel path for small shards: both expose the same calls.
+pub const Small = union(enum) {
+    mailbox: *Mailbox,
+    roce: *Roce,
+
+    fn fits(s: Small, n: usize) bool {
+        return switch (s) {
+            inline else => |p| p.fits(n),
+        };
+    }
+
+    fn sum(s: Small, src: DevicePtr, dst: DevicePtr, count: usize, t: DType, stream: collective.Stream) Error!void {
+        return switch (s) {
+            inline else => |p| p.sum(src, dst, count, t, stream),
+        };
+    }
+
+    fn gather(s: Small, src: DevicePtr, dst: DevicePtr, n: usize, stream: collective.Stream) Error!void {
+        return switch (s) {
+            inline else => |p| p.allGatherBytes(src, dst, n, stream),
+        };
+    }
+
+    fn exchange(s: Small, src: DevicePtr, dst: DevicePtr, n: usize, stream: collective.Stream) Error!void {
+        return switch (s) {
+            inline else => |p| p.exchangeBytes(src, dst, n, stream),
+        };
+    }
+
+    fn check(s: Small) Error!void {
+        return switch (s) {
+            inline else => |p| p.check(),
+        };
+    }
+
+    fn abort(s: Small) void {
+        switch (s) {
+            inline else => |p| p.abort(),
+        }
+    }
+};
+
 pub const Hybrid = struct {
-    mail: *Mailbox,
+    small: Small,
     nccl: *Nccl,
-    /// Largest shard a rank sends through the mailbox.
+    /// Largest shard a rank sends through the small path.
     max_bytes: usize,
 
     pub fn iface(h: *Hybrid) collective.Collective {
-        return .{ .ptr = h, .vtable = &vtable };
+        return .{ .ptr = h, .vtable = if (h.small == .roce) &roce_vtable else &mailbox_vtable };
     }
 
-    const vtable: collective.Collective.VTable = .{
-        .kind = .hybrid,
-        .rank = rankOf,
-        .world = worldOf,
-        .all_reduce = allReduce,
-        .all_gather = allGather,
-        .exchange = exchange,
-        .send = send,
-        .recv = recv,
-        .barrier = barrier,
-        .check = check,
-        .abort = abort,
-    };
+    fn vtable(comptime kind: collective.Kind) collective.Collective.VTable {
+        return .{
+            .kind = kind,
+            .rank = rankOf,
+            .world = worldOf,
+            .all_reduce = allReduce,
+            .all_gather = allGather,
+            .exchange = exchange,
+            .send = send,
+            .recv = recv,
+            .barrier = barrier,
+            .check = check,
+            .abort = abort,
+        };
+    }
+
+    const mailbox_vtable = vtable(.hybrid);
+    const roce_vtable = vtable(.roce);
 
     fn self_(ptr: *anyopaque) *Hybrid {
         return @ptrCast(@alignCast(ptr));
     }
 
-    fn small(h: *const Hybrid, n: usize) bool {
-        return n <= h.max_bytes and h.mail.fits(n);
+    fn routed(h: *const Hybrid, n: usize) bool {
+        return n <= h.max_bytes and h.small.fits(n);
     }
 
     fn rankOf(ptr: *anyopaque) u32 {
@@ -50,20 +98,20 @@ pub const Hybrid = struct {
 
     fn allReduce(ptr: *anyopaque, s: DevicePtr, r: DevicePtr, count: usize, t: DType, op: Op, stream: collective.Stream) Error!void {
         const h = self_(ptr);
-        if (op == .sum and (t == .f32 or t == .bf16) and h.small(count * t.size())) return h.mail.sum(s, r, count, t, stream);
+        if (op == .sum and (t == .f32 or t == .bf16) and h.routed(count * t.size())) return h.small.sum(s, r, count, t, stream);
         return Nccl.allReduce(h.nccl, s, r, count, t, op, stream);
     }
 
     fn allGather(ptr: *anyopaque, s: DevicePtr, r: DevicePtr, count: usize, t: DType, stream: collective.Stream) Error!void {
         const h = self_(ptr);
-        if (h.small(count * t.size())) return h.mail.allGatherBytes(s, r, count * t.size(), stream);
+        if (h.routed(count * t.size())) return h.small.gather(s, r, count * t.size(), stream);
         return Nccl.allGather(h.nccl, s, r, count, t, stream);
     }
 
     fn exchange(ptr: *anyopaque, s: DevicePtr, r: DevicePtr, count: usize, t: DType, peer: u32, stream: collective.Stream) Error!void {
         const h = self_(ptr);
         try collective.checkPeer(h.nccl.me, h.nccl.size, peer);
-        if (h.small(count * t.size())) return h.mail.exchangeBytes(s, r, count * t.size(), stream);
+        if (h.routed(count * t.size())) return h.small.exchange(s, r, count * t.size(), stream);
         return Nccl.exchange(h.nccl, s, r, count, t, peer, stream);
     }
 
@@ -81,13 +129,13 @@ pub const Hybrid = struct {
 
     fn check(ptr: *anyopaque) Error!void {
         const h = self_(ptr);
-        try h.mail.check();
+        try h.small.check();
         try Nccl.iface(h.nccl).check();
     }
 
     fn abort(ptr: *anyopaque) void {
         const h = self_(ptr);
-        h.mail.abort();
+        h.small.abort();
         Nccl.iface(h.nccl).abort();
     }
 };

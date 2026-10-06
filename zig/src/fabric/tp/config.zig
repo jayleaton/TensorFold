@@ -6,7 +6,12 @@ pub const Backend = enum {
     nccl,
     /// Exchanges of at most `mailbox_max_bytes` a rank through the one-shot mailbox kernel, NCCL above that.
     mailbox,
+    /// The same split between two hosts: the small exchanges over RoCE (doorbell + RDMA proxy), NCCL above.
+    roce,
 };
+
+/// What `roce` does when its setup or load-time probe fails on any rank (GLM53_TF_ROCE_FALLBACK).
+pub const Fallback = enum { nccl, @"error" };
 
 pub const Error = error{BadSetting};
 
@@ -33,6 +38,16 @@ pub const Config = struct {
     /// Rank 1's memory report period on the fate channel (also how fast it notices rank 0 hanging up).
     report_ns: u64 = std.time.ns_per_s / 2,
     nccl_lib: []const u8 = "libnccl.so.2",
+    /// `name[:gid],...` RDMA devices for `roce` (null: every active Ethernet port with an IPv4 RoCE v2 GID).
+    roce_hca: ?[]const u8 = null,
+    /// Stripe over at most this many HCAs (auto detection only).
+    roce_hcas: u8 = 2,
+    roce_tc: u8 = 0,
+    /// Pin the proxy thread (it busy-spins one core between exchanges).
+    roce_cpu: ?u32 = null,
+    /// `shm` runs the RoCE protocol on one host without RDMA (tests); `verbs` is the real wire.
+    roce_wire: enum { verbs, shm } = .verbs,
+    roce_fallback: Fallback = .nccl,
 
     /// Reads every setting from `get` (the environment in `fromEnv`); unset names keep the defaults.
     pub fn parse(get: *const fn ([]const u8) ?[]const u8) Error!Config {
@@ -45,7 +60,7 @@ pub const Config = struct {
         c.connect_timeout_ns = try seconds(get, "TF_DSV41_PLAN_TIMEOUT", 300, 0.1, 86400);
         c.device = try int(u32, get, "TF_TP_DEVICE", c.device, 0, 63);
         if (get("TF_COMM_BACKEND")) |b| c.backend = std.meta.stringToEnum(Backend, std.mem.trim(u8, b, " ")) orelse {
-            std.log.warn("TF_COMM_BACKEND={s}: expected nccl or mailbox", .{b});
+            std.log.warn("TF_COMM_BACKEND={s}: expected nccl, mailbox or roce", .{b});
             return error.BadSetting;
         };
         c.mailbox_max_bytes = 1024 * try int(usize, get, "TF_TP_MAILBOX_MAX_KB", 256, 4, 16 * 1024);
@@ -54,6 +69,18 @@ pub const Config = struct {
         c.grace_ns = try seconds(get, "TF_DSV41_FAILFAST_GRACE_S", 1.0, 0, 60);
         c.report_ns = try seconds(get, "TF_DSV41_PEER_MEM_S", 0.5, 0.01, 60);
         if (get("TF_NCCL_LIB")) |p| c.nccl_lib = p;
+        c.roce_hca = get("TF_TP_ROCE_HCA");
+        c.roce_hcas = try int(u8, get, "TF_TP_ROCE_HCAS", 2, 1, 2);
+        c.roce_tc = try int(u8, get, "TF_TP_ROCE_TC", try int(u8, get, "NCCL_IB_TC", 0, 0, 255), 0, 255);
+        if (get("TF_TP_ROCE_CPU")) |_| c.roce_cpu = try int(u32, get, "TF_TP_ROCE_CPU", 0, 0, 4095);
+        if (get("TF_TP_ROCE_WIRE")) |w| c.roce_wire = std.meta.stringToEnum(@TypeOf(c.roce_wire), w) orelse {
+            std.log.warn("TF_TP_ROCE_WIRE={s}: expected verbs or shm", .{w});
+            return error.BadSetting;
+        };
+        if (get("TF_TP_ROCE_FALLBACK")) |f| c.roce_fallback = std.meta.stringToEnum(Fallback, f) orelse {
+            std.log.warn("TF_TP_ROCE_FALLBACK={s}: expected nccl or error", .{f});
+            return error.BadSetting;
+        };
         return c;
     }
 
@@ -68,6 +95,8 @@ pub const Config = struct {
         h.update(std.mem.asBytes(&c.backend));
         h.update(std.mem.asBytes(&c.mailbox_max_bytes));
         h.update(std.mem.asBytes(&c.failfast));
+        h.update(std.mem.asBytes(&c.roce_wire));
+        h.update(std.mem.asBytes(&c.roce_fallback));
         var out: [32]u8 = undefined;
         h.final(&out);
         return out;
@@ -130,8 +159,13 @@ test "defaults follow the Python engine's ports and knobs" {
 test "bad settings are refused and the digest ignores the rank" {
     Fake.pairs = &.{.{ "TF_TP_RANK", "2" }};
     try std.testing.expectError(error.BadSetting, Config.parse(&Fake.get));
-    Fake.pairs = &.{.{ "TF_COMM_BACKEND", "roce" }};
+    Fake.pairs = &.{.{ "TF_COMM_BACKEND", "rdma" }};
     try std.testing.expectError(error.BadSetting, Config.parse(&Fake.get));
+    Fake.pairs = &.{ .{ "TF_COMM_BACKEND", "roce" }, .{ "TF_TP_ROCE_HCA", "rocep1s0f1,roceP2p1s0f1" }, .{ "NCCL_IB_TC", "106" } };
+    const r = try Config.parse(&Fake.get);
+    try std.testing.expectEqual(Backend.roce, r.backend);
+    try std.testing.expectEqual(@as(u8, 106), r.roce_tc);
+    try std.testing.expectEqualStrings("rocep1s0f1,roceP2p1s0f1", r.roce_hca.?);
     Fake.pairs = &.{ .{ "TF_COMM_BACKEND", "mailbox" }, .{ "TF_TP_MAILBOX_MAX_KB", "64" }, .{ "TF_DSV41_FAILFAST_GRACE_S", "0.25" } };
     const a = try Config.parse(&Fake.get);
     try std.testing.expectEqual(@as(usize, 64 * 1024), a.mailbox_max_bytes);

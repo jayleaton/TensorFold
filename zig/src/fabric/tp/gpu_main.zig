@@ -1,4 +1,4 @@
-//! `tf-tp-test suite | failfast RANK fatal|kill`: one rank of a two-process TP=2 test on real GPUs (settings from TF_TP_*).
+//! `tf-tp-test suite | failfast RANK fatal|kill | roce-host`: one rank of a two-process TP=2 test on real GPUs (settings from TF_TP_*).
 const std = @import("std");
 const cuda = @import("cuda");
 const tp = @import("tp");
@@ -11,10 +11,11 @@ const max_bytes = (4 << 20) + 4096;
 pub fn main(init: std.process.Init) !u8 {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len < 2) {
-        std.debug.print("usage: tf-tp-test suite | failfast RANK fatal|kill\n", .{});
+        std.debug.print("usage: tf-tp-test suite | failfast RANK fatal|kill | roce-host\n", .{});
         return 2;
     }
     const cfg = try tp.Config.fromEnv();
+    if (std.mem.eql(u8, args[1], "roce-host")) return @import("roce_host.zig").run(cfg, init.gpa);
     var driver = try cuda.Driver.open();
     defer driver.close();
     var ctx = try cuda.Context.init(&driver, @intCast(cfg.device));
@@ -37,8 +38,8 @@ fn suite(s: *tp.Session, d: *const cuda.Driver, gpa: std.mem.Allocator, cfg: tp.
     var backends: [2]struct { comm: tp.Collective, label: []const u8 } = undefined;
     var n_backends: usize = 1;
     backends[0] = .{ .comm = s.nccl.iface(), .label = "nccl" };
-    if (s.mail != null) {
-        backends[1] = .{ .comm = s.comm(), .label = "mailbox" };
+    if (s.comm().kind() != .nccl) {
+        backends[1] = .{ .comm = s.comm(), .label = if (s.roce != null) "roce" else "mailbox" };
         n_backends = 2;
     }
     const sizes = [_]usize{ 6, 1000, 4096, 65536, 256 * 1024, 256 * 1024 + 16, 1 << 20, 4 << 20 };

@@ -36,12 +36,12 @@ const MailArgs = extern struct {
 };
 
 /// Driver calls the runtime's table does not carry (page-locking memory this process mapped itself).
-const HostRegister = struct {
+pub const HostRegister = struct {
     lib: std.DynLib,
     register: *const fn (?*anyopaque, usize, c_uint) callconv(.c) cuda.abi.Result,
     unregister: *const fn (?*anyopaque) callconv(.c) cuda.abi.Result,
 
-    fn open() !HostRegister {
+    pub fn open() !HostRegister {
         var lib = std.DynLib.open("libcuda.so.1") catch return error.DriverUnavailable;
         errdefer lib.close();
         return .{
@@ -85,14 +85,15 @@ pub const Mailbox = struct {
         defer if (fd >= 0) {
             _ = std.c.close(fd);
         };
-        if (b.rank == 0) {
-            const s = try std.fmt.bufPrint(&name, "/dev/shm/tf-tp-{d}-{x}", .{ std.c.getpid(), sock.nowNs() });
-            name_len = @intCast(s.len);
-            name[name_len] = 0;
-            fd = std.c.open(name[0..name_len :0], .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .CLOEXEC = true }, @as(std.c.mode_t, 0o600));
-            if (fd < 0 or std.c.ftruncate(fd, @intCast(len)) != 0) return error.SharedMemoryUnavailable;
+        if (b.rank == 0) blk: {
+            const s = std.fmt.bufPrint(&name, "/dev/shm/tf-tp-{d}-{x}", .{ std.c.getpid(), sock.nowNs() }) catch break :blk;
+            name[s.len] = 0;
+            fd = std.c.open(name[0..s.len :0], .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .CLOEXEC = true }, @as(std.c.mode_t, 0o600));
+            if (fd >= 0 and std.c.ftruncate(fd, @intCast(len)) == 0) name_len = @intCast(s.len);
         }
+        // an empty name tells the other rank that rank 0 failed (it must not wait for a name that never comes)
         try b.broadcast(std.mem.asBytes(&name_len), std.mem.asBytes(&name_len));
+        if (name_len == 0) return error.SharedMemoryUnavailable;
         try b.broadcast(name[0..name_len], name[0..name_len]);
         name[name_len] = 0;
         const path = name[0..name_len :0];
@@ -196,7 +197,7 @@ pub const Mailbox = struct {
         for (0..2) |r| {
             const rec = ctrl_rank + 8 * r;
             if (m.ctrlWord(rec).load(.acquire) != 0) {
-                std.log.warn("tp mailbox: rank {d}'s wait for seq {d} failed (block {d}, flag held {d})", .{ r, m.ctrlWord(rec + 1).load(.acquire), m.ctrlWord(rec + 3).load(.acquire), m.ctrlWord(rec + 2).load(.acquire) });
+                std.log.warn("tp mailbox: rank {d}'s wait for seq {d} failed ({s} after {d} us; block {d}, flag held {d})", .{ r, m.ctrlWord(rec + 1).load(.acquire), if (m.ctrlWord(rec + 4).load(.acquire) == 1) "aborted" else "timed out", m.ctrlWord(rec + 5).load(.acquire), m.ctrlWord(rec + 3).load(.acquire), m.ctrlWord(rec + 2).load(.acquire) });
                 return error.PeerFailed;
             }
         }

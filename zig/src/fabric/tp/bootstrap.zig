@@ -8,24 +8,32 @@ pub const max_ranks = 64;
 pub const max_blob = 64 * 1024;
 
 const magic: u32 = 0x31425054; // "TPB1"
-const version: u32 = 1;
+const version: u32 = 2;
 
 pub const Error = error{ Protocol, Mismatch, TooLarge } || sock.Error;
 
-const Hello = extern struct { magic: u32, version: u32, world: u32, rank: u32 };
+/// `role`: 0 the control connection (bootstrap, then the fate channel), 1 the plan link.
+const Hello = extern struct { magic: u32, version: u32, world: u32, rank: u32, role: u32 };
 
 pub const Bootstrap = struct {
     rank: u32,
     world: u32,
     /// Rank 0: the socket of rank i at index i (index 0 unused); other ranks: rank 0's socket at index 0.
     fds: [max_ranks]sock.Fd = @splat(-1),
-    deadline_ns: u64,
+    /// The plan link's sockets, laid out as `fds`.
+    plan_fds: [max_ranks]sock.Fd = @splat(-1),
+    /// Each call's limit for the peers' bytes (the connect timeout).
+    timeout_ns: u64,
+
+    fn deadline(b: *const Bootstrap) u64 {
+        return sock.nowNs() + b.timeout_ns;
+    }
 
     /// Rank 0 listens on `link_port` and accepts every other rank; the others connect to `master`. Both until the
     /// connect timeout.
     pub fn open(cfg: Config) Error!Bootstrap {
         if (cfg.world > max_ranks or cfg.rank >= cfg.world) return error.Protocol;
-        var b: Bootstrap = .{ .rank = cfg.rank, .world = cfg.world, .deadline_ns = sock.nowNs() + cfg.connect_timeout_ns };
+        var b: Bootstrap = .{ .rank = cfg.rank, .world = cfg.world, .timeout_ns = cfg.connect_timeout_ns };
         errdefer b.close();
         if (cfg.world == 1) return b;
         if (cfg.rank == 0) {
@@ -33,28 +41,33 @@ pub const Bootstrap = struct {
             defer sock.close(l);
             try b.acceptAll(l);
         } else {
-            const fd = try sock.connect(cfg.master, cfg.link_port, b.deadline_ns);
-            b.fds[0] = fd;
-            const h: Hello = .{ .magic = magic, .version = version, .world = cfg.world, .rank = cfg.rank };
-            try sock.sendAll(fd, std.mem.asBytes(&h));
+            const until = b.deadline();
+            for ([_]u32{ 0, 1 }) |role| {
+                const fd = try sock.connect(cfg.master, cfg.link_port, until);
+                if (role == 0) b.fds[0] = fd else b.plan_fds[0] = fd;
+                const h: Hello = .{ .magic = magic, .version = version, .world = cfg.world, .rank = cfg.rank, .role = role };
+                try sock.sendAll(fd, std.mem.asBytes(&h));
+            }
         }
         return b;
     }
 
     /// Rank 0 over an already listening socket (tests: an ephemeral port).
     pub fn acceptOn(l: sock.Fd, world: u32, timeout_ns: u64) Error!Bootstrap {
-        var b: Bootstrap = .{ .rank = 0, .world = world, .deadline_ns = sock.nowNs() + timeout_ns };
+        var b: Bootstrap = .{ .rank = 0, .world = world, .timeout_ns = timeout_ns };
         errdefer b.close();
         try b.acceptAll(l);
         return b;
     }
 
     fn acceptAll(b: *Bootstrap, l: sock.Fd) Error!void {
-        var joined: u32 = 1;
-        while (joined < b.world) {
-            const fd = try sock.accept(l, b.deadline_ns);
+        // every other rank's control and plan connections, in any order
+        var joined: u32 = 0;
+        const until = b.deadline();
+        while (joined < 2 * (b.world - 1)) {
+            const fd = try sock.accept(l, until);
             var h: Hello = undefined;
-            sock.recvExact(fd, std.mem.asBytes(&h), b.deadline_ns) catch {
+            sock.recvExact(fd, std.mem.asBytes(&h), until) catch {
                 sock.close(fd);
                 continue;
             };
@@ -63,25 +76,33 @@ pub const Bootstrap = struct {
                 sock.close(fd);
                 continue;
             }
-            if (h.world != b.world or h.rank == 0 or h.rank >= b.world or b.fds[h.rank] >= 0) {
+            const table = if (h.role == 0) &b.fds else &b.plan_fds;
+            if (h.world != b.world or h.rank == 0 or h.rank >= b.world or h.role > 1 or table[h.rank] >= 0) {
                 std.log.warn("tp bootstrap: rank {d} of {d} joined a world of {d}", .{ h.rank, h.world, b.world });
                 sock.close(fd);
                 return error.Mismatch;
             }
-            b.fds[h.rank] = fd;
+            table[h.rank] = fd;
             joined += 1;
         }
     }
 
-    /// Takes the sockets (the fate channel keeps them); `close` then leaves them open.
+    /// Takes the control sockets (the fate channel keeps them); `close` then leaves them open.
     pub fn release(b: *Bootstrap) [max_ranks]sock.Fd {
         const out = b.fds;
         b.fds = @splat(-1);
         return out;
     }
 
+    /// Takes the plan link's sockets.
+    pub fn releasePlan(b: *Bootstrap) [max_ranks]sock.Fd {
+        const out = b.plan_fds;
+        b.plan_fds = @splat(-1);
+        return out;
+    }
+
     pub fn close(b: *Bootstrap) void {
-        for (&b.fds) |*fd| if (fd.* >= 0) {
+        for ([_]*[max_ranks]sock.Fd{ &b.fds, &b.plan_fds }) |table| for (table) |*fd| if (fd.* >= 0) {
             sock.close(fd.*);
             fd.* = -1;
         };
@@ -107,11 +128,11 @@ pub const Bootstrap = struct {
         for (0..b.world) |i| {
             const len: u32 = if (i == 0) @intCast(mine.len) else blk: {
                 var l: u32 = undefined;
-                try sock.recvExact(b.fds[i], std.mem.asBytes(&l), b.deadline_ns);
+                try sock.recvExact(b.fds[i], std.mem.asBytes(&l), b.deadline());
                 break :blk l;
             };
             if (len > max_blob or used + len > out.len) return error.TooLarge;
-            if (i == 0) @memcpy(out[used..][0..len], mine) else try sock.recvExact(b.fds[i], out[used..][0..len], b.deadline_ns);
+            if (i == 0) @memcpy(out[used..][0..len], mine) else try sock.recvExact(b.fds[i], out[used..][0..len], b.deadline());
             blobs[i] = out[used..][0..len];
             used += len;
         }
@@ -125,9 +146,9 @@ pub const Bootstrap = struct {
         var used: usize = 0;
         for (0..b.world) |i| {
             var l: u32 = undefined;
-            try sock.recvExact(fd, std.mem.asBytes(&l), b.deadline_ns);
+            try sock.recvExact(fd, std.mem.asBytes(&l), b.deadline());
             if (l > max_blob or used + l > out.len) return error.TooLarge;
-            try sock.recvExact(fd, out[used..][0..l], b.deadline_ns);
+            try sock.recvExact(fd, out[used..][0..l], b.deadline());
             blobs[i] = out[used..][0..l];
             used += l;
         }

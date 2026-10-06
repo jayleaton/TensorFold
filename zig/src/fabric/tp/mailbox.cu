@@ -19,7 +19,7 @@ namespace tftp {
 
 constexpr int kMaxBlocks = 16;
 constexpr int kFlagStride = 32;  // words: one 128-byte line per flag
-// ctrl words: [0] abort (any rank, any host thread); per rank r at 16 + 8 r: failed, seq, seen, block
+// ctrl words: [0] abort (any rank, any host thread); per rank r at 16 + 8 r: failed, seq, seen, block, why, waited us
 constexpr int kCtrlAbort = 0;
 constexpr int kCtrlRank = 16;
 
@@ -183,9 +183,11 @@ __device__ __forceinline__ void sum_bytes(uint8_t *out, const uint8_t *mine, con
     }
 }
 
-// Thread 0 of a block: spin until the peer block's flag holds seq; false on abort or timeout.
+// Thread 0 of a block: spin until the peer block's flag holds seq; false on abort or timeout, with `why` (1 abort,
+// 2 timeout) and the microseconds waited. The clock only counts forward: a %globaltimer read below the start (it
+// is not promised monotonic across its updates) restarts nothing and ends nothing.
 __device__ __noinline__ bool wait_flag(const uint32_t *flag, uint32_t seq, const uint32_t *ctrl, uint64_t timeout_ns,
-                                       uint32_t *seen) {
+                                       uint32_t *seen, uint32_t *why, uint32_t *waited_us) {
     const uint64_t t0 = globaltimer();
     uint32_t polls = 0;
     while (true) {
@@ -195,8 +197,13 @@ __device__ __noinline__ bool wait_flag(const uint32_t *flag, uint32_t seq, const
             return true;
         }
         if ((++polls & 63u) == 0u) {
-            if (ld_relaxed_sys(ctrl + kCtrlAbort) != 0u || globaltimer() - t0 > timeout_ns) {
+            const uint64_t now = globaltimer();
+            const bool aborted = ld_relaxed_sys(ctrl + kCtrlAbort) != 0u;
+            const bool late = now > t0 && now - t0 > timeout_ns;
+            if (aborted || late) {
                 *seen = ld_acquire_sys(flag);
+                *why = aborted ? 1u : 2u;
+                *waited_us = now > t0 ? static_cast<uint32_t>((now - t0) / 1000u) : 0u;
                 return *seen == seq;
             }
         }
@@ -243,14 +250,16 @@ extern "C" __global__ void __launch_bounds__(512) tp_mailbox(MailArgs a) {
 
     // 2. the peer's block of the same index (it wrote exactly the bytes this block reads)
     if (tid == 0) {
-        uint32_t seen = 0u;
-        if (!wait_flag(a.my_flags + flag_at, seq, a.ctrl, a.timeout_ns, &seen)) {
+        uint32_t seen = 0u, why = 0u, waited = 0u;
+        if (!wait_flag(a.my_flags + flag_at, seq, a.ctrl, a.timeout_ns, &seen, &why, &waited)) {
             s_bad = 1u;
             if (atom_cas_gpu(a.state + 2, 0u, 1u) == 0u) {  // one failure record a rank
                 uint32_t *rec = a.ctrl + kCtrlRank + 8u * a.rank;
                 st_relaxed_sys(rec + 1, seq);
                 st_relaxed_sys(rec + 2, seen);
                 st_relaxed_sys(rec + 3, blockIdx.x);
+                st_relaxed_sys(rec + 4, why);
+                st_relaxed_sys(rec + 5, waited);
                 fence_sc_sys();
                 st_relaxed_sys(rec, 1u);
                 fence_sc_sys();
@@ -290,6 +299,140 @@ extern "C" __global__ void __launch_bounds__(512) tp_mailbox(MailArgs a) {
         }
         if (last && ok) {
             st_release_gpu(a.state, seq);
+        }
+    }
+}
+
+// The RoCE variant (roce.zig): the same epoch, slots, flags, timeout and copy-out, but the shard travels through a
+// host proxy, as in the Python engine's roce.cu: every block stages its share into this rank's pinned send slot, the
+// last block to finish rings the doorbell (the slot's padded byte count, then seq with a system-scope release), the
+// proxy thread RDMA-writes the slot to the peer's receive slot and a 4-byte seq flag after it on the same RC queue
+// pair (one stripe and one flag per HCA), and every block waits for every used HCA's flag before its copy-out.
+// Region (roce.zig): ctrl [4 KiB], flags [2 slots][kRoceHcas] at kFlagStride, send [2][slot_bytes], recv [2][slot].
+namespace tftp {
+
+constexpr int kRoceHcas = 2;
+// ctrl words shared with roce.zig's proxy: [0] doorbell seq, [4 + slot] padded bytes of that slot's op, [8] the
+// last seq completed here, [12] abort (any host thread); a failed wait: [16] failed, [17] seq, [18] seen, [19] hca,
+// [20] why (1 abort, 2 timeout), [21] microseconds waited
+constexpr int kRoceSeq = 0;
+constexpr int kRoceSlotBytes = 4;
+constexpr int kRoceCompleted = 8;
+constexpr int kRoceFailed = 16;
+constexpr int kRoceAbort = 12;  // wait_flag reads ctrl[kCtrlAbort]: the RoCE abort word is passed as that ctrl
+
+struct RoceArgs {
+    const uint8_t *in;
+    uint8_t *out;
+    uint8_t *send_slots;        // this rank's send slots (pinned host, read by the NIC)
+    const uint8_t *recv_slots;  // this rank's receive slots (written by the peer's NIC)
+    const uint32_t *flags;      // this rank's flags [2][kRoceHcas], written by the peer's NIC
+    uint32_t *ctrl;
+    uint32_t *state;            // device: [0] epoch, [1] tail counter, [2] poison, [3] stage counter
+    uint64_t nbytes;
+    uint64_t slot_bytes;
+    uint64_t timeout_ns;
+    uint32_t rank;
+    uint32_t mode;
+    uint32_t n_hca;
+    uint32_t pad;
+};
+
+}  // namespace tftp
+
+extern "C" __global__ void __launch_bounds__(512) tp_roce(RoceArgs a) {
+    __shared__ uint32_t s_head[2];  // poison, seq
+    __shared__ uint32_t s_bad;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t gdim = gridDim.x;
+    const uint64_t index = static_cast<uint64_t>(blockIdx.x) * blockDim.x + tid;
+    const uint64_t stride = static_cast<uint64_t>(gdim) * blockDim.x;
+
+    if (tid == 0) {
+        s_head[0] = ld_relaxed_gpu(a.state + 2);
+        s_head[1] = ld_relaxed_gpu(a.state) + 1u;
+        s_bad = 0u;
+    }
+    __syncthreads();
+    if (s_head[0] != 0u) {
+        return;
+    }
+    const uint32_t seq = s_head[1];
+    const uint64_t slot = seq & 1u;
+
+    // 1. stage this block's share into the send slot; the last block to finish rings the doorbell
+    copy_bytes<false>(a.send_slots + slot * a.slot_bytes, a.in, a.nbytes, index, stride);
+    __syncthreads();
+    if (tid == 0) {
+        fence_sc_sys();
+        const bool last = gdim == 1u || atom_add_acq_rel_gpu(a.state + 3, 1u) == gdim - 1u;
+        if (last) {
+            if (gdim > 1u) {
+                st_release_gpu(a.state + 3, 0u);
+                fence_sc_sys();  // every block's staging (seen through the counter) before the doorbell
+            }
+            st_relaxed_sys(a.ctrl + kRoceSlotBytes + slot, static_cast<uint32_t>((a.nbytes + 15u) & ~uint64_t(15u)));
+            st_release_sys(a.ctrl + kRoceSeq, seq);
+        }
+    }
+    if (a.mode == kGather) {
+        copy_bytes<false>(a.out + static_cast<uint64_t>(a.rank) * a.nbytes, a.in, a.nbytes, index, stride);
+    }
+
+    // 2. every HCA's flag for this slot (the stripes do not follow the blocks: each block needs all of them)
+    if (tid == 0) {
+        for (uint32_t h = 0; h < a.n_hca; h++) {
+            uint32_t seen = 0u, why = 0u, waited = 0u;
+            if (!wait_flag(a.flags + (slot * kRoceHcas + h) * kFlagStride, seq, a.ctrl + kRoceAbort, a.timeout_ns, &seen,
+                           &why, &waited)) {
+                s_bad = 1u;
+                if (atom_cas_gpu(a.state + 2, 0u, 1u) == 0u) {
+                    st_relaxed_sys(a.ctrl + kRoceFailed + 1, seq);
+                    st_relaxed_sys(a.ctrl + kRoceFailed + 2, seen);
+                    st_relaxed_sys(a.ctrl + kRoceFailed + 3, h);
+                    st_relaxed_sys(a.ctrl + kRoceFailed + 4, why);
+                    st_relaxed_sys(a.ctrl + kRoceFailed + 5, waited);
+                    fence_sc_sys();
+                    st_relaxed_sys(a.ctrl + kRoceFailed, 1u);
+                    fence_sc_sys();
+                }
+                break;
+            }
+        }
+    }
+    __syncthreads();
+
+    // 3. copy out of the receive slot the peer's NIC wrote
+    if (s_bad == 0u) {
+        const uint8_t *inbox = a.recv_slots + slot * a.slot_bytes;
+        switch (a.mode) {
+            case kGather:
+                copy_bytes<true>(a.out + static_cast<uint64_t>(1u - a.rank) * a.nbytes, inbox, a.nbytes, index,
+                                 stride);
+                break;
+            case kExchange:
+                copy_bytes<true>(a.out, inbox, a.nbytes, index, stride);
+                break;
+            case kSumF32:
+                sum_bytes<false>(a.out, a.in, inbox, a.nbytes, a.rank, index, stride);
+                break;
+            default:
+                sum_bytes<true>(a.out, a.in, inbox, a.nbytes, a.rank, index, stride);
+                break;
+        }
+    }
+
+    // 4. the epoch, as tp_mailbox; the host also sees the last completed seq
+    __syncthreads();
+    if (tid == 0) {
+        const bool last = gdim == 1u || atom_add_acq_rel_gpu(a.state + 1, 1u) == gdim - 1u;
+        const bool ok = gdim == 1u ? s_bad == 0u : ld_relaxed_gpu(a.state + 2) == 0u;
+        if (last && gdim > 1u) {
+            st_release_gpu(a.state + 1, 0u);
+        }
+        if (last && ok) {
+            st_release_gpu(a.state, seq);
+            st_relaxed_sys(a.ctrl + kRoceCompleted, seq);
         }
     }
 }
