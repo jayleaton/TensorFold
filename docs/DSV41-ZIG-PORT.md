@@ -206,7 +206,7 @@ Rules from `ZIG-PREVIEW.md`:
     - dsq-zig-kern-1 checked ours against the v2 source (8474f31) offline: 135/135 SASS-equal for sm_120, the same for sm_121.
     - Pods 9–13 showed 130/130 only because they shipped stale pre-v2 fatbins.
     - With the 78b703d twin, read this line as expected. The next twin rebuilt for any reason comes from 8474f31, and then the line is clean.
-- **The M2c-2 kit** is `~/Documents/Projects/spark-work/zig-m2c2-kit` (tree 312480d; sm_121 fatbins from dsq-zig-kern-1's 07935cc, SASS-equal to Spark prod's 8474f31 build). It is for the user's morning run: `RUNBOOK.md`.
+- **The M2c-2 kit** is `~/Documents/Projects/spark-work/zig-m2c2-kit` (tree ffba58d; sm_121 fatbins from dsq-zig-kern-1's 07935cc, SASS-equal to Spark prod's 8474f31 build). It is for the user's morning run: `RUNBOOK.md`.
 - **M2c-1, prod expert top-p on the same gate.** The prune path (`_prune`, `group`, the kit-weights glue) is already in `block.zig` and bit-checked by M1 on the prod captures.
   - The run: `--env M1_JOB=m2b --env M2B_TOPP=0.85` on 2x PRO 6000. It is one environment flag, passed to Python's reference and to our ranks.
   - Expected: about 6 min, about $0.45. The gate is the same (tokens, logits, blocks).
@@ -230,11 +230,17 @@ Rules from `ZIG-PREVIEW.md`:
     - the kit drops caches between phases;
     - the aarch64 build is cross-compiled on the dev box (1 min);
     - the sm_121 fatbins are dsq-zig-kern-1's.
-  - **Not in M2c-2:** DSpark, our own prefill, graphs, timing as a gate.
+  - **Optional M3 phase (`LANES=1`, about +12 min):** the same decode through lanes over the GPU target, below. It compares tokens only.
+  - **Prefill over RoCE: design only.** Zig has no prefill yet; the run starts from Python's prompt state. When it lands, its all-gathers use the same `Collective` as decode: the hybrid sends exchanges up to `mailbox_max_bytes` (256 KiB by default; `TF_TP_MAILBOX_MAX_KB`, up to 16 MB) over RoCE and larger ones over NCCL. A 16-row prefill window's exchanges fit the mailbox. Python's 2,048-row prefill chunks would need the threshold raised or NCCL.
+  - **DSpark in the kit: weights only.** The plan and loader carry the DSpark heads (`named.dspark`: `main_proj`, the norms, Markov `w1` / `w2`, `conf`) and blocks 40–42. Capture set P (layers 36–39 plus the drafter's phases i0 / d0 / i1 / d1) is ready in `dsv41_m1_capture.py`. The GPU pass is not written: it waits for a P capture on a pod, as `block.zig` waited for M1's captures. Drafts never change the emitted tokens (verification is exact), so the Spark run's token gate does not depend on it.
+  - **Not in M2c-2:** the DSpark pass, our own prefill, graphs, timing as a gate.
 - **M3 status:**
   - **Built:**
     - `target.zig`: draft/iface.zig's `Target` over `forward.zig`. It covers one slot, chain verify windows with greedy choices (`forward.greedy`: Python's cross-rank rule), `keep` of a chain prefix, prefill as consecutive decode windows, and the taps.
     - `block.Options.taps`: the boundaries entering layers 37–39 write `w.taps` `[n, 3 × hidden]`, as `dspark.py`.
+    - **Leader / follower** (`forward.zig`, commit ffba58d): with `Forward.link` set (the tp session's plan link), rank 0 sends each `window(ids)` (at most 128 ids), `greedy(n)` and `keep(k)` as a plan op before running it. The other ranks run `follow()`, which replays the ops until `stop`. The host engine (lanes) runs on rank 0 alone.
+    - `m3.zig`: `generate()` runs `lanes.Engine` over `draft/lanes.zig` with the GPU target and a `NoDraft` pass (streams with `drafts = false`; the pass is never asked). `GpuTarget.resume_first` starts from a slot that already holds the prompt.
+    - **The gate:** `M2B_LANES=1` on the M2b driver. Rank 0's lanes tokens must equal the reference's (prompt's pick + S steps); rank 1 follows. It is host-built only; the first run is the Spark kit's `LANES=1` or the next 2-GPU pod.
   - **Next:**
     1. **The DSpark pass on the GPU** (draft/iface.zig `Pass`):
        - `main_proj` + RMS norm of the taps;
