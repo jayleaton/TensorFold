@@ -11,6 +11,9 @@ pub const PageStore = pagestore.PageStore;
 pub const HostPool = pagestore.HostPool;
 pub const prefix = @import("prefix.zig");
 pub const lanes = @import("lanes.zig");
+pub const format = @import("format.zig");
+pub const disk = @import("disk.zig");
+pub const Disk = disk.Disk;
 
 test {
     _ = freeset;
@@ -18,4 +21,7 @@ test {
     _ = pagestore;
     _ = prefix;
     _ = lanes;
+    _ = format;
+    _ = disk;
+    _ = @import("disk_test.zig");
 }
