@@ -59,6 +59,14 @@ not to these copies.
 | split KV copies | `tf-dsv41-test kvsplit` and the KV agent's 2-rank NCCL test | 3 / 3 bit-exact; 520,192 entries a rank, 0 mismatches |
 | spills | `-Xptxas -v` per fatbin | equal to the Python build's. x3seg `<K2 6/10/12, 4, 3>` spills 32-68 B and dense3 at MINB 4 / 2 spills, in Python too. Prod's dense3 MINB 3 / 1 has 0 spills. |
 
+**The M2c-2 Spark kit (2026-10-07, at 07935cc).**
+- **Sources:** every copied source is byte-identical to the Spark prod engine's tree (decode1 `dsv41-perf1-night` 8474f31).
+- **SASS:** `FATBINS=<zig-out/fatbin> SM=121 bash sass_check.sh` compares all 19 twin modules both ways, the fresh compile and the built fatbins: 441 kernels, all SASS-equal on sm_121, rc 0.
+- **Python-only instances:** `linear`'s other codebooks (`3inst`, `mcg`; the pack is all `mul1`), and the CCCL `EmptyKernel`.
+- **Spills:** our 5 modules without a Python twin have 0 spills on sm_121.
+- **Kit fatbins:** the sm_121-only set is in `zig-dsv41-scratch/zig-out-sm121/fatbin`. Its SASS is identical module by module to the checked set, and `SHA256SUMS` covers the 24 `dsv41_*` files.
+- **Shared memory:** GB10's opt-in limit is sm_120's (101,376 B), and the load refuses per device. Expect the same 7 x3gm cfg 3 / XM 2 refusals.
+
 SASS on sm_121 (NGC 26.07, nvcc 13.3.73; the e1e2 runtime image has the same nvcc). Kernels compared, all equal:
 
 | fatbin | Python extension | kernels |
