@@ -153,7 +153,7 @@ pub fn v3Of(mats: u32, xm: u32, out: []usize) []usize {
 }
 
 /// v3's default variant of a projection (sm_120 pod timing at prod shapes: docs/DSV41-ZIG-KERNELS.md 3.2d).
-pub const v3_default: struct { gu: [2]usize, dn: usize } = .{ .gu = .{ 5, 2 }, .dn = 9 };
+pub const v3_default: struct { gu: [2]usize, dn: usize } = .{ .gu = .{ 4, 1 }, .dn = 9 };
 
 /// x3gm.tuned2: (gate/up cfg, down cfg) of a v2 block: forced ids where gm2_kernel is built at them, else G6's (0 with
 /// one rotated input, 1 with two; down 0) at any row count.

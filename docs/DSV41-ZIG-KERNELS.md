@@ -339,6 +339,45 @@ contract: replay == eager, bit for bit).
 - Row-mode padding to the row buckets (1-8, 12, 16, 24, 32, 48, 64) needs the stacked multi-slot state and comes with it.
 - Graphs read state at fixed addresses: every buffer they touch is allocated once (bind; send and gathered at the planned rows). A change in any of them drops every graph.
 
+## 3.2d x3gm v3 (`Z/x3gm3.cu`, ours): measured, bit-identical, small
+
+**Where v2's time goes** (sm_120 SASS of its prod tiles, before writing v3):
+- In the k loop of a stage at about 32 members an expert, about 70 % of instructions are the trellis decode:
+  - per value one `IMAD`, one `IDP.4A`, half a `PRMT`, half an `HFMA2`, about 2 for window extraction;
+  - 32 of 490 instructions are `HMMA`.
+- The codebook arithmetic is already at its minimum; issue and tensor time are about equal at prod routing.
+- v2's prod gate/up tile (GU1, two inputs) spills at 128 registers.
+- Its down tile (DN0) runs 4-warp CTAs at 253 registers: 8 warps an SM.
+- Every item starts with three dependent global reads (ticket, pass entry, member rows).
+
+**What v3 changes** (`gm3_kernel`, over x3gm.cu's verbatim device code; sync.py's footer guard keeps x3gm.cu's
+instances out of x3gm3.cu), all with the same mma chains and epilogue:
+- **Claim-ahead:** the next item's ticket, pass entry and member rows are read during stages 0-4 of the current one, each load a stage before its use.
+- **LEAN:** runs of windows that fit 32 bits (K2 3, 4, 7, 10) are read by one funnel shift, and byte-aligned windows by one permute.
+- **1-column-tile warps:** 16 warps an SM for down, and 512-thread gate/up CTAs, without spills.
+- The 11 variants are in `exl3.v3_variants`; `exl3.v3_default` is the measured choice.
+
+**Pod (2026-10-07, 1x RTX PRO 6000, 188 SMs, $0.08)**
+- **Bits:** every x3gm fixture with every v3 variant is equal to the Python engine's gm_kernel outputs (13 cases, 0 failed; prod's D 5,120 / I 1,152 geometry at 2,048 rows, the chunks, the 1,337-row tail).
+- **Timing:** `x3gm3-bench` at prod shapes (384 experts, top-6, ragged 4 / 6 / 8 / 10, unique weights from DRAM), every output byte-equal to v2, ms (median of 9).
+
+| rows, routing | v2 gate/up + down | v3 best gate/up | v3 best down (`v3[9]`) | v3 best total |
+| --- | ---: | ---: | ---: | ---: |
+| 512 uniform | 1.459 + 0.767 = 2.226 | 1.429 (`[3]`) | 0.746 (-2.8 %) | 2.175 (-2.3 %) |
+| 1,024 uniform | 1.529 + 0.830 = 2.360 | 1.513 (`[3]`) | 0.800 (-3.7 %) | 2.313 (-2.0 %) |
+| **2,048 uniform (prod chunk)** | 1.709 + 0.973 = **2.682** | 1.701 (`[1]`) | 0.922 (-5.2 %) | **2.623 (-2.2 %)** |
+| 2,048 Zipf 0.8 | 2.001 + 1.120 = 3.121 | 1.973 (`[3]`) | 1.060 (-5.4 %) | 3.026 (-3.1 %) |
+
+**What it means**
+- **Down:** the 8-warp tile is the only real gain, -3 to -5 %. Its claim-ahead alone (`v3[6]`, v2's tile) gives -2.4 to -6.0 %, so most of the gain is per-item latency.
+- **Gate/up:** none of the changes beats v2 by more than noise. The 512-thread tile (`v3[2]`) is 11-21 % slower: each warp reloads every member's B fragments for one column tile, so it issues twice the ldmatrix, in one CTA an SM. LEAN is within noise; ptxas already did most of it.
+- **The perf study's "+17-22 % available" was v2's gain** (the predicated mma). After v2, the kernel is decode-issue and tensor balanced at prod routing. What is left in issue terms is a few percent, not a rewrite's worth.
+- **On GB10** (DRAM-bound at prefill), the lever is bytes: the rotated X (2 × 126 MB a layer written and read) and the fp32 Y (252 MB written, read by combine). That needs a fused rotation or combine with its own exactness design, not issue work.
+
+**Default:** `v3_default` = down `v3[9]` and gate/up `v3[1]` (`[4]` with one input): -2.2 % at prod's 2,048-row chunk, the same bits. Whether the Zig prefill takes v3 or stays on v2 is the port lead's call; both are exact. sm_121: the
+included x3gm.cu is still 135 / 135 SASS-equal to Python (fresh compile and built fatbin); the v3 variants have the
+same registers and spills as on sm_120.
+
 ## 3.3 Perf notes that touch these launches (docs/DSV41-ZIG-PERF.md)
 
 - **x3gm at 4,096-row blocks.** `exl3.gmTuned` takes Python's tuning table (`tune_default` = `x3gm.TUNE`). Its 4K
