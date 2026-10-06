@@ -93,7 +93,7 @@ pub fn build(b: *std.Build) void {
     dsv41DraftTests(b, test_step);
     server_build.tests(b, test_step);
     tp_build.add(b, target, optimize, test_step);
-    kv_build.add(b, test_step, tp_build.module);
+    kv_build.add(b, target, optimize, test_step, tp_build.module);
     const flash_host = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/flashnext_host.zig"), .target = target, .optimize = optimize, .link_libc = true }) });
     b.step("compile-flashnext-host", "Compile FlashNext CPU metadata contracts without running them").dependOn(&flash_host.step);
     const flash_host_run = b.addRunArtifact(flash_host);
