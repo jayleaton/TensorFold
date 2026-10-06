@@ -3,7 +3,8 @@
 // __float2half, the intrinsics c10::BFloat16 / c10::Half use on CUDA). Built with --fmad=false: none has a
 // multiply-add, and torch runs each as its own kernel, every intermediate rounded where it is stored.
 //
-//   embed_send   rows[i] = 0 <= ids[i] - lo < V ? embed[ids[i] - lo] : +0          (index_select, where; bf16 exact)
+//   embed_send   rows[i] = 0 <= ids[i] - lo < V ? bf16_rn(f32 embed[ids[i] - lo]) : +0  (index_select .to(f32), where, .to(bf16):
+//                exact but for NaN, which the round trip makes canonical 0x7FFF)
 //   embed_sum    out[i] = repeat x4 of bf16_rn(((f32 recv[0] + f32 recv[1]) + ...))    (allsum: clone + adds, .to)
 //   cast_bf16    y = bf16_rn(x)                                                       (the MoE partial, .to(bf16))
 //   kit_weights  y = f32(f16_rn(x))                                                   (pick.kit_weights)
@@ -29,7 +30,7 @@ __global__ void __launch_bounds__(256) embed_send_kernel(const long long* __rest
     for (long long e = (long long)blockIdx.x * blockDim.x + threadIdx.x; e < total; e += (long long)gridDim.x * blockDim.x) {
         const long long i = e / D, d = e - i * D;
         const long long local = ids[i] - vocab_lo;
-        rows[e] = (local >= 0 && local < V) ? embed[local * D + d] : (uint16_t)0;
+        rows[e] = (local >= 0 && local < V) ? to_bf(bf(embed[local * D + d])) : (uint16_t)0;
     }
 }
 
