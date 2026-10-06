@@ -155,7 +155,16 @@ Rules from `ZIG-PREVIEW.md`:
   - **The next M1 pod carries** (batched; none planned):
     - the GPU compare of `prepare.lanes` against Python's dense3 words (pod 8 only compared them as plain strips);
     - the kernel agent's x3gm v2 check (f97ffde). gm2, with the ticket on and off, is compared bit for bit against the fixture's `gm_kernel` outputs, so each x3gm case should log "v2 4 launches".
-    - Stage from a tree at or after f97ffde. The fatbins are unchanged since 643164c.
+    - Stage from a tree at or after 6ff3472, with the fatbins rebuilt at 22:44 (R1c: SASS equal to decode1 78b703d).
+    - The R1c router prune pass has no GPU check yet. The replay checks it only if the pod's Python twin is built from decode1 78b703d with `RG_PRUNE` on. The e1e2 image is not.
+- **R1c and `block.zig`:**
+  - `block.zig` follows the prod capture (prod.env), which has none of R1c.
+  - When prod adopts R1c, a new prod capture becomes the spec, and the `block.zig` changes are:
+    - attention with `split > 0` and `qrope` (un-rotated q; the q `_rope` launch goes);
+    - the router's `prune` (`rg.pruneOf`; the `_prune` launch goes);
+    - x3seg `rot_in` with `nw`/`eps` (the `q_norm` fold; bf16 rows).
+  - `tf-dsv41-m1 check` on that capture gates the change before any pod.
+- **`roce.cu` wait fix (bb0cff8, Python):** nothing to port. The Zig TP runtime's one flag wait (`fabric/tp/mailbox.cu` `wait_flag`, used by the mailbox and `tp_roce`) only times out when `now > t0`, so a `%globaltimer` read below the start can't end it early. The Zig port is what found the Python bug.
 
 ## 3. Python to Zig, component by component
 
