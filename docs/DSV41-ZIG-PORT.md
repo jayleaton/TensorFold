@@ -260,7 +260,24 @@ Effort is in engineering days for this agent team, assuming GPU windows are avai
     - the EXL3 linears, x3seg, the routed-expert chain, x3gm, the fast-prefill GEMM and the split router.
   - **Kernel exactness job:** 13/13 cases pass, and the SASS of the ported kernels is identical to the Python extensions'.
   - Each M1 pod takes about 15-19 min and costs about $0.6.
-  - **Still open for M1:** set C, the DSpark block (layer 40), is running in pod 5. Then M1's second half: our own block forward (`block.zig`) driving these kernels in Python's order on our own buffers, with no captured inputs.
+  - **Still open for M1:** set C, the DSpark block (layer 40), is running in pod 5.
+- **M1, second half: our own block forward.** The capture's op log is the spec. A full-attention block's decode window is about 30-35 launches:
+  1. Engram (layers 1 and 14): wkv linear, `_fuse_dec`.
+  2. mHC: `_site_dec` + `_finish_k`.
+  3. The q/kv projections through x3seg, then `_rms2`.
+  4. `wq_b` (linear), `_rope`, `_kv_store`.
+  5. Full layers: the compressor (`_pool_norm`, `_kv_store`), indexer keys (linear on `ix_wk`, `_index_k`), `_scores`, `_dtopk`.
+  6. Attention: `_chunks` + `_merge`.
+  7. `wo_a` (x3seg), `wo_b` (linear).
+  8. mHC again, then the router `_fused`.
+  9. Experts: `group`, `rot_in`, `grouped` gate/up, `gateup_epilogue`, `grouped` down, `down_combine`.
+  - **`prepare.zig`** builds the derived weight forms Python's `Block` makes at load:
+    - linear trellises re-laid out as int32 `[N/128, K/16, 8, 32]`;
+    - x3seg segment tables;
+    - the experts' int64 address and int32 K2 tables over 385 entries (384 routed plus the shared expert), with `suh`/`svh` stacked `[385, K]`;
+    - dense3's lanes layout for the 8-bit `ix_wk`.
+  - **`block.zig`** issues the launches on our own buffers. `state.zig` holds the per-slot SWA ring, compressed rows, index keys and ratio-2 carry, through the KV agent's `DevicePool` once it lands.
+  - **Gate:** `tf-dsv41-m1 forward` runs our block on the capture's window inputs only (ids, positions, the prompt's KV state) and compares each of our launches, in order, with the capture's op at the same position: the same kernel, the same scalar arguments, and bit-equal buffers. Derived weights are compared byte for byte with the capture's copies.
 
 **M2. Whole model, TP=2, greedy token-identical on GB10** (about 15–20 days).
 - **Build:**
