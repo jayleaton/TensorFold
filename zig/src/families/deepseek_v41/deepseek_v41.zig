@@ -12,6 +12,8 @@ pub const stage = @import("stage.zig");
 pub const named = @import("named.zig");
 pub const rounds = @import("rounds.zig");
 pub const prepare = @import("prepare.zig");
+pub const engram_host = @import("engram_host.zig");
+pub const buffers = @import("buffers.zig");
 
 test {
     _ = config;
@@ -23,5 +25,7 @@ test {
     _ = named;
     _ = rounds;
     _ = prepare;
+    _ = engram_host;
+    _ = buffers;
     _ = @import("host_test.zig");
 }

@@ -12,12 +12,16 @@ const block = @import("block.zig");
 const buffers = @import("buffers.zig");
 const run = @import("run.zig");
 const Config = @import("config.zig").Config;
+const eh = @import("engram_host.zig");
 
 pub const Error = error{ GlueNotBuilt, BadWindow };
 
 /// One slot's position, Engram tail and pending window (what keep() commits).
 pub const Slot = struct {
     pos: u64 = 0,
+    /// the last max_ngram - 1 committed ids (Engram's lookback; fewer at the sequence start)
+    tail: [eh.max_ngram]u32 = undefined,
+    tail_len: usize = 0,
     /// the window in flight: its first position, its rows
     pending: ?struct { start: u64, n: u32 } = null,
 };
@@ -36,6 +40,11 @@ pub const Forward = struct {
     /// pinned staging of the window's token ids, and their device copy (int64, the embedding step reads them)
     host: ?cuda.HostBuffer = null,
     dev_ids: ?cuda.DeviceBuffer = null,
+    /// Engram's hasher (tools/zig/dsv41_engram_host.py's tables) and the rows' source; M2a: the synthetic rows
+    engram: ?*const eh.Host = null,
+    gathered: ?cuda.DeviceBuffer = null,
+    /// Engram's own pinned staging (the ids' staging may still be in flight: one buffer a producer)
+    rows_host: ?cuda.HostBuffer = null,
     /// a bf16 [rows, hidden] send buffer for the exchanges whose partial is not bf16 already (embedding, MoE)
     send: ?cuda.DeviceBuffer = null,
     /// the window's token ids (the embedding step reads them)
@@ -49,6 +58,8 @@ pub const Forward = struct {
         if (f.host) |*h| h.free();
         if (f.dev_ids) |*b| b.free();
         if (f.send) |*b| b.free();
+        if (f.gathered) |*b| b.free();
+        if (f.rows_host) |*b| b.free();
         f.programs.deinit(f.gpa);
         f.arena.deinit();
     }
@@ -100,6 +111,24 @@ pub const Forward = struct {
             const dst = r.addressOf(try std.fmt.bufPrint(&nb, "s.L{d}.carry", .{L})) orelse return error.Unbound;
             try r.kernels.others(r.stream).carry(src, w, 0, accepted, w, dst);
         };
+        // Engram's tail: (tail + the committed ids)[-(max_ngram - 1):]
+        if (f.engram) |h| {
+            const keep_n = h.max_ngram - 1;
+            var all: [2 * eh.max_ngram + 128]u32 = undefined;
+            var m: usize = 0;
+            for (f.slot.tail[0..f.slot.tail_len]) |t| {
+                all[m] = t;
+                m += 1;
+            }
+            const take = @min(accepted + 1, all.len - m);
+            for (f.ids[0..take]) |t| {
+                all[m] = t;
+                m += 1;
+            }
+            const k = @min(m, keep_n);
+            @memcpy(f.slot.tail[0..k], all[m - k .. m]);
+            f.slot.tail_len = k;
+        }
         f.slot.pos = p.start + accepted + 1;
         f.slot.pending = null;
     }
@@ -147,6 +176,7 @@ pub const Forward = struct {
                 f.dev_ids = try cuda.DeviceBuffer.alloc(r.d, @max(8 * n, 256));
             }
             const h = f.host.?.bytes;
+            try r.stream.synchronize(); // the previous window's copy out of this staging has finished
             for (f.ids, 0..) |id, i| std.mem.writeInt(i64, h[8 * i ..][0..8], id, .little);
             try r.d.check(r.d.api.cuMemcpyHtoDAsync_v2(f.dev_ids.?.ptr, h.ptr, 8 * n, s), "cuMemcpyHtoDAsync");
             const embed = r.weights.get("embed") orelse return error.MissingWeight;
@@ -173,7 +203,48 @@ pub const Forward = struct {
         if (std.mem.eql(u8, step, "kit_weights"))
             return k.kitWeights(try r.tensorAddr(c.args[0].arg.t), try r.tensorAddr(c.args[1].arg.t), numel(c.args[0].arg.t));
         if (std.mem.eql(u8, step, "kit_logits")) return k.kitLogits(try r.tensorAddr(c.args[0].arg.t), numel(c.args[0].arg.t));
-        return glueMissing(step); // engram_rows: the host hashing (NgramHasher) and the rows' source (EngramSource)
+        if (std.mem.eql(u8, step, "engram_rows")) return f.engramRows(r, c);
+        return glueMissing(step);
+    }
+
+    /// A window's Engram rows of layer L: hashes of its ids (with the slot's tail), this rank's heads' rows (M2a: the
+    /// synthetic index rows), the all-gather and the column order of forward.gather_cols.
+    fn engramRows(f: *Forward, r: *run.Runner, c: *const calls.Call) !void {
+        const h = f.engram orelse return glueMissing("engram_rows (no Engram tables)");
+        const L: u32 = @intCast(c.args[1].arg.i);
+        const li = std.mem.indexOfScalar(u32, h.layer_ids, L) orelse return error.NotEngram;
+        const n = f.ids.len;
+        const C = h.cols();
+        const W = f.comm.world();
+        const dim: usize = f.cfg.engram_head_dim;
+        const sh = h.headShard(f.comm.rank(), W);
+        const a = f.gpa;
+        const hashes = try a.alloc(i64, n * h.layer_ids.len * C);
+        defer a.free(hashes);
+        h.hash(f.ids, f.slot.tail[0..f.slot.tail_len], hashes);
+        const idx = try a.alloc(i64, n * sh[1]);
+        defer a.free(idx);
+        for (0..n) |t| for (0..sh[1]) |j| {
+            idx[t * sh[1] + j] = hashes[(t * h.layer_ids.len + li) * C + sh[0] + j];
+        };
+        const cols = sh[1] * dim; // this rank's columns of a row
+        const bytes = 2 * n * cols;
+        // an earlier copy out of this staging (the previous Engram layer's) must have left it before it is rewritten
+        try r.stream.synchronize();
+        if (f.rows_host == null or f.rows_host.?.bytes.len < bytes) {
+            if (f.rows_host) |*hb| hb.free();
+            f.rows_host = try cuda.HostBuffer.alloc(r.d, @max(bytes, 4096));
+        }
+        eh.indexRows(idx, dim, @alignCast(std.mem.bytesAsSlice(u16, f.rows_host.?.bytes[0..bytes])));
+        const send = try f.sendBuffer(r, bytes);
+        const s = r.stream.handle;
+        try r.d.check(r.d.api.cuMemcpyHtoDAsync_v2(send, f.rows_host.?.bytes.ptr, bytes, s), "cuMemcpyHtoDAsync");
+        if (f.gathered == null or f.gathered.?.len < W * bytes) {
+            if (f.gathered) |*g| g.free();
+            f.gathered = try cuda.DeviceBuffer.alloc(r.d, W * bytes);
+        }
+        try f.comm.allGather(send, f.gathered.?.ptr, n * cols, .bf16, s);
+        return r.kernels.others(r.stream).gatherCols(f.gathered.?.ptr, W, n, cols, try r.tensorAddr(c.args[0].arg.t));
     }
 };
 
