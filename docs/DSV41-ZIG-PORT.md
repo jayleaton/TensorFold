@@ -249,6 +249,13 @@ Effort is in engineering days for this agent team, assuming GPU windows are avai
 - `drafter.zig`; copy drafts from the lane core's copy index; DeepSeek's depth costs.
 - Keyed sampling at T > 0 with the same Gumbel keys (seed, absolute position, id) as Python.
 - **GPU:** both Sparks.
+- **State:** the host side is done (`draft/**`, `core/lanes/trim.zig`, commits `4d94c92..a49ea13`, `zig build test-dsv41-draft` 17/17, upstream lanes 37/37; interface in section 0).
+- **Open items:**
+  1. The speculative early pass (`TF_DSV41_SPEC_DRAFT`) and the nucleus candidate path (`TF_DSV41_SPEC_NUCLEUS`) are not ported.
+  2. The first round drafts at the lane's prior depth, not a full DSpark block.
+  3. The cost of verify windows over 32 rows is to be measured once M2's forward exists.
+  4. Load the real prod calibration table (`calib-*.json` from the Sparks' `/cache`, through `Costs.parseJson`) once the Spark agent can copy it.
+  5. M2 contract: a chain window's rows stay in the target's state until `keep()` is called, because in a shared round the lane core asks for drafts before it keeps. Ingest reads the kept path from the window's taps, not from the pool.
 
 **M4. Server** (about 8–12 days).
 - `zig/src/native/cuda.zig`, wiring into `engines.zig` for Linux builds.
