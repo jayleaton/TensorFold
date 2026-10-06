@@ -109,7 +109,8 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
             step capture "${M1_CAPTURE_MIN:-12}" python -B "$Z/tools/zig/dsv41_m1_capture.py" --pack "$LP" --out "$CAP" \
                 --sets "$M2B_CAPTURE"); then
             du -sh "$CAP" | tee "$RES/capture-size.txt"
-            CUDA_VISIBLE_DEVICES=0 step m1 "${M1_REPLAY_MIN:-10}" "$Z/bin/tf-dsv41-m1" replay "$LP" "$CAP" "$RES/m1" || rc=1
+            # M1_MODE=both: also our emitters' launches on our buffers (block.zig, block_prefill.zig, dspark_emit.zig)
+            CUDA_VISIBLE_DEVICES=0 step m1 "${M1_REPLAY_MIN:-10}" "$Z/bin/tf-dsv41-m1" "${M1_MODE:-replay}" "$LP" "$CAP" "$RES/m1" || rc=1
         else rc=1; fi
         mkdir -p "$RES/capture"
         for f in meta.json weights.json manifest.json jit.json; do [[ -f "$CAP/$f" ]] && cp "$CAP/$f" "$RES/capture/"; done
@@ -117,6 +118,7 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
         [[ -f "$CAP/ops.jsonl" ]] && gzip -c "$CAP/ops.jsonl" > "$RES/capture/ops.jsonl.gz"
         [[ -f "$CAP/launches.json" ]] && gzip -c "$CAP/launches.json" > "$RES/capture/launches.json.gz"
         rm -rf "$CAP/blobs"
+        mkdir -p "$RES/m1" && cp "$CAP/meta.json" "$RES/m1/capture-meta.json" 2>/dev/null
     fi
     # M2B_TOPP unset: top-p off (M2b); set (prod: 0.85): the same gate with prod's expert prune (M2c's first stage)
     unset TF_DSV41_EXPERT_TOPP
@@ -127,6 +129,8 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
             --layers "0-$hi" --steps "${M2B_STEPS:-64}" \
        && step engram-host 3 python -B "$Z/tools/zig/dsv41_engram_host.py" --py-src /dsv41-tf/src \
             --config "$LP/config.json" --tokenizer "$LP/tokenizer.json" --out "$REF/engram-host.bin"; then
+        # DSpark's Triton variants (the reference never drafts): capture P's AOT set merged into the reference's
+        if [[ -d "${CAP:-}/aot" ]]; then python -B "$Z/tools/zig/dsv41_aot_merge.py" "$REF/aot" "$CAP/aot" | tee -a "$RES/steps.txt"; fi
         mb=$(left); (( mb > 16 )) && mb=16
         step m2b "$mb" bash "$Z/tools/zig/dsv41_m1/m2b_ranks.sh" "$Z/bin/tf-dsv41-m1" "$LP" "$REF" "$RES/m2b" \
             || rc=1

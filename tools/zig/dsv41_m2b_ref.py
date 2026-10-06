@@ -113,6 +113,11 @@ def rank_main(rank: int, a) -> None:
         tokens.append(tok)
         fw.keep(0, 0)
     fw.trace = None
+    # windows of 2.. rows after every recorded step (nothing recorded comes from them): their Triton variants join
+    # the AOT set (a 1 specializes), for M3's lanes gates whose verify windows hold drafts
+    for n in a.extra_rows:
+        fw.run([Seg(0, fw.slot.pos, tuple([tok] * n))])
+        fw.keep(0, n - 1)
     torch.cuda.synchronize()
     run_s = time.time() - t0 - load_s
     mine = {"rank": rank, "load_s": round(load_s, 1), "run_s": round(run_s, 1), "tokens": tokens,
@@ -142,6 +147,8 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=4101)
     ap.add_argument("--port", type=int, default=29611)
     ap.add_argument("--rank", type=int, default=-1, help="two hosts: this host's rank (one process); -1: both ranks here")
+    ap.add_argument("--extra-rows", type=lambda v: [int(x) for x in v.split(",") if x], default=[2, 3, 4, 5, 6],
+                    help="windows of these rows after the steps (their Triton variants in the AOT set)")
     ap.add_argument("--master", default="127.0.0.1", help="rank 0's address (two hosts: the head's CX7 address)")
     a = ap.parse_args()
     Path(a.out).mkdir(parents=True, exist_ok=True)

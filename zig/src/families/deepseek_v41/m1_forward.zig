@@ -298,6 +298,8 @@ pub fn runAll(f: *Forward, out_dir: []const u8, experts: []const u8) !Counts {
     const w = try check.widthsFromCapture(a, listing, experts);
     const cfg: Config = .{};
     const ws = try check.windows(a, f.io, f.dir);
+    var wg = w;
+    try check.gmWidths(a, &wg, ws);
     var last_set: []const u8 = "";
     var roles: calls.Roles = .{ .a = a };
     for (ws) |win| {
@@ -307,7 +309,11 @@ pub fn runAll(f: *Forward, out_dir: []const u8, experts: []const u8) !Counts {
             roles = .{ .a = a };
         }
         last_set = win.set;
-        const cs = try calls.launches(a, try block.emit(a, &cfg, &w, .{}, win.layers, win.n, win.start, true));
+        // a prefill segment (p<n>): block_prefill.zig's launches
+        const cs = try calls.launches(a, if (win.prefill)
+            try @import("block_prefill.zig").emitPrefill(a, &cfg, &wg, .{}, win.layers, win.n, win.start, true)
+        else
+            try block.emit(a, &cfg, &wg, .{}, win.layers, win.n, win.start, true));
         if (cs.len != win.ops.len) return error.CallCount;
         const before = f.counts;
         for (cs, win.ops, 0..) |*c, op, i| {

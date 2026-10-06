@@ -215,7 +215,7 @@ pub fn windows(a: std.mem.Allocator, io: std.Io, dir: []const u8) ![]Window {
 /// The routed experts' K2s present per layer (Widths.gm) from the prefill phases' x3gm launches: weights.json holds
 /// each ragged stack as one blob, so the per-expert widths are the plan's (a run's loader has them); the check takes
 /// the widths the capture launched (gate/up: arg 16 of `gateup`, down: arg 12 of `down`, the layer from its svh).
-fn gmWidths(a: std.mem.Allocator, w: *block.Widths, ws: []const Window) !void {
+pub fn gmWidths(a: std.mem.Allocator, w: *block.Widths, ws: []const Window) !void {
     for (ws) |win| for (win.ops) |op| {
         const name = op.get("name").?.string;
         const down = std.mem.eql(u8, name, "tf_dsv41_x3gm_v1.down");
