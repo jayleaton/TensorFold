@@ -393,9 +393,10 @@ pub const Functions = struct {
     gate_copy: cuda.Function,
     paced: cuda.Function,
     segments: [2]cuda.Function, // bulk false / true
+    topk_keys: cuda.Function,
 
     /// `pf`: the four pfdense modules (K2 8, 10, 12, 16).
-    pub fn resolve(m_attn: cuda.Module, m_topk: cuda.Module, m_mhc: cuda.Module, m_mhc_pf: cuda.Module, m_rg: cuda.Module, pf: [4]cuda.Module, m_gate: cuda.Module, m_pace: cuda.Module, m_l2pf: cuda.Module) !Functions {
+    pub fn resolve(m_attn: cuda.Module, m_topk: cuda.Module, m_mhc: cuda.Module, m_mhc_pf: cuda.Module, m_rg: cuda.Module, pf: [4]cuda.Module, m_gate: cuda.Module, m_pace: cuda.Module, m_l2pf: cuda.Module, m_keys: cuda.Module) !Functions {
         var f: Functions = undefined;
         inline for (0..8) |i| f.attn[i] = try m_attn.function(attn.symbol(if (i >= 4) 4 else 2, (i & 2) != 0, (i & 1) != 0));
         for (f.attn) |fun| try fun.allowDynamicShared(attn.SMEM);
@@ -425,8 +426,15 @@ pub const Functions = struct {
         f.gate_copy = try m_gate.function("_ZN17dsv41_engram_gate16gate_copy_kernelEPxiiPKhxPhxxi");
         f.paced = try m_pace.function("_ZN12dsv41_l2pace12paced_kernelEPKlijmm");
         f.segments = .{ try m_l2pf.function("_ZN6tfl2pf15segments_kernelILb0EEEvPKlij"), try m_l2pf.function("_ZN6tfl2pf15segments_kernelILb1EEEvPKlij") };
+        f.topk_keys = try m_keys.function("_ZN15dsv41_topk_keys11topk_kernelEPKfxiiPfPx");
         return f;
     }
+};
+
+/// topk_keys.cu: pick.top's bounds (C columns a row within pick.COLS, k within the shared sort).
+pub const topk_keys = struct {
+    pub const max_cols = 1 << 16;
+    pub const max_k = 1024;
 };
 
 pub const Ops = struct {
@@ -544,6 +552,21 @@ pub const Ops = struct {
         args.add(ns_per_piece);
         args.add(delay_ns);
         try o.go(o.f.paced, .{ ctas, 1, 1 }, 32, 0, null, &args);
+    }
+
+    /// pick.top (topk_keys.cu): each of `rows` rows' best k of bf16-valued fp32 logits [rows, C] (row stride `ld`),
+    /// value descending then lower column; vals fp32 [rows, k], cols int64 [rows, k]. Logits that are not
+    /// bf16-valued take Python's stable-sort path instead: not this kernel.
+    pub fn topKeys(o: Ops, lg: u64, ld: usize, rows: usize, C: usize, k: usize, vals: u64, cols: u64) !void {
+        if (rows < 1 or C < 1 or C > topk_keys.max_cols or k < 1 or k > @min(C, topk_keys.max_k)) return error.Shape;
+        var args: cuda.Args = .{};
+        args.add(lg);
+        args.add(@as(i64, @intCast(ld)));
+        args.add(@as(c_int, @intCast(C)));
+        args.add(@as(c_int, @intCast(k)));
+        args.add(vals);
+        args.add(cols);
+        try o.go(o.f.topk_keys, .{ rows, 1, 1 }, 1024, 0, null, &args);
     }
 
     /// tfl2pf launch_segments: (address, bytes) table prefetched to L2 (bulk: cp.async.bulk.prefetch).

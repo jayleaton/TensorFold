@@ -334,6 +334,31 @@ pub fn x3gm(gpu: Gpu, k: *const dsv41.Kernels, dir: []const u8) !void {
     check.pass("BITEXACT x3gm {s}: R {d} x {d} slots, D {d}, I {d}, {s}, shx {}: rot, {d} runs ({d} launches), combine", .{ std.fs.path.basename(dir), R, slots, D, I, if (ragged) "ragged" else "stacked", shx, runs, launches });
 }
 
+/// topk_keys.cu against pick.top (torch.topk on pick.keys) at k 1 / 5 / 64 / 1,024 over 64,640 columns.
+pub fn topkCases(gpu: Gpu, k: *const dsv41.Kernels, dir: []const u8) !void {
+    var fx = try Fixture.open(gpu.gpa, gpu.io, dir);
+    defer fx.deinit();
+    var b: Bufs = .{ .gpu = gpu, .fx = &fx };
+    defer b.deinit();
+    var stream = try cuda.Stream.init(gpu.d, true);
+    defer stream.deinit();
+    const o = k.others(stream);
+    const R = try size(fx, "R");
+    const C = try size(fx, "C");
+    const lg = try b.up("lg");
+    var name_buf: [32]u8 = undefined;
+    for (0..try size(fx, "ks")) |i| {
+        const kk = try size(fx, try std.fmt.bufPrint(&name_buf, "k{d}", .{i}));
+        const vals = try b.zeros(R * kk * 4, 0xee);
+        const cols = try b.zeros(R * kk * 8, 0xee);
+        try o.topKeys(lg.ptr, C, R, C, kk, vals.ptr, cols.ptr);
+        try stream.synchronize();
+        try same(gpu, fx, cols, try std.fmt.bufPrint(&name_buf, "cols{d}", .{i}), "topk_keys cols");
+        try same(gpu, fx, vals, try std.fmt.bufPrint(&name_buf, "vals{d}", .{i}), "topk_keys vals");
+    }
+    check.pass("BITEXACT topk_keys.cu == pick.top on {d} rows x {d} columns, 4 k", .{ R, C });
+}
+
 /// x3gm_plan.cu against torch's x3gm.plan on prod-sized picks (the "plan" case).
 pub fn planCases(gpu: Gpu, k: *const dsv41.Kernels, dir: []const u8) !void {
     var fx = try Fixture.open(gpu.gpa, gpu.io, dir);

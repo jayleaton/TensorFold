@@ -249,6 +249,25 @@ def plan_case(out: Path, g) -> dict:
     return {"cases": len(cases)}
 
 
+def topk_case(out: Path, g) -> dict:
+    """pick.top on a rank's vocabulary half (64,640 columns) of bf16-valued logits with many exact ties."""
+    from tensorfold.families.deepseek_v41.cuda import pick
+    R, C = 6, 64640
+    lg = (torch.randint(-96, 97, (R, C), generator=g).float() / 16.0)          # bf16-exact, heavy ties
+    lg[1] = torch.randn(C, generator=g).to(torch.bfloat16).float()               # a realistic row
+    lg[2, ::7] = 6.0                                                              # one value at many columns
+    lg[3] = -0.0
+    lg = lg.to(DEV)
+    arrays, params = {"lg": lg}, {"kind": "topk", "R": R, "C": C, "ks": 4}
+    for i, k in enumerate((1, 5, 64, 1024)):
+        vals, cols = pick.top(lg, k)
+        arrays.update({f"vals{i}": vals, f"cols{i}": cols})
+        params[f"k{i}"] = k
+    torch.cuda.synchronize()
+    save(out, params, arrays)
+    return {"rows": R}
+
+
 def main() -> None:
     out = Path(sys.argv[1]) / "fixtures"
     g = torch.Generator().manual_seed(4141)
@@ -290,6 +309,7 @@ def main() -> None:
                                           limit=10.0, runs=["tuned", (1, 0, True), (2, 4, True)],
                                           dequant=(128, 128, 10))
     report["x3gm_plan"] = plan_case(out / "x3gm_plan", g)
+    report["topk_keys"] = topk_case(out / "topk_keys", g)
     (out.parent / "oracle.json").write_text(json.dumps({"device": torch.cuda.get_device_name(0), **report}, indent=1))
     print(json.dumps(report, indent=1))
 

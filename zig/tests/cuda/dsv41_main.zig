@@ -90,6 +90,8 @@ fn all(gpu: check.Gpu, k: *const dsv41.Kernels, root: []const u8) !void {
             experts.x3gm(gpu, k, path)
         else if (std.mem.eql(u8, kind.slice(), "plan"))
             experts.planCases(gpu, k, path)
+        else if (std.mem.eql(u8, kind.slice(), "topk"))
+            experts.topkCases(gpu, k, path)
         else
             error.UnknownKind;
         r catch |e| {
