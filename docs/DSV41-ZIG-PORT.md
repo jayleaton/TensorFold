@@ -170,6 +170,10 @@ Rules from `ZIG-PREVIEW.md`:
   - Every block's streams (9/9) and every logit are bit-equal to Python in windows of 1, 3 and 16 rows (64,640 / 193,920 / 1,034,240 logits).
   - Load: our loader 19.4 GB, plus 206 weight forms built, 284 s. Python's reference is 276 s to load and 474 s to run.
   - Kernel job: the twin suites' recording works (302 calls, 141 replayed bit-exact). Then `tf-dsv41-test` panicked on an empty tensor's negative offset in its replay (dsq-zig-kern-1), so the oracle cases, glue included, did not run this time.
+- **The next pod's kernel job** (stage from ≥ ea3e600, rebuild `tf-dsv41-test`; fatbins and `job.sh` unchanged): `replay.zig` now nulls empty or negative-offset tensors. Its first GPU checks are:
+  - all 302 recorded replays (pod 11 got 141 bit-exact before the panic: the first GPU evidence for the R1/R1c kernels through Zig);
+  - the 14 oracle cases;
+  - `embed_send`'s NaN edge.
 - **M2 next:**
   - **M2b**, TP=2 on two GPUs in one pod over NCCL: the whole backbone, both ranks, against Python's TP=2. It needs the `tp` session bootstrap in `forward.zig`'s driver and a two-rank Python reference.
   - Graphs and the R3/R4 work come after M2b.
