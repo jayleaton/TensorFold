@@ -1,0 +1,144 @@
+//! A rank's TP settings from the environment (the Python engine's names where it has one): rank, master, port, backend, fail-fast knobs.
+const std = @import("std");
+
+pub const Backend = enum {
+    /// NCCL for everything (the Python engine's default).
+    nccl,
+    /// Exchanges of at most `mailbox_max_bytes` a rank through the one-shot mailbox kernel, NCCL above that.
+    mailbox,
+};
+
+pub const Error = error{BadSetting};
+
+pub const Config = struct {
+    world: u32 = 2,
+    rank: u32 = 0,
+    /// Rank 0's address as the other ranks reach it (the CX7 address on the Sparks).
+    master: []const u8 = "127.0.0.1",
+    /// The rendezvous port of the Python engine (`--port`); the link listens on `link_port`.
+    port: u16 = 29500,
+    /// Rank 0 listens here: TF_DSV41_PLAN_PORT, else `port` + 7 (Python's plan link port).
+    link_port: u16 = 29507,
+    /// How long rank 0 waits for the others and they keep retrying the connect (TF_DSV41_PLAN_TIMEOUT).
+    connect_timeout_ns: u64 = 300 * std.time.ns_per_s,
+    /// CUDA device ordinal this rank uses.
+    device: u32 = 0,
+    backend: Backend = .nccl,
+    mailbox_max_bytes: usize = 256 * 1024,
+    /// A mailbox wait for the peer gives up after this long and poisons the transport (fail-stop).
+    mailbox_timeout_ns: u64 = 120 * std.time.ns_per_s,
+    failfast: bool = true,
+    /// After a failure: time for the HTTP threads to answer before exit 70.
+    grace_ns: u64 = std.time.ns_per_s,
+    /// Rank 1's memory report period on the fate channel (also how fast it notices rank 0 hanging up).
+    report_ns: u64 = std.time.ns_per_s / 2,
+    nccl_lib: []const u8 = "libnccl.so.2",
+
+    /// Reads every setting from `get` (the environment in `fromEnv`); unset names keep the defaults.
+    pub fn parse(get: *const fn ([]const u8) ?[]const u8) Error!Config {
+        var c: Config = .{};
+        c.world = try int(u32, get, "TF_TP_WORLD", c.world, 1, 64);
+        c.rank = try int(u32, get, "TF_TP_RANK", c.rank, 0, c.world - 1);
+        if (get("TF_TP_MASTER")) |m| c.master = m;
+        c.port = try int(u16, get, "TF_TP_PORT", c.port, 1, 65535 - 8);
+        c.link_port = try int(u16, get, "TF_DSV41_PLAN_PORT", c.port + 7, 1, 65535);
+        c.connect_timeout_ns = try seconds(get, "TF_DSV41_PLAN_TIMEOUT", 300, 0.1, 86400);
+        c.device = try int(u32, get, "TF_TP_DEVICE", c.device, 0, 63);
+        if (get("TF_COMM_BACKEND")) |b| c.backend = std.meta.stringToEnum(Backend, std.mem.trim(u8, b, " ")) orelse {
+            std.log.warn("TF_COMM_BACKEND={s}: expected nccl or mailbox", .{b});
+            return error.BadSetting;
+        };
+        c.mailbox_max_bytes = 1024 * try int(usize, get, "TF_TP_MAILBOX_MAX_KB", 256, 4, 16 * 1024);
+        c.mailbox_timeout_ns = try seconds(get, "TF_TP_MAILBOX_TIMEOUT_S", 120, 0.001, 86400);
+        if (get("TF_DSV41_FAILFAST")) |v| c.failfast = !(std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "off"));
+        c.grace_ns = try seconds(get, "TF_DSV41_FAILFAST_GRACE_S", 1.0, 0, 60);
+        c.report_ns = try seconds(get, "TF_DSV41_PEER_MEM_S", 0.5, 0.01, 60);
+        if (get("TF_NCCL_LIB")) |p| c.nccl_lib = p;
+        return c;
+    }
+
+    pub fn fromEnv() Error!Config {
+        return parse(&envGet);
+    }
+
+    /// The settings both ranks must share (everything but rank, device and timeouts), as bytes to compare.
+    pub fn digest(c: Config) [32]u8 {
+        var h = std.crypto.hash.sha2.Sha256.init(.{});
+        h.update(std.mem.asBytes(&c.world));
+        h.update(std.mem.asBytes(&c.backend));
+        h.update(std.mem.asBytes(&c.mailbox_max_bytes));
+        h.update(std.mem.asBytes(&c.failfast));
+        var out: [32]u8 = undefined;
+        h.final(&out);
+        return out;
+    }
+};
+
+fn envGet(name: []const u8) ?[]const u8 {
+    var buf: [64]u8 = undefined;
+    if (name.len >= buf.len) return null;
+    @memcpy(buf[0..name.len], name);
+    buf[name.len] = 0;
+    const v = std.c.getenv(buf[0..name.len :0]) orelse return null;
+    const s = std.mem.span(v);
+    return if (s.len == 0) null else s;
+}
+
+fn int(comptime T: type, get: *const fn ([]const u8) ?[]const u8, name: []const u8, default: T, lo: T, hi: T) Error!T {
+    const raw = get(name) orelse return default;
+    const v = std.fmt.parseInt(T, std.mem.trim(u8, raw, " "), 10) catch {
+        std.log.warn("{s}={s}: expected an integer", .{ name, raw });
+        return error.BadSetting;
+    };
+    if (v < lo or v > hi) {
+        std.log.warn("{s}={d}: expected {d}..{d}", .{ name, v, lo, hi });
+        return error.BadSetting;
+    }
+    return v;
+}
+
+fn seconds(get: *const fn ([]const u8) ?[]const u8, name: []const u8, default: f64, lo: f64, hi: f64) Error!u64 {
+    const v = if (get(name)) |raw| std.fmt.parseFloat(f64, std.mem.trim(u8, raw, " ")) catch {
+        std.log.warn("{s}={s}: expected seconds", .{ name, raw });
+        return error.BadSetting;
+    } else default;
+    if (!(v >= lo and v <= hi)) {
+        std.log.warn("{s}={d}: expected {d}..{d} s", .{ name, v, lo, hi });
+        return error.BadSetting;
+    }
+    return @intFromFloat(v * std.time.ns_per_s);
+}
+
+const Fake = struct {
+    var pairs: []const [2][]const u8 = &.{};
+    fn get(name: []const u8) ?[]const u8 {
+        for (pairs) |p| if (std.mem.eql(u8, p[0], name)) return p[1];
+        return null;
+    }
+};
+
+test "defaults follow the Python engine's ports and knobs" {
+    Fake.pairs = &.{ .{ "TF_TP_RANK", "1" }, .{ "TF_TP_PORT", "29600" } };
+    const c = try Config.parse(&Fake.get);
+    try std.testing.expectEqual(@as(u32, 1), c.rank);
+    try std.testing.expectEqual(@as(u16, 29607), c.link_port);
+    try std.testing.expectEqual(Backend.nccl, c.backend);
+    try std.testing.expectEqual(std.time.ns_per_s, c.grace_ns);
+    try std.testing.expectEqual(std.time.ns_per_s / 2, c.report_ns);
+}
+
+test "bad settings are refused and the digest ignores the rank" {
+    Fake.pairs = &.{.{ "TF_TP_RANK", "2" }};
+    try std.testing.expectError(error.BadSetting, Config.parse(&Fake.get));
+    Fake.pairs = &.{.{ "TF_COMM_BACKEND", "roce" }};
+    try std.testing.expectError(error.BadSetting, Config.parse(&Fake.get));
+    Fake.pairs = &.{ .{ "TF_COMM_BACKEND", "mailbox" }, .{ "TF_TP_MAILBOX_MAX_KB", "64" }, .{ "TF_DSV41_FAILFAST_GRACE_S", "0.25" } };
+    const a = try Config.parse(&Fake.get);
+    try std.testing.expectEqual(@as(usize, 64 * 1024), a.mailbox_max_bytes);
+    try std.testing.expectEqual(std.time.ns_per_s / 4, a.grace_ns);
+    var b = a;
+    b.rank = 1;
+    try std.testing.expectEqualSlices(u8, &a.digest(), &b.digest());
+    b.mailbox_max_bytes = 1024;
+    try std.testing.expect(!std.mem.eql(u8, &a.digest(), &b.digest()));
+}
