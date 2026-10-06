@@ -97,6 +97,52 @@ pub const GmShape = struct {
     }
 };
 
+/// x3gm v2 (gm2_kernel): the tiles it is built at (x3gm.py V2_GU / V2_DN).
+pub const v2_gu = [_]usize{ 0, 1 };
+pub const v2_dn = [_]usize{0};
+
+/// x3gm.cu Smem2<MATS, XM, tile>: one launch over every width of gm_k2s, so the widest width's dynamic shared memory;
+/// a width's ring is the tile's NSA, cut (Ring2) while two CTAs an SM at 2 bits would not keep their second CTA.
+pub fn gm2Shape(mats: u32, xm: u32, t: [5]u32) GmShape {
+    const mtl, const ng, const ks, const nsa, const ngr = t;
+    const four = GmShape.of(mats, xm, 4, t);
+    const two_ctas = 2 * (@as(usize, four.smem) + 1536) <= 102400 and four.threads <= 256 and mtl * ng <= 16; // Cfg<K2 4>::MINB == 2
+    var smem: u32 = 0;
+    for (gm_k2s) |k2| {
+        const stage: usize = @as(usize, xm) * (ng * 8) * (ks * 16) * 2 + @as(usize, mats) * ks * 8 * (4 * k2) * 4;
+        var ring: u32 = nsa;
+        if (two_ctas) {
+            while (ring > 2 and 2 * (stage * ring + 1536) > 102400) ring -= 1;
+        }
+        smem = @max(smem, GmShape.of(mats, xm, k2, .{ mtl, ng, ks, ring, ngr }).smem);
+    }
+    return .{ .threads = four.threads, .smem = smem };
+}
+
+/// x3gm.tuned2: (gate/up cfg, down cfg) of a v2 block: forced ids where gm2_kernel is built at them, else G6's (0 with
+/// one rotated input, 1 with two; down 0) at any row count.
+pub fn gmTuned2(force_gu: ?usize, force_dn: ?usize, shx: bool) [2]usize {
+    const gu = if (force_gu) |f| (if (std.mem.indexOfScalar(usize, &v2_gu, f) != null) f else null) else null;
+    const dn = if (force_dn) |f| (if (std.mem.indexOfScalar(usize, &v2_dn, f) != null) f else null) else null;
+    return .{ gu orelse (if (shx) 0 else 1), dn orelse 0 };
+}
+
+/// The host check x3gm.py makes before a v2 launch: every expert's width is one gm2_kernel dispatches.
+pub fn gm2WidthsOk(widths: []const u32) bool {
+    for (widths) |w| if (gmK2Index(w) == null) return false;
+    return true;
+}
+
+pub fn gm2GuSymbol(comptime xm: u32, comptime cfg: usize) [:0]const u8 {
+    const t = gu_tiles[cfg];
+    return std.fmt.comptimePrint("_ZN10dsv41_x3gm10gm2_kernelILi2ELi{d}ELi{d}ELi{d}ELi{d}ELi{d}ELi{d}EEEvNS_4ArgsE", .{ xm, t[0], t[1], t[2], t[3], t[4] });
+}
+
+pub fn gm2DnSymbol(comptime cfg: usize) [:0]const u8 {
+    const t = dn_tiles[cfg];
+    return std.fmt.comptimePrint("_ZN10dsv41_x3gm10gm2_kernelILi1ELi1ELi{d}ELi{d}ELi{d}ELi{d}ELi{d}EEEvNS_4ArgsE", .{ t[0], t[1], t[2], t[3], t[4] });
+}
+
 /// x3gm.smem_bytes: Cfg::SMEM plus the static rows / item words.
 pub fn gmSmemBytes(t: [5]u32, mats: u32, xm: u32, k2: u32) usize {
     return @as(usize, GmShape.of(mats, xm, k2, t).smem) + 4 * 8 * t[1] + 4;
@@ -181,6 +227,7 @@ pub const GmArgs = extern struct {
     t1: u64 = 0,
     tp0: u64 = 0,
     tp1: u64 = 0,
+    k2e: u64 = 0, // int32 [E] each expert's K2 (gm2_kernel; gm_kernel ignores it)
     order: u64 = 0,
     pe: u64 = 0,
     poff: u64 = 0,
@@ -198,7 +245,7 @@ pub const GmArgs = extern struct {
 };
 
 comptime {
-    std.debug.assert(@sizeOf(GmArgs) == 152 and @offsetOf(GmArgs, "K") == 136 and @offsetOf(GmArgs, "limit") == 144);
+    std.debug.assert(@sizeOf(GmArgs) == 160 and @offsetOf(GmArgs, "k2e") == 48 and @offsetOf(GmArgs, "K") == 144 and @offsetOf(GmArgs, "limit") == 152);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -222,6 +269,8 @@ pub const Functions = struct {
     gm_rot: [2][2]cuda.Function, // [bf16, fp16][mats - 1]
     gm_dequant: [gm_k2s.len]cuda.Function,
     gm_plan: cuda.Function,
+    gm2_gu: [2][v2_gu.len]Gm, // [xm - 1][cfg]
+    gm2_dn: Gm,
 
     /// Resolves every instance (a wrong name fails here, not on a rare path) and opts x3gm into its shared memory.
     pub fn resolve(experts: cuda.Module, x3ld: cuda.Module, x3pf: cuda.Module, x3gm: cuda.Module, x3gm_plan: cuda.Module, optin: u32) !Functions {
@@ -250,6 +299,10 @@ pub const Functions = struct {
             inline for (0..dn_tiles.len) |c| f.gm_dn[ki][c] = try gmResolve(x3gm, gmDnSymbol(k2, c), GmShape.of(1, 1, k2, dn_tiles[c]), optin);
             f.gm_dequant[ki] = try x3gm.function(gmDequantSymbol(k2));
         }
+        inline for (.{ 1, 2 }) |xm| inline for (v2_gu, 0..) |c, ci| {
+            f.gm2_gu[xm - 1][ci] = try gmResolve(x3gm, gm2GuSymbol(xm, c), gm2Shape(2, xm, gu_tiles[c]), optin);
+        };
+        f.gm2_dn = try gmResolve(x3gm, gm2DnSymbol(0), gm2Shape(1, 1, dn_tiles[0]), optin);
         f.gm_plan = try x3gm_plan.function("_ZN15dsv41_x3gm_plan11plan_kernelEPKiiiiPiS2_S2_S2_S2_");
         f.gm_rot = .{ .{ try x3gm.function(gm_sym.rot_bf16_1), try x3gm.function(gm_sym.rot_bf16_2) }, .{ try x3gm.function(gm_sym.rot_f16_1), try x3gm.function(gm_sym.rot_f16_2) } };
         return f;
@@ -502,6 +555,37 @@ pub const Ops = struct {
         try o.gmLaunch(o.f.gm_dn[ki][cfg], a, use_ticket);
     }
 
+    /// dsv41_x3gm_gateup2_cuda (x3gm v2): Xd of every pass of every width in one launch; `k2e` int32 [E] the experts'
+    /// gate widths (each in gm_k2s: gm2WidthsOk), `tables`: tg / tu are int64 pointer tables (ragged), else the stacks.
+    pub fn gm2Gateup(o: Ops, xg: u64, xu: u64, tg: u64, tu: u64, k2e: u64, order: u64, pe: u64, poff: u64, pcnt: u64, npass: u64, ticket: u64, svh_g: u64, svh_u: u64, suh_d: u64, xd: u64, K: usize, N: usize, shx: bool, cfg: usize, use_ticket: bool, limit: f32, tables: bool) !void {
+        const ci = std.mem.indexOfScalar(usize, &v2_gu, cfg) orelse return error.Unsupported;
+        try gmCheck(.gu, cfg, K, N);
+        var a: GmArgs = .{ .x0 = xg, .x1 = xu, .k2e = k2e, .order = order, .pe = pe, .poff = poff, .pcnt = pcnt, .npass = npass, .ticket = ticket, .sv0 = svh_g, .sv1 = svh_u, .sd = suh_d, .xd = xd, .K = int(K), .N = int(N), .limit = limit };
+        if (tables) {
+            a.tp0 = tg;
+            a.tp1 = tu;
+        } else {
+            a.t0 = tg;
+            a.t1 = tu;
+        }
+        try o.gmLaunch(o.f.gm2_gu[if (shx) 0 else 1][ci], a, use_ticket);
+    }
+
+    /// dsv41_x3gm_down2_cuda (x3gm v2): Y of every pass of every width in one launch; `k2e` the experts' down widths.
+    pub fn gm2Down(o: Ops, xd: u64, td: u64, k2e: u64, order: u64, pe: u64, poff: u64, pcnt: u64, npass: u64, ticket: u64, svh_d: u64, y: u64, K: usize, N: usize, cfg: usize, use_ticket: bool, tables: bool) !void {
+        if (std.mem.indexOfScalar(usize, &v2_dn, cfg) == null) return error.Unsupported;
+        try gmCheck(.dn, cfg, K, N);
+        var a: GmArgs = .{ .x0 = xd, .x1 = xd, .k2e = k2e, .order = order, .pe = pe, .poff = poff, .pcnt = pcnt, .npass = npass, .ticket = ticket, .sv0 = svh_d, .y = y, .K = int(K), .N = int(N) };
+        if (tables) {
+            a.tp0 = td;
+            a.tp1 = td;
+        } else {
+            a.t0 = td;
+            a.t1 = td;
+        }
+        try o.gmLaunch(o.f.gm2_dn, a, use_ticket);
+    }
+
     /// x3gm.plan on the device (x3gm_plan.cu): the passes of `pairs` picks (values 0..E, E = not this launch) in
     /// members of `bm`: order [pairs], pe / poff / pcnt [planPasses(pairs, E, bm)], npass [1]; torch's integers.
     pub fn gmPlan(o: Ops, pick: u64, pairs: usize, E: usize, bm: usize, order: u64, pe: u64, poff: u64, pcnt: u64, npass: u64) !void {
@@ -547,6 +631,17 @@ test "x3ld checks mirror the binding's" {
     bad = g;
     bad.K = 16 * 4 * 3; // three k steps a warp: not a multiple of pd 2
     try std.testing.expectError(error.Shape, x3ldCheck(bad, 8, 2, 0));
+}
+
+test "x3gm v2 shapes and tuning" {
+    // gate/up cfg 0, one input: K2 10's ring cut from 3 to 2 stages keeps two CTAs an SM; the widest width sets SMEM
+    const s = gm2Shape(2, 1, gu_tiles[0]);
+    try std.testing.expectEqual(@as(u32, 256), s.threads);
+    try std.testing.expect(2 * (@as(usize, s.smem) + 1536) <= 102400);
+    try std.testing.expectEqual([2]usize{ 0, 0 }, gmTuned2(null, null, true));
+    try std.testing.expectEqual([2]usize{ 1, 0 }, gmTuned2(3, 2, false));
+    try std.testing.expect(gm2WidthsOk(&.{ 3, 10, 6 }));
+    try std.testing.expect(!gm2WidthsOk(&.{ 2, 6 }));
 }
 
 test "x3gm shapes, fits and tuning as x3gm.py" {

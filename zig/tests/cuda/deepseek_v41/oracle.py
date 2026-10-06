@@ -216,6 +216,27 @@ def x3gm_case(out: Path, g, *, R, slots, E, D, I, k2g, k2d, shx, input_dtype, li
         up.combine(y, wts, o, R, D, slots)
         arrays.update({f"run{r}_xd": xd, f"run{r}_y": y, f"run{r}_out": o})
     params["runs"] = len(runs)
+    if hasattr(ext, "gateup2"):                        # x3gm v2 (gm2_kernel): _run_v2's "one" mode, both tickets
+        k2g_t = torch.tensor(L.k2["g"] + [k2g[0] if not ragged else 0], dtype=torch.int32, device=DEV)
+        k2d_t = torch.tensor(L.k2["d"] + [k2d[0] if not ragged else 0], dtype=torch.int32, device=DEV)
+        cg, cd = gm.tuned2({"gu": None, "dn": None}, shx)
+        order, pe, poff, pcnt, npass = gm.plan(pick, E, gm.bm_of("gu", cg))
+        arrays.update(v2_k2g=k2g_t, v2_k2d=k2d_t, v2_order=order, v2_pe=pe, v2_poff=poff, v2_pcnt=pcnt, v2_npass=npass)
+        for tk in (True, False):
+            xd = torch.zeros(P, I, dtype=torch.float16, device=DEV)
+            y = torch.zeros(P, D, dtype=torch.float32, device=DEV)
+            ticket.zero_()
+            ext.gateup2(xg, xu, tg, tu, k2g_t, order, pe, poff, pcnt, npass, ticket, L.svh_g, L.svh_u, L.suh_d, xd, D,
+                        I, shx, cg, tk, float(limit), ragged)
+            ticket.zero_()
+            ext.down2(xd, td, k2d_t, order, pe, poff, pcnt, npass, ticket, L.svh_d, y, I, D, cd, tk, ragged)
+            o = torch.zeros(R, D, dtype=torch.float32, device=DEV)
+            up.combine(y, wts, o, R, D, slots)
+            torch.cuda.synchronize()
+            if tk:                                     # v2 == gm_kernel, bit for bit (dsq-x3gm-1's claim, rechecked)
+                assert torch.equal(xd, arrays["run0_xd"]) and torch.equal(y, arrays["run0_y"]), "gm2 != gm"
+            arrays.update({f"v2_t{int(tk)}_xd": xd, f"v2_t{int(tk)}_y": y, f"v2_t{int(tk)}_out": o})
+        params.update(v2=1, v2_gu=cg, v2_dn=cd)
     if dequant:
         K, N, k2 = dequant
         t = trellis(g, K, N, k2).to(DEV)

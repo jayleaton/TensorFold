@@ -1,4 +1,4 @@
-// Device code of src/tensorfold/families/deepseek_v41/cuda/mhc_cuda.cu (git blob c792c1251be6; the whole file, DSV41_MHC_NO_TORCH defined),
+// Device code of src/tensorfold/families/deepseek_v41/cuda/mhc_cuda.cu (git blob c792c1251be6 at dsv41-x3gm1; the whole file, DSV41_MHC_NO_TORCH defined),
 // generated and checked by zig/kernels/cuda/deepseek_v41/sync.py. Do not edit: change the Python source.
 #define DSV41_MHC_NO_TORCH
 // SPDX-License-Identifier: MIT

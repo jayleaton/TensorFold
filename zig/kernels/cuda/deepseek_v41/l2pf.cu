@@ -1,4 +1,4 @@
-// Device code of src/tensorfold/families/glm5_next/spark/l2pf.cu (git blob ace57d9cab36; the whole file),
+// Device code of src/tensorfold/families/glm5_next/spark/l2pf.cu (git blob ace57d9cab36 at dsv41-x3gm1; the whole file),
 // generated and checked by zig/kernels/cuda/deepseek_v41/sync.py. Do not edit: change the Python source.
 // L2 prefetch kernels for the decode rounds' idle windows (patches/0460, GLM53_TF_L2PF).
 //

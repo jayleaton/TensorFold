@@ -317,6 +317,30 @@ pub fn x3gm(gpu: Gpu, k: *const dsv41.Kernels, dir: []const u8) !void {
         try stream.synchronize();
         try same(gpu, fx, out, try std.fmt.bufPrint(&name_buf, "run{d}_out", .{r}), "x3gm combine");
     }
+    var v2_launches: usize = 0;
+    if (has(fx, "v2_xd") or has(fx, "v2_t1_xd")) {
+        // x3gm v2: one plan over every pair, one gate/up and one down launch over every width
+        const k2g = try b.up("v2_k2g");
+        const k2d = try b.up("v2_k2d");
+        const pl = [_]u64{ (try b.up("v2_order")).ptr, (try b.up("v2_pe")).ptr, (try b.up("v2_poff")).ptr, (try b.up("v2_pcnt")).ptr, (try b.up("v2_npass")).ptr };
+        const cg: usize = @intCast(try fx.int("v2_gu"));
+        const cd: usize = @intCast(try fx.int("v2_dn"));
+        for ([_]bool{ true, false }) |tk| {
+            try xd.fill8(0, null);
+            try y.fill8(0, null);
+            try ticket.fill8(0, null);
+            try o.gm2Gateup(xg, xu, tg.ptr, tu.ptr + base_u, k2g.ptr, pl[0], pl[1], pl[2], pl[3], pl[4], ticket.ptr, svh_g.ptr, svh_u.ptr, suh_d.ptr, xd.ptr, D, I, shx, cg, tk, limit, ragged);
+            try ticket.fill8(0, null);
+            try o.gm2Down(xd.ptr, td.ptr + base_d, k2d.ptr, pl[0], pl[1], pl[2], pl[3], pl[4], ticket.ptr, svh_d.ptr, y.ptr, I, D, cd, tk, ragged);
+            try o.combine(y.ptr, wts.ptr, out.ptr, R, D, slots);
+            try stream.synchronize();
+            const t: u8 = @intFromBool(tk);
+            try same(gpu, fx, xd, try std.fmt.bufPrint(&name_buf, "v2_t{d}_xd", .{t}), "x3gm v2 gate/up Xd");
+            try same(gpu, fx, y, try std.fmt.bufPrint(&name_buf, "v2_t{d}_y", .{t}), "x3gm v2 down Y");
+            try same(gpu, fx, out, try std.fmt.bufPrint(&name_buf, "v2_t{d}_out", .{t}), "x3gm v2 combine");
+            v2_launches += 2;
+        }
+    }
     if (has(fx, "dequant_in")) {
         const t = try b.up("dequant_in");
         const dk: usize = @intCast(try fx.int("dequant_k"));
@@ -331,7 +355,7 @@ pub fn x3gm(gpu: Gpu, k: *const dsv41.Kernels, dir: []const u8) !void {
         try stream.synchronize();
         try same(gpu, fx, dq, "dequant_up", "upstream dequant");
     }
-    check.pass("BITEXACT x3gm {s}: R {d} x {d} slots, D {d}, I {d}, {s}, shx {}: rot, {d} runs ({d} launches), combine", .{ std.fs.path.basename(dir), R, slots, D, I, if (ragged) "ragged" else "stacked", shx, runs, launches });
+    check.pass("BITEXACT x3gm {s}: R {d} x {d} slots, D {d}, I {d}, {s}, shx {}: rot, {d} runs ({d} launches), v2 {d} launches, combine", .{ std.fs.path.basename(dir), R, slots, D, I, if (ragged) "ragged" else "stacked", shx, runs, launches, v2_launches });
 }
 
 /// pointwise.cu against torch: the shared expert's SwiGLU with the limit, and the partial adds (fp32, into bf16).

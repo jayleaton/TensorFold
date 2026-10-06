@@ -395,6 +395,16 @@ fn x3gmExt(o: exl3.Ops, func: []const u8, args: []const Arg, kwargs: []const Kw)
         try o.gmDown(try c.ptr(0), try c.ptr(1), try c.ptr(2), try c.ptr(3), try c.ptr(4), try c.ptr(5), try c.ptr(6), try c.ptr(7), try c.ptr(8), try c.ptr(9), try c.usz(10), try c.usz(11), try c.u(12), try c.usz(13), try c.boolean(14, true), try c.boolean(15, false));
         return true;
     }
+    if (is(func, "gateup2")) {
+        const c: Call = .{ .args = args, .kwargs = kwargs, .names = &.{ "xg", "xu", "tg", "tu", "k2e", "order", "pe", "poff", "pcnt", "npass", "ticket", "svh_g", "svh_u", "suh_d", "xd", "K", "N", "shx", "cfg", "use_ticket", "limit", "tables" } };
+        try o.gm2Gateup(try c.ptr(0), try c.ptr(1), try c.ptr(2), try c.ptr(3), try c.ptr(4), try c.ptr(5), try c.ptr(6), try c.ptr(7), try c.ptr(8), try c.ptr(9), try c.ptr(10), try c.ptr(11), try c.ptr(12), try c.ptr(13), try c.ptr(14), try c.usz(15), try c.usz(16), try c.boolean(17, false), try c.usz(18), try c.boolean(19, true), @floatCast(try c.float(20)), try c.boolean(21, false));
+        return true;
+    }
+    if (is(func, "down2")) {
+        const c: Call = .{ .args = args, .kwargs = kwargs, .names = &.{ "xd", "td", "k2e", "order", "pe", "poff", "pcnt", "npass", "ticket", "svh_d", "y", "K", "N", "cfg", "use_ticket", "tables" } };
+        try o.gm2Down(try c.ptr(0), try c.ptr(1), try c.ptr(2), try c.ptr(3), try c.ptr(4), try c.ptr(5), try c.ptr(6), try c.ptr(7), try c.ptr(8), try c.ptr(9), try c.ptr(10), try c.usz(11), try c.usz(12), try c.usz(13), try c.boolean(14, true), try c.boolean(15, false));
+        return true;
+    }
     if (is(func, "rot")) {
         const c: Call = .{ .args = args, .kwargs = kwargs, .names = &.{ "x", "x_stride", "pick", "suh0", "suh1", "out0", "out1", "K", "slots", "pairs", "mats" } };
         const x = try c.tensor(0);

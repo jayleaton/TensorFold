@@ -1,4 +1,4 @@
-// Device code of src/tensorfold/cuda/exl3/decode.cuh (git blob 1acca8f0457c; lines 1-162; torch includes and host code cut),
+// Device code of src/tensorfold/cuda/exl3/decode.cuh (git blob 1acca8f0457c at dsv41-x3gm1; lines 1-162; torch includes and host code cut),
 // generated and checked by zig/kernels/cuda/deepseek_v41/sync.py. Do not edit: change the Python source.
 // EXL3 tiles (format.py, after ExLlamaV3, MIT, Copyright (c) 2025 Turboderp): lane L decodes a tile's values 8L..8L+7 straight into its two mma.m16n8k16 B fragments, bit for bit.
 

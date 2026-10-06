@@ -1,4 +1,4 @@
-// Device code of src/tensorfold/cuda/exl3/experts.cu (git blob 28c88af332c6; lines 1-239; torch includes and host code cut),
+// Device code of src/tensorfold/cuda/exl3/experts.cu (git blob 28c88af332c6 at dsv41-x3gm1; lines 1-239; torch includes and host code cut),
 // generated and checked by zig/kernels/cuda/deepseek_v41/sync.py. Do not edit: change the Python source.
 // EXL3 routed experts, any codebook and a width per expert: fixed-order splits, slots and butterflies, no atomics; 4-bit mcg matches GLM's kernel bit for bit.
 

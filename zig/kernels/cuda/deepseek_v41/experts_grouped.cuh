@@ -1,4 +1,4 @@
-// Device code of src/tensorfold/cuda/exl3/experts_grouped.cuh (git blob 57be4c027785; lines 1-307, 356; torch includes and host code cut),
+// Device code of src/tensorfold/cuda/exl3/experts_grouped.cuh (git blob 57be4c027785 at dsv41-x3gm1; lines 1-307, 356; torch includes and host code cut),
 // generated and checked by zig/kernels/cuda/deepseek_v41/sync.py. Do not edit: change the Python source.
 // Grouped EXL3 expert GEMV (after ExLlamaV3, MIT, Copyright (c) 2025 Turboderp): rows stay independent, K ranges fixed by shape, warps summed in order.
 #pragma once
