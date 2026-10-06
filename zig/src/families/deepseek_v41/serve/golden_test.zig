@@ -258,3 +258,101 @@ test "DSML replies parse and stream as dsml.py does (TF_DSV41_GOLDEN/dsml.jsonl)
     defer testing.allocator.free(data);
     try checkDsml(data);
 }
+
+const sampling = @import("sampling.zig");
+
+/// Each rank's best ``k`` of its vocabulary half (``pick.top``), gathered in rank order, as the engine hands them.
+fn gather(a: std.mem.Allocator, row: []const f32, world: usize, k: usize, values: *std.ArrayList(f32), ids: *std.ArrayList(u32)) !void {
+    values.clearRetainingCapacity();
+    ids.clearRetainingCapacity();
+    const Key = struct {
+        fn of(v: f32, id: u32) u64 {
+            const bits: u32 = @bitCast(v + 0.0);
+            const mono: u32 = if (bits & 0x8000_0000 == 0) bits | 0x8000_0000 else ~bits;
+            return @as(u64, mono) << 32 | (0xFFFF_FFFF - id);
+        }
+    };
+    var keys: std.ArrayList(u64) = .empty;
+    defer keys.deinit(a);
+    var lo: usize = 0;
+    for (0..world) |w| {
+        // numpy's array_split: the first (len % world) halves one longer
+        const size = row.len / world + @intFromBool(w < row.len % world);
+        keys.clearRetainingCapacity();
+        for (lo..lo + size) |i| try keys.append(a, Key.of(row[i], @intCast(i)));
+        std.sort.pdq(u64, keys.items, {}, std.sort.desc(u64));
+        for (keys.items[0..@min(k, size)]) |kk| {
+            const id = 0xFFFF_FFFF - @as(u32, @truncate(kk));
+            try values.append(a, row[id]);
+            try ids.append(a, id);
+        }
+        lo += size;
+    }
+}
+
+fn checkSampling(lines: []const u8) !void {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var picker = try sampling.Picker.init(a, 129280 * 2);
+    defer picker.deinit();
+    var values: std.ArrayList(f32) = .empty;
+    defer values.deinit(a);
+    var ids: std.ArrayList(u32) = .empty;
+    defer ids.deinit(a);
+    var it = std.mem.splitScalar(u8, lines, '\n');
+    var rows: usize = 0;
+    var bad: usize = 0;
+    var fallbacks: usize = 0;
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        _ = arena.reset(.retain_capacity);
+        const x = arena.allocator();
+        const c = (try json.parseText(x, line)).ok;
+        rows += 1;
+        const b64 = c.get("logits").?.string;
+        const raw = try x.alloc(u8, try std.base64.standard.Decoder.calcSizeForSlice(b64));
+        try std.base64.standard.Decoder.decode(raw, b64);
+        const logits = try x.alloc(f32, raw.len / 4);
+        for (logits, 0..) |*v, i| v.* = @bitCast(std.mem.readInt(u32, raw[4 * i ..][0..4], .little));
+        const world: usize = @intCast(c.get("world").?.int64().?);
+        const count: usize = @intCast(c.get("count").?.int64().?);
+        const sv = c.get("sampling").?;
+        const s: ?sampling.Sampling = if (sv == .array) .{
+            .seed = @intCast(std.fmt.parseInt(u64, sv.array[0].int, 10) catch unreachable),
+            .temperature = sv.array[1].float64().?,
+            .top_k = @intCast(sv.array[2].int64().?),
+            .top_p = sv.array[3].float64().?,
+            .min_p = sv.array[4].float64().?,
+        } else null;
+        const position: u64 = @intCast(c.get("position").?.int64().?);
+        try testing.expectEqual(count, sampling.candidateCount(s, @intCast(logits.len), sampling.nucleus_count));
+        var stats: std.ArrayList([2]f64) = .empty;
+        for (c.get("stats").?.array) |st| try stats.append(x, .{ st.array[0].float64().?, st.array[1].float64().? });
+        try gather(a, logits, world, count, &values, &ids);
+        var got = picker.pick(.{ .values = values.items, .ids = ids.items, .stats = stats.items, .count = count }, position, s);
+        const full = got == .full_row;
+        if (full) {
+            fallbacks += 1;
+            try gather(a, logits, world, logits.len, &values, &ids);
+            got = picker.pick(.{ .values = values.items, .ids = ids.items }, position, s);
+        }
+        const want: u32 = @intCast(c.get("token").?.int64().?);
+        if (got != .token or got.token != want or full != c.get("full").?.bool) {
+            bad += 1;
+            if (bad <= 5) std.debug.print("sampling row {d}: want {d} (full {}) got {any} (full {}); vocab {d} world {d} count {d} sampling {any}\n", .{ rows - 1, want, c.get("full").?.bool, got, full, logits.len, world, count, s });
+        }
+    }
+    std.debug.print("sampling golden: {d}/{d} rows picked as the Python engine picks them ({d} nucleus rows on the whole row)\n", .{ rows - bad, rows, fallbacks });
+    try testing.expectEqual(@as(usize, 0), bad);
+}
+
+test "rows sample as the Python engine's host rule does (TF_DSV41_GOLDEN/sampling.jsonl)" {
+    const data = try readGolden(testing.allocator, "sampling.jsonl") orelse return error.SkipZigTest;
+    defer testing.allocator.free(data);
+    try checkSampling(data);
+}
+
+test "rows sample as the Python engine's host rule does (committed set)" {
+    try checkSampling(@import("dsv41_serve_fixtures").sampling);
+}

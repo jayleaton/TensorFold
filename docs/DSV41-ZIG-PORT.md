@@ -41,6 +41,11 @@ Rules for every owner:
   - `Pass.ingest(slot, start, taps, rows)`: taps rows `rows[i]` into the slot's context rings at positions `start + i` (the lanes backend sends only the kept path, last `window` rows). In a shared round the lane core drafts before `keep`, so ingest reads the path, never the pool.
   - `Pass.propose(asks, out)`: one pass over every `Ask{slot, anchor, start, params}` (anchor = the pending token at `start`, `params` = the chain kernel's keyed sampling); `out[i]` gets `block` drafts and confidences, and with trees the gathered candidates and base logits `[block, K]`. `Pass.reset(slot)` restarts a slot's context; `Pass.markov()` returns host copies of the Markov / confidence heads for trees (null: chains only).
   - Row cap: 64 rows a forward, 16 a slot (graph buckets 1-8, 12, 16, 24, 32, 48, 64). The depth prices rounds from the measured table (`draft.Costs`, read from Python's `calib-*.json`), never a clock.
+- **Server** (`zig/src/families/deepseek_v41/serve/`, module `dsv41_serve`; host only, goldens against the Python engine):
+  - `sampling.Picker.init(gpa, capacity) -> Picker`: one thread's scratch (capacity = the vocabulary, for whole rows); nothing allocates after.
+  - `Picker.pick(row: Row, position: u64, s: ?Sampling) -> Pick` and `Picker.pickRows(rows, positions, s, out: []Pick)`: `batch._choose`. `Row{values: []f32, ids: []u32, stats: [][2]f64, count}` is a row's gathered candidates (any order; `Candidates.row` reads the `[W, R, 2k]` fp32 gather), `count` the merged cut (`candidateCount(s, vocab, nucleus_count)`), `stats` each rank's (max, sum exp(v/T - max/T)) for nucleus rows (`isNucleus`). `Pick` is `.token` or `.full_row` (gather the row's whole vocabulary and pick again without stats). Greedy (`s == null` or T <= 0) is the largest logit, ties to the lower id.
+  - `sampling.accept(window: []u32, chosen: []u32) -> usize`: drafts kept from a chain window `[pending, d1, ...]`; the round emits `chosen[0..accepted + 1]`.
+  - `tokenizer.Tokenizer.load(gpa, io, dir)`, `Encoder.encode`, `Detokenizer.push`; `template.render(a, messages, Options, *Problem)`; `tools.parse` / `tools.Stream.feed`. The server reaches the engine only through `engine_api.Engine`.
 
 ## 1. How the Zig engine is built
 
