@@ -27,7 +27,19 @@ fn tokenize(srv: *Server, cx: *Cx, body: Value) errors.Refused!Value {
     if (body != .object) return cx.refuse("the request body must be a JSON object");
     const strings = try flag(cx, body, "return_token_strs", false);
     var ids: []const u32 = undefined;
-    if (body.has("messages")) {
+    if (body.has("messages") and srv.family != null) {
+        // rendered exactly as a chat request with the same body
+        const fam = srv.family.?;
+        const generation = try flag(cx, body, "add_generation_prompt", true);
+        const m = body.get("messages").?;
+        if (m != .array or m.array.len == 0) return cx.refuse("messages must be a non-empty list");
+        const t = try fam.thinking(cx, body);
+        const rendered = fam.render(cx, .{ .messages = m, .tools = try fam.tools(cx, body), .thinking = t.enable orelse srv.config.enable_thinking, .effort = t.effort orelse srv.config.reasoning_effort orelse fam.defaultEffort(), .generation = generation, .body = body }) catch |e| switch (e) {
+            error.Refused => return cx.refuse(cx.message),
+            else => |x| return x,
+        };
+        ids = rendered.ids;
+    } else if (body.has("messages")) {
         const generation = try flag(cx, body, "add_generation_prompt", true);
         const msgs = try messages.normalize(cx, body.get("messages"), "system", srv.needs_user_after_tool);
         const tools = tool_specs.active(cx, body.get("tools"), body.get("tool_choice")) catch |e| switch (e) {

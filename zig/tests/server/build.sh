@@ -6,10 +6,12 @@ root="$(cd "$(dirname "$0")/../../.." && pwd)"
 out="$root/zig-out/server"
 mkdir -p "$out"
 core=(--dep lanes "-Mengine_api=$root/zig/src/core/engine_api.zig" "-Mlanes=$root/zig/src/core/lanes/lanes.zig"
-      "-Mtokenizer=$root/zig/src/core/tokenizer/tokenizer.zig" "-Mtemplate=$root/zig/src/core/template/template.zig" "-Mjson=$root/zig/src/server/json.zig")
+      "-Mtokenizer=$root/zig/src/core/tokenizer/tokenizer.zig" "-Mtemplate=$root/zig/src/core/template/template.zig" "-Mjson=$root/zig/src/server/json.zig"
+      --dep json --dep tokenizer --dep lanes --dep dsv41_serve_fixtures -lc "-Mdsv41_serve=$root/zig/src/families/deepseek_v41/serve/root.zig"
+      "-Mdsv41_serve_fixtures=$root/zig/src/families/deepseek_v41/fixtures/serve/fixtures.zig")
 "$zig" build-exe -lc -O "${OPT:-ReleaseSafe}" --dep server --dep engine_api "-Mroot=$root/zig/tests/server/fake_serve.zig" \
-  --dep engine_api --dep tokenizer --dep template --dep json "-Mserver=$root/zig/src/server/root.zig" "${core[@]}" \
+  --dep engine_api --dep tokenizer --dep template --dep json --dep dsv41_serve "-Mserver=$root/zig/src/server/root.zig" "${core[@]}" \
   --name fake_serve -femit-bin="$out/fake_serve"
-"$zig" build-exe -lc -O "${OPT:-ReleaseSafe}" --dep engine_api --dep tokenizer --dep template --dep json --dep native_engines \
+"$zig" build-exe -lc -O "${OPT:-ReleaseSafe}" --dep engine_api --dep tokenizer --dep template --dep json --dep dsv41_serve --dep native_engines \
   "-Mroot=$root/zig/src/server/main.zig" --dep engine_api "-Mnative_engines=$root/zig/src/native/none.zig" "${core[@]}" \
   --name tensorfold-native -femit-bin="$out/tensorfold-native"

@@ -2,3 +2,4 @@
 pub const template = @embedFile("template.jsonl");
 pub const dsml = @embedFile("dsml.jsonl");
 pub const sampling = @embedFile("sampling.jsonl");
+pub const mini_tokenizer = @embedFile("mini_tokenizer.json");

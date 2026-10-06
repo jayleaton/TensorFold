@@ -77,8 +77,7 @@ pub const Store = struct {
         defer s.gpa.free(pathz);
         const fd = posix.openatZ(posix.AT.FDCWD, pathz, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .NONBLOCK = true }, 0) catch return error.Unsafe;
         defer _ = posix.system.close(fd);
-        var st: posix.Stat = undefined;
-        if (posix.errno(posix.system.fstat(fd, &st)) != .SUCCESS) return error.Unsafe;
+        const st = statOf(fd, null) orelse return error.Unsafe;
         if ((st.mode & posix.S.IFMT) != posix.S.IFREG or st.mode & 0o044 != 0) {
             problem.* = "API key file must be a regular file unreadable by other users; use chmod 600";
             return error.Invalid;
@@ -130,15 +129,13 @@ pub const Store = struct {
         if (s.file_arena) |*old| old.deinit();
         s.file_arena = arena;
         s.file = keys.items;
-        s.stamp = .{ st.dev, st.ino, std.math.lossyCast(i128, st.mtime().nsec) + @as(i128, st.mtime().sec) * std.time.ns_per_s, st.size, st.mode };
+        s.stamp = st.stamp();
     }
 
     fn statStamp(s: *Store) ?[5]i128 {
         const pathz = s.gpa.dupeSentinel(u8, s.path.?, 0) catch return null;
         defer s.gpa.free(pathz);
-        var st: posix.Stat = undefined;
-        if (posix.errno(posix.system.stat(pathz, &st)) != .SUCCESS) return null;
-        return .{ st.dev, st.ino, std.math.lossyCast(i128, st.mtime().nsec) + @as(i128, st.mtime().sec) * std.time.ns_per_s, st.size, st.mode };
+        return (statOf(posix.AT.FDCWD, pathz) orelse return null).stamp();
     }
 
     /// Rereads the key file when SIGHUP asked or, at most once a second, when its stamp changed.
@@ -259,4 +256,32 @@ test "gates and digests" {
     try std.testing.expect(gated("/alternative/chat/completions", false));
     try std.testing.expect(digest("has space") == null);
     try std.testing.expect(loopback("127.0.0.1") and loopback("::1") and !loopback("0.0.0.0"));
+}
+
+/// What the key file's checks read: its device, inode, modification time, size and mode.
+const FileStat = struct {
+    dev: i128,
+    ino: i128,
+    mtime_ns: i128,
+    size: i128,
+    mode: u32,
+
+    fn stamp(st: FileStat) [5]i128 {
+        return .{ st.dev, st.ino, st.mtime_ns, st.size, st.mode };
+    }
+};
+
+/// ``fd``'s stat (``path`` null) or ``path``'s (relative to ``fd``): statx on Linux, where libc has no fstat binding.
+fn statOf(fd: posix.fd_t, path: ?[*:0]const u8) ?FileStat {
+    if (@import("builtin").os.tag == .linux) {
+        const linux = std.os.linux;
+        var sx: linux.Statx = undefined;
+        const flags: u32 = if (path == null) 0x1000 else 0; // AT_EMPTY_PATH: the open file itself
+        if (linux.errno(linux.statx(fd, path orelse "", flags, linux.STATX.BASIC_STATS, &sx)) != .SUCCESS) return null;
+        return .{ .dev = (@as(i128, sx.dev_major) << 32) | sx.dev_minor, .ino = sx.ino, .mtime_ns = @as(i128, sx.mtime.sec) * std.time.ns_per_s + sx.mtime.nsec, .size = sx.size, .mode = sx.mode };
+    }
+    var st: posix.Stat = undefined;
+    const rc = if (path) |p| posix.system.stat(p, &st) else posix.system.fstat(fd, &st);
+    if (posix.errno(rc) != .SUCCESS) return null;
+    return .{ .dev = st.dev, .ino = st.ino, .mtime_ns = std.math.lossyCast(i128, st.mtime().nsec) + @as(i128, st.mtime().sec) * std.time.ns_per_s, .size = st.size, .mode = st.mode };
 }

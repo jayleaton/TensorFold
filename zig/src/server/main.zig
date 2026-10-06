@@ -7,6 +7,9 @@ const hub = @import("hub.zig");
 const engines = @import("engines.zig");
 const serve = @import("serve.zig");
 const hf_text = @import("hf_text.zig");
+const deepseek = @import("deepseek.zig");
+const model_text = @import("model_text.zig");
+const family = @import("family.zig");
 
 const usage_line = "usage: tensorfold serve [-h] [--host HOST] [--port PORT] [--name NAME] [--alias ALIAS] [--api-key API_KEY] [--api-key-file API_KEY_FILE] [--metrics-open] [--dashboard] [--context CONTEXT] [--speed-up SETTINGS] [--max-tokens MAX_TOKENS] [--temperature TEMPERATURE] [--top-p TOP_P] [--top-k TOP_K] [--min-p MIN_P] [--thinking | --no-thinking] [--reasoning-effort {low,medium,high,xhigh}] [--thinking-budget THINKING_BUDGET] [--loop-guard] [--no-drafts] [--parallel PARALLEL] [--no-update-check] [--backend {auto,mlx,cuda}] model\n";
 
@@ -37,16 +40,31 @@ pub fn main(init: std.process.Init) !u8 {
     };
     var problem: []const u8 = "";
     const dir = try hub.resolve(a, io, init.environ_map, args.model, &problem) orelse return fail(problem);
-    const text = hf_text.HfText.load(gpa, io, dir, &problem) catch return fail(problem);
-    defer text.deinit();
     const model_type = modelType(a, io, dir);
+    // DeepSeek-V4.1 has its own tokenizer, encoding and reply rules; every other family reads its chat template
+    var text: model_text.Text = undefined;
+    var fam: ?family.Family = null;
+    var hf: ?*hf_text.HfText = null;
+    var ds: ?*deepseek.DeepSeek = null;
+    if (std.mem.eql(u8, model_type, deepseek.model_type)) {
+        const options = deepseek.Options.fromEnv(init.environ_map, &problem) catch return fail(problem);
+        ds = deepseek.DeepSeek.load(gpa, io, dir, options, &problem) catch return fail(problem);
+        text = ds.?.text();
+        fam = ds.?.family_();
+    } else {
+        hf = hf_text.HfText.load(gpa, io, dir, &problem) catch return fail(problem);
+        text = hf.?.text();
+    }
+    defer if (hf) |t| t.deinit();
+    defer if (ds) |d| d.deinit(true);
     const opened = try engines.open(a, gpa, io, dir, model_type, args, &problem) orelse return fail(problem);
     defer opened.close(opened.ctx);
     return serve.run(gpa, io, args, .{
         .engine = opened.engine,
-        .text = text.text(),
+        .text = text,
+        .family = fam,
         .served = hub.servedName(args.name, args.model, dir),
-        .sampling = try sampling(a, io, dir, args),
+        .sampling = try sampling(a, io, dir, args, fam != null),
         .environ = init.environ_map,
         .started = started,
     });
@@ -67,8 +85,13 @@ fn modelType(a: std.mem.Allocator, io: std.Io, dir: []const u8) []const u8 {
 }
 
 /// generation_config.json's sampling (``do_sample`` false is greedy), then the serve flags over it.
-fn sampling(a: std.mem.Allocator, io: std.Io, dir: []const u8, args: cli.Args) !?json.Value {
+fn sampling(a: std.mem.Allocator, io: std.Io, dir: []const u8, args: cli.Args, python_defaults: bool) !?json.Value {
     const out = try json.newObject(a);
+    if (python_defaults) { // the Spark server's own defaults under the checkpoint's and the flags (DeepSeek-V4.1)
+        try out.put(a, "temperature", .{ .float = 1.0 });
+        try out.put(a, "top_k", .{ .int = "20" });
+        try out.put(a, "top_p", .{ .float = 0.95 });
+    }
     const path = try std.fs.path.join(a, &.{ dir, "generation_config.json" });
     if (std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20))) |bytes| {
         if ((try json.parse(a, bytes)) == .ok) {

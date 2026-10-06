@@ -12,7 +12,7 @@
 //! ``Tokenizer`` is immutable and shared; an ``Encoder`` holds one thread's scratch and piece cache, so encoding a
 //! prompt allocates nothing once its buffers have grown. ``Detokenizer`` turns ids into text a token at a time.
 const std = @import("std");
-const unicode = @import("tok_unicode");
+const unicode = @import("tokenizer").unicode; // the core tokenizer's Unicode tables
 const Allocator = std.mem.Allocator;
 
 pub const Error = error{ InvalidTokenizer, OutOfMemory };

@@ -69,7 +69,7 @@ test "the release tokenizer encodes the golden corpus to tokenizers' ids exactly
             }
         }
     }
-    std.debug.print("tokenizer golden: {d}/{d} documents equal\n", .{ docs - bad, docs });
+    if (bad > 0 or env("TF_DSV41_GOLDEN") != null) std.debug.print("tokenizer golden: {d}/{d} documents equal\n", .{ docs - bad, docs });
     try testing.expectEqual(@as(usize, 0), bad);
 }
 
@@ -100,7 +100,7 @@ test "the release tokenizer decodes ids to tokenizers' text exactly, whole and a
             if (bad <= 5) std.debug.print("decode case {d}: want {f}\n got {f}\n", .{ cases - 1, std.json.fmt(want[0..@min(want.len, 120)], .{}), std.json.fmt(got[0..@min(got.len, 120)], .{}) });
         }
     }
-    std.debug.print("decode golden: {d}/{d} cases equal\n", .{ cases - bad, cases });
+    if (bad > 0 or env("TF_DSV41_GOLDEN") != null) std.debug.print("decode golden: {d}/{d} cases equal\n", .{ cases - bad, cases });
     try testing.expectEqual(@as(usize, 0), bad);
 }
 
@@ -164,7 +164,7 @@ fn checkTemplates(lines: []const u8) !void {
             }
         }
     }
-    std.debug.print("template golden: {d}/{d} equal to encoding.encode ({d} of them also the release chat_template.jinja's text)\n", .{ cases - bad, cases, jinja });
+    if (bad > 0 or env("TF_DSV41_GOLDEN") != null) std.debug.print("template golden: {d}/{d} equal to encoding.encode ({d} of them also the release chat_template.jinja's text)\n", .{ cases - bad, cases, jinja });
     try testing.expectEqual(@as(usize, 0), bad);
 }
 
@@ -245,7 +245,7 @@ fn checkDsml(lines: []const u8) !void {
             if (bad <= 3) std.debug.print("dsml case {d}: {s}; thinking={} text {f}\n", .{ cases - 1, w, thinking, std.json.fmt(text[0..@min(text.len, 400)], .{}) });
         }
     }
-    std.debug.print("dsml golden: {d}/{d} replies equal to dsml.py ({d} stream feeds)\n", .{ cases - bad, cases, feeds });
+    if (bad > 0 or env("TF_DSV41_GOLDEN") != null) std.debug.print("dsml golden: {d}/{d} replies equal to dsml.py ({d} stream feeds)\n", .{ cases - bad, cases, feeds });
     try testing.expectEqual(@as(usize, 0), bad);
 }
 
@@ -343,7 +343,7 @@ fn checkSampling(lines: []const u8) !void {
             if (bad <= 5) std.debug.print("sampling row {d}: want {d} (full {}) got {any} (full {}); vocab {d} world {d} count {d} sampling {any}\n", .{ rows - 1, want, c.get("full").?.bool, got, full, logits.len, world, count, s });
         }
     }
-    std.debug.print("sampling golden: {d}/{d} rows picked as the Python engine picks them ({d} nucleus rows on the whole row)\n", .{ rows - bad, rows, fallbacks });
+    if (bad > 0 or env("TF_DSV41_GOLDEN") != null) std.debug.print("sampling golden: {d}/{d} rows picked as the Python engine picks them ({d} nucleus rows on the whole row)\n", .{ rows - bad, rows, fallbacks });
     try testing.expectEqual(@as(usize, 0), bad);
 }
 

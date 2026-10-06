@@ -75,6 +75,8 @@ pub const Setup = struct {
     started: i96 = 0,
     /// Called once the socket listens, with its port (tests read it).
     on_listen: ?*const fn (port: u16) void = null,
+    /// The checkpoint family's own chat rules (DeepSeek-V4.1), or null.
+    family: ?@import("family.zig").Family = null,
 };
 
 fn env(s: Setup, name: []const u8) ?[]const u8 {
@@ -118,6 +120,7 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         .seed_salt = salt,
         .request_log = env(s, "TENSORFOLD_REQUEST_LOG"),
         .dashboard = args.dashboard,
+        .family = s.family,
     };
     const srv = server_mod.Server.init(gpa, io, s.engine, s.text, config, if (store.enabled()) &store else null) catch {
         std.debug.print("tensorfold: the server could not start\n", .{});

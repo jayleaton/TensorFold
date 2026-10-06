@@ -119,11 +119,18 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
     try fields.validateModalities(cx, body);
     try fields.probabilityOptions(cx, body);
     if (srv.config.request_log) |path| request_log.append(cx.a, path, body);
-    var input: chat.Input = .{ .fields = undefined };
-    if (is_chat) {
+    var input: chat.Input = .{ .fields = undefined, .body = body };
+    if (srv.family) |fam| if (is_chat) {
+        // a family renders the client's messages and tools itself (its encoding reads OpenAI's shapes)
+        const m = body.get("messages") orelse Value.null;
+        if (m != .array or m.array.len == 0) return cx.refuse("messages must be a non-empty list");
+        input.messages = m;
+        input.tools = try fam.tools(cx, body);
+    };
+    if (is_chat and srv.family == null) {
         input.messages = try messages.normalize(cx, body.get("messages"), "system", srv.needs_user_after_tool);
         input.tools = try tool_specs.active(cx, body.get("tools"), body.get("tool_choice"));
-    } else if (body.get("messages")) |m| if (m == .array and m.array.len > 0) {
+    } else if (!is_chat) if (body.get("messages")) |m| if (m == .array and m.array.len > 0) {
         input.messages = try messages.normalize(cx, m, "system", srv.needs_user_after_tool);
     };
     if (!is_chat and input.messages.array.len == 0) input.prompt = try legacyPrompt(srv, cx, body.get("prompt"));
@@ -141,8 +148,11 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
     const sampling = try json.newObject(cx.a);
     for ([_][]const u8{ "temperature", "top_p", "top_k", "min_p", "seed", "priority", "draft", "thinking_budget", "ignore_eos", "stop" } ++ grammar.fields) |k| if (body.get(k)) |v| try sampling.put(cx.a, k, v);
     try grammar.refusal(cx, body);
-    if (input.tools.len > 0 and try tool_specs.choiceRequiresCall(cx.a, body.get("tool_choice"))) try sampling.put(cx.a, "tool_call_required", .{ .bool = true });
-    const thinking = try fields.thinkingFields(cx, body, srv.effort_levels);
+    if (srv.family == null and input.tools.len > 0 and try tool_specs.choiceRequiresCall(cx.a, body.get("tool_choice"))) try sampling.put(cx.a, "tool_call_required", .{ .bool = true });
+    const thinking: fields.Thinking = if (srv.family) |fam| blk: {
+        const t = try fam.thinking(cx, body);
+        break :blk .{ .enable = t.enable, .effort = t.effort };
+    } else try fields.thinkingFields(cx, body, srv.effort_levels);
     if (thinking.effort) |e| try sampling.put(cx.a, "reasoning_effort", .{ .string = e });
     if (thinking.enable) |on| try sampling.put(cx.a, "enable_thinking", .{ .bool = on });
     input.fields = .{ .object = sampling };
@@ -150,6 +160,7 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
     if (body.field("parallel_tool_calls")) |p| {
         if (p != .bool) return cx.refuse("parallel_tool_calls must be a boolean");
         policy.single = !p.bool;
+        input.single_call = policy.single;
     }
     const options = body.get("stream_options");
     return .{
@@ -293,6 +304,7 @@ const Run = struct {
 
     /// ``ToolCallPolicy.finish``: the reply's calls parsed out of its content.
     fn attachCalls(r: *Run, reply: *chat.Reply) Allocator.Error!?[]Value {
+        if (reply.calls) |calls| return if (calls.len > 0) calls else null; // the family parsed them (and applied the one-call policy)
         const tools = r.plan.input.tools;
         if (tools.len == 0) return null;
         const parsed = try tool_parse.parse(r.a, reply.content, tools, r.plan.policy.maxCalls());
@@ -348,8 +360,14 @@ const Run = struct {
         if (r.is_chat) {
             const message = try json.newObject(a);
             try message.put(a, "role", .{ .string = "assistant" });
-            try message.put(a, "content", if (calls != null) .null else .{ .string = reply.content });
-            if (reply.reasoning) |t| if (t.len > 0) try message.put(a, "reasoning_content", .{ .string = t });
+            const empty_null = r.srv.family != null and reply.content.len == 0; // the family's Python app: ``content or None``
+            try message.put(a, "content", if (calls != null or empty_null) .null else .{ .string = reply.content });
+            if (reply.reasoning) |t| if (t.len > 0) {
+                if (r.srv.family) |fam| {
+                    const d = try fam.reasoningDelta(a, t);
+                    for (d.object.keys(), d.object.values()) |k, v| try message.put(a, k, v);
+                } else try message.put(a, "reasoning_content", .{ .string = t });
+            };
             if (calls) |c| try message.put(a, "tool_calls", .{ .array = c });
             try choice.put(a, "message", .{ .object = message });
             try choice.put(a, "finish_reason", .{ .string = reply.finish_reason });
@@ -418,7 +436,8 @@ const Run = struct {
 
     fn stream(r: *Run, gone: Gone, field: []const u8) void {
         const a = r.a;
-        const tools = r.plan.input.tools.len > 0;
+        // a family streams calls and prose itself, so its stream is the plain one
+        const tools = r.plan.input.tools.len > 0 and r.srv.family == null;
         var cx: Cx = .{ .a = a };
         // every refusal comes before the stream opens, so it gets the same 400 as a whole reply
         const prepared = chat.prepare(r.srv, &cx, r.plan.input, gone) catch |e| return r.unsent(&cx, e, field);

@@ -18,6 +18,7 @@ const prompt = @import("prompt.zig");
 const tool_specs = @import("tool_specs.zig");
 const chunk_plan = @import("chunk_plan.zig");
 const log = @import("log.zig");
+const family_mod = @import("family.zig");
 const Value = json.Value;
 const Cx = errors.Cx;
 const Allocator = std.mem.Allocator;
@@ -39,6 +40,8 @@ pub const Config = struct {
     /// TENSORFOLD_REQUEST_LOG: where chat and completion bodies are appended; null: nowhere.
     request_log: ?[]const u8 = null,
     timeouts: http_conn.Timeouts = .{},
+    /// The checkpoint family's own chat rules (DeepSeek-V4.1); null: the chat template path.
+    family: ?family_mod.Family = null,
 };
 
 pub const Server = struct {
@@ -59,6 +62,7 @@ pub const Server = struct {
     think_close_end: ?u32 = null,
     metrics: metrics.Metrics,
     store: responses.Store,
+    family: ?family_mod.Family = null,
     next_id: std.atomic.Value(u64) = .init(1),
     /// Connections open now; a stop waits for them before freeing what they read.
     open_connections: std.atomic.Value(u32) = .init(0),
@@ -68,7 +72,7 @@ pub const Server = struct {
     /// Reads what the template and tokenizer decide once: late system role, think markers, efforts, the forced close.
     pub fn init(gpa: Allocator, io: std.Io, engine: api.Engine, text: model_text.Text, config: Config, keys: ?*auth.Store) !*Server {
         const srv = try gpa.create(Server);
-        srv.* = .{ .gpa = gpa, .io = io, .engine = engine, .info = engine.info(), .text = text, .config = config, .keys = keys, .metrics = .{ .gpa = gpa }, .store = .{ .gpa = gpa }, .arena = .init(gpa) };
+        srv.* = .{ .gpa = gpa, .io = io, .engine = engine, .info = engine.info(), .text = text, .config = config, .keys = keys, .metrics = .{ .gpa = gpa }, .store = .{ .gpa = gpa }, .arena = .init(gpa), .family = config.family };
         const a = srv.arena.allocator();
         srv.eos = try a.dupe(u32, text.eosIds());
         if (text.tokenId(reply_text.channel_markers.close) != null) srv.markers = reply_text.channel_markers;
@@ -105,7 +109,12 @@ pub const Server = struct {
         _ = temperature; // the request's own temperature field decides, as in the Python server
         const options = try json.newObject(cx.a);
         if (srv.config.default_sampling) |d| try merge(options, cx, try fields.parseNumbers(cx, d));
-        try merge(options, cx, try fields.parseNumbers(cx, f));
+        const asked = try fields.parseNumbers(cx, f);
+        // a family whose Python server ignores the request's min_p keeps the default's
+        if (srv.family) |fam| if (!fam.vt.reads_min_p) {
+            _ = asked.object.orderedRemove("min_p");
+        };
+        try merge(options, cx, asked);
         const temp = number(options.get("temperature")) orelse 0;
         if (temp <= 0) return null;
         const seed: u64 = if (options.get("seed")) |s| seedBits(s) else api.seedFor(prompt_ids, srv.config.seed_salt);
