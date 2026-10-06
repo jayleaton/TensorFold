@@ -260,7 +260,10 @@ Effort is in engineering days for this agent team, assuming GPU windows are avai
     - the EXL3 linears, x3seg, the routed-expert chain, x3gm, the fast-prefill GEMM and the split router.
   - **Kernel exactness job:** 13/13 cases pass, and the SASS of the ported kernels is identical to the Python extensions'.
   - Each M1 pod takes about 15-19 min and costs about $0.6.
-  - **Still open for M1:** set C, the DSpark block (layer 40), is running in pod 5.
+  - **Pod 5 completes the replay gate:**
+    - sets A, B and C: 9 blocks, including the DSpark block (layer 40: 128 experts, top-3);
+    - weights 535/535;
+    - 1,353/1,353 ops bit-exact alone and chained (4,533 inputs from our own outputs), 0 skipped.
 - **M1, second half: our own block forward.** The capture's op log is the spec. A full-attention block's decode window is about 30-35 launches:
   1. Engram (layers 1 and 14): wkv linear, `_fuse_dec`.
   2. mHC: `_site_dec` + `_finish_k`.
