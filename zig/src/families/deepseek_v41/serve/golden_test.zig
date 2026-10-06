@@ -177,3 +177,84 @@ test "the chat encoding renders the full generated set (TF_DSV41_GOLDEN/template
     defer testing.allocator.free(data);
     try checkTemplates(data);
 }
+
+const tools = @import("tools.zig");
+
+fn deltaEqual(want: json.Value, got: tools.Delta) bool {
+    const w = want.array;
+    const kind = w[0].string;
+    return switch (got) {
+        .reasoning => |t| std.mem.eql(u8, kind, "r") and std.mem.eql(u8, w[1].string, t),
+        .content => |t| std.mem.eql(u8, kind, "c") and std.mem.eql(u8, w[1].string, t),
+        .call => |c| std.mem.eql(u8, kind, "open") and w[1].int64().? == c.index and std.mem.eql(u8, w[2].string, c.name),
+        .arguments => |g| std.mem.eql(u8, kind, "args") and w[1].int64().? == g.index and std.mem.eql(u8, w[2].string, g.text),
+    };
+}
+
+fn callsEqual(a: std.mem.Allocator, want: json.Value, got: []const tools.Call) !bool {
+    if (want.array.len != got.len) return false;
+    for (want.array, got) |w, c| {
+        if (!std.mem.eql(u8, w.array[0].string, c.name)) return false;
+        if (!std.mem.eql(u8, w.array[1].string, try c.arguments(a))) return false;
+    }
+    return true;
+}
+
+/// Each recorded reply parsed whole and fed in the recorded pieces: the same parts, deltas at every feed, and calls.
+fn checkDsml(lines: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var it = std.mem.splitScalar(u8, lines, '\n');
+    var cases: usize = 0;
+    var bad: usize = 0;
+    var feeds: usize = 0;
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        _ = arena.reset(.retain_capacity);
+        const a = arena.allocator();
+        const c = (try json.parseText(a, line)).ok;
+        cases += 1;
+        const text = c.get("text").?.string;
+        const thinking = c.get("thinking").?.bool;
+        const offered = try tools.Tools.init(a, if (c.get("tools").? == .array) c.get("tools").?.array else &.{});
+        var why: ?[]const u8 = null;
+        const p = try tools.parse(a, text, thinking, offered, .{});
+        const wp = c.get("parse").?;
+        if (!std.mem.eql(u8, wp.get("reasoning").?.string, p.reasoning)) why = "parse reasoning";
+        if (why == null and !std.mem.eql(u8, wp.get("content").?.string, p.content)) why = "parse content";
+        if (why == null and !try callsEqual(a, wp.get("calls").?, p.calls)) why = "parse calls";
+        var s = tools.Stream.init(a, thinking, offered, .{});
+        var out: std.ArrayList(tools.Delta) = .empty;
+        const cuts = c.get("cuts").?.array;
+        const deltas = c.get("deltas").?.array;
+        for (deltas, 0..) |want, k| {
+            if (why != null) break;
+            out.clearRetainingCapacity();
+            if (k < cuts.len) try s.feed(text[0..@intCast(cuts[k].int64().?)], false, &out) else try s.finish(text, &out);
+            feeds += 1;
+            if (want.array.len != out.items.len) {
+                why = "stream delta count";
+            } else for (want.array, out.items) |w, g| {
+                if (!deltaEqual(w, g)) why = "stream delta";
+            }
+            if (why != null and bad < 3) std.debug.print("  feed {d}/{d}: want {d} deltas, got {d}\n", .{ k, deltas.len, want.array.len, out.items.len });
+        }
+        if (why == null and !try callsEqual(a, c.get("stream_calls").?, s.calls.items)) why = "stream calls";
+        if (why) |w| {
+            bad += 1;
+            if (bad <= 3) std.debug.print("dsml case {d}: {s}; thinking={} text {f}\n", .{ cases - 1, w, thinking, std.json.fmt(text[0..@min(text.len, 400)], .{}) });
+        }
+    }
+    std.debug.print("dsml golden: {d}/{d} replies equal to dsml.py ({d} stream feeds)\n", .{ cases - bad, cases, feeds });
+    try testing.expectEqual(@as(usize, 0), bad);
+}
+
+test "DSML replies parse and stream as the Python engine's dsml.py does (committed set)" {
+    try checkDsml(@import("dsv41_serve_fixtures").dsml);
+}
+
+test "DSML replies parse and stream as dsml.py does (TF_DSV41_GOLDEN/dsml.jsonl)" {
+    const data = try readGolden(testing.allocator, "dsml.jsonl") orelse return error.SkipZigTest;
+    defer testing.allocator.free(data);
+    try checkDsml(data);
+}

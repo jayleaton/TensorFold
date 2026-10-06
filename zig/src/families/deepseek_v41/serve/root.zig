@@ -2,6 +2,7 @@
 //! sampler. The HTTP server (zig/src/server) reaches the model through these; the engine, through ``sampling``.
 pub const tokenizer = @import("tokenizer.zig");
 pub const template = @import("template.zig");
+pub const tools = @import("tools.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
