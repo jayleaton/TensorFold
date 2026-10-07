@@ -103,6 +103,14 @@ pub const Model = struct {
         const m = try gpa.create(Model);
         errdefer gpa.destroy(m);
         m.gpa = gpa;
+        // gpa.create applies no field defaults: the parts made only with drafts, KV, several slots or sampling start
+        // null here, or close() frees garbage when they are off (TF_DSV41_DRAFTS=0 and the rest)
+        m.pass = null;
+        m.sessions = null;
+        m.slots = 1;
+        m.slot_set = null;
+        m.rows = null;
+        m.sampler = null;
         m.arena = std.heap.ArenaAllocator.init(gpa);
         errdefer m.arena.deinit();
         const a = m.arena.allocator();
