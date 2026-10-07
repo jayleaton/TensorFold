@@ -823,7 +823,22 @@ pub const Emitter = struct {
             if (!e.cfg.isCandidateSource(L)) return;
             const nb = std.math.divCeil(i64, nk, cbs) catch unreachable;
             const bp = topkPlan(nb, null);
-            if (bp[1] > topk_max_ept) return error.Unsupported;
+            if (bp[1] > topk_max_ept) {
+                // past 8 x 512 x 31 blocks too (positions past ~1,015,808): dtopk.blocks (_dtopk mode 2, no counts)
+                const cb: i64 = e.cfg.candidate_blocks;
+                return e.triton("_dtopk", .{ n, 1, 1 }, &.{
+                    .{ .name = "S", .arg = scores },             .{ .name = "s_stride", .arg = .{ .i = scores.t.stride[0] } },
+                    .{ .name = "P", .arg = scores },             .{ .name = "p_stride", .arg = .{ .i = 0 } },
+                    .{ .name = "POS", .arg = try e.pos() },      .{ .name = "NK", .arg = .{ .i = nb } },
+                    .{ .name = "OUT", .arg = cand },             .{ .name = "o_stride", .arg = .{ .i = cand.t.stride[0] } },
+                    .{ .name = "CNT", .arg = cand },             .{ .name = "RATIO", .arg = .{ .i = ratio } },
+                    .{ .name = "K", .arg = .{ .i = cb } },       .{ .name = "MODE", .arg = .{ .i = 2 } },
+                    .{ .name = "ROWS", .arg = .{ .b = false } }, .{ .name = "T", .arg = .{ .i = 4096 } },
+                    .{ .name = "BS", .arg = .{ .i = cbs } },     .{ .name = "RB", .arg = .{ .i = 8 } },
+                    .{ .name = "NPASS", .arg = .{ .i = 8 } },    .{ .name = "SORT", .arg = .{ .b = false } },
+                    .{ .name = "COUNT", .arg = .{ .b = false } }, .{ .name = "KP", .arg = .{ .i = @intCast(std.math.ceilPowerOfTwo(u64, @intCast(cb)) catch unreachable) } },
+                });
+            }
             const job: [8]Arg = .{ scores, try e.empty(.i32), cand, try e.view(cand.t.role, .i32, &.{0}, &.{e.cfg.candidate_blocks}, 0), .{ .i = nb }, .{ .i = e.cfg.candidate_blocks }, .{ .i = 2 }, .{ .i = bp[1] } };
             var one: std.ArrayList(Arg) = .empty;
             try one.appendSlice(e.a, &job);
