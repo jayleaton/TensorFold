@@ -186,6 +186,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     dsv41_api.addImport("lanes", dsv41_lanes);
     dsv41_m1.addImport("engine_api", dsv41_api);
     dsv41_m1.addImport("dsv41_serve", @import("sampling.zig").serve(b, target, optimize, dsv41_lanes).serve); // the keyed sampler's Picker
+    @import("grammar.zig").addTo(b, dsv41_m1, target, optimize); // structured output (grammar_gpu.zig): xgrammar's core, the mask PTX
     @import("sampling.zig").gpu(b, target, optimize, cuda, dsv41); // tf-dsv41-samp: the keyed sampler's device steps
     b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-m1", .root_module = dsv41_m1 }));
     // M4 on the GPU: tensorfold-dsv41, the native server with DeepSeek-V4.1's CUDA engine (rank 0; the other ranks run
@@ -197,6 +198,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const engine_tp = @import("tp.zig").module(b, target, optimize, cuda);
     ds_engine.addImport("tp", engine_tp);
     ds_engine.addImport("kv", @import("kv.zig").module(b, target, optimize, cuda, engine_tp));
+    @import("grammar.zig").addTo(b, ds_engine, target, optimize); // structured output (grammar_gpu.zig)
     b.installArtifact(b.addExecutable(.{ .name = "tensorfold-dsv41", .root_module = @import("server.zig").withEngine(b, target, .ReleaseSafe, ds_engine) }));
 }
 
