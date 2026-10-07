@@ -2,6 +2,7 @@
 //! and the engine-less server binary. Goldens beyond the committed ones: TF_DSV41_MODEL (the release tokenizer.json's
 //! directory) and TF_DSV41_GOLDEN (zig/tests/server/dsv41/gen_*.py's output directory).
 const std = @import("std");
+const vision_build = @import("vision.zig");
 
 /// DeepSeek-V4.1's serving module (tokenizer, encoding, DSML tools, sampling) over the modules the server shares.
 pub fn serveModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, json: *std.Build.Module, tokenizer: *std.Build.Module, lanes: *std.Build.Module) *std.Build.Module {
@@ -16,6 +17,7 @@ pub fn serveModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: st
             .{ .name = "tokenizer", .module = tokenizer },
             .{ .name = "lanes", .module = lanes },
             .{ .name = "dsv41_serve_fixtures", .module = fixtures },
+            .{ .name = "dsv41_vision", .module = vision_build.module(b, target, optimize, json) },
         },
     });
 }
