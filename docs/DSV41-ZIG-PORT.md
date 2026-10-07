@@ -333,6 +333,18 @@ The hooks:
   - **Only the Sparks can check:** 512K-1M prompts on the whole model (a 1M reference does not fit the pod's time or a PRO 6000's 25-layer budget at both modes), prod's own `TF_DSV41_INDEX_BUDGET_MIB=64` (Zig keeps 256: the materialised selection's row blocks differ, its rows do not), and prefill memory at 1M (`L.ix.stream` is 256 MiB of the segment arena; `kv.budget`'s prefill price does not count it yet).
   - **Spark kit note:** the served model needs `TF_DSV41_CONTEXT` and a `rope.bin` of that many rows + 2,048, and DSpark's AOT set must include `_stream` (an AOT prompt over 8,192 tokens), or long prompts fail with `MissingTritonVariant`.
 
+- `dsq-zig-ops-1` (serving and ops parity with prod's Python server; section 0d):
+  - **No pod step.** Everything host-checkable is gated on host: `zig build test-server` with `TF_DSV41_MODEL` (the release tokenizer) runs `wire_test.zig`. That test checks 49/49 exchanges and 28/28 request-log lines equal to prod's own server, recorded at 8474f31 by `tools/zig/dsv41_ops/http_golden.py`. `test-dsv41` covers `prepared.zig`.
+  - **Spark window steps:** `tools/zig/dsv41_ops/WINDOW-STEPS.md`, about 55–75 min, not run. In order:
+    1. build the Zig image natively on dgx-01;
+    2. `scripts/v2-rollback.sh zig` (the first boot writes the prepared files);
+    3. a restart, for the fast-boot time;
+    4. `wire_probe.py` against Zig, then against Python;
+    5. the request log and disconnect;
+    6. a fail-fast kill of rank 1 with the watchdog's heal;
+    7. `scripts/v2-rollback.sh perf1`.
+  - **Assets:** the kit's `m4-assets` on both nodes (`HEAD_ASSETS` / `WORKER_ASSETS` of `config/prod-zig.env`), and the gated sm_121 fatbins for the image's build context.
+
 ### Pod 26, the combined gate (2026-10-07, 57 min, $3.97)
 
 The tree was `798b4f5`, built from a clean archive. The fatbins were the sm_120 base set plus `dsv41_kvsplit` and `dsv41_sampling`. Logs are in the quant repo, `results/20261007-comb26-pod26`.
@@ -430,6 +442,64 @@ The tree was `798b4f5`, built from a clean archive. The fatbins were the sm_120 
   - From Zig's `slot drafts` / lanes counters and prod's per-request `drafting` stats, compare acceptance (accepted / drafted) and tokens a stream round. They should be close, not identical, because the host chain sums in a different fp32 order.
   - Assets: `rows-aot` plus DSpark's set P, nothing more.
   - About 15 min after run B's load.
+
+### 0d. Serving and ops parity with prod (`dsq-zig-ops-1`)
+
+The Zig server answers as prod's Python server does. Prod's DeepSeek app (`deepseek_v41/cuda/app.py` at 8474f31) runs on the GLM Spark server base (`glm5_next/spark/server.py`, `health.py`, `reqlog.py`), not on upstream TensorFold's `server/app.py`, so the Zig server, which was upstream's, gained that surface as `Config.wire = .spark` (`zig/src/server/spark.zig`).
+- **Selection:** `main` picks it for DeepSeek-V4.1, and `TENSORFOLD_WIRE=spark|tensorfold` overrides. The upstream wire is unchanged.
+- **The gate:** `wire_test.zig` replays `fixtures/serve/wire.jsonl` against the Zig server with the same scripted engine. `tools/zig/dsv41_ops/http_golden.py` recorded the file from prod's own handler over a socket. It holds 49 exchanges plus the request log. It compares status, Content-Type, the body (JSON, or the whole SSE stream), the engine's inputs (prompt ids, max_tokens, keyed sampling and seed, drafts, EOS, background) and every request-log record, with ids and clocks masked. **49/49 and 28/28 equal.**
+
+| Surface | Prod (Python) | Zig before | Zig now |
+|---|---|---|---|
+| Reply ids, `model` | `chatcmpl-` + 24 hex; the served name | 32 hex; the asked alias | = prod |
+| `usage` | no `completion_tokens_details` | had it | = prod |
+| Engine stats | `tensorfold`: the engine's job stats | `tensorfold` runtime + `speculative` + `exact_mode` | `tensorfold`: prompt, cached, ttft_s, finish, completion, prefill_s, decode_s, rounds, drafted, accepted (+ `token_ids`, `images_omitted`) |
+| SSE end | usage only with `include_usage`, in the last chunk; `[DONE]` | usage always, or a separate chunk | = prod |
+| Streaming reasoning / content / tool calls | `dsml.Stream` deltas | same (srv-1) | = prod (byte-identical in the test) |
+| Stop strings, max_tokens, finish_reason, `ignore_eos` | answer-only stops, holdback, `length` / `stop` / `tool_calls` | same | = prod |
+| `reasoning_effort` / thinking / kwargs errors | app.py's messages | same | = prod |
+| A call's prose (`content`) | kept beside `tool_calls` | null | = prod |
+| `n`, numbers, `stop`, token-ID prompts | `App.check` messages | upstream's | = prod |
+| Context limit | `context_problem` words, `context_length_exceeded`, param | upstream's words | = prod |
+| Errors | `{"error": {message, type, code?, param?}}`; 404 `{"error": "not found"}` | upstream's | = prod |
+| `logprobs`, modalities | ignored | refused (400) | ignored, as prod |
+| `/v1/models` | `created`, `root`, `max_model_len`, `context_length`, aliases | id / created / owned_by | = prod |
+| `/health` | `health.py` body; strict mode 503 | upstream's | = prod (`TF_DSV41_HEALTH` / `GLM53_TF_HEALTH`, `STALL_S`) |
+| `/metrics` | `tensorfold_*` rows | upstream's histograms | = prod |
+| `/tokenize` | `count`, `max_model_len`, `tokens`, `token_strs: null` | no `token_strs` | = prod |
+| Request log | `reqlog.py` (blake2b-64, prefix fields, rotation) | upstream's body log | = prod (`TF_DSV41_REQUEST_LOG`, `GLM53_TF_REQUEST_LOG_*`) |
+| Disconnect | `TF_DSV41_DISCONNECT` (socket check every round) | always on | = prod (`0`: a failed write only) |
+| Startup | greedy warning (public PR #14); `serving: N slot(s)` | neither | both |
+| Concurrency, admission | batcher, 4 slots | LaneHost; `TF_DSV41_SLOTS` (slots-1) | engine-side, not the server's |
+| Grammar (`response_format` enforced, `tool_choice` required / named) | xgrammar | none | `dsq-zig-grammar-1` |
+| Native images | `TF_DSV41_IMAGES=native` | refused | `dsq-zig-vision-1` |
+
+Where the Zig numbers are more faithful than prod's:
+- Prod's batch engine reports no top-level `drafted` / `accepted`, so prod's `/health` `drafted_total` / `accepted_total` stay 0. Zig fills them from the lanes' counters.
+- Prod's `rounds` is the batcher's global round counter, so `rounds_total` sums global counters. Zig's is the request's own.
+
+**Engine knobs from `prod.env`:**
+- **Sessions:** `TF_DSV41_SESSIONS` (0: no store), `SESSION_DISK_GIB` and `SESSION_DISK_MIN` go to `sessions.Disk.open` (`sessions_gpu.zig`).
+- **Memory floor:** `TF_DSV41_FLOOR_GIB` is validated against the hard floor (`0 < hard <= target`). The measured boot check warns when the worst serving point falls under it, as `memory.py`'s load check does. This hunk landed inside `81c7187`.
+- **Prepared folders:** `TF_DSV41_PREPARED` / `_PREPARED_WRITE` (`prepared.zig`).
+  - The Spark window's first Zig server took **505 s** to load, against prod's 33–48 s with Python's prepared folders.
+  - Each layer's named host images are now written once and read back on later boots. The folder is keyed by the builders' source, the pack's shards, the rank, the plan and DSpark.
+  - `dsv41 load:` logs where a boot went (images vs upload + digest). The window measures the gain.
+  - The SHA-256 digest of every tensor at upload (`load.zig`) is still paid on every boot. It is the next cut if the window shows it matters.
+
+**Ops** (prod mirror, branch `zig-serve`, worktree `dsv41-tensorfold-spark-zig-serve`, local only):
+- `docker/zig/Dockerfile`: a native aarch64 / sm_121 build on dgx-01, from the gated fatbins or nvcc.
+- `scripts/zig-image.sh stage|build|check`.
+- `scripts/serve.sh ENGINE=zig`:
+  - `--init` on every container;
+  - `build` / `start` / `stop` / `restart` / `status` / `logs` / `canary` / `watch`;
+  - the assets and the prepared folder checked by preflight;
+  - the Python configs' args byte-identical to `main`'s.
+- `config/prod-zig.env`.
+- `scripts/v2-rollback.sh zig` (`perf1` returns to Python).
+- `canary.py --skip`.
+- `docs/ZIG-SERVE.md`.
+- The watchdog tick (`/health` + exit 70) and the systemd units need no change.
 
 ## 1. How the Zig engine is built
 
