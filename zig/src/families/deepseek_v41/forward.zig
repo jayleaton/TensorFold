@@ -93,6 +93,8 @@ pub const Forward = struct {
     kv: ?*kvs.Kv = null,
     /// M5: the session store (sessions_gpu.zig): the ids each keep commits, and the operations a follower runs
     sess: ?Sess = null,
+    /// a workstream's plan-link operations (docs 0a's ranges; slots.zig 16-19), run by a follower in the leader's order
+    ext: ?Ext = null,
     /// the keyed sampler (sampling_gpu.zig): a follower runs rank 0's sampled choices too (their gathers pair up)
     sampler: ?Sampler = null,
 
@@ -324,6 +326,9 @@ pub const Forward = struct {
     }
     const op_tree_drop: i64 = 20;
 
+    /// A workstream's follower side: rank 0's message of an operation number this file does not know.
+    pub const Ext = struct { ptr: *anyopaque, run: *const fn (ptr: *anyopaque, msg: []const i64) anyerror!void };
+
     /// The session store's side of the forward (sessions_gpu.zig): `commit` hears every committed id (keep, prefill
     /// segments); `save` / `restore` are the leader's operations the followers run in its order.
     pub const Sess = struct {
@@ -459,7 +464,10 @@ pub const Forward = struct {
                     const x = f.sampler orelse return error.BadPlan;
                     try x.follow(x.ptr, msg);
                 },
-                else => return error.BadPlan,
+                else => {
+                    const x = f.ext orelse return error.BadPlan;
+                    try x.run(x.ptr, msg);
+                },
             }
         }
     }
