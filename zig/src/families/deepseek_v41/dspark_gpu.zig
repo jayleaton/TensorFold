@@ -22,7 +22,7 @@ const emit = @import("dspark_emit.zig");
 const iface = @import("draft/iface.zig");
 const dspark = @import("draft/dspark.zig");
 
-pub const Error = error{ Slots, NotAPrefix, NoWeight };
+pub const Error = error{ Slots, NotAPrefix, NoWeight, CandidateWidth };
 
 pub const GpuPass = struct {
     gpa: std.mem.Allocator,
@@ -80,7 +80,7 @@ pub const GpuPass = struct {
         x.* = .{
             .gpa = gpa,
             .f = f,
-            .shape = .{ .block = cfg.dspark_block, .noise = cfg.dspark_noise_token, .window = cfg.window, .rank = rank, .hidden = cfg.hidden, .candidates = k },
+            .shape = .{ .block = cfg.dspark_block, .noise = cfg.dspark_noise_token, .window = cfg.window, .rank = rank, .hidden = cfg.hidden, .candidates = world * k },
             .k = k,
             .ingest_rows = ingest_rows,
             .markov = .{ .w1 = w1, .w2 = w2, .rank = rank, .conf = conf },
@@ -198,8 +198,15 @@ pub const GpuPass = struct {
         var scratch = std.heap.ArenaAllocator.init(x.gpa);
         defer scratch.deinit();
         try dspark.chain(scratch.allocator(), x.markov, x.cand, x.cval, c, a.anchor, a.params, if (x.conf != null) x.hid else null, out[0].drafts, out[0].conf);
-        if (out[0].cand) |cd| @memcpy(cd, x.cand[0..cd.len]);
-        if (out[0].base) |b| @memcpy(b, x.cval[0..b.len]);
+        // trees (lanes' siblings): the gathered candidates and base logits [block][world x k], Python's last_tree
+        if (out[0].cand) |cd| {
+            if (cd.len != x.cand.len) return error.CandidateWidth;
+            @memcpy(cd, x.cand);
+        }
+        if (out[0].base) |b| {
+            if (b.len != x.cval.len) return error.CandidateWidth;
+            @memcpy(b, x.cval);
+        }
     }
 
     fn followPropose(p: *anyopaque, anchor: u32, start: u64) anyerror!void {

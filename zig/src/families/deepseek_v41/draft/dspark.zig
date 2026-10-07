@@ -15,7 +15,7 @@ pub const Shape = struct {
     window: u32 = 128, // sliding_window: context rows a draft row sees
     rank: u32 = 256, // dspark_markov_rank
     hidden: u32 = 4096,
-    candidates: u32 = 64, // a rank's best K a position (128 / world at most)
+    candidates: u32 = 64, // a position's candidates, gathered over the ranks (world x min(64, 128 / world))
 
     /// The context ring's rows: a power of two holding the window and the block.
     pub fn ring(s: Shape) u32 {

@@ -14,6 +14,8 @@ const Pack = @import("pack.zig").Pack;
 const plan = @import("plan.zig");
 const m3 = @import("m3.zig");
 const drive = @import("draft/drive.zig");
+const tree = @import("draft/tree.zig");
+const branches_oracle = @import("draft/branches_oracle.zig");
 const dspark_emit = @import("dspark_emit.zig");
 const dspark_gpu = @import("dspark_gpu.zig");
 
@@ -179,7 +181,9 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, ref: []con
     const want_tokens = meta.object.get("tokens").?.array.items;
     // M2B_LANES (M3's gates): the same decode through the lanes engine over the GPU target on rank 0, the other rank
     // following rank 0's forward operations over the plan link; tokens only (no digests). 1: drafts off; 2: the
-    // reference's tokens as drafts, corrupted on drive.Oracle's schedule (multi-row windows, partial keeps, rejects)
+    // reference's tokens as drafts, corrupted on drive.Oracle's schedule (multi-row windows, partial keeps, rejects);
+    // 4: draft trees with the tree oracle's siblings (draft/branches_oracle.zig: they lose, and win every 4th round);
+    // 3 with TF_DSV41_TREE: DSpark's own trees. Trees resolve as chains on the slot (draft/branches.zig)
     if (lanes_mode != 0) {
         const mode = lanes_mode;
         f.link = &session.plan;
@@ -191,6 +195,9 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, ref: []con
         for (want, want_tokens) |*d, v| d.* = @intCast(v.integer);
         var r: m3.Result = .{ .tokens = &.{}, .drafted = 0, .accepted = 0 };
         var equal: usize = 0;
+        const trees = try tree.Settings.fromEnv();
+        const tree_on = mode == 4 or (mode == 3 and trees.siblings > 0);
+        var tr: m3.TreeResult = .{ .r = .{ .tokens = &.{}, .drafted = 0, .accepted = 0, .trees = 0, .sib_wins = 0, .rounds = 0 }, .chains = .{} };
         if (rank == 0) {
             const pids = meta.object.get("prompt_ids").?.array.items;
             const prompt = try a.alloc(u32, pids.len);
@@ -198,8 +205,16 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, ref: []con
             var nd: drive.NoDraft = .{};
             var oracle: drive.Oracle = .{ .serial = want, .prompt_len = prompt.len, .vocab = cfg.vocab };
             const pass = if (gp) |g| g.pass() else if (mode == 2) oracle.pass() else nd.pass();
-            r = try m3.generate(gpa, &f, pass, mode >= 2, prompt, want[0], @intCast(want.len), cfg.dspark_block + 1);
-            r.off_anchor = oracle.off_anchor;
+            if (tree_on) {
+                var to = try branches_oracle.TreeOracle.init(gpa, want, prompt.len, cfg.vocab);
+                defer to.deinit(gpa);
+                const set = if (mode == 4 and trees.siblings == 0) tree.Settings{ .siblings = 2 } else trees;
+                tr = try m3.generateTrees(gpa, &f, if (gp) |g| g.pass() else to.pass(), prompt, want[0], @intCast(want.len), cfg.dspark_block + 1, set);
+                r = .{ .tokens = tr.r.tokens, .drafted = tr.r.drafted, .accepted = tr.r.accepted, .off_anchor = to.off_anchor };
+            } else {
+                r = try m3.generate(gpa, &f, pass, mode >= 2, prompt, want[0], @intCast(want.len), cfg.dspark_block + 1);
+                r.off_anchor = oracle.off_anchor;
+            }
             try f.stop();
             for (r.tokens, want[0..@min(r.tokens.len, want.len)]) |g, wt| {
                 if (g != wt) break;
@@ -213,11 +228,13 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, ref: []con
         const kept_some = switch (mode) {
             2 => r.accepted > 0 and r.accepted < r.drafted,
             3 => r.drafted > 0,
+            // the tree oracle: siblings verified, some won, the serial anchors throughout
+            4 => r.accepted > 0 and tr.r.trees > 0 and tr.r.sib_wins > 0 and tr.r.sib_wins < tr.r.trees and r.off_anchor == 0,
             else => true,
         };
         const ok = rank != 0 or (r.tokens.len == want.len and equal == want.len and kept_some);
-        try cwd.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}/m3-rank{d}.json", .{ out_dir, rank }), .data = try std.fmt.allocPrint(a, "{{\"rank\": {d}, \"mode\": {d}, \"tokens\": {d}, \"want\": {d}, \"equal_prefix\": {d}, \"drafted\": {d}, \"accepted\": {d}, \"off_anchor\": {d}, \"s\": {d:.1}, \"pass\": {}}}\n", .{ rank, mode, r.tokens.len, want.len, equal, r.drafted, r.accepted, r.off_anchor, lanes_s, ok }) });
-        std.debug.print("{s} M3 lanes mode {d} rank {d}: tokens {d}/{d} equal, drafted {d}, accepted {d}, {d:.1} s\n", .{ if (ok) "PASS" else "FAIL", mode, rank, equal, want.len, r.drafted, r.accepted, lanes_s });
+        try cwd.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}/m3-rank{d}.json", .{ out_dir, rank }), .data = try std.fmt.allocPrint(a, "{{\"rank\": {d}, \"mode\": {d}, \"tokens\": {d}, \"want\": {d}, \"equal_prefix\": {d}, \"drafted\": {d}, \"accepted\": {d}, \"off_anchor\": {d}, \"trees\": {d}, \"sib_wins\": {d}, \"rounds\": {d}, \"chains\": {d}, \"rerun_rows\": {d}, \"s\": {d:.1}, \"pass\": {}}}\n", .{ rank, mode, r.tokens.len, want.len, equal, r.drafted, r.accepted, r.off_anchor, tr.r.trees, tr.r.sib_wins, tr.r.rounds, tr.chains.chains, tr.chains.rerun_rows, lanes_s, ok }) });
+        std.debug.print("{s} M3 lanes mode {d} rank {d}: tokens {d}/{d} equal, drafted {d}, accepted {d}, trees {d}, sibling wins {d}, rounds {d}, {d:.1} s\n", .{ if (ok) "PASS" else "FAIL", mode, rank, equal, want.len, r.drafted, r.accepted, tr.r.trees, tr.r.sib_wins, tr.r.rounds, lanes_s });
         return if (ok) 0 else 1;
     }
     // greedy decoding against the reference's tokens
