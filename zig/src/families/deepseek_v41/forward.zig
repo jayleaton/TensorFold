@@ -1,5 +1,6 @@
 //! M2's forward: a slot's decode windows over the whole model, block.zig's program (launches + glue) run by run.zig
-//! on this rank, the exchanges over the TP Collective. One slot, contiguous state (the prod path's: no page tables);
+//! on this rank, the exchanges over the TP Collective. One slot: contiguous state (the gates' reference), or the paged
+//! KV pool with split KV and sessions (M5, `kv`: kv_state.zig);
 //! the window's calls are emitted once a row bucket and reused (the same launches every window of that size: graphs
 //! capture them in R4). Glue steps whose kernel is not in dsv41_kernels yet fail with GlueNotBuilt (named), so a run
 //! says exactly what is missing.
@@ -15,6 +16,7 @@ const Config = @import("config.zig").Config;
 const eh = @import("engram_host.zig");
 const graphs = @import("graphs.zig");
 const pf = @import("forward_prefill.zig");
+const kvs = @import("kv_state.zig");
 
 pub const Error = error{ GlueNotBuilt, BadWindow };
 
@@ -72,6 +74,10 @@ pub const Forward = struct {
     last_rows: u32 = 0,
     /// rank 0 inside a prefill: its windows and keeps are the followers' own (they got the whole prompt), not sent
     quiet: bool = false,
+    /// M5: the KV families in the paged pool (null: the slot's contiguous buffers); opts.pool is its emitter view
+    kv: ?*kvs.Kv = null,
+    /// M5: the session store (sessions_gpu.zig): the ids each keep commits, and the operations a follower runs
+    sess: ?Sess = null,
 
     pub fn init(gpa: std.mem.Allocator, cfg: *const Config, widths: *const block.Widths, opts: block.Options, runner: *run.Runner, comm: tp.collective.Collective) Forward {
         return .{ .gpa = gpa, .cfg = cfg, .widths = widths, .opts = opts, .runner = runner, .comm = comm, .arena = std.heap.ArenaAllocator.init(gpa) };
@@ -162,6 +168,8 @@ pub const Forward = struct {
         }
         const ids = f.ids_own.items;
         if (ids.len == 0 or f.slot.pending != null) return error.BadWindow;
+        // the pool's pages for the window's positions, their table entries up before the launches (every rank alike)
+        if (f.kv) |kx| try kx.reserve(f.slot.pos + ids.len);
         if (f.leads()) {
             var msg: [2 + 128]i64 = undefined;
             if (ids.len > 128) return error.BadWindow;
@@ -256,6 +264,7 @@ pub const Forward = struct {
         }
         f.slot.pos = p.start + accepted + 1;
         f.slot.pending = null;
+        if (f.sess) |x| try x.commit(x.ptr, f.ids[0 .. accepted + 1]);
     }
 
     const op_window: i64 = 1;
@@ -265,6 +274,22 @@ pub const Forward = struct {
     const op_ds_ingest: i64 = 5;
     const op_ds_propose: i64 = 6;
     const op_prefill: i64 = 7;
+    const op_sess_save: i64 = 8;
+    const op_sess_restore: i64 = 9;
+
+    /// The session store's side of the forward (sessions_gpu.zig): `commit` hears every committed id (keep, prefill
+    /// segments); `save` / `restore` are the leader's operations the followers run in its order.
+    pub const Sess = struct {
+        ptr: *anyopaque,
+        commit: *const fn (ptr: *anyopaque, ids: []const u32) anyerror!void,
+        save: *const fn (ptr: *anyopaque) anyerror!void,
+        restore: *const fn (ptr: *anyopaque, id: u32) anyerror!void,
+    };
+
+    /// Rank 0: a session operation to the followers (before running it).
+    pub fn sendSess(f: *Forward, op: enum { save, restore }, id: u32) !void {
+        if (f.leads()) try f.link.?.send(&.{ if (op == .save) op_sess_save else op_sess_restore, id });
+    }
 
     /// The drafter's operations a follower runs (dspark_gpu.zig): its collectives pair up with the leader's.
     pub const Drafter = struct {
@@ -333,6 +358,14 @@ pub const Forward = struct {
                 },
                 op_keep => try f.keep(@intCast(msg[1])),
                 op_stop => return,
+                op_sess_save => {
+                    const x = f.sess orelse return error.BadPlan;
+                    try x.save(x.ptr);
+                },
+                op_sess_restore => {
+                    const x = f.sess orelse return error.BadPlan;
+                    try x.restore(x.ptr, @intCast(msg[1]));
+                },
                 op_ds_ingest => {
                     const d = f.drafter orelse return error.BadPlan;
                     try d.ingest(d.ptr, @intCast(msg[1]), @intCast(msg[2]), @intCast(msg[3]), @intCast(msg[4]));
@@ -369,6 +402,7 @@ pub const Forward = struct {
     pub fn glueFn(ctx: *anyopaque, r: *run.Runner, c: *const calls.Call) anyerror!void {
         const f: *Forward = @ptrCast(@alignCast(ctx));
         const step = c.name["glue.".len..];
+        if (std.mem.startsWith(u8, step, "kx_")) return (f.kv orelse return error.GlueNotBuilt).glue(r, c, step);
         const s = r.stream.handle;
         const k = r.kernels.others(r.stream);
         const p = f.slot.pending.?;

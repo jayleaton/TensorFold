@@ -1,0 +1,281 @@
+//! M5: the forward's KV in the paged pool (pool.py / slots.py on the Zig engine). The comp and index-key families live in
+//! kv.DevicePool's tensors over a sessions.Pool book; the live slot reads and writes them through its page table, so its
+//! pages can be shared with session entries, parked to NVMe and restored without copies of the live rows.
+//!
+//! - The window's calls name the pool as roles (block.zig `Pool`): "s.kv.comp.L<i>", "s.kv.ik.L<i>", "s.kv.pt", "s.kv.ct".
+//!   `bind` points them at the device pool's own buffers (Runner.external), so the buffer plan never allocates them.
+//! - Pages: before a window or a prefill segment the slot maps every page its positions reach (`reserve`); the dirty
+//!   table range goes up on the compute stream before the launches. Both ranks make the same calls in the same order
+//!   (the leader's operations), so their books stay identical; only the bytes behind a split family's page differ.
+//! - Split KV (TF_DSV41_KV_SPLIT=1, TP > 1): the comp rows of logical page k live on rank k % W (the residue
+//!   allocator); writes go through the split table (an owned page's local page, else the discard page); after each index
+//!   layer's selection the glue trades the selected rows (kv/split.zig): `kx_dense` (graph-shaped, decode windows and
+//!   short segments) or `kx_union` (a prefill segment's sorted unique rows, one host sync). The attention reads them
+//!   unpaged at the remapped tokens: split == replicated, bit for bit.
+//! - TF_DSV41_KV_SPLIT_COMPACT (kv/split.zig's compact mode): the dense exchange packs each owner's rows and moves only
+//!   those where the transport takes device lengths.
+//!
+//! Not here yet: a prefill union past TF_DSV41_KV_SPLIT_UNION_MIB (Python runs the segment's attention in row blocks;
+//! this runtime refuses it with error.UnionSplit: never at the gates' 4,096 positions, possible at 1M), row mode (several
+//! live slots in one window).
+
+const std = @import("std");
+const cuda = @import("cuda");
+const tp = @import("tp");
+const kv = @import("kv");
+const calls = @import("calls.zig");
+const block = @import("block.zig");
+const buffers = @import("buffers.zig");
+const run = @import("run.zig");
+const Config = @import("config.zig").Config;
+
+const sessions = kv.sessions;
+
+pub const Error = error{ UnionSplit, PoolTooSmall, BadGlue, NoPool };
+
+pub const Options = struct {
+    /// TF_DSV41_POOL_TOKENS (whole pages of every residue)
+    tokens: u64,
+    /// TF_DSV41_KV_SPLIT (needs TP > 1)
+    split: bool = false,
+    /// the live slot's capacity in positions (Forward's limit)
+    capacity: u64,
+    /// TF_DSV41_KV_SPLIT_UNION_MIB, bytes
+    union_cap: u64 = 128 << 20,
+};
+
+/// TF_DSV41_POOL_TOKENS / TF_DSV41_KV_SPLIT / TF_DSV41_KV_SPLIT_UNION_MIB (null: no pool, the contiguous slot).
+pub fn optionsFromEnv(capacity: u64, world: u32) !?Options {
+    const t = std.c.getenv("TF_DSV41_POOL_TOKENS") orelse return null;
+    const tokens = try std.fmt.parseInt(u64, std.mem.span(t), 10);
+    const split = if (std.c.getenv("TF_DSV41_KV_SPLIT")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+    if (split and world < 2) return error.SplitNeedsTp;
+    const mib: u64 = if (std.c.getenv("TF_DSV41_KV_SPLIT_UNION_MIB")) |v| try std.fmt.parseInt(u64, std.mem.span(v), 10) else 128;
+    // pool.py settings: rounded up to whole pages of every residue
+    const unit: u64 = 256 * @as(u64, world);
+    return .{ .tokens = (tokens + unit - 1) / unit * unit, .split = split, .capacity = capacity, .union_cap = mib << 20 };
+}
+
+/// The measured boot check (memory.py serve_check, kv/budget.zig) before the pool is allocated: MemAvailable now - the pool
+/// (split counted) - the measured boot growth - the worst serving dip >= the hard floor (TF_DSV41_FLOOR_HARD_GIB). It runs
+/// where the GPU allocates from host memory (GB10; TF_DSV41_BOOT_MEASURED forces it); a refusal names the largest pool.
+pub fn bootCheck(ctx: *const cuda.Context, cfg: *const Config, o: Options, rank: u32, world: u32) !void {
+    const budget = kv.budget;
+    const mi = budget.meminfo() catch |e| {
+        std.log.warn("kv: no /proc/meminfo ({t}): the measured boot check is skipped", .{e});
+        return;
+    };
+    const dev = try ctx.memInfo();
+    const integrated = (ctx.attribute(.integrated) catch 0) != 0;
+    if (!budget.measuredApplies(budget.modeFromEnv(), integrated, dev.total, mi.total)) return;
+    var knobs: budget.Knobs = .{};
+    if (std.c.getenv("TF_DSV41_FLOOR_HARD_GIB")) |v| knobs.hard_gib = try std.fmt.parseFloat(f64, std.mem.span(v));
+    var layout = try kv.Layout.fromConfig(cfg, .{ .split = o.split and world > 1 });
+    const r = budget.serveCheck(knobs, .{ .rank = rank, .avail_gib = @as(f64, @floatFromInt(mi.available)) / budget.GiB, .terms = try budget.Serve.fromEnv(rank) }, layout.pool(), world, o.tokens);
+    var buf: [1024]u8 = undefined;
+    if (!r.ok) {
+        std.log.err("kv: {s}", .{r.message(&buf)});
+        return error.PoolDoesNotFit;
+    }
+    std.log.info("kv: {s}", .{r.message(&buf)});
+}
+
+pub const Kv = struct {
+    gpa: std.mem.Allocator,
+    layout: kv.Layout,
+    pool: sessions.Pool,
+    dev: kv.DevicePool,
+    slot: *sessions.Slot,
+    opts: Options,
+    world: u32,
+    rank: u32,
+    comm: tp.collective.Collective,
+    /// the forward's runner (kernels, stream) for the exchange's copies
+    runner: *run.Runner,
+    /// a union's device list of local rows to send (grows)
+    phys: ?cuda.DeviceBuffer = null,
+    /// the exchange (kv/split.zig: dense, or packed per TF_DSV41_KV_SPLIT_COMPACT) over the engine's kvsplit kernels,
+    /// and the packed exchange's int32 [W] owner lengths (persistent: graph-capturable)
+    x: kv.split.Exchange = undefined,
+    ops: Ops = undefined,
+    lens: ?cuda.DeviceBuffer = null,
+    stats: Stats = .{},
+
+    pub const Stats = struct { dense: u64 = 0, unions: u64 = 0, union_rows_max: u64 = 0, bytes: u64 = 0 };
+
+    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, ctx: *const cuda.Context, cfg: *const Config, o: Options, runner: *run.Runner, comm: tp.collective.Collective) !*Kv {
+        const world: u32 = @intCast(comm.world());
+        const k = try gpa.create(Kv);
+        errdefer gpa.destroy(k);
+        k.* = .{ .gpa = gpa, .layout = try kv.Layout.fromConfig(cfg, .{ .split = o.split and world > 1 }), .pool = undefined, .dev = undefined, .slot = undefined, .opts = o, .world = world, .rank = @intCast(comm.rank()), .comm = comm, .runner = runner };
+        k.pool = try sessions.Pool.init(gpa, k.layout.pool(), o.tokens, if (k.layout.opts.split) world else 1, if (k.layout.opts.split) k.rank else 0);
+        errdefer k.pool.deinit();
+        k.slot = try k.pool.newSlot(o.capacity);
+        k.dev = try kv.DevicePool.init(gpa, d, ctx, &k.pool, runner.stream, 1, k.slot.max_pages);
+        errdefer k.dev.deinit();
+        k.ops = .{ .r = runner };
+        if (k.layout.opts.split) {
+            k.lens = try cuda.DeviceBuffer.alloc(d, 4 * @as(usize, world));
+            // the compact mode's transport agreement happens here, once, outside any graph
+            k.x = try kv.split.Exchange.init(comm, k.ops.kernels(), try kv.split.compactMode());
+        }
+        return k;
+    }
+
+    pub fn deinit(k: *Kv) void {
+        if (k.phys) |*b| b.free();
+        if (k.lens) |*b| b.free();
+        k.dev.deinit();
+        k.pool.deinit();
+        k.gpa.destroy(k);
+    }
+
+    /// The emitter's view of the pool (block.Options.pool).
+    pub fn options(k: *Kv) block.Pool {
+        const fams = k.layout.families();
+        return .{
+            .comp_pages = k.pool.familyTensorPages(fams[0]),
+            .ik_pages = k.pool.familyTensorPages(fams[1]),
+            .pts = k.slot.max_pages,
+            .split = k.layout.opts.split,
+            .union_cap = @intCast(k.opts.union_cap),
+        };
+    }
+
+    /// Points the window's pool roles at the device pool's buffers (before Runner.bind), checking each covers what
+    /// the buffer plan's calls reach.
+    pub fn bind(k: *Kv, r: *run.Runner, plan: *const buffers.Plan) !void {
+        var nb: [64]u8 = undefined;
+        for (k.layout.sources[0..k.layout.nsources]) |L| {
+            const c = k.layout.compOf(L).?;
+            try k.external(r, plan, try std.fmt.bufPrint(&nb, "s.kv.comp.L{d}", .{L}), k.dev.tensors[c]);
+            try k.external(r, plan, try std.fmt.bufPrint(&nb, "s.kv.ik.L{d}", .{L}), k.dev.tensors[c + 1]);
+        }
+        try k.external(r, plan, "s.kv.pt", k.dev.table);
+        try k.external(r, plan, "s.kv.ct", k.dev.local);
+    }
+
+    fn external(_: *Kv, r: *run.Runner, plan: *const buffers.Plan, role: []const u8, b: cuda.DeviceBuffer) !void {
+        if (plan.sizes.get(role)) |need| if (need > b.len) return error.PoolTooSmall;
+        try r.external(role, b.ptr);
+    }
+
+    /// Maps every page holding positions < end and uploads the changed table entries (before a window's launches).
+    pub fn reserve(k: *Kv, end: u64) !void {
+        try k.slot.ensure(end);
+        try k.dev.syncTables();
+    }
+
+    /// Keeps the pages holding positions < keep (a rollback, or a release at 0).
+    pub fn truncate(k: *Kv, keep: u64) !void {
+        _ = try k.slot.truncate(keep);
+        try k.dev.syncTables();
+    }
+
+    /// The slot's pages back to the pool (a session entry may still hold them).
+    pub fn release(k: *Kv) !void {
+        _ = try k.slot.releaseAll();
+        try k.dev.syncTables();
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+    // split KV's exchange (block.zig Emitter.exchange: sel, comp family, split table, send, recv, tokens, psh)
+
+    pub fn glue(k: *Kv, r: *run.Runner, c: *const calls.Call, step: []const u8) !void {
+        if (std.mem.eql(u8, step, "kx_dense")) return k.dense(r, c);
+        if (std.mem.eql(u8, step, "kx_union")) return k.unionOf(r, c);
+        return error.BadGlue;
+    }
+
+    fn args(r: *run.Runner, c: *const calls.Call) !struct { sel: calls.Tensor, comp: u64, table: u64, send: u64, recv: u64, tok: u64, psh: u32 } {
+        const x = c.args;
+        if (x.len != 7) return error.BadGlue;
+        return .{
+            .sel = x[0].arg.t,
+            .comp = try r.tensorAddr(x[1].arg.t),
+            .table = try r.tensorAddr(x[2].arg.t),
+            .send = try r.tensorAddr(x[3].arg.t),
+            .recv = try r.tensorAddr(x[4].arg.t),
+            .tok = try r.tensorAddr(x[5].arg.t),
+            .psh = @intCast(x[6].arg.i),
+        };
+    }
+
+    /// Every rank sends the selected rows it owns for every entry (a discard row elsewhere), one all-gather; entry
+    /// (r, j) becomes token owner x R x K + r x K + j.
+    fn dense(k: *Kv, r: *run.Runner, c: *const calls.Call) !void {
+        const a = try args(r, c);
+        const rows: u32 = @intCast(a.sel.shape[0]);
+        const kk: u32 = @intCast(a.sel.shape[1]);
+        const da: kv.split.DenseArgs = .{
+            .sel = try r.tensorAddr(a.sel), .rows = rows, .k = kk, .table = a.table, .pts = 0, .rslot = 0, .psh = a.psh,
+            .base = a.comp, .row_bytes = block.Pool.row_bytes, .world = k.world, .send = a.send, .tok = a.tok,
+        };
+        const bytes = @as(usize, rows) * kk * block.Pool.row_bytes;
+        // packed where the compact mode and the transport take it (the same answer on every rank), else dense
+        try k.x.window(kv.split.PackArgs.of(da, k.rank, k.lens.?.ptr), a.recv, r.stream.handle);
+        k.stats.dense += 1;
+        k.stats.bytes += bytes * k.world;
+    }
+
+    /// A prefill segment's union: the sorted unique selected rows, each owner's list padded to the longest (one host
+    /// sync: both ranks size the exchange alike), token owner x M + the row's index in its owner's list.
+    fn unionOf(k: *Kv, r: *run.Runner, c: *const calls.Call) !void {
+        const a = try args(r, c);
+        const n: usize = @intCast(a.sel.shape[0]);
+        const kk: u32 = @intCast(a.sel.shape[1]);
+        const sel = try k.gpa.alloc(i32, n * kk);
+        defer k.gpa.free(sel);
+        try r.stream.synchronize();
+        try cuda.DeviceBuffer.download(.{ .d = r.d, .ptr = try r.tensorAddr(a.sel), .len = sel.len * 4 }, 0, std.mem.sliceAsBytes(sel));
+        const table = try k.gpa.alloc(u32, k.slot.max_pages);
+        defer k.gpa.free(table);
+        for (table, 0..) |*t, i| t.* = k.slot.localTableAt(@intCast(i));
+        var blocks: std.ArrayList(kv.split.Block) = .empty;
+        defer {
+            for (blocks.items) |*b| b.deinit(k.gpa);
+            blocks.deinit(k.gpa);
+        }
+        try kv.split.planUnion(k.gpa, .{ .sel = sel, .k = kk, .table = table, .psh = a.psh, .world = k.world, .rank = k.rank, .row_bytes = block.Pool.row_bytes, .cap = k.opts.union_cap }, &blocks);
+        if (blocks.items.len != 1) return error.UnionSplit;
+        const b = blocks.items[0];
+        if (k.phys == null or k.phys.?.len < 4 * b.phys.len) {
+            if (k.phys) |*p| p.free();
+            k.phys = try cuda.DeviceBuffer.alloc(r.d, @max(4 * b.phys.len, 256));
+        }
+        try cuda.DeviceBuffer.upload(k.phys.?, 0, std.mem.sliceAsBytes(b.phys));
+        try cuda.DeviceBuffer.upload(.{ .d = r.d, .ptr = a.tok, .len = 4 * b.tokens.len }, 0, std.mem.sliceAsBytes(b.tokens));
+        try k.x.unionBlock(a.comp, block.Pool.row_bytes, k.phys.?.ptr, b.m, a.send, a.recv, r.stream.handle);
+        k.stats.unions += 1;
+        k.stats.union_rows_max = @max(k.stats.union_rows_max, @as(u64, b.m) * k.world);
+        k.stats.bytes += @as(u64, b.m) * block.Pool.row_bytes * k.world;
+    }
+};
+
+/// kv/split.zig's device kernels over the engine's kvsplit ops (kernels_ops: the same argument layouts).
+const Ops = struct {
+    r: *run.Runner,
+
+    fn kernels(o: *Ops) kv.split.Kernels {
+        return .{ .ptr = o, .vtable = &.{ .dense = dense, .gather = gather, .pack = pack } };
+    }
+
+    fn self(ptr: *anyopaque) *Ops {
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    fn dense(ptr: *anyopaque, a: kv.split.DenseArgs, _: tp.collective.Stream) anyerror!void {
+        const r = self(ptr).r;
+        try r.kernels.others(r.stream).kvDense(.{ .sel = a.sel, .rows = a.rows, .k = a.k, .table = a.table, .pts = a.pts, .rslot = a.rslot, .psh = a.psh, .base = a.base, .row_bytes = a.row_bytes, .world = a.world, .send = a.send, .tok = a.tok });
+    }
+
+    fn gather(ptr: *anyopaque, base: u64, row_bytes: u32, phys: u64, n: u32, send: u64, _: tp.collective.Stream) anyerror!void {
+        const r = self(ptr).r;
+        try r.kernels.others(r.stream).kvGather(base, row_bytes, phys, n, send);
+    }
+
+    fn pack(ptr: *anyopaque, a: kv.split.PackArgs, _: tp.collective.Stream) anyerror!void {
+        const r = self(ptr).r;
+        try r.kernels.others(r.stream).kvPack(.{ .sel = a.sel, .rows = a.rows, .k = a.k, .table = a.table, .pts = a.pts, .rslot = a.rslot, .psh = a.psh, .rank = a.rank, .base = a.base, .row_bytes = a.row_bytes, .world = a.world, .send = a.send, .tok = a.tok, .lens = a.lens });
+    }
+};

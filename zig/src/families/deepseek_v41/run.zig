@@ -41,10 +41,18 @@ pub const Runner = struct {
         r.addrs.deinit(r.gpa);
     }
 
-    /// Allocates every role of `plan`: persistent roles one buffer each, the rest one zeroed arena.
+    /// A persistent role whose memory another owner holds (M5: the KV pool's family tensors and tables): bind leaves it.
+    pub fn external(r: *Runner, role: []const u8, addr: u64) !void {
+        const g = try r.addrs.getOrPut(r.gpa, role);
+        if (!g.found_existing) g.key_ptr.* = try r.gpa.dupe(u8, role);
+        g.value_ptr.* = addr;
+    }
+
+    /// Allocates every role of `plan`: persistent roles one buffer each (but the external ones), the rest one zeroed arena.
     pub fn bind(r: *Runner, plan: *const buffers.Plan) !void {
         var arena_bytes: u64 = 0;
         for (plan.sizes.keys(), plan.sizes.values()) |k, v| {
+            if (buffers.scopeOf(k) == .persistent and r.addrs.contains(k)) continue;
             if (buffers.scopeOf(k) == .persistent) {
                 const b = try cuda.DeviceBuffer.alloc(r.d, v);
                 try b.fill8(0, null);

@@ -437,6 +437,8 @@ pub const Functions = struct {
     add: cuda.Function,
     add_bf16: cuda.Function,
     kv_dense: cuda.Function,
+    /// kvsplit's compact pack (TF_DSV41_KV_SPLIT_COMPACT); null in a fatbin built before it
+    kv_pack: ?cuda.Function = null,
     kv_gather: cuda.Function,
     glue: [10]cuda.Function, // glue.syms order
     pfglue: [pfglue.syms.len]cuda.Function, // pfglue.syms order
@@ -487,6 +489,7 @@ pub const Functions = struct {
         f.add_bf16 = try m_pw.function("_ZN15dsv41_pointwise15add_bf16_kernelEPKfS1_P13__nv_bfloat16x");
         f.kv_dense = try m_kv.function("_ZN13dsv41_kvsplit12dense_kernelENS_9DenseArgsE");
         f.kv_gather = try m_kv.function("_ZN13dsv41_kvsplit13gather_kernelEPKhjPKjjPh");
+        f.kv_pack = m_kv.function("_ZN13dsv41_kvsplit11pack_kernelENS_8PackArgsE") catch null;
         inline for (glue.syms, 0..) |name, i| f.glue[i] = try m_glue.function(name);
         inline for (pfglue.syms, 0..) |name, i| f.pfglue[i] = try m_pfglue.function(name);
         return f;
@@ -510,8 +513,27 @@ pub const kvsplit = struct {
         tok: u64,
     };
 
+    /// kv/split.zig's PackArgs (DenseArgs' fields at the same offsets, rank in psh's padding, lens after tok).
+    pub const PackArgs = extern struct {
+        sel: u64,
+        rows: u32,
+        k: u32,
+        table: u64,
+        pts: u32,
+        rslot: u64,
+        psh: u32,
+        rank: u32,
+        base: u64,
+        row_bytes: u32,
+        world: u32,
+        send: u64,
+        tok: u64,
+        lens: u64,
+    };
+
     comptime {
         std.debug.assert(@sizeOf(DenseArgs) == 80 and @offsetOf(DenseArgs, "rslot") == 32 and @offsetOf(DenseArgs, "send") == 64);
+        std.debug.assert(@sizeOf(PackArgs) == 88 and @offsetOf(PackArgs, "rank") == 44 and @offsetOf(PackArgs, "lens") == 80);
     }
 
     fn grid(words: u64) usize {
@@ -761,6 +783,18 @@ pub const Ops = struct {
         var args: cuda.Args = .{};
         args.add(a);
         try o.go(o.f.kv_dense, .{ kvsplit.grid(words), 1, 1 }, 256, 0, null, &args);
+    }
+
+    /// kvsplit pack (compact): this rank's owned rows of the selection first in send, tokens owner x R x K + place,
+    /// lens[W] each owner's bytes; one launch, block 256, grid ceil(R x K / 256).
+    pub fn kvPack(o: Ops, a: kvsplit.PackArgs) !void {
+        const f = o.f.kv_pack orelse return error.Unsupported;
+        if (a.row_bytes == 0 or a.row_bytes % 8 != 0 or a.k == 0 or a.world == 0 or a.world > 8 or a.psh > 30) return error.Shape;
+        const n = @as(u64, a.rows) * a.k;
+        if (n == 0) return;
+        var args: cuda.Args = .{};
+        args.add(a);
+        try o.go(f, .{ @intCast((n + 255) / 256), 1, 1 }, 256, 0, null, &args);
     }
 
     /// kvsplit gather: send[i] = base row phys[i] (uint32 [n]).

@@ -9,6 +9,8 @@
 //! - `aot/`: the Triton kernels by variant (any M1 capture's or M2b reference's AOT set on that GPU, merged with a
 //!   set P capture's for DSpark: tools/zig/dsv41_aot_merge.py).
 //! The kernel knobs: TF_DSV41_EXPERT_TOPP (prod 0.85; unset: off), TF_DSV41_R1=1 (prod-perf1's decode path).
+//! M5 (kv_state.zig): TF_DSV41_POOL_TOKENS puts the KV families in the paged pool (its measured boot check first),
+//! TF_DSV41_KV_SPLIT=1 shards the comp rows over the ranks; every rank must set the same.
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -28,6 +30,8 @@ const m2a = @import("m2a.zig");
 const target_mod = @import("target.zig");
 const dspark_emit = @import("dspark_emit.zig");
 const dspark_gpu = @import("dspark_gpu.zig");
+const kvs = @import("kv_state.zig");
+const sg = @import("sessions_gpu.zig");
 
 pub const Options = struct {
     drafts: bool = true,
@@ -35,6 +39,8 @@ pub const Options = struct {
     prefill_rows: u32 = 16,
     /// the prompt through the forward's own prefill (2,048-row segments) instead: TF_DSV41_OWN_PREFILL (default on)
     own_prefill: bool = true,
+    /// the backbone layers to load and run (null: all; a gate runs a reference's prefix, e.g. 0-24)
+    layers: ?[]const u32 = null,
 };
 
 /// TF_DSV41_OWN_PREFILL=0: prompts as 16-row decode windows (every rank must agree: the plans differ)
@@ -64,6 +70,8 @@ pub const Model = struct {
     lbuf: [eh.max_layers]u32 = undefined,
     gt: target_mod.GpuTarget,
     pass: ?*dspark_gpu.GpuPass = null,
+    /// M5: the session store over the paged pool (with TF_DSV41_POOL_TOKENS)
+    sessions: ?*sg.Sessions = null,
 
     pub fn rank(m: *const Model) u32 {
         return m.tcfg.rank;
@@ -93,8 +101,11 @@ pub const Model = struct {
         const world: u32 = @intCast(comm.world());
         m.cfg = try Config.read(gpa, io, pack_dir);
         m.pack = try Pack.open(gpa, io, pack_dir);
-        const backbone = try a.alloc(u32, m.cfg.layers);
-        for (backbone, 0..) |*l, i| l.* = @intCast(i);
+        const backbone = if (o.layers) |ls| try a.dupe(u32, ls) else blk: {
+            const all = try a.alloc(u32, m.cfg.layers);
+            for (all, 0..) |*l, i| l.* = @intCast(i);
+            break :blk all;
+        };
         var ds: [8]u32 = undefined;
         const blocks = if (o.drafts) try std.mem.concat(a, u32, &.{ backbone, dspark_emit.blocks(&m.cfg, &ds) }) else backbone;
         m.pl = try plan.build(gpa, &m.cfg, &m.pack, .{ .rank = m.tcfg.rank, .world = world, .blocks = blocks, .top = true, .dspark = o.drafts });
@@ -119,6 +130,11 @@ pub const Model = struct {
         const r1 = if (std.c.getenv("TF_DSV41_R1")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
         m.f = fwd.Forward.init(gpa, &m.cfg, &m.widths, .{ .world = world, .expert_topp = topp, .r1 = r1, .taps = o.drafts }, &m.runner, comm);
         m.f.layers = backbone;
+        if (try kvs.optionsFromEnv(@intCast(m.f.opts.limit), world)) |ko| {
+            try kvs.bootCheck(&m.ctx, &m.cfg, ko, m.tcfg.rank, world);
+            m.f.kv = try kvs.Kv.init(gpa, &m.driver, &m.ctx, &m.cfg, ko, &m.runner, comm);
+            m.f.opts.pool = m.f.kv.?.options();
+        }
         // the buffer plan: every window up to the prefill rows (a verify window is at most a block + 1), and DSpark's
         var buckets: [64]u32 = undefined;
         const nb = @max(o.prefill_rows, m.cfg.dspark_block + 1);
@@ -126,6 +142,7 @@ pub const Model = struct {
         var bp = try m.f.plan(buckets[0..nb]);
         if (o.drafts) try dspark_gpu.GpuPass.plan(m.f.arena.allocator(), &m.f, &bp, nb);
         if (o.own_prefill) try m.f.planPrefill(&bp, @intCast(m.f.opts.prefill_rows));
+        if (m.f.kv) |k| try k.bind(&m.runner, &bp);
         try m.runner.bind(&bp);
         const src: forms.Source = .{ .d = &m.driver, .weights = &m.weights, .plan = &m.pl };
         for (bp.sizes.keys()) |role| {
@@ -143,7 +160,8 @@ pub const Model = struct {
         m.host = try eh.Host.load(ehb, m.cfg.engram_heads, m.cfg.engram_pad, m.cfg.engram_vocab, &m.lbuf);
         m.f.engram = &m.host;
         if (world > 1) m.f.link = &m.session.plan;
-        m.gt = .{ .f = &m.f, .prefill_rows = o.prefill_rows, .max_rows = nb, .own_prefill = o.own_prefill };
+        if (m.f.kv != null) m.sessions = try sg.Sessions.init(gpa, io, &m.f, &bp, try sg.optionsFromEnv());
+        m.gt = .{ .f = &m.f, .prefill_rows = o.prefill_rows, .max_rows = nb, .own_prefill = o.own_prefill, .sessions = m.sessions };
         if (o.drafts) m.pass = try dspark_gpu.GpuPass.init(gpa, &m.f, nb);
         try m.driver.check(m.driver.api.cuCtxSynchronize(), "cuCtxSynchronize");
         try comm.barrier();
@@ -153,6 +171,8 @@ pub const Model = struct {
     pub fn close(m: *Model) void {
         const gpa = m.gpa;
         if (m.pass) |p| p.deinit();
+        if (m.sessions) |x| x.deinit();
+        if (m.f.kv) |k| k.deinit();
         m.f.deinit();
         m.runner.deinit();
         m.aot.deinit();

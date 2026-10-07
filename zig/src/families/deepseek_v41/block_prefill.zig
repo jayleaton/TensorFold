@@ -335,28 +335,28 @@ const Seg = struct {
         return .{ try e.buf("s.L{d}.swa.v", .{L}, .u8, &.{ r, 576 }), try e.buf("s.L{d}.swa.s", .{L}, .u8, &.{ r, 8 }) };
     }
 
-    /// A KV source's compressed pool (values, scales).
+    /// A KV source's compressed rows (values, scales): the slot's contiguous ones, or the pool's (block.zig).
     fn pool(e: *E, L: u32) ![2]Arg {
-        const rows = @divFloor(e.o.limit, e.cfg.compressRatio(L)) + 1;
-        return .{ try e.buf("s.L{d}.comp.v", .{L}, .u8, &.{ rows, 576 }), try e.buf("s.L{d}.comp.s", .{L}, .u8, &.{ rows, 8 }) };
+        return e.pool(L, e.cfg.compressRatio(L));
     }
 
     fn indexKeys(e: *E, L: u32) !Arg {
-        const r: i64 = e.cfg.compressRatio(L);
-        return e.buf("s.L{d}.ik", .{L}, .u8, &.{ @divFloor(e.o.limit, r) + 1, @as(i64, e.cfg.index_dim) + 4 });
+        return e.indexKeys(L);
     }
 
-    /// compress.kv_store: rows into the SWA ring (ratio 0) or a compressed pool.
+    /// compress.kv_store: rows into the SWA ring (ratio 0) or a compressed family (pool mode: through the slot's
+    /// table, the split table under split KV).
     fn kvStore(s: *Seg, lat: Arg, rows: [2]Arg, ratio: i64) !void {
         const e = s.e;
+        const pg = try e.paging(ratio, true);
         try e.triton("_kv_store", .{ e.n, 1, 1 }, &.{
             .{ .name = "LAT", .arg = lat },                          .{ .name = "l_stride", .arg = .{ .i = e.cfg.head_dim } },
             .{ .name = "CS", .arg = try e.ropeTable() },             .{ .name = "cs_stride", .arg = .{ .i = 64 } },
             .{ .name = "V", .arg = rows[0] },                        .{ .name = "S", .arg = rows[1] },
-            .{ .name = "v_stride", .arg = .{ .i = 576 } },           .{ .name = "s_stride", .arg = .{ .i = 8 } },
+            .{ .name = "v_stride", .arg = .{ .i = pg.vs } },         .{ .name = "s_stride", .arg = .{ .i = pg.ss } },
             .{ .name = "POS", .arg = try pos(e) },                   .{ .name = "RATIO", .arg = .{ .i = ratio } },
-            .{ .name = "RING", .arg = .{ .i = if (ratio == 0) s.ring else 1 } }, .{ .name = "PT", .arg = .none },
-            .{ .name = "PSH", .arg = .{ .i = 0 } },                  .{ .name = "SL", .arg = .none },
+            .{ .name = "RING", .arg = .{ .i = if (ratio == 0) s.ring else 1 } }, .{ .name = "PT", .arg = pg.pt },
+            .{ .name = "PSH", .arg = .{ .i = pg.psh } },             .{ .name = "SL", .arg = .none },
             .{ .name = "PTS", .arg = .{ .i = 0 } },                  .{ .name = "ROWS", .arg = .{ .b = false } },
             .{ .name = "PDL", .arg = .{ .b = false } },
         });
@@ -387,13 +387,14 @@ const Seg = struct {
         try s.kvStore(lat, try pool(e, L), ratio);
         const kp = try e.buf("L.ix_k", .{}, .bf16, &.{ n, ID });
         try s.proj(try e.fmt("L{d}.attn.ix_wk", .{L}), .strips, lat, hd, ID, kp);
+        const kpg = try e.paging(ratio, false);
         try e.triton("_index_k", .{ n, 1, 1 }, &.{
             .{ .name = "KP", .arg = kp },                                                    .{ .name = "k_stride", .arg = .{ .i = ID } },
             .{ .name = "W", .arg = try e.weight("L{d}.attn.ix_knorm", .{L}, .f32, &.{ID}) }, .{ .name = "CS", .arg = try e.ropeTable() },
             .{ .name = "cs_stride", .arg = .{ .i = 64 } },                                   .{ .name = "IK", .arg = try indexKeys(e, L) },
             .{ .name = "POS", .arg = try pos(e) },                                           .{ .name = "EPS", .arg = .{ .f = E.dec(e.cfg.eps) } },
-            .{ .name = "RATIO", .arg = .{ .i = ratio } },                                    .{ .name = "PT", .arg = .none },
-            .{ .name = "PSH", .arg = .{ .i = 0 } },                                          .{ .name = "KFP8", .arg = .{ .b = true } },
+            .{ .name = "RATIO", .arg = .{ .i = ratio } },                                    .{ .name = "PT", .arg = kpg.pt },
+            .{ .name = "PSH", .arg = .{ .i = kpg.psh } },                                    .{ .name = "KFP8", .arg = .{ .b = true } },
             .{ .name = "SL", .arg = .none },                                                 .{ .name = "PTS", .arg = .{ .i = 0 } },
             .{ .name = "ROWS", .arg = .{ .b = false } },                                     .{ .name = "PDL", .arg = .{ .b = false } },
         });
@@ -416,6 +417,7 @@ const Seg = struct {
         const IH: i64 = e.cfg.index_heads;
         const ID: i64 = e.cfg.index_dim;
         const out = try e.buf("L.ix.scores", .{}, .f32, &.{ rows, nk });
+        const spg = try e.paging(ratio, false);
         try e.triton("_scores", .{ rows, cdiv(nk, 64), 1 }, &.{
             .{ .name = "QI", .arg = try e.view(.{ .buf = "L.qi" }, .bf16, &.{ rows, IH, ID }, &.{ IH * ID, ID, 1 }, a * IH * ID * 2) },
             .{ .name = "W", .arg = try e.view(.{ .buf = "L.ix_w" }, .f32, &.{ rows, IH }, &.{ IH, 1 }, a * IH * 4) },
@@ -427,8 +429,8 @@ const Seg = struct {
             .{ .name = "D", .arg = .{ .i = ID } },                      .{ .name = "BP", .arg = .{ .i = 64 } },
             .{ .name = "WS", .arg = .{ .f = 1.0 / @sqrt(@as(f64, @floatFromInt(IH))) } },
             .{ .name = "SCALE", .arg = .{ .f = 1.0 / @sqrt(@as(f64, @floatFromInt(ID))) } },
-            .{ .name = "GATHER", .arg = .{ .b = keys != null } },       .{ .name = "PT", .arg = .none },
-            .{ .name = "PSH", .arg = .{ .i = 0 } },                     .{ .name = "KFP8", .arg = .{ .b = true } },
+            .{ .name = "GATHER", .arg = .{ .b = keys != null } },       .{ .name = "PT", .arg = spg.pt },
+            .{ .name = "PSH", .arg = .{ .i = spg.psh } },               .{ .name = "KFP8", .arg = .{ .b = true } },
             .{ .name = "SL", .arg = .none },                            .{ .name = "PTS", .arg = .{ .i = 0 } },
             .{ .name = "ROWS", .arg = .{ .b = false } },                .{ .name = "CBS", .arg = .{ .i = cbs } },
         });
@@ -633,19 +635,30 @@ const Seg = struct {
         var tok = lo;
         var cnt = lo;
         var t_stride: i64 = 0;
+        var fpg: E.Paging = .{ .pt = .none, .psh = 0, .vs = 0, .ss = 0 };
         if (ratio > 0) {
-            const p = try pool(e, e.cfg.kvSource(L).?);
-            cv = p[0];
-            cs = p[1];
+            const src = e.cfg.kvSource(L).?;
             const sel = try selection(e, e.cfg.indexSource(L).?);
-            tok = sel[0];
             cnt = sel[1];
             t_stride = e.cfg.index_topk;
+            if (e.o.pool != null and e.o.pool.?.split) {
+                // split: an index layer's selection brings its rows over the exchange; its reuse layers read them too
+                const got = if (indexer) try e.exchange(src, e.cfg.compressRatio(src), sel[0]) else try e.received(src, e.cfg.compressRatio(src));
+                cv = got.cv;
+                cs = got.cs;
+                tok = got.tok;
+            } else {
+                const p = try pool(e, src);
+                cv = p[0];
+                cs = p[1];
+                tok = sel[0];
+                fpg = try e.paging(e.cfg.compressRatio(src), false);
+            }
         }
         try e.triton("_fused", .{ n, @divExact(H, bmq), 1 }, &.{
             .{ .name = "Q", .arg = try e.view(q.t.role, .bf16, &.{ n, H, hd }, &.{ H * hd, hd, 1 }, 0) },
             .{ .name = "CV", .arg = cv },                         .{ .name = "CSC", .arg = cs },
-            .{ .name = "cvs", .arg = .{ .i = 576 } },             .{ .name = "css", .arg = .{ .i = 8 } },
+            .{ .name = "cvs", .arg = .{ .i = cv.t.stride[0] } },  .{ .name = "css", .arg = .{ .i = cs.t.stride[0] } },
             .{ .name = "TOK", .arg = tok },                       .{ .name = "t_stride", .arg = .{ .i = t_stride } },
             .{ .name = "CNT", .arg = cnt },                       .{ .name = "SV", .arg = rows[0] },
             .{ .name = "SSC", .arg = rows[1] },                   .{ .name = "svs", .arg = .{ .i = 576 } },
@@ -657,7 +670,7 @@ const Seg = struct {
             // Python's D ** -0.5 (libm pow, correctly rounded): sqrt of the exact 1 / 512 rounds the same way
             .{ .name = "SCALE", .arg = .{ .f = @sqrt(1.0 / @as(f64, @floatFromInt(hd))) } }, .{ .name = "RING", .arg = .{ .i = s.ring } },
             .{ .name = "WINDOW", .arg = .{ .i = W } },            .{ .name = "COMP", .arg = .{ .b = ratio > 0 } },
-            .{ .name = "PT", .arg = .none },                      .{ .name = "PSH", .arg = .{ .i = 0 } },
+            .{ .name = "PT", .arg = fpg.pt },                     .{ .name = "PSH", .arg = .{ .i = fpg.psh } },
             .{ .name = "HG", .arg = .{ .i = hg } },               .{ .name = "OR", .arg = .{ .i = n } },
         });
         if (s.staged) try e.glue("stage_out", &.{ slot[0], slot[1], .{ .i = ring0 }, rows[0], rows[1], .{ .i = s.ring }, .{ .i = @max(0, e.end() - W) }, .{ .i = e.end() } });

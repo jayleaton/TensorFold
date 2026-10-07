@@ -30,6 +30,8 @@ const usage =
     \\usage: tf-dsv41-m1 replay|forward|both PACK CAPTURE OUT
     \\       tf-dsv41-m1 check CAPTURE   (host only: block.zig's calls against the capture's launches)
     \\       tf-dsv41-m1 plan            (host only: the whole model emitted from the q28-v2 listings, M2's buffer plan)
+    \\       tf-dsv41-m1 m5-emit CAPTURE (host only: the pool / split programs' invariants for every captured window)
+    \\       tf-dsv41-m1 m5 paged|split|compact|park PACK REF OUT (M5: a rank of TP=2 on the paged pool vs the pool reference)
     \\       tf-dsv41-m1 m2a PACK REF OUT (M2a: our forward vs tools/zig/dsv41_m2a_digests.py's run, one GPU)
     \\       tf-dsv41-m1 m2b PACK REF OUT (M2b: a rank of TP=2 over NCCL vs tools/zig/dsv41_m2b_ref.py; TF_TP_RANK ...)
     \\       tf-dsv41-m1 follow PACK ASSETS (a served model's rank > 0: rank 0's forward operations until it stops)
@@ -48,6 +50,12 @@ pub fn main(init: std.process.Init) !u8 {
     if (args.len == 5 and std.mem.eql(u8, args[1], "m2b")) {
         return @import("m2b.zig").main(init.gpa, init.io, args[2], args[3], args[4]) catch |e| {
             std.debug.print("FAIL tf-dsv41-m1 m2b: {t}\n", .{e});
+            return 1;
+        };
+    }
+    if (args.len == 6 and std.mem.eql(u8, args[1], "m5")) {
+        return @import("m5.zig").main(init.gpa, init.io, args[2], args[3], args[4], args[5]) catch |e| {
+            std.debug.print("FAIL tf-dsv41-m1 m5: {t}\n", .{e});
             return 1;
         };
     }
@@ -85,6 +93,16 @@ pub fn main(init: std.process.Init) !u8 {
             return 1;
         };
         out.interface.print("dcheck: {d} mismatches\n", .{bad}) catch {};
+        out.interface.flush() catch {};
+        return if (bad == 0) 0 else 1;
+    }
+    if (args.len == 3 and std.mem.eql(u8, args[1], "m5-emit")) {
+        var buf: [4096]u8 = undefined;
+        var out = std.Io.File.stdout().writer(init.io, &buf);
+        const bad = @import("m5_emit.zig").checkAll(init.gpa, init.io, args[2], @embedFile("fixtures/q28v2-expert-k2.txt"), &out.interface) catch |e| {
+            std.debug.print("FAIL tf-dsv41-m1 m5-emit: {t}\n", .{e});
+            return 1;
+        };
         out.interface.flush() catch {};
         return if (bad == 0) 0 else 1;
     }

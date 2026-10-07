@@ -66,6 +66,37 @@ pub const Options = struct {
     r1: bool = false,
     /// MHC_TAIL_SPIN (SM cycles a CTA waits for the last arrival)
     mhc_spin: i64 = 8000,
+    /// M5: the KV families in the paged pool (kv.DevicePool, Python's serving slots) instead of the slot's contiguous
+    /// buffers; null: contiguous (the gates' reference state)
+    pool: ?Pool = null,
+};
+
+/// The paged pool as a window's calls see it (pool.py, slots.py: one slot's 1-D table, PT / PSH a family).
+/// - "s.kv.comp.L<i>": kv source i's comp rows, uint8 [rows, 584] (576 values then 8 scale bytes); split: this rank's
+///   local pages, then the local null and discard pages;
+/// - "s.kv.ik.L<i>": its index keys, uint8 [rows, 132], whole on every rank;
+/// - "s.kv.pt": the slot's page table, int32 [pts]; "s.kv.ct": the split table (an owned logical page's local page,
+///   any other the discard page), which the comp rows are stored through.
+/// Split (TF_DSV41_KV_SPLIT): after each index layer's selection the selected rows come over an exchange (kv/split.zig:
+/// dense in decode windows and short segments, a union in prefill segments) into "w.kx.recv", and the attention reads
+/// them unpaged at the remapped tokens "w.kx.tok": the same row bytes in the same list order (split == replicated).
+pub const Pool = struct {
+    /// pages each family tensor holds (comp: split's local pages + null + discard)
+    comp_pages: i64,
+    ik_pages: i64,
+    /// pages a slot's table holds
+    pts: i64,
+    split: bool = false,
+    /// split's union cap (TF_DSV41_KV_SPLIT_UNION_MIB): the prefill receive buffer's bytes
+    union_cap: i64 = 128 << 20,
+    pub const page: i64 = 256;
+    pub const row_bytes: i64 = 584;
+    pub const ik_bytes: i64 = 132;
+
+    /// log2 of a family's rows a page
+    pub fn shift(ratio: i64) i64 {
+        return std.math.log2_int(u64, @intCast(@divExact(page, ratio)));
+    }
 };
 
 pub const Emitter = struct {
@@ -404,32 +435,98 @@ pub const Emitter = struct {
         return e.buf("w.pos", .{}, .i32, &.{1});
     }
 
-    /// The KV store (_kv_store): the SWA ring (ratio 0) or a compressed pool.
-    fn kvStore(e: *Emitter, lat: Arg, src: u32, ratio: i64) !void {
+    /// The KV store (_kv_store): the SWA ring (ratio 0) or a compressed family (contiguous, or the pool's rows through
+    /// the slot's table: the split table under split KV, so a rank keeps only the rows it owns).
+    pub fn kvStore(e: *Emitter, lat: Arg, src: u32, ratio: i64) !void {
         const rows = try e.pool(src, ratio);
+        const pg = try e.paging(ratio, true);
         try e.triton("_kv_store", .{ e.n, 1, 1 }, &.{
             .{ .name = "LAT", .arg = lat },                          .{ .name = "l_stride", .arg = .{ .i = e.cfg.head_dim } },
             .{ .name = "CS", .arg = try e.ropeTable() },             .{ .name = "cs_stride", .arg = .{ .i = 64 } },
             .{ .name = "V", .arg = rows[0] },                        .{ .name = "S", .arg = rows[1] },
-            .{ .name = "v_stride", .arg = .{ .i = 576 } },           .{ .name = "s_stride", .arg = .{ .i = 8 } },
+            .{ .name = "v_stride", .arg = .{ .i = pg.vs } },         .{ .name = "s_stride", .arg = .{ .i = pg.ss } },
             .{ .name = "POS", .arg = try e.pos() },                  .{ .name = "RATIO", .arg = .{ .i = ratio } },
-            .{ .name = "RING", .arg = .{ .i = if (ratio == 0) 2 * @as(i64, e.cfg.window) else 1 } }, .{ .name = "PT", .arg = .none },
-            .{ .name = "PSH", .arg = .{ .i = 0 } },                  .{ .name = "SL", .arg = .none },
+            .{ .name = "RING", .arg = .{ .i = if (ratio == 0) 2 * @as(i64, e.cfg.window) else 1 } }, .{ .name = "PT", .arg = pg.pt },
+            .{ .name = "PSH", .arg = .{ .i = pg.psh } },             .{ .name = "SL", .arg = .none },
             .{ .name = "PTS", .arg = .{ .i = 0 } },                  .{ .name = "ROWS", .arg = .{ .b = false } },
             .{ .name = "PDL", .arg = .{ .b = false } },
         });
     }
 
-    /// A layer's KV rows (fp8 latent + rope, 576 B) and scales (8 B): the SWA ring (ratio 0) or the compressed pool.
-    fn pool(e: *Emitter, L: u32, ratio: i64) ![2]Arg {
+    /// A family's paging: the slot's table and rows-a-page shift (pool mode), with the row strides (pool rows are 584 B
+    /// records); none for the SWA ring and the contiguous slot. `store`: the comp rows' writes (the split table).
+    pub const Paging = struct { pt: Arg, psh: i64, vs: i64, ss: i64 };
+
+    pub fn paging(e: *Emitter, ratio: i64, store: bool) !Paging {
+        const p = e.o.pool orelse return .{ .pt = .none, .psh = 0, .vs = 576, .ss = 8 };
+        if (ratio == 0) return .{ .pt = .none, .psh = 0, .vs = 576, .ss = 8 };
+        const tab: []const u8 = if (store and p.split) "s.kv.ct" else "s.kv.pt";
+        return .{ .pt = try e.buf("{s}", .{tab}, .i32, &.{p.pts}), .psh = Pool.shift(ratio), .vs = Pool.row_bytes, .ss = Pool.row_bytes };
+    }
+
+    /// A layer's KV rows (fp8 latent + rope, 576 B) and scales (8 B): the SWA ring (ratio 0), the slot's contiguous
+    /// compressed rows, or the pool's family tensor (584 B records, paged).
+    pub fn pool(e: *Emitter, L: u32, ratio: i64) ![2]Arg {
+        if (ratio > 0) if (e.o.pool) |p| {
+            const rows = p.comp_pages * @divExact(Pool.page, ratio);
+            const role: calls.Role = .{ .buf = try e.fmt("s.kv.comp.L{d}", .{L}) };
+            return .{ try e.view(role, .u8, &.{ rows, 576 }, &.{ Pool.row_bytes, 1 }, 0), try e.view(role, .u8, &.{ rows, 8 }, &.{ Pool.row_bytes, 1 }, 576) };
+        };
         const rows: i64 = if (ratio == 0) 2 * @as(i64, e.cfg.window) else @divFloor(e.o.limit, ratio) + 1;
         const kind = if (ratio == 0) "swa" else "comp";
         return .{ try e.buf("s.L{d}.{s}.v", .{ L, kind }, .u8, &.{ rows, 576 }), try e.buf("s.L{d}.{s}.s", .{ L, kind }, .u8, &.{ rows, 8 }) };
     }
 
-    fn indexKeys(e: *Emitter, L: u32) !Arg {
+    pub fn indexKeys(e: *Emitter, L: u32) !Arg {
         const r: i64 = e.cfg.compressRatio(L);
+        if (e.o.pool) |p| return e.buf("s.kv.ik.L{d}", .{L}, .u8, &.{ p.ik_pages * @divExact(Pool.page, r), Pool.ik_bytes });
         return e.buf("s.L{d}.ik", .{L}, .u8, &.{ @divFloor(e.o.limit, r) + 1, @as(i64, e.cfg.index_dim) + 4 });
+    }
+
+    /// Split KV: kv source `src`'s rows of selection `sel` [n, K] from their owners (kv/split.zig, forward's glue): dense
+    /// (fixed shapes) up to 16 rows, else the segment's union (host-planned, under the union cap). The attention reads
+    /// the received rows unpaged at the remapped tokens.
+    pub const Received = struct { cv: Arg, cs: Arg, tok: Arg };
+
+    /// The rows and tokens of the last exchange (a reuse layer: the same selection and kv source).
+    pub fn received(e: *Emitter, src: u32, ratio: i64) !Received {
+        _ = src;
+        _ = ratio;
+        const p = e.o.pool.?;
+        const n = e.n;
+        const K: i64 = e.cfg.index_topk;
+        const W: i64 = e.o.world;
+        const sent: i64 = if (n <= 16) n * K else @divFloor(p.union_cap, (W + 1) * Pool.row_bytes);
+        const recv: calls.Role = .{ .buf = "w.kx.recv" };
+        return .{
+            .cv = try e.view(recv, .u8, &.{ W * sent, 576 }, &.{ Pool.row_bytes, 1 }, 0),
+            .cs = try e.view(recv, .u8, &.{ W * sent, 8 }, &.{ Pool.row_bytes, 1 }, 576),
+            .tok = try e.buf("w.kx.tok", .{}, .i32, &.{ n, K }),
+        };
+    }
+
+    pub fn exchange(e: *Emitter, src: u32, ratio: i64, sel: Arg) !Received {
+        const p = e.o.pool.?;
+        const n = e.n;
+        const K: i64 = e.cfg.index_topk;
+        const W: i64 = e.o.world;
+        const small = n <= 16;
+        // dense: every rank sends R x K rows; union: (W + 1) x M rows under the cap
+        const sent: i64 = if (small) n * K else @divFloor(p.union_cap, (W + 1) * Pool.row_bytes);
+        const recv = try e.buf("w.kx.recv", .{}, .u8, &.{ W * sent, Pool.row_bytes });
+        const tok = try e.buf("w.kx.tok", .{}, .i32, &.{ n, K });
+        const comp = try e.buf("s.kv.comp.L{d}", .{src}, .u8, &.{ p.comp_pages * @divExact(Pool.page, ratio), Pool.row_bytes });
+        try e.glue(if (small) "kx_dense" else "kx_union", &.{
+            sel,                                                 comp,
+            try e.buf("s.kv.ct", .{}, .i32, &.{p.pts}),          try e.buf("w.kx.send", .{}, .u8, &.{ sent, Pool.row_bytes }),
+            recv,                                                tok,
+            .{ .i = Pool.shift(ratio) },
+        });
+        return .{
+            .cv = try e.view(recv.t.role, .u8, &.{ W * sent, 576 }, &.{ Pool.row_bytes, 1 }, 0),
+            .cs = try e.view(recv.t.role, .u8, &.{ W * sent, 8 }, &.{ Pool.row_bytes, 1 }, 576),
+            .tok = tok,
+        };
     }
 
     /// topk.plan: (cluster CTAs, entries a thread) for `nk` entries.
@@ -542,13 +639,14 @@ pub const Emitter = struct {
             try e.kvStore(lat, L, ratio);
             const kp = try e.buf("L.ix_k", .{}, .bf16, &.{ n, ID });
             try e.upstream(try e.fmt("L{d}.attn.ix_wk", .{L}), lat, hd, ID, kp);
+            const kpg = try e.paging(ratio, false);
             try e.triton("_index_k", .{ n, 1, 1 }, &.{
                 .{ .name = "KP", .arg = kp },                                                    .{ .name = "k_stride", .arg = .{ .i = ID } },
                 .{ .name = "W", .arg = try e.weight("L{d}.attn.ix_knorm", .{L}, .f32, &.{ID}) }, .{ .name = "CS", .arg = try e.ropeTable() },
                 .{ .name = "cs_stride", .arg = .{ .i = 64 } },                                   .{ .name = "IK", .arg = try e.indexKeys(L) },
                 .{ .name = "POS", .arg = try e.pos() },                                          .{ .name = "EPS", .arg = .{ .f = dec(e.cfg.eps) } },
-                .{ .name = "RATIO", .arg = .{ .i = ratio } },                                    .{ .name = "PT", .arg = .none },
-                .{ .name = "PSH", .arg = .{ .i = 0 } },                                          .{ .name = "KFP8", .arg = .{ .b = true } },
+                .{ .name = "RATIO", .arg = .{ .i = ratio } },                                    .{ .name = "PT", .arg = kpg.pt },
+                .{ .name = "PSH", .arg = .{ .i = kpg.psh } },                                    .{ .name = "KFP8", .arg = .{ .b = true } },
                 .{ .name = "SL", .arg = .none },                                                 .{ .name = "PTS", .arg = .{ .i = 0 } },
                 .{ .name = "ROWS", .arg = .{ .b = false } },                                     .{ .name = "PDL", .arg = .{ .b = false } },
             });
@@ -567,24 +665,38 @@ pub const Emitter = struct {
         var cs = try e.empty(.u8);
         var tok = try e.empty(.i32);
         var cnt = try e.empty(.i32);
+        var apg: Paging = .{ .pt = try e.empty(.i32), .psh = 0, .vs = 0, .ss = 0 };
         if (ratio > 0) {
-            const p = try e.pool(kv_src.?, e.cfg.compressRatio(kv_src.?));
-            cv = p[0];
-            cs = p[1];
+            const src_ratio = e.cfg.compressRatio(kv_src.?);
             const sel = try e.selection(e.cfg.indexSource(L).?);
-            tok = sel[0];
             cnt = sel[1];
+            if (e.o.pool != null and e.o.pool.?.split) {
+                // split: an index layer's selection brings its rows over the exchange; its reuse layers read them too
+                const got = if (indexer) try e.exchange(kv_src.?, src_ratio, sel[0]) else try e.received(kv_src.?, src_ratio);
+                cv = got.cv;
+                cs = got.cs;
+                tok = got.tok;
+            } else {
+                const p = try e.pool(kv_src.?, src_ratio);
+                cv = p[0];
+                cs = p[1];
+                tok = sel[0];
+                if (e.o.pool != null) {
+                    const pg = try e.paging(src_ratio, false);
+                    apg = .{ .pt = pg.pt, .psh = pg.psh, .vs = 0, .ss = 0 };
+                }
+            }
         }
         const rows_scr = n * 5 * H;
         try e.ext("tf_dsv41_attn_cuda_v1.attn", &.{
             try e.view(q.t.role, .bf16, &.{ n, H, hd }, &.{ H * hd, hd, 1 }, 0), cv, cs, tok, cnt, swa[0], swa[1],
             try e.buf("w.lo", .{}, .i32, &.{n}),                                 try e.empty(.i32),
             try e.pos(),                              try e.empty(.i64),
-            try e.empty(.i32),                                                  try e.weight("L{d}.attn.sink", .{L}, .f32, &.{H}),
+            apg.pt,                                                             try e.weight("L{d}.attn.sink", .{L}, .f32, &.{H}),
             try e.ropeTable(),                                                  try e.buf("s.attn.po", .{}, .f32, &.{rows_scr * 512}),
             try e.buf("s.attn.pm", .{}, .f32, &.{rows_scr}),                    try e.buf("s.attn.pl", .{}, .f32, &.{rows_scr}),
             o,                                                                  try e.buf("s.attn.ticket", .{}, .i32, &.{e.ticketLen()}),
-            .{ .i = 2 * @as(i64, e.cfg.window) },                               .{ .i = 0 },
+            .{ .i = 2 * @as(i64, e.cfg.window) },                               .{ .i = apg.psh },
             .{ .i = 0 },                                                        .{ .i = 4 },
         });
         if (e.o.r1) {
@@ -631,6 +743,7 @@ pub const Emitter = struct {
         const cand = try e.buf("w.cand", .{}, .i32, &.{ n, e.cfg.candidate_blocks });
         const keys = if (reindex) cand else scores;
         const kst: i64 = if (reindex) e.cfg.candidate_blocks else nk;
+        const spg = try e.paging(ratio, false);
         try e.triton("_scores", .{ n, std.math.divCeil(i64, nk, 64) catch unreachable, 1 }, &.{
             .{ .name = "QI", .arg = try e.view(qi.t.role, .bf16, &.{ n, IH, ID }, &.{ IH * ID, ID, 1 }, 0) },
             .{ .name = "W", .arg = iw },                                .{ .name = "w_stride", .arg = .{ .i = IH } },
@@ -641,7 +754,7 @@ pub const Emitter = struct {
             .{ .name = "H", .arg = .{ .i = IH } },                      .{ .name = "D", .arg = .{ .i = ID } },
             .{ .name = "BP", .arg = .{ .i = 64 } },                     .{ .name = "WS", .arg = .{ .f = 1.0 / @sqrt(@as(f64, @floatFromInt(IH))) } },
             .{ .name = "SCALE", .arg = .{ .f = 1.0 / @sqrt(@as(f64, @floatFromInt(ID))) } }, .{ .name = "GATHER", .arg = .{ .b = reindex } },
-            .{ .name = "PT", .arg = .none },                            .{ .name = "PSH", .arg = .{ .i = 0 } },
+            .{ .name = "PT", .arg = spg.pt },                           .{ .name = "PSH", .arg = .{ .i = spg.psh } },
             .{ .name = "KFP8", .arg = .{ .b = true } },                 .{ .name = "SL", .arg = .none },
             .{ .name = "PTS", .arg = .{ .i = 0 } },                     .{ .name = "ROWS", .arg = .{ .b = false } },
             .{ .name = "CBS", .arg = .{ .i = if (reindex) cbs else 0 } },

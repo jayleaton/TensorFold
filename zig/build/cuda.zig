@@ -161,7 +161,9 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     dsv41_m1.addImport("cuda", cuda);
     dsv41_m1.addImport("core", mods.core);
     dsv41_m1.addImport("dsv41_kernels", dsv41);
-    dsv41_m1.addImport("tp", @import("tp.zig").module(b, target, optimize, cuda)); // M2's forward: the TP collectives
+    const m1_tp = @import("tp.zig").module(b, target, optimize, cuda);
+    dsv41_m1.addImport("tp", m1_tp); // M2's forward: the TP collectives
+    dsv41_m1.addImport("kv", @import("kv.zig").module(b, target, optimize, cuda, m1_tp)); // M5: the paged pool, split KV, sessions
     const dsv41_lanes = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = target, .optimize = optimize, .link_libc = true });
     dsv41_m1.addImport("lanes", dsv41_lanes); // M3: the GPU target's lanes types
     // M4: the served engine (serve_engine.zig) for follow / generate, over the server's engine seam
@@ -175,7 +177,9 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     ds_engine.addImport("cuda", cuda);
     ds_engine.addImport("core", b.createModule(.{ .root_source_file = b.path("zig/src/core/safetensors_root.zig"), .target = target, .optimize = optimize, .link_libc = true }));
     ds_engine.addImport("dsv41_kernels", dsv41);
-    ds_engine.addImport("tp", @import("tp.zig").module(b, target, optimize, cuda));
+    const engine_tp = @import("tp.zig").module(b, target, optimize, cuda);
+    ds_engine.addImport("tp", engine_tp);
+    ds_engine.addImport("kv", @import("kv.zig").module(b, target, optimize, cuda, engine_tp));
     b.installArtifact(b.addExecutable(.{ .name = "tensorfold-dsv41", .root_module = @import("server.zig").withEngine(b, target, .ReleaseSafe, ds_engine) }));
 }
 

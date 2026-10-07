@@ -128,6 +128,7 @@ fn segment(f: *Forward, ids: []const u32, head: bool) !void {
     const a = sa.allocator();
     const layers = try f.backbone(a);
     const start = f.slot.pos;
+    if (f.kv) |kx| try kx.reserve(start + n);
     const cs = block_prefill.emitPrefill(a, f.cfg, f.widths, f.opts, layers, n, @intCast(start), head) catch |e| {
         if (e == error.Unsupported) log.warn("prefill: the {d}-row segment at {d} is not on the prefill path (block_prefill: Unsupported; past TF_DSV41_INDEX_STREAM_MIN visible keys its stream top-k is not ported)", .{ n, start });
         return e;
@@ -160,6 +161,7 @@ fn commit(f: *Forward, n: u32) !void {
     if (f.engram) |h| tailOf(&f.slot, f.ids[0..n], h.max_ngram - 1);
     f.slot.pos = p.start + n;
     f.slot.pending = null;
+    if (f.sess) |x| try x.commit(x.ptr, f.ids[0..n]);
 }
 
 /// Engram's tail after committing `ids`: (tail + ids)[-keep:].
@@ -259,6 +261,7 @@ fn glueFn(ctx: *anyopaque, r: *run.Runner, c: *const calls.Call) anyerror!void {
     const k = r.kernels.others(r.stream);
     const x = c.args;
     const eql = std.mem.eql;
+    if (std.mem.startsWith(u8, step, "kx_")) return (f.kv orelse return error.BadGlue).glue(r, c, step);
     if (eql(u8, step, "proj_carry")) {
         // torch.cat([the slot's carry, the projection]): position start - 1's row, then the segment's
         const carry = x[0].arg.t;
