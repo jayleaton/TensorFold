@@ -42,6 +42,8 @@ pub const Options = struct {
     capacity: u64,
     /// TF_DSV41_KV_SPLIT_UNION_MIB, bytes
     union_cap: u64 = 128 << 20,
+    /// live slots (slots.zig, TF_DSV41_SLOTS): the pool's slots and the device tables' rows
+    slots: u32 = 1,
 };
 
 /// TF_DSV41_POOL_TOKENS / TF_DSV41_KV_SPLIT / TF_DSV41_KV_SPLIT_UNION_MIB (null: no pool, the contiguous slot).
@@ -85,7 +87,9 @@ pub const Kv = struct {
     layout: kv.Layout,
     pool: sessions.Pool,
     dev: kv.DevicePool,
+    /// the current slot (one-slot operations), one of `slots`
     slot: *sessions.Slot,
+    slots: []*sessions.Slot = &.{},
     opts: Options,
     world: u32,
     rank: u32,
@@ -110,8 +114,11 @@ pub const Kv = struct {
         k.* = .{ .gpa = gpa, .layout = try kv.Layout.fromConfig(cfg, .{ .split = o.split and world > 1 }), .pool = undefined, .dev = undefined, .slot = undefined, .opts = o, .world = world, .rank = @intCast(comm.rank()), .comm = comm, .runner = runner };
         k.pool = try sessions.Pool.init(gpa, k.layout.pool(), o.tokens, if (k.layout.opts.split) world else 1, if (k.layout.opts.split) k.rank else 0);
         errdefer k.pool.deinit();
-        k.slot = try k.pool.newSlot(o.capacity);
-        k.dev = try kv.DevicePool.init(gpa, d, ctx, &k.pool, runner.stream, 1, k.slot.max_pages);
+        k.slots = try gpa.alloc(*sessions.Slot, @max(o.slots, 1));
+        errdefer gpa.free(k.slots);
+        for (k.slots) |*s| s.* = try k.pool.newSlot(o.capacity);
+        k.slot = k.slots[0];
+        k.dev = try kv.DevicePool.init(gpa, d, ctx, &k.pool, runner.stream, @intCast(k.slots.len), k.slot.max_pages);
         errdefer k.dev.deinit();
         k.ops = .{ .r = runner };
         if (k.layout.opts.split) {
@@ -127,7 +134,13 @@ pub const Kv = struct {
         if (k.lens) |*b| b.free();
         k.dev.deinit();
         k.pool.deinit();
+        k.gpa.free(k.slots);
         k.gpa.destroy(k);
+    }
+
+    /// Slot i becomes the current one (slots.zig: one-slot operations on slot i).
+    pub fn select(k: *Kv, i: u32) void {
+        k.slot = k.slots[i];
     }
 
     /// The emitter's view of the pool (block.Options.pool).
