@@ -16,11 +16,12 @@ pub const Policy = struct {
     sibcal: calib.SibCal = .{},
     owner: *ln.Lanes = undefined,
     sib_rows: usize,
+    dup: tree.Dup,
     trees: u64 = 0, // rounds that verified a sibling
     sib_wins: u64 = 0,
 
     pub fn init(gpa: Allocator, costs: Costs, opts: ln.Options) !Policy {
-        return .{ .gpa = gpa, .depth = try depth.Depth.init(gpa, costs, opts.shape.block, opts.depth), .sib_rows = opts.sib_rows };
+        return .{ .gpa = gpa, .depth = try depth.Depth.init(gpa, costs, opts.shape.block, opts.depth), .sib_rows = opts.sib_rows, .dup = opts.dup };
     }
 
     pub fn deinit(p: *Policy) void {
@@ -77,7 +78,7 @@ pub const Policy = struct {
     fn loneTree(p: *Policy, arena: Allocator, st: *ln.St, ask: depth.Depth.Ask) !lt.Choice {
         var sibs: [tree.max_siblings]f64 = undefined;
         for (st.sib[0..st.n_sib], sibs[0..st.n_sib], 0..) |s, *q, j| q.* = p.sibcal.q(j, s.p);
-        const c = try p.depth.chooseTree(ask.slot, ask.conf, ask.most, sibs[0..st.n_sib], true, ask.first, .{}, p.sib_rows);
+        const c = try p.depth.chooseTree(ask.slot, ask.conf, ask.most, sibs[0..st.n_sib], true, ask.first, p.dup, p.sib_rows);
         var lens: [tree.max_siblings]u32 = @splat(0);
         var total: u32 = @intCast(c.k);
         for (lens[0..st.n_sib], c.lens[0..st.n_sib], st.sib_len[0..st.n_sib]) |*l, want, have| {

@@ -13,6 +13,7 @@ const depth = @import("depth.zig");
 const calib = @import("calib.zig");
 const costs_mod = @import("costs.zig");
 const Policy = @import("policy.zig").Policy;
+const branches = @import("branches.zig");
 
 pub const max_block = 16;
 
@@ -21,6 +22,7 @@ pub const Options = struct {
     depth: depth.Settings = .{},
     siblings: u32 = 0, // first-position siblings (TF_DSV41_TREE - 1; 0: chains only)
     sib_rows: u32 = 4, // a sibling branch's rows at most (TF_DSV41_TREE_ROWS)
+    dup: tree.Dup = .{}, // tree.plan's sibling pricing (Python's: TF_DSV41_TREE_DUP_MS a sibling, its pending row counted)
     slots: u32 = 4, // streams at once
 };
 
@@ -150,7 +152,16 @@ pub const Lanes = struct {
     fn ingest(x: *Lanes, st: *St, start: u64, rows: []const u32) !void {
         const span = iface.ingestSpan(rows.len, x.opts.shape.window);
         if (span.count == 0) return;
-        try x.pass.ingest(st.slot, start + span.skip, x.target.taps(st.slot), rows[span.skip..]);
+        const taps = x.target.taps(st.slot);
+        const m = taps.map orelse return x.pass.ingest(st.slot, start + span.skip, taps, rows[span.skip..]);
+        // a tree resolved as chains: the path's rows in the taps of the chain that holds it
+        var mapped: [branches.max_rows]u32 = undefined;
+        if (span.count > mapped.len) return error.TreeRows;
+        for (rows[span.skip..], mapped[0..span.count]) |r, *o| {
+            if (r >= m.len or m[r] == branches.unrun) return error.TreeTaps;
+            o.* = m[r];
+        }
+        try x.pass.ingest(st.slot, start + span.skip, taps, mapped[0..span.count]);
     }
 
     fn prefill(ptr: *anyopaque, s: *Stream) anyerror!void {

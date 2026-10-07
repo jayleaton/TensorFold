@@ -19,7 +19,8 @@ pub const Segment = struct {
 
 /// The taps of a slot's last rows (the streams' mean entering the DSpark target layers, bf16 [rows, 3 x hidden] on
 /// the GPU): `address` a device address (a host one on the CPU twin), row i = the window's (or prompt's) row i.
-pub const Taps = struct { address: u64, rows: u32, stride: u32 };
+/// `map`: a tree window resolved as chains (branches.zig): window row -> taps row (branches.unrun: no taps).
+pub const Taps = struct { address: u64, rows: u32, stride: u32, map: ?[]const u32 = null };
 
 pub const Target = struct {
     ptr: *anyopaque,

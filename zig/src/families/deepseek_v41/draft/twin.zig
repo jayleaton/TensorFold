@@ -234,6 +234,13 @@ pub const Twin = struct {
         }
     }
 
+    /// Drop the slot's last window without committing a row (branches.zig: a chain whose branch lost).
+    pub fn drop(t: *Twin, slot: u32) void {
+        const s = &t.slots[slot];
+        s.k.shrinkRetainingCapacity(s.base * t.dims.dim);
+        s.v.shrinkRetainingCapacity(s.base * t.dims.dim);
+    }
+
     fn taps(ptr: *anyopaque, slot: u32) iface.Taps {
         const t = self(ptr);
         const s = &t.slots[slot];

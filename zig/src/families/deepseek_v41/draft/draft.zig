@@ -15,6 +15,8 @@ pub const lanes = @import("lanes.zig");
 pub const Lanes = lanes.Lanes;
 pub const twin = @import("twin.zig");
 pub const drive = @import("drive.zig");
+pub const branches = @import("branches.zig");
+pub const branches_oracle = @import("branches_oracle.zig");
 
 test {
     _ = costs;
@@ -28,6 +30,9 @@ test {
     _ = lanes;
     _ = twin;
     _ = drive;
+    _ = branches;
+    _ = branches_oracle;
+    _ = @import("branches_test.zig");
     _ = @import("drive_test.zig");
     _ = @import("lanes_test.zig");
     _ = @import("golden_test.zig");
