@@ -32,6 +32,7 @@ const dspark_emit = @import("dspark_emit.zig");
 const dspark_gpu = @import("dspark_gpu.zig");
 const kvs = @import("kv_state.zig");
 const sg = @import("sessions_gpu.zig");
+const samp = @import("sampling_gpu.zig");
 
 pub const Options = struct {
     drafts: bool = true,
@@ -84,6 +85,8 @@ pub const Model = struct {
     pass: ?*dspark_gpu.GpuPass = null,
     /// M5: the session store over the paged pool (with TF_DSV41_POOL_TOKENS)
     sessions: ?*sg.Sessions = null,
+    /// the keyed sampler, every rank (requests with T > 0; the followers run its gathers from forward.follow)
+    sampler: ?*samp.GpuSampler = null,
 
     pub fn rank(m: *const Model) u32 {
         return m.tcfg.rank;
@@ -175,6 +178,8 @@ pub const Model = struct {
         if (m.f.kv != null) m.sessions = try sg.Sessions.init(gpa, io, &m.f, &bp, try sg.optionsFromEnv());
         m.gt = .{ .f = &m.f, .prefill_rows = o.prefill_rows, .max_rows = nb, .own_prefill = o.own_prefill, .sessions = m.sessions };
         if (o.drafts) m.pass = try dspark_gpu.GpuPass.init(gpa, &m.f, nb);
+        m.sampler = try samp.GpuSampler.init(gpa, &m.f);
+        m.gt.sampler = m.sampler;
         try m.driver.check(m.driver.api.cuCtxSynchronize(), "cuCtxSynchronize");
         try comm.barrier();
         return m;
@@ -183,6 +188,7 @@ pub const Model = struct {
     pub fn close(m: *Model) void {
         const gpa = m.gpa;
         if (m.pass) |p| p.deinit();
+        if (m.sampler) |x| x.deinit();
         if (m.sessions) |x| x.deinit();
         if (m.f.kv) |k| k.deinit();
         m.f.deinit();
