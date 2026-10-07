@@ -465,6 +465,26 @@ Each rank's matcher walks the same tokens, so every rank fills the same masks fo
 - `TF_DSV41_SPEC_DRAFT`'s early pass with masks is not covered (not ported).
 - Fills overlap the forward but are awaited before the pick. At 4 slots × 16 rows the fill cost sits on the critical path only when it exceeds the forward. Measure it on the Spark window (`TF_DSV41_PHASES`).
 
+### Pods 29 and 30: the fix-up and last combined gates (2026-10-07, for the overnight run)
+
+Logs are in the quant repo: `results/20261007-fix29-pod29` (pod 29, tree 4d91532) and `results/20261007-comb30-pod30` (pod 30, tree 8278ede). Both ran on index Engram rows (no `M2B_ENGRAM`): pod 26 had already gated R3 on M4 and m2b.
+
+| gate | result | note |
+|---|---|---|
+| M2b decode regression | PASS (29, 30) | |
+| speculative pass (`TF_DSV41_SPEC_DRAFT`), lanes 3 and 4 | **PASS** (29): 65/65 tokens == Python's serial, 20/20 and 1/1 speculations used, 4.64 tokens a round (mode 4) | first GPU run |
+| structured output (`TF_DSV41_GRAMMAR`), drafts on and serial | **PASS** (30): Zig == Python 6/6 replies each | first GPU run; the HTTP step did not run (script bug, fixed `1c863d2`) |
+| fused dense prefill (`TF_DSV41_PF_DENSE=fused`) | **PASS** (30): 65/65 state roles, 64/64 tokens + logits, both ranks | knobs gate's first run; the rest below |
+| M5 split / park / compact | PASS on the 2,060-row prompt (61/61 roles, 64/64; park through RAM and NVMe) on pod 29; the 9-row prompt after it in the same load tripped the dump check on stale ring rows (tokens + logits 64/64) | gate fixed `a4caf46` (a fresh slot a prompt); rerun on pod 30 |
+| images (`TF_DSV41_IMAGES=native`, `BIAS_VL`) | **FAIL** (30): the tower is not bit-exact, 0/3 images; block 0 already differs by one bf16 ulp in 0.35-0.6 % of elements, compounding over 32 blocks (final span up to ~0.1); every image prefill differs from block 0 (first token still equal) | torch SDPA / cuBLAS summation order; `dsq-zig-vision-1` reopened. **Keep `IMAGES` off overnight** |
+| long prompts (`TF_DSV41_CONTEXT`, stream top-k, split row blocks) | not run: both Zig runs stopped at load with `MissingTritonVariant _prune` | gate bug: `m5.zig` turns the m2b job's `M2B_TOPP=0.85` into the expert top-p while the reference ran with it off; fixed `33be853`. **Run C overnight is the first GPU run of long prompts** |
+| R1 eager with the timing rows | FAIL (29): rank 1 `CUDA_ERROR_ILLEGAL_ADDRESS` in the profiled 4-row R1 windows **after** the 64-step gate; R1 graphs and 1-row windows ran | diagnosis tooling `6596725` (`TF_DSV41_SYNC_EACH=1` names the faulting call; `M2B_R1_DIAG`); pod 30 result below |
+| slots + multi-slot drafting | not run on 29: its `ref.py` failed twice (pool `split=` on the r1c twin, then `SlotsForward` lacks `engram_inputs_eager`) | fixed `c081aa9` (midprofile twin) and `fcaebe1` (`DecodeForward`); pod 30 result below |
+
+Pod-side lessons for anyone running pods: the shared `runpod/idle-guard.sh` deletes a pod whose container log is unchanged 60 min (pod 29 at 19:40): a job driven over ssh must write a heartbeat to `/proc/1/fd/1`. `vision_kernels.zig` did not compile with `dsv41_vision.fatbin` embedded (Zig 0.17: `field_names`), fixed `8278ede`.
+
+**For the overnight run (`dsq-zig-night-1`):** the kit at e19bb41 predates `33be853`, `1c863d2` and the pod-30 fixes below; they only change pod gate scripts, except where a row says otherwise. Kit knobs: keep `IMAGES` off; `GRAMMAR=1` and `PF_DENSE=fused` are gated (both PASS here).
+
 ### 0b. Several live slots and row buckets (`dsq-zig-slots-1`)
 
 `TF_DSV41_SLOTS=N` (1 by default: today's one-slot path, nothing changes) gives the GPU path N live slots with batched decode windows, as Python's batcher runs them (row mode, G8: `rowtab.py`, `rowmode.py`, `rowgraphs.py`). It needs the paged pool (`TF_DSV41_POOL_TOKENS`); the contiguous slot is refused by name.
