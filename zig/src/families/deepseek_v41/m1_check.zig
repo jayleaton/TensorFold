@@ -258,6 +258,30 @@ pub fn gmWidths(a: std.mem.Allocator, w: *block.Widths, ws: []const Window) !voi
     };
 }
 
+/// The x3gm version the capture's prefill launched (gm2pf.ofLaunches over every phase's ops): meta.json's
+/// TF_DSV41_GM_V2 is not it, the pre-v2 twins ignored the knob.
+pub fn gmMode(ws: []const Window) @import("gm2pf.zig").Mode {
+    const Names = struct {
+        ws: []const Window,
+        w: usize = 0,
+        i: usize = 0,
+        pub fn next(it: *@This()) ?[]const u8 {
+            while (it.w < it.ws.len) {
+                const ops = it.ws[it.w].ops;
+                if (it.i < ops.len) {
+                    it.i += 1;
+                    return ops[it.i - 1].get("name").?.string;
+                }
+                it.w += 1;
+                it.i = 0;
+            }
+            return null;
+        }
+    };
+    var it: Names = .{ .ws = ws };
+    return @import("gm2pf.zig").ofLaunches(&it);
+}
+
 /// M2's Triton variant choice on the host: each Triton call split into runtime arguments and constexprs over its
 /// function's compiled variants (aot.json with constexprs, div16, nospec), matched by the engine's own aot.zig test.
 /// Exactly one variant may match, and it must be the one the capture launched.
@@ -302,8 +326,10 @@ pub fn checkAll(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, experts: []
     const cfg: Config = .{};
     const ws = try windows(a, io, dir);
     try gmWidths(a, &w, ws);
-    const opts = try optionsOf(a, io, dir);
+    var opts = try optionsOf(a, io, dir);
+    opts.gm_v2 = gmMode(ws);
     if (opts.r1) try log.print("options: R1 (the capture's knobs)\n", .{});
+    if (opts.gm_v2 != .off) try log.print("options: x3gm v2 {t} (the capture's launches)\n", .{opts.gm_v2});
     var bad: usize = 0;
     // the variant gate when the capture's AOT set carries the specialization (dsv41_m1_capture.py pack_aot, 2026-10-06+)
     var variants: ?Variants = null;
