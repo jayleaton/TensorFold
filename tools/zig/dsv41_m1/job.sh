@@ -85,7 +85,8 @@ fi
 #      compact park; REF = $LOCAL/m5-ref-MODE, holding p<N>/ a prompt), skipped with a message when the binary's
 #      usage has no m5 command.
 # Knobs: M5_HI M5_PROMPTS M2B_STEPS M5_CAPTURES M5_REPLAY M5_REFS M5_GATES M5_INDEX_KV M5_PARK_KV M5_REF_RESERVE
-# M5_CAPTURE_MIN M5_REF_MIN M5_GATE_MIN M2B_COPY_MIN (defaults below); M1_BUDGET_MIN as every job.
+# M5_CAPTURE_MIN M5_REF_MIN M5_GATE_MIN M2B_COPY_MIN (defaults below), M5_REFS_FROM (an earlier pod's references:
+# no reference runs, no m5-agree); M1_BUDGET_MIN as every job.
 if [[ "${M1_JOB:-m1}" == m5 ]]; then
     hi=${M5_HI:-24}
     LP=$LOCAL/pack
@@ -163,6 +164,11 @@ if [[ "${M1_JOB:-m1}" == m5 ]]; then
     for mode in ${M5_REFS:-pool split compact park}; do
         REF=$LOCAL/m5-ref-$mode
         rm -rf "$REF"
+        # M5_REFS_FROM=<dir>: an earlier pod's references (m5-ref-<mode>/, engram-host.bin in each prompt's dir)
+        if [[ -n "${M5_REFS_FROM:-}" && -d "$M5_REFS_FROM/m5-ref-$mode" ]]; then
+            cp -r "$M5_REFS_FROM/m5-ref-$mode" "$REF" && okrefs+=("$mode") && echo "m5-ref-$mode from $M5_REFS_FROM" | tee -a "$RES/steps.txt"
+            continue
+        fi
         case $mode in
             pool) args=(--pool) ;;
             split) args=(--split --compact 0) ;;
@@ -188,10 +194,10 @@ if [[ "${M1_JOB:-m1}" == m5 ]]; then
         done
         [[ -d "$REF/aot" ]] && tar -czf "$o/aot.tar.gz" -C "$REF" aot
     done
-    if (( ${#okrefs[@]} )); then
+    if (( ${#okrefs[@]} )) && [[ -z "${M5_REFS_FROM:-}" ]]; then
         if step m5-engram-host 3 python -B "$Z/tools/zig/dsv41_engram_host.py" --py-src "$TWIN/src" \
                 --config "$LP/config.json" --tokenizer "$LP/tokenizer.json" --out "$LOCAL/m5-engram-host.bin"; then
-            for mode in "${okrefs[@]}"; do for p in $PROMPTS; do cp "$LOCAL/m5-engram-host.bin" "$LOCAL/m5-ref-$mode/p$p/"; done; done
+            for mode in "${okrefs[@]}"; do for p in $PROMPTS; do cp "$LOCAL/m5-engram-host.bin" "$LOCAL/m5-ref-$mode/p$p/engram-host.bin"; done; done
         else rc=1; fi
         # every mode's tokens and per-step logits digests == the replicated pool's (split == replicated bit for bit;
         # the park reference's uninterrupted run too, and its restored run == that run: ref.json park_equal)
