@@ -71,8 +71,10 @@ case "$PHASE" in
             -v "${CACHE_VOL:-dsv41-perf1-cache}:/cache" "${KN[@]}" -e TF_DSV41_GM_V2=1 -e M1_PREFILL_ROWS=0 \
             -e PYTHONPATH=/dsv41-tf/src:/cache/pylib -e TORCH_EXTENSIONS_DIR=/cache/torch_extensions -e TRITON_CACHE_DIR=/cache/triton \
             --entrypoint python "$IMAGE" -u -B /kit/tools/zig/dsv41_m1_capture.py --pack /model --out /out/capture-p --sets P \
-            > "$OUT/capture-p.log" 2>&1 && rm -rf "$CAP/blobs" \
-            && python3 "$KIT/tools/zig/dsv41_aot_merge.py" "$ASSETS/aot" "$CAP/aot" | tee -a "$OUT/capture-p.log" ;;
+            > "$OUT/capture-p.log" 2>&1 || { echo "capture P failed: $OUT/capture-p.log"; exit 1; }
+        # the blobs are the container's (root-owned): removed as root in the image; the merge does not depend on it
+        docker run --rm -v "$OUT:/out" --entrypoint rm "$IMAGE" -rf /out/capture-p/blobs || echo "warning: $CAP/blobs left"
+        python3 "$KIT/tools/zig/dsv41_aot_merge.py" "$ASSETS/aot" "$CAP/aot" | tee -a "$OUT/capture-p.log" ;;
     rows-aot)
         # the row-mode Triton variants (ROWS, int64 POS, SL / PTS) of every bucket up to 16 on this GPU: Python's slots
         # engine (prod's tree: rowtab / rowmode / rowgraphs) at TP=2 over the two hosts, 4 slots, layers 0-24 (every
