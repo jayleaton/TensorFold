@@ -478,6 +478,17 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
             grep -h "^mdraft\|PASS mdraft\|FAIL mdraft" "$RES"/mdraft*.log "$RES"/mdraft-*/rank0.log 2>/dev/null | tee -a "$RES/steps.txt"
         else echo "mdraft skipped: no tools/zig/dsv41_mdraft/job.sh" | tee -a "$RES/steps.txt"; rc=1; fi
     fi
+    # the gap-closing workstreams (each tools/zig/dsv41_<name>/job.sh with a <name>_gate, same env as slots_gate):
+    # M2B_LONGPF (long prompts past 4,096 keys), M2B_SPEC (SPEC_DRAFT early pass), M2B_GRAMMAR (structured output),
+    # M2B_VISION (image input)
+    for name in longpf spec grammar vision; do
+        knob=M2B_${name^^}
+        [[ "${!knob:-0}" == 1 ]] || continue
+        if [[ -f "$Z/tools/zig/dsv41_$name/job.sh" ]]; then
+            (source "$Z/tools/zig/dsv41_$name/job.sh"; "${name}_gate") || rc=1
+            grep -h "PASS $name\|FAIL $name" "$RES"/$name*.log "$RES"/$name-*/*.log 2>/dev/null | tee -a "$RES/steps.txt"
+        else echo "$name skipped: no tools/zig/dsv41_$name/job.sh" | tee -a "$RES/steps.txt"; rc=1; fi
+    done
     for d in "${refs[@]}"; do
         o=$RES/m2b-ref; [[ -n "$PROMPTS" ]] && o=$RES/m2b-ref/$(basename "$d")
         mkdir -p "$o"
