@@ -8,12 +8,14 @@
 #      the text bias, then p4..p6 the same prompts after vision.attach_bias_vl(fw.blocks, $LP) (gate.bias_vl from the
 #      pack's native.safetensors: image rows in their own MoE call, prod's TF_DSV41_BIAS_VL); state dumps,
 #      VISION_STEPS greedy tokens, the AOT set with the image paths' Triton / row-count variants
-#   2. vision-vit (~1 min, GPU 0): tf-dsv41-m1 vision: the Zig tower's embed / block0 / 1 / 15 / 31 / vit / gelu stages
-#      and span rows == Python's, bit for bit ("PASS vision ViT + aligner == Python: 3/3 images")
+#   2. vision-vit (~1 min, GPU 0): tf-dsv41-m1 vision: the Zig tower's embed / block 0's ops (b0.norm1 .. b0.w2) /
+#      block0 / 1 / 15 / 31 / vit / gelu stages and span rows == Python's, bit for bit ("PASS vision ViT + aligner ==
+#      Python: 3/3 images"); on a FAIL, vision-vit-ops reruns it with TF_DSV41_VISION_RESYNC=1 (each stage on
+#      Python's input: every differing op apart)
 #   3. vision-prefill-p1..p6 (~2 min each): tf-dsv41-m1 m2b with M2B_PREFILL=1 on each prompt: the Zig prefill from an
 #      empty slot (image rows into rank 0's embedding, Engram's keep; p4..p6 with TF_DSV41_BIAS_VL=$LP: the image
 #      rows' own MoE call), every state role == Python's, then the tokens
-#   4. vision-generate / vision-generate-bias (~3 min each): the prompts through the served engine (tf-dsv41-m1
+#   4. vision-generate / vision-generate-bias (~3 min each, at most VISION_GEN_MIN = 8): the prompts through the served engine (tf-dsv41-m1
 #      generate, drafts off): "PASS M4 CLI == HTTP: 3/3 replies equal" (here: Zig's replies == Python's)
 # Each run prints "PASS vision ..." / "FAIL vision ..." into $RES/steps.txt. Knobs: VISION_STEPS (32), VISION_REF_MIN
 # (14), VISION_RUNS ("vit prefill generate prefill-bias generate-bias"; about 22 min in all).
@@ -37,8 +39,13 @@ vision_gate() {
     if [[ " $runs " == *" vit "* ]]; then
         if CUDA_VISIBLE_DEVICES=0 step vision-vit 4 "$Z/bin/tf-dsv41-m1" vision "$LP" "$vdir"; then
             echo "PASS vision vit" | tee -a "$RES/steps.txt"
-        else echo "FAIL vision vit (first differing stage in vision-vit.log)" | tee -a "$RES/steps.txt"; fi
-        cp "$RES/vision-vit.log" "$RES/vision/" 2>/dev/null
+        else
+            echo "FAIL vision vit (first differing stage in vision-vit.log)" | tee -a "$RES/steps.txt"
+            # each op on Python's input (TF_DSV41_VISION_RESYNC=1): every differing op of block 0 / each block, apart
+            TF_DSV41_VISION_RESYNC=1 CUDA_VISIBLE_DEVICES=0 step vision-vit-ops 4 "$Z/bin/tf-dsv41-m1" vision "$LP" "$vdir"
+            grep -E "differ|bytes, Python" "$RES/vision-vit-ops.log" | head -60
+        fi
+        cp "$RES/vision-vit.log" "$RES/vision-vit-ops.log" "$RES/vision/" 2>/dev/null
     fi
     export TF_DSV41_IMAGES=native TF_DSV41_VISION_HOLD=$vdir
     vprefill() { # PROMPT-DIRS...: the M2B_PREFILL gate on each
@@ -56,7 +63,8 @@ vision_gate() {
     }
     vgenerate() { # NAME TRACE
         (( $(left) >= 4 )) || { echo "FAIL vision $1: skipped, $(left) min left" | tee -a "$RES/steps.txt"; return; }
-        if TF_DSV41_LAYERS=0-$hi VISION_PORT=$(( 29790 + i )) step "vision-$1" 5 bash "$Z/tools/zig/dsv41_vision/gen_ranks.sh" \
+        mb=$(left); (( mb > ${VISION_GEN_MIN:-8} )) && mb=${VISION_GEN_MIN:-8}
+        if TF_DSV41_LAYERS=0-$hi VISION_PORT=$(( 29790 + i )) VISION_TAIL1=25 step "vision-$1" "$mb" bash "$Z/tools/zig/dsv41_vision/gen_ranks.sh" \
                 "$Z/bin/tf-dsv41-m1" "$LP" "$ref/p1" "$2" "$RES/vision/$1"; then
             echo "PASS vision $1 (replies == Python's)" | tee -a "$RES/steps.txt"
         else echo "FAIL vision $1" | tee -a "$RES/steps.txt"; fi

@@ -1,10 +1,12 @@
 // DeepSeek-V4.1's vision tower glue (vision.py ``Tower``), each kernel the torch op sequence the Python engine runs,
-// in torch's order and roundings (separate fp32 ops: built with --fmad=false), so the tower's bits are torch's:
+// in torch's order and roundings (separate fp32 ops as _rn intrinsics, which never contract; libdevice's expf / erff /
+// powf / cosf / sinf under nvcc's defaults as torch builds them: no fast math, fmad on), so the tower's bits are torch's:
 //   rms        _rms: x.float(); sum(x^2) as at::native's inner-dim reduce (32 lanes, 4 accumulators of float4
 //              loads, combined 0+1+2+3, shuffle-down 16..1), * 1/D, + eps, rsqrtf, x * r, w.float() * x, -> bf16
 //   rope       _rope + _rotate on q and k of the qkv rows, v copied: [n, 3 D] -> q, k, v as [heads, n, 64]
 //   attn       F.scaled_dot_product_attention's FLASH backend (FA2 fwd, hdim 64: 128 x 128 tiles, 4 warps, key
-//              blocks last first, exp2 with the log2-scaled max, P in bf16, the row sums quad-reduced at the end)
+//              blocks last first, exp2f(s * scale - max * scale) unfused (flash built with UNFUSE_FMA), P in bf16,
+//              the row sums quad-reduced at the end)
 //   silu_mul   F.silu(g) * u on the w1 rows' halves; gelu  F.gelu (erf); add  x + y (bf16, fp32 math)
 //   unfold     the aligner's pad + 3 x 3 unfold: [h, w, C] -> [L, C * 9] (c major, then kh, kw), zeros past the edge
 //   span       the image's span rows: image_start / image_newline / image_end and the aligner rows in prompt order
@@ -76,7 +78,6 @@ __device__ __forceinline__ void mma16816(float* d, const uint32_t* a, const uint
 __device__ __forceinline__ uint32_t pack2(__nv_bfloat16 lo, __nv_bfloat16 hi) {
     return (uint32_t)__bfloat16_as_ushort(lo) | ((uint32_t)__bfloat16_as_ushort(hi) << 16);
 }
-__device__ __forceinline__ float ex2(float x) { float y; asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x)); return y; }
 
 constexpr int BM = 128, BN = 128, HD = 64;
 
@@ -160,7 +161,7 @@ extern "C" __global__ void __launch_bounds__(128) dsv41_vision_attn(const __nv_b
                 if (!first) {
                     const float prev = row_max[mi][hr];
                     const float cur = mx == -INFINITY ? 0.f : mx;
-                    const float sc = ex2(__fmul_rn(__fsub_rn(prev, cur), scale_log2));
+                    const float sc = exp2f(__fmul_rn(__fsub_rn(prev, cur), scale_log2));
                     row_sum[mi][hr] = __fmul_rn(row_sum[mi][hr], sc);
 #pragma unroll
                     for (int d = 0; d < 8; d++) {
@@ -176,7 +177,7 @@ extern "C" __global__ void __launch_bounds__(128) dsv41_vision_attn(const __nv_b
                 for (int ni = 0; ni < 16; ni++)
 #pragma unroll
                     for (int e = 0; e < 2; e++) {
-                        const float p = ex2(__fmaf_rn(s[ni][hr * 2 + e], scale_log2, -ms));
+                        const float p = exp2f(__fsub_rn(__fmul_rn(s[ni][hr * 2 + e], scale_log2), ms));
                         s[ni][hr * 2 + e] = p;
                         sum = init ? p : __fadd_rn(sum, p);
                         init = false;

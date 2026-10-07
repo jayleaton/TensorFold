@@ -19,6 +19,11 @@
 Prompts 1..3 route image rows with the text bias (as Python without TF_DSV41_BIAS_VL).
 
     python -u -B vision_ref.py --vdir VDIR [--bias-vl DIR] -- --pack PACK --out OUT --layers 0-24 --steps 32 --prompts 1,2,3,4,5,6
+
+``--tower-only``: steps 1 and 2 alone on one GPU (cuda:0; the pack's vision tensors, no model load, about 2 min), for
+``tf-dsv41-m1 vision PACK VDIR`` on the same GPU:
+
+    python -u -B vision_ref.py --tower-only --vdir VDIR --pack PACK
 """
 from __future__ import annotations
 
@@ -107,14 +112,32 @@ def tower_dumps(vdir: Path, pack: Path, images: dict, dev):
             cos, sin = V._rope(img.n_vit_h, img.n_vit_w, hd // 2, t.theta, x.device)
             for i in range(t.layers):
                 p = f"vision.blocks.{i}"
+                # block 0's every op as its own stage ("b0.<op>", the Zig tower's layouts)
+                b0 = (lambda k, v: dumps.__setitem__(f"b0.{k}", v.clone())) if i == 0 else (lambda k, v: None)
                 h = V._rms(x, tt[f"{p}.norm1.weight"])
-                q, k, v = (a.view(n, t.heads, hd) for a in t.lin(h, f"{p}.attn.wqkv").chunk(3, dim=-1))
+                b0("norm1", h)
+                qkv = t.lin(h, f"{p}.attn.wqkv")
+                b0("qkv", qkv)
+                q, k, v = (a.view(n, t.heads, hd) for a in qkv.chunk(3, dim=-1))
                 q, k = V._rotate(q, cos, sin), V._rotate(k, cos, sin)
+                b0("rope", torch.stack([q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1)]))
                 o = V._sdpa(q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1))
-                x = x + t.lin(o.transpose(0, 1).reshape(n, -1), f"{p}.attn.wo")
+                o = o.transpose(0, 1).reshape(n, -1)
+                b0("attn", o)
+                wo = t.lin(o, f"{p}.attn.wo")
+                b0("wo", wo)
+                x = x + wo
+                b0("res1", x)
                 h = V._rms(x, tt[f"{p}.norm2.weight"])
-                g, u = t.lin(h, f"{p}.mlp.w1").chunk(2, dim=-1)
-                x = x + t.lin(F.silu(g) * u, f"{p}.mlp.w2")
+                b0("norm2", h)
+                w1 = t.lin(h, f"{p}.mlp.w1")
+                b0("w1", w1)
+                g, u = w1.chunk(2, dim=-1)
+                su = F.silu(g) * u
+                b0("silu", su)
+                w2 = t.lin(su, f"{p}.mlp.w2")
+                b0("w2", w2)
+                x = x + w2
                 if f"block{i}" in STAGES:
                     dumps[f"block{i}"] = x.clone()
             vit = V._rms(x, tt["vision.norm.weight"])
@@ -211,6 +234,13 @@ M2B.one = one_image
 
 def main() -> int:
     argv = sys.argv[1:]
+    if "--tower-only" in argv:
+        import torch
+
+        vdir, pack = Path(argv[argv.index("--vdir") + 1]), Path(argv[argv.index("--pack") + 1])
+        os.environ.pop("TF_DSV41_BIAS_VL", None)
+        tower_dumps(vdir, pack, prepare(vdir, pack), torch.device("cuda:0"))
+        return 0
     if "--vdir" not in argv or "--" not in argv:
         raise SystemExit(__doc__)
     os.environ["DSV41_VISION_DIR"] = argv[argv.index("--vdir") + 1]

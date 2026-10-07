@@ -1,15 +1,17 @@
 //! DeepSeek-V4.1's vision tower on rank 0 (vision.py ``Tower``, ``TF_DSV41_IMAGES=native``): the ViT (patch embedding
 //! 588 -> 1,024, 32 pre-norm blocks with a 2D RoPE and full attention within the image, SwiGLU 1,024 -> 2,816, a final
 //! RMSNorm) and the aligner (3 x 3 unfold, 9,216 -> 5,120, GELU, 5,120 -> 5,120), BF16 (0.97 GB), with the span's
-//! delimiter rows. The torch ops' bits come from vision.cu (each op torch's order) and cuBLASLt with addmm's settings
-//! (``gemm_and_bias``: fp32 compute, the heuristic's first algorithm, the bias epilogue). ``Encoder`` caches recent
-//! images' span rows by digest (TF_DSV41_VISION_CACHE_MB, default 64).
+//! delimiter rows. The torch ops' bits come from vision.cu (each op torch's order) and torch's two GEMM paths: a
+//! linear with a bias is addmm's cuBLASLt call (``gemm_and_bias``: fp32 compute, the bias epilogue, the heuristic's
+//! first algorithm under a 1 MiB workspace and the pointers' alignments), one without is ``mm``'s cublasGemmEx
+//! (vision_blas.zig). ``Encoder`` caches recent images' span rows by digest (TF_DSV41_VISION_CACHE_MB, default 64).
 const std = @import("std");
 const cuda = @import("cuda");
 const pack_mod = @import("pack.zig");
 const vk = @import("dsv41_kernels").vision;
 const held = @import("dsv41_serve").vision.held;
 const lt_mod = cuda.cublaslt;
+const blas_mod = @import("vision_blas.zig");
 
 const log = std.log.scoped(.dsv41);
 const Allocator = std.mem.Allocator;
@@ -31,6 +33,7 @@ pub const Shape = struct {
 const epilogue_attr: c_int = 7; // CUBLASLT_MATMUL_DESC_EPILOGUE
 const bias_pointer_attr: c_int = 8; // CUBLASLT_MATMUL_DESC_BIAS_POINTER
 const epilogue_bias: u32 = 4; // CUBLASLT_EPILOGUE_BIAS
+const pref_min_alignment_a: c_int = 5; // CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES (B 6, C 7, D 8)
 
 pub const Tower = struct {
     gpa: Allocator,
@@ -39,7 +42,10 @@ pub const Tower = struct {
     k: vk.Functions,
     lt: lt_mod.Library,
     handle: lt_mod.Handle,
+    blas: blas_mod.Blas,
+    /// torch's cuBLAS workspace (32 MiB); cuBLASLt shares it (``TORCH_CUBLASLT_UNIFIED_WORKSPACE``) at `lt_ws` bytes
     workspace: cuda.DeviceBuffer,
+    lt_ws: usize,
     weights: std.StringHashMapUnmanaged(cuda.DeviceBuffer) = .empty,
     bytes: u64 = 0,
     scratch: ?cuda.DeviceBuffer = null,
@@ -47,13 +53,10 @@ pub const Tower = struct {
     /// Every vision tensor of `pack` uploaded (BF16, as stored), the kernels and cuBLASLt opened.
     pub fn load(gpa: Allocator, io: std.Io, d: *const cuda.Driver, pack: *const pack_mod.Pack, shape: Shape) !*Tower {
         const t = try gpa.create(Tower);
-        errdefer gpa.destroy(t);
-        var lt = try lt_mod.Library.open();
-        errdefer lt.close();
-        var handle: lt_mod.Handle = null;
-        try lt.check(lt.api.cublasLtCreate(&handle), "cublasLtCreate");
-        const ws_mb = envUsize("TF_DSV41_VISION_LT_WS_MB", 32);
-        t.* = .{ .gpa = gpa, .d = d, .shape = shape, .k = try vk.Functions.load(d), .lt = lt, .handle = handle, .workspace = try cuda.DeviceBuffer.alloc(d, ws_mb << 20) };
+        t.* = init(gpa, d, shape) catch |e| {
+            gpa.destroy(t);
+            return e;
+        };
         errdefer t.deinit();
         var it = pack.names.iterator();
         var buf: std.ArrayList(u8) = .empty;
@@ -77,6 +80,23 @@ pub const Tower = struct {
         return t;
     }
 
+    /// The kernels, cuBLASLt, cuBLAS and the shared workspace; no weights yet.
+    fn init(gpa: Allocator, d: *const cuda.Driver, shape: Shape) !Tower {
+        var lt = try lt_mod.Library.open();
+        errdefer lt.close();
+        var handle: lt_mod.Handle = null;
+        try lt.check(lt.api.cublasLtCreate(&handle), "cublasLtCreate");
+        errdefer _ = lt.api.cublasLtDestroy(handle);
+        var blas = try blas_mod.Blas.open();
+        errdefer blas.close();
+        // ``CUBLASLT_WORKSPACE_SIZE`` (KiB, default 1,024), capped by the cuBLAS workspace as torch caps it
+        const lt_ws = @min(envUsize("CUBLASLT_WORKSPACE_SIZE", 1024) << 10, blas_mod.workspace_bytes);
+        var ks = try vk.Functions.load(d);
+        errdefer ks.unload();
+        const ws = try cuda.DeviceBuffer.alloc(d, blas_mod.workspace_bytes);
+        return .{ .gpa = gpa, .d = d, .shape = shape, .k = ks, .lt = lt, .handle = handle, .blas = blas, .workspace = ws, .lt_ws = lt_ws };
+    }
+
     pub fn deinit(t: *Tower) void {
         var it = t.weights.iterator();
         while (it.next()) |e| {
@@ -86,6 +106,7 @@ pub const Tower = struct {
         t.weights.deinit(t.gpa);
         if (t.scratch) |*s| s.free();
         t.workspace.free();
+        t.blas.close();
         _ = t.lt.api.cublasLtDestroy(t.handle);
         t.lt.close();
         t.k.unload();
@@ -104,21 +125,20 @@ pub const Tower = struct {
         return if (t.weights.get(name)) |b| b.ptr else null;
     }
 
-    /// ``F.linear(x [m, k], W [n, k], b)`` -> y [m, n] bf16 (addmm's cublasLt call with the bias epilogue, or the plain
-    /// matmul without a bias).
+    /// ``F.linear(x [m, k], W [n, k], b)`` -> y [m, n] bf16: addmm's cuBLASLt call with the bias epilogue, or mm's
+    /// cublasGemmEx without a bias.
     fn linear(t: *Tower, s: cuda.Stream, x: u64, m: usize, k: usize, wt: u64, bias: ?u64, n: usize, y: u64) !void {
+        const b = bias orelse return t.blas.linear(@ptrCast(s.handle), t.workspace.ptr, x, m, k, wt, n, y);
         const api = t.lt.api;
         var desc: lt_mod.MatmulDesc = null;
         try t.lt.check(api.cublasLtMatmulDescCreate(&desc, lt_mod.compute_32f, .f32), "desc");
         defer _ = api.cublasLtMatmulDescDestroy(desc);
-        const ta: c_int = @intFromEnum(lt_mod.Op.t);
-        const tb: c_int = @intFromEnum(lt_mod.Op.n);
+        const ta: c_int = @backingInt(lt_mod.Op.t);
+        const tb: c_int = @backingInt(lt_mod.Op.n);
         try t.lt.check(api.cublasLtMatmulDescSetAttribute(desc, lt_mod.desc_transa, &ta, @sizeOf(c_int)), "transa");
         try t.lt.check(api.cublasLtMatmulDescSetAttribute(desc, lt_mod.desc_transb, &tb, @sizeOf(c_int)), "transb");
-        if (bias) |b| {
-            try t.lt.check(api.cublasLtMatmulDescSetAttribute(desc, epilogue_attr, &epilogue_bias, @sizeOf(u32)), "epilogue");
-            try t.lt.check(api.cublasLtMatmulDescSetAttribute(desc, bias_pointer_attr, &b, @sizeOf(u64)), "bias");
-        }
+        try t.lt.check(api.cublasLtMatmulDescSetAttribute(desc, epilogue_attr, &epilogue_bias, @sizeOf(u32)), "epilogue");
+        try t.lt.check(api.cublasLtMatmulDescSetAttribute(desc, bias_pointer_attr, &b, @sizeOf(u64)), "bias");
         var la: lt_mod.Layout = null;
         var lb: lt_mod.Layout = null;
         var lc: lt_mod.Layout = null;
@@ -131,15 +151,20 @@ pub const Tower = struct {
         var pref: lt_mod.Preference = null;
         try t.lt.check(api.cublasLtMatmulPreferenceCreate(&pref), "pref");
         defer _ = api.cublasLtMatmulPreferenceDestroy(pref);
-        const limit: u64 = t.workspace.len;
+        const limit: u64 = t.lt_ws;
         try t.lt.check(api.cublasLtMatmulPreferenceSetAttribute(pref, lt_mod.pref_max_workspace_bytes, &limit, @sizeOf(u64)), "workspace");
+        // ``_getAlignment``: A = W, B = x, C = y, D = the bias
+        for ([_]u64{ wt, x, y, b }, 0..) |p, i| {
+            const al: u32 = blas_mod.alignment(p);
+            try t.lt.check(api.cublasLtMatmulPreferenceSetAttribute(pref, pref_min_alignment_a + @as(c_int, @intCast(i)), &al, @sizeOf(u32)), "alignment");
+        }
         var found: [1]lt_mod.Heuristic = undefined;
         var count: c_int = 0;
         try t.lt.check(api.cublasLtMatmulAlgoGetHeuristic(t.handle, desc, la, lb, lc, lc, pref, 1, &found, &count), "heuristic");
         if (count < 1 or found[0].state != 0) return error.NoAlgorithm;
         const one: f32 = 1;
         const zero: f32 = 0;
-        try t.lt.check(api.cublasLtMatmul(t.handle, desc, &one, wt, la, x, lb, &zero, y, lc, y, lc, &found[0].algo, t.workspace.ptr, t.workspace.len, s.handle), "matmul");
+        try t.lt.check(api.cublasLtMatmul(t.handle, desc, &one, wt, la, x, lb, &zero, y, lc, y, lc, &found[0].algo, t.workspace.ptr, t.lt_ws, s.handle), "matmul");
     }
 
     fn grow(t: *Tower, bytes: usize) !u64 {
@@ -197,16 +222,28 @@ pub const Tower = struct {
         const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(D / sh.heads)));
         const scale_log2: f32 = @floatCast(@as(f64, scale) * std.math.log2e);
         for (0..sh.layers) |i| {
+            // block 0's every op as its own stage ("b0.<op>", Python's layout), so a gate names the op
+            const t0: ?Tap = if (i == 0) tap else null;
             try ks.rms(x, try t.w("vision.blocks.{d}.norm1.weight", .{i}), h, n, D, 1e-6);
+            if (t0) |tp| try tp.at(tp.ctx, s, "b0.norm1", h, n * D * 2);
             try t.linear(s, h, n, D, try t.w("vision.blocks.{d}.attn.wqkv.weight", .{i}), t.wOpt("vision.blocks.{d}.attn.wqkv.bias", .{i}), 3 * D, qkv);
+            if (t0) |tp| try tp.at(tp.ctx, s, "b0.qkv", qkv, n * 3 * D * 2);
             try ks.rope(qkv, q, kk, v, n, img.vit_w, sh.heads, sh.theta);
+            if (t0) |tp| try tp.at(tp.ctx, s, "b0.rope", q, 3 * n * D * 2); // q k v as [3, heads, n, 64]
             try ks.attn(q, kk, v, o, n, sh.heads, scale_log2);
+            if (t0) |tp| try tp.at(tp.ctx, s, "b0.attn", o, n * D * 2);
             try t.linear(s, o, n, D, try t.w("vision.blocks.{d}.attn.wo.weight", .{i}), t.wOpt("vision.blocks.{d}.attn.wo.bias", .{i}), D, h);
+            if (t0) |tp| try tp.at(tp.ctx, s, "b0.wo", h, n * D * 2);
             try ks.add(x, h, n * D);
+            if (t0) |tp| try tp.at(tp.ctx, s, "b0.res1", x, n * D * 2);
             try ks.rms(x, try t.w("vision.blocks.{d}.norm2.weight", .{i}), h, n, D, 1e-6);
+            if (t0) |tp| try tp.at(tp.ctx, s, "b0.norm2", h, n * D * 2);
             try t.linear(s, h, n, D, try t.w("vision.blocks.{d}.mlp.w1.weight", .{i}), t.wOpt("vision.blocks.{d}.mlp.w1.bias", .{i}), 2 * I, m);
+            if (t0) |tp| try tp.at(tp.ctx, s, "b0.w1", m, n * 2 * I * 2);
             try ks.siluMul(m, mm, n, I);
+            if (t0) |tp| try tp.at(tp.ctx, s, "b0.silu", mm, n * I * 2);
             try t.linear(s, mm, n, I, try t.w("vision.blocks.{d}.mlp.w2.weight", .{i}), t.wOpt("vision.blocks.{d}.mlp.w2.bias", .{i}), D, h);
+            if (t0) |tp| try tp.at(tp.ctx, s, "b0.w2", h, n * D * 2);
             try ks.add(x, h, n * D);
             if (tap) |tp| {
                 var nb: [32]u8 = undefined;

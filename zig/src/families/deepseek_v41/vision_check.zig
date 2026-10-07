@@ -3,6 +3,9 @@
 //! (``<name>.<stage>.bin``: embed, block<i>, vit, gelu) and its span rows (``<name>.span.bin``). Each stage and the span
 //! are compared bit for bit; a differing stage reports its first differing element, the count and the largest
 //! difference, so the first op that leaves torch's bits is named. PASS when every image's span rows are equal.
+//! Block 0 also dumps each op (``b0.norm1`` .. ``b0.w2``). TF_DSV41_VISION_RESYNC=1 tests the ops apart: after each
+//! compared stage the buffer takes Python's bits, so every stage's count is that op's alone (the span then is not the
+//! tower's: the PASS line stays the chained run's job).
 const std = @import("std");
 const cuda = @import("cuda");
 const pack_mod = @import("pack.zig");
@@ -14,6 +17,7 @@ const Cmp = struct {
     io: std.Io,
     dir: []const u8,
     name: []const u8,
+    resync: bool = false,
     bad_stages: usize = 0,
     first_bad: ?[]const u8 = null,
 
@@ -33,6 +37,7 @@ const Cmp = struct {
             return;
         }
         const r = diff(got, want);
+        if (r.count != 0 and c.resync) try cuda.DeviceBuffer.upload(.{ .d = s.d, .ptr = ptr, .len = bytes }, 0, want);
         if (r.count == 0) return;
         c.bad_stages += 1;
         if (c.first_bad == null) c.first_bad = try c.gpa.dupe(u8, stage);
@@ -71,6 +76,8 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, dir: []cons
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const got = try rows_mod.readManifest(arena.allocator(), io, dir);
+    const resync = if (std.c.getenv("TF_DSV41_VISION_RESYNC")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+    if (resync) std.debug.print("vision: TF_DSV41_VISION_RESYNC=1, each stage on Python's input (ops apart)\n", .{});
     var equal: usize = 0;
     for (got.held.slice(), got.m.images) |*img, e| {
         const np = @as(usize, img.vit_h) * img.vit_w * 3 * 14 * 14;
@@ -79,7 +86,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, dir: []cons
         const bytes = img.n_vids * t.shape.out * 2;
         var out = try cuda.DeviceBuffer.alloc(&driver, bytes);
         defer out.free();
-        var cmp: Cmp = .{ .gpa = gpa, .io = io, .dir = dir, .name = e.name };
+        var cmp: Cmp = .{ .gpa = gpa, .io = io, .dir = dir, .name = e.name, .resync = resync };
         const t0 = std.Io.Clock.awake.now(io).nanoseconds;
         try t.spanTapped(stream, img, patches.ptr, out.ptr, .{ .ctx = &cmp, .at = Cmp.at });
         try Cmp.at(&cmp, stream, "span", out.ptr, bytes);
