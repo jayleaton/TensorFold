@@ -235,6 +235,14 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, step: *std.Build.S
     const rows_run = b.addRunArtifact(b.addTest(.{ .root_module = rows }));
     b.step("test-dsv41-rows", "DeepSeek-V4.1 row mode (several slots) on the real emitter, host only").dependOn(&rows_run.step);
     step.dependOn(&rows_run.step);
+    // DSV4.1 prod knobs on the Zig side: their readers and the fused dense prefill on the real prefill emitter
+    const knobs = b.createModule(.{ .root_source_file = b.path("zig/src/families/deepseek_v41/prod_knobs_test.zig"), .target = host, .optimize = .debug, .link_libc = true });
+    knobs.addImport("cuda", cuda);
+    knobs.addImport("dsv41_kernels", dsv41Kernels(b, host, .debug, cuda, &.{}));
+    knobs.addImport("tp", @import("tp.zig").module(b, host, .debug, cuda));
+    const knobs_run = b.addRunArtifact(b.addTest(.{ .root_module = knobs }));
+    b.step("test-dsv41-knobs", "DeepSeek-V4.1 prod knobs (fused dense prefill, rows, read-ahead) on the real prefill emitter, host only").dependOn(&knobs_run.step);
+    step.dependOn(&knobs_run.step);
     // DSV4.1 DSpark over several slots: the passes' launches, statics and messages on the real emitter
     const mdraft = b.createModule(.{ .root_source_file = b.path("zig/src/families/deepseek_v41/mdraft_test.zig"), .target = host, .optimize = .debug, .link_libc = true });
     mdraft.addImport("cuda", cuda);
