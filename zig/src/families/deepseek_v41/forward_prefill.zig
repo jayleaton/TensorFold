@@ -301,6 +301,8 @@ fn glueFn(ctx: *anyopaque, r: *run.Runner, c: *const calls.Call) anyerror!void {
     if (eql(u8, step, "stream_merge")) return longpf.merge(&st.long, f.gpa, r, c);
     if (eql(u8, step, "zeros")) return zero(r, try r.tensorAddr(x[0].arg.t), bytesOf(x[0].arg.t));
     if (eql(u8, step, "image_keep")) return vision_rows.keep(f, r, c);
+    if (eql(u8, step, "image_split") or eql(u8, step, "image_merge")) return vision_rows.splitRows(f, r, c, eql(u8, step, "image_merge"));
+    if (eql(u8, step, "gm_ticket_again")) return zero(r, try r.tensorAddr(x[0].arg.t), bytesOf(x[0].arg.t)); // vision.moe's text call: the same layer
     if (eql(u8, step, "topk")) {
         // index.top_positions: each row's `count` largest int64 keys as positions, ascending, -1 padded
         const keys = x[0].arg.t;
