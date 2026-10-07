@@ -126,6 +126,9 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, ref: []con
     var f = fwd.Forward.init(gpa, &cfg, &wd, .{ .expert_topp = topp, .r1 = r1 }, &runner, comm);
     defer f.deinit();
     f.layers = layers;
+    // TF_DSV41_IMAGES=native + TF_DSV41_VISION_HOLD (vision_rows.zig): the vision gate's image prompts
+    try @import("vision_rows.zig").boot(gpa, io, &f, &pack, &driver, rank);
+    defer @import("vision_rows.zig").close(&f);
     // the reference's slot limit (dsv41_m2b_ref.py --limit; its rope.bin has limit + 2,048 rows): long prompts
     if (meta.object.get("limit")) |l| {
         f.opts.limit = l.integer;
