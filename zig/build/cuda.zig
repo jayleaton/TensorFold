@@ -219,14 +219,14 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, step: *std.Build.S
     const rows_run = b.addRunArtifact(b.addTest(.{ .root_module = rows }));
     b.step("test-dsv41-rows", "DeepSeek-V4.1 row mode (several slots) on the real emitter, host only").dependOn(&rows_run.step);
     step.dependOn(&rows_run.step);
-    // DSV4.1 long prompts: the stream top-k and split KV's row-blocked attention on the real prefill emitter
-    const longpf = b.createModule(.{ .root_source_file = b.path("zig/src/families/deepseek_v41/longpf_test.zig"), .target = host, .optimize = .debug, .link_libc = true });
-    longpf.addImport("cuda", cuda);
-    longpf.addImport("dsv41_kernels", dsv41Kernels(b, host, .debug, cuda, &.{}));
-    longpf.addImport("tp", @import("tp.zig").module(b, host, .debug, cuda));
-    const longpf_run = b.addRunArtifact(b.addTest(.{ .root_module = longpf }));
-    b.step("test-dsv41-longpf", "DeepSeek-V4.1 long prompts (stream top-k, split KV's row blocks) on the real prefill emitter, host only").dependOn(&longpf_run.step);
-    step.dependOn(&longpf_run.step);
+    // DSV4.1 DSpark over several slots: the passes' launches, statics and messages on the real emitter
+    const mdraft = b.createModule(.{ .root_source_file = b.path("zig/src/families/deepseek_v41/mdraft_test.zig"), .target = host, .optimize = .debug, .link_libc = true });
+    mdraft.addImport("cuda", cuda);
+    mdraft.addImport("dsv41_kernels", dsv41Kernels(b, host, .debug, cuda, &.{}));
+    mdraft.addImport("tp", @import("tp.zig").module(b, host, .debug, cuda));
+    const mdraft_run = b.addRunArtifact(b.addTest(.{ .root_module = mdraft }));
+    b.step("test-dsv41-mdraft", "DeepSeek-V4.1 DSpark drafting over several slots on the real emitter, host only").dependOn(&mdraft_run.step);
+    step.dependOn(&mdraft_run.step);
     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = host, .optimize = .debug, .link_libc = true });
     cli.addImport("cuda", cuda);
     cli.addImport("core", mods.core);
