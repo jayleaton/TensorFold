@@ -503,6 +503,7 @@ Pod-side lessons for anyone running pods: the shared `runpod/idle-guard.sh` dele
 - R1's 4-row `mhc_cuda` fault was the M2b test driver's 1-row buffer plan (fixed `a585336`); the served path plans every window size, so no `R1=0` fallback is expected (keep it as a last resort).
 - Kit knobs: keep `IMAGES` off (the tower is not bit-exact); `GRAMMAR=1`, `PF_DENSE=fused` and the 64 MiB index budget are gated (PASS here); `SLOT_DRAFTS=1` is gated eager.
 - Long prompts (run C) have no GPU gate yet: run C is their first GPU run.
+- Part 4 (Zig as prod): `config/prod-zig.env` on the prod mirror's `zig-serve` branch is at `57a1ea0`: it now turns on `TF_DSV41_SPEC_DRAFT=1`, `TF_DSV41_GRAMMAR=1` (the canary's json probe back on) and `TF_DSV41_PF_DENSE=fused` with prod's table, all gated on pods 29 / 30; `IMAGES` stays `placeholder`.
 - **Images (`IMAGES=native` + `BIAS_VL`):** the tower fix's gate runs on the Sparks this night: "FOR THE NIGHT RUN: images" just below. Keep `IMAGES` off in the kit's other runs whatever it prints.
 
 ### FOR THE NIGHT RUN: images (`dsq-zig-vision-1`, TF_DSV41_IMAGES=native + BIAS_VL)
