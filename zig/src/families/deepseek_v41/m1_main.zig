@@ -80,6 +80,11 @@ pub fn main(init: std.process.Init) !u8 {
             std.debug.print("FAIL tf-dsv41-m1 follow: {t}\n", .{e});
             return 1;
         };
+    if (args.len == 5 and std.mem.eql(u8, args[1], "slots"))
+        return @import("slots_cli.zig").main(init.gpa, init.io, args[2], args[3], args[4]) catch |e| {
+            std.debug.print("FAIL tf-dsv41-m1 slots: {t}\n", .{e});
+            return 1;
+        };
     if (args.len == 5 and std.mem.eql(u8, args[1], "generate"))
         return @import("serve_cli.zig").generate(init.gpa, init.io, args[2], args[3], args[4]) catch |e| {
             std.debug.print("FAIL tf-dsv41-m1 generate: {t}\n", .{e});
