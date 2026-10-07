@@ -348,7 +348,7 @@ const Ds = struct {
             .{ .i = 4 },
         });
         // R1: the split kernel's CTAs a chunk; q arrives rotated (the drafter keeps its `_rope`: no ATTN_ROPE fold)
-        if (e.o.r1) try d.appendArgs(&.{ .{ .i = E.attnSplit(n) }, .{ .i = 0 } });
+        if (e.o.r1) try d.appendArgs(&.{ .{ .i = E.attnSplit(n) }, .{ .i = 0 } }) else if (e.o.r1_sig) try d.appendArgs(&.{ .{ .i = 0 }, .{ .i = 0 } });
         // o: wo_a's groups over the heads' columns, then wo_b (this rank's fp32 partial)
         const g: usize = cf.o_groups / e.o.world;
         const gk: i64 = @divExact(H * hd, @as(i64, @intCast(g)));
@@ -389,7 +389,8 @@ const Ds = struct {
             .{ .f = E.dec(d.cfg().eps) },                                     .{ .f = E.dec(d.cfg().hc_eps) },
             .{ .f = E.dec(d.cfg().hc_post_alpha) },                           .{ .i = d.cfg().hc_sinkhorn_iters },
         });
-        if (e.o.r1) try d.appendArgs(&.{ .{ .i = e.o.mhc_spin }, .{ .i = 0 } }); // MHC_TAIL; a final mixes nothing
+        if (e.o.r1) try d.appendArgs(&.{ .{ .i = e.o.mhc_spin }, .{ .i = 0 } }) // MHC_TAIL; a final mixes nothing
+        else if (e.o.r1_sig) try d.appendArgs(&.{ .{ .i = -1 }, .{ .i = 0 } });
     }
 
     /// R1's trailing arguments onto the last call.
@@ -510,8 +511,14 @@ pub fn checkDraft(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, experts: 
     var roles: calls.Roles = .{ .a = a };
     var flow: check.Flow = .{ .a = a };
     var bad: usize = 0;
-    const opts = try check.optionsOf(a, io, dir);
-    for (try phases(a, io, dir, &cfg)) |p| {
+    var opts = try check.optionsOf(a, io, dir);
+    const ps = try phases(a, io, dir, &cfg);
+    {
+        const lists = try a.alloc([]std.json.ObjectMap, ps.len);
+        for (lists, ps) |*l, p| l.* = p.ops;
+        opts.r1_sig = !opts.r1 and check.r1Sig(lists);
+    }
+    for (ps) |p| {
         const cs = try phaseCalls(a, &cfg, &w, opts, p);
         var equal: usize = 0;
         var shown: usize = 0;

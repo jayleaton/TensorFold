@@ -855,7 +855,7 @@ const Seg = struct {
             @memcpy(more[0..last.args.len], last.args);
             more[last.args.len] = .{ .arg = .{ .list = &.{} } };
             last.args = more;
-        }
+        } else if (e.o.r1_sig) try e.appendLast(&.{.{ .list = &.{} }});
         // the kit's fp16 weights, the shared slot masked, the routed slots' contiguous copies (one row: torch's
         // .contiguous() keeps the [1, topk] view of the [1, slots] rows, the same bytes)
         const rs: i64 = if (n == 1) slots else topk;

@@ -70,6 +70,10 @@ pub const Options = struct {
     /// prune + kit rounding (RG_PRUNE, PRUNE_KIT), a bf16 MoE partial (MOE_BF16), q_norm folded into its consumers'
     /// rot_in (RMS_FOLD)
     r1: bool = false,
+    /// R1 off, but the bindings of a twin that always takes R1's trailing arguments (the midprofile twin, dba6a1f+):
+    /// each call R1 extends gets them at their off values (mHC spin -1 / defer 0, the attention's split 0 / rope 0, the
+    /// route's empty prune list, `_prune`'s KIT false). The same launches; the check reads it from a capture's calls
+    r1_sig: bool = false,
     /// MHC_TAIL_SPIN (SM cycles a CTA waits for the last arrival)
     mhc_spin: i64 = 8000,
     /// M5: the KV families in the paged pool (kv.DevicePool, Python's serving slots) instead of the slot's contiguous
@@ -167,6 +171,15 @@ pub const Emitter = struct {
         x.begin = e.begin;
         e.begin = .none;
         try e.out.append(e.a, x);
+    }
+
+    /// Appends positional arguments to the last emitted call (R1's trailing arguments).
+    pub fn appendLast(e: *Emitter, args: []const Arg) !void {
+        const last = &e.out.items[e.out.items.len - 1];
+        const more = try e.a.alloc(calls.Named, last.args.len + args.len);
+        @memcpy(more[0..last.args.len], last.args);
+        for (more[last.args.len..], args) |*m, x| m.* = .{ .arg = x };
+        last.args = more;
     }
 
     pub fn ext(e: *Emitter, name: []const u8, args: []const Arg) !void {
@@ -556,9 +569,10 @@ pub const Emitter = struct {
         return .{ try e.buf("w.sel{d}", .{src}, .i32, &.{ e.n, e.cfg.index_topk }), try e.buf("w.cnt{d}", .{src}, .i32, &.{e.n}) };
     }
 
-    /// attn_cuda's ticket words: a (row, head tile)'s ranks, 4 with R1's split kernel (MAX_SPLIT)
+    /// attn_cuda's ticket words: a (row, head tile)'s ranks, 4 with R1's split kernel (MAX_SPLIT); the twins with
+    /// R1's bindings size it for the split kernel whatever the knob (`r1_sig`)
     pub fn ticketLen(e: *const Emitter) i64 {
-        return if (e.o.r1) 1024 else 256;
+        return if (e.o.r1 or e.o.r1_sig) 1024 else 256;
     }
 
     /// attn_cuda.split: CTAs a chunk with R1 (ATTN_SPLIT 4 up to ATTN_SPLIT_ROWS = 2 rows, 1 above)
@@ -721,7 +735,7 @@ pub const Emitter = struct {
             more[last.args.len] = .{ .arg = .{ .i = attnSplit(n) } };
             more[last.args.len + 1] = .{ .arg = .{ .i = 1 } };
             last.args = more;
-        }
+        } else if (e.o.r1_sig) try e.appendLast(&.{ .{ .i = 0 }, .{ .i = 0 } });
         // o: wo_a's groups over the heads' columns, then wo_b (this rank's partial)
         const g: usize = e.cfg.o_groups / e.o.world;
         const gk: i64 = @divExact(H * hd, @as(i64, @intCast(g)));

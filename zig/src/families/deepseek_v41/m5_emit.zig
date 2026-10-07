@@ -132,6 +132,7 @@ pub fn checkAll(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, experts: []
     for ([_]bool{ false, true }) |split| {
         var opts = try check.optionsOf(a, io, dir);
         opts.gm_v2 = check.gmMode(ws);
+        opts.r1_sig = !opts.r1 and try check.r1SigOf(a, ws);
         opts.pool = poolOf(opts.limit, split);
         const P = opts.pool.?;
         for (ws) |win| {

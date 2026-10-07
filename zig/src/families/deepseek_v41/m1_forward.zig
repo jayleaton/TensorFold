@@ -308,6 +308,7 @@ pub fn runAll(f: *Forward, out_dir: []const u8, experts: []const u8) !Counts {
     try check.gmWidths(a, &wg, ws);
     var opts = try check.optionsOf(a, f.io, f.dir);
     opts.gm_v2 = check.gmMode(ws);
+    opts.r1_sig = !opts.r1 and try check.r1SigOf(a, ws);
     var last_set: []const u8 = "";
     var roles: calls.Roles = .{ .a = a };
     for (ws) |win| {
@@ -365,8 +366,10 @@ pub fn runDraft(f: *Forward, out_dir: []const u8, experts: []const u8) !Counts {
     var it = f.bufs.valueIterator();
     while (it.next()) |b| b.live = false;
     var roles: calls.Roles = .{ .a = a };
-    const dopts = try check.optionsOf(a, f.io, f.dir);
-    for (try ds.phases(a, f.io, f.dir, &cfg)) |p| {
+    var dopts = try check.optionsOf(a, f.io, f.dir);
+    const dphases = try ds.phases(a, f.io, f.dir, &cfg);
+    dopts.r1_sig = !dopts.r1 and check.r1Sig(try opsOf(a, dphases));
+    for (dphases) |p| {
         const cs = try ds.phaseCalls(a, &cfg, &w, dopts, p);
         const before = f.counts;
         for (cs[0..@min(cs.len, p.ops.len)], p.ops[0..@min(cs.len, p.ops.len)], 0..) |*c, op, i| {
@@ -383,4 +386,10 @@ pub fn runDraft(f: *Forward, out_dir: []const u8, experts: []const u8) !Counts {
         std.debug.print("forward P {s}: {d} calls, {d} equal, {d} differ, {d} skipped, {d} failed\n", .{ p.name, f.counts.calls - before.calls, f.counts.equal - before.equal, f.counts.differ - before.differ, f.counts.skipped - before.skipped, f.counts.failed - before.failed });
     }
     return f.counts;
+}
+
+fn opsOf(a: std.mem.Allocator, ps: anytype) ![]const []std.json.ObjectMap {
+    const lists = try a.alloc([]std.json.ObjectMap, ps.len);
+    for (lists, ps) |*l, p| l.* = p.ops;
+    return lists;
 }

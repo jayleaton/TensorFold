@@ -260,6 +260,27 @@ pub fn gmWidths(a: std.mem.Allocator, w: *block.Widths, ws: []const Window) !voi
 
 /// The x3gm version the capture's prefill launched (gm2pf.ofLaunches over every phase's ops): meta.json's
 /// TF_DSV41_GM_V2 is not it, the pre-v2 twins ignored the knob.
+/// A capture from a twin whose bindings always take R1's trailing arguments (the midprofile twin, dba6a1f+) with R1
+/// off: an mHC boundary launched with 26 arguments and spin -1 (`block.Options.r1_sig`).
+pub fn r1Sig(ops_lists: []const []std.json.ObjectMap) bool {
+    for (ops_lists) |ops| for (ops) |op| {
+        const name = (op.get("name") orelse continue);
+        if (name != .string or !std.mem.eql(u8, name.string, "tf_dsv41_mhc_cuda_v1.run")) continue;
+        const args = (op.get("args") orelse continue).array.items;
+        if (args.len != 26) return false;
+        const spin = args[24].object.get("v") orelse return false;
+        return spin == .integer and spin.integer < 0;
+    };
+    return false;
+}
+
+/// `r1Sig` over a capture's windows.
+pub fn r1SigOf(a: std.mem.Allocator, ws: []const Window) !bool {
+    const lists = try a.alloc([]std.json.ObjectMap, ws.len);
+    for (lists, ws) |*l, w| l.* = w.ops;
+    return r1Sig(lists);
+}
+
 pub fn gmMode(ws: []const Window) @import("gm2pf.zig").Mode {
     const Names = struct {
         ws: []const Window,
@@ -328,7 +349,9 @@ pub fn checkAll(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, experts: []
     try gmWidths(a, &w, ws);
     var opts = try optionsOf(a, io, dir);
     opts.gm_v2 = gmMode(ws);
+    opts.r1_sig = !opts.r1 and try r1SigOf(a, ws);
     if (opts.r1) try log.print("options: R1 (the capture's knobs)\n", .{});
+    if (opts.r1_sig) try log.print("options: R1's trailing arguments at their off values (the twin's bindings)\n", .{});
     if (opts.gm_v2 != .off) try log.print("options: x3gm v2 {t} (the capture's launches)\n", .{opts.gm_v2});
     var bad: usize = 0;
     // the variant gate when the capture's AOT set carries the specialization (dsv41_m1_capture.py pack_aot, 2026-10-06+)

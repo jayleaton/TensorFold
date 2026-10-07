@@ -87,7 +87,7 @@ pub fn mhc(e: *E, layer: ?u32, which: []const u8, mode: Mode) !void {
             .{ .f = E.dec(e.cfg.hc_eps) },                           .{ .f = E.dec(e.cfg.hc_post_alpha) },
             .{ .i = e.cfg.hc_sinkhorn_iters },
         });
-    }
+    } else if (e.o.r1_sig) try e.appendLast(&.{ .{ .i = -1 }, .{ .i = 0 } }); // the twin's binding, R1 off: no tail
     if (mix) e.coef = 1 - e.coef;
     if (mode == .boundary) e.cur = 1 - e.cur;
 }
@@ -163,7 +163,7 @@ pub fn moe(e: *E, L: u32) !void {
         @memcpy(more[0..last.args.len], last.args);
         more[last.args.len] = .{ .arg = .{ .list = try e.a.dupe(Arg, pa) } };
         last.args = more;
-    }
+    } else if (e.o.r1_sig) try e.appendLast(&.{.{ .list = &.{} }}); // the twin's route always takes the prune list
     if (!fold) {
         try e.triton("_prune", .{ std.math.divCeil(i64, n, 16) catch unreachable, 1, 1 }, &.{
             .{ .name = "PICK", .arg = pick },               .{ .name = "WTS", .arg = wts },
@@ -174,6 +174,13 @@ pub fn moe(e: *E, L: u32) !void {
             .{ .name = "KP", .arg = .{ .i = 8 } },          .{ .name = "DUP", .arg = .{ .b = false } },
             .{ .name = "BR", .arg = .{ .i = 16 } },         .{ .name = "ORIG", .arg = .{ .b = false } },
         });
+        if (e.o.r1_sig) { // the twin's `_prune` takes KIT (R1's PRUNE_KIT) as its last constexpr
+            const last = &e.out.items[e.out.items.len - 1];
+            const more = try e.a.alloc(calls.Named, last.args.len + 1);
+            @memcpy(more[0..last.args.len], last.args);
+            more[last.args.len] = .{ .name = "KIT", .arg = .{ .b = false } };
+            last.args = more;
+        }
         try e.glue("kit_weights", &.{ wts, try e.buf("L.wts16", .{}, .f32, &.{ n, slots }) });
         try e.ext("tensorfold_exl3_experts_v1.group", &.{ pick, uids, ucount, members, .{ .i = n }, .{ .i = slots }, .{ .i = Et } });
     }
