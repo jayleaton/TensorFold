@@ -402,8 +402,8 @@ pub fn phases(a: std.mem.Allocator, io: std.Io, dir: []const u8, cfg: *const Con
 }
 
 /// A phase's launches (glue left out).
-pub fn phaseCalls(a: std.mem.Allocator, cfg: *const Config, w: *const block.Widths, p: Phase) ![]const calls.Call {
-    const all = if (p.name[0] == 'i') try emitIngest(a, cfg, w, .{}, p.n, p.skip) else try emitPass(a, cfg, w, .{}, p.n);
+pub fn phaseCalls(a: std.mem.Allocator, cfg: *const Config, w: *const block.Widths, o: block.Options, p: Phase) ![]const calls.Call {
+    const all = if (p.name[0] == 'i') try emitIngest(a, cfg, w, o, p.n, p.skip) else try emitPass(a, cfg, w, o, p.n);
     return calls.launches(a, all);
 }
 
@@ -425,8 +425,9 @@ pub fn checkDraft(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, experts: 
     var roles: calls.Roles = .{ .a = a };
     var flow: check.Flow = .{ .a = a };
     var bad: usize = 0;
+    const opts = try check.optionsOf(a, io, dir);
     for (try phases(a, io, dir, &cfg)) |p| {
-        const cs = try phaseCalls(a, &cfg, &w, p);
+        const cs = try phaseCalls(a, &cfg, &w, opts, p);
         var equal: usize = 0;
         var shown: usize = 0;
         const m = @min(cs.len, p.ops.len);

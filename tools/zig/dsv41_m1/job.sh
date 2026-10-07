@@ -115,6 +115,7 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
             du -sh "$dir" | tee "$RES/$name-size.txt"
             # M1_MODE=both: also our emitters' launches on our buffers (block.zig, block_prefill.zig, dspark_emit.zig)
             "$Z/bin/tf-dsv41-m1" check "$dir" > "$RES/$name-check.log" 2>&1; tail -1 "$RES/$name-check.log" | tee -a "$RES/steps.txt"
+            [[ ",$sets," == *,P,* ]] && { "$Z/bin/tf-dsv41-m1" dcheck "$dir" > "$RES/$name-dcheck.log" 2>&1; tail -1 "$RES/$name-dcheck.log" | tee -a "$RES/steps.txt"; }
             CUDA_VISIBLE_DEVICES=0 step "m1-$name" "${M1_REPLAY_MIN:-10}" "$Z/bin/tf-dsv41-m1" "${M1_MODE:-replay}" "$LP" "$dir" "$RES/m1-$name" || rc=1
         else rc=1; fi
         mkdir -p "$RES/$name"

@@ -351,8 +351,9 @@ pub fn runDraft(f: *Forward, out_dir: []const u8, experts: []const u8) !Counts {
     var it = f.bufs.valueIterator();
     while (it.next()) |b| b.live = false;
     var roles: calls.Roles = .{ .a = a };
+    const dopts = try check.optionsOf(a, f.io, f.dir);
     for (try ds.phases(a, f.io, f.dir, &cfg)) |p| {
-        const cs = try ds.phaseCalls(a, &cfg, &w, p);
+        const cs = try ds.phaseCalls(a, &cfg, &w, dopts, p);
         if (cs.len != p.ops.len) return error.CallCount;
         const before = f.counts;
         for (cs, p.ops, 0..) |*c, op, i| {
