@@ -556,6 +556,9 @@ pub const Emitter = struct {
         };
     }
 
+    /// attn_cuda's MAX_EPT: past 8 CTAs x 512 threads x 31 entries a selection runs Python's Triton dtopk instead.
+    const topk_max_ept: i64 = 31;
+
     /// topk.plan: (cluster CTAs, entries a thread) for `nk` entries.
     fn topkPlan(nk: i64, cl_in: ?i64) [2]i64 {
         const cl = cl_in orelse @max(1, @min(8, std.math.divCeil(i64, nk, 4096) catch 1));
@@ -800,6 +803,34 @@ pub const Emitter = struct {
         const sel = try e.selection(L);
         const k: i64 = e.cfg.index_topk;
         const pl = topkPlan(nk, null);
+        if (pl[1] > topk_max_ept) {
+            // attn_cuda.plan is None past 8 x 512 x 31 entries: Python's backend runs dtopk.select (Triton _dtopk,
+            // the counts in the same launch), then a candidate source's blocks alone (attn_cuda.blocks: one job over
+            // the cdiv(nk, 8) blocks). A Reindex layer's scores are over the candidate blocks (16,384 keys): never here.
+            if (reindex) return error.Unsupported;
+            try e.triton("_dtopk", .{ n, 1, 1 }, &.{
+                .{ .name = "S", .arg = scores },                 .{ .name = "s_stride", .arg = .{ .i = scores.t.stride[0] } },
+                .{ .name = "P", .arg = scores },                 .{ .name = "p_stride", .arg = .{ .i = 0 } },
+                .{ .name = "POS", .arg = try e.pos() },          .{ .name = "NK", .arg = .{ .i = nk } },
+                .{ .name = "OUT", .arg = sel[0] },               .{ .name = "o_stride", .arg = .{ .i = k } },
+                .{ .name = "CNT", .arg = sel[1] },               .{ .name = "RATIO", .arg = .{ .i = ratio } },
+                .{ .name = "K", .arg = .{ .i = k } },            .{ .name = "MODE", .arg = .{ .i = 0 } },
+                .{ .name = "ROWS", .arg = .{ .b = false } },     .{ .name = "T", .arg = .{ .i = 4096 } },
+                .{ .name = "BS", .arg = .{ .i = 8 } },           .{ .name = "RB", .arg = .{ .i = 8 } },
+                .{ .name = "NPASS", .arg = .{ .i = 8 } },        .{ .name = "SORT", .arg = .{ .b = false } },
+                .{ .name = "COUNT", .arg = .{ .b = true } },     .{ .name = "KP", .arg = .{ .i = @intCast(std.math.ceilPowerOfTwo(u64, @intCast(k)) catch unreachable) } },
+            });
+            if (!e.cfg.isCandidateSource(L)) return;
+            const nb = std.math.divCeil(i64, nk, cbs) catch unreachable;
+            const bp = topkPlan(nb, null);
+            if (bp[1] > topk_max_ept) return error.Unsupported;
+            const job: [8]Arg = .{ scores, try e.empty(.i32), cand, try e.view(cand.t.role, .i32, &.{0}, &.{e.cfg.candidate_blocks}, 0), .{ .i = nb }, .{ .i = e.cfg.candidate_blocks }, .{ .i = 2 }, .{ .i = bp[1] } };
+            var one: std.ArrayList(Arg) = .empty;
+            try one.appendSlice(e.a, &job);
+            try one.appendSlice(e.a, &job);
+            try one.appendSlice(e.a, &.{ .{ .i = 1 }, try e.pos(), .{ .i = ratio }, .{ .i = cbs }, .{ .i = n }, .{ .i = bp[0] } });
+            return e.ext("tf_dsv41_attn_cuda_v1.topk", one.items);
+        }
         var jobs: [2][8]Arg = undefined;
         jobs[0] = .{ scores, if (reindex) cand else try e.empty(.i32), sel[0], sel[1], .{ .i = nk }, .{ .i = k }, .{ .i = if (reindex) 3 else 0 }, .{ .i = pl[1] } };
         const blocks = e.cfg.isCandidateSource(L);
