@@ -1,8 +1,9 @@
 //! M3's GPU target: draft/iface.zig's `Target` over forward.zig, so the lanes backend (draft/lanes.zig) drives the real
 //! model as it drives the CPU twin. This first form is one slot, chain windows (a draft chain under the pending token),
 //! greedy choices and the prefill as consecutive decode windows; trees (`parents`) run as chain windows on the slot
-//! (draft/branches.zig: the main chain, then a winning sibling's path in place of it); sampling (`lanes.Sampling` keyed
-//! at `draws`) and several slots are refused by name until state.zig (per-slot pools) and the sampler land.
+//! (draft/branches.zig: the main chain, then a winning sibling's path in place of it); several slots are refused by
+//! name until state.zig (per-slot pools) lands. Sampling (`lanes.Sampling`, T > 0, keyed at `draws`) goes through
+//! `sampler` (sampling_gpu.zig: Python's candidates, nucleus statistics and keyed choice); without one it is refused.
 //! M5 (`sessions`, with the paged pool): a prompt resumes the longest saved entry that strictly prefixes it (RAM or
 //! NVMe) and prefills only the rest; a released slot is saved as an entry (its pages shared, its bounded state kept),
 //! the residency budget parking or dropping the least recently used chats.
@@ -12,6 +13,7 @@ const iface = @import("draft/iface.zig");
 const lanes = @import("lanes");
 const fwd = @import("forward.zig");
 const sg = @import("sessions_gpu.zig");
+const samp = @import("sampling_gpu.zig");
 const branches = @import("draft/branches.zig");
 
 pub const Error = error{ TreeWindow, Sampling, Slots, NotAChain, WindowRows };
@@ -30,6 +32,8 @@ pub const GpuTarget = struct {
     own_prefill: bool = false,
     /// M5: the session store over the paged pool (null: every prompt from an empty slot, nothing kept)
     sessions: ?*sg.Sessions = null,
+    /// the keyed sampler (model.zig makes it on every rank): sampled choices; null refuses them (error.Sampling)
+    sampler: ?*samp.GpuSampler = null,
     /// draft trees (`parents`): resolved as chain windows on the slot (draft/branches.zig), the last one kept by path
     tree: branches.Resolver = .{},
 
@@ -44,10 +48,9 @@ pub const GpuTarget = struct {
     }
 
     fn prefill(p: *anyopaque, slot: u32, ids: []const u32, sampling: ?lanes.Sampling, draw: u64) anyerror!u32 {
-        _ = draw;
         const t = self_(p);
         if (slot != 0) return error.Slots;
-        if (sampling != null) return error.Sampling;
+        const keyed = try t.keyedOf(sampling);
         t.tree.clear();
         if (t.resume_first) |first| if (t.f.slot.pos == ids.len and t.f.slot.pending == null) return first;
         // a saved entry that prefixes the prompt: the slot continues at its position, the rest is prefilled
@@ -58,6 +61,7 @@ pub const GpuTarget = struct {
             try t.f.prefill(rest);
             const seg: usize = @intCast(t.f.opts.prefill_rows);
             const last = if (rest.len % seg == 0) seg else rest.len % seg;
+            if (keyed) |s| return t.pickOne(@intCast(last - 1), s, draw);
             const picks = try t.f.gpa.alloc(u32, last);
             defer t.f.gpa.free(picks);
             try t.f.greedy(picks);
@@ -69,10 +73,12 @@ pub const GpuTarget = struct {
             const n = @min(@min(t.prefill_rows, t.max_rows), ids.len - at_);
             try t.f.window(ids[at_ .. at_ + n]);
             if (at_ + n == ids.len) {
-                // the keyed choice after the prompt's last row: the last row's greedy pick
-                var rows: [64]u32 = undefined;
-                try t.f.greedy(rows[0..n]);
-                choice[0] = rows[n - 1];
+                // the keyed choice after the prompt's last row: the last row's greedy pick, or its sampled one
+                if (keyed) |s| choice[0] = try t.pickOne(@intCast(n - 1), s, draw) else {
+                    var rows: [64]u32 = undefined;
+                    try t.f.greedy(rows[0..n]);
+                    choice[0] = rows[n - 1];
+                }
             }
             try t.f.keep(@intCast(n - 1));
             at_ += n;
@@ -87,7 +93,7 @@ pub const GpuTarget = struct {
         if (s.slot != 0) return error.Slots;
         if (s.parents != null) return t.tree.window(.{ .ptr = t, .vtable = &chains }, s, choices[0]);
         t.tree.clear();
-        if (s.sampling != null) return error.Sampling;
+        const keyed = try t.keyedOf(s.sampling);
         // a chain window never kept keeps every row (iface.Target.window): lanes' undrafted step (queue) sends the
         // next row without a keep
         if (t.f.slot.pending) |w| {
@@ -97,7 +103,22 @@ pub const GpuTarget = struct {
         if (s.start != t.f.slot.pos) return error.NotAChain;
         if (s.tokens.len > t.max_rows) return error.WindowRows;
         try t.f.window(s.tokens);
+        if (keyed) |smp| return t.sampler.?.choose(0, @intCast(s.tokens.len), smp, s.draws, choices[0][0..s.tokens.len]);
         try t.f.greedy(choices[0][0..s.tokens.len]);
+    }
+
+    /// T > 0: the sampling the sampler keys (null: greedy); refused without a sampler.
+    fn keyedOf(t: *const GpuTarget, sampling: ?lanes.Sampling) !?lanes.Sampling {
+        if (!samp.sampled(sampling)) return null;
+        if (t.sampler == null) return error.Sampling;
+        return sampling;
+    }
+
+    /// The keyed choice of "w.logits" row `row`, drawn at `draw`.
+    fn pickOne(t: *GpuTarget, row: u32, s: lanes.Sampling, draw: u64) !u32 {
+        var one: [1]u32 = undefined;
+        try t.sampler.?.choose(row, 1, s, &.{draw}, &one);
+        return one[0];
     }
 
     fn keep(p: *anyopaque, slot: u32, path: []const u32) anyerror!void {
