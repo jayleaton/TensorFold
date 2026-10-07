@@ -400,7 +400,7 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
     if [[ "${M2B_M4:-0}" == 1 ]]; then
         # the R0 reference's assets (its AOT set holds set P's DSpark variants: M2B_CAPTURE=P); M2B_M4_R1=1: the R1
         # reference's (then M2B_CAPTURE_R1=P for DSpark's R1 variants)
-        A=$R0; eng=$LOCAL/engram-r0
+        A=${R0:-$REF}; eng=$LOCAL/engram-r0
         if [[ "${M2B_M4_R1:-0}" == 1 && -d "${REF1:-}/aot" ]]; then A=$REF1; eng=$LOCAL/engram-r1; fi
         m4env=(TF_TP_WORLD=2 TF_DSV41_ASSETS="$A" TF_DSV41_LAYERS="0-$hi" TF_DSV41_GRAPHS=1 TF_DSV41_OWN_PREFILL=1
                TF_DSV41_FAILFAST=0 TF_DSV41_EXPERT_TOPP=${M2B_TOPP:-0.85} TF_DSV41_PHASES=1 TF_DSV41_PHASES_OUT=$RES/m4/phases.json)
