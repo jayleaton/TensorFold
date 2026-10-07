@@ -35,6 +35,9 @@ const sg = @import("sessions_gpu.zig");
 const slots_mod = @import("slots.zig");
 const batch = @import("batch.zig");
 const samp = @import("sampling_gpu.zig");
+const dspark_rows = @import("dspark_rows.zig");
+const dspark_slots = @import("dspark_slots.zig");
+const iface = @import("draft/iface.zig");
 
 pub const Options = struct {
     drafts: bool = true,
@@ -56,14 +59,6 @@ pub fn layersEnv(gpa: std.mem.Allocator) !?[]const u32 {
     const ls = try gpa.alloc(u32, hi - lo + 1);
     for (ls, 0..) |*l, i| l.* = lo + @as(u32, @intCast(i));
     return ls;
-}
-
-/// TF_DSV41_CONTEXT (Python's context, prod 1,048,576): the slot's positions; null: block.Options' 4,096
-pub fn contextEnv() !?i64 {
-    const v = std.c.getenv("TF_DSV41_CONTEXT") orelse return null;
-    const c = try std.fmt.parseInt(i64, std.mem.span(v), 10);
-    if (c < 1) return error.BadContext;
-    return c;
 }
 
 /// TF_DSV41_OWN_PREFILL=0: prompts as 16-row decode windows (every rank must agree: the plans differ)
@@ -99,8 +94,16 @@ pub const Model = struct {
     slots: u32 = 1,
     slot_set: ?*slots_mod.SlotSet = null,
     rows: ?*batch.Batch = null,
+    /// DSpark drafts over several live slots (TF_DSV41_SLOT_DRAFTS=1 with TF_DSV41_SLOTS > 1, dspark_slots.zig)
+    slot_pass: ?*dspark_slots.SlotPass = null,
     /// the keyed sampler, every rank with TF_DSV41_SAMPLING=1 (requests with T > 0; followers run its gathers in follow)
     sampler: ?*samp.GpuSampler = null,
+
+    /// The served engine's DSpark pass: several slots' (slot_pass), else the one-slot pass; null without drafts.
+    pub fn draftPass(m: *Model) ?iface.Pass {
+        if (m.slot_pass) |x| return x.pass();
+        return if (m.pass) |p| p.pass() else null;
+    }
 
     pub fn rank(m: *const Model) u32 {
         return m.tcfg.rank;
@@ -118,6 +121,7 @@ pub const Model = struct {
         m.slots = 1;
         m.slot_set = null;
         m.rows = null;
+        m.slot_pass = null;
         m.sampler = null;
         m.arena = std.heap.ArenaAllocator.init(gpa);
         errdefer m.arena.deinit();
@@ -167,11 +171,6 @@ pub const Model = struct {
         const r1 = if (std.c.getenv("TF_DSV41_R1")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
         m.f = fwd.Forward.init(gpa, &m.cfg, &m.widths, .{ .world = world, .expert_topp = topp, .r1 = r1, .taps = o.drafts }, &m.runner, comm);
         m.f.layers = backbone;
-        // the rope tables cover the limit + a prefill segment (dsv41_rope_tables.py --rows: the assets' rope.bin)
-        if (try contextEnv()) |c| {
-            m.f.opts.limit = c;
-            m.f.opts.rope_rows = c + 2048;
-        }
         m.slots = try slots_mod.countFromEnv();
         if (try kvs.optionsFromEnv(@intCast(m.f.opts.limit), world)) |ko_| {
             var ko = ko_;
@@ -189,6 +188,10 @@ pub const Model = struct {
         if (o.own_prefill) try m.f.planPrefill(&bp, @intCast(m.f.opts.prefill_rows));
         const rows_cap = try batch.capFromEnv();
         if (m.slots > 1) try batch.Batch.plan(&m.f, &bp, m.slots, rows_cap);
+        // TF_DSV41_SLOT_DRAFTS=1: DSpark over every live slot (off: drafts are refused with several slots, as before)
+        const slot_drafts = o.drafts and m.slots > 1 and dspark_rows.enabled();
+        const group = if (slot_drafts) try dspark_rows.groupFromEnv(m.cfg.dspark_block) else 1;
+        if (slot_drafts) try dspark_slots.SlotPass.plan(m.f.arena.allocator(), &m.f, &bp, m.slots, group);
         if (m.f.kv) |k| try k.bind(&m.runner, &bp);
         try m.runner.bind(&bp);
         const src: forms.Source = .{ .d = &m.driver, .weights = &m.weights, .plan = &m.pl };
@@ -201,14 +204,8 @@ pub const Model = struct {
         }
         const rope = try cwd.readFileAlloc(io, try std.fs.path.join(a, &.{ assets, "rope.bin" }), a, .limited(1 << 28));
         const half = (rope.len - 16) / 2;
-        // rope.bin must hold the limit's rows (f32 [rows, 64] a table): a shorter one would leave positions unrotated
-        const want: usize = @intCast(m.f.opts.rope_rows * 64 * 4);
-        if (half < want) {
-            std.log.scoped(.dsv41).err("rope.bin holds {d} positions, the limit needs {d} (dsv41_rope_tables.py --rows)", .{ half / 256, want / 256 });
-            return error.RopeTooShort;
-        }
         for ([_][]const u8{ "s.rope.main", "s.rope.comp" }, 0..) |role, i| if (m.runner.addressOf(role)) |p|
-            try cuda.DeviceBuffer.upload(.{ .d = &m.driver, .ptr = p, .len = want }, 0, rope[16 + i * half ..][0..want]);
+            try cuda.DeviceBuffer.upload(.{ .d = &m.driver, .ptr = p, .len = half }, 0, rope[16 + i * half ..][0..half]);
         const ehb = try cwd.readFileAllocOptions(io, try std.fs.path.join(a, &.{ assets, "engram-host.bin" }), a, .limited(1 << 26), .@"4", null);
         m.host = try eh.Host.load(ehb, m.cfg.engram_heads, m.cfg.engram_pad, m.cfg.engram_vocab, &m.lbuf);
         m.f.engram = &m.host;
@@ -217,6 +214,7 @@ pub const Model = struct {
         m.gt = .{ .f = &m.f, .prefill_rows = o.prefill_rows, .max_rows = nb, .own_prefill = o.own_prefill, .sessions = m.sessions };
         if (o.drafts) m.pass = try dspark_gpu.GpuPass.init(gpa, &m.f, nb);
         if (m.slots > 1) try m.openRows(rows_cap, &bp);
+        if (slot_drafts) m.slot_pass = try dspark_slots.SlotPass.init(gpa, &m.f, m.pass.?, m.rows.?, m.slots, group);
         // TF_DSV41_SAMPLING=1: keyed sampling (T > 0) on every rank; off: such requests are refused (error.Sampling)
         m.sampler = if (samp.enabled()) try samp.GpuSampler.init(gpa, &m.f) else null;
         m.gt.sampler = m.sampler;
@@ -241,6 +239,7 @@ pub const Model = struct {
 
     pub fn close(m: *Model) void {
         const gpa = m.gpa;
+        if (m.slot_pass) |x| x.deinit();
         if (m.rows) |b| b.deinit();
         if (m.slot_set) |ss| ss.deinit();
         if (m.pass) |p| p.deinit();
