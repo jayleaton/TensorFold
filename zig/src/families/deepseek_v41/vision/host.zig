@@ -6,6 +6,7 @@ const prep = @import("prep.zig");
 const vids_mod = @import("vids.zig");
 const parts = @import("parts.zig");
 const decode = @import("decode.zig");
+const fetch_mod = @import("fetch.zig");
 const Allocator = std.mem.Allocator;
 
 /// One prepared image, shared by the cache and the requests that hold it.
@@ -31,6 +32,7 @@ pub const Host = struct {
     s: prep.Settings,
     registry: vids_mod.Registry,
     fetcher: ?Fetcher = null,
+    owned_fetcher: ?*fetch_mod.Fetcher = null,
     mutex: std.Io.Mutex = .init,
     cache: std.AutoArrayHashMapUnmanaged([32]u8, *Shared) = .empty, // oldest first
     cache_bytes: u64 = 0,
@@ -40,7 +42,20 @@ pub const Host = struct {
         return .{ .gpa = gpa, .io = io, .s = s, .registry = .{ .gpa = gpa } };
     }
 
+    /// TF_DSV41_VISION_FETCH=1 (the default): image URLs through prod's fetch policy (``fetch.zig``).
+    pub fn enableFetch(h: *Host) Allocator.Error!void {
+        if (!h.s.fetch or h.owned_fetcher != null) return;
+        const f = try h.gpa.create(fetch_mod.Fetcher);
+        f.* = fetch_mod.Fetcher.init(h.gpa, h.io, &h.s);
+        h.owned_fetcher = f;
+        h.fetcher = f.it();
+    }
+
     pub fn deinit(h: *Host) void {
+        if (h.owned_fetcher) |f| {
+            f.deinit();
+            h.gpa.destroy(f);
+        }
         for (h.cache.values()) |e| h.release(e);
         h.cache.deinit(h.gpa);
         h.registry.deinit();

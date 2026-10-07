@@ -14,6 +14,7 @@ pub const prep = @import("prep.zig");
 pub const vids = @import("vids.zig");
 pub const parts = @import("parts.zig");
 pub const host = @import("host.zig");
+pub const fetch = @import("fetch.zig");
 pub const mode = @import("mode.zig");
 pub const held = @import("held.zig");
 
@@ -21,4 +22,5 @@ test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("jpeg_pix.zig");
     _ = @import("golden_test.zig");
+    _ = @import("fetch_test.zig");
 }
