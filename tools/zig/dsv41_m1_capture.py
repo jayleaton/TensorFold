@@ -18,6 +18,26 @@ Output (``--out``): ops.jsonl (one launch a line), blobs/ (content-addressed buf
 dtype, shape, sha256 of every weight tensor the blocks hold), launches.json + manifest.json + aot/ (the launched
 Triton cubins in the Zig engine's aot.json form), meta.json.
 
+M5's KV modes (unset: the contiguous stores above, every output as before):
+
+- ``M1_PAGED=1``: each set's forward is ``slots.SlotsForward`` with one pool slot (``dsv41_m5_kv.KV``, mode "pool"):
+  the kv sources' compressed rows and index keys live in a ``pool.Pool`` and every kernel reads and writes them
+  through the slot's page table (PT = the slot's 1-D row of the stacked table, PSH = log2 rows a page of the family),
+  as ``slots.SlotsForward.bind`` installs them for serving. A page holder takes a page before each of the slot's, so
+  the table is not the identity (pages 1, 3, 5 ...). The pages are mapped before each run (the round's ``ensure``).
+- ``M1_SPLIT=1`` (``TF_DSV41_KV_SPLIT`` semantics; implies the pool): the pool split over the world-2 communicator,
+  rank 0's shard (residue 0 pages; ``ctable``), ``kvsplit.Exchange`` built by ``bind`` (``TF_DSV41_KV_SPLIT_COMPACT``
+  as set: 0 dense, force: ``kvsplit_pack.pack2`` and the variable gather). Split is captured on rank 0 alone, its peer
+  simulated as every TP exchange here: the zero peer. The selected rows the peer owns arrive as zeros (records of
+  zero bytes), so every buffer is reproducible from rank 0's work alone, as the zero partials are; split == replicated
+  bit for bit is checked at real TP=2 by the references (dsv41_m2b_ref.py --pool vs --split). The exchange's steps
+  that are not launches are recorded as kind "glue" ops (``ext`` "glue": ``kvsplit.gather`` = the index_select of the
+  rank's rows into the send buffer, ``kvsplit.all_gather`` / ``kvsplit.var_gather`` = the transport, with "world",
+  "rank" and "peer": "zeros"); ``tf-dsv41-m1 replay`` skips them as unbound. Decode windows (<= 128 rows) and a
+  12-row prefill segment exchange dense, a 2,048-row one by union (``Exchange.plan`` / ``fetch``).
+- meta.json gains "kv" (the mode, the glue names) and each set's "kv" (``dsv41_m5_kv.KV.describe``: page, tables'
+  pages, shifts, families, split's local / discard pages, the exchange's compact mode). Set P stays contiguous only.
+
     PYTHONPATH=<tensorfold src> TRITON_CACHE_DIR=<dir> python -B dsv41_m1_capture.py --pack PACK --out OUT
 """
 
@@ -41,6 +61,8 @@ SETS = {"A": (1, 2, 3), "B": (20, 21, 22, 23, 24), "C": (40,), "D": (8, 13, 14, 
 WINDOWS = (1, 3, 16)
 PREFILL = int(os.environ.get("M1_PREFILL_ROWS", "256"))   # rows of the recorded prefill segment after the windows
 #   (the fast prefill kernels; 2048 = prod's PREFILL_CHUNK, the Zig prefill's launch list)
+KV_MODE = "split" if os.environ.get("M1_SPLIT", "0") == "1" else ("pool" if os.environ.get("M1_PAGED", "0") == "1" else "")
+#   M5: the forward's slot in a KV pool (M1_PAGED) or a split pool (M1_SPLIT; docstring); "" = the contiguous stores
 SCAN_MAX = 1 << 20          # int64 elements scanned for device addresses a tensor at most
 
 
@@ -67,6 +89,7 @@ class Capture:
         self.seq = 0
         self.blob_bytes = 0
         self.counts: dict[str, int] = {}
+        self.kv_sets: dict[str, dict] = {}                 # M5: each set's pool (dsv41_m5_kv.KV.describe)
 
     # -- weights ---------------------------------------------------------------------------------------------------
     def name_weights(self, rank_w, layers) -> dict:
@@ -399,20 +422,36 @@ def run_set(cap, rec, s, loader, W, cfg, embed, norm, head, tmap, dev, a, g, vh,
     layers = [loader.layer(L) for L in SETS[s]]
     tree = W.RankW(0, 2, 0, embed, layers, norm, head, None, {})
     if s == "P":
+        if KV_MODE:
+            raise ValueError("set P: contiguous stores only (M1_PAGED / M1_SPLIT unset)")
         return run_draft(cap, rec, s, loader, cfg, tree, layers, tmap, dev, a, g, vh, Forward, Seg, Triton, NgramHasher)
     digests = cap.name_weights(tree, layers)
     rows = {L: IndexRows(cfg.engram_head_dim) for L in cfg.engram_layer_ids}
-    fw = Forward(cfg, tree, csa2=Triton(128, cfg.num_attention_heads // 2, dev), comm=ZeroPeer(), device=dev,
-                 limit=a.limit, chunk=128, engram_rows=rows, hasher=NgramHasher(cfg, tmap), slots=1,
-                 contiguous=True, pchunk=2048)
+    kv = None
+    if KV_MODE:                 # M5: the slot in a (split) KV pool, as serving binds it (dsv41_m5_kv.KV)
+        import dsv41_m5_kv as M5
+        from tensorfold.families.deepseek_v41.cuda.slots import SlotsForward
+
+        fw = SlotsForward(cfg, tree, csa2=Triton(128, cfg.num_attention_heads // 2, dev), comm=ZeroPeer(),
+                          device=dev, limit=a.limit, chunk=128, engram_rows=rows, hasher=NgramHasher(cfg, tmap),
+                          slots=1, contiguous=False, pchunk=2048)
+        kv = M5.KV(fw, Path(a.pack), KV_MODE, 0, 2, a.limit, dev)
+    else:
+        fw = Forward(cfg, tree, csa2=Triton(128, cfg.num_attention_heads // 2, dev), comm=ZeroPeer(), device=dev,
+                     limit=a.limit, chunk=128, engram_rows=rows, hasher=NgramHasher(cfg, tmap), slots=1,
+                     contiguous=True, pchunk=2048)
     # ids in rank 0's vocabulary half (its embedding rows; the peer's are zero)
     ids = torch.randint(3, vh, (a.prompt + sum(WINDOWS) + PREFILL,), generator=g).tolist()
+    if kv is not None:
+        kv.grow(a.prompt)
     fw.prompt(ids[:a.prompt])
     pos = a.prompt
     cap.set = s
     # M1_PREFILL_ROWS=0: decode windows only (pod 21: four sets' 2,048-row prefill blobs filled the pod's disk)
     for n, prefill in [(n, False) for n in WINDOWS] + ([(PREFILL, True)] if PREFILL > 0 else []):
         cap.phase = f"p{n}" if prefill else f"w{n}"
+        if kv is not None:
+            kv.grow(fw.slot.pos + n)            # the round's ensure: pages mapped before the run
         cap.recording = True
         try:
             with rec.scope(f"{s}-{cap.phase}"):
@@ -422,7 +461,9 @@ def run_set(cap, rec, s, loader, W, cfg, embed, norm, head, tmap, dev, a, g, vh,
         fw.keep(0, n - 1)
         pos += n
     torch.cuda.synchronize()
-    del fw, tree, layers
+    if kv is not None:
+        cap.kv_sets[s] = kv.describe(fw)
+    del fw, tree, layers, kv
     return digests
 
 
@@ -513,6 +554,11 @@ def main() -> int:
     cap = Capture(out)
     rec = aot.Recorder()
     install(cap, rec)
+    if KV_MODE == "split":
+        os.environ["TF_DSV41_KV_SPLIT"] = "1"           # the knob the split stands for (meta.json's env)
+        import dsv41_m5_kv as M5
+
+        M5.install_glue(cap)
     import torch
     from tensorfold.families.deepseek_v41.cuda import weights as W
     from tensorfold.families.deepseek_v41.cuda.config import Config
@@ -537,6 +583,10 @@ def main() -> int:
     import triton
 
     meta["triton"] = triton.__version__
+    if KV_MODE:
+        meta["kv"] = {"mode": "paged" if KV_MODE == "pool" else KV_MODE, "prefill_rows": PREFILL,
+                      "glue": ["kvsplit.gather", "kvsplit.all_gather", "kvsplit.var_gather"] if KV_MODE == "split"
+                      else [], "peer_rows": "zeros" if KV_MODE == "split" else None}
     weights: dict = {}
     g = torch.Generator().manual_seed(4101)
     meta["failed_sets"] = {}
@@ -557,6 +607,8 @@ def main() -> int:
         ls = list(SETS[s]) + (list(range(cfg.num_hidden_layers, cfg.num_hidden_layers + cfg.num_nextn_predict_layers))
                               if s == "P" else [])          # P: the drafter's blocks load too
         meta["sets"][s] = {"layers": ls, "load_and_run_s": round(time.time() - t0, 1), "ops": cap.seq}
+        if s in cap.kv_sets:
+            meta["sets"][s]["kv"] = cap.kv_sets[s]
         torch.cuda.empty_cache()
     cap.ops.close()
     (out / "weights.json").write_text(json.dumps(weights, indent=0, sort_keys=True) + "\n")

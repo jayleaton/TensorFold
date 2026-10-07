@@ -12,6 +12,38 @@ Writes DIR/ref.json, DIR/rank<r>/state/*, DIR/rope.bin, DIR/aot/.
 ``--prompts 2060,2049,...`` (both ranks on this host): one load, each prompt from a fresh slot (Forward.new_slot, the
 stores zeroed as a new Forward's) into DIR/p<N>/, a whole reference dir each (the AOT set and rope tables of every
 prompt's kernels in each).
+
+M5 (the Python twin with split KV + sessions, tensorfold-decode1 dsv41-midprofile):
+
+- ``--pool``: the forward's slot is a KV pool slot (``slots.SlotsForward`` + ``dsv41_m5_kv.KV``, mode "pool"), bound as
+  serving binds it: the compressed rows and index keys read and written through the slot's page table (a page holder
+  interleaves its pages, so the table is not the identity; ``TF_DSV41_INDEX_KV`` picks the index family's rows);
+- ``--split``: ``TF_DSV41_KV_SPLIT=1`` semantics (set for both ranks): the pool split over the two ranks
+  (``pool.Pool(split=2, rank=r)``), each rank's comp families its own pages, ``kvsplit.Exchange`` trading the selected
+  rows (dense in windows and short segments, union in 2,048-row prefill segments); ``--compact force`` (or the env
+  ``TF_DSV41_KV_SPLIT_COMPACT``): the packed exchange (``kvsplit_pack.pack2``, the variable gather);
+- ``--park``: after the prompt (and its state dump), the session saved at the prompt's end (``sessions.Store.save``),
+  parked to an NVMe dir (DIR/p<N>/park/, the ``sessdisk`` tier, ``TF_DSV41_SESSION_*`` as set), then the steps decoded
+  uninterrupted (the recorded tokens); then the slot emptied, the entry found and restored (the holder takes a page
+  first: other physical pages), ``fw.restore``, and the same steps decoded again: rank<r>.json "park" holds those
+  tokens / logits digests and "equal" (== the uninterrupted run's, the gate); ``--park`` implies ``--pool`` unless
+  ``--split``.
+- In these modes the AOT set is recorded on both ranks and merged (rank 1's Triton variants: ``pack2`` specializes on
+  the rank), and the state dump (rank<r>/state/) replaces ``s.L<i>.comp.v / .s / .ik`` with the pool's roles (the
+  rings ``s.L<i>.swa.v / .s``, the carries ``s.L<i>.carry`` and state.json's pos / tail stay as they are):
+
+  | role (file <role>.bin)  | what                                                                                     |
+  | --- | --- |
+  | ``s.kv.comp.L<i>``      | kv source i's ``comp`` family tensor as stored: uint8 [rows, 584] (576 value bytes, 8 scale bytes a row); rows = pages x 256 / ratio: replicated (npages + 1 null page), split this rank's local pages (npages / W, then the local null page, then the discard page) |
+  | ``s.kv.ik.L<i>``        | kv source i's ``index_k`` family as stored, whole on every rank: uint8 [rows, 132] under ``TF_DSV41_INDEX_KV=fp8``, bf16 [rows, 128] otherwise (state.json kv.families: dtype, shape) |
+  | ``s.kv.pt``             | the slot's page table, int32 [pages] (the 1-D row PT the kernels get; unmapped = the null page) |
+  | ``s.kv.ct``             | split only: the slot's split table (``Slot.ctable``): an owned logical page -> its local page, any other -> the discard page, unmapped -> the local null page; int32 [pages] |
+  | ``s.kv.comp.L<i>.rows`` | the comp rows of logical rows [0, pos // ratio) read through the table, in logical order; split: only the rows this rank owns (logical page k with k % W == rank) through ``s.kv.ct``, which ``s.kv.comp.L<i>.rows.json`` lists ("comp_logical": [a, b) runs) |
+  | ``s.kv.ik.L<i>.rows``   | the index keys of logical rows [0, pos // ratio) through ``s.kv.pt`` (every row, every rank) |
+
+  state.json gains "kv" (``dsv41_m5_kv.KV.dump``: mode, page, split, rank, index_kv, the pool's page counts, null /
+  local null / discard pages, the slot's physical pages in logical order (and split: their local pages), each
+  family's dtype / shape / row bytes, each kv source's shift and row lists) and "shapes" (role -> dtype, shape).
 """
 from __future__ import annotations
 
@@ -53,6 +85,7 @@ def rank_main(rank: int, a) -> None:
     t0 = time.time()
     out = Path(a.out)
     dev = torch.device(f"cuda:{dev_index}")
+    kvmode = a.kv
     comm = open_comm(rank, 2, a.master, a.port)
     pack = Path(a.pack)
     cfg = Config.from_file(pack / "config.json")
@@ -70,31 +103,55 @@ def rank_main(rank: int, a) -> None:
             print(f"loaded layer {L} at {time.time() - t0:.0f} s", flush=True)
     tree = W.RankW(rank, 2, rank * vh, embed, layers, norm, head, None, {})
     rows = {L: IndexRows(cfg.engram_head_dim) for L in cfg.engram_layer_ids}
-    fw = Forward(cfg, tree, csa2=Triton(128, cfg.num_attention_heads // 2, dev), comm=comm, device=dev,
-                 limit=a.limit, chunk=128, engram_rows=rows, hasher=NgramHasher(cfg, tmap), slots=1,
-                 contiguous=True, pchunk=2048)
+    kv = None
+    if kvmode == "contig":
+        fw = Forward(cfg, tree, csa2=Triton(128, cfg.num_attention_heads // 2, dev), comm=comm, device=dev,
+                     limit=a.limit, chunk=128, engram_rows=rows, hasher=NgramHasher(cfg, tmap), slots=1,
+                     contiguous=True, pchunk=2048)
+    else:                          # M5: the slot in a (split) KV pool, bound as serving binds it
+        import dsv41_m5_kv as M5
+        from tensorfold.families.deepseek_v41.cuda.slots import SlotsForward
+
+        fw = SlotsForward(cfg, tree, csa2=Triton(128, cfg.num_attention_heads // 2, dev), comm=comm, device=dev,
+                          limit=a.limit, chunk=128, engram_rows=rows, hasher=NgramHasher(cfg, tmap), slots=1,
+                          contiguous=False, pchunk=2048)
+        kv = M5.KV(fw, pack, kvmode, rank, 2, a.limit, dev, scramble=not a.no_scramble)
     load_s = time.time() - t0
     rec = None
-    if rank == 0 or a.rank >= 0:   # the AOT set (and rope tables) on each host of a two-host run, the prompt's prefill
-        import triton_aot_manifest as aot   # kernels included (Zig's own prefill launches them: M2B_PREFILL)
+    both = kvmode != "contig" and a.rank < 0     # M5: rank 1's Triton variants too (pack2 specializes on the rank)
+    if rank == 0 or a.rank >= 0 or both:   # the AOT set (and rope tables) on each host of a two-host run, the
+        import triton_aot_manifest as aot   # prompt's prefill kernels included (Zig's own prefill: M2B_PREFILL)
 
         rec = aot.Recorder().install()
     dirs = [Path(a.out) / f"p{p}" for p in a.prompts] if a.prompts else [Path(a.out)]
     for i, (prompt, out) in enumerate(zip(a.prompts or [a.prompt], dirs)):
         if i > 0:
-            fw.slots[0] = fw.new_slot(contiguous=True)
-        one(rank, a, fw, cfg, greedy, Seg, digest, prompt, out, lo, hi, t0, load_s, i == len(dirs) - 1)
+            if kv is None:
+                fw.slots[0] = fw.new_slot(contiguous=True)
+            else:
+                kv.fresh(fw)
+        one(rank, a, fw, cfg, greedy, Seg, digest, prompt, out, lo, hi, t0, load_s, i == len(dirs) - 1, kv)
     run_s = time.time() - t0 - load_s
     top = Path(a.out)
+    cache = Path(os.environ.get("TRITON_CACHE_DIR", Path.home() / ".triton" / "cache"))
+    if both and rank == 1:          # rank 1's set beside rank 0's, merged by rank 0 after the barrier
+        r1 = top / "aot-rank1"
+        r1.mkdir(parents=True, exist_ok=True)
+        rec.dump(r1 / "launches.json")
+        aot.build(cache, r1 / "launches.json", r1 / "manifest.json", None)
+        pack_aot(r1 / "manifest.json", cache, r1 / "aot", specialization())
+    if both:
+        comm.barrier()
     if rank == 0 or a.rank >= 0:   # the AOT set and rope tables on each host of a two-host run
         tabs = RO.tables(cfg, a.limit + 2048)
         (top / "rope.bin").write_bytes(b"DSV41RP1" + struct.pack("<II", *tabs[0].cs.shape)
                                        + tabs[0].cs.contiguous().numpy().tobytes()
                                        + tabs[1].cs.contiguous().numpy().tobytes())
         rec.dump(top / "launches.json")
-        cache = Path(os.environ.get("TRITON_CACHE_DIR", Path.home() / ".triton" / "cache"))
         aot.build(cache, top / "launches.json", top / "manifest.json", None)
         pack_aot(top / "manifest.json", cache, top / "aot", specialization())
+        if both:
+            print(f"rank 0: rank 1's AOT set merged: {merge_aot(top / 'aot', top / 'aot-rank1' / 'aot')}", flush=True)
         for d in dirs:
             if d != top:
                 shutil.copy(top / "rope.bin", d / "rope.bin")
@@ -103,11 +160,53 @@ def rank_main(rank: int, a) -> None:
     comm.barrier()
 
 
-def one(rank, a, fw, cfg, greedy, Seg, digest, prompt, out, lo, hi, t0, load_s, last) -> None:
+def merge_aot(dst: Path, src: Path) -> dict:
+    """The kernels of AOT set ``src`` that ``dst`` lacks (by hash), with their cubins (dsv41_aot_merge.py's rule)."""
+
+    import shutil
+
+    a = json.loads((dst / "aot.json").read_text())
+    b = json.loads((src / "aot.json").read_text())
+    have = {k["hash"] for k in a["kernels"]}
+    added = 0
+    for k in b["kernels"]:
+        if k["hash"] in have:
+            continue
+        shutil.copyfile(src / "cubins" / f"{k['hash']}.cubin", dst / "cubins" / f"{k['hash']}.cubin")
+        a["kernels"].append(k)
+        have.add(k["hash"])
+        added += 1
+    (dst / "aot.json").write_text(json.dumps(a, indent=1) + "\n")
+    return {"added": added, "kernels": len(a["kernels"])}
+
+
+def decode(fw, greedy, Seg, digest, tok, steps, kv, trace) -> tuple[list, list, dict]:
+    """``steps`` greedy windows of one row from ``tok``: (tokens, logits digests, the first window's block digests)."""
+
+    tokens, digests, layers_d = [tok], [], {}
+    for step in range(steps):
+        fw.trace = {} if step == 0 and trace else None
+        if kv is not None:
+            kv.grow(fw.slot.pos + 1)
+        lg = fw.run([Seg(0, fw.slot.pos, (tok,))])
+        if step == 0 and trace:
+            layers_d = {str(L): digest(t) for L, t in sorted(fw.trace.items())}
+        digests.append(digest(lg))
+        tok = int(greedy(fw, lg)[0])
+        tokens.append(tok)
+        fw.keep(0, 0)
+    fw.trace = None
+    return tokens, digests, layers_d
+
+
+def one(rank, a, fw, cfg, greedy, Seg, digest, prompt, out, lo, hi, t0, load_s, last, kv=None) -> None:
     """One prompt from the slot as it is: its state dump, greedy steps and digests into ``out``."""
 
     import torch
 
+    if kv is not None:
+        one_kv(rank, a, fw, cfg, greedy, Seg, digest, prompt, out, lo, hi, t0, load_s, last, kv)
+        return
     g = torch.Generator().manual_seed(a.seed)
     ids = torch.randint(3, cfg.vocab_size, (prompt,), generator=g).tolist()
     t1 = time.time()
@@ -161,6 +260,74 @@ def one(rank, a, fw, cfg, greedy, Seg, digest, prompt, out, lo, hi, t0, load_s, 
     (out / f"rank{rank}.json").write_text(json.dumps(mine) + "\n")
 
 
+def one_kv(rank, a, fw, cfg, greedy, Seg, digest, prompt, out, lo, hi, t0, load_s, last, kv) -> None:
+    """``one`` on a pool slot (M5): the pages mapped before each run, the state by the pool's roles; ``--park``: the
+    session round trip after the prompt, the steps decoded uninterrupted and again after the restore."""
+
+    import torch
+
+    g = torch.Generator().manual_seed(a.seed)
+    ids = torch.randint(3, cfg.vocab_size, (prompt,), generator=g).tolist()
+    t1 = time.time()
+    kv.grow(len(ids))
+    logits = fw.prompt(ids)
+    tok = int(greedy(fw, logits[-1:])[0])
+    torch.cuda.synchronize()
+    if rank == 0:
+        print(f"prompt of {prompt} at {time.time() - t0:.0f} s, first token {tok} ({kv.mode} pool)", flush=True)
+    sd = out / f"rank{rank}" / "state"
+    sd.mkdir(parents=True, exist_ok=True)
+    roles, shapes, s0 = {}, {}, fw.slot
+
+    def put(role, t):
+        f = sd / f"{role}.bin"
+        f.write_bytes(t.contiguous().view(torch.uint8).cpu().numpy().tobytes())
+        roles[role] = f.name
+        shapes[role] = {"dtype": str(t.dtype).replace("torch.", ""), "shape": list(t.shape)}
+
+    for L in range(lo, hi + 1):
+        v, sc = s0.swa[L].kernel()
+        put(f"s.L{L}.swa.v", v)
+        put(f"s.L{L}.swa.s", sc)
+        if L in s0.carry:
+            put(f"s.L{L}.carry", s0.carry[L])
+    kvinfo = kv.dump(fw, put, sd)
+    (sd / "state.json").write_text(json.dumps({"pos": s0.pos, "tail": list(s0.tail), "roles": roles,
+                                               "shapes": shapes, "kv": kvinfo}, indent=1) + "\n")
+    park = None
+    if a.park:
+        import dsv41_m5_kv as M5
+
+        park = M5.Park(kv, out / "park")
+        park.save_park(fw, ids)
+        if rank == 0:
+            print(f"parked {park.info.get('file_bytes', 0) / 2**20:.1f} MiB in {park.info.get('park_s')} s", flush=True)
+    tokens, digests, layers_d = decode(fw, greedy, Seg, digest, tok, a.steps, kv, True)
+    mine = {"rank": rank, "load_s": round(load_s, 1), "tokens": tokens, "logits_sha256": digests,
+            "layers_first_window": layers_d, "prompt_ids": ids, "kv": kv.mode}
+    if park is not None:
+        park.restore(fw, ids + [tok])
+        t2, d2, _ = decode(fw, greedy, Seg, digest, tok, a.steps, kv, False)
+        park.info.update(tokens=t2, logits_sha256=d2, equal=bool(t2 == tokens and d2 == digests))
+        if rank == 0:
+            print(f"restored in {park.info.get('restore_s')} s: {a.steps} steps "
+                  f"{'== the uninterrupted run' if park.info['equal'] else 'DIFFER from the uninterrupted run'}",
+                  flush=True)
+        park.close()
+        mine["park"] = park.info
+    if last:
+        tok = mine["park"]["tokens"][-1] if park is not None else tokens[-1]
+        for n in a.extra_rows:
+            kv.grow(fw.slot.pos + n)
+            fw.run([Seg(0, fw.slot.pos, tuple([tok] * n))])
+            fw.keep(0, n - 1)
+    torch.cuda.synchronize()
+    if kv.kvx is not None:
+        mine["exchange"] = kv.kvx.describe()
+    mine["run_s"] = round(time.time() - t1, 1)
+    (out / f"rank{rank}.json").write_text(json.dumps(mine) + "\n")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--pack", required=True)
@@ -177,9 +344,23 @@ def main() -> int:
     ap.add_argument("--extra-rows", type=lambda v: [int(x) for x in v.split(",") if x], default=[2, 3, 4, 5, 6, 16],
                     help="windows of these rows after the steps (their Triton variants in the AOT set)")
     ap.add_argument("--master", default="127.0.0.1", help="rank 0's address (two hosts: the head's CX7 address)")
+    ap.add_argument("--pool", action="store_true", help="M5: the slot in a replicated KV pool (paged stores)")
+    ap.add_argument("--split", action="store_true", help="M5: TF_DSV41_KV_SPLIT=1, the pool split over the ranks")
+    ap.add_argument("--compact", default=None, help="M5 --split: TF_DSV41_KV_SPLIT_COMPACT (0 / 1 / force)")
+    ap.add_argument("--park", action="store_true", help="M5: save / park / restore after the prompt (implies --pool)")
+    ap.add_argument("--no-scramble", action="store_true", help="M5: no page holder (the slot's pages 0, 1, 2 ...)")
     a = ap.parse_args()
     if a.prompts and a.rank >= 0:
         ap.error("--prompts runs both ranks on this host")
+    a.kv = "split" if a.split else ("pool" if a.pool or a.park else "contig")
+    if a.compact is not None:
+        if not a.split:
+            ap.error("--compact needs --split")
+        os.environ["TF_DSV41_KV_SPLIT_COMPACT"] = a.compact
+    if a.split:
+        os.environ["TF_DSV41_KV_SPLIT"] = "1"           # both ranks (spawned with this environment)
+    elif a.kv == "pool":
+        os.environ.pop("TF_DSV41_KV_SPLIT", None)
     Path(a.out).mkdir(parents=True, exist_ok=True)
     if a.rank >= 0:                         # two hosts: this host's rank alone (the other host runs the other)
         rank_main(a.rank, a)
@@ -189,6 +370,10 @@ def main() -> int:
         meta = {"layers": a.layers, "prompt": a.prompt, "steps": a.steps, "seed": a.seed, "limit": a.limit,
                 "tokens": mine["tokens"], "prompt_ids": mine["prompt_ids"], "host_rank": a.rank,
                 "env": {k: v for k, v in os.environ.items() if k.startswith("TF_DSV41")}, "ranks": ranks}
+        if a.kv != "contig":
+            meta["kv"] = a.kv
+            if "park" in mine:
+                ranks[a.rank]["park"] = mine["park"]
         (Path(a.out) / "ref.json").write_text(json.dumps(meta, indent=1) + "\n")
         print(json.dumps({"rank": a.rank, "tokens": len(mine["tokens"]), "first": mine["tokens"][:8]}), flush=True)
         return 0
@@ -208,8 +393,21 @@ def main() -> int:
                 "tokens": r0["tokens"], "prompt_ids": r0["prompt_ids"],
                 "env": {k: v for k, v in os.environ.items() if k.startswith("TF_DSV41")},
                 "ranks": [{k: r[k] for k in ("load_s", "run_s", "logits_sha256", "layers_first_window")} for r in (r0, r1)]}
+        if a.kv != "contig":            # M5: the pool mode, the exchange's counts, the park round trip a rank
+            meta["kv"] = a.kv
+            for m, r in zip(meta["ranks"], (r0, r1)):
+                for k in ("park", "exchange"):
+                    if k in r:
+                        m[k] = r[k]
+            if "park" in r0:
+                eq = bool(r0["park"].get("equal") and r1.get("park", {}).get("equal"))
+                meta["park_equal"] = eq
+                if not eq:
+                    print(f"prompt {prompt}: the restored session's steps differ from the uninterrupted run", flush=True)
+                    st = 1
         (d / "ref.json").write_text(json.dumps(meta, indent=1) + "\n")
-        print(json.dumps({"prompt": prompt, "tokens": len(meta["tokens"]), "first": meta["tokens"][:8]}), flush=True)
+        print(json.dumps({"prompt": prompt, "tokens": len(meta["tokens"]), "first": meta["tokens"][:8],
+                          **({"park_equal": meta["park_equal"]} if "park_equal" in meta else {})}), flush=True)
     return st
 
 

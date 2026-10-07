@@ -67,6 +67,170 @@ if [[ "${M1_JOB:-m1}" == x3gm3 ]]; then
     exit $rc
 fi
 
+# M1_JOB=m5 (TWO GPUs): M5's Python side on the midprofile twin (tensorfold-decode1 dsv41-midprofile: split KV +
+# sessions; midprofile.tar.gz = /opt/midprofile/{src,tests,ext}, its extensions prebuilt for sm_120, from
+# tools/zig/dsv41_m5/stage_midprofile_twin.sh; looked for in $Z, then on the volume at dsq/m5/). In order, each step
+# in what the budget leaves (a capture starts only while M5_REF_RESERVE minutes stay for the references and gates):
+#   1. the pack's shards up to layer M5_HI (24) copied to local NVMe (as M2b);
+#   2. captures on GPU 0 (prod-knobs.env + x3gm v2, as M2B_CAPTURE): M5_CAPTURES, each MODE:SETS:PREFILL_ROWS with
+#      MODE paged (M1_PAGED=1), split (M1_SPLIT=1) or compact (split + TF_DSV41_KV_SPLIT_COMPACT=force); then
+#      `tf-dsv41-m1 check` on each (host only), `tf-dsv41-m1 replay` on the ones named in M5_REPLAY (GPU 0, bit for bit);
+#      small files to $RES/m5-cap-<mode>-<sets>-p<rows>/, the blobs deleted after each;
+#   3. the references at TP=2 (dsv41_m2b_ref.py on both GPUs, layers 0-M5_HI, prompts M5_PROMPTS, M2B_STEPS steps,
+#      expert top-p off, TF_DSV41_INDEX_KV=M5_INDEX_KV): M5_REFS of pool (--pool), split (--split), compact (--split
+#      --compact force), park (--park on M5_PARK_KV's pool: save / park / restore == the uninterrupted run); each into
+#      $LOCAL/m5-ref-<mode>/p<N>/ with engram-host.bin; then m5-agree: every mode's tokens and logits digests == pool's
+#      (and the park round trip's == its own uninterrupted run);
+#   4. the Zig gates (placeholders until tf-dsv41-m1 has them): `tf-dsv41-m1 m5 MODE $LP $REF $RES/m5-MODE` for
+#      M5_GATES (split compact park; REF = $LOCAL/m5-ref-MODE, holding p<N>/ a prompt), skipped with a message when
+#      the binary's usage has no m5 command.
+# Knobs: M5_HI M5_PROMPTS M2B_STEPS M5_CAPTURES M5_REPLAY M5_REFS M5_GATES M5_INDEX_KV M5_PARK_KV M5_REF_RESERVE
+# M5_CAPTURE_MIN M5_REF_MIN M5_GATE_MIN M2B_COPY_MIN (defaults below); M1_BUDGET_MIN as every job.
+if [[ "${M1_JOB:-m1}" == m5 ]]; then
+    hi=${M5_HI:-24}
+    LP=$LOCAL/pack
+    mkdir -p "$LP"
+    : > "$LOCAL/pack-files"
+    for f in "$PACK"/*; do
+        b=$(basename "$f")
+        if [[ "$b" =~ ^layer-([0-9]+)\.safetensors$ ]]; then
+            L=$(( 10#${BASH_REMATCH[1]} ))
+            (( L > hi )) && continue
+        fi
+        echo "$b" >> "$LOCAL/pack-files"
+    done
+    ( while sleep 30; do echo "$(date -u +%H:%M:%S) $(du -sm "$LP" | cut -f1) MB"; done ) > "$RES/pack-copy-progress.log" 2>&1 &
+    prog=$!
+    if ! (cd "$PACK" && step pack-copy "${M2B_COPY_MIN:-10}" xargs -a "$LOCAL/pack-files" -P 16 -I{} cp {} "$LP/"); then
+        echo "pack copy did not finish: loading from the volume" | tee -a "$RES/steps.txt"
+        LP=$PACK
+    fi
+    kill $prog 2>/dev/null
+    du -sh "$LP" | tee -a "$RES/steps.txt"
+    # the midprofile twin: nothing below runs without it (the split pool, Exchange and sessions are its code)
+    MT=""
+    for c in "$Z/midprofile.tar.gz" "${PACK%%/out/*}/m5/midprofile.tar.gz"; do [[ -f "$c" ]] && { MT=$c; break; }; done
+    if [[ -z "$MT" ]] || ! tar -xzf "$MT" -C /; then
+        echo "m5: no midprofile.tar.gz (in \$Z or dsq/m5/ on the volume) or it did not unpack: nothing to run" \
+            | tee -a "$RES/steps.txt"
+        echo "=== rc=1"; exit 1
+    fi
+    TWIN=/opt/midprofile
+    { echo "m5 twin: $MT -> $TWIN ($(cat "$TWIN/COMMIT" 2>/dev/null | head -1))"; ls "$TWIN/ext" | tr '\n' ' '; echo; } \
+        | tee -a "$RES/env.txt"
+    BIN=$Z/bin/tf-dsv41-m1
+    reserve=${M5_REF_RESERVE:-14}
+    # 2. the captures (GPU 0)
+    for spec in ${M5_CAPTURES:-paged:B,D:2048 split:B,D:2048 paged:B,D:12 split:B,D:12 compact:B:12}; do
+        IFS=: read -r mode sets rows <<< "$spec"
+        name=m5-cap-$mode-${sets//,/}-p$rows
+        dir=$LOCAL/$name
+        l=$(left); mb=$(( l - reserve )); (( mb > ${M5_CAPTURE_MIN:-10} )) && mb=${M5_CAPTURE_MIN:-10}
+        (( mb >= 3 )) || { echo "$name skipped: $l min left, $reserve kept for the references" | tee -a "$RES/steps.txt"; rc=1; continue; }
+        rm -rf "$dir"
+        if (set -a; source "$Z/tools/zig/dsv41_m1/prod-knobs.env"; set +a
+            export PYTHONPATH=$TWIN/src TORCH_EXTENSIONS_DIR=$TWIN/ext TF_DSV41_GM_V2=1 CUDA_VISIBLE_DEVICES=0 \
+                   M1_PREFILL_ROWS=$rows
+            case $mode in
+                paged) export M1_PAGED=1 ;;
+                split) export M1_SPLIT=1 TF_DSV41_KV_SPLIT_COMPACT=0 ;;
+                compact) export M1_SPLIT=1 TF_DSV41_KV_SPLIT_COMPACT=force ;;
+                *) echo "unknown capture mode $mode"; exit 2 ;;
+            esac
+            step "$name" "$mb" python -B "$Z/tools/zig/dsv41_m1_capture.py" --pack "$LP" --out "$dir" --sets "$sets"); then
+            du -sh "$dir" | tee "$RES/$name-size.txt"
+            "$BIN" check "$dir" > "$RES/$name-check.log" 2>&1; echo "$name check: $(tail -1 "$RES/$name-check.log")" | tee -a "$RES/steps.txt"
+            if [[ " ${M5_REPLAY:-paged-p2048 split-p2048} " == *" $mode-p$rows "* ]]; then
+                l=$(left); mb=$(( l - reserve )); (( mb > 10 )) && mb=10
+                if (( mb >= 3 )); then
+                    CUDA_VISIBLE_DEVICES=0 step "replay-$name" "$mb" "$BIN" replay "$LP" "$dir" "$RES/replay-$name" || rc=1
+                else echo "replay-$name skipped: $l min left" | tee -a "$RES/steps.txt"; fi
+            fi
+        else rc=1; fi
+        mkdir -p "$RES/$name"
+        for f in meta.json weights.json manifest.json jit.json; do [[ -f "$dir/$f" ]] && cp "$dir/$f" "$RES/$name/"; done
+        [[ -d "$dir/aot" ]] && tar -czf "$RES/$name/aot.tar.gz" -C "$dir" aot
+        [[ -f "$dir/ops.jsonl" ]] && gzip -c "$dir/ops.jsonl" > "$RES/$name/ops.jsonl.gz"
+        [[ -f "$dir/launches.json" ]] && gzip -c "$dir/launches.json" > "$RES/$name/launches.json.gz"
+        rm -rf "$dir/blobs"
+    done
+    # 3. the references (both GPUs), engine defaults but the index keys' format, expert top-p off
+    unset TF_DSV41_EXPERT_TOPP
+    export TF_DSV41_INDEX_KV=${M5_INDEX_KV:-fp8}
+    PROMPTS=${M5_PROMPTS:-2060 9}
+    port=29811
+    okrefs=()
+    for mode in ${M5_REFS:-pool split compact park}; do
+        REF=$LOCAL/m5-ref-$mode
+        rm -rf "$REF"
+        case $mode in
+            pool) args=(--pool) ;;
+            split) args=(--split --compact 0) ;;
+            compact) args=(--split --compact force) ;;
+            park) args=(--park); [[ "${M5_PARK_KV:-pool}" == split ]] && args+=(--split --compact 0) ;;
+            *) echo "unknown reference mode $mode" | tee -a "$RES/steps.txt"; rc=1; continue ;;
+        esac
+        l=$(left); mb=$l; (( mb > ${M5_REF_MIN:-8} )) && mb=${M5_REF_MIN:-8}
+        (( mb >= 3 )) || { echo "m5-ref-$mode skipped: $l min left" | tee -a "$RES/steps.txt"; rc=1; continue; }
+        if (export PYTHONPATH=$TWIN/src TORCH_EXTENSIONS_DIR=$TWIN/ext
+            step "m5-ref-$mode" "$mb" python -u -B "$Z/tools/zig/dsv41_m2b_ref.py" --pack "$LP" --out "$REF" \
+                --layers "0-$hi" --steps "${M2B_STEPS:-64}" --prompts "$(echo $PROMPTS | tr ' ' ',')" --port $port "${args[@]}"); then
+            okrefs+=("$mode")
+        else rc=1; fi
+        port=$(( port + 10 ))
+        o=$RES/m5-ref-$mode
+        for p in $PROMPTS; do
+            d=$REF/p$p; mkdir -p "$o/p$p"
+            for f in ref.json rank0.json rank1.json manifest.json; do [[ -f "$d/$f" ]] && cp "$d/$f" "$o/p$p/"; done
+            for r in 0 1; do [[ -f "$d/rank$r/state/state.json" ]] && cp "$d/rank$r/state/state.json" "$o/p$p/state-rank$r.json"; done
+        done
+        [[ -d "$REF/aot" ]] && tar -czf "$o/aot.tar.gz" -C "$REF" aot
+    done
+    if (( ${#okrefs[@]} )); then
+        if step m5-engram-host 3 python -B "$Z/tools/zig/dsv41_engram_host.py" --py-src "$TWIN/src" \
+                --config "$LP/config.json" --tokenizer "$LP/tokenizer.json" --out "$LOCAL/m5-engram-host.bin"; then
+            for mode in "${okrefs[@]}"; do for p in $PROMPTS; do cp "$LOCAL/m5-engram-host.bin" "$LOCAL/m5-ref-$mode/p$p/"; done; done
+        else rc=1; fi
+        # every mode's tokens and per-step logits digests == the replicated pool's (split == replicated bit for bit;
+        # the park reference's uninterrupted run too, and its restored run == that run: ref.json park_equal)
+        step m5-agree 1 python -B - "$LOCAL" "$PROMPTS" "${okrefs[@]}" <<'PY' || rc=1
+import json, sys
+from pathlib import Path
+local, prompts, modes = Path(sys.argv[1]), sys.argv[2].split(), sys.argv[3:]
+bad = 0
+for p in prompts:
+    refs = {m: json.loads((local / f"m5-ref-{m}" / f"p{p}" / "ref.json").read_text()) for m in modes
+            if (local / f"m5-ref-{m}" / f"p{p}" / "ref.json").exists()}
+    base = refs.get("pool")
+    for m, r in refs.items():
+        same = base is None or (r["tokens"] == base["tokens"] and
+                                all(a["logits_sha256"] == b["logits_sha256"] for a, b in zip(r["ranks"], base["ranks"])))
+        park = r.get("park_equal")
+        ok = same and park is not False
+        bad += not ok
+        print(f"p{p} {m}: tokens {len(r['tokens'])}, == pool {same if base else '(no pool reference)'}"
+              + (f", park round trip {'==' if park else '!='} uninterrupted" if park is not None else "")
+              + ("" if ok else "  MISMATCH"))
+print(f"m5-agree: {bad} mismatches")
+sys.exit(1 if bad else 0)
+PY
+    fi
+    # 4. the Zig gates (tf-dsv41-m1 m5 MODE PACK REF OUT): placeholders until the binary has the command
+    for mode in ${M5_GATES:-split compact park}; do
+        REF=$LOCAL/m5-ref-$mode
+        if ! "$BIN" 2>&1 | grep -q 'tf-dsv41-m1 m5'; then
+            echo "m5-$mode skipped: $BIN has no m5 command yet (its usage lists none)" | tee -a "$RES/steps.txt"; continue
+        fi
+        [[ " ${okrefs[*]} " == *" $mode "* ]] || { echo "m5-$mode skipped: no m5-ref-$mode" | tee -a "$RES/steps.txt"; rc=1; continue; }
+        l=$(left); mb=$l; (( mb > ${M5_GATE_MIN:-6} )) && mb=${M5_GATE_MIN:-6}
+        (( mb >= 3 )) || { echo "m5-$mode skipped: $l min left" | tee -a "$RES/steps.txt"; rc=1; continue; }
+        (export TF_TP_PORT=$port; step "m5-$mode" "$mb" "$BIN" m5 "$mode" "$LP" "$REF" "$RES/m5-$mode") || rc=1
+        port=$(( port + 10 ))
+    done
+    echo "=== rc=$rc"
+    exit $rc
+fi
+
 # M1_JOB=m2a: M2a instead of M1 (the Python reference over layers M2A_LAYERS (0-8) with its slot state, rope tables
 # and AOT set; the Engram host tables; tf-dsv41-m1 m2a; then the kernel job in what is left)
 # M1_JOB=m2b (TWO GPUs): M2b. The pack's shards up to layer M2B_HI (27: ~69 GB a rank; the whole backbone does not
