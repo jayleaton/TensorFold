@@ -2,15 +2,14 @@
 //! block_prefill.zig's program, run eagerly by run.zig with this file's glue handler, each segment then committed as a
 //! keep of all its rows. Python's Forward.prompt: the head (and kit_logits) only on the last segment.
 //!
-//! - A segment of at most 16 rows (the prompt's ragged tail, or a whole short prompt) is not on the prefill path
-//!   (block_prefill refuses it): it runs as decode windows (forward.window + keep), as Python's short segments do.
+//! - A segment of at most 16 rows (the prompt's ragged tail, or a whole short prompt) is block_prefill's short segment:
+//!   Python's mix of prefill projections and the decode kernels' row paths, committed the same way.
 //! - The commit (keep's equivalent, Python's Forward.keep(slot, n - 1)): each ratio-2 KV source's carry is its fp32
 //!   projection's last row ("w.L<i>.proj", the f32 of the bf16 rows, so the same bits as decode's carry kernel), the
 //!   Engram tail is (tail + the segment's ids)[-(max_ngram - 1):], the position moves by the rows, nothing pending.
 //!   The rings, pools and index keys the segment's kernels already wrote.
-//! - After a prefill the last step's logits are in "w.logits", `Forward.last_rows` rows of them (the last segment's,
-//!   or the tail window's): greedy takes `out[0..last_rows]` and the caller reads the last row. A tail split into
-//!   several windows (decode buckets smaller than it) has its rows' logits gathered back into rows [0, tail).
+//! - After a prefill the last step's logits are in "w.logits", `Forward.last_rows` rows of them (the last segment's):
+//!   greedy takes `out[0..last_rows]` and the caller reads the last row.
 //! - Run once before the first segment: the persistent tables no loader form builds, the prefill GEMM's Hadamard
 //!   ("s.pf.had", exl3.prefill's bf16 +-1) and x3gm's pointer tables ("s.L<i>.gm.t{g,u,d}": the routed experts'
 //!   trellis addresses, the prefix of forms' "s.L<i>.ex.tp_*" before the shared expert's), and the exchange / Engram
@@ -30,7 +29,7 @@ const Forward = fwd.Forward;
 
 const log = std.log.scoped(.dsv41);
 
-pub const Error = error{ NoExpertTable, NoK2Table, BadGlue, TailRows };
+pub const Error = error{ NoExpertTable, NoK2Table, BadGlue };
 
 /// The prefill's own state on the forward (forward.zig: `prefill_state`).
 pub const State = struct {
@@ -40,8 +39,6 @@ pub const State = struct {
     ids: std.ArrayList(u32) = .empty,
     /// gm_plan's width-masked picks (int32 [P])
     masked: ?cuda.DeviceBuffer = null,
-    /// a split tail's logits rows
-    stash: ?cuda.DeviceBuffer = null,
     /// the segment's layers and the MoE blocks seen: gm_ticket starts each layer's MoE, gm_plan reads its K2 table
     layers: []const u32 = &.{},
     moe: usize = 0,
@@ -49,21 +46,20 @@ pub const State = struct {
 
     pub fn deinit(s: *State, gpa: std.mem.Allocator) void {
         if (s.masked) |*b| b.free();
-        if (s.stash) |*b| b.free();
         s.ids.deinit(gpa);
     }
 };
 
 /// Adds the prefill program's roles at `rows` (the largest segment) to `p`: at start 0 and at the last start its
-/// emitter takes (the indexer's scores grow with the keys), and a 17-row segment's (the small-segment paths: the
-/// Triton mHC site, the out-of-place boundary streams).
+/// emitter takes (the indexer's scores grow with the keys), a 17-row segment's (the small-segment paths: the Triton
+/// mHC site, the out-of-place boundary streams) and a 16-row short segment's (the decode kernels' roles).
 pub fn plan(f: *Forward, p: *buffers.Plan, rows: u32) !void {
     if (rows <= 16) return error.BadWindow;
     var la = std.heap.ArenaAllocator.init(f.gpa);
     defer la.deinit();
     const layers = try f.backbone(la.allocator());
-    const sizes = [_]u32{ rows, 17 };
-    for (sizes[0..if (rows > 17) 2 else 1]) |n| {
+    const sizes = [_]u32{ rows, 17, 16 };
+    for (sizes[if (rows > 17) 0 else 1..]) |n| {
         const top = try lastStart(f, layers, n);
         for ([_]i64{ 0, top }) |start| {
             var ea = std.heap.ArenaAllocator.init(f.gpa);
@@ -118,16 +114,12 @@ pub fn prompt(f: *Forward, ids_in: []const u32) !void {
     var at: usize = 0;
     while (at < ids.len) {
         const n = @min(seg, ids.len - at);
-        if (n <= 16) {
-            try tail(f, ids[at..]);
-            break;
-        }
         try segment(f, ids[at .. at + n], at + n == ids.len);
         at += n;
     }
 }
 
-/// One segment of more than 16 rows at the slot's position, run eagerly, then committed.
+/// One segment at the slot's position, run eagerly, then committed.
 fn segment(f: *Forward, ids: []const u32, head: bool) !void {
     const st = &f.prefill_state;
     const n: u32 = @intCast(ids.len);
@@ -181,33 +173,6 @@ fn tailOf(s: *fwd.Slot, ids: []const u32, keep: usize) void {
     std.mem.copyForwards(u32, s.tail[0..old], s.tail[s.tail_len - old .. s.tail_len]);
     @memcpy(s.tail[old .. old + ids.len], ids);
     s.tail_len = old + ids.len;
-}
-
-/// A tail of at most 16 rows: decode windows, each kept whole. One window when the decode buckets hold it; else
-/// windows of the largest bucket, their logits rows gathered into rows [0, tail) of "w.logits" for greedy.
-fn tail(f: *Forward, ids: []const u32) !void {
-    const most: usize = f.planned_rows;
-    if (most == 0) return error.TailRows;
-    if (ids.len <= most) {
-        try f.window(ids);
-        try f.keep(@intCast(ids.len - 1));
-        f.last_rows = @intCast(ids.len);
-        return;
-    }
-    const r = f.runner;
-    const row: usize = 4 * @as(usize, f.cfg.vocab / f.comm.world());
-    const stash = try grow(&f.prefill_state.stash, r.d, ids.len * row);
-    const logits = r.addressOf("w.logits") orelse return error.Unbound;
-    var at: usize = 0;
-    while (at < ids.len) {
-        const m = @min(most, ids.len - at);
-        try f.window(ids[at .. at + m]);
-        try copy(r, stash + at * row, logits, m * row);
-        try f.keep(@intCast(m - 1));
-        at += m;
-    }
-    try copy(r, logits, stash, ids.len * row);
-    f.last_rows = @intCast(ids.len);
 }
 
 /// Once: the tables no loader form builds and the buffers a segment's exchanges / Engram rows need.

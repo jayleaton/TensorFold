@@ -646,7 +646,16 @@ pub const Emitter = struct {
             .{ .name = "PTS", .arg = .{ .i = 0 } },                     .{ .name = "ROWS", .arg = .{ .b = false } },
             .{ .name = "CBS", .arg = .{ .i = if (reindex) cbs else 0 } },
         });
-        // attn_cuda topk: up to two jobs in one launch (the list repeats a single job)
+        try e.topk(L, scores, cand, nk, ratio);
+    }
+
+    /// attn_cuda topk over a window's `scores` [n, nk] of index layer L: up to two jobs in one launch (the list repeats a
+    /// single job). A candidate source also picks the candidate blocks into `cand`; a Reindex layer's scores are over
+    /// `cand`'s blocks. Python's short prefill segments take it too (block_prefill.zig).
+    pub fn topk(e: *Emitter, L: u32, scores: Arg, cand: Arg, nk: i64, ratio: i64) !void {
+        const n = e.n;
+        const reindex = e.cfg.mode(L) == .reindex;
+        const cbs: i64 = e.cfg.candidate_block_size;
         const sel = try e.selection(L);
         const k: i64 = e.cfg.index_topk;
         const pl = topkPlan(nk, null);

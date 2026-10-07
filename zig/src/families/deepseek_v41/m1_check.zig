@@ -115,18 +115,28 @@ pub const Flow = struct {
     glue: std.StringArrayHashMapUnmanaged(u32) = .empty,
     /// window / layer roles first touched by a call that leaves them unchanged: inputs the forward's glue fills
     inputs: std.StringArrayHashMapUnmanaged(u32) = .empty,
+    /// roles one of our glue steps touched since they came into scope: their first read may hold bytes the glue
+    /// wrote that equal what a freed storage held (x3gm's gate / down plans of a few picks), not a wrong wire
+    glued: std.StringHashMapUnmanaged(void) = .empty,
     miswired: u32 = 0,
 
     pub fn begin(f: *Flow, b: calls.Begin) void {
         if (b == .none) return;
-        var drop: std.ArrayList([]const u8) = .empty;
-        var it = f.last.keyIterator();
-        while (it.next()) |k| {
-            if (std.mem.startsWith(u8, k.*, "s.")) continue;
-            if (b == .layer and std.mem.startsWith(u8, k.*, "w.")) continue;
-            drop.append(f.a, k.*) catch {};
+        inline for (.{ &f.last, &f.glued }) |m| {
+            var drop: std.ArrayList([]const u8) = .empty;
+            var it = m.keyIterator();
+            while (it.next()) |k| {
+                if (std.mem.startsWith(u8, k.*, "s.")) continue;
+                if (b == .layer and std.mem.startsWith(u8, k.*, "w.")) continue;
+                drop.append(f.a, k.*) catch {};
+            }
+            for (drop.items) |k| _ = m.remove(k);
         }
-        for (drop.items) |k| _ = f.last.remove(k);
+    }
+
+    /// A glue step of ours (no captured launch): the roles it reads or writes.
+    pub fn glueCall(f: *Flow, c: *const calls.Call) !void {
+        for (c.args) |x| if (x.arg == .t and x.arg.t.role == .buf) try f.glued.put(f.a, x.arg.t.role.buf, {});
     }
 
     pub fn call(f: *Flow, c: *const calls.Call, op: std.json.ObjectMap, log: *std.Io.Writer, where: []const u8) !void {
@@ -157,7 +167,7 @@ pub const Flow = struct {
                 g.value_ptr.* += 1;
             }
             // a first touch that writes overwrites whatever a freed storage held; only a read can be miswired
-            const read = std.mem.eql(u8, before.string, o.get("after").?.string);
+            const read = std.mem.eql(u8, before.string, o.get("after").?.string) and !f.glued.contains(b.role);
             var it = f.last.iterator();
             while (it.next()) |e| if (read and std.mem.eql(u8, e.value_ptr[0], key) and std.mem.eql(u8, e.value_ptr[1], before.string)) {
                 f.miswired += 1;
@@ -309,16 +319,23 @@ pub fn checkAll(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, experts: []
             flow.last = .empty;
         }
         last_set = win.set;
-        const cs = try calls.launches(a, if (win.prefill)
+        const all = if (win.prefill)
             try block_prefill.emitPrefill(a, &cfg, &w, opts, win.layers, win.n, win.start, true)
         else
-            try block.emit(a, &cfg, &w, opts, win.layers, win.n, win.start, true));
+            try block.emit(a, &cfg, &w, opts, win.layers, win.n, win.start, true);
+        const cs = try calls.launches(a, all);
         var equal: usize = 0;
         var shown: usize = 0;
         const m = @min(cs.len, win.ops.len);
+        var g: usize = 0; // the next of `all`: our glue steps and the scopes in emission order
         for (cs[0..m], win.ops[0..m], 0..) |*c, op, i| {
             roles.begin(c.begin);
-            flow.begin(c.begin);
+            while (all[g].glue) : (g += 1) {
+                flow.begin(all[g].begin);
+                try flow.glueCall(&all[g]);
+            }
+            flow.begin(all[g].begin);
+            g += 1;
             try flow.call(c, op, log, try std.fmt.allocPrint(a, "{s} {s} #{d}", .{ win.set, win.phase, i }));
             const vwhy = if (variants) |*v| try v.check(a, c, op) else null;
             if (vwhy) |why| {

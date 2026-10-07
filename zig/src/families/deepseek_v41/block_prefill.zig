@@ -27,9 +27,15 @@
 //! gm_ticket, gm_plan (x3gm.plan of one width's picks), swiglu (the shared expert's clamped SiLU product), moe_sum
 //! (bf16(routed + shared)), engram_rows, trace, kit_logits.
 //!
-//! Not taken here (error.Unsupported): segments of at most 16 rows (the decode kernels' row paths: mhc_cuda, dtopk,
-//! the narrow router), the stream top-k of full-mode layers 2 / 8 / 14 at TF_DSV41_INDEX_STREAM_MIN visible keys or
-//! more, uniform (not ragged) expert stacks, gate / up sharing their sign vector (x3gm shx).
+//! A short segment (at most 16 rows: a prompt's ragged tail, or a whole short prompt) is Python's mix (pod 24's
+//! captures at 1, 12 and 16 rows): the prefill projections, indexer scores, fused attention, x3gm experts and shared
+//! GEMMs as above, but every kernel that has a row path for at most 16 rows takes it, as in a decode window
+//! (block.zig, block_moe.zig): mhc_cuda for every site, post-only and the final norm (no `_finish_k`), the L2 prefetch
+//! (o / f / x sites), attn_cuda's top-k (a Reindex layer scoring over its candidate blocks, no `_keys` or torch top-k)
+//! and the narrow router. The exchanges land in the decode window's "w.recv.*" that mhc_cuda reads.
+//!
+//! Not taken here (error.Unsupported): the stream top-k of full-mode layers 2 / 8 / 14 at TF_DSV41_INDEX_STREAM_MIN
+//! visible keys or more, uniform (not ragged) expert stacks, gate / up sharing their sign vector (x3gm shx).
 
 const std = @import("std");
 const dk = @import("dsv41_kernels");
@@ -86,6 +92,8 @@ const Seg = struct {
     ring: i64,
     /// the candidate source ran in this segment (reindex layers read its candidates)
     cand: bool = false,
+    /// at most 16 rows: Python's short segment (the module doc)
+    short: bool = false,
 
     // -----------------------------------------------------------------------------------------------------------
     // dense EXL3 projections (prefill_mm.matmul)
@@ -178,9 +186,11 @@ const Seg = struct {
         return e.buf("L.recv.moe", .{}, .bf16, &.{ e.o.world, e.n, D });
     }
 
-    /// One mixing site of layer L (`which`: hc_attn / hc_ffn): mhc.site / mhc.boundary, then `_finish_k`.
+    /// One mixing site of layer L (`which`: hc_attn / hc_ffn): mhc.site / mhc.boundary, then `_finish_k` (a short
+    /// segment: mhc_cuda alone).
     fn site(s: *Seg, L: u32, which: []const u8, mode: moe.Mode) !void {
         const e = s.e;
+        if (s.short) return moe.mhc(e, L, which, mode);
         const n = e.n;
         const D: i64 = e.cfg.hidden;
         const post = mode == .boundary;
@@ -260,6 +270,7 @@ const Seg = struct {
     /// mhc.post_only: the last exchange's post into `xout` (the streams in place, or the trace's copy).
     fn postOnly(s: *Seg, xout: Arg) !void {
         const e = s.e;
+        if (s.short) return moe.postOnly(e, xout);
         const prev = try coefs(e, e.coef);
         const x = try e.streams();
         try s.siteTriton(x, xout, try gathered(e, ""), prev, null, null, x, x, null, 0, false);
@@ -268,6 +279,7 @@ const Seg = struct {
     /// mhc.final: the last post, collapse 2, the final norm; then the head's columns over every row.
     fn final(s: *Seg) !void {
         const e = s.e;
+        if (s.short) return moe.finish(e); // mhc_cuda's final, then the same head
         const n = e.n;
         const D: i64 = e.cfg.hidden;
         const x = try e.streams();
@@ -397,8 +409,9 @@ const Seg = struct {
         return e.view(x.t.role, dt, &.{ rows, cols }, &.{ cols, 1 }, a * cols * size(dt));
     }
 
-    /// index.scores over rows [a, a + rows) of the segment: dense (key i = position i) or over `keys`' positions.
-    fn scores(s: *Seg, keys_of: u32, ratio: i64, a: i64, rows: i64, p: Arg, nk: i64, keys: ?Arg) !Arg {
+    /// index.scores over rows [a, a + rows) of the segment: dense (key i = position i) or over `keys`' positions
+    /// (`cbs` > 0: `keys` are candidate blocks of `cbs` positions, a short segment's Reindex layer).
+    fn scores(s: *Seg, keys_of: u32, ratio: i64, a: i64, rows: i64, p: Arg, nk: i64, keys: ?Arg, cbs: i64) !Arg {
         const e = s.e;
         const IH: i64 = e.cfg.index_heads;
         const ID: i64 = e.cfg.index_dim;
@@ -408,7 +421,7 @@ const Seg = struct {
             .{ .name = "W", .arg = try e.view(.{ .buf = "L.ix_w" }, .f32, &.{ rows, IH }, &.{ IH, 1 }, a * IH * 4) },
             .{ .name = "w_stride", .arg = .{ .i = IH } },               .{ .name = "IK", .arg = try indexKeys(e, keys_of) },
             .{ .name = "OUT", .arg = out },                             .{ .name = "POS", .arg = p },
-            .{ .name = "KEYS", .arg = keys orelse out },                .{ .name = "k_stride", .arg = .{ .i = nk } },
+            .{ .name = "KEYS", .arg = keys orelse out },                .{ .name = "k_stride", .arg = .{ .i = if (cbs > 0) keys.?.t.shape[1] else nk } },
             .{ .name = "NK", .arg = .{ .i = nk } },                     .{ .name = "o_stride", .arg = .{ .i = nk } },
             .{ .name = "RATIO", .arg = .{ .i = ratio } },               .{ .name = "H", .arg = .{ .i = IH } },
             .{ .name = "D", .arg = .{ .i = ID } },                      .{ .name = "BP", .arg = .{ .i = 64 } },
@@ -417,7 +430,7 @@ const Seg = struct {
             .{ .name = "GATHER", .arg = .{ .b = keys != null } },       .{ .name = "PT", .arg = .none },
             .{ .name = "PSH", .arg = .{ .i = 0 } },                     .{ .name = "KFP8", .arg = .{ .b = true } },
             .{ .name = "SL", .arg = .none },                            .{ .name = "PTS", .arg = .{ .i = 0 } },
-            .{ .name = "ROWS", .arg = .{ .b = false } },                .{ .name = "CBS", .arg = .{ .i = 0 } },
+            .{ .name = "ROWS", .arg = .{ .b = false } },                .{ .name = "CBS", .arg = .{ .i = cbs } },
         });
         return out;
     }
@@ -470,6 +483,20 @@ const Seg = struct {
         const cbs: i64 = e.cfg.candidate_block_size;
         const cb: i64 = e.cfg.candidate_blocks;
         const sel = try selection(e, L);
+        if (s.short) {
+            // the whole segment's scores, then attn_cuda's top-k (its job list picks a source's candidate blocks; a
+            // Reindex layer scores over them) and visible counts
+            const cand = try e.buf("w.cand", .{}, .i32, &.{ n, cb });
+            if (md == .reindex and e.cfg.usesCandidates(L) and s.cand) {
+                const sc = try s.scores(src, ratio, 0, n, try pos(e), cb * cbs, cand, cbs);
+                return e.topk(L, sc, cand, cb * cbs, ratio);
+            }
+            const nvis = @max(@divFloor(e.end(), ratio), 1);
+            const sc = try s.scores(src, ratio, 0, n, try pos(e), nvis, null, 0);
+            try e.topk(L, sc, cand, nvis, ratio);
+            if (e.cfg.isCandidateSource(L)) s.cand = true;
+            return;
+        }
         if (md == .reindex and e.cfg.usesCandidates(L) and s.cand) {
             // backend.reindex: the row's own scores over its candidates' positions, in row blocks under the budget
             const NK = cb * cbs;
@@ -485,7 +512,7 @@ const Seg = struct {
                 const p = if (whole) try pos(e) else try s.blockPos(j, a);
                 const ck = try e.buf("L.ix.ckeys", .{}, .i32, &.{ rows, NK });
                 try e.glue("cand_keys", &.{ try rowsOf(e, try e.buf("w.cand", .{}, .i32, &.{ n, cb }), .i32, a, rows, cb), ck, .{ .i = cbs } });
-                const sc = try s.scores(src, ratio, a, rows, p, NK, ck);
+                const sc = try s.scores(src, ratio, a, rows, p, NK, ck, 0);
                 try e.glue("topk", &.{ try s.sortKeys(sc, rows, NK, ck), try rowsOf(e, sel[0], .i32, a, rows, topk), .{ .i = topk } });
             }
         } else {
@@ -504,7 +531,7 @@ const Seg = struct {
                 const rows = @min(st, n - a);
                 const p = if (whole) try pos(e) else try s.blockPos(j, a);
                 const nk = if (whole) nvis else @max(@divFloor(e.start + a + rows, ratio), 1);
-                const sc = try s.scores(src, ratio, a, rows, p, nk, null);
+                const sc = try s.scores(src, ratio, a, rows, p, nk, null, 0);
                 try e.glue("topk", &.{ try s.sortKeys(sc, rows, nk, null), try rowsOf(e, sel[0], .i32, a, rows, topk), .{ .i = topk } });
                 if (cand) try s.candidates(sc, a, rows, nk, p, ratio);
             }
@@ -571,6 +598,7 @@ const Seg = struct {
         try s.proj(try e.fmt("L{d}.attn.wq_b", .{L}), .lanes, qn, e.cfg.q_lora, H * hd, q);
         const qi = try e.buf("L.qi", .{}, .bf16, &.{ n, IH * ID });
         if (indexer) try s.proj(try e.fmt("L{d}.attn.ix_wq_b", .{L}), .lanes, qn, e.cfg.q_lora, IH * ID, qi);
+        if (s.short) try e.prefetchO(L);
         try rope(e, q, H, hd);
         if (indexer) {
             try rope(e, qi, IH, ID);
@@ -662,25 +690,38 @@ const Seg = struct {
         const x = try e.buf("w.out", .{}, .bf16, &.{ n, D });
         const pick = try e.buf("L.pick", .{}, .i32, &.{ n, slots });
         const wts = try e.buf("L.wts", .{}, .f32, &.{ n, slots });
-        // router_gemv.route over every row (one CHUNK), prefill's config (8 warps, 2 experts a warp)
+        // router_gemv.route over every row (one CHUNK), prefill's config (8 warps, 2 experts a warp); at most 16 rows
+        // the narrow kernel (TF_DSV41_RG_NARROW 2, as a decode window's)
         const tile: i64 = for ([_]i64{ 1, 2, 4, 8, 16 }) |t| {
             if (t >= @min(n, 16)) break t;
         } else 16;
+        const cfg: [2]i64 = if (n <= 16) .{ 2, 0 } else .{ 8, 2 };
         try e.ext("tf_dsv41_router_gemv_v2.route", &.{
             x,                                                        try e.weight("L{d}.moe.gate", .{L}, .bf16, &.{ Et, D }),
             try e.weight("L{d}.moe.bias", .{L}, .f32, &.{Et}),       pick,
             wts,                                                      try e.buf("L.logits", .{}, .f32, &.{ n, Et }),
             try e.buf("s.router.cnt", .{}, .i32, &.{128}),           .{ .i = topk },
             .{ .i = slots },                                          .{ .f = E.dec(e.cfg.routed_scale) },
-            .{ .i = tile },                                           .{ .i = 8 },
-            .{ .i = 2 },                                              .{ .b = true },
+            .{ .i = tile },                                           .{ .i = cfg[0] },
+            .{ .i = cfg[1] },                                         .{ .b = true },
             .{ .b = false },                                          try e.empty(.i32),
             try e.empty(.i32),                                        try e.t(.empty, .i32, &.{ 0, 1 }),
             .{ .i = 0 },                                              .{ .b = false },
         });
-        // the kit's fp16 weights, the shared slot masked, the routed slots' contiguous copies
-        const pk = try e.buf("L.gm.pick", .{}, .i32, &.{ n, topk });
-        const w6 = try e.buf("L.gm.wts", .{}, .f32, &.{ n, topk });
+        if (e.o.r1) {
+            // the R1 twin's route always takes the prune list (router_gemv.route: list(prune or [])); prefill's is
+            // empty (the prune runs after it, prefill_moe's rule)
+            const last = &e.out.items[e.out.items.len - 1];
+            const more = try e.a.alloc(calls.Named, last.args.len + 1);
+            @memcpy(more[0..last.args.len], last.args);
+            more[last.args.len] = .{ .arg = .{ .list = &.{} } };
+            last.args = more;
+        }
+        // the kit's fp16 weights, the shared slot masked, the routed slots' contiguous copies (one row: torch's
+        // .contiguous() keeps the [1, topk] view of the [1, slots] rows, the same bytes)
+        const rs: i64 = if (n == 1) slots else topk;
+        const pk = try e.view(.{ .buf = "L.gm.pick" }, .i32, &.{ n, topk }, &.{ rs, 1 }, 0);
+        const w6 = try e.view(.{ .buf = "L.gm.wts" }, .f32, &.{ n, topk }, &.{ rs, 1 }, 0);
         try e.glue("gm_picks", &.{ pick, wts, pk, w6 });
         // x3gm._run_ragged: one row block (X / Y in the experts' scratch z, Xd in its xg), rot, a gate/up launch a
         // gate width present, a down launch a down width present, upstream's combine
@@ -787,6 +828,13 @@ const Seg = struct {
     // -----------------------------------------------------------------------------------------------------------
     // the segment (forward._run / _layers / _finish)
 
+    /// Where an exchange (`which`: attn / moe) lands: the layer's (`gathered`), or a short segment's "w.recv.*"
+    /// (block_moe.mhc's).
+    fn recv(s: *Seg, comptime which: []const u8) !Arg {
+        const e = s.e;
+        return e.buf("{s}.recv." ++ which, .{if (s.short) "w" else "L"}, .bf16, &.{ e.o.world, e.n, e.cfg.hidden });
+    }
+
     fn run(s: *Seg, layers: []const u32, head: bool) !void {
         const e = s.e;
         const n = e.n;
@@ -804,10 +852,12 @@ const Seg = struct {
                 try s.site(L, "hc_attn", if (i == 0) .site1 else .site2);
             } else try s.site(L, "hc_attn", .boundary);
             try s.attention(L);
-            try e.glue("exchange", &.{ try e.buf("L.part", .{}, .bf16, &.{ n, D }), try e.buf("L.recv.attn", .{}, .bf16, &.{ e.o.world, n, D }) });
+            if (s.short) try e.prefetchF(L);
+            try e.glue("exchange", &.{ try e.buf("L.part", .{}, .bf16, &.{ n, D }), try s.recv("attn") });
             try s.site(L, "hc_ffn", .boundary);
             try s.moeBlock(L);
-            try e.glue("exchange", &.{ try e.buf("L.moe16", .{}, .bf16, &.{ n, D }), try e.buf("L.recv.moe", .{}, .bf16, &.{ e.o.world, n, D }) });
+            if (s.short and i + 1 < layers.len) try e.prefetchX(layers[i + 1]);
+            try e.glue("exchange", &.{ try e.buf("L.moe16", .{}, .bf16, &.{ n, D }), try s.recv("moe") });
             if (e.o.trace) {
                 const y = try e.buf("w.trace", .{}, .bf16, &.{ n, 4 * D });
                 try s.postOnly(y);
@@ -821,7 +871,7 @@ const Seg = struct {
 /// The calls of a prefill segment of `n` rows from position `start` over `layers` (ascending, consecutive), and the
 /// final norm + head when `head` (arena-owned by `a`).
 pub fn emitPrefill(a: std.mem.Allocator, cfg: *const Config, w: *const block.Widths, o: block.Options, layers: []const u32, n: i64, start: i64, head: bool) ![]calls.Call {
-    if (n <= 16 or n > o.prefill_rows or n > router_chunk) return error.Unsupported;
+    if (n < 1 or n > o.prefill_rows or n > router_chunk) return error.Unsupported;
     var e: E = .{ .a = a, .cfg = cfg, .w = w, .o = o, .n = n, .start = start };
     const W: i64 = cfg.window;
     // forward.staging: the slot's ring holds 2 x window rows; a longer segment goes through the staging ring
@@ -829,7 +879,7 @@ pub fn emitPrefill(a: std.mem.Allocator, cfg: *const Config, w: *const block.Wid
     const stage: i64 = @intCast(std.math.ceilPowerOfTwo(u64, @intCast(o.prefill_rows + W - 1)) catch return error.Unsupported);
     const ring = if (staged) stage else 2 * W;
     if (ring < n + W - 1) return error.Unsupported; // attn_pf: the ring must hold the rows and their windows
-    var s: Seg = .{ .e = &e, .staged = staged, .ring = ring };
+    var s: Seg = .{ .e = &e, .staged = staged, .ring = ring, .short = n <= 16 };
     try s.run(layers, head);
     return e.out.items;
 }
