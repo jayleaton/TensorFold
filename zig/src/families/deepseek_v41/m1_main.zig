@@ -100,6 +100,11 @@ pub fn main(init: std.process.Init) !u8 {
             std.debug.print("FAIL tf-dsv41-m1 generate: {t}\n", .{e});
             return 1;
         };
+    if (args.len == 4 and std.mem.eql(u8, args[1], "vision")) // the vision tower vs Python's dumps (vision_check.zig)
+        return @import("vision_check.zig").run(init.gpa, init.io, args[2], args[3]) catch |e| {
+            std.debug.print("FAIL tf-dsv41-m1 vision: {t}\n", .{e});
+            return 1;
+        };
     if (args.len == 3 and std.mem.eql(u8, args[1], "dcheck")) {
         var buf: [4096]u8 = undefined;
         var out = std.Io.File.stdout().writer(init.io, &buf);
