@@ -59,6 +59,8 @@ pub const Forward = struct {
     ids: []const u32 = &.{},
     /// TF_DSV41_IMAGES=native (vision_rows.zig): every rank keeps image positions out of Engram; rank 0's image rows
     images: bool = false,
+    /// TF_DSV41_BIAS_VL loaded (every rank): image rows route with gate.bias_vl ("L<i>.moe.bias_vl")
+    image_bias: bool = false,
     vision: ?*vision_rows.Rows = null,
     ids_own: std.ArrayList(u32) = .empty,
     /// the backbone layers the forward runs (all of them unless a gate runs a prefix: M2a's 0-24)
