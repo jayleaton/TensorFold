@@ -22,6 +22,7 @@ const ph = @import("phases.zig");
 const timed = @import("phases_timed.zig");
 const grammar_gpu = @import("grammar_gpu.zig");
 const Allocator = std.mem.Allocator;
+const vision_rows = @import("vision_rows.zig");
 
 pub const backends: []const []const u8 = &.{"cuda"};
 pub const families: []const api.Family = &.{.{ .model_type = "deepseek_v41", .formats = &.{"exl3"} }};
@@ -126,6 +127,8 @@ pub const Served = struct {
         try s.host.start();
         if (s.gengine) |ge| ge.inner = s.host.engine();
         s.rec = Recorder.init(gpa, io, if (s.gengine) |ge| ge.engine() else s.host.engine());
+        // TF_DSV41_IMAGES=native (vision_rows.zig): a request's images held from submit to its finished event
+        s.rec.inner = try vision_rows.wrap(gpa, &m.f, s.rec.inner);
         return s;
     }
 
