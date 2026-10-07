@@ -157,7 +157,8 @@ pub const Recorder = struct {
     /// every recorded line so far (the file is rewritten whole: one reply at a time)
     log: std.ArrayList(u8) = .empty,
 
-    const Rec = struct { r: *Recorder, sink: api.Sink, prompt: []u32, out: std.ArrayList(u32) = .empty, drafted: u64 = 0 };
+    /// `sampling`: the request's own (seed included), so `tf-dsv41-m1 generate` replays a sampled reply as it was asked
+    const Rec = struct { r: *Recorder, sink: api.Sink, prompt: []u32, sampling: ?api.Sampling = null, out: std.ArrayList(u32) = .empty, drafted: u64 = 0 };
 
     pub fn init(gpa: Allocator, io: std.Io, inner: api.Engine) Recorder {
         return .{ .gpa = gpa, .io = io, .inner = inner, .path = if (std.c.getenv("TF_DSV41_TRACE_TOKENS")) |p| std.mem.span(p) else null };
@@ -200,7 +201,7 @@ pub const Recorder = struct {
     fn submit(ctx: *anyopaque, id: api.Id, request: *const api.Request, sink: api.Sink) api.SubmitError!void {
         const r = self(ctx);
         const x = r.gpa.create(Rec) catch return error.Busy;
-        x.* = .{ .r = r, .sink = sink, .prompt = r.gpa.dupe(u32, request.prompt) catch {
+        x.* = .{ .r = r, .sink = sink, .sampling = request.sampling, .prompt = r.gpa.dupe(u32, request.prompt) catch {
             r.gpa.destroy(x);
             return error.Busy;
         } };
@@ -238,7 +239,7 @@ pub const Recorder = struct {
     fn write(r: *Recorder, x: *const Rec) void {
         var line: std.Io.Writer.Allocating = .init(r.gpa);
         defer line.deinit();
-        std.json.Stringify.value(.{ .prompt = x.prompt, .tokens = x.out.items, .drafted = x.drafted }, .{}, &line.writer) catch return;
+        std.json.Stringify.value(.{ .prompt = x.prompt, .tokens = x.out.items, .drafted = x.drafted, .sampling = x.sampling }, .{}, &line.writer) catch return;
         line.writer.writeByte('\n') catch return;
         r.log.appendSlice(r.gpa, line.written()) catch return;
         std.Io.Dir.cwd().writeFile(r.io, .{ .sub_path = r.path.?, .data = r.log.items }) catch {};
