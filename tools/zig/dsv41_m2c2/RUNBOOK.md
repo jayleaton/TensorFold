@@ -53,7 +53,8 @@ One prod window, three runs in order. Each run gates the next:
   - The checks: every state role (SWA rings, compressed pools, index keys, ratio-2 carries) bytes-equal to Python's dump, the same position and Engram tail, the same first token, then the decode gate from that state.
   - The pass line: `PASS Zig prefill rank N: ... state roles K/K equal ...`, then `PASS M2b rank N` in `out/seed*/prefill.log`.
   - `PROMPT=2600` makes the prompt cross a segment boundary (2,048 + 552).
-  - This gate has not run on a GPU yet (the prefill segments' launches have: 320/320). If it fails, step 7 can still run with `TF_DSV41_OWN_PREFILL=0`, which prefills through decode windows.
+  - This gate has not run on a GPU yet (the prefill segments' launches have: 320/320).
+  - **M4 (steps 7 and 10) prefills with the Zig prefill by default.** If this gate was skipped or failed, run steps 7 and 10 with `OWN_PREFILL=0` on both hosts (e.g. `OWN_PREFILL=0 ASSETS=... ./run_m4.sh 0 out server`): the prompts then go through 16-row decode windows, as tested before.
 - M4: `DRAFTS=0` serves without DSpark (then step 6 is not needed). `TF_DSV41_GRAPHS=1` on both ranks enables decode graphs.
 
 **What the numbers mean:**
