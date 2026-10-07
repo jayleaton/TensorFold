@@ -316,6 +316,23 @@ The hooks:
   - **Assets:** made by the step itself. `ref.py` writes `trace.jsonl`, `rope.bin` and `aot/`, including the row-mode Triton variants of every bucket up to 16; `dsv41_engram_host.py` writes `engram-host.bin`. No capture is needed.
   - **Default off:** `TF_DSV41_SLOTS` unset is today's path. On 8f40a20, `check` cap24-1 / cap24-12 / cap24-16 / cap15 / cap18 / cap22, `dcheck cap16` and `m5-emit cap18` give 0 mismatches.
 
+- `dsq-zig-longpf-1` (long prompts up to the 1M limit; `longpf.zig`):
+  - **What it ports** (tensorfold-decode1 8474f31 `csa2/stream_topk.py`, `backend._stream_select`; dsv41-kvsplit / midprofile `kvsplit.plan`, `blocks._attend_blocks`):
+    - **Stream top-k.** From `TF_DSV41_INDEX_STREAM_MIN` (prod 4,096) visible keys, a full-mode layer without the candidates' scores (2 / 8 / 14) selects as Python does: per row block of `stream_topk.plan` (scratch under its own 256 MiB BUDGET), the Triton `_stream` (program = row x 16,384-key split) and the glue `stream_merge`. The merge gathers each split's first K keys (`kvGather` over every other K-slot row; one split: none) and runs `index.top_positions` over them. Keys are unique, so the set is Python's whatever the split order. No new kernel: `_stream` comes from the reference's AOT set, the rest are prefill glue kernels gated on pod 20.
+    - **Split KV past the union cap.** `kv_state` keeps a union's row blocks (planUnion's halves) instead of `error.UnionSplit`. `longpf.window` runs a segment's calls and gives each `_fused` attention that reads `w.kx.recv` (the index layer's and its reuse layers') block by block: block j's rows exchanged, then the same launch over rows [a, b) (Q / TOK / CNT / LO / OUT rows moved, POS = start + a, every constexpr and OR unchanged: the same AOT variant).
+    - **The served limit.** `TF_DSV41_CONTEXT` (Python's context; prod 1,048,576) sets the served model's slot limit (default 4,096 as before) and its rope rows (limit + 2,048; `rope.bin` must hold them: `dsv41_rope_tables.py --rows`, else `error.RopeTooShort`). The M2b driver takes the reference's `limit` from `ref.json`.
+  - **Hooks** (one commit each): `block_prefill.zig` (`streamSelect`), `forward_prefill.zig` (`stream_merge`, `longpf.window`), `kv_state.zig` (`blocks`, `fetchBlock`), `model.zig` (`TF_DSV41_CONTEXT`), `m2b.zig` (the reference's limit), `zig/build/cuda.zig` (`test-dsv41-longpf`).
+  - **Host gate:** `zig build test-dsv41-longpf`, 5/5 on the real emitter (release config, q28-v2 widths, 1M limit, contiguous / paged / split): a 2,048-row segment at the limit's end streams on every full-mode non-candidate layer in two row blocks (512K visible keys: 32 splits, 1,024 rows a launch), scratch within the budget, no `_keys` there; below the threshold nothing changes; a split segment's exchanged attentions split into row blocks moving only the row-indexed tensors.
+  - **Default off:** short prompts emit exactly as before. `check` cap24-1 / cap24-12 / cap24-16 / cap15 / cap18 / cap22 and `dcheck cap16`: 0 mismatches; `m5-emit cap18`: 8 programs, 0 problems (on HEAD + these commits alone).
+  - **Pod step** (`M2B_LONGPF=1`, TWO GPUs inside `M1_JOB=m2b`; `tools/zig/dsv41_longpf/job.sh`, `longpf_gate`):
+    - **Python twin:** the midprofile twin (`midprofile.tar.gz` in `$Z` or `dsq/m5/`, unpacked to `/opt/midprofile` as `M1_JOB=m5` does; its prefill is 8474f31's, and split KV is its code). The optional `prod` run uses `/dsv41-tf/src`.
+    - **Runs** (`LONGPF_RUNS`, default `paged split`): `longpf-ref-paged` / `longpf-ref-split` (`dsv41_m2b_ref.py --pool` / `--split --compact 0`, prompts `LONGPF_PROMPTS` = 8,192 / 32,768 / 131,072 in one load, `--limit` = the longest + 2,048, `LONGPF_STEPS` 16 steps, prod-knobs.env with expert top-p off, `TF_DSV41_KV_SPLIT_UNION_MIB=8` so the long prompts' unions split into row blocks on both sides), then `longpf-paged` / `longpf-split` (`tf-dsv41-m1 m5 paged|split` through `m5_ranks.sh`, `TF_DSV41_CONTEXT` = the reference's limit). Each compares the pool's rows in logical order (a split rank's owned rows), the SWA rings and carries, position, Engram tail and first token, then every step's token and logits digest. `prod` adds the contiguous slot on prod's twin through `M2B_PREFILL=1`, a prompt each.
+    - **Verdicts:** `PASS longpf <run> ...` / `FAIL longpf <run> ...` in `$RES/longpf-gate/summary.log`, with the Zig exchanges' counts and Python's union log lines.
+    - **Minutes** (estimates): a reference about 6, a Zig run about 4; the default runs about 20 min (`LONGPF_PROMPTS="8192 32768"`: about 11).
+    - **Assets:** made by the step. The references write `rope.bin` (limit + 2,048 rows) and `aot/` (with `_stream`); `engram-host.bin` is the M2b reference's (`$LOCAL/m2b-ref/engram-host.bin`) or made by `dsv41_engram_host.py`, copied into each `p<N>/` under that exact name.
+  - **Only the Sparks can check:** 512K-1M prompts on the whole model (a 1M reference does not fit the pod's time or a PRO 6000's 25-layer budget at both modes), prod's own `TF_DSV41_INDEX_BUDGET_MIB=64` (Zig keeps 256: the materialised selection's row blocks differ, its rows do not), and prefill memory at 1M (`L.ix.stream` is 256 MiB of the segment arena; `kv.budget`'s prefill price does not count it yet).
+  - **Spark kit note:** the served model needs `TF_DSV41_CONTEXT` and a `rope.bin` of that many rows + 2,048, and DSpark's AOT set must include `_stream` (an AOT prompt over 8,192 tokens), or long prompts fail with `MissingTritonVariant`.
+
 ### Pod 26, the combined gate (2026-10-07, 57 min, $3.97)
 
 The tree was `798b4f5`, built from a clean archive. The fatbins were the sm_120 base set plus `dsv41_kvsplit` and `dsv41_sampling`. Logs are in the quant repo, `results/20261007-comb26-pod26`.
@@ -657,7 +674,7 @@ Rules from `ZIG-PREVIEW.md`:
     - **Pod job:** `M2B_PREFILL_GATE=1`, with `M2B_PROMPT=2600` to cross a segment boundary (prepared, not launched).
     - **Spark kit:** `PREFILL=1` on the M2c-2 step (about +10 min); the runbook falls M4 back to `OWN_PREFILL=0` unless it passed. Kit tree 982f12f.
   - **Known limits:**
-    - Prompts whose full-mode layers see more than 4,096 keys need the stream top-k, which block_prefill does not port (`error.Unsupported`).
+    - Prompts whose full-mode layers see more than 4,096 keys need the stream top-k, which block_prefill does not port (`error.Unsupported`); ported since by `dsq-zig-longpf-1` (§0a, Pod steps).
     - Greedy after a full 2,048-row segment downloads every row's logits; a last-row greedy is a later speed fix.
     - Segment shapes other than 2,048 and the SWA, Engram and ratio-2 layers' prefill have only been host-checked; the gate covers them.
 - **Pod 23, held** (63f16d7 + the reference fix, 26 min, $1.81): **the Zig prefill gate passes for full and ragged segments.**
@@ -725,7 +742,7 @@ Rules from `ZIG-PREVIEW.md`:
   - **Host gate on cap15:** p2048 320/320 calls equal, 192 Triton variants 0 wrong, 0 miswired. Decode is unchanged (145/145 per window).
   - **Verified layer modes:** a full KV + candidate source (20), reuse (21–23), reindex (24).
   - **Emitted but not yet compared:** SWA layers 0–1, the Engram layers, ratio-2 sources 2 / 8 / 14, and row counts other than 2,048. A host smoke ran them, but there is no capture to compare against.
-  - **Refused (`error.Unsupported`):** segments of 16 rows or fewer (they go through the decode kernels) and the streamed top-k for 4,096+ keys.
+  - **Refused (`error.Unsupported`):** segments of 16 rows or fewer (they go through the decode kernels) and the streamed top-k for 4,096+ keys (both since ported: short segments in 6587de9, the stream top-k by `dsq-zig-longpf-1`).
   - **What remains before Zig can prefill:** the forward's prefill glue, 15 steps that Python runs in torch between the launches: `topk`, `moe_sum`, `swiglu`, `counts`, `gm_picks`, `gm_plan`, `gm_ticket`, `stage_in` / `stage_out`, `ix_w`, `proj`, `proj_carry`, `cand_keys`, `block_pos`, `zeros`. Several are reductions whose bits depend on torch's order (top-k ties, sums), so they are kernel work for dsq-zig-kern-1, each gated against the capture's buffers. M1's GPU forward re-seeds them from the capture meanwhile, so the next pod gates every launch of the segment on the GPU (`M1_MODE=both` on a p2048 capture).
 - **M3 status:**
   - **Built:**
