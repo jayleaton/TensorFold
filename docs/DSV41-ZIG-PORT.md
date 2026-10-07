@@ -269,6 +269,35 @@ The hooks:
   - **Assets:** made by the step itself. `ref.py` writes `trace.jsonl`, `rope.bin` and `aot/`, including the row-mode Triton variants of every bucket up to 16; `dsv41_engram_host.py` writes `engram-host.bin`. No capture is needed.
   - **Default off:** `TF_DSV41_SLOTS` unset is today's path. On 8f40a20, `check` cap24-1 / cap24-12 / cap24-16 / cap15 / cap18 / cap22, `dcheck cap16` and `m5-emit cap18` give 0 mismatches.
 
+### Pod 26, the combined gate (2026-10-07, 57 min, $3.97)
+
+The tree was `798b4f5`, built from a clean archive. The fatbins were the sm_120 base set plus `dsv41_kvsplit` and `dsv41_sampling`. Logs are in the quant repo, `results/20261007-comb26-pod26`.
+
+| gate | result |
+|---|---|
+| set P capture: `check`, `dcheck` | 0 mismatches |
+| M2b decode (prompts 45, 173; prod's knobs, top-p 0.85, R3 Engram shards) | PASS |
+| Zig prefill gate, 45 and 173 rows | PASS |
+| lanes, mode 4 (chains) and mode 3t (trees) | PASS |
+| M4, R3 Engram, graphs, phases: CLI replay == HTTP, drafts on | 8/8 (1,769 drafted; acceptance 0.003, as expected: the drafter's taps are zero on the 0–24 prefix) |
+| M4, drafts off: the same HTTP trace | 8/8, so drafted == serial |
+| keyed sampling: `generate` on Python's 6 sampled replies (T 0.6–1.3, top-p / top-k / min-p, seed above 2^63) | 6/6 == Python |
+| M5 references (pool, split, compact, park) and `m5-agree` (split == replicated, park == uninterrupted, in Python) | PASS |
+| M5 Zig gates: split, park, compact | not run: `FileNotFound` on `engram-host.bin` (fixed in `836dd47`), then out of budget |
+
+- **Served phases (M4, 1,008 rounds):** 6.07 ms a window on the 25-layer prefix. The host's part (forward 0.108 ms + graph stage 0.041 ms + replay launch 0.060 ms) is about 0.21 ms of it.
+- **The pod's own bugs, now fixed:**
+  - staging did not ship `tools/zig/dsv41_perf` / `dsv41_slots` / `dsv41_samp` or `tf-dsv41-samp` (the quant repo's `stage-zigm1.sh`);
+  - a failed reference ended job.sh on `R0` (`068f8c7`);
+  - M4 waited on `serving model` while the server prints `serving pack at` (`b886a4b`).
+- **Still to run on the fix-up pod (cap $5):**
+  - M5 split / park / compact on pod 26's references (`M5_REFS_FROM=/workspace/dsq/m5-refs-26`);
+  - the slots gate (`M2B_SLOTS=1`) and `samp-slots` (sampling at 4 slots, `798b4f5`);
+  - R1 and the timing table against Python R1 (`M2B_R1=1 M2B_R1_GRAPHS=1 M2B_PROFILE_ROWS`);
+  - M4 at prod's calibration (`M2B_M4_ENV=TF_DSV41_CALIB_FILE=...`; prod's tables, copied read-only, are in `dsv41-zig-ref/calib-prod/`);
+  - multi-slot drafting (`M2B_MDRAFT=1`, `dsq-zig-mdraft-1`).
+- **The gap-closing workstreams** (`dsq-zig-longpf-1`, `dsq-zig-spec-1`, `dsq-zig-grammar-1`, `dsq-zig-vision-1`) each ship `tools/zig/dsv41_<name>/job.sh` with a `<name>_gate`. The gate runs inside `M1_JOB=m2b` with slots_gate's environment, behind `M2B_LONGPF` / `M2B_SPEC` / `M2B_GRAMMAR` / `M2B_VISION` (`7618d35`). The ones not ready for the fix-up pod go on a second batched pod. The Spark window does not wait for them.
+
 ### 0b. Several live slots and row buckets (`dsq-zig-slots-1`)
 
 `TF_DSV41_SLOTS=N` (1 by default: today's one-slot path, nothing changes) gives the GPU path N live slots with batched decode windows, as Python's batcher runs them (row mode, G8: `rowtab.py`, `rowmode.py`, `rowgraphs.py`). It needs the paged pool (`TF_DSV41_POOL_TOKENS`); the contiguous slot is refused by name.
