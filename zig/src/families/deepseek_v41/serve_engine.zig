@@ -81,7 +81,7 @@ pub const Served = struct {
         defer if (cal.path) |p| gpa.free(p);
         s.costs = cal.costs;
         std.log.info("dsv41 draft costs: {t}{s}{s}, verify 1 / 16 rows {d:.3} / {d:.3} ms, pass {d:.3} ms", .{ cal.source, if (cal.path != null) " " else "", cal.path orelse "", s.costs.windowMs(1), s.costs.windowMs(16), s.costs.draft });
-        var pass = if (m.pass) |p| p.pass() else s.nd.pass();
+        var pass = m.draftPass() orelse s.nd.pass();
         var tgt = m.gt.target();
         s.phases = try ph.Phases.fromEnv(gpa);
         if (s.phases) |x| {
