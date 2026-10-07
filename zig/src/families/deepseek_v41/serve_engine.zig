@@ -16,6 +16,8 @@ const drive = @import("draft/drive.zig");
 const costs_mod = @import("draft/costs.zig");
 const tree = @import("draft/tree.zig");
 const m3 = @import("m3.zig");
+const ph = @import("phases.zig");
+const timed = @import("phases_timed.zig");
 const Allocator = std.mem.Allocator;
 
 pub const backends: []const []const u8 = &.{"cuda"};
@@ -55,6 +57,10 @@ pub const Served = struct {
     core: lanes.Engine,
     host: api.LaneHost,
     rec: Recorder,
+    /// TF_DSV41_PHASES (phases.zig): the round's phases around the target and the pass
+    phases: ?*ph.Phases = null,
+    tt: timed.TimedTarget = undefined,
+    tpass: timed.TimedPass = undefined,
 
     /// Rank 0's engine over a loaded model (`drafts`: DSpark's pass, else serial windows through the same lanes).
     pub fn open(gpa: Allocator, io: std.Io, dir: []const u8, assets: []const u8, drafts: bool, context: ?i64) !*Served {
@@ -68,10 +74,20 @@ pub const Served = struct {
         s.m = m;
         s.nd = .{};
         s.costs = try costs_mod.defaults(gpa, 64);
-        const pass = if (m.pass) |p| p.pass() else s.nd.pass();
+        var pass = if (m.pass) |p| p.pass() else s.nd.pass();
+        var tgt = m.gt.target();
+        s.phases = try ph.Phases.fromEnv(gpa);
+        if (s.phases) |x| {
+            x.sync = .{ .ctx = m, .run = syncStream };
+            m.f.phases = x;
+            s.tt = .{ .inner = tgt, .p = x, .gpa = gpa, .io = io };
+            s.tpass = .{ .inner = pass, .p = x };
+            tgt = s.tt.target();
+            pass = s.tpass.pass();
+        }
         // draft trees (TF_DSV41_TREE / _DUP_MS / _ROWS, Python's knobs; off by default): first-position siblings
         const trees = if (m.pass != null) try tree.Settings.fromEnv() else tree.Settings{};
-        s.x = try ln.Lanes.init(gpa, m.gt.target(), pass, s.costs, .{ .shape = m3.shapeOf(&m.f), .slots = 1, .siblings = trees.siblings, .sib_rows = trees.sib_rows, .dup = trees.dup });
+        s.x = try ln.Lanes.init(gpa, tgt, pass, s.costs, .{ .shape = m3.shapeOf(&m.f), .slots = 1, .siblings = trees.siblings, .sib_rows = trees.sib_rows, .dup = trees.dup });
         s.arena = std.heap.ArenaAllocator.init(gpa);
         s.cfg = try lanes.Config.init(gpa, try s.x.model(s.arena.allocator(), 64), 16, 15);
         // drafts sized from the cost tables, not the wall clock: a request drafts (and so verifies) the same whatever the
@@ -89,6 +105,11 @@ pub const Served = struct {
         return s;
     }
 
+    fn syncStream(ctx: *anyopaque) anyerror!void {
+        const m: *model.Model = @ptrCast(@alignCast(ctx));
+        try m.stream.synchronize();
+    }
+
     fn bindContext(ctx: *anyopaque) anyerror!void {
         const m: *model.Model = @ptrCast(@alignCast(ctx));
         try m.ctx.makeCurrent();
@@ -103,6 +124,11 @@ pub const Served = struct {
         const gpa = s.gpa;
         s.host.stop();
         s.m.f.stop() catch {}; // the followers' loops end
+        if (s.phases) |x| {
+            x.flush(gpa, s.io);
+            s.m.f.phases = null;
+            gpa.destroy(x);
+        }
         s.rec.deinit();
         s.core.deinit();
         s.cfg.deinit(gpa);
