@@ -297,6 +297,21 @@ Rules from `ZIG-PREVIEW.md`:
   - aarch64 `tf-dsv41-m1` and `tensorfold-dsv41`, built against dsq-zig-kern-1's sm_121 fatbins from 81f0477 (26 modules; no kernel source changed since), from a clean archive of the tree;
   - `RUNBOOK.md` is the one window: M2c-2 (with R1) → DSpark's AOT set on each host → the M4 server and requests → the CLI replay (HTTP == CLI) and DSpark's acceptance → restore with `scripts/v2-rollback.sh perf1`. **About 1 h 45 min of downtime, up to 2 h 15 min.**
 - **The night's pods:** runs 15–22 cost **$11.42** in all: 15–19 $6.17, 20–21 $2.33, 22 $2.92.
+- **Zig prefill, wired** (1332aa6 by a helper agent; 2671c15, 982f12f), offline. It has not run on a GPU.
+  - **The runner:** `forward.prefill(ids)` (forward_prefill.zig) runs block_prefill's segments, 2,048 rows each (Python's PREFILL_CHUNK, the last ragged).
+    - The exchanges (20 MiB a rank) go through NCCL in the hybrid, as recorded above.
+    - All 21 glue steps run on dsq-zig-kern-1's prefill glue kernels (gated == torch, pod 20) or as plain async copies / memsets.
+    - **Each segment is committed as Python's `keep`:** the ratio-2 carry from its fp32 projection's last row, the Engram tail, the position. A tail of 16 rows or fewer goes through decode windows. The head runs on the last segment only; `f.last_rows` tells greedy how many rows it left.
+    - **Leader / follower:** the prompt is sent in frames (`op_prefill`); the followers run the same segments.
+    - **Tables filled on the first prefill:** the bf16 Hadamard, and the x3gm pointer tables (forms' `tp_*`). `m2a.widths` now fills `Widths.gm`.
+  - **M4:** GpuTarget and the served model prefill through it (`TF_DSV41_OWN_PREFILL=0`: back to 16-row decode windows).
+  - **The gate is `M2B_PREFILL=1`** on the M2b driver. The slot starts empty, our prefill runs the reference's prompt, then every state role must equal Python's dump byte for byte: SWA rings, compressed pools, index keys, ratio-2 carries. The position, Engram tail and first token must match too, and then the decode gate runs as usual.
+    - **Pod job:** `M2B_PREFILL_GATE=1`, with `M2B_PROMPT=2600` to cross a segment boundary (prepared, not launched).
+    - **Spark kit:** `PREFILL=1` on the M2c-2 step (about +10 min); the runbook falls M4 back to `OWN_PREFILL=0` unless it passed. Kit tree 982f12f.
+  - **Known limits:**
+    - Prompts whose full-mode layers see more than 4,096 keys need the stream top-k, which block_prefill does not port (`error.Unsupported`).
+    - Greedy after a full 2,048-row segment downloads every row's logits; a last-row greedy is a later speed fix.
+    - Segment shapes other than 2,048 and the SWA, Engram and ratio-2 layers' prefill have only been host-checked; the gate covers them.
 - **Next, in order:**
   1. **The Spark window** (the kit's RUNBOOK.md): M2c-2 with R1, M4, and DSpark's acceptance. Spark prod has run R1's knobs since 10-07 at -6.5 % a window with the same bits: attention split 4 + qrope, mHC spin / defer + coef, the router's prune, downCombine bf16, x3seg rot_in with the q_norm fold. The gate is a capture on prod-knobs.env plus r1c-knobs.env's R1 line on the 8474f31 twin. It goes ahead of new glue fusions, which are estimated under 3 %.
   2. **The prefill runtime:** the 15 torch-glue steps as kernels, then `Forward.prefill` over 2,048-row chunks (NCCL exchanges).
