@@ -41,6 +41,7 @@ It answers three questions:
 
 | step | where | what | time |
 |---|---|---|---|
+| 00 | dev box | **the lease:** `ssh dgx01@192.168.1.116 'test -f ~/ai/.test-window-lease && echo held'` must print nothing (held: Spark-tool-kit owns the Sparks; touch neither, wait). `run_m4.sh` / `run_host.sh` refuse on rank 0 while it is held | — |
 | 0 | dev box | `rsync -a <kit>/ dgx01@192.168.1.116:~/zig-window-kit/`, and the same to dgx-02 (`/home/root/zig-window-kit/`, via dgx-01). Then on both: `cd ~/zig-window-kit && sha256sum -c SHA256SUMS` | 2 min |
 | 1 | dgx-01, prod up | **prod speed:** `python3 bench_http.py --url http://127.0.0.1:8000 --label prod --out out/prod.json` (8 cells x 2 reps, 384 tokens, thinking off) | 10 min |
 | 2 | dgx-01, prod up | **prod long context:** `python3 bench_http.py --url http://127.0.0.1:8000 --label prod --long 32768,131072,524288 --out out/prod-long.json` | 10–15 min |

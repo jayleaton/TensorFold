@@ -10,6 +10,9 @@
 set -u
 RANK=${1:?rank}; OUT=${2:?outdir}
 KIT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# dgx-01's test-window lease (Spark-tool-kit's campaign.sh windows): held = the Sparks are not ours, nothing starts
+LEASE=${LEASE_FILE:-/home/dgx01/ai/.test-window-lease}
+if [[ "$RANK" == 0 && -f "$LEASE" ]]; then echo "the test-window lease is held ($LEASE): another window owns the Sparks"; exit 3; fi
 MASTER=${MASTER:-192.168.100.10}
 IMAGE=${IMAGE:-tensorfold-dsv41:e1e2-8474f31}
 CACHE_VOL=${CACHE_VOL:-dsv41-perf1-cache}
