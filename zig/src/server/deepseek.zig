@@ -490,7 +490,8 @@ pub const DeepSeek = struct {
         };
         const h = try gpa.create(vision.host.Host);
         h.* = vision.host.Host.init(gpa, io, s);
-        log.line("images: native (TF_DSV41_IMAGES), at most {d} a request, {d} positions an image; image URLs: data: only", .{ s.max_images, s.budget() });
+        try h.enableFetch(); // TF_DSV41_VISION_FETCH (default 1): https image URLs as prod fetches them
+        log.line("images: native (TF_DSV41_IMAGES), at most {d} a request, {d} positions an image; image URLs: {s}", .{ s.max_images, s.budget(), if (s.fetch) "data: and https (public addresses, pinned)" else "data: only (TF_DSV41_VISION_FETCH=0)" });
         return h;
     }
 
