@@ -211,7 +211,8 @@ pub const Model = struct {
         m.widths = try m2a.widths(a, &m.weights, &m.pl);
         m.runner = .{ .gpa = gpa, .d = &m.driver, .stream = m.stream, .kernels = &m.kernels, .triton = &m.aot, .weights = &m.weights };
         const topp: ?f64 = if (std.c.getenv("TF_DSV41_EXPERT_TOPP")) |v| try std.fmt.parseFloat(f64, std.mem.span(v)) else null;
-        const r1 = if (std.c.getenv("TF_DSV41_R1")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+        // TF_DSV41_R1=1, or prod.env's eight R1 knobs by their Python names (prod_knobs.r1)
+        const r1 = @import("prod_knobs.zig").r1(&@import("prod_knobs.zig").env);
         m.f = fwd.Forward.init(gpa, &m.cfg, &m.widths, .{ .world = world, .expert_topp = topp, .r1 = r1, .taps = o.drafts }, &m.runner, comm);
         m.f.layers = backbone;
         // the rope tables cover the limit + a prefill segment (dsv41_rope_tables.py --rows: the assets' rope.bin)
@@ -219,6 +220,7 @@ pub const Model = struct {
             m.f.opts.limit = c;
             m.f.opts.rope_rows = c + 2048;
         }
+        try @import("prod_knobs.zig").apply(&m.f, a, io, m.tcfg.rank);
         m.slots = try slots_mod.countFromEnv();
         if (try kvs.optionsFromEnv(@intCast(m.f.opts.limit), world)) |ko_| {
             var ko = ko_;
