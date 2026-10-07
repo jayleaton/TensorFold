@@ -72,6 +72,11 @@ pub const Options = struct {
     /// M5: the KV families in the paged pool (kv.DevicePool, Python's serving slots) instead of the slot's contiguous
     /// buffers; null: contiguous (the gates' reference state)
     pool: ?Pool = null,
+    /// TF_DSV41_PF_DENSE=fused (prod_knobs.zig): prefill's dense EXL3 GEMMs as pfdense's fused kernel; null: the W_q
+    /// unpack + Triton `_gemm` (the captures' path). The same bits either way.
+    pfd: ?*const @import("prod_knobs.zig").PfDense = null,
+    /// TF_DSV41_INDEX_BUDGET_MIB (bytes): prefill's indexer scores + sort keys a launch (row blocks; the same bits)
+    index_budget: i64 = 256 << 20,
 };
 
 /// The paged pool as a window's calls see it (pool.py, slots.py: one slot's 1-D table, PT / PSH a family).
