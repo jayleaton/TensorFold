@@ -410,7 +410,8 @@ def run_set(cap, rec, s, loader, W, cfg, embed, norm, head, tmap, dev, a, g, vh,
     fw.prompt(ids[:a.prompt])
     pos = a.prompt
     cap.set = s
-    for n, prefill in [(n, False) for n in WINDOWS] + [(PREFILL, True)]:
+    # M1_PREFILL_ROWS=0: decode windows only (pod 21: four sets' 2,048-row prefill blobs filled the pod's disk)
+    for n, prefill in [(n, False) for n in WINDOWS] + ([(PREFILL, True)] if PREFILL > 0 else []):
         cap.phase = f"p{n}" if prefill else f"w{n}"
         cap.recording = True
         try:

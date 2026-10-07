@@ -153,9 +153,10 @@ pub fn moe(e: *E, L: u32) !void {
         .{ .i = if (!fold) 0 else Et },                           .{ .b = fold },
     });
     if (e.o.r1) {
-        // prune.fold_args: [min_w, topp, scale, min_k, orig, drop, dup] (empty: no rule, a DSpark block's)
+        // prune.fold_args: [min_w, topp, scale, min_k, orig, drop, dup] (empty: no rule, a DSpark block's); drop is
+        // moe's block.ex.count, the table's size with the shared expert (Et: an id past the routed and shared rows)
         const pa: []const Arg = if (backbone and e.o.expert_topp != null) &.{
-            .{ .f = 0.0 }, .{ .f = e.o.expert_topp.? }, .{ .f = scale }, .{ .i = 3 }, .{ .i = 0 }, .{ .i = ex.count }, .{ .i = 0 },
+            .{ .f = 0.0 }, .{ .f = e.o.expert_topp.? }, .{ .f = scale }, .{ .i = 3 }, .{ .i = 0 }, .{ .i = Et }, .{ .i = 0 },
         } else &.{};
         const last = &e.out.items[e.out.items.len - 1];
         const more = try e.a.alloc(calls.Named, last.args.len + 1);
