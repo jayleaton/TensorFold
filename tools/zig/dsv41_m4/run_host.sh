@@ -46,7 +46,9 @@ ARGS=(--rm --gpus all --ipc=host --network host --device /dev/infiniband --ulimi
       -e TF_DSV41_GRAPHS="${GRAPHS:-1}" -e TF_DSV41_DRAFT_TIMED="${DRAFT_TIMED:-0}"
       -e TF_DSV41_PLAN_TIMEOUT=1800 -e NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-enp1s0f1np1}
       -e NCCL_IB_HCA=${NCCL_IB_HCA:-rocep1s0f1,roceP2p1s0f1}
-      -e TF_DSV41_SAMPLING="${SAMPLING:-1}" -e TF_DSV41_SLOTS="$SLOTS")
+      -e TF_DSV41_SAMPLING="${SAMPLING:-1}" -e TF_DSV41_SLOTS="$SLOTS"
+      -e GLM53_TF_ROCE_MAX_KB="${ROCE_MAX_KB:-1024}" -e TF_DSV41_INDEX_BUDGET_MIB=64 -e TF_DSV41_PREFILL_CHUNK=2048
+      -e TF_DSV41_PREFILL_ROWS=2048)   # prod's: 4-slot x 16-row windows stay on RoCE (Zig's default 256 KiB sends them to NCCL)
 [[ -n "${POOL_TOKENS:-}" ]] && ARGS+=(-e TF_DSV41_POOL_TOKENS="$POOL_TOKENS")
 [[ "${KV_SPLIT:-0}" == 1 ]] && ARGS+=(-e TF_DSV41_KV_SPLIT=1)
 [[ -n "${INDEX_KV:-}" ]] && ARGS+=(-e TF_DSV41_INDEX_KV="$INDEX_KV")
