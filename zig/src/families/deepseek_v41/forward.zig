@@ -278,6 +278,7 @@ pub const Forward = struct {
     const op_sess_restore: i64 = 9;
     const op_release: i64 = 10;
     const op_ds_reset: i64 = 11;
+    const op_tree_drop: i64 = 20;
 
     /// The session store's side of the forward (sessions_gpu.zig): `commit` hears every committed id (keep, prefill
     /// segments); `save` / `restore` are the leader's operations the followers run in its order.
@@ -289,6 +290,14 @@ pub const Forward = struct {
         /// the slot empty: its pages back, the committed ids cleared
         reset: *const fn (ptr: *anyopaque) anyerror!void,
     };
+
+    /// Drops the pending window on every rank without committing a row (draft/branches.zig: a tree's chain whose branch
+    /// lost; the next chain rewrites its positions before any read, as a rejected draft's).
+    pub fn drop(f: *Forward) !void {
+        if (f.slot.pending == null) return error.BadWindow;
+        if (f.leads()) try f.link.?.send(&.{op_tree_drop});
+        f.slot.pending = null;
+    }
 
     /// Frees the slot for the next stream on every rank (the Spark window's fix: a follower kept its position, so the
     /// next request ran rank 1 from a stale slot): position 0, no Engram tail, no pending window, the pool's pages back.
@@ -377,6 +386,7 @@ pub const Forward = struct {
                 },
                 op_keep => try f.keep(@intCast(msg[1])),
                 op_release => try f.release(),
+                op_tree_drop => try f.drop(),
                 op_stop => return,
                 op_sess_save => {
                     const x = f.sess orelse return error.BadPlan;
