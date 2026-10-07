@@ -260,6 +260,15 @@ Rules from `ZIG-PREVIEW.md`:
   - **Lanes mode 1 PASS:** 65/65 tokens equal, drafts off.
   - **Lanes mode 2 PASS:** 65/65 tokens equal, 79 drafted, 47 accepted. Multi-row verify windows, partial keeps and rejects all ran through the GPU target and the leader/follower plan ops at TP=2.
   - **Mode 3 stopped at the pass's own guard (`NotAPrefix`).** Lanes trims the prompt to the window itself and hands the taps' row indices (1408..1535), so the pass now ingests a contiguous run from any first row.
+- **Pod 19** (a0cf72d, 15 min, $1.10), all PASS:
+  - **M1 on fresh captures P + B(2048):** the replay is 889/889 launches alone and chained, weights 693/693. The **GPU forward of our emitters is bit-equal to Python**: decode windows 131/131 each, the **2,048-row prefill segment 320/320**, the **DSpark ingest 15/15 + 15/15 and passes 71/71 + 71/71**, and prepared forms 182/182. The torch glue is re-seeded from the capture.
+  - **M2b regression:** 64/64 tokens and logits on both ranks.
+  - **Lanes mode 3 (the GPU DSpark pass at TP=2):** 65/65 tokens equal to the serial reference, 68 drafted. Acceptance is 0, as expected here: on the 0–24 prefix the taps are zeros, not layers 37–39's. Acceptance with real taps needs the whole model, i.e. the Sparks (M2c-2 with LANES) or a bigger GPU.
+  - **The round's pods 15–19 cost $6.17** against an $8 cap.
+- **Next, in order:**
+  1. **R1 in block.zig** (dsq-zig-kern-1's kernels are ready and replay-checked). Spark prod has run R1's knobs since 10-07 at -6.5 % a window with the same bits: attention split 4 + qrope, mHC spin / defer + coef, the router's prune, downCombine bf16, x3seg rot_in with the q_norm fold. The gate is a capture on prod-knobs.env plus r1c-knobs.env's R1 line on the 8474f31 twin. It goes ahead of new glue fusions, which are estimated under 3 %.
+  2. **The prefill runtime:** the 15 torch-glue steps as kernels, then `Forward.prefill` over 2,048-row chunks (NCCL exchanges).
+  3. **The M2c-2 kit rebuilt with the DSpark pass**, so the Spark run measures acceptance with real taps.
 - **The DSpark GPU pass** (`dspark_emit.zig`, `dspark_gpu.zig`):
   - **Emitter:** ingest (main_proj with split K, main_norm, each block's wkv / kv_norm / ring store) and the pass. The pass is:
     - the block ids embedded;
