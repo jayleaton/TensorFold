@@ -104,3 +104,51 @@ const Aborts = struct {
 test "abort frees a rank waiting in a collective" {
     try host.run(2, {}, Aborts.go);
 }
+
+const VarGather = struct {
+    fn go(c: Collective, rank: u32, refuse: u32) !void {
+        const world = c.world();
+        const stride = 200;
+        const whole = refuse & (@as(u32, 1) << @intCast(rank)) != 0;
+        try std.testing.expectEqual(!whole, c.varFits(stride));
+        try std.testing.expectEqual(refuse == 0, try c.varAgreed());
+        try std.testing.expectEqual(refuse == 0, try c.varAgreed()); // kept: no second collective
+        var ins: [host.max_ranks][stride]u8 = undefined;
+        for (0..world) |r| reference.fill(&ins[r], .u8, @intCast(r), 11);
+        // lengths of 0, odd, 16 and the whole stride, in bytes; .f32 strides count elements
+        const cases = [_][3]i32{ .{ 0, 17, 200 }, .{ 200, 0, 3 }, .{ 16, 16, 16 }, .{ 199, 200, 1 } };
+        inline for (.{ DType.u8, DType.f32 }) |t| for (cases) |lens| {
+            var out: [stride * host.max_ranks]u8 = @splat(0xEE);
+            try c.allGatherV(addr(&ins[rank]), addr(&out), stride / t.size(), @intFromPtr(&lens), t, null);
+            for (0..world) |r| {
+                const len: usize = @intCast(lens[r]);
+                try std.testing.expectEqualSlices(u8, ins[r][0..len], out[r * stride ..][0..len]);
+                // past a length: the transport's choice (here: untouched, or the whole stride where device lengths are refused)
+                const past = out[r * stride + len .. (r + 1) * stride];
+                if (whole) try std.testing.expectEqualSlices(u8, ins[r][len..], past) else for (past) |x| try std.testing.expectEqual(@as(u8, 0xEE), x);
+            }
+        };
+        try c.barrier();
+    }
+};
+
+test "a variable-length all-gather moves each rank's length, and the ranks agree on device lengths once" {
+    for ([_]u32{ 2, 3 }) |w| {
+        try host.runWith(w, .{}, @as(u32, 0), VarGather.go);
+        try host.runWith(w, .{ .var_refuse = 2 }, @as(u32, 2), VarGather.go);
+    }
+}
+
+const VarDesync = struct {
+    fn go(c: Collective, rank: u32, _: void) !void {
+        var a: [64]u8 = @splat(0);
+        var b: [128]u8 = undefined;
+        const lens = [2]i32{ 8, if (rank == 0) 8 else 16 };
+        const r = c.allGatherV(addr(&a), addr(&b), 64, @intFromPtr(&lens), .u8, null);
+        if (r) |_| return error.ShouldHaveFailed else |e| if (e != error.Invalid and e != error.Aborted) return e;
+    }
+};
+
+test "lengths that differ between ranks are refused on every rank" {
+    try host.run(2, {}, VarDesync.go);
+}

@@ -336,7 +336,30 @@ struct RoceArgs {
     uint32_t mode;
     uint32_t n_hca;
     uint32_t pad;
+    // Variable lengths (gather only; nullptr: every shard is ``nbytes``): lens[r] = rank r's bytes (<= nbytes), read on the
+    // device, the same array on both ranks. Rank r stages and posts lens[r] (padded to 16, at least 16: the proxy posts no
+    // empty op) and the peer copies lens[r] bytes of it to out + r x nbytes (cf28d37's contract; the wire is unchanged).
+    const int32_t *lens;
 };
+
+// Rank r's bytes this op: ``nbytes``, or lens[r] capped at nbytes.
+__device__ __forceinline__ uint64_t roce_shard(const RoceArgs &a, uint32_t r) {
+    if (a.lens == nullptr) {
+        return a.nbytes;
+    }
+    const int32_t v = __ldg(a.lens + r);
+    const uint64_t n = v > 0 ? static_cast<uint64_t>(v) : 0u;
+    return n < a.nbytes ? n : a.nbytes;
+}
+
+// The bytes a copy of an n-byte shard moves: n rounded up to 16 when that stays inside a 16-aligned stride (the 16-byte
+// path; the bytes past n are the sender's, unspecified to the reader), else n exactly.
+__device__ __forceinline__ uint64_t roce_span(const RoceArgs &a, uint64_t n) {
+    if (a.lens == nullptr || (a.nbytes & 15u) != 0u) {
+        return n;
+    }
+    return (n + 15u) & ~uint64_t(15u);
+}
 
 }  // namespace tftp
 
@@ -359,9 +382,13 @@ extern "C" __global__ void __launch_bounds__(512) tp_roce(RoceArgs a) {
     }
     const uint32_t seq = s_head[1];
     const uint64_t slot = seq & 1u;
+    const bool var = a.mode == kGather && a.lens != nullptr;
+    const uint64_t mine = var ? roce_shard(a, a.rank) : a.nbytes;
+    const uint64_t theirs = var ? roce_shard(a, 1u - a.rank) : a.nbytes;
+    const uint64_t padded = var ? (mine < 16u ? 16u : (mine + 15u) & ~uint64_t(15u)) : (a.nbytes + 15u) & ~uint64_t(15u);
 
     // 1. stage this block's share into the send slot; the last block to finish rings the doorbell
-    copy_bytes<false>(a.send_slots + slot * a.slot_bytes, a.in, a.nbytes, index, stride);
+    copy_bytes<false>(a.send_slots + slot * a.slot_bytes, a.in, var ? roce_span(a, mine) : a.nbytes, index, stride);
     __syncthreads();
     if (tid == 0) {
         fence_sc_sys();
@@ -371,12 +398,13 @@ extern "C" __global__ void __launch_bounds__(512) tp_roce(RoceArgs a) {
                 st_release_gpu(a.state + 3, 0u);
                 fence_sc_sys();  // every block's staging (seen through the counter) before the doorbell
             }
-            st_relaxed_sys(a.ctrl + kRoceSlotBytes + slot, static_cast<uint32_t>((a.nbytes + 15u) & ~uint64_t(15u)));
+            st_relaxed_sys(a.ctrl + kRoceSlotBytes + slot, static_cast<uint32_t>(padded));
             st_release_sys(a.ctrl + kRoceSeq, seq);
         }
     }
     if (a.mode == kGather) {
-        copy_bytes<false>(a.out + static_cast<uint64_t>(a.rank) * a.nbytes, a.in, a.nbytes, index, stride);
+        copy_bytes<false>(a.out + static_cast<uint64_t>(a.rank) * a.nbytes, a.in, var ? roce_span(a, mine) : a.nbytes,
+                          index, stride);
     }
 
     // 2. every HCA's flag for this slot (the stripes do not follow the blocks: each block needs all of them)
@@ -407,8 +435,8 @@ extern "C" __global__ void __launch_bounds__(512) tp_roce(RoceArgs a) {
         const uint8_t *inbox = a.recv_slots + slot * a.slot_bytes;
         switch (a.mode) {
             case kGather:
-                copy_bytes<true>(a.out + static_cast<uint64_t>(1u - a.rank) * a.nbytes, inbox, a.nbytes, index,
-                                 stride);
+                copy_bytes<true>(a.out + static_cast<uint64_t>(1u - a.rank) * a.nbytes, inbox,
+                                 var ? roce_span(a, theirs) : a.nbytes, index, stride);
                 break;
             case kExchange:
                 copy_bytes<true>(a.out, inbox, a.nbytes, index, stride);

@@ -10,6 +10,8 @@ This is the multi-process tensor-parallel runtime for DeepSeek-V4.1 on the Zig e
 | --- | --- |
 | `allReduce(src, dst, count, dtype, op, stream)` | sum / max / min, added in rank order, so every rank holds the same bits |
 | `allGather(src, dst, count, dtype, stream)` | rank 0's shard first (NCCL's layout) |
+| `allGatherV(src, dst, stride, lens, dtype, stream)` | `allGather` of `stride` elements where only rank r's first `lens[r]` bytes matter (`lens`: device int32 `[world]`, the same on every rank). Bytes past a length are unspecified. See "Variable lengths" below. |
+| `varFits(bytes)`, `varAgreed()` | whether this rank's transport moves only the lengths for `bytes`-byte strides; whether every rank's does (agreed once a communicator) |
 | `exchange(src, dst, count, dtype, peer, stream)` | two ranks trade buffers in one group (Python's `swap`) |
 | `send` / `recv` | point to point |
 | `barrier()`, `check()` | host calls. `check` reports a failure the transport recorded. |
@@ -55,6 +57,20 @@ Every data call only enqueues on `stream`. There is no host sync and no allocati
 | `TF_TP_ROCE_FALLBACK` | `nccl` (default) or `error` |
 | `TF_TP_ROCE_WIRE` | `verbs` (default) or `shm`, the RoCE protocol on one host without RDMA (tests) |
 | `TF_DSV41_FAILFAST`, `TF_DSV41_FAILFAST_GRACE_S`, `TF_DSV41_PEER_MEM_S` | fail-fast knobs, same names as in Python |
+
+## Variable lengths (`allGatherV`)
+
+This is the Python engine's `comm.var_gather` / `var_fits` (cf28d37) for split KV's compact exchange (`TF_DSV41_KV_SPLIT_COMPACT`, `kv/split.zig`'s `densePacked`). The receive layout is `allGather`'s, `[world][stride]`: rank r's `lens[r]` bytes land at `dst + r x stride`. The lengths are device data, so a captured graph replays with new lengths and nothing syncs with the host.
+
+| Transport | What moves |
+| --- | --- |
+| RoCE (`tp_roce`, a stride the small path takes) | Rank r stages and posts only `lens[r]` bytes: the doorbell carries `lens[r]` padded to 16, at least 16 (the proxy posts no empty op). The peer copies `lens[src]` bytes out. With a 16-aligned stride both copies round up to 16 bytes and stay on the 16-byte path. The proxy and the wire are unchanged: they already post the doorbell's count, and every HCA gets its flag even for an empty stripe, so the waits do not depend on the length. |
+| Mailbox, NCCL, RoCE above `TF_TP_MAILBOX_MAX_KB` | The whole strides (`allGather`): the same bytes where `lens` says. |
+| In-process (`host.zig`) | Only the lengths; the rest of `dst` is left as it was, so a reader past a length sees stale bytes. It refuses lengths that differ between ranks. `runWith(.{ .var_refuse = mask })` makes those ranks' transports refuse device lengths. |
+
+`varFits(bytes)` is a rank-local answer. It is true only for RoCE with its device side, for a stride the small path takes. `varAgreed()` is every rank's `varFits(16)`. `Session.open` computes it once with an all-gather over the bootstrap and keeps it on the route (`Hybrid.var_agreed`); NCCL alone answers false. The in-process ranks compute it with one int all-gather the first time and keep it on the `Rank`. The answer lives on the communicator object, never in a cache keyed by its address: in Python, a reused `id()` once gave one rank a stale answer and the collectives fell out of step (dba6a1f).
+
+Optional vtable entries (`all_gather_v`, `var_fits`, `var_agreed`; null by default) keep other `Collective` implementations building unchanged. A null `all_gather_v` falls back to `all_gather` of the whole strides.
 
 ## Fail-fast (`fate.zig`)
 

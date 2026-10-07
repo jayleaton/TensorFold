@@ -47,6 +47,8 @@ const RoceArgs = extern struct {
     mode: u32,
     n_hca: u32,
     pad: u32 = 0,
+    /// gather only: device int32 [2] of each rank's bytes (0: every shard is `nbytes`)
+    lens: DevicePtr = 0,
 };
 
 pub const WireKind = enum {
@@ -308,7 +310,7 @@ pub const Roce = struct {
         return n <= r.slot_bytes;
     }
 
-    fn launch(r: *Roce, mode: Mode, in: DevicePtr, out: DevicePtr, n: usize, stream: collective.Stream) Error!void {
+    fn launch(r: *Roce, mode: Mode, in: DevicePtr, out: DevicePtr, n: usize, lens: DevicePtr, stream: collective.Stream) Error!void {
         if (r.aborted.load(.acquire)) return error.Aborted;
         if (n > r.slot_bytes) return error.Unsupported;
         if (n == 0) return;
@@ -327,6 +329,7 @@ pub const Roce = struct {
             .rank = r.me,
             .mode = @intFromEnum(mode),
             .n_hca = r.wire.hcas(),
+            .lens = lens,
         };
         var params = [1]?*anyopaque{@ptrCast(&a)};
         const blocks = @import("mailbox.zig").blocksFor(n);
@@ -334,11 +337,18 @@ pub const Roce = struct {
     }
 
     pub fn allGatherBytes(r: *Roce, s: DevicePtr, o: DevicePtr, n: usize, stream: collective.Stream) Error!void {
-        return r.launch(.gather, s, o, n, stream);
+        return r.launch(.gather, s, o, n, 0, stream);
+    }
+
+    /// `allGatherBytes` of n-byte strides where rank r stages and posts only lens[r] bytes (device int32 [2], the same on both
+    /// ranks; padded to 16, at least 16: the proxy posts no empty op) and the peer copies lens[r] of them to out + r x n.
+    pub fn allGatherV(r: *Roce, s: DevicePtr, o: DevicePtr, n: usize, lens: DevicePtr, stream: collective.Stream) Error!void {
+        if (lens == 0) return error.Invalid;
+        return r.launch(.gather, s, o, n, lens, stream);
     }
 
     pub fn exchangeBytes(r: *Roce, s: DevicePtr, o: DevicePtr, n: usize, stream: collective.Stream) Error!void {
-        return r.launch(.exchange, s, o, n, stream);
+        return r.launch(.exchange, s, o, n, 0, stream);
     }
 
     pub fn sum(r: *Roce, s: DevicePtr, o: DevicePtr, count: usize, t: DType, stream: collective.Stream) Error!void {
@@ -347,7 +357,7 @@ pub const Roce = struct {
             .bf16 => .sum_bf16,
             else => return error.Unsupported,
         };
-        return r.launch(mode, s, o, count * t.size(), stream);
+        return r.launch(mode, s, o, count * t.size(), 0, stream);
     }
 
     /// Ends this rank's waits and the proxy (the peer learns through the fate channel and aborts its own).
@@ -377,14 +387,22 @@ pub const Roce = struct {
     /// The kernel's side of one op done by the host (tests, and `tf-tp-test roce-host` on hosts without a GPU check):
     /// out <- [rank 0's in, rank 1's in] (gather) through the same slots, doorbell, wire and flags.
     pub fn hostGather(r: *Roce, in: []const u8, out: []u8) Error!void {
+        return r.hostGatherV(in, out, null);
+    }
+
+    /// `hostGather` with the kernel's variable lengths (`allGatherV`): rank k's first lens[k] bytes of its n land at out + k x n.
+    pub fn hostGatherV(r: *Roce, in: []const u8, out: []u8, lens: ?[2]u32) Error!void {
         const n = in.len;
         if (n == 0 or n > r.slot_bytes or out.len < 2 * n) return error.Invalid;
+        if (lens) |l| if (l[0] > n or l[1] > n) return error.Invalid;
+        const mine: usize = if (lens) |l| l[r.me] else n;
+        const theirs: usize = if (lens) |l| l[1 - r.me] else n;
         const seq = r.host_epoch +% 1;
         const slot: usize = seq & 1;
-        @memcpy(r.region[send_off + slot * r.slot_bytes ..][0..n], in);
-        r.word(w_slot_bytes + slot).store(@intCast(std.mem.alignForward(usize, n, 16)), .release);
+        @memcpy(r.region[send_off + slot * r.slot_bytes ..][0..mine], in[0..mine]);
+        r.word(w_slot_bytes + slot).store(@intCast(@max(16, std.mem.alignForward(usize, mine, 16))), .release);
         r.word(w_seq).store(seq, .release);
-        @memcpy(out[r.me * n ..][0..n], in);
+        @memcpy(out[r.me * n ..][0..mine], in[0..mine]);
         const t0 = sock.nowNs();
         for (0..r.wire.hcas()) |h| {
             const flag: *std.atomic.Value(u32) = @ptrCast(@alignCast(r.region[flag_off + (slot * 2 + h) * flag_stride ..].ptr));
@@ -394,7 +412,7 @@ pub const Roce = struct {
                 std.atomic.spinLoopHint();
             }
         }
-        @memcpy(out[(1 - r.me) * n ..][0..n], r.region[send_off + 2 * r.slot_bytes + slot * r.slot_bytes ..][0..n]);
+        @memcpy(out[(1 - r.me) * n ..][0..theirs], r.region[send_off + 2 * r.slot_bytes + slot * r.slot_bytes ..][0..theirs]);
         r.host_epoch = seq;
     }
 };

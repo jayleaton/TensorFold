@@ -56,6 +56,8 @@ pub const Hybrid = struct {
     nccl: *Nccl,
     /// Largest shard a rank sends through the small path.
     max_bytes: usize,
+    /// Every rank's `varFits(16)`, agreed at `Session.open` (the bootstrap's all-gather): `varAgreed`'s answer.
+    var_agreed: bool = false,
 
     pub fn iface(h: *Hybrid) collective.Collective {
         return .{ .ptr = h, .vtable = if (h.small == .roce) &roce_vtable else &mailbox_vtable };
@@ -74,6 +76,9 @@ pub const Hybrid = struct {
             .barrier = barrier,
             .check = check,
             .abort = abort,
+            .all_gather_v = allGatherV,
+            .var_fits = varFits,
+            .var_agreed = varAgreed,
         };
     }
 
@@ -106,6 +111,27 @@ pub const Hybrid = struct {
         const h = self_(ptr);
         if (h.routed(count * t.size())) return h.small.gather(s, r, count * t.size(), stream);
         return Nccl.allGather(h.nccl, s, r, count, t, stream);
+    }
+
+    /// RoCE moves each rank's device length; the mailbox and NCCL move whole strides (the same bytes where lens says).
+    fn allGatherV(ptr: *anyopaque, s: DevicePtr, r: DevicePtr, stride: usize, lens: DevicePtr, t: DType, stream: collective.Stream) Error!void {
+        const h = self_(ptr);
+        const n = stride * t.size();
+        if (varFits(ptr, n)) return h.small.roce.allGatherV(s, r, n, lens, stream);
+        return allGather(ptr, s, r, stride, t, stream);
+    }
+
+    /// RoCE with its device side, for a stride the small path takes (the route is the size's alone: every rank alike).
+    pub fn varFits(ptr: *anyopaque, n: usize) bool {
+        const h = self_(ptr);
+        return switch (h.small) {
+            .roce => |p| n > 0 and h.routed(n) and p.d != null,
+            .mailbox => false,
+        };
+    }
+
+    fn varAgreed(ptr: *anyopaque) Error!bool {
+        return self_(ptr).var_agreed;
     }
 
     fn exchange(ptr: *anyopaque, s: DevicePtr, r: DevicePtr, count: usize, t: DType, peer: u32, stream: collective.Stream) Error!void {

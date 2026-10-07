@@ -62,6 +62,7 @@ pub const Session = struct {
             },
             .roce => try s.openRoce(d, &b, kernel_image),
         }
+        try s.agreeVar(&b);
         s.plan = planlink.PlanLink.init(cfg.rank, cfg.world, b.releasePlan());
         if (cfg.failfast) {
             s.fate = Fate.init(cfg, b.release());
@@ -99,6 +100,17 @@ pub const Session = struct {
             s.roce = null;
             return s.roceFallback(error.ProbeMismatch);
         };
+    }
+
+    /// `Collective.varAgreed`: whether every rank's transport moves device lengths (`varFits(16)` on all), one all-gather
+    /// over the bootstrap a session, kept on the route (NCCL alone never does).
+    fn agreeVar(s: *Session, b: *Bootstrap) !void {
+        var blobs: [bootstrap.max_ranks][]const u8 = undefined;
+        var buf: [bootstrap.max_ranks]u8 = undefined;
+        const all = try b.allGather(&.{@intFromBool(s.comm().varFits(16))}, &buf, &blobs);
+        var ok = true;
+        for (all) |x| ok = ok and x[0] == 1;
+        if (s.mail != null or s.roce != null) s.route.var_agreed = ok;
     }
 
     fn roceFallback(s: *Session, e: anyerror) !void {

@@ -54,6 +54,14 @@ pub const Collective = struct {
         check: *const fn (ptr: *anyopaque) Error!void,
         /// Any thread: end pending and later work at once; safe while another thread is inside a call.
         abort: *const fn (ptr: *anyopaque) void,
+        /// recv [world][stride]: rank r's first lens[r] bytes land at recv + r x stride (lens: device int32 [world] of bytes, the
+        /// same on every rank, each <= the stride's bytes); bytes past a length are unspecified. Null: `all_gather` of whole strides.
+        all_gather_v: ?*const fn (ptr: *anyopaque, send: DevicePtr, recv: DevicePtr, stride: usize, lens: DevicePtr, t: DType, stream: Stream) Error!void = null,
+        /// Whether `all_gather_v` moves only the lengths for shards of `bytes` on this rank's transport (rank-local). Null: never.
+        var_fits: ?*const fn (ptr: *anyopaque, bytes: usize) bool = null,
+        /// Host: whether every rank's transport takes device lengths (`var_fits(16)` on all), agreed once per communicator by an
+        /// int all-gather and kept on the implementation. Null: false.
+        var_agreed: ?*const fn (ptr: *anyopaque) Error!bool = null,
     };
 
     pub fn kind(c: Collective) Kind {
@@ -74,6 +82,25 @@ pub const Collective = struct {
 
     pub fn allGather(c: Collective, src: DevicePtr, dst: DevicePtr, count: usize, t: DType, stream: Stream) Error!void {
         return c.vtable.all_gather(c.ptr, src, dst, count, t, stream);
+    }
+
+    /// `allGather` of `stride` elements a rank where only rank r's first lens[r] bytes matter (see `VTable.all_gather_v`):
+    /// a transport that takes device lengths moves just those, any other the whole strides (the same bytes where lens says).
+    pub fn allGatherV(c: Collective, src: DevicePtr, dst: DevicePtr, stride: usize, lens: DevicePtr, t: DType, stream: Stream) Error!void {
+        if (c.vtable.all_gather_v) |f| return f(c.ptr, src, dst, stride, lens, t, stream);
+        return c.vtable.all_gather(c.ptr, src, dst, stride, t, stream);
+    }
+
+    /// Whether `allGatherV` of `bytes`-byte strides moves only the lengths here (callers agree first: `varAgreed`).
+    pub fn varFits(c: Collective, bytes: usize) bool {
+        const f = c.vtable.var_fits orelse return false;
+        return f(c.ptr, bytes);
+    }
+
+    /// Every rank's transport takes device lengths: one agreement a communicator (every rank calls it alike, outside any graph).
+    pub fn varAgreed(c: Collective) Error!bool {
+        const f = c.vtable.var_agreed orelse return false;
+        return f(c.ptr);
     }
 
     pub fn exchange(c: Collective, src: DevicePtr, dst: DevicePtr, count: usize, t: DType, peer: u32, stream: Stream) Error!void {

@@ -9,9 +9,9 @@ const Error = collective.Error;
 
 pub const max_ranks = 8;
 
-const Call = enum(u8) { none, all_reduce, all_gather, exchange, barrier };
+const Call = enum(u8) { none, all_reduce, all_gather, all_gather_v, exchange, barrier };
 
-const Post = struct { call: Call = .none, send: DevicePtr = 0, recv: DevicePtr = 0, count: usize = 0, t: DType = .u8, op: Op = .sum, peer: u32 = 0 };
+const Post = struct { call: Call = .none, send: DevicePtr = 0, recv: DevicePtr = 0, count: usize = 0, t: DType = .u8, op: Op = .sum, peer: u32 = 0, lens: DevicePtr = 0 };
 
 /// One-way message slot from rank `src` to rank `dst` (send / recv).
 const Slot = struct { buf: std.atomic.Value(DevicePtr) = .init(0), bytes: usize = 0, taken: std.atomic.Value(bool) = .init(false) };
@@ -24,6 +24,8 @@ pub const Group = struct {
     arrived: std.atomic.Value(u32) = .init(0),
     generation: std.atomic.Value(u32) = .init(0),
     aborted: std.atomic.Value(bool) = .init(false),
+    /// Ranks (a bit each) whose transport refuses device lengths: their `all_gather_v` moves whole strides (NCCL's fallback; tests).
+    var_refuse: u32 = 0,
     slots: [max_ranks][max_ranks]Slot = @splat(@splat(.{})),
 
     pub fn init(world: u32) Group {
@@ -68,6 +70,8 @@ fn bytesAt(p: DevicePtr, n: usize) []u8 {
 pub const Rank = struct {
     group: *Group,
     me: u32,
+    /// `varAgreed`'s answer, once this communicator agreed.
+    var_agreed: ?bool = null,
 
     pub fn iface(self: *Rank) collective.Collective {
         return .{ .ptr = self, .vtable = &vtable };
@@ -85,6 +89,9 @@ pub const Rank = struct {
         .barrier = barrier,
         .check = check,
         .abort = abort,
+        .all_gather_v = allGatherV,
+        .var_fits = varFits,
+        .var_agreed = varAgreed,
     };
 
     fn self_(ptr: *anyopaque) *Rank {
@@ -136,6 +143,51 @@ pub const Rank = struct {
         const out = bytesAt(r, n * g.world);
         for (0..g.world) |i| @memcpy(out[i * n ..][0..n], bytesAt(g.posts[i].send, n));
         try g.meet();
+    }
+
+    fn lensAt(p: DevicePtr, world: u32) []const i32 {
+        return @as([*]const i32, @ptrFromInt(p))[0..world];
+    }
+
+    /// Copies only each rank's lens[r] bytes (the rest of recv stays as it was, so a reader past a length sees stale bytes);
+    /// a rank in `var_refuse` takes whole strides. Lengths that differ between ranks are refused on every rank.
+    fn allGatherV(ptr: *anyopaque, s: DevicePtr, r: DevicePtr, stride: usize, lens: DevicePtr, t: DType, _: collective.Stream) Error!void {
+        const self = self_(ptr);
+        const g = self.group;
+        try self.enter(.{ .call = .all_gather_v, .send = s, .recv = r, .count = stride, .t = t, .lens = lens });
+        const n = stride * t.size();
+        const mine = lensAt(lens, g.world);
+        for (0..g.world) |i| if (!std.mem.eql(i32, mine, lensAt(g.posts[i].lens, g.world))) {
+            abort(self);
+            return error.Invalid;
+        };
+        const whole = g.var_refuse & (@as(u32, 1) << @intCast(self.me)) != 0;
+        const out = bytesAt(r, n * g.world);
+        for (0..g.world) |i| {
+            if (mine[i] < 0 or mine[i] > n) {
+                abort(self);
+                return error.Invalid;
+            }
+            const len: usize = if (whole) n else @intCast(mine[i]);
+            @memcpy(out[i * n ..][0..len], bytesAt(g.posts[i].send, len));
+        }
+        try g.meet();
+    }
+
+    fn varFits(ptr: *anyopaque, bytes: usize) bool {
+        const self = self_(ptr);
+        return bytes > 0 and self.group.var_refuse & (@as(u32, 1) << @intCast(self.me)) == 0;
+    }
+
+    /// One int all-gather of `varFits(16)` the first time, then the kept answer.
+    fn varAgreed(ptr: *anyopaque) Error!bool {
+        const self = self_(ptr);
+        if (self.var_agreed) |v| return v;
+        const mine: i32 = @intFromBool(varFits(ptr, 16));
+        var all: [max_ranks]i32 = undefined;
+        try allGather(ptr, @intFromPtr(&mine), @intFromPtr(&all), 1, .i32, null);
+        self.var_agreed = std.mem.min(i32, all[0..self.group.world]) == 1;
+        return self.var_agreed.?;
     }
 
     fn exchange(ptr: *anyopaque, s: DevicePtr, r: DevicePtr, count: usize, t: DType, peer: u32, _: collective.Stream) Error!void {
@@ -211,7 +263,17 @@ pub const Rank = struct {
 
 /// Runs `body(rank_collective, rank, ctx)` on `world` threads at once and returns the first error any rank hit.
 pub fn run(world: u32, ctx: anytype, comptime body: fn (collective.Collective, u32, @TypeOf(ctx)) anyerror!void) !void {
+    return runWith(world, .{}, ctx, body);
+}
+
+pub const Options = struct {
+    /// `Group.var_refuse`: ranks whose transport takes no device lengths.
+    var_refuse: u32 = 0,
+};
+
+pub fn runWith(world: u32, opts: Options, ctx: anytype, comptime body: fn (collective.Collective, u32, @TypeOf(ctx)) anyerror!void) !void {
     var group = Group.init(world);
+    group.var_refuse = opts.var_refuse;
     var ranks: [max_ranks]Rank = undefined;
     var errs: [max_ranks]?anyerror = @splat(null);
     var threads: [max_ranks]std.Thread = undefined;

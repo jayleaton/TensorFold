@@ -19,6 +19,8 @@ const Run = struct {
     errs: [2]?anyerror = .{ null, null },
     done: [2]u32 = .{ 0, 0 },
     max_bytes: usize = 16 * 1024,
+    /// Variable lengths (`Roce.allGatherV`'s contract): each op's lens[r] bytes of rank r's n, 0 and n included.
+    var_lens: bool = false,
 };
 
 fn rank(run: *Run, me: u32, lfd: sock.Fd) void {
@@ -50,10 +52,12 @@ fn body(run: *Run, me: u32, lfd: sock.Fd) ?anyerror {
         const n = 1 + (k * 7919) % run.max_bytes;
         reference.fill(in[0..n], .u8, me, k);
         reference.fill(peer[0..n], .u8, 1 - me, k);
-        r.hostGather(in[0..n], out[0 .. 2 * n]) catch |e| return e;
+        const lens: [2]u32 = if (k % 5 == 0) .{ 0, @intCast(n) } else .{ @intCast((k * 31) % (n + 1)), @intCast((k * 17 + 5) % (n + 1)) };
+        const l: [2]usize = if (run.var_lens) .{ lens[0], lens[1] } else .{ n, n };
+        r.hostGatherV(in[0..n], out[0 .. 2 * n], if (run.var_lens) lens else null) catch |e| return e;
         const r0 = if (me == 0) in[0..n] else peer[0..n];
         const r1 = if (me == 1) in[0..n] else peer[0..n];
-        if (!std.mem.eql(u8, out[0..n], r0) or !std.mem.eql(u8, out[n .. 2 * n], r1)) return error.WrongBytes;
+        if (!std.mem.eql(u8, out[0..l[0]], r0[0..l[0]]) or !std.mem.eql(u8, out[n..][0..l[1]], r1[0..l[1]])) return error.WrongBytes;
         run.done[me] += 1;
     }
     r.check() catch |e| return e;
@@ -78,6 +82,13 @@ fn twoRanks(run: *Run) !void {
 
 test "the RoCE protocol over the shm wire: 2,000 gathers of every size, bit for bit" {
     var run: Run = .{ .port = 0, .wire = .shm, .ops = 2000 };
+    try twoRanks(&run);
+    for (run.errs) |e| if (e) |err| return err;
+    try std.testing.expectEqual([2]u32{ 2000, 2000 }, run.done);
+}
+
+test "the RoCE protocol with variable lengths over the shm wire: each rank posts its own padded count, empty shards included" {
+    var run: Run = .{ .port = 0, .wire = .shm, .ops = 2000, .var_lens = true };
     try twoRanks(&run);
     for (run.errs) |e| if (e) |err| return err;
     try std.testing.expectEqual([2]u32{ 2000, 2000 }, run.done);
