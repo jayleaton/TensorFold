@@ -60,6 +60,18 @@ One overnight window, the whole model at TP=2 over RoCE. It runs everything gate
 
 **What run A turns on** (`run_m4.sh`'s defaults; both ranks alike): R1, decode graphs, the Zig prefill, DSpark drafts with prod's speculative pass (`SPEC=1`), drafts priced by prod's stored calibration (`CALIB=real`: the cache volume read-only), keyed sampling (`SAMPLING=1`), R3 Engram from the node's shards (`ENGRAM=1`), and prod's RoCE / index-budget / 2,048-row prefill knobs. The features gated on the last pod (structured output, images with `bias_vl`, x3gm v2 prefill, the fused dense prefill, Engram read-ahead) are listed below with the knobs that turn them on. Each can be turned off: `ENGRAM=0`, `CALIB=`, `SAMPLING=0`, `SPEC=0`, `DRAFTS=0`, `GRAPHS=0`, `OWN_PREFILL=0`.
 
+**Features behind a knob, off in this kit until their pod gate passes** (both ranks alike; turn one on by adding its knob to every `run_m4.sh` command of a run):
+
+| feature | knob | pod gate |
+|---|---|---|
+| structured output (grammar) | `GRAMMAR=1` | `M2B_GRAMMAR` (pod 30, not run yet) |
+| images, with prod's image routing bias | `IMAGES=native BIAS_VL=1` | `M2B_VISION` (pod 30, not run yet) |
+| x3gm v2 prefill (+7 % prefill at 8K–32K) | `GM_V2=1` | `M2B_GM2PF` (pod 30, not run yet) |
+| fused dense prefill, Engram read-ahead | `PF_DENSE=fused PREFETCH_AHEAD=1` | `M2B_KNOBS` (pod 30, not run yet) |
+| several slots with sessions | none yet | not built (refused with `SLOTS` > 1) |
+
+Long prompts past 4,096 keys (run C's `CONTEXT`) are host-gated, and their pod gate (`M2B_LONGPF`) is also on pod 30. Run C is where they first run on GPUs.
+
 **What the numbers mean:**
 - Step 5 and step 10 are pass / fail: Zig's forward == Python's on the whole model, and the served path's replies == the same requests replayed through the CLI.
 - Step 14's speed tables are Zig's tok/s against prod's per cell (best of 2 reps; 4 streams: the aggregate while all four are live). B2 is the like-for-like row: prod also serves 4 slots with drafts.
