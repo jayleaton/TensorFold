@@ -344,7 +344,7 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
         # M2B_LONGPF (long prompts past 4,096 keys), M2B_SPEC (SPEC_DRAFT early pass), M2B_GRAMMAR (structured output),
         # M2B_VISION (image input), M2B_KNOBS (prod engine knobs on the Zig side), M2B_SESS4 (sessions with several slots),
         # M2B_GM2PF (x3gm v2 on Zig's prefill: a v2 capture checked + replayed, v2 == v1, the prefill gate off / v2 timed)
-        for name in longpf spec grammar vision knobs sess4 gm2pf; do
+        for name in ${*:-longpf spec grammar vision knobs sess4 gm2pf}; do
             knob=M2B_${name^^}
             [[ "${!knob:-0}" == 1 ]] || continue
             if [[ -f "$Z/tools/zig/dsv41_$name/job.sh" ]]; then
@@ -359,7 +359,7 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
         step m2b "$mb" bash "$Z/tools/zig/dsv41_m1/m2b_ranks.sh" "$Z/bin/tf-dsv41-m1" "$LP" "$R0" "$RES/m2b" \
             || rc=1
         # M2B_GATES_FIRST=1: the workstream gates (never run on a GPU) before R1 / M4 / sampling / slots (gated before)
-        [[ "${M2B_GATES_FIRST:-0}" == 1 ]] && ws_gates
+        [[ "${M2B_GATES_FIRST:-0}" == 1 ]] && ws_gates longpf spec grammar vision knobs sess4
         # M2B_PREFILL_GATE=1: Zig's own prefill from an empty slot (M2B_PREFILL=1): every state role == the
         # reference's dump and its first token, then the decode gate (M2B_PROMPT 2600: a 2,048-row chunk + a ragged one)
         if [[ "${M2B_PREFILL_GATE:-0}" == 1 ]]; then
@@ -519,7 +519,10 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
     fi
     # the gap-closing workstreams (ws_gates, defined after the M2b reference): here, unless M2B_GATES_FIRST=1 ran them
     # right after the M2b decode gate
-    [[ "${M2B_GATES_FIRST:-0}" == 1 ]] || ! declare -F ws_gates > /dev/null || ws_gates
+    # (with M2B_GATES_FIRST=1, gm2pf still here: its captures and timing come after the correctness gates)
+    if declare -F ws_gates > /dev/null; then
+        if [[ "${M2B_GATES_FIRST:-0}" == 1 ]]; then ws_gates gm2pf; else ws_gates; fi
+    fi
     for d in "${refs[@]}"; do
         o=$RES/m2b-ref; [[ -n "$PROMPTS" ]] && o=$RES/m2b-ref/$(basename "$d")
         mkdir -p "$o"
