@@ -20,6 +20,9 @@ Prompts 1..3 route image rows with the text bias (as Python without TF_DSV41_BIA
 
     python -u -B vision_ref.py --vdir VDIR [--bias-vl DIR] -- --pack PACK --out OUT --layers 0-24 --steps 32 --prompts 1,2,3,4,5,6
 
+Two hosts (the Sparks, spark.sh): the same with ``--rank R --master ADDR`` on each; each host prepares the images
+(seeded, the same bits) and rank 0 alone dumps the tower.
+
 ``--tower-only``: steps 1 and 2 alone on one GPU (cuda:0; the pack's vision tensors, no model load, about 2 min), for
 ``tf-dsv41-m1 vision PACK VDIR`` on the same GPU:
 
@@ -183,9 +186,10 @@ def one_image(rank, a, fw, cfg, greedy, Seg, digest, prompt, out, *rest):
 
     vdir, pack = Path(os.environ["DSV41_VISION_DIR"]), Path(a.pack)
     if "images" not in _STATE:
-        _STATE["images"] = prepare(vdir, pack) if rank == 0 else None
+        two_hosts = a.rank >= 0                  # rank 1 on its own host: the same seeded images prepared there
+        _STATE["images"] = prepare(vdir, pack) if rank == 0 or two_hosts else None
         fw.comm.barrier() if hasattr(fw.comm, "barrier") else None
-        if rank != 0:
+        if rank != 0 and not two_hosts:
             _STATE["images"] = _load_manifest(vdir)
         if rank == 0:
             enc = tower_dumps(vdir, pack, _STATE["images"], fw.device)
