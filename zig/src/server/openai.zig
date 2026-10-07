@@ -159,6 +159,8 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
     const sampling = try json.newObject(cx.a);
     for ([_][]const u8{ "temperature", "top_p", "top_k", "min_p", "seed", "priority", "draft", "thinking_budget", "ignore_eos", "stop" } ++ grammar.fields) |k| if (body.get(k)) |v| try sampling.put(cx.a, k, v);
     try grammar.refusal(cx, body);
+    // a family's engine with structured output (DeepSeek-V4.1, TF_DSV41_GRAMMAR=1): tool calls held to their schemas
+    if (srv.family != null and srv.info.structures) if (try grammar.toolSpec(cx, body, grammar.toolGrammarEnv())) |t| try sampling.put(cx.a, "tools_grammar", .{ .string = t });
     if (srv.family == null and input.tools.len > 0 and try tool_specs.choiceRequiresCall(cx.a, body.get("tool_choice"))) try sampling.put(cx.a, "tool_call_required", .{ .bool = true });
     const thinking: fields.Thinking = if (srv.family) |fam| blk: {
         const t = try fam.thinking(cx, body);
