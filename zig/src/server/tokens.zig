@@ -49,6 +49,14 @@ fn tokenize(srv: *Server, cx: *Cx, body: Value) errors.Refused!Value {
             else => |x| return x,
         };
         ids = rendered.ids;
+        if (rendered.images) |im| { // /tokenize shows the image token at each image position (expand(virtual=False))
+            defer im.release();
+            const out = try cx.a.dupe(u32, rendered.ids);
+            for (out) |*id| if (id.* >= 1 << 24) {
+                id.* = im.token;
+            };
+            ids = out;
+        }
     } else if (body.has("messages")) {
         const generation = try flag(cx, body, "add_generation_prompt", true);
         const msgs = try messages.normalize(cx, body.get("messages"), "system", srv.needs_user_after_tool);
