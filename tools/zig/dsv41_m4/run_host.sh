@@ -153,8 +153,28 @@ case "$PHASE" in
             --rank "$RANK" --master "$MASTER" --port 29841 > "$OUT/taps-aot.log" 2>&1 \
             || { echo "taps-aot reference failed: $OUT/taps-aot.log"; exit 1; }
         python3 "$KIT/tools/zig/dsv41_aot_merge.py" "$ASSETS/aot" "$TA/aot" | tee -a "$OUT/taps-aot.log" ;;
+    pool-aot)
+        # prompts prefilled into the paged pool (the `_fused` variants with PT, every row count's % 16 / == 1, every
+        # layer kind): SLOTS > 1 or POOL_TOKENS serves every prompt there. dsv41_m2b_ref.py --pool (POOL_AOT_MODE=split:
+        # --split, a tree whose Pool takes split=) at TP=2 over the two hosts on layers 0-24, merged into ASSETS/aot
+        C=8474f3164ea60cb9c9f8e9bd5a4493fdf13eaa47
+        if [[ "$RANK" == 0 ]]; then TF=/home/dgx01/ai/src/dsv41-prod/$C; else TF=/home/root/ai/src/dsv41-prod/$C; fi
+        KN=(); for f in prod-knobs.env r1c-knobs.env; do while read -r kv; do [[ "$kv" =~ ^TF_ ]] && KN+=(-e "$kv"); done < "$KIT/tools/zig/dsv41_m1/$f"; done
+        PA=$OUT/pool-aot; rm -rf "$PA"
+        docker run --rm --gpus all --ipc=host --network host --device /dev/infiniband --ulimit memlock=-1 --cap-add IPC_LOCK \
+            -v "$TF:/dsv41-tf:ro" -v "$MODEL:/model:ro" -v "$KIT:/kit:ro" -v "$OUT:/out" -v "$CACHE_VOL:/cache" "${KN[@]}" \
+            -e TF_DSV41_EXPERT_TOPP=0.85 -e PYTHONPATH=/dsv41-tf/src:/cache/pylib \
+            -e TORCH_EXTENSIONS_DIR=/cache/torch_extensions -e TRITON_CACHE_DIR=/cache/triton \
+            -e NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-enp1s0f1np1} -e NCCL_IB_HCA=${NCCL_IB_HCA:-rocep1s0f1,roceP2p1s0f1} \
+            -e GLOO_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-enp1s0f1np1} --name "dsv41-zig-pool-r$RANK" \
+            --entrypoint python "$IMAGE" -u -B /kit/tools/zig/dsv41_m2b_ref.py --pack /model --out /out/pool-aot --layers 0-24 \
+            --"${POOL_AOT_MODE:-pool}" --prompt 64 --steps 1 --aot-taps \
+            --aot-prompts "${AOT_PROMPTS-1,2,9,16,17,33,45,48,54,64,65,96,173,300,1025,2049,2600}" \
+            --rank "$RANK" --master "$MASTER" --port 29861 > "$OUT/pool-aot.log" 2>&1 \
+            || { echo "pool-aot reference failed: $OUT/pool-aot.log"; exit 1; }
+        python3 "$KIT/tools/zig/dsv41_aot_merge.py" "$ASSETS/aot" "$PA/aot" | tee -a "$OUT/pool-aot.log" ;;
     follow)
         docker run "${ARGS[@]}" --name dsv41-zig-m4-r$RANK --entrypoint bash "$IMAGE" \
             -c "$NCCL; exec /kit/tf-dsv41-m1 follow /model /assets" 2>&1 | tee -a "$OUT/follow.log" ;;
-    *) echo "phase: server | generate | follow | dspark-aot | rows-aot | long-aot | taps-aot"; exit 2 ;;
+    *) echo "phase: server | generate | follow | dspark-aot | rows-aot | long-aot | taps-aot | pool-aot"; exit 2 ;;
 esac

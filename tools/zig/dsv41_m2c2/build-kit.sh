@@ -18,7 +18,7 @@ zig build -Dtarget=aarch64-linux-gnu -Dfatbins="$FB" -Dsm=121 -Doptimize=Release
 cp "$KIT/.build/bin/tf-dsv41-m1" "$KIT/.build/bin/tensorfold-dsv41" "$KIT/" && rm -rf "$KIT/.build"
 cp "$TPF" "$KIT/tp_mailbox.fatbin"
 cp tools/zig/dsv41_m2b_ref.py tools/zig/dsv41_m1_capture.py tools/zig/triton_aot_manifest.py tools/zig/dsv41_engram_host.py \
-    tools/zig/dsv41_aot_merge.py "$KIT/tools/zig/"
+    tools/zig/dsv41_aot_merge.py tools/zig/dsv41_m5_kv.py "$KIT/tools/zig/"
 cp tools/zig/dsv41_m1/prod-knobs.env tools/zig/dsv41_m1/r1c-knobs.env "$KIT/tools/zig/dsv41_m1/"
 cp "$HERE/run_host.sh" "$KIT/"
 # M4: the Zig server on rank 0, the CLI replay, DSpark's acceptance (tools/zig/dsv41_m4)

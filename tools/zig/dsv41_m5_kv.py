@@ -74,8 +74,10 @@ class KV:
         npages = 2 * maxp + 4                   # the slot, the holder's interleaved pages and its restore shifts
         whole = max(1, self.split)
         npages = -(-npages // whole) * whole
-        self.pool = PO.Pool(self.topo, npages * page, index_kv=self.index_kv, device=device, split=self.split,
-                            rank=self.rank)
+        # split= / rank= only for a split pool (a replicated pool is every tree's default: prod's 8474f31 Pool has
+        # neither keyword)
+        kw = {"split": self.split, "rank": self.rank} if self.split else {}
+        self.pool = PO.Pool(self.topo, npages * page, index_kv=self.index_kv, device=device, **kw)
         self.ps = self.pool.new_slot(capacity)
         self.other = self.pool.new_slot(2 * capacity + 4 * page)
         self.scramble = bool(scramble)
