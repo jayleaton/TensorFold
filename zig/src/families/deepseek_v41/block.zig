@@ -33,6 +33,9 @@ pub const Widths = struct {
 
 /// Run-time sizes the Python engine fixes at load (its scratch and pools), and the prod L2 prefetch settings.
 pub const Options = struct {
+    /// TF_DSV41_IMAGES=native (vision_rows.zig): this prefill segment holds image positions, so Engram fuses with a keep
+    /// vector (0 there; vision.window's ``keep``)
+    image_keep: bool = false,
     /// TP ranks (a boot constant): every per-rank width below is the model's / world; the plan checked divisibility
     world: u32 = 2,
     /// KV positions a slot holds (pool rows = limit / ratio + 1)
