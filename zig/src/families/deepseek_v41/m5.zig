@@ -122,6 +122,9 @@ fn onePrompt(gpa: std.mem.Allocator, io: std.Io, a: std.mem.Allocator, m: *model
     const mine = try readJson(a, io, dir, try std.fmt.allocPrint(a, "rank{d}.json", .{rank}));
     const sdir = try std.fmt.allocPrint(a, "{s}/rank{d}/state", .{ dir, rank });
     const st = try readJson(a, io, sdir, "state.json");
+    // a fresh slot, as Python's new_slot: the bounded roles (SWA rings, carries) zeroed, so the rows a short prompt never
+    // writes compare equal after a longer one in the same load (the pool's rows go through the slot's tables)
+    try zeroBounded(a, io, m, st, sdir);
     const pids = meta.object.get("prompt_ids").?.array.items;
     const prompt = try a.alloc(u32, pids.len);
     for (prompt, pids) |*d, v| d.* = @intCast(v.integer);
@@ -188,6 +191,19 @@ fn onePrompt(gpa: std.mem.Allocator, io: std.Io, a: std.mem.Allocator, m: *model
 }
 
 const Cmp = struct { roles: usize = 0, equal: usize = 0, first_bad: []const u8 = "" };
+
+/// Every bounded role the dump names (not the pool's `s.kv.*`) set to zero bytes, the dump file's length each.
+fn zeroBounded(a: std.mem.Allocator, io: std.Io, m: *model.Model, st: Value, sdir: []const u8) !void {
+    const r = &m.runner;
+    var it = st.object.get("roles").?.object.iterator();
+    while (it.next()) |e| {
+        if (std.mem.startsWith(u8, e.key_ptr.*, "s.kv.")) continue;
+        const p = r.addressOf(e.key_ptr.*) orelse return error.StateRole;
+        const len = (try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ sdir, e.value_ptr.string }), a, .limited(1 << 32))).len;
+        try (cuda.DeviceBuffer{ .d = r.d, .ptr = p, .len = len }).fill8(0, r.stream.handle);
+    }
+    try r.stream.synchronize();
+}
 
 /// The dump's roles against ours: the bounded roles byte for byte, the pool's logical rows through the slot's tables.
 fn compareState(gpa: std.mem.Allocator, a: std.mem.Allocator, io: std.Io, m: *model.Model, st: Value, sdir: []const u8, rank: u32) !Cmp {
