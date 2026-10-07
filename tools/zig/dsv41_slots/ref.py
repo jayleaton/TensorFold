@@ -49,7 +49,7 @@ def rank_main(rank: int, a) -> None:
     from tensorfold.families.deepseek_v41.cuda.csa2.backend import Triton
     from tensorfold.families.deepseek_v41.cuda.engram_host import NgramHasher, token_map
     from tensorfold.families.deepseek_v41.cuda.forward import Seg, greedy
-    from tensorfold.families.deepseek_v41.cuda.slots import SlotsForward
+    from tensorfold.families.deepseek_v41.cuda.decode import DecodeForward    # serving's SlotsForward (Engram hooks)
     from tensorfold.families.glm5_next.spark import kvpool
 
     t0 = time.time()
@@ -68,7 +68,7 @@ def rank_main(rank: int, a) -> None:
     tree = W.RankW(rank, 2, rank * vh, embed, layers, norm, head, None, {})
     rows = {L: IndexRows(cfg.engram_head_dim) for L in cfg.engram_layer_ids}
     S = a.slots
-    fw = SlotsForward(cfg, tree, csa2=Triton(128, cfg.num_attention_heads // 2, dev), comm=comm, device=dev,
+    fw = DecodeForward(cfg, tree, csa2=Triton(128, cfg.num_attention_heads // 2, dev), comm=comm, device=dev,
                       limit=a.limit, chunk=128, engram_rows=rows, hasher=NgramHasher(cfg, tmap), slots=S,
                       contiguous=False, pchunk=2048)
     page = PO.PAGE
