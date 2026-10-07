@@ -166,18 +166,57 @@ fn rankedBefore(_: void, a: Ranked, b: Ranked) bool {
 }
 
 /// A row's best `ids.len` by (value desc, id asc) as token ids (`id0`: the rank's first column); any top-k agrees.
+/// A bounded selection under the same strict order: the first k of a full sort, without sorting the vocabulary (a
+/// whole-row sort was 40 ms a pass on the Spark, the pass's largest host cost).
 pub fn candidates(scratch: Allocator, logits: []const f32, id0: u32, ids: []i32, vals: []f32) !void {
-    const all = try scratch.alloc(Ranked, logits.len);
-    defer scratch.free(all);
-    for (all, logits, 0..) |*r, v, i| r.* = .{ .value = v, .id = @intCast(i) };
     const k = @min(ids.len, logits.len);
-    std.sort.pdq(Ranked, all, {}, rankedBefore);
-    for (ids[0..k], vals[0..k], all[0..k]) |*i, *v, r| {
+    const best = try scratch.alloc(Ranked, k);
+    defer scratch.free(best);
+    var n: usize = 0;
+    for (logits, 0..) |v, i| {
+        const r: Ranked = .{ .value = v, .id = @intCast(i) };
+        if (n == k) {
+            if (k == 0 or !rankedBefore({}, r, best[k - 1])) continue;
+            n -= 1;
+        }
+        var j = n;
+        while (j > 0 and rankedBefore({}, r, best[j - 1])) : (j -= 1) best[j] = best[j - 1];
+        best[j] = r;
+        n += 1;
+    }
+    for (ids[0..k], vals[0..k], best[0..k]) |*i, *v, r| {
         i.* = @intCast(r.id + id0);
         v.* = r.value;
     }
     @memset(ids[k..], -1);
     @memset(vals[k..], -std.math.inf(f32));
+}
+
+test "candidates: the bounded selection == the first k of a full sort (ties by id)" {
+    const a = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(4101);
+    const rnd = prng.random();
+    const logits = try a.alloc(f32, 5000);
+    defer a.free(logits);
+    for (logits) |*v| v.* = @floatFromInt(rnd.intRangeAtMost(i32, -40, 40)); // many ties
+    const all = try a.alloc(Ranked, logits.len);
+    defer a.free(all);
+    for (all, logits, 0..) |*r, v, i| r.* = .{ .value = v, .id = @intCast(i) };
+    std.sort.pdq(Ranked, all, {}, rankedBefore);
+    for ([_]usize{ 1, 3, 64, 200 }) |k| {
+        var ids: [256]i32 = undefined;
+        var vals: [256]f32 = undefined;
+        try candidates(a, logits, 7, ids[0 .. k + 2], vals[0 .. k + 2]);
+        for (all[0..k], ids[0..k], vals[0..k]) |r, i, v| {
+            try std.testing.expectEqual(@as(i32, @intCast(r.id + 7)), i);
+            try std.testing.expectEqual(r.value, v);
+        }
+    }
+    // a row shorter than the list: its ids, then -1
+    var ids: [4]i32 = undefined;
+    var vals: [4]f32 = undefined;
+    try candidates(a, &.{ 1.0, 3.0, 3.0 }, 10, &ids, &vals);
+    try std.testing.expectEqualSlices(i32, &.{ 11, 12, 10, -1 }, &ids);
 }
 
 /// window = [pending, d_1 .. d_k], chosen = the target's choice after each row -> drafts kept.
