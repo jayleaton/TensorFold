@@ -32,6 +32,8 @@ const usage =
     \\       tf-dsv41-m1 plan            (host only: the whole model emitted from the q28-v2 listings, M2's buffer plan)
     \\       tf-dsv41-m1 m2a PACK REF OUT (M2a: our forward vs tools/zig/dsv41_m2a_digests.py's run, one GPU)
     \\       tf-dsv41-m1 m2b PACK REF OUT (M2b: a rank of TP=2 over NCCL vs tools/zig/dsv41_m2b_ref.py; TF_TP_RANK ...)
+    \\       tf-dsv41-m1 follow PACK ASSETS (a served model's rank > 0: rank 0's forward operations until it stops)
+    \\       tf-dsv41-m1 generate PACK ASSETS TRACE (rank 0: TRACE's prompts through the served engine, ids == recorded)
     \\  PACK     the EXL3 pack (config.json, index, shards)
     \\  CAPTURE  tools/zig/dsv41_m1_capture.py's output (ops.jsonl, blobs/, weights.json, aot/, meta.json)
     \\  OUT      weights.jsonl, replay.jsonl, forward.jsonl, summary.json
@@ -65,6 +67,16 @@ pub fn main(init: std.process.Init) !u8 {
         out.interface.flush() catch {};
         return 0;
     }
+    if (args.len == 4 and std.mem.eql(u8, args[1], "follow"))
+        return @import("serve_cli.zig").follow(init.gpa, init.io, args[2], args[3]) catch |e| {
+            std.debug.print("FAIL tf-dsv41-m1 follow: {t}\n", .{e});
+            return 1;
+        };
+    if (args.len == 5 and std.mem.eql(u8, args[1], "generate"))
+        return @import("serve_cli.zig").generate(init.gpa, init.io, args[2], args[3], args[4]) catch |e| {
+            std.debug.print("FAIL tf-dsv41-m1 generate: {t}\n", .{e});
+            return 1;
+        };
     if (args.len == 3 and std.mem.eql(u8, args[1], "dcheck")) {
         var buf: [4096]u8 = undefined;
         var out = std.Io.File.stdout().writer(init.io, &buf);

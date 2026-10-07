@@ -162,8 +162,21 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     dsv41_m1.addImport("core", mods.core);
     dsv41_m1.addImport("dsv41_kernels", dsv41);
     dsv41_m1.addImport("tp", @import("tp.zig").module(b, target, optimize, cuda)); // M2's forward: the TP collectives
-    dsv41_m1.addImport("lanes", b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = target, .optimize = optimize, .link_libc = true })); // M3: the GPU target's lanes types
+    const dsv41_lanes = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    dsv41_m1.addImport("lanes", dsv41_lanes); // M3: the GPU target's lanes types
+    // M4: the served engine (serve_engine.zig) for follow / generate, over the server's engine seam
+    const dsv41_api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    dsv41_api.addImport("lanes", dsv41_lanes);
+    dsv41_m1.addImport("engine_api", dsv41_api);
     b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-m1", .root_module = dsv41_m1 }));
+    // M4 on the GPU: tensorfold-dsv41, the native server with DeepSeek-V4.1's CUDA engine (rank 0; the other ranks run
+    // tf-dsv41-m1 follow)
+    const ds_engine = b.createModule(.{ .root_source_file = b.path("zig/src/families/deepseek_v41/serve_engine.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    ds_engine.addImport("cuda", cuda);
+    ds_engine.addImport("core", b.createModule(.{ .root_source_file = b.path("zig/src/core/safetensors_root.zig"), .target = target, .optimize = optimize, .link_libc = true }));
+    ds_engine.addImport("dsv41_kernels", dsv41);
+    ds_engine.addImport("tp", @import("tp.zig").module(b, target, optimize, cuda));
+    b.installArtifact(b.addExecutable(.{ .name = "tensorfold-dsv41", .root_module = @import("server.zig").withEngine(b, target, .ReleaseSafe, ds_engine) }));
 }
 
 /// Host unit tests of the CUDA runtime, the backend-neutral core, the lane core and the CUDA family (no GPU), on any host.

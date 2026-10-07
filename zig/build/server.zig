@@ -45,9 +45,15 @@ fn server(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
     });
     if (natives) |n| {
         n.addImport("engine_api", api);
+        n.addImport("lanes", lanes); // an engine on the lane core shares the server's (engine_api's) lanes types
         m.addImport("native_engines", n);
     }
     return .{ .json = json, .serve = serve, .server = m, .api = api };
+}
+
+/// tensorfold-native's root module with `natives` as its built-in engines (zig/build/cuda.zig: tensorfold-dsv41).
+pub fn withEngine(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, natives: *std.Build.Module) *std.Build.Module {
+    return server(b, target, optimize, "zig/src/server/main.zig", natives).server;
 }
 
 /// `test-dsv41-serve`: the serving module's goldens; `test-server`: the HTTP server's tests (DeepSeek over HTTP
