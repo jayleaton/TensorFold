@@ -20,7 +20,7 @@ fn drafts() bool {
 }
 
 pub fn follow(gpa: std.mem.Allocator, io: std.Io, pack: []const u8, assets: []const u8) !u8 {
-    const m = try model.Model.open(gpa, io, pack, assets, .{ .drafts = drafts() });
+    const m = try model.Model.open(gpa, io, pack, assets, .{ .drafts = drafts(), .own_prefill = model.ownPrefillEnv() });
     defer m.close();
     if (m.rank() == 0) return error.RankZeroServes;
     std.debug.print("rank {d}: loaded, following rank 0\n", .{m.rank()});

@@ -49,6 +49,11 @@ One prod window, three runs in order. Each run gates the next:
 
 **Optional knobs:**
 - M2c-2: `SEEDS="4101 4102"` adds about 25 min. `BACKEND=nccl` takes NCCL only.
+- **`PREFILL=1` on step 3** (about **+10 min**): Zig's own prefill gate. After the decode gate, our ranks load again from an empty slot and prefill the reference's prompt in 2,048-row segments, with the exchanges over NCCL (20 MiB each, above the RoCE mailbox's 16 MB ceiling).
+  - The checks: every state role (SWA rings, compressed pools, index keys, ratio-2 carries) bytes-equal to Python's dump, the same position and Engram tail, the same first token, then the decode gate from that state.
+  - The pass line: `PASS Zig prefill rank N: ... state roles K/K equal ...`, then `PASS M2b rank N` in `out/seed*/prefill.log`.
+  - `PROMPT=2600` makes the prompt cross a segment boundary (2,048 + 552).
+  - This gate has not run on a GPU yet (the prefill segments' launches have: 320/320). If it fails, step 7 can still run with `TF_DSV41_OWN_PREFILL=0`, which prefills through decode windows.
 - M4: `DRAFTS=0` serves without DSpark (then step 6 is not needed). `TF_DSV41_GRAPHS=1` on both ranks enables decode graphs.
 
 **What the numbers mean:**

@@ -19,6 +19,9 @@ pub const GpuTarget = struct {
     resume_first: ?u32 = null,
     /// the most rows a window may take: the forward's buffers are planned for its buckets (run.zig has no bounds)
     max_rows: u32 = 16,
+    /// the prompt through the forward's own prefill (2,048-row segments, Python's chunks; forward.planPrefill sized
+    /// its buffers) instead of `prefill_rows`-row decode windows
+    own_prefill: bool = false,
 
     pub fn target(t: *GpuTarget) iface.Target {
         return .{ .ptr = t, .vtable = &vtable };
@@ -36,6 +39,16 @@ pub const GpuTarget = struct {
         if (slot != 0) return error.Slots;
         if (sampling != null) return error.Sampling;
         if (t.resume_first) |first| if (t.f.slot.pos == ids.len and t.f.slot.pending == null) return first;
+        if (t.own_prefill) {
+            // the keyed choice after the prompt: the last segment's last row
+            try t.f.prefill(ids);
+            const seg: usize = @intCast(t.f.opts.prefill_rows);
+            const last = if (ids.len % seg == 0) seg else ids.len % seg;
+            const picks = try t.f.gpa.alloc(u32, last);
+            defer t.f.gpa.free(picks);
+            try t.f.greedy(picks);
+            return picks[last - 1];
+        }
         var at: usize = 0;
         var choice: [1]u32 = .{0};
         while (at < ids.len) {

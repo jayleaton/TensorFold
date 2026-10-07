@@ -31,9 +31,17 @@ const dspark_gpu = @import("dspark_gpu.zig");
 
 pub const Options = struct {
     drafts: bool = true,
-    /// rows a prefill window takes (the decode buckets the plan sizes for)
+    /// rows a prefill window takes (the decode buckets the plan sizes for) when the prompt runs as decode windows
     prefill_rows: u32 = 16,
+    /// the prompt through the forward's own prefill (2,048-row segments) instead: TF_DSV41_OWN_PREFILL (default on)
+    own_prefill: bool = true,
 };
+
+/// TF_DSV41_OWN_PREFILL=0: prompts as 16-row decode windows (every rank must agree: the plans differ)
+pub fn ownPrefillEnv() bool {
+    const v = std.c.getenv("TF_DSV41_OWN_PREFILL") orelse return true;
+    return !std.mem.eql(u8, std.mem.span(v), "0");
+}
 
 pub const Model = struct {
     gpa: std.mem.Allocator,
@@ -117,6 +125,7 @@ pub const Model = struct {
         for (buckets[0..nb], 0..) |*b, i| b.* = @intCast(i + 1);
         var bp = try m.f.plan(buckets[0..nb]);
         if (o.drafts) try dspark_gpu.GpuPass.plan(m.f.arena.allocator(), &m.f, &bp, nb);
+        if (o.own_prefill) try m.f.planPrefill(&bp, @intCast(m.f.opts.prefill_rows));
         try m.runner.bind(&bp);
         const src: forms.Source = .{ .d = &m.driver, .weights = &m.weights, .plan = &m.pl };
         for (bp.sizes.keys()) |role| {
@@ -134,7 +143,7 @@ pub const Model = struct {
         m.host = try eh.Host.load(ehb, m.cfg.engram_heads, m.cfg.engram_pad, m.cfg.engram_vocab, &m.lbuf);
         m.f.engram = &m.host;
         if (world > 1) m.f.link = &m.session.plan;
-        m.gt = .{ .f = &m.f, .prefill_rows = o.prefill_rows, .max_rows = nb };
+        m.gt = .{ .f = &m.f, .prefill_rows = o.prefill_rows, .max_rows = nb, .own_prefill = o.own_prefill };
         if (o.drafts) m.pass = try dspark_gpu.GpuPass.init(gpa, &m.f, nb);
         try m.driver.check(m.driver.api.cuCtxSynchronize(), "cuCtxSynchronize");
         try comm.barrier();

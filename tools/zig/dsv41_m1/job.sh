@@ -133,7 +133,7 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
     REF=$LOCAL/m2b-ref
     rm -rf "$REF"
     if step m2b-ref "${M2B_REF_MIN:-18}" python -u -B "$Z/tools/zig/dsv41_m2b_ref.py" --pack "$LP" --out "$REF" \
-            --layers "0-$hi" --steps "${M2B_STEPS:-64}" \
+            --layers "0-$hi" --steps "${M2B_STEPS:-64}" --prompt "${M2B_PROMPT:-1536}" \
        && step engram-host 3 python -B "$Z/tools/zig/dsv41_engram_host.py" --py-src /dsv41-tf/src \
             --config "$LP/config.json" --tokenizer "$LP/tokenizer.json" --out "$REF/engram-host.bin"; then
         # DSpark's Triton variants (the reference never drafts): capture P's AOT set merged into the reference's
@@ -141,6 +141,14 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
         mb=$(left); (( mb > 16 )) && mb=16
         step m2b "$mb" bash "$Z/tools/zig/dsv41_m1/m2b_ranks.sh" "$Z/bin/tf-dsv41-m1" "$LP" "$REF" "$RES/m2b" \
             || rc=1
+        # M2B_PREFILL_GATE=1: Zig's own prefill from an empty slot (M2B_PREFILL=1): every state role == the
+        # reference's dump and its first token, then the decode gate (M2B_PROMPT 2600: a 2,048-row chunk + a ragged one)
+        if [[ "${M2B_PREFILL_GATE:-0}" == 1 ]]; then
+            mb=$(left); (( mb > 10 )) && mb=10
+            (export M2B_PREFILL=1 M2B_PORT=29717
+             step m2b-prefill "$mb" bash "$Z/tools/zig/dsv41_m1/m2b_ranks.sh" "$Z/bin/tf-dsv41-m1" "$LP" "$REF" "$RES/m2b-prefill") \
+                || rc=1
+        fi
         # M2B_GRAPHS=1: the same gate again with graphed decode windows (TF_DSV41_GRAPHS=1, R4): == the reference
         if [[ "${M2B_GRAPHS:-0}" == 1 ]]; then
             mb=$(left); (( mb > 8 )) && mb=8

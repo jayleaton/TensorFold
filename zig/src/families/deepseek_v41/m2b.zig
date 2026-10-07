@@ -55,6 +55,9 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, ref: []con
     // M2B_LANES (M3's gates, below): 1 drafts off, 2 the oracle's drafts, 3 DSpark's GPU pass (its blocks and heads
     // load too)
     const lanes_mode: u32 = if (std.c.getenv("M2B_LANES")) |v| try std.fmt.parseInt(u32, std.mem.span(v), 10) else 0;
+    // M2B_PREFILL=1 (the Zig prefill's gate): the slot starts empty and our prefill runs the reference's prompt; every
+    // state role must then equal the reference's dump, its first token too, before the decode gate as usual
+    const own_prefill = if (std.c.getenv("M2B_PREFILL")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
 
     var driver = try cuda.Driver.open();
     defer driver.close();
@@ -124,6 +127,7 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, ref: []con
         // M2B_LANES windows hold the pending token + a DSpark block of drafts
         var p = try f.plan(if (lanes_mode != 0) rows_lanes[0 .. cfg.dspark_block + 1] else &.{1});
         if (lanes_mode == 3) try dspark_gpu.GpuPass.plan(f.arena.allocator(), &f, &p, cfg.dspark_block + 1);
+        if (own_prefill) try f.planPrefill(&p, @intCast(f.opts.prefill_rows));
         f.programs.clearRetainingCapacity();
         f.opts.trace = false;
         try p.add(try f.program(1));
@@ -149,16 +153,21 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, ref: []con
     // this rank's slot after the reference's prompt
     const sdir = try std.fmt.allocPrint(a, "{s}/rank{d}/state", .{ ref, rank });
     const st = try std.json.parseFromSliceLeaky(Value, a, try cwd.readFileAlloc(io, try std.fs.path.join(a, &.{ sdir, "state.json" }), a, .limited(1 << 24)), .{});
-    var sit = st.object.get("roles").?.object.iterator();
-    while (sit.next()) |e| {
-        const bytes = try cwd.readFileAlloc(io, try std.fs.path.join(a, &.{ sdir, e.value_ptr.string }), a, .limited(1 << 32));
-        if (bp.sizes.get(e.key_ptr.*) == null or bp.sizes.get(e.key_ptr.*).? < bytes.len) return error.StateRole;
-        try cuda.DeviceBuffer.upload(.{ .d = &driver, .ptr = runner.addressOf(e.key_ptr.*).?, .len = bytes.len }, 0, bytes);
+    var prefill_report: ?PrefillReport = null;
+    if (own_prefill) {
+        prefill_report = try ownPrefill(gpa, io, a, &f, &driver, &runner, meta, st, sdir, rank);
+    } else {
+        var sit = st.object.get("roles").?.object.iterator();
+        while (sit.next()) |e| {
+            const bytes = try cwd.readFileAlloc(io, try std.fs.path.join(a, &.{ sdir, e.value_ptr.string }), a, .limited(1 << 32));
+            if (bp.sizes.get(e.key_ptr.*) == null or bp.sizes.get(e.key_ptr.*).? < bytes.len) return error.StateRole;
+            try cuda.DeviceBuffer.upload(.{ .d = &driver, .ptr = runner.addressOf(e.key_ptr.*).?, .len = bytes.len }, 0, bytes);
+        }
+        f.slot.pos = @intCast(st.object.get("pos").?.integer);
+        const tail = st.object.get("tail").?.array.items;
+        for (tail, 0..) |t, i| f.slot.tail[i] = @intCast(t.integer);
+        f.slot.tail_len = tail.len;
     }
-    f.slot.pos = @intCast(st.object.get("pos").?.integer);
-    const tail = st.object.get("tail").?.array.items;
-    for (tail, 0..) |t, i| f.slot.tail[i] = @intCast(t.integer);
-    f.slot.tail_len = tail.len;
     try driver.check(driver.api.cuCtxSynchronize(), "cuCtxSynchronize");
     try comm.barrier();
     const load_s = @as(f64, @floatFromInt(t0.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds())) / 1e9;
@@ -257,9 +266,66 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, ref: []con
     const dec_s = @as(f64, @floatFromInt(tw0.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds())) / 1e9;
     f.trace = null;
     const nl = mine.get("layers_first_window").?.object.count();
-    const ok = tokens_equal == steps and logits_equal == steps and layers_equal == nl;
+    const pre_ok = if (prefill_report) |pr| pr.ok() else true;
+    if (prefill_report) |pr| try log.writer.print("{{\"prefill\": {{\"rows\": {d}, \"seconds\": {d:.2}, \"roles_equal\": {d}, \"roles\": {d}, \"first_differing_role\": \"{s}\", \"pos_equal\": {}, \"tail_equal\": {}, \"first_token\": {d}, \"want\": {d}}}}}\n", .{ pr.rows, pr.seconds, pr.equal, pr.roles, pr.first_bad, pr.pos_ok, pr.tail_ok, pr.first, pr.want_first });
+    const ok = tokens_equal == steps and logits_equal == steps and layers_equal == nl and pre_ok;
     try log.writer.print("{{\"rank\": {d}, \"steps\": {d}, \"tokens_equal\": {d}, \"logits_equal\": {d}, \"layers_equal\": {d}, \"layers\": {d}, \"first_differing_layer\": {?d}, \"load_s\": {d:.1}, \"decode_s\": {d:.1}, \"pass\": {}}}\n", .{ rank, steps, tokens_equal, logits_equal, layers_equal, nl, first_layer, load_s, dec_s, ok });
     try cwd.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}/m2b-rank{d}.jsonl", .{ out_dir, rank }), .data = log.written() });
+    if (prefill_report) |pr| std.debug.print("{s} Zig prefill rank {d}: {d} rows in {d:.2} s, state roles {d}/{d} equal (first differing: {s}), position {}, Engram tail {}, first token {d} vs {d}\n", .{ if (pr.ok()) "PASS" else "FAIL", rank, pr.rows, pr.seconds, pr.equal, pr.roles, pr.first_bad, pr.pos_ok, pr.tail_ok, pr.first, pr.want_first });
     std.debug.print("{s} M2b rank {d}: tokens {d}/{d}, logits {d}/{d}, first window blocks {d}/{d} (first differing {?d}), decode {d:.1} s\n", .{ if (ok) "PASS" else "FAIL", rank, tokens_equal, steps, logits_equal, steps, layers_equal, nl, first_layer, dec_s });
     return if (ok) 0 else 1;
+}
+
+const PrefillReport = struct {
+    rows: usize,
+    seconds: f64,
+    roles: usize,
+    equal: usize,
+    first_bad: []const u8,
+    pos_ok: bool,
+    tail_ok: bool,
+    first: u32,
+    want_first: u32,
+
+    fn ok(p: PrefillReport) bool {
+        return p.equal == p.roles and p.pos_ok and p.tail_ok and p.first == p.want_first;
+    }
+};
+
+/// M2B_PREFILL: the reference's prompt through our prefill from an empty slot, then the slot against the reference's
+/// dump role by role (bytes), its position and Engram tail, and the prompt's greedy choice against the reference's
+/// first token. The decode gate runs after it from this state.
+fn ownPrefill(gpa: std.mem.Allocator, io: std.Io, a: std.mem.Allocator, f: *fwd.Forward, driver: *cuda.Driver, runner: *run.Runner, meta: Value, st: Value, sdir: []const u8, rank: u32) !PrefillReport {
+    _ = rank;
+    const cwd = std.Io.Dir.cwd();
+    const pids = meta.object.get("prompt_ids").?.array.items;
+    const prompt = try a.alloc(u32, pids.len);
+    for (prompt, pids) |*d, v| d.* = @intCast(v.integer);
+    const t0 = std.Io.Clock.awake.now(io);
+    try f.prefill(prompt);
+    // the prompt's choice: the last chunk's last row
+    const seg: usize = @intCast(f.opts.prefill_rows);
+    const last: usize = if (prompt.len % seg == 0) seg else prompt.len % seg;
+    const picks = try a.alloc(u32, last);
+    try f.greedy(picks);
+    try driver.check(driver.api.cuCtxSynchronize(), "cuCtxSynchronize");
+    const secs = @as(f64, @floatFromInt(t0.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds())) / 1e9;
+    var rep: PrefillReport = .{ .rows = prompt.len, .seconds = secs, .roles = 0, .equal = 0, .first_bad = "", .pos_ok = false, .tail_ok = false, .first = picks[last - 1], .want_first = @intCast(meta.object.get("tokens").?.array.items[0].integer) };
+    var it = st.object.get("roles").?.object.iterator();
+    while (it.next()) |e| {
+        const want = try cwd.readFileAlloc(io, try std.fs.path.join(a, &.{ sdir, e.value_ptr.string }), a, .limited(1 << 32));
+        const got = try gpa.alloc(u8, want.len);
+        defer gpa.free(got);
+        const ptr = runner.addressOf(e.key_ptr.*) orelse return error.StateRole;
+        try cuda.DeviceBuffer.download(.{ .d = driver, .ptr = ptr, .len = got.len }, 0, got);
+        rep.roles += 1;
+        if (std.mem.eql(u8, got, want)) rep.equal += 1 else if (rep.first_bad.len == 0) rep.first_bad = e.key_ptr.*;
+    }
+    rep.pos_ok = f.slot.pos == @as(u64, @intCast(st.object.get("pos").?.integer));
+    const tail = st.object.get("tail").?.array.items;
+    rep.tail_ok = f.slot.tail_len == tail.len;
+    for (tail, 0..) |t, i| if (i < f.slot.tail_len and f.slot.tail[i] != @as(u32, @intCast(t.integer))) {
+        rep.tail_ok = false;
+    };
+    return rep;
 }
