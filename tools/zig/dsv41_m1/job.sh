@@ -81,9 +81,9 @@ fi
 #      --compact force), park (--park on M5_PARK_KV's pool: save / park / restore == the uninterrupted run); each into
 #      $LOCAL/m5-ref-<mode>/p<N>/ with engram-host.bin; then m5-agree: every mode's tokens and logits digests == pool's
 #      (and the park round trip's == its own uninterrupted run);
-#   4. the Zig gates (placeholders until tf-dsv41-m1 has them): `tf-dsv41-m1 m5 MODE $LP $REF $RES/m5-MODE` for
-#      M5_GATES (split compact park; REF = $LOCAL/m5-ref-MODE, holding p<N>/ a prompt), skipped with a message when
-#      the binary's usage has no m5 command.
+#   4. the Zig gates: `tf-dsv41-m1 m5 MODE $LP $REF $RES/m5-MODE` on both ranks (m5_ranks.sh) for M5_GATES (split
+#      compact park; REF = $LOCAL/m5-ref-MODE, holding p<N>/ a prompt), skipped with a message when the binary's
+#      usage has no m5 command.
 # Knobs: M5_HI M5_PROMPTS M2B_STEPS M5_CAPTURES M5_REPLAY M5_REFS M5_GATES M5_INDEX_KV M5_PARK_KV M5_REF_RESERVE
 # M5_CAPTURE_MIN M5_REF_MIN M5_GATE_MIN M2B_COPY_MIN (defaults below); M1_BUDGET_MIN as every job.
 if [[ "${M1_JOB:-m1}" == m5 ]]; then
@@ -172,7 +172,9 @@ if [[ "${M1_JOB:-m1}" == m5 ]]; then
         esac
         l=$(left); mb=$l; (( mb > ${M5_REF_MIN:-8} )) && mb=${M5_REF_MIN:-8}
         (( mb >= 3 )) || { echo "m5-ref-$mode skipped: $l min left" | tee -a "$RES/steps.txt"; rc=1; continue; }
-        if (export PYTHONPATH=$TWIN/src TORCH_EXTENSIONS_DIR=$TWIN/ext
+        # prod's kernel knobs (the path the Zig emitters emit), as every M2b reference runs
+        if (set -a; source "$Z/tools/zig/dsv41_m1/prod-knobs.env"; set +a; unset TF_DSV41_EXPERT_TOPP
+            export PYTHONPATH=$TWIN/src TORCH_EXTENSIONS_DIR=$TWIN/ext TF_DSV41_INDEX_KV=${M5_INDEX_KV:-fp8}
             step "m5-ref-$mode" "$mb" python -u -B "$Z/tools/zig/dsv41_m2b_ref.py" --pack "$LP" --out "$REF" \
                 --layers "0-$hi" --steps "${M2B_STEPS:-64}" --prompts "$(echo $PROMPTS | tr ' ' ',')" --port $port "${args[@]}"); then
             okrefs+=("$mode")
@@ -224,7 +226,7 @@ PY
         [[ " ${okrefs[*]} " == *" $mode "* ]] || { echo "m5-$mode skipped: no m5-ref-$mode" | tee -a "$RES/steps.txt"; rc=1; continue; }
         l=$(left); mb=$l; (( mb > ${M5_GATE_MIN:-6} )) && mb=${M5_GATE_MIN:-6}
         (( mb >= 3 )) || { echo "m5-$mode skipped: $l min left" | tee -a "$RES/steps.txt"; rc=1; continue; }
-        (export TF_TP_PORT=$port; step "m5-$mode" "$mb" "$BIN" m5 "$mode" "$LP" "$REF" "$RES/m5-$mode") || rc=1
+        (export TF_TP_PORT=$port; step "m5-$mode" "$mb" bash "$Z/tools/zig/dsv41_m1/m5_ranks.sh" "$BIN" "$mode" "$LP" "$REF" "$RES/m5-$mode") || rc=1
         port=$(( port + 10 ))
     done
     echo "=== rc=$rc"
