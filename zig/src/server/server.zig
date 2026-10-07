@@ -170,7 +170,10 @@ pub const Server = struct {
         if (try grammar.spec(cx, f)) |s| {
             if (!srv.info.structures) return cx.refuse("structured output (response_format and the guided_* fields) is not supported by this engine yet");
             request.structure = .{ .kind = s.kind, .text = s.text, .after = if (thinking) srv.text.tokenId(srv.markers.close) else null };
-        }
+        } else if (f.get("tools_grammar")) |t| if (srv.info.structures and t == .string) {
+            // the output format wins over strict tools; beside a required call it was refused (grammar.refusal)
+            request.structure = .{ .kind = .tools, .text = t.string, .after = if (thinking) srv.text.tokenId(srv.markers.close) else null };
+        };
     }
 
     const Form = struct { opener: []const u8, lead: ?[]const u8, tail: ?[]const u8 };
