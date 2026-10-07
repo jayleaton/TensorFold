@@ -185,6 +185,16 @@ def rank_main(rank: int, a) -> None:
         import dsv41_samp_ref
 
         dsv41_samp_ref.run_cases(fw, cfg, rank, Path(a.out) / "samp", dsv41_samp_ref.PROMPTS, a.steps, a.seed)
+    # --grammar (dsq-zig-grammar-1): the structured-output gate's reference on this load (dsv41_grammar/grammar_ref.py:
+    # prod's grammar masks over serial decoding, DIR/grammar/trace.jsonl with each case's structure); the sampled
+    # gate's prompt lengths, so the AOT set from --sampled covers them
+    if a.grammar:
+        if kv is not None:
+            raise SystemExit("--grammar: the contiguous slot only (no --pool / --split / --park)")
+        sys.path.insert(0, str(Path(__file__).resolve().parent / "dsv41_grammar"))
+        import grammar_ref
+
+        grammar_ref.run_cases(fw, cfg, rank, Path(a.out) / "grammar", Path(a.pack), 48, a.seed)
     # --aot-prompts: more prompt lengths, each from a fresh slot, prefilled and decoded a step for their Triton variants
     # alone (Triton specializes integer arguments on % 16 and == 1: rows, key counts and strides of every prefill
     # path, the 64-row CUDA top-k and the `_keys` one; the Spark window's 45-token chat prompt had none). Nothing
@@ -414,6 +424,8 @@ def main() -> int:
     ap.add_argument("--prompts", type=lambda v: [int(x) for x in v.split(",") if x], default=[],
                     help="several prompts in one load, each from a fresh slot into DIR/p<N> (both ranks here)")
     ap.add_argument("--steps", type=int, default=64)
+    ap.add_argument("--grammar", action="store_true",
+                    help="also the structured-output gate's replies (dsv41_grammar/grammar_ref.py) into DIR/grammar/trace.jsonl")
     ap.add_argument("--sampled", action="store_true",
                     help="also the keyed sampling gate's replies (dsv41_samp_ref.run_cases) into DIR/samp/trace.jsonl")
     ap.add_argument("--limit", type=int, default=4096)
