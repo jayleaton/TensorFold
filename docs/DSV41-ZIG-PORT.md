@@ -98,7 +98,7 @@ Five agents work on `dsv41-zig` at once toward one combined pod gate and one Spa
   - 12–15: `dsq-zig-samp-1` (12 taken: `op_sample`, `[op, row0, n, T, top_k, top_p, min_p]`);
   - 16–19: `dsq-zig-slots-1`;
   - 20–23: `dsq-zig-trees-1` (20: `op_tree_drop`, `Forward.drop`);
-  - 24–27: `dsq-zig-speed-1`.
+  - 24–27: `dsq-zig-speed-1` (none used: its hooks ride on `op_ds_propose`).
 - **Defaults.** Every new behaviour is behind a knob or a new code path, and defaults to today's. With every new knob off, the gates `check cap24-*/cap15/cap18/cap22` and `dcheck cap16` still give 0 mismatches. Run `tf-dsv41-m1 m5-emit cap18` before committing a change to an emitter.
 - **Pool vs contiguous.** A slot's KV is either the contiguous roles (`s.L<i>.comp.*`, `s.L<i>.ik`) or the pool (`block.Options.pool`, the `s.kv.*` roles). New code must work with both, or refuse the other by name.
 - **Collectives.** Leader and followers make the same collective calls in the same order. Anything rank 0 decides (sampling draws, tree shapes, slot admission) travels on the plan link before the work that depends on it.
@@ -143,6 +143,50 @@ Five agents work on `dsv41-zig` at once toward one combined pod gate and one Spa
     3. `tf-dsv41-m1 generate` on that trace, `TF_DSV41_DRAFTS=0`, then `1`. Expected in each: `PASS M4 CLI == HTTP: 6/6 replies equal` (here it means Zig == Python).
     - With `SAMP_OWN_PREFILL=1` (the default), the prompt lengths need their Triton variants: add `37,50,66,83,128,292` to `M2B_AOT_PROMPTS`, or set `SAMP_OWN_PREFILL=0`.
     - The kernel fatbins must include `dsv41_sampling`. With `-Dnvcc=` it is built. With `-Dfatbins=` (`build-pod.sh`), copy `zig-dsv41-scratch/samp/fatbin/dsv41_sampling.fatbin` into the fatbin dir first. It was built with nvcc 13.3, the build's flags, for sm_120 and sm_121.
+- `dsq-zig-speed-1` (decode speed):
+  - **Found: the served engine never read Engram's table.** Every Zig path took M2a's index rows (`engram_host.indexRows`), so the Spark window's M4 replies were not the model's, and its 46.7 tok/s paid no NVMe reads at all. M2c-2 passed because its reference used the same index rows.
+  - **R3, built:**
+    - `engram_rows.zig` reads the kit's packed shards (`engram-l<L>-r<r>of<W>.bin`, Python `ShardRows`). It uses O_DIRECT, with a buffered fallback that drops the read pages.
+    - Values convert through one 65,536-entry table, whose SHA-256 equals the one torch builds (`dequant(...).to(bfloat16)`). Only the 514 NaN entries depend on torch's code path, and no packed table holds a NaN code.
+    - Reads go out as io_uring batches of merged sector extents. Without io_uring (a seccomp profile) they run when the window needs them.
+    - An LRU cache holds `TF_DSV41_ENGRAM_CACHE` records a layer (65,536). Prompt-sized batches bypass the cache.
+    - `engram_host.Source` is the interface (doc 4b's `EngramSource`). The forward opens `TF_DSV41_ENGRAM_DIR` on first use on every rank. With it unset, the forward keeps today's index rows and logs a warning.
+    - **Read-ahead:** the pending token's rows (the next window's row 0) are issued when rank 0 sends `op_ds_propose` and when a follower receives it, so they are read during the DSpark pass. `engram_host.lookbackAt` gives the lookback from the slot's tail plus the unkept window. A wrong guess costs a read, never a bit. `TF_DSV41_ENGRAM_PREFETCH=0` turns the read-ahead off.
+    - **Not built:** Python's GPU-side wait (`engram_gate.cu`'s spin on a pinned word, then the copy, before layers 1 / 14). Without it, the drafted rows' reads still sit in `graph.stage`. It needs a kernel (dsq-zig-kern-1) and a pod.
+  - **Graphs on in M4:** `model.zig` sets `Forward.graphs_default` (`graphs.Settings.fromEnvOr`) on every rank, so the ranks agree. `TF_DSV41_GRAPHS=0` turns graphs off. The gates' drivers (m2a / m2b) still default to off.
+    - Slots: `Model.openRows` sets `graphs_read`, so one-slot graphs stay off with several slots. Keys are one slot's (rows, context bucket); row mode brings its own.
+  - **Host overhead:**
+    - `Forward.greedy` now stages through pinned memory and keeps its device pairs. Before, every window did a `cuMemAlloc` and a `cuMemFree` (which synchronizes), plus pageable copies.
+    - `greedy.argmax` is vectorized and picks the same column as the scalar loop (ties, ±0, NaN): 61 → 9 µs a 64,640-wide row.
+    - An eager window re-emits its whole program and scans the AOT set per call. `tf-dsv41-m1 plan` emits 6 whole-model windows plus 3 DSpark blocks in 20 ms on the dev box, about 2–3 ms a window before any issue cost. Graphed decode does neither, which is why graphs-on is the first lever.
+    - Still eager every round: the DSpark pass (about 100 calls issued, ingest re-emitted, and `hostStep`'s pageable download of [5, 64,640] fp32 logits plus a host top-k). Graphing the pass, as Python's `draft_graphs` does, is the next host item.
+  - **Glue fusion:** not built. It is kernel work in the shared kernel dir, it needs a GPU bits test, and KERNELS 3.2f estimates 2.4–2.8 %, below graphs, R3's GPU wait and the pass graph.
+  - **Per-round timing:**
+    - `phases.zig` (`TF_DSV41_PHASES=1|sync`, `TF_DSV41_PHASES_OUT`) uses Python `phases.py`'s names and report shape.
+    - `phases_timed.zig` wraps the lanes' `Target` / `Pass`. The forward times `forward`, `graph.stage` / `graph.replay` / `graph.capture`, `engram.wait`, `prefetch` and `candidates`.
+    - `tools/zig/dsv41_perf/gap.py` compares the two engines. `phases` sets Python m2bench's report against the Zig server's, in ms a round. `windows` sets the pod's R1 per-window wall times (Python `--profile`, Zig `M2B_ZIG_PROF_ROWS`, eager and graphed) side by side with GPU ms by kernel family.
+  - **Hooks** (one commit each): `forward.zig` (fields, greedy, the Engram source and read-ahead, timers, `fromEnvOr`); `model.zig` (`graphs_default`); `serve_engine.zig` (the phase decorators); `deepseek_v41.zig` (the test list); `dsv41_m2b_ref.py` (`--engram-dir` / `--engram-make`).
+  - **Host gate:** `zig build test-dsv41`, 29 pass and 1 skip. It covers:
+    - the Engram rows against Python's own `engram_host.py` (`fixtures/engram-rows-ref.txt`, from `tools/zig/dsv41_perf/engram_fixture.py`): the table, three index sets read synchronously and through io_uring, read-ahead, bulk read-through and eviction;
+    - the lookback;
+    - `greedy.argmax` against the scalar loop (200 random rows plus edge cases);
+    - the phase report.
+    - `python3 tools/zig/dsv41_perf/gap.py selftest`.
+  - **Pod step** (inside `M1_JOB=m2b`; no extra Python load, about 2 min in all):
+    1. **`M2B_ENGRAM=1`** (to add to `job.sh`): put the real-row path under every existing gate.
+       - The R0 and R1 references get `--engram-dir $LOCAL/engram --engram-make`. Each rank writes its own sparse shards, with records under the prompts' rows (`engram_shards.py`, a few MB written).
+       - Export `TF_DSV41_ENGRAM_DIR=$LOCAL/engram` for every Zig rank step.
+       - Expected: every gate's PASS lines unchanged (tokens / logits 64/64, blocks, `M2B_PREFILL_GATE=1`'s 65/65 roles, which read the written records), and `engram: rows from ...` in each rank's log.
+    2. **The R1 gates with timing:** `M2B_R1=1 M2B_R1_GRAPHS=1 M2B_PROFILE_ROWS="1 2 4 6" M2B_ZIG_PROF_ROWS="1 2 4 6"`. The greedy rewrite is gated here: m2b-r1 and m2b-r1-graphs PASS on both ranks.
+    3. **`M2B_M4=1`**, with three changes to `m4env`:
+       - drop `TF_DSV41_GRAPHS=1`, so the new default is what runs: `server.log` must show `graphs: on`;
+       - add `TF_DSV41_PHASES=1 TF_DSV41_PHASES_OUT=$m4dir/phases.json`, and `TF_DSV41_ENGRAM_DIR` with step 1;
+       - run the `generate` replays with `TF_DSV41_ENGRAM_PREFETCH=0`.
+       `PASS M4 CLI == HTTP` then also proves R3's read-ahead on == off. `drafted == serial` holds as before.
+    4. **`bash $Z/tools/zig/dsv41_perf/speed_step.sh $Z $RES`** (about 10 s) writes `RES/speed-gap.md`: the per-window table (rows 1 / 2 / 4 / 6: Python R1, Zig eager, Zig graphed) and the GPU ms by family. It also greps the `graphs: on` and `engram:` lines.
+  - **Spark window:** the kit sets `TF_DSV41_ENGRAM_DIR` to the node's shards (`HEAD_ENGRAM` / `WORKER_ENGRAM` of prod-perf1.env) on both ranks.
+    - M2c-2's reference takes `--engram-dir` with the same path (the real-row gate on the whole model).
+    - The served comparison: `bench_http.py` on Zig with `TF_DSV41_PHASES=1`, and Python's m2bench with `TF_DSV41_PHASES=1` on the same prompts, then `gap.py phases`.
 - `dsq-zig-trees-1` (draft trees on the GPU target; design below):
   - **`M2B_LANES=4`** (`M1_JOB=m2b`, 2 GPUs, about 4 min after the shared load): lanes with first-position trees (2 siblings) and the tree oracle's drafts over the GPU target at TP=2. Rank 0's tokens must equal the reference's serial greedy tokens, with trees > 0 and 0 < sibling wins < trees. Expected lines: `PASS M3 lanes mode 4 rank 0: tokens 64/64 equal, drafted N, accepted M, trees T, sibling wins W, ...` and `PASS M3 lanes mode 4 rank 1`. `m3-4/m3-rank0.json` also records `chains` and `rerun_rows`. No new assets.
   - **`M2B_LANES=3` with `TF_DSV41_TREE=3`** (about 4 min): DSpark's own siblings (gathered `[block, 128]` candidates) through the same path. The gate is tokens equal and drafted > 0. On the 0–24 prefix the taps are zeros, so the tree counts are informational. `job.sh` runs one mode list with one environment, so this needs its own mode token. The suggested hook is `3t` → `M2B_LANES=3 TF_DSV41_TREE=3`, with the result dir `m3-3t`.
