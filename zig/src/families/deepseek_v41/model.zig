@@ -18,6 +18,7 @@ const dk = @import("dsv41_kernels");
 const tp = @import("tp");
 const Config = @import("config.zig").Config;
 const Pack = @import("pack.zig").Pack;
+const vision_rows = @import("vision_rows.zig");
 const plan = @import("plan.zig");
 const named = @import("named.zig");
 const load = @import("load.zig");
@@ -272,6 +273,8 @@ pub const Model = struct {
         // TF_DSV41_SAMPLING=1: keyed sampling (T > 0) on every rank; off: such requests are refused (error.Sampling)
         m.sampler = if (samp.enabled()) try samp.GpuSampler.init(gpa, &m.f) else null;
         m.gt.sampler = m.sampler;
+        // TF_DSV41_IMAGES=native (vision_rows.zig): Engram's keep at image positions on every rank, the tower on rank 0
+        try vision_rows.boot(gpa, io, &m.f, &m.pack, &m.driver, m.tcfg.rank);
         // TF_DSV41_GRAMMAR=1: the checkpoint's grammar compilers on every rank (tokenizer.json from the pack, or
         // TF_DSV41_GRAMMAR_TOKENIZER's dir); masks for up to 64 rows a pick (Python's row cap)
         if (try grammar_gpu.enabled()) {
@@ -304,6 +307,7 @@ pub const Model = struct {
         if (m.slot_set) |ss| ss.deinit();
         if (m.pass) |p| p.deinit();
         if (m.sampler) |x| x.deinit();
+        vision_rows.close(&m.f);
         if (m.grammar) |x| x.deinit();
         if (m.sessions) |x| x.deinit();
         if (m.f.kv) |k| k.deinit();
