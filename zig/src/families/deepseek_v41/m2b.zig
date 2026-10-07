@@ -126,6 +126,11 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, ref: []con
     var f = fwd.Forward.init(gpa, &cfg, &wd, .{ .expert_topp = topp, .r1 = r1 }, &runner, comm);
     defer f.deinit();
     f.layers = layers;
+    // the reference's slot limit (dsv41_m2b_ref.py --limit; its rope.bin has limit + 2,048 rows): long prompts
+    if (meta.object.get("limit")) |l| {
+        f.opts.limit = l.integer;
+        f.opts.rope_rows = l.integer + 2048;
+    }
     var bp = blk: {
         // the plan at both trace settings (the traced program adds one role)
         f.opts.trace = true;
