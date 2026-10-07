@@ -14,9 +14,9 @@
 //!   ("s.pf.had", exl3.prefill's bf16 +-1) and x3gm's pointer tables ("s.L<i>.gm.t{g,u,d}": the routed experts'
 //!   trellis addresses, the prefix of forms' "s.L<i>.ex.tp_*" before the shared expert's), and the exchange / Engram
 //!   buffers grown to a segment (so a graphed decode window captured after it keeps its addresses).
-//! - Segments past the stream top-k's threshold (a full-mode layer without the candidates' scores at
-//!   TF_DSV41_INDEX_STREAM_MIN visible keys) are not ported in block_prefill: error.Unsupported, logged with the
-//!   segment's position.
+//! - Long prompts (longpf.zig): past TF_DSV41_INDEX_STREAM_MIN visible keys the full-mode layers select with the
+//!   stream top-k (glue "stream_merge"); under split KV a union past the cap runs its attentions in row blocks
+//!   (longpf.window).
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -24,6 +24,7 @@ const calls = @import("calls.zig");
 const buffers = @import("buffers.zig");
 const run = @import("run.zig");
 const block_prefill = @import("block_prefill.zig");
+const longpf = @import("longpf.zig");
 const fwd = @import("forward.zig");
 const Forward = fwd.Forward;
 
@@ -43,8 +44,11 @@ pub const State = struct {
     layers: []const u32 = &.{},
     moe: usize = 0,
     layer: u32 = 0,
+    /// long prompts' buffers (longpf.zig)
+    long: longpf.State = .{},
 
     pub fn deinit(s: *State, gpa: std.mem.Allocator) void {
+        s.long.deinit(gpa);
         if (s.masked) |*b| b.free();
         s.ids.deinit(gpa);
     }
@@ -94,7 +98,7 @@ fn lastStart(f: *Forward, layers: []const u32, n: u32) !i64 {
         const mid = lo + @divFloor(hi - lo, 2);
         if (try emits(f, layers, n, mid)) lo = mid else hi = mid;
     }
-    log.info("prefill: {d}-row segments emit up to start {d} (the stream top-k past it is not ported)", .{ n, lo });
+    log.info("prefill: {d}-row segments emit up to start {d}", .{ n, lo });
     return lo;
 }
 
@@ -130,7 +134,7 @@ fn segment(f: *Forward, ids: []const u32, head: bool) !void {
     const start = f.slot.pos;
     if (f.kv) |kx| try kx.reserve(start + n);
     const cs = block_prefill.emitPrefill(a, f.cfg, f.widths, f.opts, layers, n, @intCast(start), head) catch |e| {
-        if (e == error.Unsupported) log.warn("prefill: the {d}-row segment at {d} is not on the prefill path (block_prefill: Unsupported; past TF_DSV41_INDEX_STREAM_MIN visible keys its stream top-k is not ported)", .{ n, start });
+        if (e == error.Unsupported) log.warn("prefill: the {d}-row segment at {d} is not on the prefill path (block_prefill: Unsupported)", .{ n, start });
         return e;
     };
     // the glue reads the ids (embedding, Engram) and the pending window (positions)
@@ -140,7 +144,7 @@ fn segment(f: *Forward, ids: []const u32, head: bool) !void {
     st.layers = layers;
     st.moe = 0;
     f.runner.glue = .{ .ctx = f, .run = glueFn };
-    try f.runner.window(cs);
+    try longpf.window(&st.long, f.gpa, f.runner, f.kv, start, cs);
     try commit(f, n);
     f.last_rows = n;
 }
@@ -269,6 +273,7 @@ fn glueFn(ctx: *anyopaque, r: *run.Runner, c: *const calls.Call) anyerror!void {
         try copy(r, buf, try r.tensorAddr(carry), bytesOf(carry));
         return copy(r, buf + bytesOf(carry), try r.tensorAddr(x[1].arg.t), bytesOf(x[1].arg.t));
     }
+    if (eql(u8, step, "stream_merge")) return longpf.merge(&st.long, f.gpa, r, c);
     if (eql(u8, step, "zeros")) return zero(r, try r.tensorAddr(x[0].arg.t), bytesOf(x[0].arg.t));
     if (eql(u8, step, "topk")) {
         // index.top_positions: each row's `count` largest int64 keys as positions, ascending, -1 padded
