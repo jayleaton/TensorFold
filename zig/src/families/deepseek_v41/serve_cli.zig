@@ -5,7 +5,9 @@
 //!   generate PACK ASSETS TRACE  rank 0: every line of TRACE (TF_DSV41_TRACE_TOKENS' file from tensorfold-dsv41) replayed
 //!                               through the same engine (serve_engine.Served: lanes over the GPU target) as one
 //!                               greedy request of the recorded prompt and length; PASS when every reply's ids equal
-//!                               the recorded ones (M4's "HTTP tokens == CLI")
+//!                               the recorded ones (M4's "HTTP tokens == CLI"); a line's "sampling" ({seed,
+//!                               temperature, top_k, top_p, min_p}: dsv41_samp_ref.py's replies) makes it that keyed
+//!                               request (the sampled gate: Python's tokens for the same request and seed)
 //!
 //! TF_DSV41_DRAFTS=0: no DSpark (serial windows through the same lanes), as the server's --no-drafts.
 
@@ -79,11 +81,13 @@ pub fn generate(gpa: std.mem.Allocator, io: std.Io, pack: []const u8, assets: []
     var drafted: u64 = 0;
     var accepted: u64 = 0;
     while (lines.next()) |line| : (id += 1) {
-        const Line = struct { prompt: []const u32, tokens: []const u32, drafted: ?u64 = null };
+        const Keyed = struct { seed: u64, temperature: f64, top_k: u32, top_p: f64, min_p: f64 = 0 };
+        const Line = struct { prompt: []const u32, tokens: []const u32, drafted: ?u64 = null, sampling: ?Keyed = null };
         const rec = try std.json.parseFromSliceLeaky(Line, a, line, .{ .ignore_unknown_fields = true });
         var box: Box = .{ .io = io, .gpa = gpa };
         defer box.tokens.deinit(gpa);
-        const req: api.Request = .{ .prompt = rec.prompt, .max_tokens = @intCast(rec.tokens.len), .drafts = drafts() };
+        const smp: ?api.Sampling = if (rec.sampling) |k| .{ .seed = k.seed, .temperature = k.temperature, .top_k = k.top_k, .top_p = k.top_p, .min_p = k.min_p } else null;
+        const req: api.Request = .{ .prompt = rec.prompt, .max_tokens = @intCast(rec.tokens.len), .drafts = drafts(), .sampling = smp };
         try eng.submit(id, &req, .{ .ctx = &box, .event = Box.event });
         const why = box.wait();
         const same = std.mem.eql(u32, box.tokens.items, rec.tokens);
