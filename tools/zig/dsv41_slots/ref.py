@@ -74,7 +74,11 @@ def rank_main(rank: int, a) -> None:
     page = PO.PAGE
     maxp = kvpool.pages_for(a.limit, page)
     index_kv = os.environ.get("TF_DSV41_INDEX_KV", "bf16").strip() or "bf16"
-    pool = PO.Pool(TO.load(pack), (S * maxp + 4) * page, index_kv=index_kv, device=dev, split=0, rank=rank)
+    # split / rank only where the tree's Pool has them (split KV trees); prod's 8474f31 Pool has neither, and an
+    # unsplit pool is the default there
+    import inspect
+    pkw = {k: v for k, v in (("split", 0), ("rank", rank)) if k in inspect.signature(PO.Pool.__init__).parameters}
+    pool = PO.Pool(TO.load(pack), (S * maxp + 4) * page, index_kv=index_kv, device=dev, **pkw)
     pss = [pool.new_slot(a.limit) for _ in range(S)]
     fw.bind(pss)
     load_s = time.time() - t0
