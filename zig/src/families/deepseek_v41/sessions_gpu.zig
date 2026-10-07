@@ -12,8 +12,10 @@
 //!   recently used chat after every save.
 //! Both ranks make the same calls in the same order (the leader's operations: forward.zig `op_sess_*`), so entries,
 //! pages and evictions agree; a split rank parks and restores only the comp rows it owns.
-//! Knobs as Python's: TF_DSV41_SESSION_DISK (the NVMe tier's directory; unset: RAM only), TF_DSV41_SESSION_RESIDENT
-//! (idle chats kept), TF_DSV41_SESSION_RESIDENT_GIB, TF_DSV41_SESSION_RAM_MIB, TF_DSV41_SESSION_STAGING_MIB.
+//! Knobs as Python's: TF_DSV41_SESSIONS (0: no store), TF_DSV41_SESSION_DISK (the NVMe tier's directory; unset: RAM
+//! only), TF_DSV41_SESSION_DISK_GIB (64: the tier's files, least recently used deleted past it),
+//! TF_DSV41_SESSION_DISK_MIN (1024: shorter entries are dropped, not parked), TF_DSV41_SESSION_RESIDENT (idle chats
+//! kept), TF_DSV41_SESSION_RESIDENT_GIB, TF_DSV41_SESSION_RAM_MIB, TF_DSV41_SESSION_STAGING_MIB.
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -30,7 +32,11 @@ const Blob = sessions.disk.Blob;
 pub const Error = error{ NoPool, BadBlob };
 
 pub const Options = struct {
+    /// TF_DSV41_SESSIONS (default 1, as stack.py)
+    enabled: bool = true,
     disk: ?[]const u8 = null,
+    disk_budget: u64 = 64 << 30,
+    disk_min_tokens: u64 = 1024,
     resident: u32 = 0,
     resident_bytes: u64 = 0,
     ram_bytes: u64 = 512 << 20,
@@ -39,7 +45,16 @@ pub const Options = struct {
 
 pub fn optionsFromEnv() !Options {
     var o: Options = .{};
-    if (std.c.getenv("TF_DSV41_SESSION_DISK")) |v| o.disk = std.mem.span(v);
+    if (std.c.getenv("TF_DSV41_SESSIONS")) |v| o.enabled = !std.mem.eql(u8, std.mem.trim(u8, std.mem.span(v), " "), "0");
+    if (std.c.getenv("TF_DSV41_SESSION_DISK")) |v| if (std.mem.trim(u8, std.mem.span(v), " ").len > 0) {
+        o.disk = std.mem.trim(u8, std.mem.span(v), " ");
+    };
+    if (std.c.getenv("TF_DSV41_SESSION_DISK_GIB")) |v| if (std.mem.span(v).len > 0) {
+        o.disk_budget = @intFromFloat(try std.fmt.parseFloat(f64, std.mem.span(v)) * (1 << 30));
+    };
+    if (std.c.getenv("TF_DSV41_SESSION_DISK_MIN")) |v| if (std.mem.span(v).len > 0) {
+        o.disk_min_tokens = try std.fmt.parseInt(u64, std.mem.span(v), 10);
+    };
     if (std.c.getenv("TF_DSV41_SESSION_RESIDENT")) |v| o.resident = try std.fmt.parseInt(u32, std.mem.span(v), 10);
     if (std.c.getenv("TF_DSV41_SESSION_RESIDENT_GIB")) |v| o.resident_bytes = @intFromFloat(try std.fmt.parseFloat(f64, std.mem.span(v)) * (1 << 30));
     if (std.c.getenv("TF_DSV41_SESSION_RAM_MIB")) |v| o.ram_bytes = (try std.fmt.parseInt(u64, std.mem.span(v), 10)) << 20;
@@ -91,7 +106,7 @@ pub const Sessions = struct {
             var full: [32]u8 = undefined;
             h.final(&full);
             // the staging set (TF_DSV41_SESSION_STAGING_MIB) in 8 MiB chunks: a park's or restore's whole host transient
-            s.disk = try sessions.Disk.open(gpa, io, .{ .root = root, .compat = full[0..16].*, .rank = kx.rank, .world = kx.world, .staging = @max(2, o.staging_mib / 8), .chunk = 8 << 20 });
+            s.disk = try sessions.Disk.open(gpa, io, .{ .root = root, .compat = full[0..16].*, .rank = kx.rank, .world = kx.world, .budget = o.disk_budget, .min_tokens = o.disk_min_tokens, .staging = @max(2, o.staging_mib / 8), .chunk = 8 << 20 });
         }
         errdefer if (s.disk) |d| d.close();
         s.store = try Store.init(gpa, io, &kx.pool, kx.dev.store(), s.disk, .{ .ram_bytes = o.ram_bytes, .chats = o.resident, .resident_bytes = o.resident_bytes });
