@@ -468,6 +468,16 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
             grep -h "^PASS\|^FAIL" "$RES/samp/samp-slots4.log" 2>/dev/null | sed 's/^/samp-slots4: /' | tee -a "$RES/steps.txt"
         fi
     fi
+    # M2B_MDRAFT=1 (dsq-zig-mdraft-1): DSpark drafting with several live slots (TF_DSV41_SLOT_DRAFTS) against Python's
+    # batcher, after the slots gate (its $LOCAL/slots-ref assets): tools/zig/dsv41_mdraft/job.sh's mdraft_gate
+    if [[ "${M2B_MDRAFT:-0}" == 1 ]]; then
+        if [[ -f "$Z/tools/zig/dsv41_mdraft/job.sh" ]]; then
+            (unset TF_DSV41_ENGRAM_DIR
+             export SLOTS_PYSRC=${SLOTS_PYSRC:-/opt/r1c/src} TORCH_EXTENSIONS_DIR=${SLOTS_EXT:-/opt/r1c/ext}
+             source "$Z/tools/zig/dsv41_mdraft/job.sh"; mdraft_gate) || rc=1
+            grep -h "^mdraft\|PASS mdraft\|FAIL mdraft" "$RES"/mdraft*.log "$RES"/mdraft-*/rank0.log 2>/dev/null | tee -a "$RES/steps.txt"
+        else echo "mdraft skipped: no tools/zig/dsv41_mdraft/job.sh" | tee -a "$RES/steps.txt"; rc=1; fi
+    fi
     for d in "${refs[@]}"; do
         o=$RES/m2b-ref; [[ -n "$PROMPTS" ]] && o=$RES/m2b-ref/$(basename "$d")
         mkdir -p "$o"
