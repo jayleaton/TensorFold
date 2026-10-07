@@ -10,7 +10,8 @@
 //! - **Reasoning memory**: the reasoning of replies this server gave, by tool-call id and content digest, restored
 //!   into history messages that come back without it (TF_DSV41_REASONING_MEMORY entries, default 1024).
 //! - **Images** (TF_DSV41_IMAGES): ``placeholder`` (default) renders each image part as TF_DSV41_IMAGE_TEXT, a notice
-//!   that the model cannot see it; ``reject`` refuses such requests; ``native`` needs the vision encoder (not here).
+//!   that the model cannot see it; ``reject`` refuses such requests; ``native`` sends them to the vision tower on rank 0
+//!   (``serve.vision``: each part a sentinel, then ``<｜deepseek_image｜>``, then its span of virtual ids).
 //! - ``response_format``'s schema joins the system block (``## Response Format``; TF_DSV41_SCHEMA_PROMPT=0: not).
 //! - Replies' reasoning as ``reasoning_content`` and ``reasoning`` (TF_DSV41_REASONING_FIELDS).
 const std = @import("std");
@@ -27,12 +28,13 @@ const Allocator = std.mem.Allocator;
 const tokenizer = serve.tokenizer;
 const template = serve.template;
 const tools_mod = serve.tools;
+const vision = serve.vision;
 
 pub const model_type = "deepseek_v41";
 
 pub const image_text = "[image omitted: this server does not pass images to the model, so the model cannot see this image. Do not guess what it shows; say that it could not be seen.]";
 
-pub const Images = enum { placeholder, reject };
+pub const Images = enum { placeholder, reject, native };
 
 pub const Options = struct {
     images: Images = .placeholder,
@@ -42,6 +44,8 @@ pub const Options = struct {
     schema_prompt: bool = true,
     memory_entries: usize = 1024,
     eos: []const u32 = &.{1},
+    /// native: the environment the vision limits (TF_DSV41_VISION_*) and TF_DSV41_BIAS_VL are read from at load
+    env: ?*const std.process.Environ.Map = null,
 
     /// The TF_DSV41_* knobs from ``env``; ``problem`` says which one is wrong.
     pub fn fromEnv(env: ?*const std.process.Environ.Map, problem: *[]const u8) error{Invalid}!Options {
@@ -49,10 +53,11 @@ pub const Options = struct {
         const m = env orelse return o;
         if (m.get("TF_DSV41_IMAGES")) |v| {
             const t = std.mem.trim(u8, v, " ");
-            if (std.mem.eql(u8, t, "placeholder") or t.len == 0) o.images = .placeholder else if (std.mem.eql(u8, t, "reject")) o.images = .reject else {
-                problem.* = if (std.mem.eql(u8, t, "native")) "TF_DSV41_IMAGES=native: the vision encoder is not in the native server yet; use placeholder or reject" else "TF_DSV41_IMAGES: expected placeholder, reject or native";
+            o.images = std.meta.stringToEnum(Images, if (t.len == 0) "placeholder" else t) orelse {
+                problem.* = "TF_DSV41_IMAGES: expected placeholder, reject or native";
                 return error.Invalid;
-            }
+            };
+            o.env = m;
         }
         if (m.get("TF_DSV41_IMAGE_TEXT")) |v| if (std.mem.trim(u8, v, " ").len > 0) {
             o.image_text = std.mem.trim(u8, v, " ");
@@ -201,6 +206,9 @@ pub const DeepSeek = struct {
     options: Options,
     memory: Memory,
     images_omitted: std.atomic.Value(u64) = .init(0),
+    /// TF_DSV41_IMAGES=native: the image front end (rank 0's prepared-image cache, virtual ids)
+    vision: ?*vision.host.Host = null,
+    io: ?std.Io = null,
 
     pub fn load(gpa: Allocator, io: std.Io, dir: []const u8, options: Options, problem: *[]const u8) !*DeepSeek {
         const d = try gpa.create(DeepSeek);
@@ -209,7 +217,8 @@ pub const DeepSeek = struct {
             problem.* = try std.fmt.allocPrint(gpa, "cannot read {s}/tokenizer.json ({s})", .{ dir, @errorName(e) });
             return error.Load;
         };
-        d.* = .{ .gpa = gpa, .tok = tok, .options = options, .memory = .{ .gpa = gpa, .entries = options.memory_entries } };
+        d.* = .{ .gpa = gpa, .tok = tok, .options = options, .memory = .{ .gpa = gpa, .entries = options.memory_entries }, .io = io };
+        if (options.images == .native) d.vision = try openVision(gpa, io, dir, options.env, problem);
         return d;
     }
 
@@ -221,6 +230,10 @@ pub const DeepSeek = struct {
     }
 
     pub fn deinit(d: *DeepSeek, owns_tokenizer: bool) void {
+        if (d.vision) |v| {
+            v.deinit();
+            d.gpa.destroy(v);
+        }
         d.memory.deinit();
         if (owns_tokenizer) d.tok.deinit();
         d.gpa.destroy(d);
@@ -395,6 +408,7 @@ pub const DeepSeek = struct {
         if (d.options.schema_prompt) o.response_format = try schemaForPrompt(a, p.body);
         var counter: Counter = .{ .d = d };
         if (o.image != null) o.image = .{ .ctx = &counter, .text = Counter.hook };
+        if (d.vision) |vh| return d.renderNative(cx, vh, messages, &o);
         var problem: template.Problem = .{};
         const prompt = template.render(a, messages, o, &problem) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -403,6 +417,81 @@ pub const DeepSeek = struct {
         const ids = try d.tok.encodeAlloc(a, prompt);
         if (counter.n > 0 and p.generation) log.line("images: {d} image part(s) replaced by the placeholder notice (TF_DSV41_IMAGES=placeholder)", .{counter.n});
         return .{ .ids = ids, .images_omitted = counter.n };
+    }
+
+    /// TF_DSV41_IMAGES=native: each image part a sentinel, the sentinels as the placeholder in prompt order, the
+    /// images fetched / decoded / preprocessed, each placeholder id as its span of virtual ids (``app._render``,
+    /// ``prompt_ids``); the prepared images held for the request.
+    fn renderNative(d: *DeepSeek, cx: *Cx, vh: *vision.host.Host, messages: Value, o: *template.Options) errors.Refused!family.Rendered {
+        const a = cx.a;
+        var marker = vision.parts.Marker.init(a, d.io.?);
+        o.image = .{ .ctx = &marker, .text = vision.parts.Marker.hook };
+        var problem: template.Problem = .{};
+        const prompt = template.render(a, messages, o.*, &problem) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Refused => return cx.refuse(problem.message),
+        };
+        var vp: vision.parts.Problem = .{};
+        const sp = marker.splice(prompt, &vp) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Refused => return cx.refuse(vp.message),
+        };
+        const ids = try d.tok.encodeAlloc(a, sp.text);
+        if (sp.urls.len == 0) return .{ .ids = ids };
+        const shared = vh.images(a, sp.urls, &vp) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Refused => return if (vp.busy) cx.fail(.capacity, "{s}", .{vp.message}) else cx.refuse(vp.message),
+        };
+        const hold = try a.create(Hold);
+        hold.* = .{ .vh = vh, .shared = shared };
+        errdefer hold.release();
+        const preps = try a.alloc(vision.prep.Prepared, shared.len);
+        const imgs = try a.alloc(vision.held.HeldImage, shared.len);
+        for (shared, preps, imgs) |s, *p, *h| {
+            p.* = s.p;
+            h.* = .{ .patches = s.p.patches.ptr, .vit_h = s.p.vit_h, .vit_w = s.p.vit_w, .llm_h = s.p.llm_h, .llm_w = s.p.llm_w, .digest = s.p.digest, .vids = s.p.vids.ptr, .n_vids = s.p.vids.len };
+        }
+        const expanded = vision.parts.expand(a, ids, preps, vh.s.image_token, true, &vp) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Refused => return cx.refuse(vp.message),
+        };
+        hold.h = .{ .images = imgs.ptr, .n = imgs.len };
+        return .{ .ids = expanded, .images = .{ .held = &hold.h, .token = vh.s.image_token, .ctx = hold, .release_fn = Hold.releaseFn } };
+    }
+
+    /// A request's prepared images, given back to the cache's counts at the request's end.
+    const Hold = struct {
+        vh: *vision.host.Host,
+        shared: []const *vision.host.Shared,
+        h: vision.held.Held = .{ .images = undefined, .n = 0 },
+        done: bool = false,
+
+        fn release(x: *Hold) void {
+            if (x.done) return;
+            x.done = true;
+            x.vh.releaseAll(x.shared);
+        }
+        fn releaseFn(ctx: *anyopaque) void {
+            release(@ptrCast(@alignCast(ctx)));
+        }
+    };
+
+    fn openVision(gpa: Allocator, io: std.Io, dir: []const u8, env: ?*const std.process.Environ.Map, problem: *[]const u8) !*vision.host.Host {
+        const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
+        defer gpa.free(path);
+        const cfg = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 24)) catch null;
+        defer if (cfg) |c| gpa.free(c);
+        const arena = try gpa.create(std.heap.ArenaAllocator); // the settings' vision_config lives as long as the server
+        arena.* = std.heap.ArenaAllocator.init(gpa);
+        var msg: []const u8 = "";
+        const s = vision.prep.Settings.read(arena.allocator(), if (cfg) |c| try arena.allocator().dupe(u8, c) else null, env, &msg) catch |e| {
+            problem.* = try std.fmt.allocPrint(gpa, "TF_DSV41_IMAGES=native: {s} ({t})", .{ msg, e });
+            return error.Load;
+        };
+        const h = try gpa.create(vision.host.Host);
+        h.* = vision.host.Host.init(gpa, io, s);
+        log.line("images: native (TF_DSV41_IMAGES), at most {d} a request, {d} positions an image; image URLs: data: only", .{ s.max_images, s.budget() });
+        return h;
     }
 
     const Counter = struct {
@@ -550,4 +639,38 @@ test "reasoning_effort and the thinking switches read as the Python app reads th
     try std.testing.expectEqual(@as(u8, 100), budget("xhigh"));
     try std.testing.expectError(error.Refused, DeepSeek.thinkingFn(undefined, &cx, (try json.parseText(cx.a, "{\"reasoning_effort\": 101}")).ok));
     try std.testing.expectError(error.Refused, DeepSeek.thinkingFn(undefined, &cx, (try json.parseText(cx.a, "{\"chat_template_kwargs\": {\"thinking\": 1}}")).ok));
+}
+
+test "TF_DSV41_IMAGES=native: an image part becomes its span of virtual ids, held for the request (mini tokenizer)" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var cx: Cx = .{ .a = arena.allocator() };
+    const tok = try serve.tokenizer.Tokenizer.parse(gpa, serve.fixtures.mini_tokenizer);
+    defer tok.deinit();
+    const d = try DeepSeek.init(gpa, tok, .{ .images = .native });
+    defer d.deinit(false);
+    const vh = try gpa.create(vision.host.Host);
+    vh.* = vision.host.Host.init(gpa, std.testing.io, .{ .image_token = 1003 }); // the mini tokenizer's image id
+    d.vision = vh;
+    d.io = std.testing.io;
+    const png = "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAGCAIAAABxZ0isAAAAoUlEQVR4nAGWAGn/AAAAAB4eHjw8PFpaWnh4eJaWlrS0tNLS0gAHBwclJSVDQ0NhYWF/f3+dnZ27u7vZ2dkADg4OLCwsSkpKaGhohoaGpKSkwsLC4ODgABUVFTMzM1FRUW9vb42Njaurq8nJyefn5wAcHBw6OjpYWFh2dnaUlJSysrLQ0NDu7u4AIyMjQUFBX19ffX19m5ububm519fX9fX1CLhE6bQqUiMAAAAASUVORK5CYII=";
+    const body = "[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"a typed <\u{ff5c}deepseek_image\u{ff5c}> stays text\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64," ++ png ++ "\"}},{\"type\":\"text\",\"text\":\"what is it\"}]}]";
+    const messages = (try json.parseText(cx.a, body)).ok;
+    const got = try d.family_().render(&cx, .{ .messages = messages, .tools = &.{}, .thinking = false, .effort = "high", .body = .null });
+    const im = got.images orelse return error.NoImages;
+    defer im.release();
+    const h: *const vision.held.Held = @ptrCast(@alignCast(im.held));
+    try std.testing.expectEqual(@as(u64, 1), h.n);
+    const img = h.slice()[0];
+    var span: usize = 0;
+    var at: ?usize = null;
+    for (got.ids, 0..) |t, i| if (vision.vids.isVid(t)) {
+        if (at == null) at = i;
+        span += 1;
+    };
+    try std.testing.expectEqual(@as(usize, img.n_vids), span); // one image: its whole span, in one run
+    try std.testing.expectEqualSlices(u32, img.vids[0..img.n_vids], got.ids[at.? .. at.? + span]);
+    try std.testing.expect(std.mem.indexOfScalar(u32, got.ids, 1003) == null); // the typed placeholder stayed text
+    try std.testing.expectEqual(@as(u32, 12), img.llm_h); // 8 x 6 scaled up to 544^2: 630 x 476 -> 45 x 34 patches
 }
