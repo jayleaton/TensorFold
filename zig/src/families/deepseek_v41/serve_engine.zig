@@ -87,7 +87,7 @@ pub const Served = struct {
         }
         // draft trees (TF_DSV41_TREE / _DUP_MS / _ROWS, Python's knobs; off by default): first-position siblings
         const trees = if (m.pass != null) try tree.Settings.fromEnv() else tree.Settings{};
-        s.x = try ln.Lanes.init(gpa, tgt, pass, s.costs, .{ .shape = m3.shapeOf(&m.f), .slots = 1, .siblings = trees.siblings, .sib_rows = trees.sib_rows, .dup = trees.dup });
+        s.x = try ln.Lanes.init(gpa, tgt, pass, s.costs, .{ .shape = m3.shapeOf(&m.f), .slots = m.slots, .siblings = trees.siblings, .sib_rows = trees.sib_rows, .dup = trees.dup });
         s.arena = std.heap.ArenaAllocator.init(gpa);
         s.cfg = try lanes.Config.init(gpa, try s.x.model(s.arena.allocator(), 64), 16, 15);
         // drafts sized from the cost tables, not the wall clock: a request drafts (and so verifies) the same whatever the
@@ -97,7 +97,7 @@ pub const Served = struct {
         s.core = lanes.Engine.init(gpa, &s.cfg, s.x.backend(), s.clock.clock());
         s.x.attach(&s.core);
         const window: u32 = @intCast(@min(context orelse m.f.opts.limit, m.f.opts.limit));
-        s.host = api.LaneHost.init(gpa, io, &s.core, .{ .name = "dsv41-cuda", .lanes = 1, .context_window = window, .prefill_step = m.gt.prefill_rows });
+        s.host = api.LaneHost.init(gpa, io, &s.core, .{ .name = "dsv41-cuda", .lanes = m.slots, .context_window = window, .prefill_step = m.gt.prefill_rows });
         // the lanes run on LaneHost's thread: the model's CUDA context must be current there
         s.host.on_thread = .{ .ctx = m, .run = bindContext };
         try s.host.start();
