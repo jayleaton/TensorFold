@@ -49,6 +49,12 @@ pub const Forward = struct {
     /// roles re-seeded for glue, and how often
     glue: std.StringArrayHashMapUnmanaged(u32) = .empty,
 
+    /// Every buffer seeded again from the capture at its next first touch (after a window stopped on structure).
+    pub fn unseat(f: *Forward) void {
+        var it = f.bufs.valueIterator();
+        while (it.next()) |b| b.live = false;
+    }
+
     pub fn deinit(f: *Forward) void {
         var it = f.bufs.iterator();
         while (it.next()) |e| {
@@ -315,15 +321,22 @@ pub fn runAll(f: *Forward, out_dir: []const u8, experts: []const u8) !Counts {
             try @import("block_prefill.zig").emitPrefill(a, &cfg, &wg, opts, win.layers, win.n, win.start, true)
         else
             try block.emit(a, &cfg, &wg, opts, win.layers, win.n, win.start, true));
-        if (cs.len != win.ops.len) return error.CallCount;
         const before = f.counts;
-        for (cs, win.ops, 0..) |*c, op, i| {
+        // a window whose calls do not match the capture's structure stops there (its remaining calls count as
+        // failed) and every role is seeded again from the capture, so the next window is checked on its own
+        for (cs[0..@min(cs.len, win.ops.len)], win.ops[0..@min(cs.len, win.ops.len)], 0..) |*c, op, i| {
             roles.begin(c.begin);
             if (try calls.check(a, c, op, &roles)) |why| {
                 std.debug.print("structure: {s} {s} #{d}: {s}\n", .{ win.set, win.phase, i, why });
-                return error.Structure;
+                f.counts.failed += win.ops.len - i;
+                f.unseat();
+                break;
             }
             try f.run(c, op, log, try std.fmt.allocPrint(a, "{s} {s} #{d}", .{ win.set, win.phase, i }));
+        } else if (cs.len != win.ops.len) {
+            std.debug.print("structure: {s} {s}: {d} calls vs captured {d}\n", .{ win.set, win.phase, cs.len, win.ops.len });
+            f.counts.failed += 1;
+            f.unseat();
         }
         try log.flush();
         std.debug.print("forward {s} {s}: {d} calls, {d} equal, {d} differ, {d} skipped, {d} failed\n", .{ win.set, win.phase, f.counts.calls - before.calls, f.counts.equal - before.equal, f.counts.differ - before.differ, f.counts.skipped - before.skipped, f.counts.failed - before.failed });
@@ -354,13 +367,14 @@ pub fn runDraft(f: *Forward, out_dir: []const u8, experts: []const u8) !Counts {
     const dopts = try check.optionsOf(a, f.io, f.dir);
     for (try ds.phases(a, f.io, f.dir, &cfg)) |p| {
         const cs = try ds.phaseCalls(a, &cfg, &w, dopts, p);
-        if (cs.len != p.ops.len) return error.CallCount;
         const before = f.counts;
-        for (cs, p.ops, 0..) |*c, op, i| {
+        for (cs[0..@min(cs.len, p.ops.len)], p.ops[0..@min(cs.len, p.ops.len)], 0..) |*c, op, i| {
             roles.begin(c.begin);
             if (try calls.check(a, c, op, &roles)) |why| {
                 std.debug.print("structure: P {s} #{d}: {s}\n", .{ p.name, i, why });
-                return error.Structure;
+                f.counts.failed += p.ops.len - i;
+                f.unseat();
+                break;
             }
             try f.run(c, op, log, try std.fmt.allocPrint(a, "P {s} #{d}", .{ p.name, i }));
         }
