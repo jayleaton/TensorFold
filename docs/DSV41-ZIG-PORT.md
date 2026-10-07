@@ -416,6 +416,49 @@ Rules from `ZIG-PREVIEW.md`:
   - `tf-dsv41-m1 check` on that capture gates the change before any pod.
 - **`roce.cu` wait fix (bb0cff8, Python):** nothing to port. The Zig TP runtime's one flag wait (`fabric/tp/mailbox.cu` `wait_flag`, used by the mailbox and `tp_roce`) only times out when `now > t0`, so a `%globaltimer` read below the start can't end it early. The Zig port is what found the Python bug.
 
+
+### Spark window, 2026-10-07: outcome
+
+Prod was down 12:34-14:07 (93 min) and was restored on perf1 (`scripts/v2-rollback.sh perf1`: 17 x 23 -> 391,
+canaries ok, a chat completion on :8000 answered). The kit was tree `3a8a672`, copied to both Sparks and checksum-verified.
+M4 ran on two fixes rebuilt on that tree with the kit's sm_121 fatbins (81f0477). Logs are in the quant repo,
+`results/zig-spark-20261007/` (`r0/`, `r1/`, `zig-m4-fixes.patch`).
+
+| step | result |
+| --- | --- |
+| M2c-2, whole model, TP=2 over RoCE, R1, top-p 0.85, seed 4101 | **PASS** on both ranks: tokens 512/512, logits 512/512, first-window blocks 40/40 (reference 385 s, ours 517 s) |
+| `PREFILL=1`: Zig prefill from an empty slot, 1,536 rows | **PASS** on both ranks: state roles 95/95 == Python, position, Engram tail, first token 223 == 223, then 512/512 tokens + logits |
+| DSpark's Triton set (`dspark-aot`) | 4 variants added on each rank (dgx-01's merge by hand: the step's `rm -rf blobs` hit root-owned files) |
+| M4 server, 8 prompts over HTTP | first run: every request failed (`CUDA_ERROR_INVALID_CONTEXT`); after fix 1, `MissingTritonVariant` `_keys` (Zig prefill); with `OWN_PREFILL=0`, request 1 ok, then `BadWindow`; after fix 2: **8/8 replies** (256 tokens each) |
+| M4 CLI replay == HTTP | **FAIL, 6/8**: lines 3 (43-token prompt) and 6 (41) differ; 1, 2, 4, 5, 7 and 8 equal |
+| DSpark acceptance, q28-v2, 8 chat prompts, thinking on | HTTP **1,398 / 2,103 = 0.665**, 3.18 tokens a round (644 rounds for 2,048 tokens); CLI replay 1,335 / 2,208 = 0.605 |
+
+**Fixes (both general, not Spark-specific):**
+1. **LaneHost runs the lanes on its own thread, and the CUDA context was never current there.** Every driver call on
+   the served path failed. `LaneHost.on_thread` (core/lane_host.zig) is a hook that runs first on the engine thread;
+   `Served` binds the model's context with it. The CLI `generate` goes through the same `Served`, so it had the same bug.
+   M2b/M3 never saw it: they drive the forward from the main thread.
+2. **`GpuTarget.release` reset the slot on rank 0 only.** The followers kept the finished reply's position and its
+   last, never-kept window, so the next request's first window returned `BadWindow` on rank 1. `Forward.release()` now
+   sends `op_release` on the plan link, and the follow loop resets its slot too. This is not on the branch: the
+   M5 sessions work in progress rewrites `release` and uses op 8. It must carry the same broadcast; the patch is in
+   `zig-m4-fixes.patch`.
+
+**Open, from the window:**
+- **The Zig prefill's `_keys` launches pass strides = NK**, while Python pads that buffer (every captured `_keys`
+  variant has div16 strides). A prompt whose compressed-key count is not a multiple of 16 (every short chat prompt:
+  NK 22 on a 45-row prompt) has no AOT variant. M2c-2's 1,536-row prompt avoids it. Pad like Python, then rerun M4
+  with the Zig prefill. A one-off 45-row reference (`--prompt 45 --steps 4`) added 10 other variants (`_site` at R=45
+  and more) to the AOT set. The kit's reference should capture an odd-length prompt as well.
+- **CLI != HTTP on 2/8:** the draft counts differ between the two runs even where the tokens match (line 4: 207 vs 199
+  drafted). So the verify windows differ in rows, and a near tie flips. DSpark's drafts must be a function of the
+  request alone (reset its rings / proposer state per stream), or the gate should run `DRAFTS=0`. `generate` should
+  print the first differing index.
+- Speed, one slot, graphs off, prefill as 16-row windows: decode **46.7 tok/s** (2,048 tokens in 43.8 s), against
+  prod's Python engine at 52.6 (prose T0) to 86.6 (code T0) tok/s (E1E2-SPARK-WINDOW section 9). Prefill: 375 prompt tokens in 2.17 s
+  (173 tok/s on 41-60-token prompts). Not comparable to prod's 2,077 / 2,380 tok/s cold 8K / 32K. Graphs
+  (`TF_DSV41_GRAPHS=1`) and the Zig prefill are the next measurements.
+
 ## 3. Python to Zig, component by component
 
 Two things decide how each part is ported:

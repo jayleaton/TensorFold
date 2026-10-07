@@ -76,9 +76,16 @@ pub const Served = struct {
         s.x.attach(&s.core);
         const window: u32 = @intCast(@min(context orelse m.f.opts.limit, m.f.opts.limit));
         s.host = api.LaneHost.init(gpa, io, &s.core, .{ .name = "dsv41-cuda", .lanes = 1, .context_window = window, .prefill_step = m.gt.prefill_rows });
+        // the lanes run on LaneHost's thread: the model's CUDA context must be current there
+        s.host.on_thread = .{ .ctx = m, .run = bindContext };
         try s.host.start();
         s.rec = Recorder.init(gpa, io, s.host.engine());
         return s;
+    }
+
+    fn bindContext(ctx: *anyopaque) anyerror!void {
+        const m: *model.Model = @ptrCast(@alignCast(ctx));
+        try m.ctx.makeCurrent();
     }
 
     pub fn engine(s: *Served) api.Engine {

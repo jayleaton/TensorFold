@@ -35,6 +35,10 @@ pub const LaneHost = struct {
     live_generated: u64 = 0,
     lone: ?api.Lone = null, // the backend's driver for a lone greedy stream; null: every stream in the lane core
     lone_job: ?*Job = null, // the job that driver holds now
+    /// Runs first on the engine thread: a backend whose API state is per thread (a CUDA context) binds it there.
+    on_thread: ?ThreadInit = null,
+
+    pub const ThreadInit = struct { ctx: *anyopaque, run: *const fn (ctx: *anyopaque) anyerror!void };
 
     const Mark = struct { at: i96, tokens: u64 };
     const window_ns: i96 = 2 * std.time.ns_per_s;
@@ -384,6 +388,7 @@ pub const LaneHost = struct {
     }
 
     fn run(h: *LaneHost) void {
+        if (h.on_thread) |t| t.run(t.ctx) catch |e| std.log.err("lane host: the engine thread's init failed ({t})", .{e});
         while (true) {
             h.takeCancels();
             while (h.admitOne()) {}
