@@ -16,6 +16,7 @@ const drive = @import("draft/drive.zig");
 const costs_mod = @import("draft/costs.zig");
 const tree = @import("draft/tree.zig");
 const calib_env = @import("draft/calib_env.zig");
+const spec = @import("draft/spec.zig");
 const m3 = @import("m3.zig");
 const ph = @import("phases.zig");
 const timed = @import("phases_timed.zig");
@@ -93,7 +94,7 @@ pub const Served = struct {
         }
         // draft trees (TF_DSV41_TREE / _DUP_MS / _ROWS, Python's knobs; off by default): first-position siblings
         const trees = if (m.pass != null) try tree.Settings.fromEnv() else tree.Settings{};
-        s.x = try ln.Lanes.init(gpa, tgt, pass, s.costs, .{ .shape = m3.shapeOf(&m.f), .slots = m.slots, .siblings = trees.siblings, .sib_rows = trees.sib_rows, .dup = trees.dup, .depth = try calib_env.depthSettings(&calib_env.env) });
+        s.x = try ln.Lanes.init(gpa, tgt, pass, s.costs, .{ .shape = m3.shapeOf(&m.f), .slots = m.slots, .siblings = trees.siblings, .sib_rows = trees.sib_rows, .dup = trees.dup, .depth = try calib_env.depthSettings(&calib_env.env), .spec = if (m.pass != null) try spec.Settings.fromEnv() else .{} });
         s.arena = std.heap.ArenaAllocator.init(gpa);
         s.cfg = try lanes.Config.init(gpa, try s.x.model(s.arena.allocator(), 64), 16, 15);
         // drafts sized from the cost tables, not the wall clock: a request drafts (and so verifies) the same whatever the
@@ -139,6 +140,7 @@ pub const Served = struct {
         s.core.deinit();
         s.cfg.deinit(gpa);
         s.arena.deinit();
+        s.x.reportSpec();
         s.x.deinit();
         s.costs.deinit(gpa);
         s.m.close();
