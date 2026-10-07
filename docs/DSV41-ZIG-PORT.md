@@ -265,8 +265,30 @@ Rules from `ZIG-PREVIEW.md`:
   - **M2b regression:** 64/64 tokens and logits on both ranks.
   - **Lanes mode 3 (the GPU DSpark pass at TP=2):** 65/65 tokens equal to the serial reference, 68 drafted. Acceptance is 0, as expected here: on the 0–24 prefix the taps are zeros, not layers 37–39's. Acceptance with real taps needs the whole model, i.e. the Sparks (M2c-2 with LANES) or a bigger GPU.
   - **The round's pods 15–19 cost $6.17** against an $8 cap.
+- **R1 in block.zig** (a66008b, 8b72239): `Options.r1`, written from decode1 78b703d's source, since there was no R1 capture to write it against. The changes:
+  - attention split 4 + q RoPE in the kernel (two trailing attn args; no q `_rope`);
+  - mhc_cuda's tail spin + late flag, plus a `coef` launch after each mixing site;
+  - the router's prune + kit in its tail (a prune list; no `_prune`, no kit_weights glue, no `group`);
+  - down_combine to bf16 with a plain exchange;
+  - q_norm folded into wq_b's / ix_wq_b's rot_in (norm list + eps), with kv_norm as `_rms` before the SWA store.
+  The checks take R1 from a capture's env and M2b from the reference's. The pre-R1 output is unchanged: cap15 and cap18 0 mismatches, every pre-R1 GPU gate still passes.
+- **Pod 20** (9253c7a, 18 min, $1.27): the batched pod.
+  - **Regression all PASS:** M2b eager and with graphs (1 capture, 62 replays), lanes modes 1 / 2 / 3 (65/65 each).
+  - **dsq-zig-kern-1's kernel job: 322/322 bit-exact**, including the **prefill glue kernels == torch** (top positions, candidate keys, visible counts, gm picks, width mask, fp64 casts, projection, ring copies) and the x3gm prefill cases.
+  - **The R1 capture failed inside Python:** the r1c twin (78b703d) lacks 8474f31's FastLinear `norm` fix, which is Python-only; the R1 kernels are identical between the two. Set D also needed layer 8 (13–15's KV source). `dsv41-zig-ref/r1c-fix.tar.gz` is the twin with 8474f31's prefill_mm.py.
+- **Pod 21** (81f0477, 15 min, $1.06): the R1 fix-up.
+  - **The R1 capture ran out of the pod's disk:** four sets with 2,048-row prefill blobs beside the 135 GB local pack. `M1_PREFILL_ROWS=0` now captures decode windows only.
+  - **The R1 reference ran on the patched twin. Our R1 decode at TP=2 differs from it from block 0 of the first window** (tokens 0/64). One cause found offline since: the prune list's `drop` must be `Et` (moe's `block.ex.count`), not the routed count (8b72239). The rest needs the R1 capture, call for call, as block.zig had M1's.
+  - The pre-R1 M2b regression passes again.
+- **M4 on the GPU** (81f0477, 45b1791), host-built:
+  - `model.zig` loads one rank of the whole model for serving. It needs the pack + `TF_DSV41_ASSETS` (rope.bin, engram-host.bin, aot/).
+  - `serve_engine.zig` is the native server's engine: lanes over GpuTarget + GpuPass in a LaneHost on rank 0, one slot. `TF_DSV41_TRACE_TOKENS` records each reply's prompt and ids.
+  - The binary is `tensorfold-dsv41` (zig/build/cuda.zig, server.zig `withEngine`).
+  - `tf-dsv41-m1 follow` runs the ranks > 0. `tf-dsv41-m1 generate` replays a trace through the same engine and requires the same ids ("HTTP tokens == CLI").
+  - The Spark runbook is `tools/zig/dsv41_m4/` (run_host.sh, RUNBOOK.md). The whole model does not fit a PRO 6000, so its first run is a Spark window.
+- **The night's pods:** runs 15–21 for M3 cost **$8.50**: 15–19 $6.17, 20–21 $2.33.
 - **Next, in order:**
-  1. **R1 in block.zig** (dsq-zig-kern-1's kernels are ready and replay-checked). Spark prod has run R1's knobs since 10-07 at -6.5 % a window with the same bits: attention split 4 + qrope, mHC spin / defer + coef, the router's prune, downCombine bf16, x3seg rot_in with the q_norm fold. The gate is a capture on prod-knobs.env plus r1c-knobs.env's R1 line on the 8474f31 twin. It goes ahead of new glue fusions, which are estimated under 3 %.
+  1. **Finish R1:** an R1 capture with `M1_PREFILL_ROWS=0` (sets A, B, D, P, on r1c-fix.tar.gz), then `tf-dsv41-m1 check` call for call against it, then the R1 M2b gate. One 2-GPU pod, about 20 min. Spark prod has run R1's knobs since 10-07 at -6.5 % a window with the same bits: attention split 4 + qrope, mHC spin / defer + coef, the router's prune, downCombine bf16, x3seg rot_in with the q_norm fold. The gate is a capture on prod-knobs.env plus r1c-knobs.env's R1 line on the 8474f31 twin. It goes ahead of new glue fusions, which are estimated under 3 %.
   2. **The prefill runtime:** the 15 torch-glue steps as kernels, then `Forward.prefill` over 2,048-row chunks (NCCL exchanges).
   3. **The M2c-2 kit rebuilt with the DSpark pass**, so the Spark run measures acceptance with real taps.
 - **The DSpark GPU pass** (`dspark_emit.zig`, `dspark_gpu.zig`):
