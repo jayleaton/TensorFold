@@ -125,6 +125,10 @@ pub const Set = struct {
             .f32 => |x| std.log.err("  {s}: fp32 {d}", .{ a.name, x }),
             .u64 => |x| std.log.err("  {s}: u64 {d}", .{ a.name, x }),
         };
+        // the constexprs pick the variant as much as the arguments do: without them the gap cannot be named
+        for (consts) |c| {
+            if (c.int) |x| std.log.err("  constexpr {s} = {d}", .{ c.name, x }) else if (c.f32) |x| std.log.err("  constexpr {s} = {d}", .{ c.name, x });
+        }
         return error.MissingTritonVariant;
     }
 
