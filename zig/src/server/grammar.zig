@@ -99,3 +99,76 @@ pub fn refusal(cx: *Cx, body: Value) errors.Refused!void {
     if (tools != null and tools.?.truthy() and try tool_specs.choiceRequiresCall(cx.a, body.get("tool_choice")))
         return cx.fail(.request, "{s} cannot be combined with tool_choice \"required\" or a named function: send one", .{s.field});
 }
+
+/// TF_DSV41_TOOL_GRAMMAR=1 (``structured.tool_grammar``): every auto tools request is held to its schemas, as strict
+/// tools are.
+pub fn toolGrammarEnv() bool {
+    const v = std.c.getenv("TF_DSV41_TOOL_GRAMMAR") orelse return false;
+    return std.mem.eql(u8, std.mem.trim(u8, std.mem.span(v), " "), "1");
+}
+
+fn functionOf(t: Value) ?Value {
+    if (t != .object) return null;
+    if (t.get("type")) |ty| if (!(ty == .string and std.mem.eql(u8, ty.string, "function"))) return null;
+    const f = t.get("function") orelse return null;
+    return if (f == .object) f else null;
+}
+
+/// GLM 0610's ``_tool_spec`` (DeepSeek-V4.1's structured output, with ``structured.Host.spec``'s TF_DSV41_TOOL_GRAMMAR
+/// rule as `auto_all`): the tools spec text when the calls are held to their schemas (``tool_choice`` "required" or a
+/// named function, any tool marked ``"strict": true``), null when they are not; a refusal when the tools are
+/// malformed. The text is ``{"tools": [...], "tool_choice": ..., "parallel_tool_calls": bool}``.
+pub fn toolSpec(cx: *Cx, body: Value, auto_all: bool) errors.Refused!?[]const u8 {
+    const tools = body.get("tools") orelse return null;
+    if (!tools.truthy()) return null;
+    if (tools != .array) return cx.refuse("tools must be a list");
+    const a = cx.a;
+    var choice: Value = .{ .string = "auto" };
+    const asked = body.get("tool_choice") orelse Value.null;
+    const auto = asked == .null or (asked == .string and std.mem.eql(u8, asked.string, "auto"));
+    if (auto) {
+        const strict = for (tools.array) |t| {
+            const f = functionOf(t) orelse continue;
+            if (f.get("strict")) |s| if (s == .bool and s.bool) break true;
+        } else false;
+        if (!strict and !auto_all) return null;
+    } else if (asked == .string and std.mem.eql(u8, asked.string, "none")) {
+        return null;
+    } else if (!(asked == .string and std.mem.eql(u8, asked.string, "required"))) {
+        const ok = asked == .object and asked.typeIs("function") and asked.get("function") != null and
+            asked.get("function").? == .object and asked.get("function").?.get("name") != null and asked.get("function").?.get("name").? == .string;
+        if (!ok) return cx.refuse("tool_choice must be \"none\", \"auto\", \"required\" or {\"type\": \"function\", \"function\": {\"name\": ...}}");
+        const inner = try json.newObject(a);
+        try inner.put(a, "name", asked.get("function").?.get("name").?);
+        const outer = try json.newObject(a);
+        try outer.put(a, "type", .{ .string = "function" });
+        try outer.put(a, "function", .{ .object = inner });
+        choice = .{ .object = outer };
+    } else choice = asked;
+    var kept: std.ArrayList(Value) = .empty;
+    for (tools.array) |t| {
+        const f = functionOf(t) orelse continue;
+        const name = f.get("name");
+        if (name == null or name.? != .string or name.?.string.len == 0) return cx.refuse("every function tool needs a name");
+        const entry = try json.newObject(a);
+        try entry.put(a, "name", name.?);
+        if (f.field("parameters")) |p| {
+            if (p != .object) return cx.fail(.request, "tool {s}: parameters must be a JSON schema object", .{name.?.string});
+            try entry.put(a, "parameters", p);
+        }
+        if (auto_all and auto) {
+            try entry.put(a, "strict", .{ .bool = true });
+        } else if (f.get("strict")) |s| try entry.put(a, "strict", .{ .bool = s.truthy() });
+        const wrap = try json.newObject(a);
+        try wrap.put(a, "type", .{ .string = "function" });
+        try wrap.put(a, "function", .{ .object = entry });
+        try kept.append(a, .{ .object = wrap });
+    }
+    if (kept.items.len == 0) return null;
+    const parallel = if (body.get("parallel_tool_calls")) |p| !(p == .bool and !p.bool) else true;
+    const spec_obj = try json.newObject(a);
+    try spec_obj.put(a, "tools", .{ .array = kept.items });
+    try spec_obj.put(a, "tool_choice", choice);
+    try spec_obj.put(a, "parallel_tool_calls", .{ .bool = parallel });
+    return try json.stringify(a, .{ .object = spec_obj }, .{ .ascii = false });
+}
