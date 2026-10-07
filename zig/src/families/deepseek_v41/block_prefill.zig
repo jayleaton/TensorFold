@@ -34,8 +34,11 @@
 //! (o / f / x sites), attn_cuda's top-k (a Reindex layer scoring over its candidate blocks, no `_keys` or torch top-k)
 //! and the narrow router. The exchanges land in the decode window's "w.recv.*" that mhc_cuda reads.
 //!
-//! Not taken here (error.Unsupported): the stream top-k of full-mode layers 2 / 8 / 14 at TF_DSV41_INDEX_STREAM_MIN
-//! visible keys or more, uniform (not ragged) expert stacks, gate / up sharing their sign vector (x3gm shx).
+//! From TF_DSV41_INDEX_STREAM_MIN visible keys a full-mode layer without the candidates' scores (2 / 8 / 14) selects
+//! with stream_topk (`_stream` + the merge glue, longpf.zig): no materialised scores, so any prompt up to the limit.
+//!
+//! Not taken here (error.Unsupported): uniform (not ragged) expert stacks, gate / up sharing their sign vector (x3gm
+//! shx).
 
 const std = @import("std");
 const dk = @import("dsv41_kernels");
@@ -43,6 +46,7 @@ const calls = @import("calls.zig");
 const block = @import("block.zig");
 const config = @import("config.zig");
 const moe = @import("block_moe.zig");
+const longpf = @import("longpf.zig");
 const Config = config.Config;
 const E = block.Emitter;
 const Arg = calls.Arg;
@@ -488,7 +492,7 @@ const Seg = struct {
         const sel = try selection(e, L);
         // backend._dt: a segment of at most 64 rows whose materialised scores fit the index budget selects with
         // attn_cuda's top-k (the decode window's job list), not `_keys` + torch's top-k (pod 25: Python's 45-row
-        // prompt launches no `_keys`); past the stream threshold the stream top-k is not ported (below)
+        // prompt launches no `_keys`); past the stream threshold the stream top-k (below)
         const reindexing = md == .reindex and e.cfg.usesCandidates(L) and s.cand;
         const nvis = @max(@divFloor(e.end(), ratio), 1);
         const streamed = !e.cfg.isCandidateSource(L) and !reindexing and n > 16 and nvis >= stream_min and @popCount(topk) == 1;
@@ -526,8 +530,12 @@ const Seg = struct {
             }
         } else {
             const cand = e.cfg.isCandidateSource(L);
-            // backend.select's stream path (full-mode layers without the candidates' scores): not ported
-            if (!cand and n > 16 and nvis >= stream_min and @popCount(topk) == 1) return error.Unsupported;
+            // backend.select's stream path (full-mode layers without the candidates' scores): stream_topk.select
+            if (streamed) {
+                try s.streamSelect(src, ratio, topk, sel[0]);
+                try e.glue("counts", &.{ sel[0], sel[1], try e.buf("w.pos64", .{}, .i64, &.{n}), .{ .i = ratio } });
+                return;
+            }
             const whole = n * nvis * 12 <= index_budget;
             const st = if (whole) n else step(e, nvis * 12);
             var a: i64 = 0;
@@ -546,6 +554,49 @@ const Seg = struct {
             if (cand) s.cand = true;
         }
         try e.glue("counts", &.{ sel[0], sel[1], try e.buf("w.pos64", .{}, .i64, &.{n}), .{ .i = ratio } });
+    }
+
+    /// backend._stream_select: stream_topk.select in row blocks whose scratch fits stream_topk.BUDGET; each block's
+    /// `_stream` (a program a row and key split: the split's best `topk` keys in its buffer's first `topk` slots), then
+    /// the merge (glue: the splits' first `topk` keys a row gathered, index.top_positions) into the selection's rows.
+    fn streamSelect(s: *Seg, src: u32, ratio: i64, topk: i64, out: Arg) !void {
+        const e = s.e;
+        const n = e.n;
+        const IH: i64 = e.cfg.index_heads;
+        const ID: i64 = e.cfg.index_dim;
+        const st = longpf.plan(n, @max(@divFloor(e.end(), ratio), 1), topk);
+        const spg = try e.paging(ratio, false);
+        var a: i64 = 0;
+        var j: usize = 0;
+        while (a < n) : ({
+            a += st;
+            j += 1;
+        }) {
+            const rows = @min(st, n - a);
+            const p = if (st >= n) try pos(e) else try s.blockPos(j, a);
+            const nk = @max(@divFloor(e.start + a + rows, ratio), 1);
+            const ns = longpf.splits(nk);
+            const buf = try e.buf("L.ix.stream", .{}, .i64, &.{ rows, ns, 2 * topk });
+            try e.triton("_stream", .{ rows, ns, 1 }, &.{
+                .{ .name = "QI", .arg = try e.view(.{ .buf = "L.qi" }, .bf16, &.{ rows, IH, ID }, &.{ IH * ID, ID, 1 }, a * IH * ID * 2) },
+                .{ .name = "W", .arg = try e.view(.{ .buf = "L.ix_w" }, .f32, &.{ rows, IH }, &.{ IH, 1 }, a * IH * 4) },
+                .{ .name = "w_stride", .arg = .{ .i = IH } },           .{ .name = "IK", .arg = try indexKeys(e, src) },
+                .{ .name = "POS", .arg = p },                           .{ .name = "KEYS", .arg = buf },
+                .{ .name = "k_stride", .arg = .{ .i = 0 } },            .{ .name = "NK", .arg = .{ .i = nk } },
+                .{ .name = "BUF", .arg = buf },                         .{ .name = "nsplit", .arg = .{ .i = ns } },
+                .{ .name = "RATIO", .arg = .{ .i = ratio } },           .{ .name = "H", .arg = .{ .i = IH } },
+                .{ .name = "D", .arg = .{ .i = ID } },                  .{ .name = "BP", .arg = .{ .i = 64 } },
+                .{ .name = "WS", .arg = .{ .f = 1.0 / @sqrt(@as(f64, @floatFromInt(IH))) } },
+                .{ .name = "SCALE", .arg = .{ .f = 1.0 / @sqrt(@as(f64, @floatFromInt(ID))) } },
+                .{ .name = "MODE", .arg = .{ .i = 0 } },                .{ .name = "SPLIT", .arg = .{ .i = longpf.split_keys } },
+                .{ .name = "K", .arg = .{ .i = topk } },                .{ .name = "CAP", .arg = .{ .i = 2 * topk } },
+                .{ .name = "BS", .arg = .{ .i = 8 } }, // index.BLOCK
+                .{ .name = "PT", .arg = spg.pt },
+                .{ .name = "PSH", .arg = .{ .i = spg.psh } },           .{ .name = "KFP8", .arg = .{ .b = true } },
+            });
+            // the merge's gathered keys [rows, ns x topk] share the materialised path's sort keys' storage
+            try e.glue("stream_merge", &.{ buf, try rowsOf(e, out, .i32, a, rows, topk), .{ .i = topk }, try e.buf("L.ix.keys", .{}, .i64, &.{ rows, ns * topk }) });
+        }
     }
 
     /// Win.sub's first position (int32 [1]) of the row block starting at row `a`.
