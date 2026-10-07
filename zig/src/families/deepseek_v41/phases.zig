@@ -26,6 +26,8 @@ pub const Name = enum {
     prefetch,
     candidates,
     commit,
+    /// the speculative pass's launch after a window (TF_DSV41_SPEC_DRAFT; its collect is `draft.pass`)
+    spec,
 };
 
 const count = std.enums.values(Name).len;

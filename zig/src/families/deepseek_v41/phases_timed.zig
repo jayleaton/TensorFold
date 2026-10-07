@@ -73,10 +73,11 @@ pub const TimedPass = struct {
     p: *ph.Phases,
 
     pub fn pass(t: *TimedPass) iface.Pass {
-        return .{ .ptr = t, .vtable = &vtable };
+        return .{ .ptr = t, .vtable = if (t.inner.vtable.begin != null) &vtable_begin else &vtable };
     }
 
     const vtable: iface.Pass.VTable = .{ .ingest = ingest, .propose = propose, .reset = reset, .markov = markov };
+    const vtable_begin: iface.Pass.VTable = .{ .ingest = ingest, .propose = propose, .reset = reset, .markov = markov, .begin = begin, .collect = collect };
 
     fn self(p: *anyopaque) *TimedPass {
         return @ptrCast(@alignCast(p));
@@ -94,6 +95,24 @@ pub const TimedPass = struct {
         const tm = ph.start(t.p, .@"draft.pass");
         defer tm.stop();
         return t.inner.propose(asks, out);
+    }
+
+    /// The speculative pass (draft/spec.zig) as the inner pass gives it: launched under `spec`, collected under
+    /// `draft.pass`; only when the inner pass has them.
+    fn begin(p: *anyopaque, asks: []const iface.Ask) anyerror!void {
+        const t = self(p);
+        const tm = ph.start(t.p, .spec);
+        defer tm.stop();
+        const f = t.inner.vtable.begin orelse return error.NoBegin;
+        return f(t.inner.ptr, asks);
+    }
+
+    fn collect(p: *anyopaque, out: []iface.Proposal) anyerror!void {
+        const t = self(p);
+        const tm = ph.start(t.p, .@"draft.pass");
+        defer tm.stop();
+        const f = t.inner.vtable.collect orelse return error.NoBegin;
+        return f(t.inner.ptr, out);
     }
 
     fn reset(p: *anyopaque, slot: u32) void {
