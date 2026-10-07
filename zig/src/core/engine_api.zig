@@ -32,8 +32,9 @@ pub const CallGate = struct {
 
 /// response_format and the guided_* fields: every token keeps the reply inside this grammar.
 pub const Structure = struct {
-    kind: enum { json, json_schema, regex, choice, grammar },
-    /// The schema (JSON text), regex, choices (a JSON array) or EBNF; empty for any JSON object.
+    kind: enum { json, json_schema, regex, choice, grammar, tools },
+    /// The schema (JSON text), regex, choices (a JSON array) or EBNF; empty for any JSON object. ``tools``: the tool
+    /// calls held to their schemas (GLM 0610's tools spec: ``{"tools", "tool_choice", "parallel_tool_calls"}``).
     text: []const u8 = "",
     /// With thinking on, the grammar starts after this token.
     after: ?u32 = null,
