@@ -92,7 +92,7 @@ pub const GpuTarget = struct {
 
     fn window(p: *anyopaque, segments: []const iface.Segment, choices: [][]u32) anyerror!void {
         const t = self_(p);
-        if (t.rows) |b| return b.targetWindow(segments, choices);
+        if (t.rows) |b| return b.targetWindow(segments, choices, t.sampler);
         if (segments.len != 1) return error.Slots;
         const s = segments[0];
         if (s.slot != 0) return error.Slots;
