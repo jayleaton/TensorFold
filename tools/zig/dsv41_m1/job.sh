@@ -315,6 +315,13 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
     # M2B_SAMP=1 (dsq-zig-samp-1): the reference also writes the sampled replies (--sampled: $REF/samp/trace.jsonl, its
     # prompt lengths in the AOT set); tools/zig/dsv41_samp/samp_step.sh runs on it after M4
     [[ "${M2B_SAMP:-0}" == 1 ]] && extra+=(--sampled)
+    # M2B_GRAMMAR=1 (dsq-zig-grammar-1): the reference also writes the grammar-constrained replies (--grammar, xgrammar
+    # 0.2.8 on the prod twin, installed --no-deps when missing); grammar_gate runs on them in the workstream loop
+    if [[ "${M2B_GRAMMAR:-0}" == 1 ]]; then
+        PYTHONPATH=/dsv41-tf/src python -c "import xgrammar" 2>/dev/null \
+            || step grammar-xgrammar 3 python -m pip install --no-deps "xgrammar==0.2.8" || true
+        extra+=(--grammar)
+    fi
     # M2B_ENGRAM=1 (dsq-zig-speed-1, R3): the references read Engram's rows from packed shards they write first (sparse,
     # records under the prompts' rows), the Zig ranks from the same files (TF_DSV41_ENGRAM_DIR): the real-row path
     # under every gate. R0's and R1's references each get their own directory.
