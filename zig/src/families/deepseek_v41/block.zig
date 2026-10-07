@@ -78,6 +78,9 @@ pub const Options = struct {
     /// TF_DSV41_PF_DENSE=fused (prod_knobs.zig): prefill's dense EXL3 GEMMs as pfdense's fused kernel; null: the W_q
     /// unpack + Triton `_gemm` (the captures' path). The same bits either way.
     pfd: ?*const @import("prod_knobs.zig").PfDense = null,
+    /// TF_DSV41_GM_V2 (gm2pf.zig): prefill's routed experts on x3gm v2 (gm2_kernel); off: v1 (the captures' path). The
+    /// same bits either way.
+    gm_v2: @import("gm2pf.zig").Mode = .off,
     /// TF_DSV41_INDEX_BUDGET_MIB (bytes): prefill's indexer scores + sort keys a launch (row blocks; the same bits)
     index_budget: i64 = 256 << 20,
 };
