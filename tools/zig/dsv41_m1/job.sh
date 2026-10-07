@@ -456,10 +456,16 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
     # dsq-zig-speed-1's tables (speed-gap.md: Zig eager / graphed vs Python R1 a window, GPU ms by family, M4's phases)
     [[ -f "$Z/tools/zig/dsv41_perf/speed_step.sh" ]] && bash "$Z/tools/zig/dsv41_perf/speed_step.sh" "$Z" "$RES" 2>&1 | tail -20 | tee -a "$RES/steps.txt"
     # M2B_SLOTS=1 (dsq-zig-slots-1): several live slots against Python's batched row mode (tools/zig/dsv41_slots/job.sh;
-    # the R1 twin's src has rowgraphs / slots: SLOTS_PYSRC), SLOTS_RUNS of its runs
+    # SLOTS_PYSRC: a twin with rowgraphs / slots AND the split pool (ref.py passes split=): the midprofile twin, unpacked
+    # here when M1_JOB=m5 did not run first; pod 29's /opt/r1c twin predates split), SLOTS_RUNS of its runs
+    if [[ "${M2B_SLOTS:-0}" == 1 || "${M2B_LONGPF:-0}" == 1 ]] && [[ ! -d /opt/midprofile/src ]]; then
+        for c in "$Z/midprofile.tar.gz" "${PACK%%/out/*}/m5/midprofile.tar.gz"; do
+            [[ -f "$c" ]] && { tar -xzf "$c" -C / && echo "midprofile twin from $c" | tee -a "$RES/steps.txt"; break; }
+        done
+    fi
     if [[ "${M2B_SLOTS:-0}" == 1 ]]; then
         (unset TF_DSV41_ENGRAM_DIR
-         export SLOTS_PYSRC=${SLOTS_PYSRC:-/opt/r1c/src} TORCH_EXTENSIONS_DIR=${SLOTS_EXT:-/opt/r1c/ext}
+         export SLOTS_PYSRC=${SLOTS_PYSRC:-/opt/midprofile/src} TORCH_EXTENSIONS_DIR=${SLOTS_EXT:-/opt/midprofile/ext}
          source "$Z/tools/zig/dsv41_slots/job.sh"; slots_gate) || rc=1
         grep -h "^slots\|PASS slots\|FAIL slots" "$RES"/slots*.log "$RES"/slots-*/rank0.log 2>/dev/null | tee -a "$RES/steps.txt"
         # with M2B_SAMP: the sampled trace again at TF_DSV41_SLOTS=4, 4 replies in flight (samp_step.sh's slots4: a
@@ -480,7 +486,7 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
     if [[ "${M2B_MDRAFT:-0}" == 1 ]]; then
         if [[ -f "$Z/tools/zig/dsv41_mdraft/job.sh" ]]; then
             (unset TF_DSV41_ENGRAM_DIR
-             export SLOTS_PYSRC=${SLOTS_PYSRC:-/opt/r1c/src} TORCH_EXTENSIONS_DIR=${SLOTS_EXT:-/opt/r1c/ext}
+             export SLOTS_PYSRC=${SLOTS_PYSRC:-/opt/midprofile/src} TORCH_EXTENSIONS_DIR=${SLOTS_EXT:-/opt/midprofile/ext}
              source "$Z/tools/zig/dsv41_mdraft/job.sh"; mdraft_gate) || rc=1
             grep -h "^mdraft\|PASS mdraft\|FAIL mdraft" "$RES"/mdraft*.log "$RES"/mdraft-*/rank0.log 2>/dev/null | tee -a "$RES/steps.txt"
         else echo "mdraft skipped: no tools/zig/dsv41_mdraft/job.sh" | tee -a "$RES/steps.txt"; rc=1; fi
