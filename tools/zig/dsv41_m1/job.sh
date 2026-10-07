@@ -422,7 +422,7 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
             follow 29861 server & fpid=$!
             env "${m4env[@]}" TF_TP_RANK=0 TF_TP_DEVICE=0 TF_TP_PORT=29861 TF_DSV41_TRACE_TOKENS="$m4dir/trace.jsonl" \
                 "$Z/bin/tensorfold-dsv41" serve "$LP" --port 8091 --parallel 1 > "$m4dir/server.log" 2>&1 & spid=$!
-            t=0; until grep -q "serving model" "$m4dir/server.log" 2>/dev/null || (( t > 600 )) || ! kill -0 $spid 2>/dev/null; do sleep 5; t=$((t + 5)); done
+            t=0; until grep -q "serving model\|serving pack at" "$m4dir/server.log" 2>/dev/null || (( t > 600 )) || ! kill -0 $spid 2>/dev/null; do sleep 5; t=$((t + 5)); done
             step m4-requests 6 bash "$Z/tools/zig/dsv41_m4/requests.sh" 8091 "${M2B_M4_TOKENS:-128}" || rc=1
             kill $spid 2>/dev/null; wait $spid 2>/dev/null; wait $fpid 2>/dev/null
             for mode in drafts serial; do
