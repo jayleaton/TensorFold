@@ -14,6 +14,7 @@ const buffers = @import("buffers.zig");
 const run = @import("run.zig");
 const Config = @import("config.zig").Config;
 const eh = @import("engram_host.zig");
+const vision_rows = @import("vision_rows.zig");
 const graphs = @import("graphs.zig");
 const pf = @import("forward_prefill.zig");
 const kvs = @import("kv_state.zig");
@@ -56,6 +57,9 @@ pub const Forward = struct {
     send: ?cuda.DeviceBuffer = null,
     /// the window's token ids (the embedding step reads them; window() copies them into ids_own)
     ids: []const u32 = &.{},
+    /// TF_DSV41_IMAGES=native (vision_rows.zig): every rank keeps image positions out of Engram; rank 0's image rows
+    images: bool = false,
+    vision: ?*vision_rows.Rows = null,
     ids_own: std.ArrayList(u32) = .empty,
     /// the backbone layers the forward runs (all of them unless a gate runs a prefix: M2a's 0-24)
     layers: ?[]const u32 = null,
@@ -556,6 +560,7 @@ pub const Forward = struct {
             const V: usize = f.cfg.vocab / W;
             const rows = try f.sendBuffer(r, 2 * n * D);
             try k.embedSend(f.dev_ids.?.ptr, n, embed.ptr, @intCast(f.comm.rank() * V), V, D, rows);
+            if (f.vision) |vr| try vr.fill(r.stream, f.ids, rows, D); // rank 0: the image positions' rows (vision.fill)
             const recv = try r.tensorAddr(c.args[1].arg.t);
             try f.comm.allGather(rows, recv, n * D, .bf16, s);
             return k.embedSum(recv, W, n, D, try r.tensorAddr(c.args[0].arg.t));
