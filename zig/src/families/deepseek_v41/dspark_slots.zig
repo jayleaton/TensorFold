@@ -348,6 +348,6 @@ pub const SlotPass = struct {
         const all = x.all[0 .. packed_.len * Wd];
         try cuda.DeviceBuffer.download(.{ .d = r.d, .ptr = dst, .len = 4 * all.len }, 0, std.mem.sliceAsBytes(all));
         rows.ungather(all, Wd, R, k, x.cand, x.cval);
-        try gpu.checkCandidates(x.cand, x.f.cfg.vocab);
+        try gpu.checkCandidates(x.cand[0 .. R * Wd * k], x.f.cfg.vocab); // the pass's rows (x.cand holds the most)
     }
 };
