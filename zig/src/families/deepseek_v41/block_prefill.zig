@@ -883,14 +883,17 @@ const Seg = struct {
         try e.glue("engram_rows", &.{ rws, .{ .i = L } });
         try s.proj(try e.fmt("L{d}.engram.wkv", .{L}), .strips, rws, K, N, kv);
         const qk = try e.weight("L{d}.engram.qk", .{L}, .f32, &.{ e.cfg.hc_mult, D });
+        // image positions (TF_DSV41_IMAGES=native): the gate times vision.window's keep (0 there)
+        const keep: ?Arg = if (e.o.image_keep) try e.buf("w.engram.keep", .{}, .f32, &.{n}) else null;
+        if (keep) |k| try e.glue("image_keep", &.{k});
         try e.triton("_fuse_dec", .{ n, 1, 1 }, &.{
             .{ .name = "X", .arg = try e.streams() },                               .{ .name = "x_stride", .arg = .{ .i = 4 * D } },
             .{ .name = "KV", .arg = kv },                                           .{ .name = "kv_stride", .arg = .{ .i = N } },
-            .{ .name = "QK", .arg = qk },                                           .{ .name = "KEEP", .arg = qk },
+            .{ .name = "QK", .arg = qk },                                           .{ .name = "KEEP", .arg = keep orelse qk },
             .{ .name = "GATE", .arg = qk },                                         .{ .name = "eps", .arg = .{ .f = E.dec(e.cfg.eps) } },
             .{ .name = "clamp", .arg = .{ .f = E.dec(e.cfg.engram_gate_clamp) } }, .{ .name = "sqrt_d", .arg = .{ .f = @sqrt(@as(f64, @floatFromInt(D))) } },
             .{ .name = "D", .arg = .{ .i = D } },                                   .{ .name = "BK", .arg = .{ .i = 64 } },
-            .{ .name = "UB", .arg = .{ .i = 1024 } },                               .{ .name = "HAS_KEEP", .arg = .{ .b = false } },
+            .{ .name = "UB", .arg = .{ .i = 1024 } },                               .{ .name = "HAS_KEEP", .arg = .{ .b = keep != null } },
             .{ .name = "HAS_GATE", .arg = .{ .b = false } },
         });
     }
