@@ -14,6 +14,7 @@ const run = @import("run.zig");
 const Config = @import("config.zig").Config;
 const eh = @import("engram_host.zig");
 const graphs = @import("graphs.zig");
+const pf = @import("forward_prefill.zig");
 
 pub const Error = error{ GlueNotBuilt, BadWindow };
 
@@ -65,6 +66,12 @@ pub const Forward = struct {
     /// window reads the knob, then off (eager, the gated path) unless it is set
     graphed: ?*Graphed = null,
     graphs_read: bool = false,
+    /// the prefill's state (forward_prefill.zig)
+    prefill_state: pf.State = .{},
+    /// rows of "w.logits" the last prefill left (its last segment's, or its tail's): greedy takes out[0..last_rows]
+    last_rows: u32 = 0,
+    /// rank 0 inside a prefill: its windows and keeps are the followers' own (they got the whole prompt), not sent
+    quiet: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, cfg: *const Config, widths: *const block.Widths, opts: block.Options, runner: *run.Runner, comm: tp.collective.Collective) Forward {
         return .{ .gpa = gpa, .cfg = cfg, .widths = widths, .opts = opts, .runner = runner, .comm = comm, .arena = std.heap.ArenaAllocator.init(gpa) };
@@ -80,13 +87,14 @@ pub const Forward = struct {
         if (f.send) |*b| b.free();
         if (f.gathered) |*b| b.free();
         if (f.rows_host) |*b| b.free();
+        f.prefill_state.deinit(f.gpa);
         f.programs.deinit(f.gpa);
         f.ids_own.deinit(f.gpa);
         f.arena.deinit();
     }
 
     /// The backbone's layers, then the head.
-    fn backbone(f: *Forward, a: std.mem.Allocator) ![]const u32 {
+    pub fn backbone(f: *Forward, a: std.mem.Allocator) ![]const u32 {
         if (f.layers) |ls| return ls;
         const ls = try a.alloc(u32, f.cfg.layers);
         for (ls, 0..) |*l, i| l.* = @intCast(i);
@@ -110,6 +118,38 @@ pub const Forward = struct {
         const cs = try block.emit(a, f.cfg, f.widths, f.opts, try f.backbone(a), n, f.opts.limit - n, true);
         try f.programs.put(f.gpa, n, cs);
         return cs;
+    }
+
+    /// Adds the prefill program's roles (block_prefill.zig, segments of up to `rows` rows) to `p`, before bind.
+    /// Shared roles take the larger size; the decode roles stay.
+    pub fn planPrefill(f: *Forward, p: *buffers.Plan, rows: u32) !void {
+        return pf.plan(f, p, rows);
+    }
+
+    /// The prompt `ids` from the slot's position (forward_prefill.zig): segments of opts.prefill_rows rows, each run
+    /// then kept whole; a tail of at most 16 rows as decode windows. After it the position has moved by ids.len,
+    /// nothing is pending, and "w.logits" holds `last_rows` rows (the caller's greedy(out[0..last_rows]), last row).
+    pub fn prefill(f: *Forward, ids: []const u32) !void {
+        if (f.slot.pending != null) return error.BadWindow;
+        if (ids.len == 0) return;
+        if (f.leads()) {
+            // [op, total, offset, ids...] frames (planlink takes up to 64M words a frame; a prompt is a few)
+            const frame: usize = 1 << 20;
+            const msg = try f.gpa.alloc(i64, 3 + @min(frame, ids.len));
+            defer f.gpa.free(msg);
+            var at: usize = 0;
+            while (at < ids.len) : (at += frame) {
+                const m = @min(frame, ids.len - at);
+                msg[0] = op_prefill;
+                msg[1] = @intCast(ids.len);
+                msg[2] = @intCast(at);
+                for (ids[at .. at + m], msg[3 .. 3 + m]) |t, *y| y.* = t;
+                try f.link.?.send(msg[0 .. 3 + m]);
+            }
+        }
+        f.quiet = true;
+        defer f.quiet = false;
+        return pf.prompt(f, ids);
     }
 
     /// One decode window: `ids` at the slot's position. This rank's logits stay in the runner's "w.logits".
@@ -224,6 +264,7 @@ pub const Forward = struct {
     const op_stop: i64 = 4;
     const op_ds_ingest: i64 = 5;
     const op_ds_propose: i64 = 6;
+    const op_prefill: i64 = 7;
 
     /// The drafter's operations a follower runs (dspark_gpu.zig): its collectives pair up with the leader's.
     pub const Drafter = struct {
@@ -246,7 +287,7 @@ pub const Forward = struct {
     }
 
     fn leads(f: *const Forward) bool {
-        return f.link != null and f.comm.rank() == 0;
+        return f.link != null and !f.quiet and f.comm.rank() == 0;
     }
 
     /// Rank 0: the followers' loops end (after the last operation they were sent).
@@ -256,13 +297,17 @@ pub const Forward = struct {
 
     /// Ranks > 0: run the leader's operations as they arrive, in its order (every collective then pairs up), until
     /// `stop`. The window's token ids come with it; greedy's choice is computed here too (its all-gather needs every
-    /// rank) and dropped.
+    /// rank) and dropped. A prefill's prompt comes in frames; the last one starts it.
     pub fn follow(f: *Forward) !void {
         var buf: std.ArrayList(i64) = .empty;
         defer buf.deinit(f.gpa);
         var ids: std.ArrayList(u32) = .empty;
         defer ids.deinit(f.gpa);
-        var picks: [128]u32 = undefined;
+        var prompt: std.ArrayList(u32) = .empty;
+        defer prompt.deinit(f.gpa);
+        // greedy's rows: a window's, or a prefill's last segment (up to prefill_rows)
+        var picks: std.ArrayList(u32) = .empty;
+        defer picks.deinit(f.gpa);
         while (true) {
             const msg = try f.link.?.recvGrow(f.gpa, &buf);
             if (msg.len == 0) return error.BadPlan;
@@ -273,7 +318,19 @@ pub const Forward = struct {
                     for (msg[2 .. 2 + n]) |t| try ids.append(f.gpa, @intCast(t));
                     try f.window(ids.items);
                 },
-                op_greedy => try f.greedy(picks[0..@intCast(msg[1])]),
+                op_greedy => {
+                    try picks.resize(f.gpa, @intCast(msg[1]));
+                    try f.greedy(picks.items);
+                },
+                op_prefill => {
+                    const total: usize = @intCast(msg[1]);
+                    const at: usize = @intCast(msg[2]);
+                    if (at == 0) prompt.clearRetainingCapacity();
+                    if (at != prompt.items.len) return error.BadPlan;
+                    for (msg[3..]) |t| try prompt.append(f.gpa, @intCast(t));
+                    if (prompt.items.len > total) return error.BadPlan;
+                    if (prompt.items.len == total) try f.prefill(prompt.items);
+                },
                 op_keep => try f.keep(@intCast(msg[1])),
                 op_stop => return,
                 op_ds_ingest => {
@@ -300,7 +357,7 @@ pub const Forward = struct {
         return n;
     }
 
-    fn sendBuffer(f: *Forward, r: *run.Runner, bytes: usize) !u64 {
+    pub fn sendBuffer(f: *Forward, r: *run.Runner, bytes: usize) !u64 {
         if (f.send == null or f.send.?.len < bytes) {
             if (f.send) |*b| b.free();
             f.send = try cuda.DeviceBuffer.alloc(r.d, bytes);
@@ -308,7 +365,8 @@ pub const Forward = struct {
         return f.send.?.ptr;
     }
 
-    fn glueFn(ctx: *anyopaque, r: *run.Runner, c: *const calls.Call) anyerror!void {
+    /// The decode window's glue (a prefill segment's handler hands it the steps both have).
+    pub fn glueFn(ctx: *anyopaque, r: *run.Runner, c: *const calls.Call) anyerror!void {
         const f: *Forward = @ptrCast(@alignCast(ctx));
         const step = c.name["glue.".len..];
         const s = r.stream.handle;

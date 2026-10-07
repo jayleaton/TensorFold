@@ -40,6 +40,13 @@ pub fn widths(a: std.mem.Allocator, w: *const load.Weights, p: *const plan.Plan)
             r[slot][1] = @max(r[slot][1], sh);
         }
         try out.experts.put(a, l.index, r);
+        // x3gm's widths present (a prefill segment's launches, x3gm.Ragged): the routed experts' gate (w1) and down
+        // (w2) K2s, the shared expert not among them
+        var gm: [2]u32 = .{ 0, 0 };
+        for (0..2) |proj| for (l.experts[proj].layout.words) |words| {
+            gm[proj] |= @as(u32, 1) << @intCast(words / 8);
+        };
+        try out.gm.put(a, l.index, gm);
     }
     return out;
 }
