@@ -17,6 +17,9 @@ const eh = @import("engram_host.zig");
 const graphs = @import("graphs.zig");
 const pf = @import("forward_prefill.zig");
 const kvs = @import("kv_state.zig");
+const er = @import("engram_rows.zig");
+const greedy_host = @import("greedy.zig");
+const ph = @import("phases.zig");
 
 pub const Error = error{ GlueNotBuilt, BadWindow };
 
@@ -68,6 +71,18 @@ pub const Forward = struct {
     /// window reads the knob, then off (eager, the gated path) unless it is set
     graphed: ?*Graphed = null,
     graphs_read: bool = false,
+    /// the graphs' default when TF_DSV41_GRAPHS is unset (model.zig: on for M4's served model; the gates' drivers: off)
+    graphs_default: bool = false,
+    /// R3: Engram's local shards (TF_DSV41_ENGRAM_DIR, engram_rows.zig), opened on first use; unset: M2a's index rows
+    engram_rows: ?*er.Rows = null,
+    engram_opened: bool = false,
+    /// R3's read-ahead at the DSpark pass (TF_DSV41_ENGRAM_PREFETCH=0: rows read when the window needs them; same bits)
+    engram_prefetch: bool = true,
+    /// TF_DSV41_PHASES (phases.zig): the window path's timers
+    phases: ?*ph.Phases = null,
+    /// greedy's pinned logits / pairs staging and device pairs, kept across windows
+    pick_host: ?cuda.HostBuffer = null,
+    pick_dev: ?cuda.DeviceBuffer = null,
     /// the prefill's state (forward_prefill.zig)
     prefill_state: pf.State = .{},
     /// rows of "w.logits" the last prefill left (its last segment's, or its tail's): greedy takes out[0..last_rows]
@@ -96,6 +111,9 @@ pub const Forward = struct {
         if (f.gathered) |*b| b.free();
         if (f.rows_host) |*b| b.free();
         f.prefill_state.deinit(f.gpa);
+        if (f.engram_rows) |x| x.close();
+        if (f.pick_host) |*b| b.free();
+        if (f.pick_dev) |*b| b.free();
         f.programs.deinit(f.gpa);
         f.ids_own.deinit(f.gpa);
         f.arena.deinit();
@@ -180,6 +198,8 @@ pub const Forward = struct {
             for (ids, 0..) |t, i| msg[2 + i] = t;
             try f.link.?.send(msg[0 .. 2 + ids.len]);
         }
+        const tf = ph.start(f.phases, .forward);
+        defer tf.stop();
         if (try f.graphedWindow(ids)) return;
         // the window's calls at its position (the indexer's scores and top-k grow with the cache: NK = end / ratio)
         var wa = std.heap.ArenaAllocator.init(f.gpa);
@@ -195,32 +215,41 @@ pub const Forward = struct {
     /// ties; -0.0 == +0.0), the float64 (value, global id) pairs all-gathered, the higher value (the lower rank on ties).
     pub fn greedy(f: *Forward, out: []u32) !void {
         if (f.leads()) try f.link.?.send(&.{ op_greedy, @intCast(out.len) });
+        const tc = ph.start(f.phases, .candidates);
+        defer tc.stop();
         const r = f.runner;
         const n = out.len;
         const W: usize = f.comm.world();
         const V: usize = f.cfg.vocab / W;
-        const host = try f.gpa.alloc(f32, n * V);
-        defer f.gpa.free(host);
+        // pinned: the logits [n, V], then the pairs [2n] and every rank's [W][2n] (reused, no allocation a window)
+        const lb = std.mem.alignForward(usize, 4 * n * V, 8);
+        const need = lb + 16 * n * (W + 1);
+        if (f.pick_host == null or f.pick_host.?.bytes.len < need) {
+            if (f.pick_host) |*b| b.free();
+            f.pick_host = try cuda.HostBuffer.alloc(r.d, @max(need, 1 << 20));
+        }
+        if (f.pick_dev == null or f.pick_dev.?.len < 16 * n * (W + 1)) {
+            if (f.pick_dev) |*b| b.free();
+            f.pick_dev = try cuda.DeviceBuffer.alloc(r.d, @max(16 * n * (W + 1), 4096));
+        }
+        const hb = f.pick_host.?.bytes;
+        const host: []f32 = @alignCast(std.mem.bytesAsSlice(f32, hb[0 .. 4 * n * V]));
+        const pairs: []f64 = @alignCast(std.mem.bytesAsSlice(f64, hb[lb..need]));
+        const dev = f.pick_dev.?;
+        const logits = r.addressOf("w.logits") orelse return error.Unbound;
+        try r.d.check(r.d.api.cuMemcpyDtoHAsync_v2(host.ptr, logits, 4 * n * V, r.stream.handle), "cuMemcpyDtoHAsync");
         try r.stream.synchronize();
-        try cuda.DeviceBuffer.download(.{ .d = r.d, .ptr = r.addressOf("w.logits") orelse return error.Unbound, .len = 4 * n * V }, 0, std.mem.sliceAsBytes(host));
-        const pairs = try f.gpa.alloc(f64, 2 * n * (W + 1));
-        defer f.gpa.free(pairs);
         for (0..n) |row| {
             const vals = host[row * V ..][0..V];
-            var best: usize = 0;
-            for (vals, 0..) |x, i| if (x > vals[best]) {
-                best = i;
-            };
+            const best = greedy_host.argmax(vals);
             pairs[2 * row] = vals[best];
             pairs[2 * row + 1] = @floatFromInt(best + f.comm.rank() * V);
         }
-        var dev = try cuda.DeviceBuffer.alloc(r.d, 8 * pairs.len);
-        defer dev.free();
-        try cuda.DeviceBuffer.upload(dev, 0, std.mem.sliceAsBytes(pairs[0 .. 2 * n]));
+        try dev.uploadAsync(0, std.mem.sliceAsBytes(pairs[0 .. 2 * n]), r.stream.handle);
         try f.comm.allGather(dev.ptr, dev.ptr + 16 * n, 2 * n, .f64, r.stream.handle);
-        try r.stream.synchronize();
         const all = pairs[2 * n ..];
-        try cuda.DeviceBuffer.download(dev, 16 * n, std.mem.sliceAsBytes(all));
+        try dev.downloadAsync(16 * n, std.mem.sliceAsBytes(all), r.stream.handle);
+        try r.stream.synchronize();
         for (out, 0..) |*o, row| {
             var bk: usize = 0;
             for (1..W) |k| if (all[2 * (k * n + row)] > all[2 * (bk * n + row)]) {
@@ -344,6 +373,8 @@ pub const Forward = struct {
     /// Rank 0: a drafter operation to the followers (before running it).
     pub fn sendDrafter(f: *Forward, ints: []const i64) !void {
         if (f.leads()) try f.link.?.send(ints);
+        // R3: the pass's anchor is the next window's row 0: its Engram rows are read while the pass runs
+        if (ints.len == 3 and ints[0] == op_ds_propose) f.prefetchEngram(@intCast(ints[2]), &.{@intCast(ints[1])});
     }
 
     pub fn dsIngestOp(start: u64, row0: u32, n: u32, avail: u32) [5]i64 {
@@ -421,6 +452,7 @@ pub const Forward = struct {
                 },
                 op_ds_propose => {
                     const d = f.drafter orelse return error.BadPlan;
+                    f.prefetchEngram(@intCast(msg[2]), &.{@intCast(msg[1])});
                     try d.propose(d.ptr, @intCast(msg[1]), @intCast(msg[2]));
                 },
                 op_sample => {
@@ -570,21 +602,39 @@ pub const Forward = struct {
 
     /// Layer L's rows of the window's ids (with the slot's tail): the hashes, this rank's heads' index rows.
     fn fillEngramRows(f: *Forward, h: *const eh.Host, L: u32, out: []u16) !void {
-        const li = std.mem.indexOfScalar(u32, h.layer_ids, L) orelse return error.NotEngram;
-        const n = f.ids.len;
-        const C = h.cols();
-        const dim: usize = f.cfg.engram_head_dim;
-        const sh = h.headShard(f.comm.rank(), f.comm.world());
-        const a = f.gpa;
-        const hashes = try a.alloc(i64, n * h.layer_ids.len * C);
-        defer a.free(hashes);
-        h.hash(f.ids, f.slot.tail[0..f.slot.tail_len], hashes);
-        const idx = try a.alloc(i64, n * sh[1]);
-        defer a.free(idx);
-        for (0..n) |t| for (0..sh[1]) |j| {
-            idx[t * sh[1] + j] = hashes[(t * h.layer_ids.len + li) * C + sh[0] + j];
-        };
-        eh.indexRows(idx, dim, out);
+        const tw = ph.start(f.phases, .@"engram.wait");
+        defer tw.stop();
+        return h.windowRows(f.gpa, try f.engramSource(h), f.ids, f.slot.tail[0..f.slot.tail_len], L, f.comm.rank(), f.comm.world(), f.cfg.engram_head_dim, out);
+    }
+
+    /// R3: the Engram rows' source, opened on first use: TF_DSV41_ENGRAM_DIR's shards on every rank alike (null:
+    /// M2a's index rows, the gates' references). TF_DSV41_ENGRAM_CACHE: records a layer (65,536).
+    fn engramSource(f: *Forward, h: *const eh.Host) !?eh.Source {
+        if (!f.engram_opened) {
+            f.engram_opened = true;
+            if (std.c.getenv("TF_DSV41_ENGRAM_PREFETCH")) |v| f.engram_prefetch = !std.mem.eql(u8, std.mem.span(v), "0");
+            if (std.c.getenv("TF_DSV41_ENGRAM_DIR")) |dir| {
+                const cap: u32 = if (std.c.getenv("TF_DSV41_ENGRAM_CACHE")) |v| try std.fmt.parseInt(u32, std.mem.span(v), 10) else 65536;
+                f.engram_rows = try er.Rows.open(f.gpa, std.mem.span(dir), f.comm.rank(), f.comm.world(), h.layer_ids, cap);
+                std.log.scoped(.dsv41).info("engram: rows from {s} (io_uring {s}, {d} records a layer cached)", .{ std.mem.span(dir), if (f.engram_rows.?.ring != null) "on" else "off", cap });
+            } else std.log.scoped(.dsv41).warn("engram: TF_DSV41_ENGRAM_DIR unset: synthetic index rows (M2a's), not the model's table", .{});
+        }
+        return if (f.engram_rows) |x| x.source() else null;
+    }
+
+    /// R3: the coming window's rows `ids` at `start` (row 0: the pending token) read ahead on this rank; its lookback
+    /// is the slot's tail plus the rows of the window in flight that `start` implies are kept. A wrong guess costs a
+    /// read at the window, never a bit.
+    pub fn prefetchEngram(f: *Forward, start: u64, ids: []const u32) void {
+        const h = f.engram orelse return;
+        const src = (f.engramSource(h) catch return) orelse return;
+        if (!f.engram_prefetch) return;
+        const tp_ = ph.start(f.phases, .prefetch);
+        defer tp_.stop();
+        var buf: [2 * eh.max_ngram + 128]u32 = undefined;
+        const pend: ?[]const u32 = if (f.slot.pending) |p| f.ids[0..p.n] else null;
+        const lb = eh.lookbackAt(f.slot.tail[0..f.slot.tail_len], f.slot.pos, pend, start, h.max_ngram - 1, &buf) orelse return;
+        h.prefetch(f.gpa, src, ids, lb, f.comm.rank(), f.comm.world());
     }
 
     /// Graphed: layer L's staged rows (copied before the launch) all-gathered, then forward.gather_cols' order.
@@ -605,7 +655,7 @@ pub const Forward = struct {
     fn graphState(f: *Forward) !?*Graphed {
         if (!f.graphs_read) {
             f.graphs_read = true;
-            const s = try graphs.Settings.fromEnv();
+            const s = try graphs.Settings.fromEnvOr(f.graphs_default);
             if (s.on and f.planned_rows > 0) {
                 const g = try f.gpa.create(Graphed);
                 errdefer f.gpa.destroy(g);
@@ -634,16 +684,22 @@ pub const Forward = struct {
         f.ids = ids;
         f.slot.pending = .{ .start = f.slot.pos, .n = n };
         // inputs: one copy of the ids and start, then each Engram layer's rows (hashed here, on the host)
-        try g.statics.stage(r.stream, ids, f.slot.pos);
-        if (f.engram) |h| for (g.stages.items) |*st| {
-            try f.fillEngramRows(h, st.layer, try st.begin(n));
-            try st.commit(r.stream, n);
-        };
+        {
+            const ts = ph.start(f.phases, .@"graph.stage");
+            defer ts.stop();
+            try g.statics.stage(r.stream, ids, f.slot.pos);
+            if (f.engram) |h| for (g.stages.items) |*st| {
+                try f.fillEngramRows(h, st.layer, try st.begin(n));
+                try st.commit(r.stream, n);
+            };
+        }
         g.active = true;
         defer g.active = false;
         r.glue = .{ .ctx = f, .run = glueFn };
         g.current = cs;
+        const t0 = ph.nowNs();
         const outcome = try g.cache.run(key, r.stream, f.fingerprint(g), .{ .ctx = f, .run = graphBody });
+        if (f.phases) |x| x.add(if (outcome == .captured) .@"graph.capture" else .@"graph.replay", ph.nowNs() - t0);
         if (outcome == .captured and g.cache.stats.captured == 1)
             std.log.scoped(.dsv41).info("graphs: first capture ({d} rows, context bucket {d})", .{ key.rows, key.ctx });
         return true;
