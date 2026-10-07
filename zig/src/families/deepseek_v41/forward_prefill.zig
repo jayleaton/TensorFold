@@ -27,6 +27,7 @@ const block_prefill = @import("block_prefill.zig");
 const longpf = @import("longpf.zig");
 const vision_rows = @import("vision_rows.zig");
 const fwd = @import("forward.zig");
+const eh = @import("engram_host.zig");
 const Forward = fwd.Forward;
 
 const log = std.log.scoped(.dsv41);
@@ -45,6 +46,8 @@ pub const State = struct {
     layers: []const u32 = &.{},
     moe: usize = 0,
     layer: u32 = 0,
+    /// TF_DSV41_PREFETCH_AHEAD (prod_knobs.zig): the next segment's Engram reads issued before this one runs
+    ahead: bool = false,
     /// long prompts' buffers (longpf.zig)
     long: longpf.State = .{},
 
@@ -119,9 +122,30 @@ pub fn prompt(f: *Forward, ids_in: []const u32) !void {
     var at: usize = 0;
     while (at < ids.len) {
         const n = @min(seg, ids.len - at);
+        if (st.ahead and at + n < ids.len) readAhead(f, ids, at, n, @min(seg, ids.len - at - n));
         try segment(f, ids[at .. at + n], at + n == ids.len);
         at += n;
     }
+}
+
+/// prefetch.py's one segment ahead: the reads of the segment after `ids[at .. at + n]` (its `next` rows, with the
+/// lookback they will see: the slot's tail and this segment's ids) start before this segment runs, so they are in
+/// flight while it does; its glue then waits for them (engram_rows keeps an unread bulk batch). A wrong guess costs a
+/// read, never a bit: the rows are the table's whatever the path.
+fn readAhead(f: *Forward, ids: []const u32, at: usize, n: usize, next: usize) void {
+    const h = f.engram orelse return;
+    if (!f.engram_prefetch) return;
+    const src = (f.engramSource(h) catch return) orelse return;
+    const keep: usize = h.max_ngram - 1;
+    const b = at + n;
+    var buf: [2 * eh.max_ngram]u32 = undefined;
+    const lb: []const u32 = if (n >= keep) ids[b - keep .. b] else blk: {
+        const old = @min(f.slot.tail_len, keep - n);
+        @memcpy(buf[0..old], f.slot.tail[f.slot.tail_len - old .. f.slot.tail_len]);
+        @memcpy(buf[old .. old + n], ids[at..b]);
+        break :blk buf[0 .. old + n];
+    };
+    h.prefetch(f.gpa, src, ids[b .. b + next], lb, f.comm.rank(), f.comm.world());
 }
 
 /// One segment at the slot's position, run eagerly, then committed.
