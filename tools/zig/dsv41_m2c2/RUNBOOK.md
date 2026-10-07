@@ -53,8 +53,11 @@ One prod window, three runs in order. Each run gates the next:
   - The checks: every state role (SWA rings, compressed pools, index keys, ratio-2 carries) bytes-equal to Python's dump, the same position and Engram tail, the same first token, then the decode gate from that state.
   - The pass line: `PASS Zig prefill rank N: ... state roles K/K equal ...`, then `PASS M2b rank N` in `out/seed*/prefill.log`.
   - `PROMPT=2600` makes the prompt cross a segment boundary (2,048 + 552).
-  - This gate has not run on a GPU yet (the prefill segments' launches have: 320/320).
-  - **M4 (steps 7 and 10) prefills with the Zig prefill by default.** If this gate was skipped or failed, run steps 7 and 10 with `OWN_PREFILL=0` on both hosts (e.g. `OWN_PREFILL=0 ASSETS=... ./run_m4.sh 0 out server`): the prompts then go through 16-row decode windows, as tested before.
+  - **Passed on 2x PRO 6000** (pod 23, layers 0–24, TP=2): a 2,600-row prompt (2,048 + 552) from an empty slot gave 65/65 state roles equal to Python's dump, the same position, Engram tail and first token, then 64/64 tokens and logits.
+  - **M4 (steps 7 and 10) prefills with the Zig prefill** (the default; `OWN_PREFILL=0` goes back to 16-row decode windows).
+    - The Zig prefill is Python's bits for every segment of 17–2,048 rows.
+    - **A prompt whose last segment has 1–16 rows** (length mod 2,048 in 1..16, or a prompt of 16 tokens or fewer) runs that tail as decode windows. That is the same model but not Python's prefill bits for those rows. Pod 23's 2,060-row case: 4/65 roles equal, first token equal.
+    - The 8 prompts in `prompts.txt` are single segments of more than 16 rows.
 - M4: `DRAFTS=0` serves without DSpark (then step 6 is not needed). `TF_DSV41_GRAPHS=1` on both ranks enables decode graphs.
 
 **What the numbers mean:**

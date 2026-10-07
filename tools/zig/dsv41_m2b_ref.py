@@ -70,6 +70,11 @@ def rank_main(rank: int, a) -> None:
     load_s = time.time() - t0
     g = torch.Generator().manual_seed(a.seed)
     ids = torch.randint(3, cfg.vocab_size, (a.prompt,), generator=g).tolist()
+    rec = None
+    if rank == 0 or a.rank >= 0:   # the AOT set (and rope tables) on each host of a two-host run, the prompt's prefill
+        import triton_aot_manifest as aot   # kernels included (Zig's own prefill launches them: M2B_PREFILL)
+
+        rec = aot.Recorder().install()
     logits = fw.prompt(ids)
     tok = int(greedy(fw, logits[-1:])[0])
     torch.cuda.synchronize()
@@ -97,11 +102,6 @@ def rank_main(rank: int, a) -> None:
         if L in s0.carry:
             put(f"s.L{L}.carry", s0.carry[L])
     (sd / "state.json").write_text(json.dumps({"pos": s0.pos, "tail": list(s0.tail), "roles": roles}, indent=1) + "\n")
-    rec = None
-    if rank == 0 or a.rank >= 0:   # the AOT set and rope tables on each host of a two-host run
-        import triton_aot_manifest as aot
-
-        rec = aot.Recorder().install()
     tokens, digests, layers_d = [tok], [], {}
     for step in range(a.steps):
         fw.trace = {} if step == 0 else None

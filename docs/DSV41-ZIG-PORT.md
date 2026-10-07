@@ -312,6 +312,13 @@ Rules from `ZIG-PREVIEW.md`:
     - Prompts whose full-mode layers see more than 4,096 keys need the stream top-k, which block_prefill does not port (`error.Unsupported`).
     - Greedy after a full 2,048-row segment downloads every row's logits; a last-row greedy is a later speed fix.
     - Segment shapes other than 2,048 and the SWA, Engram and ratio-2 layers' prefill have only been host-checked; the gate covers them.
+- **Pod 23, held** (63f16d7 + the reference fix, 26 min, $1.81): **the Zig prefill gate passes for full and ragged segments.**
+  - **A 2,600-row prompt** (one 2,048-row segment + one of 552) from an empty slot, at TP=2 on layers 0–24 with prod's knobs: **65/65 state roles equal** to Python's dump (SWA rings, compressed pools, index keys, ratio-2 carries), the same position, Engram tail and first token. Decode from it then gives 64/64 tokens and logits and 25/25 blocks on both ranks.
+  - The prompt prefilled in 0.47–0.76 s.
+  - **A 2,060-row prompt** (2,048 + a 12-row tail) **fails:** 4/65 roles equal, first token equal. A tail of 16 rows or fewer runs as decode windows, but Python's prefill path for such a segment is a mix: it takes some decode kernels (mhc_cuda, dtopk, the narrow router) and keeps its prefill projections. The fix is a ≤16-row prefill segment in block_prefill, written against a capture with `M1_PREFILL_ROWS=12`.
+  - **The first run failed with `MissingTritonVariant`:** the M2b reference installed its AOT recorder after the prompt, so the prefill kernels were not in the set. It now records from before the prompt.
+  - **Held-pod note:** the hold job marks the pod's SID as run, so `run.sh zigm1` needs its own `DSQ_SID`. And never `pkill -f` a pattern that appears in the ssh command line itself.
+  - **The kit's M4 now prefills with Zig prefill by default.** Prompts with a 1–16-row last segment still use decode windows (the same model, not Python's bits for those rows).
 - **Next, in order:**
   1. **The Spark window** (the kit's RUNBOOK.md): M2c-2 with R1, M4, and DSpark's acceptance. Spark prod has run R1's knobs since 10-07 at -6.5 % a window with the same bits: attention split 4 + qrope, mHC spin / defer + coef, the router's prune, downCombine bf16, x3seg rot_in with the q_norm fold. The gate is a capture on prod-knobs.env plus r1c-knobs.env's R1 line on the 8474f31 twin. It goes ahead of new glue fusions, which are estimated under 3 %.
   2. **The prefill runtime:** the 15 torch-glue steps as kernels, then `Forward.prefill` over 2,048-row chunks (NCCL exchanges).
