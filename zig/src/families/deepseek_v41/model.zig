@@ -272,6 +272,8 @@ pub const Model = struct {
         const so = try sg.optionsFromEnv();
         if (m.f.kv != null and m.slots == 1 and so.enabled) m.sessions = try sg.Sessions.init(gpa, io, &m.f, &bp, so);
         m.gt = .{ .f = &m.f, .prefill_rows = o.prefill_rows, .max_rows = nb, .own_prefill = o.own_prefill, .sessions = m.sessions };
+        // TF_DSV41_PROMPT_TAIL (prod_knobs.promptTail): the prompt's last token as the first decode row, as Python's server
+        m.gt.prompt_tail = try @import("prod_knobs.zig").promptTail(&@import("prod_knobs.zig").env);
         if (o.drafts) m.pass = try dspark_gpu.GpuPass.init(gpa, &m.f, nb);
         if (m.slots > 1) try m.openRows(rows_cap, &bp);
         if (slot_drafts) m.slot_pass = try dspark_slots.SlotPass.init(gpa, &m.f, m.pass.?, m.rows.?, m.slots, group);

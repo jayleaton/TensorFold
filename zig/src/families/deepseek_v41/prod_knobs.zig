@@ -209,6 +209,29 @@ pub fn prefillMode(get: Get) !PrefillMode {
     };
 }
 
+/// Where a served prompt's last token runs (`TF_DSV41_PROMPT_TAIL`, rank 0's choice: the followers replay its forward
+/// operations). `verify` (default) is Python's server (batch.py `_pieces` / `finals`, rounds.py): the rows before
+/// the last token are prefilled and the last token is the reply's first decode row, the pending row of its first
+/// verify window (decode kernels, the decode expert top-p, R1), so its KV and the first choice are a decode row's.
+/// `prefill`: every prompt row through the prefill, as Python's Forward.prompt (the gates' references that call it).
+pub const PromptTail = enum { verify, prefill };
+
+pub fn promptTail(get: Get) !PromptTail {
+    const raw = get("TF_DSV41_PROMPT_TAIL") orelse return .verify;
+    return std.meta.stringToEnum(PromptTail, std.mem.trim(u8, raw, " ")) orelse {
+        std.log.warn("TF_DSV41_PROMPT_TAIL={s}: expected verify or prefill", .{raw});
+        return error.BadKnob;
+    };
+}
+
+/// A prompt of `n` rows in `tail`'s shape: the rows through the prefill, then the rows of one decode window.
+pub fn promptSplit(n: usize, tail: PromptTail) struct { prefill: usize, window: usize } {
+    return switch (tail) {
+        .prefill => .{ .prefill = n, .window = 0 },
+        .verify => .{ .prefill = n -| 1, .window = @min(n, 1) },
+    };
+}
+
 /// The knobs onto a forward before its buffer plan, on every rank (model.zig serving, m2b.zig's gates): the fused
 /// dense prefill GEMM, the segment rows, the indexer's budget, the Engram read-ahead of the next segment, x3gm v2;
 /// `TF_DSV41_PREFILL=replay` is logged. R1 is read where the forward is made (`r1`).

@@ -44,7 +44,8 @@ grammar_gate() {
     cp "$trace" "$out/ref-trace.jsonl"
     local env=(TF_DSV41_GRAMMAR=1 TF_DSV41_SAMPLING=1 TF_TP_WORLD=2 TF_DSV41_ASSETS="$A" TF_DSV41_LAYERS="0-$hi"
                TF_DSV41_GRAPHS=1 TF_DSV41_OWN_PREFILL="${GRAMMAR_OWN_PREFILL:-1}" TF_DSV41_FAILFAST=0
-               TF_DSV41_EXPERT_TOPP="${M2B_TOPP:-0.85}")
+               TF_DSV41_EXPERT_TOPP="${M2B_TOPP:-0.85}"
+               TF_DSV41_PROMPT_TAIL=prefill)   # grammar_ref.py's replies follow Forward.prompt
     for mode in ${GRAMMAR_MODES:-drafts serial http}; do
         (( $(left) >= 4 )) || { echo "grammar-$mode skipped: $(left) min left" | tee -a "$RES/steps.txt"; continue; }
         d=1; [[ $mode == serial ]] && d=0

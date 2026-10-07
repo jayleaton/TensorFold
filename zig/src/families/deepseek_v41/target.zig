@@ -16,6 +16,7 @@ const sg = @import("sessions_gpu.zig");
 const batch = @import("batch.zig");
 const samp = @import("sampling_gpu.zig");
 const branches = @import("draft/branches.zig");
+const pk = @import("prod_knobs.zig");
 
 pub const Error = error{ TreeWindow, Sampling, Slots, NotAChain, WindowRows };
 
@@ -31,6 +32,10 @@ pub const GpuTarget = struct {
     /// the prompt through the forward's own prefill (2,048-row segments, Python's chunks; forward.planPrefill sized
     /// its buffers) instead of `prefill_rows`-row decode windows
     own_prefill: bool = false,
+    /// with `own_prefill`: where the prompt's last token runs (prod_knobs.PromptTail; model.zig reads
+    /// TF_DSV41_PROMPT_TAIL). `.verify` is Python's server: the reply's first decode window, left pending as a chain
+    /// window is. `.prefill`: the last prefill segment's last row, as Python's Forward.prompt (the gates' references)
+    prompt_tail: pk.PromptTail = .prefill,
     /// M5: the session store over the paged pool (null: every prompt from an empty slot, nothing kept)
     sessions: ?*sg.Sessions = null,
     /// several live slots (TF_DSV41_SLOTS > 1, batch.zig): windows in row mode over every slot's segment, the prompt on
@@ -60,6 +65,18 @@ pub const GpuTarget = struct {
         // a saved entry that prefixes the prompt: the slot continues at its position, the rest is prefilled
         const at: usize = if (t.sessions) |ss| @intCast(try ss.resume_(ids)) else 0;
         const rest = ids[at..];
+        if (t.own_prefill and t.prompt_tail == .verify) {
+            // Python's server (batch.py `_pieces` / `finals`): the rows before the last token are prefilled, and the
+            // last token is the pending row of the reply's first verify window: this target's own decode window
+            // (one slot or row mode), its choice greedy or keyed at `draw`, left pending for the next window to keep
+            // (a chain window never kept keeps every row; release keeps it before a session save)
+            const sp = pk.promptSplit(rest.len, .verify);
+            try t.f.prefill(rest[0..sp.prefill]);
+            var one: [1]u32 = undefined;
+            var out = [_][]u32{&one};
+            try window(p, &.{.{ .slot = slot, .start = ids.len - sp.window, .tokens = ids[ids.len - sp.window ..], .parents = null, .draws = &.{draw}, .sampling = sampling }}, &out);
+            return one[0];
+        }
         if (t.own_prefill) {
             // the keyed choice after the prompt: the last segment's last row
             try t.f.prefill(rest);

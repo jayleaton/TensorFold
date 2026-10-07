@@ -10,7 +10,8 @@
 # variants come from a set P capture merged in, else run DRAFTS=0), PORT (8091), DRAFTS (1), BACKEND (roce | nccl),
 # OWN_PREFILL (1: prompts through the Zig prefill; 0: 16-row decode windows; both ranks alike), GRAPHS (1: decode
 # windows through CUDA graphs, both ranks alike; 0: eager), DRAFT_TIMED (0: drafts sized from the cost tables, the
-# same for a request whatever the load, so HTTP == CLI; 1: the measured round times).
+# same for a request whatever the load, so HTTP == CLI; 1: the measured round times), PROMPT_TAIL (verify: the prompt's
+# last token as the first decode row, as prod's Python server; prefill: every prompt row prefilled, Forward.prompt).
 # The full-model window's knobs (both ranks alike; RUNBOOK-WINDOW.md):
 #   SAMPLING (1: keyed sampling, T > 0 served), SLOTS (1; N > 1: N live slots in row mode, the server's --parallel N;
 #   needs POOL_TOKENS and the rows-aot phase's variants; drafts off unless SLOT_DRAFTS=1: DSpark per slot with a
@@ -49,7 +50,7 @@ ARGS=(--rm --gpus all --ipc=host --network host --device /dev/infiniband --ulimi
       -e TF_TP_WORLD=2 -e TF_TP_RANK="$RANK" -e TF_TP_DEVICE=0 -e TF_TP_MASTER="$MASTER" -e TF_TP_PORT=29851
       -e TF_COMM_BACKEND="$BACKEND" -e TF_TP_ROCE_FALLBACK=error -e TF_TP_KERNEL_IMAGE=/kit/tp_mailbox.fatbin
       -e TF_DSV41_ASSETS=/assets -e TF_DSV41_EXPERT_TOPP=0.85 -e TF_DSV41_R1="${R1:-1}" -e TF_DSV41_DRAFTS="$DRAFTS" -e TF_DSV41_OWN_PREFILL="${OWN_PREFILL:-1}"
-      -e TF_DSV41_GRAPHS="${GRAPHS:-1}" -e TF_DSV41_DRAFT_TIMED="${DRAFT_TIMED:-0}"
+      -e TF_DSV41_GRAPHS="${GRAPHS:-1}" -e TF_DSV41_DRAFT_TIMED="${DRAFT_TIMED:-0}" -e TF_DSV41_PROMPT_TAIL="${PROMPT_TAIL:-verify}"
       -e TF_DSV41_PLAN_TIMEOUT=1800 -e NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-enp1s0f1np1}
       -e NCCL_IB_HCA=${NCCL_IB_HCA:-rocep1s0f1,roceP2p1s0f1}
       -e TF_DSV41_SAMPLING="${SAMPLING:-1}" -e TF_DSV41_SLOTS="$SLOTS"

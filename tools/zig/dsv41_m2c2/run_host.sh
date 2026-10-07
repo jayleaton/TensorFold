@@ -6,7 +6,7 @@
 # Start it on both hosts within about a minute (each phase's rendezvous waits up to 30 min for the other host):
 #   dgx-01:  ./run_host.sh 0 OUTDIR
 #   dgx-02:  ./run_host.sh 1 OUTDIR
-# Prod must be stopped first (RUNBOOK.md). Knobs: STEPS (512), SEEDS ("4101"), PROMPT (1536), BACKEND (roce | nccl), LANES (1: also M3's lanes gate, about +12 min), PREFILL (1: Zig's own prefill gate, about +10 min), AOT_PROMPTS (the reference's extra prompt lengths for M4's Triton variants: every prefill path; "" for none), PROF_ROWS ("1 2 4": after the gate, windows of each row count timed on both sides: the R1 timing table; Zig's in seed*/zig.log, Python's in seed*/ref.log).
+# Prod must be stopped first (RUNBOOK.md). Knobs: STEPS (512), SEEDS ("4101"), PROMPT (1536), BACKEND (roce | nccl), LANES (1: also M3's lanes gate, about +12 min), PREFILL (1: Zig's own prefill gate, about +10 min), AOT_PROMPTS (the reference's extra prompt lengths for M4's Triton variants: every prefill path; "" for none), PROF_ROWS ("1 2 4": after the gate, windows of each row count timed on both sides: the R1 timing table; Zig's in seed*/zig.log, Python's in seed*/ref.log), PROMPT_TAIL (verify: the reference runs the prompt as prod's server does, [0, n - 1) prefilled and the last token a decode row; ref.json records it and the Zig side follows it; unset: Forward.prompt).
 set -u
 RANK=${1:?rank}; OUT=${2:?outdir}
 KIT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -53,7 +53,7 @@ for seed in $SEEDS; do
     docker run "${ARGS[@]}" "${KNOBS[@]}" -e TF_DSV41_EXPERT_TOPP=0.85 --name "dsv41-zig-ref-r$RANK" \
         --entrypoint python "$IMAGE" -u -B /kit/tools/zig/dsv41_m2b_ref.py --pack /model --out "$R/ref" --aot-prompts "${AOT_PROMPTS-1,2,9,16,17,33,45,64,65,96,173,300,1025,2049,2600}" \
         --layers 0-39 --prompt "$PROMPT" --steps "$STEPS" --seed "$seed" --rank "$RANK" --master "$MASTER" --port $port \
-        ${PROF_ROWS:+--profile "$PROF_ROWS"} > "$OUT/seed$seed/ref.log" 2>&1
+        ${PROF_ROWS:+--profile "$PROF_ROWS"} ${PROMPT_TAIL:+--prompt-tail "$PROMPT_TAIL"} > "$OUT/seed$seed/ref.log" 2>&1
     rc=$?; log "seed $seed: reference rc $rc in $(( $(date +%s) - t0 )) s ($(tail -1 "$OUT/seed$seed/ref.log"))"
     (( rc == 0 )) || exit 1
     docker run "${ARGS[@]}" --entrypoint python "$IMAGE" -B /kit/tools/zig/dsv41_engram_host.py --py-src /dsv41-tf/src \

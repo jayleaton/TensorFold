@@ -6,7 +6,9 @@
 set -u
 BIN=$1 PACK=$2 ASSETS=$3 TRACE=$4 OUT=$5
 mkdir -p "$OUT"
-common=(TF_TP_WORLD=2 TF_TP_PORT=${VISION_PORT:-29790} TF_DSV41_FAILFAST=0 TF_DSV41_ASSETS="$ASSETS" TF_DSV41_DRAFTS=0)
+# TF_DSV41_PROMPT_TAIL=prefill: the reference's replies follow Forward.prompt (vision_ref.py)
+common=(TF_TP_WORLD=2 TF_TP_PORT=${VISION_PORT:-29790} TF_DSV41_FAILFAST=0 TF_DSV41_ASSETS="$ASSETS" TF_DSV41_DRAFTS=0
+        TF_DSV41_PROMPT_TAIL=prefill)
 env "${common[@]}" TF_TP_RANK=1 TF_TP_DEVICE=1 "$BIN" follow "$PACK" "$ASSETS" > "$OUT/rank1.log" 2>&1 &
 follower=$!
 env "${common[@]}" TF_TP_RANK=0 TF_TP_DEVICE=0 "$BIN" generate "$PACK" "$ASSETS" "$TRACE" > "$OUT/rank0.log" 2>&1

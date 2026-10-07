@@ -89,7 +89,8 @@ case "$PHASE" in
         [[ "$PHASE" == generate && "$RANK" != 0 ]] && { echo "generate runs on rank 0; rank 1 runs follow"; exit 2; }
         # the served engine on the reference's layers, drafts off; the assets (rope.bin, aot/, engram-host.bin): p1's
         GEN=("${ZIG[@]}" "${bias[@]}" -v "$OUT/ref/p1:/assets:ro" -e TF_DSV41_ASSETS=/assets -e TF_TP_PORT=$port
-             -e TF_DSV41_LAYERS=0-24 -e TF_DSV41_DRAFTS=0 -e TF_DSV41_EXPERT_TOPP=0.85)
+             -e TF_DSV41_LAYERS=0-24 -e TF_DSV41_DRAFTS=0 -e TF_DSV41_EXPERT_TOPP=0.85
+             -e TF_DSV41_PROMPT_TAIL=prefill)   # vision_ref.py's replies follow Forward.prompt
         if [[ "$PHASE" == follow ]]; then
             timeout --kill-after=30 900 docker run "${GEN[@]}" --name dsv41-zig-vgen-r1 --entrypoint bash "$IMAGE" \
                 -c "$NCCL; exec /kit/tf-dsv41-m1 follow /model /assets" > "$OUT/vision-follow${VARIANT:+-$VARIANT}.log" 2>&1

@@ -76,6 +76,25 @@ test "prod knob readers: PF_DENSE modes, prefill rows, prefetch ahead, prefill m
     Fake.pairs = &.{};
 }
 
+test "TF_DSV41_PROMPT_TAIL: Python's server splits a prompt at its last token, Forward.prompt does not" {
+    Fake.pairs = &.{};
+    defer Fake.pairs = &.{};
+    try testing.expectEqual(pk.PromptTail.verify, try pk.promptTail(&Fake.get));
+    Fake.pairs = &.{.{ "TF_DSV41_PROMPT_TAIL", "prefill" }};
+    try testing.expectEqual(pk.PromptTail.prefill, try pk.promptTail(&Fake.get));
+    Fake.pairs = &.{.{ "TF_DSV41_PROMPT_TAIL", "decode" }};
+    try testing.expectError(error.BadKnob, pk.promptTail(&Fake.get));
+    // batch.py `_pieces` prefills [0, n - 1), `finals` makes prompt[-1] the pending row (a 1-token prompt: no piece)
+    for ([_]usize{ 1, 2, 45, 2048, 2049, 4097 }) |n| {
+        const v = pk.promptSplit(n, .verify);
+        try testing.expectEqual(n - 1, v.prefill);
+        try testing.expectEqual(@as(usize, 1), v.window);
+        const p = pk.promptSplit(n, .prefill);
+        try testing.expectEqual(n, p.prefill);
+        try testing.expectEqual(@as(usize, 0), p.window);
+    }
+}
+
 fn widths(a: std.mem.Allocator) !block.Widths {
     var w: block.Widths = .{};
     try check.parseDense(a, &w, @embedFile("fixtures/q28v2-dense-k2.txt"));

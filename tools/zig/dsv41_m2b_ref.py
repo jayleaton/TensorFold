@@ -282,6 +282,21 @@ def decode(fw, greedy, Seg, digest, tok, steps, kv, trace) -> tuple[list, list, 
     return tokens, digests, layers_d
 
 
+def served_prompt(fw, Seg, ids, tail: str = "prefill"):
+    """The prompt's choice logits [1, V / W] in ``tail``'s shape (the Zig side: prod_knobs.PromptTail). ``verify``:
+    prod's server (batch.py ``_pieces`` / ``finals``, rounds.py) prefills [0, n - 1) and runs the last token as the
+    pending row of the reply's first verify window, a decode row (decode kernels, the decode expert top-p, R1), kept
+    whole; ``prefill``: Forward.prompt, every row prefilled (every reference before this option)."""
+
+    if tail == "prefill":
+        return fw.prompt(ids)[-1:]
+    if len(ids) > 1:
+        fw.prompt(ids[:-1])
+    lg = fw.run([Seg(0, fw.slot.pos, (ids[-1],))])
+    fw.keep(0, 0)
+    return lg[-1:]
+
+
 def one(rank, a, fw, cfg, greedy, Seg, digest, prompt, out, lo, hi, t0, load_s, last, kv=None) -> None:
     """One prompt from the slot as it is: its state dump, greedy steps and digests into ``out``."""
 
@@ -293,11 +308,11 @@ def one(rank, a, fw, cfg, greedy, Seg, digest, prompt, out, lo, hi, t0, load_s, 
     g = torch.Generator().manual_seed(a.seed)
     ids = torch.randint(3, cfg.vocab_size, (prompt,), generator=g).tolist()
     t1 = time.time()
-    logits = fw.prompt(ids)
+    logits = served_prompt(fw, Seg, ids, a.prompt_tail)
     tok = int(greedy(fw, logits[-1:])[0])
     torch.cuda.synchronize()
     if rank == 0:
-        print(f"prompt of {prompt} at {time.time() - t0:.0f} s, first token {tok}", flush=True)
+        print(f"prompt of {prompt} at {time.time() - t0:.0f} s, first token {tok} (tail {a.prompt_tail})", flush=True)
     # the slot after the prompt, by our forward's role names (block.zig: s.L<i>.swa / comp .v .s, .ik, .carry)
     sd = out / f"rank{rank}" / "state"
     sd.mkdir(parents=True, exist_ok=True)
@@ -339,7 +354,7 @@ def one(rank, a, fw, cfg, greedy, Seg, digest, prompt, out, lo, hi, t0, load_s, 
             fw.keep(0, n - 1)
     torch.cuda.synchronize()
     mine = {"rank": rank, "load_s": round(load_s, 1), "run_s": round(time.time() - t1, 1), "tokens": tokens,
-            "logits_sha256": digests, "layers_first_window": layers_d, "prompt_ids": ids}
+            "logits_sha256": digests, "layers_first_window": layers_d, "prompt_ids": ids, "prompt_tail": a.prompt_tail}
     (out / f"rank{rank}.json").write_text(json.dumps(mine) + "\n")
 
 
@@ -428,6 +443,9 @@ def main() -> int:
     ap.add_argument("--prompts", type=lambda v: [int(x) for x in v.split(",") if x], default=[],
                     help="several prompts in one load, each from a fresh slot into DIR/p<N> (with --rank: this host's rank)")
     ap.add_argument("--steps", type=int, default=64)
+    ap.add_argument("--prompt-tail", choices=("prefill", "verify"), default="prefill",
+                    help="verify: the prompt as prod's server runs it ([0, n - 1) prefilled, the last token a decode row; "
+                         "the Zig side's TF_DSV41_PROMPT_TAIL default); prefill: Forward.prompt (contiguous slot only)")
     ap.add_argument("--grammar", action="store_true",
                     help="also the structured-output gate's replies (dsv41_grammar/grammar_ref.py) into DIR/grammar/trace.jsonl")
     ap.add_argument("--sampled", action="store_true",
@@ -446,6 +464,8 @@ def main() -> int:
     ap.add_argument("--no-scramble", action="store_true", help="M5: no page holder (the slot's pages 0, 1, 2 ...)")
     a = ap.parse_args()
     a.kv = "split" if a.split else ("pool" if a.pool or a.park else "contig")
+    if a.prompt_tail == "verify" and a.kv != "contig":
+        ap.error("--prompt-tail verify: the contiguous slot only (one_kv prefills with Forward.prompt)")
     if a.compact is not None:
         if not a.split:
             ap.error("--compact needs --split")
@@ -464,6 +484,7 @@ def main() -> int:
             ranks[a.rank] = {k: mine[k] for k in ("load_s", "run_s", "logits_sha256", "layers_first_window")}
             meta = {"layers": a.layers, "prompt": prompt, "steps": a.steps, "seed": a.seed, "limit": a.limit,
                     "tokens": mine["tokens"], "prompt_ids": mine["prompt_ids"], "host_rank": a.rank,
+                    "prompt_tail": mine.get("prompt_tail", "prefill"),
                     "env": {k: v for k, v in os.environ.items() if k.startswith("TF_DSV41")}, "ranks": ranks}
             if a.kv != "contig":
                 meta["kv"] = a.kv
@@ -485,7 +506,7 @@ def main() -> int:
             st = 1
             continue
         meta = {"layers": a.layers, "prompt": prompt, "steps": a.steps, "seed": a.seed, "limit": a.limit,
-                "tokens": r0["tokens"], "prompt_ids": r0["prompt_ids"],
+                "tokens": r0["tokens"], "prompt_ids": r0["prompt_ids"], "prompt_tail": r0.get("prompt_tail", "prefill"),
                 "env": {k: v for k, v in os.environ.items() if k.startswith("TF_DSV41")},
                 "ranks": [{k: r[k] for k in ("load_s", "run_s", "logits_sha256", "layers_first_window")} for r in (r0, r1)]}
         if a.kv != "contig":            # M5: the pool mode, the exchange's counts, the park round trip a rank

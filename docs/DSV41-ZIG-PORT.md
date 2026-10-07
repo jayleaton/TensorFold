@@ -1177,7 +1177,7 @@ Run A predates `9bc88af` (the DSpark pass 31.5 -> 7.0 ms a round); B2 has it. **
 - `115b46e`, `acae981` `block.zig`: past attn_cuda's 8 x 512 x 31 entries a selection runs Python's Triton `_dtopk` (`dtopk.select`, then the candidate source's blocks as their own CUDA job, or `dtopk.blocks` past 126,976 blocks) as `backend.select` does when `attn_cuda.plan` is None (decode at 154K: `error.Shape` on both ranks; the 1M plan refused at boot).
 
 **Open, from the window:**
-- **Zig prod != Python prod on 3/8 short greedy requests** (and the bench's T0 cells 0/20, thinking off, streamed) while Zig's served path == its own CLI replay (49/49) and the M2c-2 / prefill gates are bit-exact. Prompts render alike (same head hashes and counts). Next: both engines with drafts off and the reasoning text kept, then with drafts on at one slot, to name the first differing token and whether the verify windows' row counts or the 4-slot row mode carry it.
+- **Zig prod != Python prod on 3/8 short greedy requests** (and the bench's T0 cells 0/20, thinking off, streamed) while Zig's served path == its own CLI replay (49/49) and the M2c-2 / prefill gates are bit-exact. Prompts render alike (same head hashes and counts). **Cause found offline: the prompt's last token** (next section): fixed by `TF_DSV41_PROMPT_TAIL=verify` (the default), proof steps under NEXT SPARK WINDOW.
 - **4 slots x 1M on Zig:** row mode needs the long-context selections (`_dtopk` / `_stream` with `ROWS=1`) before prod can switch; one slot at 1M works (run C).
 - **Fast boot is upload-bound:** 261 s of the 367 s is "upload + digest" with the prepared images already read.
 - **`/cache/roce-failed`** exists in prod's cache volume (preflight: "both ranks start on NCCL"); delete it to retry RoCE, if that is intended.
@@ -1186,6 +1186,101 @@ Run A predates `9bc88af` (the DSpark pass 31.5 -> 7.0 ms a round); B2 has it. **
 - **Speed at short prompts:** B2 code T0 1-stream 60.4 vs 84.7; 4 streams 82-91 vs 142-144. The window's choice reads wait on the GPU forward; next is the per-round phase split (`out/b2/phases.json`).
 - **The AOT set is sampled, not complete:** a served shape no reference launched fails `MissingTritonVariant`. A fill step that compiles the emitter's specs straight from Python's Triton source (the same cubins its JIT builds) would close the class.
 - Images: V2 still 1 ulp at b0.attn (owner `dsq-zig-vision-1`).
+
+### Zig prod vs Python prod: the prompt's last token (`dsq-zig-diverge-1`, offline)
+
+**What the night recorded.** `requests.sh` keeps usage and the content's first 80 characters, so Python's reasoning
+and ids are not in the logs, and neither server reports logprobs. No first differing index or margin can be read from
+them. They give bounds: Zig closes its reasoning (`</think>`) at reply token 240 / 105 / 198 (replies 2 / 5 / 7, from
+`out/a/trace.jsonl`), while Python is still reasoning at 256 (2, 5) or starts its content about 9 tokens before 256
+(7). So the first differing token is inside the reasoning, before 240 / 105 / 198.
+
+**Window shape is ruled out on both sides.** Zig's T0 bench hashes are identical in run A (1 slot, drafts), run B
+(4 slots, no drafts) and run B2 (4 slots, drafts), and Zig prod's 8 replies (part 4) equal run A's. Python prod's
+hashes are identical between 1 and 4 streams in both reps. Each engine is invariant to drafting, verify rows and row
+mode, so the difference is a fixed one.
+
+**The cause: where the prompt's last token runs.** Python's server never prefills a prompt's last token:
+`batch.py` `_pieces` prefills `[0, n - 1)`, `finals` makes `prompt[-1]` the slot's pending token, and `rounds.py`
+`finish_prompt(slot, n - 1, ...)` runs before the first verify window, whose row 0 is that token. That row is a decode
+row: decode kernels, decode routing with expert top-p 0.85 / min-k 3 (`PR.phase(False)`), and R1. Every Python
+reference the gates use (`dsv41_m2b_ref.py`, `dsv41_samp_ref.py`, `grammar_ref.py`, the slots `ref.py`,
+`dsv41_m1_capture.py`) calls `Forward.prompt`, which prefills all n rows: prefill kernels, every routed expert. Zig's
+own prefill mirrors `Forward.prompt` (the gates pass), and the served `GpuTarget.prefill` took the first choice from
+the last prefill row. So Zig's served path had the gates' shape, not the server's. One row's KV, ratio-2 carry, index
+key and first choice then differ (a whole top-p cut, not an ulp), and the replies drift from there. That fits 5/8
+equal on the thinking requests and 0/8 on the bench's distinct T0 prompts (384 tokens, more room to drift).
+
+**Ranked below it** (each with its evidence; none needs a change for these prompts):
+1. CED replay (`TF_DSV41_PREFILL=replay`, not ported). Python's `replay.py` and `test_dsv41_replay.py` show it equals
+   full prefill for prompts of 128 tokens or fewer (R0 = 0); every prompt here is 40-60 tokens. It still matters past
+   128 tokens (section 0e).
+2. `TF_DSV41_GM_V2=1`, `PF_DENSE=fused`, `MOE_BF16` and the other prefill knobs: the same bits by Python's own gates
+   (gate-eq, pfdense.py's proof). Zig part 4 had `PF_DENSE=fused` and gave the same replies as run A without it.
+3. RoCE vs NCCL (prod ran on NCCL because of the stale `/cache/roce-failed`): the exchanges carry bf16 values both
+   ways, a copy.
+4. Calibration, depth and the speculative pass: these choose drafts only, ruled out above.
+5. Engram: R3 reads the same shards and was gated against Python (pod 26, prompts 45 / 173). `ENGRAM_GATE` and
+   `ENGRAM_NATIVE` are exact by Python's design.
+6. Greedy ties: both take the lower id after the ranks' fp32 maxima, so only an exact fp32 tie could differ.
+
+**The fix (default on).**
+- `prod_knobs.PromptTail` / `TF_DSV41_PROMPT_TAIL` (rank 0's choice; the followers replay its operations):
+  - `verify` (default): the served target prefills `[0, n - 1)`. The last token then runs as the target's own decode
+    window (one slot, or row mode's `Batch.targetWindow`), with its greedy or keyed choice at the request's draw. The
+    window is left pending, as any chain window is: the next window keeps it, and `release` keeps it before a session
+    save.
+  - `prefill`: the old shape.
+- `promptSplit` is the one rule both shapes share.
+- `m2b.zig`'s `M2B_PREFILL` gate follows the reference's `ref.json` `prompt_tail`. `dsv41_m2b_ref.py
+  --prompt-tail verify` runs Python's server shape, and the M2c-2 kit passes it as `PROMPT_TAIL`.
+- The pod steps that replay `Forward.prompt` references through `generate` (samp, grammar, vision) pin
+  `TF_DSV41_PROMPT_TAIL=prefill`.
+- Checks: `test-dsv41-knobs` 5/5 (the reader and the split against `batch.py`'s rule). `check` cap15 / cap18 / cap22 /
+  cap24-1 / cap24-12 / cap24-16 and `dcheck cap16` give 0 mismatches; no emitter changed.
+- Speed note: the drafter's first ingest after a `verify` prompt sees one taps row (the window's). Its context restarts
+  there, as for a resumed session's prompt. Python's drafter sees the prompt's taps. The first rounds' acceptance may
+  dip; ingesting the prefill's taps before the tail window is the follow-up, if the numbers show it.
+
+#### NEXT SPARK WINDOW: proving the prompt tail (not run)
+
+The kit is built from the fix's commit or later. It also carries `tools/zig/dsv41_diverge/diverge.py` and the M4
+`prompts.txt`. Before any step, check the lease on dgx-01. `OUT=~/zig-window-kit/out/diverge` on dgx-01.
+
+0. **No downtime (prod up, about 4 min).** Get Python prod's exact ids (`return_token_ids`) for the 8 requests and the
+   bench's 8 T0 prompts, drafts on and off, then compare them with the night's recorded Zig ids:
+   ```
+   K=~/zig-window-kit; D="python3 $K/tools/zig/dsv41_diverge/diverge.py"; TOK=/home/dgx01/ai/models/dsv41-q28-v2/tokenizer.json
+   $D ask --url http://127.0.0.1:8000 --prompts $K/prompts.txt --bench --out $OUT/py.jsonl
+   $D ask --url http://127.0.0.1:8000 --prompts $K/prompts.txt --bench --no-draft --out $OUT/py-nd.jsonl
+   $D compare $OUT/py.jsonl $OUT/py-nd.jsonl --tokenizer $TOK       # expect 16/16: Python drafted == serial
+   $D fromtrace <night r0>/a/trace.jsonl --lines 42-49 --prompts $K/prompts.txt --out $OUT/zig-night.jsonl
+   $D compare <(head -8 $OUT/py.jsonl) $OUT/zig-night.jsonl --tokenizer $TOK   # 5/8; prints each first differing index
+   ```
+   Record the `first_differing` index and its context for 2 / 5 / 7. If `py != py-nd`, Python's served bits depend on
+   drafting. Stop there and report: Zig must then copy Python's window choices, which this fix does not do.
+1. **Zig prod with the fix** (the usual Zig-as-prod switch, `prod-zig.env`, a new image; fast boot about 375 s):
+   ```
+   $D ask --url http://127.0.0.1:8000 --prompts $K/prompts.txt --bench --out $OUT/zig.jsonl
+   $D ask --url http://127.0.0.1:8000 --prompts $K/prompts.txt --bench --no-draft --out $OUT/zig-nd.jsonl
+   $D compare $OUT/py.jsonl $OUT/zig.jsonl --tokenizer $TOK         # PASS = 16/16
+   $D compare $OUT/zig.jsonl $OUT/zig-nd.jsonl --tokenizer $TOK     # 16/16
+   ```
+2. **The A/B that names the cause.** Restart Zig prod with `TF_DSV41_PROMPT_TAIL=prefill` added to `prod-zig.env`
+   (remove it afterwards). Then `ask ... --out $OUT/zig-prefill.jsonl` and `compare $OUT/py.jsonl
+   $OUT/zig-prefill.jsonl`: expect the night's result again (the 8 requests 5/8, bench prompts differing). If step 1
+   is 16/16 and step 2 is not, the prompt tail is the cause, confirmed.
+3. **If step 1 is not 16/16**, the next difference is past the prompt. Name Zig's first token off Python's reply:
+   `$D trace $OUT/py.jsonl <zig server trace.jsonl of the same requests> --tokenizer $TOK --out $OUT/py-trace.jsonl`,
+   then `tf-dsv41-m1 generate /model /assets /out/py-trace.jsonl` through the M4 kit (`run_host.sh 0 OUT generate`,
+   rank 1 `follow`), `DRAFTS=1` then `DRAFTS=0`. Each line's `first_differing` is then Zig's first token off
+   Python's. The M4 server needs `TF_DSV41_TRACE_TOKENS` for the prompt ids (`run_host.sh` sets it).
+4. **The logits-level gate (optional, about 30 min, prod down):** the M2c-2 kit with `PROMPT_TAIL=verify PREFILL=1`
+   (`run_host.sh`). The reference runs Python's server shape, and Zig's `M2B_PREFILL` follows `ref.json`. PASS =
+   65/65 / 95/95 roles, the first token, and then 512/512 tokens and logits. This is the first gate whose reference is
+   the served shape.
+5. Prod back on perf1 (`scripts/v2-rollback.sh perf1`), as in every window. Keep `py*.jsonl`, `zig*.jsonl` and the
+   compare output in the quant repo's results.
 
 ### Spark window, 2026-10-07: outcome
 

@@ -28,6 +28,7 @@ const run = @import("run.zig");
 const fwd = @import("forward.zig");
 const eh = @import("engram_host.zig");
 const m2a = @import("m2a.zig");
+const pk = @import("prod_knobs.zig");
 const Value = std.json.Value;
 
 fn sha(bytes: []const u8) [64]u8 {
@@ -370,12 +371,18 @@ fn ownPrefill(gpa: std.mem.Allocator, io: std.Io, a: std.mem.Allocator, f: *fwd.
     const prompt = try a.alloc(u32, pids.len);
     for (prompt, pids) |*d, v| d.* = @intCast(v.integer);
     const t0 = std.Io.Clock.awake.now(io);
-    try f.prefill(prompt);
-    // the prompt's choice: the last chunk's last row
+    // the reference's shape (ref.json "prompt_tail", dsv41_m2b_ref.py --prompt-tail; older references: prefill):
+    // verify = Python's server, the last token as a one-row decode window kept after its choice
+    const shape: pk.PromptTail = if (meta.object.get("prompt_tail")) |v| std.meta.stringToEnum(pk.PromptTail, v.string) orelse return error.BadPromptTail else .prefill;
+    const sp = pk.promptSplit(prompt.len, shape);
+    try f.prefill(prompt[0..sp.prefill]);
+    if (sp.window > 0) try f.window(prompt[sp.prefill..]);
+    // the prompt's choice: the window's row, or the last chunk's last row
     const seg: usize = @intCast(f.opts.prefill_rows);
-    const last: usize = if (prompt.len % seg == 0) seg else prompt.len % seg;
+    const last: usize = if (sp.window > 0) sp.window else if (prompt.len % seg == 0) seg else prompt.len % seg;
     const picks = try a.alloc(u32, last);
     try f.greedy(picks);
+    if (sp.window > 0) try f.keep(0);
     try driver.check(driver.api.cuCtxSynchronize(), "cuCtxSynchronize");
     const secs = @as(f64, @floatFromInt(t0.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds())) / 1e9;
     var rep: PrefillReport = .{ .rows = prompt.len, .seconds = secs, .roles = 0, .equal = 0, .first_bad = "", .pos_ok = false, .tail_ok = false, .first = picks[last - 1], .want_first = @intCast(meta.object.get("tokens").?.array.items[0].integer) };
