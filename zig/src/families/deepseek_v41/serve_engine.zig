@@ -15,6 +15,7 @@ const ln = @import("draft/lanes.zig");
 const drive = @import("draft/drive.zig");
 const costs_mod = @import("draft/costs.zig");
 const tree = @import("draft/tree.zig");
+const calib_env = @import("draft/calib_env.zig");
 const m3 = @import("m3.zig");
 const ph = @import("phases.zig");
 const timed = @import("phases_timed.zig");
@@ -73,7 +74,12 @@ pub const Served = struct {
         s.io = io;
         s.m = m;
         s.nd = .{};
-        s.costs = try costs_mod.defaults(gpa, 64);
+        // draft pricing: prod's cached calibration (TF_DSV41_CALIB / _CALIB_DIR / _CALIB_FILE: Python's calib-*.json,
+        // shared as rank 0 shares it) and Python's depth knobs; without an entry for this engine, today's defaults
+        const cal = try calib_env.load(gpa, io, calib_env.Knobs.fromEnv(), .{ .slots = 1, .world = m.f.comm.world(), .dspark = m.pass != null, .context = @intCast(@min(context orelse m.f.opts.limit, m.f.opts.limit)) }, 64);
+        defer if (cal.path) |p| gpa.free(p);
+        s.costs = cal.costs;
+        std.log.info("dsv41 draft costs: {t}{s}{s}, verify 1 / 16 rows {d:.3} / {d:.3} ms, pass {d:.3} ms", .{ cal.source, if (cal.path != null) " " else "", cal.path orelse "", s.costs.windowMs(1), s.costs.windowMs(16), s.costs.draft });
         var pass = if (m.pass) |p| p.pass() else s.nd.pass();
         var tgt = m.gt.target();
         s.phases = try ph.Phases.fromEnv(gpa);
@@ -87,7 +93,7 @@ pub const Served = struct {
         }
         // draft trees (TF_DSV41_TREE / _DUP_MS / _ROWS, Python's knobs; off by default): first-position siblings
         const trees = if (m.pass != null) try tree.Settings.fromEnv() else tree.Settings{};
-        s.x = try ln.Lanes.init(gpa, tgt, pass, s.costs, .{ .shape = m3.shapeOf(&m.f), .slots = m.slots, .siblings = trees.siblings, .sib_rows = trees.sib_rows, .dup = trees.dup });
+        s.x = try ln.Lanes.init(gpa, tgt, pass, s.costs, .{ .shape = m3.shapeOf(&m.f), .slots = 1, .siblings = trees.siblings, .sib_rows = trees.sib_rows, .dup = trees.dup, .depth = try calib_env.depthSettings(&calib_env.env) });
         s.arena = std.heap.ArenaAllocator.init(gpa);
         s.cfg = try lanes.Config.init(gpa, try s.x.model(s.arena.allocator(), 64), 16, 15);
         // drafts sized from the cost tables, not the wall clock: a request drafts (and so verifies) the same whatever the
@@ -97,7 +103,7 @@ pub const Served = struct {
         s.core = lanes.Engine.init(gpa, &s.cfg, s.x.backend(), s.clock.clock());
         s.x.attach(&s.core);
         const window: u32 = @intCast(@min(context orelse m.f.opts.limit, m.f.opts.limit));
-        s.host = api.LaneHost.init(gpa, io, &s.core, .{ .name = "dsv41-cuda", .lanes = m.slots, .context_window = window, .prefill_step = m.gt.prefill_rows });
+        s.host = api.LaneHost.init(gpa, io, &s.core, .{ .name = "dsv41-cuda", .lanes = 1, .context_window = window, .prefill_step = m.gt.prefill_rows });
         // the lanes run on LaneHost's thread: the model's CUDA context must be current there
         s.host.on_thread = .{ .ctx = m, .run = bindContext };
         try s.host.start();
