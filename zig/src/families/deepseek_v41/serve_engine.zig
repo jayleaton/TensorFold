@@ -76,7 +76,7 @@ pub const Served = struct {
         s.nd = .{};
         // draft pricing: prod's cached calibration (TF_DSV41_CALIB / _CALIB_DIR / _CALIB_FILE: Python's calib-*.json,
         // shared as rank 0 shares it) and Python's depth knobs; without an entry for this engine, today's defaults
-        const cal = try calib_env.load(gpa, io, calib_env.Knobs.fromEnv(), .{ .slots = 1, .world = m.f.comm.world(), .dspark = m.pass != null, .context = @intCast(@min(context orelse m.f.opts.limit, m.f.opts.limit)) }, 64);
+        const cal = try calib_env.load(gpa, io, calib_env.Knobs.fromEnv(), .{ .slots = m.slots, .world = m.f.comm.world(), .dspark = m.pass != null, .context = @intCast(@min(context orelse m.f.opts.limit, m.f.opts.limit)) }, 64);
         defer if (cal.path) |p| gpa.free(p);
         s.costs = cal.costs;
         std.log.info("dsv41 draft costs: {t}{s}{s}, verify 1 / 16 rows {d:.3} / {d:.3} ms, pass {d:.3} ms", .{ cal.source, if (cal.path != null) " " else "", cal.path orelse "", s.costs.windowMs(1), s.costs.windowMs(16), s.costs.draft });
