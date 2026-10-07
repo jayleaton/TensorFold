@@ -145,6 +145,8 @@ pub const Model = struct {
         const r1 = if (std.c.getenv("TF_DSV41_R1")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
         m.f = fwd.Forward.init(gpa, &m.cfg, &m.widths, .{ .world = world, .expert_topp = topp, .r1 = r1, .taps = o.drafts }, &m.runner, comm);
         m.f.layers = backbone;
+        // M4 serves graphed decode windows unless TF_DSV41_GRAPHS=0 (every rank loads through here: they agree)
+        m.f.graphs_default = true;
         if (try kvs.optionsFromEnv(@intCast(m.f.opts.limit), world)) |ko| {
             try kvs.bootCheck(&m.ctx, &m.cfg, ko, m.tcfg.rank, world);
             m.f.kv = try kvs.Kv.init(gpa, &m.driver, &m.ctx, &m.cfg, ko, &m.runner, comm);
