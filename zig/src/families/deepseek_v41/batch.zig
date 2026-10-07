@@ -29,6 +29,7 @@ const rowmode = @import("rowmode.zig");
 const slots_mod = @import("slots.zig");
 const iface = @import("draft/iface.zig");
 const buffers = @import("buffers.zig");
+const samp = @import("sampling_gpu.zig");
 
 pub const Error = error{ BadWindow, NotAChain, RowsCap, BadPlan, TreeWindow, Sampling, Slots };
 
@@ -293,14 +294,16 @@ pub const Batch = struct {
     // -------------------------------------------------------------------------------------------------------------
     // draft/iface.zig's Target over row windows (target.zig's hooks)
 
-    /// Target.window: the segments as one round (several forwards when their rows pass the cap), each row's greedy
-    /// choice into `choices`.
-    pub fn targetWindow(b: *Batch, segments: []const iface.Segment, choices: [][]u32) !void {
+    /// Target.window: the segments as one round (several forwards when their rows pass the cap), each row's choice
+    /// into `choices`: greedy, or (T > 0, with `sampler`) the slot's keyed choices over its own rows. A forward's
+    /// segments sit back to back in "w.logits" rows [0, n), in segment order: segment i's rows are [a_i, a_i + len_i),
+    /// one GpuSampler.choose (one op_sample) each, after the forward's greedy (only when one of its segments is greedy).
+    pub fn targetWindow(b: *Batch, segments: []const iface.Segment, choices: [][]u32, sampler: ?*samp.GpuSampler) !void {
         if (segments.len == 0 or segments.len > 16) return error.Slots;
         var mix: [16]rowtab.Seg = undefined;
         for (segments, mix[0..segments.len]) |sg, *m| {
             if (sg.parents != null) return error.TreeWindow;
-            if (sg.sampling != null) return error.Sampling;
+            if (samp.sampled(sg.sampling) and sampler == null) return error.Sampling;
             if (sg.slot >= b.ss.n) return error.Slots;
             // a pending window must end where the segment starts (a chain never kept keeps every row)
             if (b.pend[sg.slot]) |p| if (sg.start != p.start + p.n) return error.NotAChain;
@@ -317,11 +320,17 @@ pub const Batch = struct {
                 n += sg.tokens.len;
             }
             try b.window(mix[rg[0]..rg[1]], ids[0..n], j > 0);
-            try b.f.greedy(picks[0..n]);
+            var greedy_rows = false;
+            for (segments[rg[0]..rg[1]]) |sg| greedy_rows = greedy_rows or !samp.sampled(sg.sampling);
+            if (greedy_rows) try b.f.greedy(picks[0..n]);
             var a: usize = 0;
             for (segments[rg[0]..rg[1]], choices[rg[0]..rg[1]]) |sg, ch| {
-                @memcpy(ch[0..sg.tokens.len], picks[a..][0..sg.tokens.len]);
-                a += sg.tokens.len;
+                const rows = ch[0..sg.tokens.len];
+                if (samp.sampled(sg.sampling))
+                    try sampler.?.choose(@intCast(a), @intCast(rows.len), sg.sampling.?, sg.draws, rows)
+                else
+                    @memcpy(rows, picks[a..][0..rows.len]);
+                a += rows.len;
             }
         }
     }
