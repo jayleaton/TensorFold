@@ -13,6 +13,7 @@ const iface = @import("draft/iface.zig");
 const lanes = @import("lanes");
 const fwd = @import("forward.zig");
 const sg = @import("sessions_gpu.zig");
+const batch = @import("batch.zig");
 const samp = @import("sampling_gpu.zig");
 const branches = @import("draft/branches.zig");
 
@@ -32,6 +33,9 @@ pub const GpuTarget = struct {
     own_prefill: bool = false,
     /// M5: the session store over the paged pool (null: every prompt from an empty slot, nothing kept)
     sessions: ?*sg.Sessions = null,
+    /// several live slots (TF_DSV41_SLOTS > 1, batch.zig): windows in row mode over every slot's segment, the prompt on
+    /// the activated slot (greedy chains; trees and sampling refused there by name)
+    rows: ?*batch.Batch = null,
     /// the keyed sampler (model.zig makes it on every rank): sampled choices; null refuses them (error.Sampling)
     sampler: ?*samp.GpuSampler = null,
     /// draft trees (`parents`): resolved as chain windows on the slot (draft/branches.zig), the last one kept by path
@@ -49,7 +53,7 @@ pub const GpuTarget = struct {
 
     fn prefill(p: *anyopaque, slot: u32, ids: []const u32, sampling: ?lanes.Sampling, draw: u64) anyerror!u32 {
         const t = self_(p);
-        if (slot != 0) return error.Slots;
+        if (t.rows) |b| try b.beginPrefill(slot) else if (slot != 0) return error.Slots;
         const keyed = try t.keyedOf(sampling);
         t.tree.clear();
         if (t.resume_first) |first| if (t.f.slot.pos == ids.len and t.f.slot.pending == null) return first;
@@ -88,6 +92,7 @@ pub const GpuTarget = struct {
 
     fn window(p: *anyopaque, segments: []const iface.Segment, choices: [][]u32) anyerror!void {
         const t = self_(p);
+        if (t.rows) |b| return b.targetWindow(segments, choices);
         if (segments.len != 1) return error.Slots;
         const s = segments[0];
         if (s.slot != 0) return error.Slots;
@@ -123,6 +128,7 @@ pub const GpuTarget = struct {
 
     fn keep(p: *anyopaque, slot: u32, path: []const u32) anyerror!void {
         const t = self_(p);
+        if (t.rows) |b| return b.keepPath(slot, path);
         if (slot != 0) return error.Slots;
         if (t.tree.live) return t.f.keep(try t.tree.keep(path));
         // a chain keeps rows 0..k: the forward commits row 0 + k accepted drafts
@@ -133,7 +139,7 @@ pub const GpuTarget = struct {
 
     fn taps(p: *anyopaque, slot: u32) iface.Taps {
         const t = self_(p);
-        _ = slot;
+        if (t.rows) |b| if (b.tapsOf(slot)) |x| return .{ .address = x.address, .rows = x.rows, .stride = @intCast(t.f.cfg.dspark_targets.items().len * t.f.cfg.hidden) };
         const n: u32 = if (t.f.slot.pending) |w| w.n else @intCast(t.f.ids.len);
         const D: u32 = t.f.cfg.hidden;
         const k: u32 = @intCast(t.f.cfg.dspark_targets.items().len);
@@ -155,6 +161,7 @@ pub const GpuTarget = struct {
 
     fn release(p: *anyopaque, slot: u32) void {
         const t = self_(p);
+        if (t.rows) |b| return b.release(slot) catch |e| std.log.err("dsv41 target: releasing slot {d} failed ({t})", .{ slot, e });
         if (slot != 0) return;
         t.tree.clear();
         if (t.sessions) |ss| {
