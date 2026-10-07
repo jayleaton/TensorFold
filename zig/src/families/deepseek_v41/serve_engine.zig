@@ -20,6 +20,7 @@ const spec = @import("draft/spec.zig");
 const m3 = @import("m3.zig");
 const ph = @import("phases.zig");
 const timed = @import("phases_timed.zig");
+const grammar_gpu = @import("grammar_gpu.zig");
 const Allocator = std.mem.Allocator;
 
 pub const backends: []const []const u8 = &.{"cuda"};
@@ -63,6 +64,9 @@ pub const Served = struct {
     phases: ?*ph.Phases = null,
     tt: timed.TimedTarget = undefined,
     tpass: timed.TimedPass = undefined,
+    /// TF_DSV41_GRAMMAR=1 (grammar_gpu.zig): the request grammars and the target that enforces them
+    gengine: ?*grammar_gpu.GrammarEngine = null,
+    gtarget: ?*grammar_gpu.GrammarTarget = null,
 
     /// Rank 0's engine over a loaded model (`drafts`: DSpark's pass, else serial windows through the same lanes).
     pub fn open(gpa: Allocator, io: std.Io, dir: []const u8, assets: []const u8, drafts: bool, context: ?i64) !*Served {
@@ -92,6 +96,18 @@ pub const Served = struct {
             tgt = s.tt.target();
             pass = s.tpass.pass();
         }
+        // structured output (TF_DSV41_GRAMMAR=1): the target cuts drafts and stages masks, the engine compiles requests
+        s.gengine = null;
+        s.gtarget = null;
+        if (m.grammar) |mk| {
+            const ge = try gpa.create(grammar_gpu.GrammarEngine);
+            ge.* = grammar_gpu.GrammarEngine.init(gpa, io, undefined, mk.g);
+            s.gengine = ge;
+            const gt = try gpa.create(grammar_gpu.GrammarTarget);
+            gt.* = try grammar_gpu.GrammarTarget.init(gpa, tgt, mk, ge);
+            s.gtarget = gt;
+            tgt = gt.target();
+        }
         // draft trees (TF_DSV41_TREE / _DUP_MS / _ROWS, Python's knobs; off by default): first-position siblings
         const trees = if (m.pass != null) try tree.Settings.fromEnv() else tree.Settings{};
         s.x = try ln.Lanes.init(gpa, tgt, pass, s.costs, .{ .shape = m3.shapeOf(&m.f), .slots = m.slots, .siblings = trees.siblings, .sib_rows = trees.sib_rows, .dup = trees.dup, .depth = try calib_env.depthSettings(&calib_env.env), .spec = if (m.pass != null) try spec.Settings.fromEnv() else .{} });
@@ -108,7 +124,8 @@ pub const Served = struct {
         // the lanes run on LaneHost's thread: the model's CUDA context must be current there
         s.host.on_thread = .{ .ctx = m, .run = bindContext };
         try s.host.start();
-        s.rec = Recorder.init(gpa, io, s.host.engine());
+        if (s.gengine) |ge| ge.inner = s.host.engine();
+        s.rec = Recorder.init(gpa, io, if (s.gengine) |ge| ge.engine() else s.host.engine());
         return s;
     }
 
@@ -137,6 +154,14 @@ pub const Served = struct {
             gpa.destroy(x);
         }
         s.rec.deinit();
+        if (s.gengine) |ge| {
+            ge.deinit();
+            gpa.destroy(ge);
+        }
+        if (s.gtarget) |gt| {
+            gt.deinit();
+            gpa.destroy(gt);
+        }
         s.core.deinit();
         s.cfg.deinit(gpa);
         s.arena.deinit();
@@ -160,7 +185,9 @@ pub const Recorder = struct {
     log: std.ArrayList(u8) = .empty,
 
     /// `sampling`: the request's own (seed included), so `tf-dsv41-m1 generate` replays a sampled reply as it was asked
-    const Rec = struct { r: *Recorder, sink: api.Sink, prompt: []u32, sampling: ?api.Sampling = null, out: std.ArrayList(u32) = .empty, drafted: u64 = 0 };
+    const Rec = struct { r: *Recorder, sink: api.Sink, prompt: []u32, sampling: ?api.Sampling = null, out: std.ArrayList(u32) = .empty, drafted: u64 = 0, structure: ?Structure = null };
+    /// a structured request's grammar (TF_DSV41_GRAMMAR), so `generate` replays it under the same grammar
+    const Structure = struct { kind: []const u8, text: []const u8 };
 
     pub fn init(gpa: Allocator, io: std.Io, inner: api.Engine) Recorder {
         return .{ .gpa = gpa, .io = io, .inner = inner, .path = if (std.c.getenv("TF_DSV41_TRACE_TOKENS")) |p| std.mem.span(p) else null };
@@ -175,6 +202,7 @@ pub const Recorder = struct {
 
     fn drop(r: *Recorder, x: *Rec) void {
         r.gpa.free(x.prompt);
+        if (x.structure) |st| r.gpa.free(st.text);
         x.out.deinit(r.gpa);
         r.gpa.destroy(x);
     }
@@ -205,6 +233,10 @@ pub const Recorder = struct {
         const x = r.gpa.create(Rec) catch return error.Busy;
         x.* = .{ .r = r, .sink = sink, .sampling = request.sampling, .prompt = r.gpa.dupe(u32, request.prompt) catch {
             r.gpa.destroy(x);
+            return error.Busy;
+        } };
+        if (request.structure) |st| x.structure = .{ .kind = @tagName(st.kind), .text = r.gpa.dupe(u8, st.text) catch {
+            r.drop(x);
             return error.Busy;
         } };
         {
@@ -241,7 +273,7 @@ pub const Recorder = struct {
     fn write(r: *Recorder, x: *const Rec) void {
         var line: std.Io.Writer.Allocating = .init(r.gpa);
         defer line.deinit();
-        std.json.Stringify.value(.{ .prompt = x.prompt, .tokens = x.out.items, .drafted = x.drafted, .sampling = x.sampling }, .{}, &line.writer) catch return;
+        std.json.Stringify.value(.{ .prompt = x.prompt, .tokens = x.out.items, .drafted = x.drafted, .sampling = x.sampling, .structure = x.structure }, .{}, &line.writer) catch return;
         line.writer.writeByte('\n') catch return;
         r.log.appendSlice(r.gpa, line.written()) catch return;
         std.Io.Dir.cwd().writeFile(r.io, .{ .sub_path = r.path.?, .data = r.log.items }) catch {};
