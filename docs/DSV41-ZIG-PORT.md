@@ -96,7 +96,7 @@ Five agents work on `dsv41-zig` at once toward one combined pod gate and one Spa
 **Interface rules.**
 - **Plan-link operation numbers** (`forward.zig`): 1–11 are taken (window, greedy, keep, stop, ds_ingest, ds_propose, prefill, sess_save, sess_restore, release, ds_reset). Reserve new ones by appending to this list in this section, in the same commit that adds them:
   - 12–15: `dsq-zig-samp-1` (12 taken: `op_sample`, `[op, row0, n, T, top_k, top_p, min_p]`);
-  - 16–19: `dsq-zig-slots-1` (16 `op_select`, 17 `op_rows`, 18 `op_rows_keep`, 19 `op_rows_drop`: `slots.zig`);
+  - 16–19: `dsq-zig-slots-1`;
   - 20–23: `dsq-zig-trees-1` (20: `op_tree_drop`, `Forward.drop`);
   - 24–27: `dsq-zig-speed-1` (none used: its hooks ride on `op_ds_propose`).
 - **Defaults.** Every new behaviour is behind a knob or a new code path, and defaults to today's. With every new knob off, the gates `check cap24-*/cap15/cap18/cap22` and `dcheck cap16` still give 0 mismatches. Run `tf-dsv41-m1 m5-emit cap18` before committing a change to an emitter.
@@ -189,10 +189,34 @@ Five agents work on `dsv41-zig` at once toward one combined pod gate and one Spa
     - The served comparison: `bench_http.py` on Zig with `TF_DSV41_PHASES=1`, and Python's m2bench with `TF_DSV41_PHASES=1` on the same prompts, then `gap.py phases`.
 - `dsq-zig-trees-1` (draft trees on the GPU target; design below):
   - **`M2B_LANES=4`** (`M1_JOB=m2b`, 2 GPUs, about 4 min after the shared load): lanes with first-position trees (2 siblings) and the tree oracle's drafts over the GPU target at TP=2. Rank 0's tokens must equal the reference's serial greedy tokens, with trees > 0 and 0 < sibling wins < trees. Expected lines: `PASS M3 lanes mode 4 rank 0: tokens 64/64 equal, drafted N, accepted M, trees T, sibling wins W, ...` and `PASS M3 lanes mode 4 rank 1`. `m3-4/m3-rank0.json` also records `chains` and `rerun_rows`. No new assets.
-  - **`M2B_LANES=3` with `TF_DSV41_TREE=3`** (about 4 min): DSpark's own siblings (gathered `[block, 128]` candidates) through the same path. The gate is tokens equal and drafted > 0. On the 0–24 prefix the taps are zeros, so the tree counts are informational. `job.sh` runs one mode list with one environment, so this needs its own mode token. The suggested hook is `3t` → `M2B_LANES=3 TF_DSV41_TREE=3`, with the result dir `m3-3t`.
-  - **Pool and split with trees:** the `M2B_M4=1` step again, with `TF_DSV41_TREE=3 TF_DSV41_POOL_TOKENS=<the M5 step's> TF_DSV41_KV_SPLIT=1` added to `m4env`. It checks HTTP == CLI with drafts, and drafts == serial. Trees use no private pages (below), so this checks `Forward.drop` against the pool's reserved pages and split's exchange.
+  - **`M2B_LANES=3` with `TF_DSV41_TREE=3`** (about 4 min): DSpark's own siblings (gathered `[block, 128]` candidates) through the same path. The gate is tokens equal and drafted > 0. On the 0–24 prefix the taps are zeros, so the tree counts are informational. Run it as the mode token `3t` in `M2B_LANES` (for example `M2B_LANES="1 2 3 3t 4"`): `job.sh` runs it as `M2B_LANES=3 TF_DSV41_TREE=3`, port 29733, results in `m3-3t`.
+  - **Pool and split with trees:** the `M2B_M4=1` step again, with `M2B_M4_ENV="TF_DSV41_TREE=3 TF_DSV41_POOL_TOKENS=<the M5 step's> TF_DSV41_KV_SPLIT=1"`. It checks HTTP == CLI with drafts, and drafts == serial. Trees use no private pages (below), so this checks `Forward.drop` against the pool's reserved pages and split's exchange.
   - **Spark window (whole model):** M4 with `TF_DSV41_TREE=3` against Python prod's engine with `TF_DSV41_TREE=3` on the same 8 prompts, at the same calibration table. Tokens must be equal. Drafted, accepted, rounds, trees and sibling wins should be close to Python's, not identical: the host `_chain` order is fp32 (as for chains).
-  - Host: `zig build test-dsv41-draft` (`branches_test.zig`).
+  - **Draft pricing from prod's calibration (`draft/calib_env.zig`):**
+    - On the pod, in the `M2B_M4=1` step (no extra minutes), add `M2B_M4_ENV="TF_DSV41_CALIB_FILE=/workspace/<prod's calib-*.json>"`. The asset is prod's newest `/cache/dsv41-calib/calib-*.json`, copied read-only from the Spark cache volume `dsv41-tf-cache`, with world 2, DSpark on and 4 slots.
+    - `m4/server.log` must show `dsv41 draft costs: cached <that file>, verify 1 / 16 rows <ms> / <ms> ms, pass <ms> ms`, with the file's values after the microsecond round trip. HTTP == CLI must still hold, with the same drafted counts, because the requests are priced from the same table.
+    - Without the knob the line reads `default`, which is today's behaviour.
+  - **Spark window, the pricing check:** run Zig's M4 with prod's own knobs, `TF_DSV41_CALIB=real TF_DSV41_CALIB_DIR=/cache/dsv41-calib`, and the cache volume mounted. It reads the table prod's last boot stored. Then compare drafted, accepted and rounds on the 8 prompts against prod with drafts on, at the same seed and knobs.
+    - Tokens must be equal.
+    - The counts should be close, not identical, because the host chain sums in a different fp32 order. They were not comparable before this, since Zig priced from `depth.default_costs`.
+  - Host: `zig build test-dsv41-draft`:
+    - `branches_test.zig`;
+    - `calib_env_test.zig`, against `fixtures/calib-golden.json` from `tools/calib_golden.py` run on prod's 8474f31 `calib.py` / `depth.py`. It checks the same entry picked from a directory, the same shared table bit for bit, and 400 depth / tree choices equal.
+
+**Draft pricing (`draft/calib_env.zig`).** The served engine prices drafts as prod does, with Python's knob names. Followers price nothing: the lanes run on rank 0 only.
+- **Modes (`TF_DSV41_CALIB`):**
+  - `cached` (the default) reads Python's stored `calib-<key>.json` from `TF_DSV41_CALIB_DIR`, by default `~/.cache/tensorfold/dsv41-calib`.
+  - `real` is prod's mode: it measures at every boot and stores the table. Zig does not measure, so `real` reads the newest stored table.
+  - `default` uses `depth.default_costs`.
+- **Picking the entry:** Python's key hashes its own image digest, which Zig cannot reproduce. So the entry is picked by the `meta.shape` stored with it:
+  - the same world and DSpark setting;
+  - at least as many slots as ours (prod's 4-slot table prices a 1-slot engine's rows the same);
+  - then, in order: the same slots, the same context, the newest.
+  - `TF_DSV41_CALIB_FILE` names one entry outright. It is Zig's own knob, with no Python twin.
+- **The values:** the table goes through `Costs.encode` / `decode` (microsecond ints, half to even), as rank 0 shares it. The depth then prices with prod's exact bits.
+- **Depth knobs:** read with Python's names: `TF_DSV41_DEPTH`, `_DRAFT_DEPTH`, `_DRAFT_SKIP`, `_DEPTH_JOINT`, `_DEPTH_FAIR`, `_DEPTH_HOST_MS`, `TF_DSV41_GRAPH_ROWS_MAX`.
+- **No matching entry:** today's 64-row defaults are used.
+- **Hook:** `serve_engine.zig`, one commit. The shape passes `slots = 1`. When several slots land, it should pass `m.slots`.
 
 **Draft trees on the GPU target (`dsq-zig-trees-1`, `draft/branches.zig`).** Python's `tree.py` runs each sibling branch as its own chain window on a shadow slot. The shadow holds a copy of the slot's rings and carries, and gets private pages under the window. Ours runs the branches on the slot itself, lazily, as chain windows:
 - the window first runs the chain of first children from row 0;
@@ -213,24 +237,6 @@ The hooks:
 - `m2b.zig`: mode 4.
 
 `iface.Taps.map` maps the tree's rows to the last chain's taps rows for lanes' ingest. Parent-conditioned trees (`TF_DSV41_TREE_PC=1`) are refused by name.
-
-### 0b. Several live slots and row buckets (`dsq-zig-slots-1`)
-
-`TF_DSV41_SLOTS=N` (1 by default: today's one-slot path, nothing changes) gives the GPU path N live slots with batched decode windows, as Python's batcher runs them (row mode, G8: `rowtab.py`, `rowmode.py`, `rowgraphs.py`). It needs the paged pool (`TF_DSV41_POOL_TOKENS`); the contiguous slot is refused by name.
-
-- **Files:**
-  - `rowtab.zig`: the row table. One int64 column each for ids, pos, rslot, wslot, prev and src, then an int32 copy of rslot for split KV's exchange. Also the buckets (1–8, 12, 16, 24, 32, 48, 64), the padding (rows mirror the last real row and write nothing), the checks, and the packing of a mix into forwards under the row cap.
-  - `rowmode.zig`: the row program, as a rewrite of `block.emit`'s window at R rows, its end at the context bucket's end. POS / SL / ROWS / PTS / PREV / OFF in `_rope`, `_kv_store`, `_pool_norm`, `_index_k` and `_scores`, and pos / sl / pts in the CUDA attention and top-k, all as `compress.py` / `index.py` / `attn_cuda.py` pass them in row mode. The stacked roles are sized for S slots. A Triton call with row knobs it does not know is refused (`UnknownRowsCall`); a union exchange is refused (`UnionInRows`). `block.zig` is unchanged, so the M1 / M5 emit gates are untouched.
-  - `slots.zig`: `SlotSet`. The stacked roles are the SWA rings (`s.L<i>.swa.*`, S x ring rows), the ratio-2 carries (`s.L<i>.carry`, [S, 2D]) and the page tables (`s.kv.pt` / `s.kv.ct`, [S, pts]). `activate(s)` points the one-slot roles at slot s's views and loads its `Forward.Slot`, so prefill / release run on slot s unchanged; the leader sends `op_select` first.
-  - `batch.zig`: `Batch`, the batched window. It keeps pending windows, maps every slot's pages, stages the row table and the Engram rows (pinned halves), then runs the row program eagerly or through the row graph cache keyed (bucket rows, context bucket). Each slot's window stays pending until `keep(slot, accepted)`, which rolls the carry from that slot's accepted row into its carry row and moves its tail and position. A round whose rows pass the cap runs as several forwards; the earlier forwards' projection rows are stashed for their keeps.
-  - `slots_cli.zig`: `tf-dsv41-m1 slots PACK ASSETS TRACE`, the gate (below). `rows_test.zig`: `zig build test-dsv41-rows`.
-- **Knobs:** `TF_DSV41_SLOTS` (1–16, every rank the same), `TF_DSV41_ROWS_CAP` (16: a bucket, the rows a forward takes; `block.emit`'s decode path is gated up to 16 rows, `mhc_cuda`'s MAXR), `TF_DSV41_GRAPHS` (row graphs, with the forward's default: on in M4; one-slot graphs stay off with several slots).
-- **Hooks** (one commit each): `kv_state.zig` (`Options.slots`, `Kv.slots`, `select`); `forward.zig` (`Forward.ext`: a follower hands op numbers it does not know to the workstream); `target.zig` (`rows`: window / keep / taps / release go to `Batch`, prefill activates the slot); `model.zig` (`slots`, `openRows`, the row programs in the buffer plan); `serve_engine.zig` (lanes slots and LaneHost admission = `m.slots`); `m1_main.zig` (`slots`); `zig/build/cuda.zig` (`test-dsv41-rows`).
-- **Not yet with several slots** (each refused by name): sessions (`sessions_gpu.zig` snapshots one slot's roles: not opened), draft trees and keyed sampling in row windows (`TreeWindow` / `Sampling`), DSpark drafting (`dspark_gpu.zig` is one slot: run `TF_DSV41_DRAFTS=0`). Engram rows come through the forward's source (`Host.windowRows`: R3's table or M2a's index rows), per segment with its slot's tail. Mixes over 16 rows run as several forwards; 24–64-row forwards need `block.emit`'s >16-row decode path (Triton mHC above `mhc_cuda`'s 16 rows).
-- **Host gate:** `zig build test-dsv41-rows`, 13/13. It covers the table against Python's `plan_rows` example; checks, packing and layout; and the whole backbone window (paged and split pool, R1 on and off, R 1 / 4 / 12 / 16) through the real `block.emit` + `transform`. In that window every CSA2 step reads the table's columns, NK is the context bucket's, the attention / top-k get pos / rslot / pts, and the plan's stacked roles are S x one slot's while every other role is unchanged.
-- **Pod step** (TWO GPUs, inside `M1_JOB=m2b` after the pack copy; `source tools/zig/dsv41_slots/job.sh; slots_gate`, with `SLOTS_PYSRC` = a Python tree with `rowgraphs` / `slots`, e.g. the decode1 twin's src with its `TORCH_EXTENSIONS_DIR`). About 14 min for the reference (one TP=2 load of layers 0–`$hi`, 4 prompts x 64 tokens, the row buckets warmed), then about 4 x 5 min:
-  1. `slots-ref`: `ref.py` writes `trace.jsonl`, `ref.json`, `rope.bin` and `aot/`, including the row-mode Triton variants (`ROWS`, int64 POS, SL / PTS) for every bucket up to 16. `slots-engram-host` writes `engram-host.bin`.
-  2. `slots-s4-eager`, `slots-s4-graphs`, `slots-s2-graphs`, `slots-s1`: `ranks.sh`, our two ranks serving the trace (`TF_DSV41_SLOTS` 4 / 4 / 2 / 1, `TF_DSV41_GRAPHS` 0 / 1 / 1 / 0, `TF_DSV41_DRAFTS=0`, `TF_DSV41_POOL_TOKENS=18432`, `TF_DSV41_LAYERS=0-$hi`). Expected in each `rank0.log`: `PASS slots batched == Python: 4/4`, `PASS slots alone == Python: 4/4`, `PASS slots batched == alone: 4/4`. s4-eager against s4-graphs is graphs off == on; s1 is today's path against the same trace.
 
 ## 1. How the Zig engine is built
 
