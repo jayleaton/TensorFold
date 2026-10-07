@@ -341,11 +341,13 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
              step m2b-graphs "$mb" bash "$Z/tools/zig/dsv41_m1/m2b_ranks.sh" "$Z/bin/tf-dsv41-m1" "$LP" "$R0" "$RES/m2b-graphs") \
                 || rc=1
         fi
-        # M2B_LANES ("1 2"): M3's gates, the same reference through lanes on rank 0 (1: drafts off; 2: oracle drafts)
+        # M2B_LANES ("1 2"): M3's gates, the same reference through lanes on rank 0 (1: drafts off; 2: oracle drafts;
+        # 3: DSpark's GPU pass; 4: draft trees with the tree oracle; 3t: mode 3 with DSpark's trees, TF_DSV41_TREE=3)
         for k in $LANES_MODES; do
             mb=$(left); (( mb > 8 )) && mb=8
             (( mb >= 3 )) || { echo "m3-$k skipped: $mb min left" | tee -a "$RES/steps.txt"; rc=1; continue; }
-            (export M2B_LANES=$k M2B_PORT=$(( 29720 + k ))
+            m=${k%t}; tree=0; [[ "$k" == *t ]] && tree=3
+            (export M2B_LANES=$m M2B_PORT=$(( 29720 + m + (tree > 0 ? 10 : 0) )) TF_DSV41_TREE=$tree
              step "m3-$k" "$mb" bash "$Z/tools/zig/dsv41_m1/m2b_ranks.sh" "$Z/bin/tf-dsv41-m1" "$LP" "$R0" "$RES/m3-$k") \
                 || rc=1
         done
@@ -387,6 +389,9 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
         m4env=(TF_TP_WORLD=2 TF_DSV41_ASSETS="$A" TF_DSV41_LAYERS="0-$hi" TF_DSV41_GRAPHS=1 TF_DSV41_OWN_PREFILL=1
                TF_DSV41_FAILFAST=0 TF_DSV41_EXPERT_TOPP=${M2B_TOPP:-0.85})
         [[ "$A" == "${REF1:-}" ]] && m4env+=(TF_DSV41_R1=1)
+        # M2B_M4_ENV ("K=V ..."): more knobs on every M4 process, e.g. TF_DSV41_CALIB_FILE=<prod's calib-*.json> (the
+        # served drafts priced by prod's table) or TF_DSV41_TREE=3 TF_DSV41_POOL_TOKENS=... TF_DSV41_KV_SPLIT=1
+        [[ -n "${M2B_M4_ENV:-}" ]] && read -ra extra_m4 <<< "$M2B_M4_ENV" && m4env+=("${extra_m4[@]}")
         m4dir=$RES/m4; mkdir -p "$m4dir"
         follow() { env "${m4env[@]}" TF_TP_RANK=1 TF_TP_DEVICE=1 TF_TP_PORT=$1 "$Z/bin/tf-dsv41-m1" follow "$LP" "$A" > "$m4dir/follow-$2.log" 2>&1; }
         mb=$(left)
