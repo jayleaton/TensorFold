@@ -112,7 +112,7 @@ pub const Batch = struct {
             }
         }
         if (s.on) {
-            b.g = undefined;
+            b.g = @as(Graphs, undefined); // non-null, payload set by init (a bare undefined leaves the optional's tag undefined: ReleaseSafe's .? panics)
             try b.g.?.init(f, s);
             std.log.scoped(.dsv41).info("row graphs: on, buckets up to {d} rows, context buckets of {d}", .{ cap, s.bucket });
         }
