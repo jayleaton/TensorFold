@@ -229,7 +229,7 @@ Five agents work on `dsv41-zig` at once toward one combined pod gate and one Spa
 - **The values:** the table goes through `Costs.encode` / `decode` (microsecond ints, half to even), as rank 0 shares it. The depth then prices with prod's exact bits.
 - **Depth knobs:** read with Python's names: `TF_DSV41_DEPTH`, `_DRAFT_DEPTH`, `_DRAFT_SKIP`, `_DEPTH_JOINT`, `_DEPTH_FAIR`, `_DEPTH_HOST_MS`, `TF_DSV41_GRAPH_ROWS_MAX`.
 - **No matching entry:** today's 64-row defaults are used.
-- **Hook:** `serve_engine.zig`, one commit. The shape passes `slots = 1`. When several slots land, it should pass `m.slots`.
+- **Hook:** `serve_engine.zig`, one commit. The shape passes the served slots (`m.slots`).
 
 **Draft trees on the GPU target (`dsq-zig-trees-1`, `draft/branches.zig`).** Python's `tree.py` runs each sibling branch as its own chain window on a shadow slot. The shadow holds a copy of the slot's rings and carries, and gets private pages under the window. Ours runs the branches on the slot itself, lazily, as chain windows:
 - the window first runs the chain of first children from row 0;
