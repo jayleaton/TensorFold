@@ -485,11 +485,12 @@ Logs are in the quant repo: `results/20261007-fix29-pod29` (pod 29, tree 4d91532
 | prod knobs: `PREFILL_ROWS` 1,024 / 512 | not run: `MissingTritonVariant _kv_store` (the knobs gate has no Python load, and the reference ran 2,048-row segments) | gate-asset gap only; prod and the kit use 2,048 |
 | prod knobs: `INDEX_BUDGET_MIB=64` | **PASS** (30) | |
 | prod knobs: read-ahead, all together | skipped (they need `M2B_ENGRAM` shards) | |
+| x3gm v2 prefill (`M2B_GM2PF`, captures only) | inconclusive (30): `same.py` PASS (Python's v2 == v1: 5 routed partials, 4 phase ends, 0 differ); `check` / `both` on the v2 capture: 83 mismatches, all argument counts of R1's calls (`mhc_cuda.run` 24 vs 26, `attn` 23 vs 25, `route` 20 vs 21, `_prune` 14 vs 15): the capture ran prod's knobs with R1 and the check inferred v2 from the launches but not R1. The prefill's first 49 calls were equal | fix: the M1 check reads R1 from the launches as it does v2; then rerun the replay. `GM_V2` stays off |
 
 Pod-side lessons for anyone running pods: the shared `runpod/idle-guard.sh` deletes a pod whose container log is unchanged 60 min (pod 29 at 19:40): a job driven over ssh must write a heartbeat to `/proc/1/fd/1`. `vision_kernels.zig` did not compile with `dsv41_vision.fatbin` embedded (Zig 0.17: `field_names`), fixed `8278ede`.
 
 **For the overnight run (`dsq-zig-night-1`):**
-- **Rebuild the kit from HEAD at or after `a36c4c2`** (the row graphs' boot panic: runs B and B2 crash at boot on e19bb41's binaries).
+- **Rebuild the kit from HEAD at or after `a36c4c2`** (the row graphs' boot panic: runs B and B2 crash at boot on e19bb41's binaries). A kit already built from `77bafde` (with the fix; the same sm_121 fatbins) is at `~/Documents/Projects/spark-work/zig-window-kit-next`, checksums verified; its RUNBOOK.md carries pod 30's feature table and the `R1=0` fallback.
 - If an R1 run dies with an illegal address (the 4-row `mhc_cuda` fault above), rerun it with `R1=0`.
 - Kit knobs: keep `IMAGES` off (the tower is not bit-exact); `GRAMMAR=1`, `PF_DENSE=fused` and the 64 MiB index budget are gated (PASS here); `SLOT_DRAFTS=1` is gated eager.
 - Long prompts (run C) have no GPU gate yet: run C is their first GPU run.

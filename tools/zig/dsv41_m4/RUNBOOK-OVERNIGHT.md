@@ -62,12 +62,14 @@ One overnight window, the whole model at TP=2 over RoCE. It runs everything gate
 
 **Features behind a knob, off in this kit until their pod gate passes** (both ranks alike; turn one on by adding its knob to every `run_m4.sh` command of a run):
 
-| feature | knob | pod gate |
+| feature | knob | pod gate (pod 30, 2026-10-07) |
 |---|---|---|
-| structured output (grammar) | `GRAMMAR=1` | `M2B_GRAMMAR` (pod 30, not run yet) |
-| images, with prod's image routing bias | `IMAGES=native BIAS_VL=1` | `M2B_VISION` (pod 30, not run yet) |
-| x3gm v2 prefill (+7 % prefill at 8K–32K) | `GM_V2=1` | `M2B_GM2PF` (pod 30, not run yet) |
-| fused dense prefill, Engram read-ahead | `PF_DENSE=fused PREFETCH_AHEAD=1` | `M2B_KNOBS` (pod 30, not run yet) |
+| structured output (grammar) | `GRAMMAR=1` | **PASS**: 6/6 replies == Python, drafts on and serial |
+| fused dense prefill | `PF_DENSE=fused` | **PASS**: 65/65 roles, 64/64 tokens + logits |
+| multi-slot drafting (run B2) | `SLOT_DRAFTS=1` | **PASS** eager (4/4 batched == alone == Python); row graphs' boot panic fixed in `a36c4c2` (this kit has it) |
+| images, with prod's image routing bias | `IMAGES=native BIAS_VL=1` | **FAIL**: the tower is not bit-exact (0/3 images). **Leave off** |
+| x3gm v2 prefill | `GM_V2=1` | inconclusive (the check missed R1's arguments; Python's v2 == v1 bits). **Leave off** |
+| Engram read-ahead | `PREFETCH_AHEAD=1` | not run (needs the shards). Leave off |
 | several slots with sessions | none yet | not built (refused with `SLOTS` > 1) |
 
 Long prompts past 4,096 keys (run C's `CONTEXT`) are host-gated, and their pod gate (`M2B_LONGPF`) is also on pod 30. Run C is where they first run on GPUs.
@@ -78,6 +80,8 @@ Long prompts past 4,096 keys (run C's `CONTEXT`) are host-gated, and their pod g
 - `T0 replies equal: N/M` compares Zig's greedy replies with prod's text for text. **Equal only for prompts of 128 tokens or fewer:** prod prefills with CED bounded replay (`TF_DSV41_PREFILL=replay`), which Zig has not ported. Zig runs full prefill, which is Python's `PREFILL=full`. The bench's code and prose prompts are short. Differences on longer prompts are expected and are not a Zig bug.
 - Long context: prompt tok/s (prompt tokens over the time to the first token) and the 128-token answer's decode tok/s, against prod's. Replies differ for the same reason.
 - `out/a/phases.json` and `out/b2/phases.json`: Zig's per-round phase times.
+
+**R1's 4-row fault (pods 29 / 30, sm_120):** `mhc_cuda.run` faults at 4-row R1 windows on the pods (1- and 2-row windows run; Python's launch of the same kernel does not fault). The Sparks served R1 with drafts on 2026-10-07 without it. If a run dies with `CudaFailed` / an illegal address, restore that run's containers and rerun it with `R1=0` on both ranks; record which.
 
 **On failure (beyond restore):**
 - **Exit 3 at a start:** the lease is held. Wait; touch nothing.
