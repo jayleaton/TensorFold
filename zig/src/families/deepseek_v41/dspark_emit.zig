@@ -38,42 +38,44 @@ pub fn blocks(cfg: *const Config, out: []u32) []u32 {
     return out[0..k];
 }
 
-/// "w.ds.i64" / "w.ds.i32" (DraftInputs' l64 / l32 for one slot of `n` rows): element offsets.
+/// "w.ds.i64" / "w.ds.i32" (DraftInputs' l64 / l32 for one slot of `n` rows): element offsets. `lay`: a pass over
+/// several slots (dspark_slots.zig), its arrays placed by `Layout.of`; only the arrays the launches read are placed.
 pub const Statics = struct {
     n: i64,
     window: i64,
-    pub fn ids(_: Statics) i64 {
-        return 0;
+    lay: ?Layout = null,
+    pub fn ids(s: Statics) i64 {
+        return if (s.lay) |l| l.ids else 0;
     }
     pub fn positions(s: Statics) i64 {
-        return s.n;
+        return if (s.lay) |l| l.positions else s.n;
     }
     pub fn ipar(s: Statics) i64 {
         return 2 * s.n;
     }
     pub fn readRows(s: Statics) i64 {
-        return 2 * s.n + 4;
+        return if (s.lay) |l| l.read else 2 * s.n + 4;
     }
     pub fn writeRows(s: Statics) i64 {
-        return 3 * s.n + 4;
+        return if (s.lay) |l| l.write else 3 * s.n + 4;
     }
     pub fn len64(s: Statics) i64 {
-        return 4 * s.n + 4;
+        return if (s.lay) |l| l.len64 else 4 * s.n + 4;
     }
     pub fn start(_: Statics) i64 {
         return 0;
     }
-    pub fn tokens(_: Statics) i64 {
-        return 1;
+    pub fn tokens(s: Statics) i64 {
+        return if (s.lay) |l| l.tokens else 1;
     }
     pub fn counts(s: Statics) i64 {
-        return 1 + s.n * s.window;
+        return if (s.lay) |l| l.counts else 1 + s.n * s.window;
     }
     pub fn lo(s: Statics) i64 {
-        return 1 + s.n * s.window + s.n;
+        return if (s.lay) |l| l.lo else 1 + s.n * s.window + s.n;
     }
     pub fn hi(s: Statics) i64 {
-        return 1 + s.n * s.window + 2 * s.n;
+        return if (s.lay) |l| l.hi else 1 + s.n * s.window + 2 * s.n;
     }
     pub fn anchor(s: Statics) i64 {
         return 1 + s.n * s.window + 3 * s.n;
@@ -82,13 +84,60 @@ pub const Statics = struct {
         return 2 + s.n * s.window + 3 * s.n;
     }
     pub fn len32(s: Statics) i64 {
-        return 5 + s.n * s.window + 3 * s.n;
+        return if (s.lay) |l| l.len32 else 5 + s.n * s.window + 3 * s.n;
     }
 };
+
+/// A pass over `slots` slots of `n` rows each: the launches' arrays back to back, each placed at the same address
+/// residue (mod 16 bytes) as the one-slot pass's, so every Triton launch keeps its one-slot specialization (the AOT
+/// set's variant: pointer alignment, ints never 1 or a multiple of 16 below 16 rows).
+pub const Layout = struct {
+    ids: i64,
+    positions: i64,
+    read: i64,
+    write: i64,
+    len64: i64,
+    tokens: i64,
+    counts: i64,
+    lo: i64,
+    hi: i64,
+    len32: i64,
+    /// the i32 elements the launches read (staged up to here: the role ends here)
+    end32: i64,
+
+    /// The first offset >= `at` with the one-slot offset's residue mod `m` elements.
+    fn place(at: i64, one: i64, m: i64) i64 {
+        return at + @mod(one - at, m);
+    }
+
+    pub fn of(slots: i64, n: i64, window: i64) Layout {
+        const one: Statics = .{ .n = n, .window = window };
+        const R = slots * n;
+        var l: Layout = undefined;
+        // DraftInputs' arrays in its order and sizes (the chain's parameters, starts and anchors kept as gaps)
+        l.ids = place(0, one.ids(), 2);
+        l.positions = place(l.ids + R, one.positions(), 2);
+        l.read = place(l.positions + R + 4 * slots, one.readRows(), 2);
+        l.write = place(l.read + R, one.writeRows(), 2);
+        l.len64 = l.write + R;
+        l.tokens = place(slots, one.tokens(), 4);
+        l.counts = place(l.tokens + R * window, one.counts(), 4);
+        l.lo = place(l.counts + R, one.lo(), 4);
+        l.hi = place(l.lo + R, one.hi(), 4);
+        l.end32 = l.hi + R;
+        l.len32 = l.end32 + 4 * slots;
+        return l;
+    }
+};
+
+/// Several slots' DSpark state: every block's ring holds `ring_slots` rings back to back (Python's stacked rings, G8);
+/// an ingest writes slot `slot`'s ring from `taps_role` (batch.zig's stash when a later forward overwrote "w.taps").
+pub const Slots = struct { ring_slots: i64 = 1, slot: i64 = 0, taps_role: []const u8 = "w.taps" };
 
 const Ds = struct {
     e: *E,
     st: Statics,
+    sl: Slots = .{},
 
     fn cfg(d: *const Ds) *const Config {
         return d.e.cfg;
@@ -102,9 +151,18 @@ const Ds = struct {
         return d.e.view(.{ .buf = "w.ds.i32" }, .i32, shape, stride, 4 * at);
     }
 
-    fn ring(d: *Ds, L: u32) ![2]Arg {
+    /// The block's rings, every slot's (a pass: rows of the stacked ring), or (`one`) slot `sl.slot`'s ring alone.
+    fn ring(d: *Ds, L: u32, one: bool) ![2]Arg {
         const r = ringRows(d.cfg());
-        return .{ try d.e.buf("s.L{d}.ring.v", .{L}, .u8, &.{ r, 576 }), try d.e.buf("s.L{d}.ring.s", .{L}, .u8, &.{ r, 8 }) };
+        const e = d.e;
+        if (one and d.sl.ring_slots > 1) {
+            const v = try e.fmt("s.L{d}.ring.v", .{L});
+            const s = try e.fmt("s.L{d}.ring.s", .{L});
+            // a view at the slot's ring (the pass's calls size the stacked role)
+            return .{ try e.view(.{ .buf = v }, .u8, &.{ r, 576 }, &.{ 576, 1 }, d.sl.slot * r * 576), try e.view(.{ .buf = s }, .u8, &.{ r, 8 }, &.{ 8, 1 }, d.sl.slot * r * 8) };
+        }
+        const rr = d.sl.ring_slots * r;
+        return .{ try e.buf("s.L{d}.ring.v", .{L}, .u8, &.{ rr, 576 }), try e.buf("s.L{d}.ring.s", .{L}, .u8, &.{ rr, 8 }) };
     }
 
     /// Triton `_rms` (rms with a weight, bf16 in and out).
@@ -122,7 +180,7 @@ const Ds = struct {
     /// `_kv_store` into a block's ring (ratio 0): ingest at "w.ds.pos" (consecutive rows), a pass at each row's own
     /// position and write row (ROWS).
     fn store(d: *Ds, lat: Arg, L: u32, rows: bool) !void {
-        const r = try d.ring(L);
+        const r = try d.ring(L, !rows);
         const n = d.e.n;
         try d.e.triton("_kv_store", .{ n, 1, 1 }, &.{
             .{ .name = "LAT", .arg = lat },                                         .{ .name = "l_stride", .arg = .{ .i = d.cfg().head_dim } },
@@ -163,7 +221,7 @@ const Ds = struct {
         const D: i64 = d.cfg().hidden;
         const hd: i64 = d.cfg().head_dim;
         const T: i64 = @as(i64, @intCast(d.cfg().dspark_targets.items().len)) * D;
-        const taps = try e.view(.{ .buf = "w.taps" }, .bf16, &.{ e.n, T }, &.{ T, 1 }, skip * T * 2);
+        const taps = try e.view(.{ .buf = d.sl.taps_role }, .bf16, &.{ e.n, T }, &.{ T, 1 }, skip * T * 2);
         const mp = try e.buf("L.ds.mp", .{}, .bf16, &.{ e.n, D });
         const mx = try e.buf("w.ds.mx", .{}, .bf16, &.{ e.n, D });
         try d.mainProj(taps, mp);
@@ -271,7 +329,7 @@ const Ds = struct {
             .{ .name = "PDL", .arg = .{ .b = false } },
         });
         try d.store(kvn, L, true);
-        const r = try d.ring(L);
+        const r = try d.ring(L, false);
         const W: i64 = cf.window;
         const rows_scr = n * 5 * H;
         const o = try e.buf("L.o", .{}, .bf16, &.{ n, H, hd });
@@ -371,8 +429,13 @@ const Ds = struct {
 
 /// An ingest of `n` rows from row `skip` of "w.taps" (arena-owned by `a`).
 pub fn emitIngest(a: std.mem.Allocator, cfg: *const Config, w: *const block.Widths, o: block.Options, n: i64, skip: i64) ![]calls.Call {
+    return emitIngestAt(a, cfg, w, o, n, skip, .{});
+}
+
+/// An ingest of `n` rows from row `skip` of `sl.taps_role` into slot `sl.slot`'s rings.
+pub fn emitIngestAt(a: std.mem.Allocator, cfg: *const Config, w: *const block.Widths, o: block.Options, n: i64, skip: i64, sl: Slots) ![]calls.Call {
     var e: E = .{ .a = a, .cfg = cfg, .w = w, .o = o, .n = n, .start = 0 };
-    var d: Ds = .{ .e = &e, .st = .{ .n = n, .window = cfg.window } };
+    var d: Ds = .{ .e = &e, .st = .{ .n = n, .window = cfg.window }, .sl = sl };
     try d.ingest(skip);
     return e.out.items;
 }
@@ -381,6 +444,15 @@ pub fn emitIngest(a: std.mem.Allocator, cfg: *const Config, w: *const block.Widt
 pub fn emitPass(a: std.mem.Allocator, cfg: *const Config, w: *const block.Widths, o: block.Options, n: i64) ![]calls.Call {
     var e: E = .{ .a = a, .cfg = cfg, .w = w, .o = o, .n = n, .start = 0 };
     var d: Ds = .{ .e = &e, .st = .{ .n = n, .window = cfg.window } };
+    try d.pass();
+    return e.out.items;
+}
+
+/// A pass over `slots` slots of `n` rows each (slots x n rows, row mode over `ring_slots` stacked rings; the
+/// statics placed by `Layout.of`).
+pub fn emitPassSlots(a: std.mem.Allocator, cfg: *const Config, w: *const block.Widths, o: block.Options, n: i64, slots: i64, ring_slots: i64) ![]calls.Call {
+    var e: E = .{ .a = a, .cfg = cfg, .w = w, .o = o, .n = slots * n, .start = 0 };
+    var d: Ds = .{ .e = &e, .st = .{ .n = n, .window = cfg.window, .lay = Layout.of(slots, n, cfg.window) }, .sl = .{ .ring_slots = ring_slots } };
     try d.pass();
     return e.out.items;
 }
