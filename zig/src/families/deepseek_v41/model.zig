@@ -91,7 +91,7 @@ pub const Model = struct {
     slots: u32 = 1,
     slot_set: ?*slots_mod.SlotSet = null,
     rows: ?*batch.Batch = null,
-    /// the keyed sampler, every rank (requests with T > 0; the followers run its gathers from forward.follow)
+    /// the keyed sampler, every rank with TF_DSV41_SAMPLING=1 (requests with T > 0; followers run its gathers in follow)
     sampler: ?*samp.GpuSampler = null,
 
     pub fn rank(m: *const Model) u32 {
@@ -190,7 +190,8 @@ pub const Model = struct {
         m.gt = .{ .f = &m.f, .prefill_rows = o.prefill_rows, .max_rows = nb, .own_prefill = o.own_prefill, .sessions = m.sessions };
         if (o.drafts) m.pass = try dspark_gpu.GpuPass.init(gpa, &m.f, nb);
         if (m.slots > 1) try m.openRows(rows_cap, &bp);
-        m.sampler = try samp.GpuSampler.init(gpa, &m.f);
+        // TF_DSV41_SAMPLING=1: keyed sampling (T > 0) on every rank; off: such requests are refused (error.Sampling)
+        m.sampler = if (samp.enabled()) try samp.GpuSampler.init(gpa, &m.f) else null;
         m.gt.sampler = m.sampler;
         try m.driver.check(m.driver.api.cuCtxSynchronize(), "cuCtxSynchronize");
         try comm.barrier();
