@@ -254,7 +254,8 @@ pub const Model = struct {
             const bytes = (try forms.build(ra.allocator(), &src, role)) orelse continue;
             try cuda.DeviceBuffer.upload(.{ .d = &m.driver, .ptr = m.runner.addressOf(role).?, .len = bytes.len }, 0, bytes);
         }
-        const rope = try cwd.readFileAlloc(io, try std.fs.path.join(a, &.{ assets, "rope.bin" }), a, .limited(1 << 28));
+        // no size cap: prod's 1M limit + 2,048 rows is 538 MB (a 256 MiB cap failed every rank's load with StreamTooLong)
+        const rope = try cwd.readFileAlloc(io, try std.fs.path.join(a, &.{ assets, "rope.bin" }), a, .unlimited);
         const half = (rope.len - 16) / 2;
         // rope.bin must hold the limit's rows (f32 [rows, 64] a table): a shorter one would leave positions unrotated
         const want: usize = @intCast(m.f.opts.rope_rows * 64 * 4);
