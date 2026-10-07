@@ -11,6 +11,7 @@ const dk = @import("dsv41_kernels");
 const calls = @import("calls.zig");
 const config = @import("config.zig");
 const moe = @import("block_moe.zig");
+const prefill = @import("block_prefill.zig");
 const Config = config.Config;
 const Arg = calls.Arg;
 const Named = calls.Named;
@@ -85,8 +86,12 @@ pub const Options = struct {
     /// TF_DSV41_GM_V2 (gm2pf.zig): prefill's routed experts on x3gm v2 (gm2_kernel); off: v1 (the captures' path). The
     /// same bits either way.
     gm_v2: @import("gm2pf.zig").Mode = .off,
-    /// TF_DSV41_INDEX_BUDGET_MIB (bytes): prefill's indexer scores + sort keys a launch (row blocks; the same bits)
+    /// TF_DSV41_INDEX_BUDGET_MIB (bytes): the indexer's materialised scores + sort keys a launch (backend.index_budget:
+    /// prefill segments and decode windows past it select in row blocks through `_keys`; the same bits)
     index_budget: i64 = 256 << 20,
+    /// a row-mode program (batch.zig, rowmode.zig: Python's RowWin): every row block scores the context bucket's keys
+    /// (RowWin.sub keeps `cap`) and no window streams its top-k (backend.select: `not win.rows`)
+    rows: bool = false,
 };
 
 /// The paged pool as a window's calls see it (pool.py, slots.py: one slot's 1-D table, PT / PSH a family).
@@ -770,27 +775,103 @@ pub const Emitter = struct {
         const ratio: i64 = e.cfg.compressRatio(src);
         const cbs: i64 = e.cfg.candidate_block_size;
         const nk: i64 = if (reindex) @as(i64, e.cfg.candidate_blocks) * cbs else @divFloor(e.end(), ratio);
-        const scores = try e.buf("L.scores", .{}, .f32, &.{ n, nk });
         const cand = try e.buf("w.cand", .{}, .i32, &.{ n, e.cfg.candidate_blocks });
-        const keys = if (reindex) cand else scores;
-        const kst: i64 = if (reindex) e.cfg.candidate_blocks else nk;
+        // backend.select / select_cand / reindex: the materialised scores + sort keys of the whole window within the
+        // index budget, else row blocks through `_keys` (_blocked); a one-slot window over 16 rows past the stream
+        // threshold would stream (backend._stream_select), which no decode window here is (the plans stop at 16 rows)
+        if (reindex) {
+            if (n * nk * 16 > e.o.index_budget) return error.Unsupported; // index.reindex in row blocks: > 256 rows at 64 MiB
+        } else {
+            const nvis = @max(nk, 1);
+            if (!e.o.rows and n > 16 and nvis >= prefill.stream_min and !e.cfg.isCandidateSource(L) and @popCount(e.cfg.index_topk) == 1) return error.Unsupported;
+            if (n * nvis * 12 > e.o.index_budget) return e.blocked(L, qi, iw, src, ratio, nvis);
+        }
+        const sc = try e.buf("L.scores", .{}, .f32, &.{ n, nk });
+        try e.scoreRows(qi, iw, src, ratio, 0, n, try e.pos(), nk, sc, if (reindex) cand else null);
+        try e.topk(L, sc, cand, nk, ratio);
+    }
+
+    /// index.scores over rows [a, a + rows) of the window into `out` [rows, nk]: dense (key i = position i), or over
+    /// the candidate blocks `cand` (a Reindex layer: candidate_keys unmaterialised, CBS).
+    fn scoreRows(e: *Emitter, qi: Arg, iw: Arg, src: u32, ratio: i64, a: i64, rows: i64, p: Arg, nk: i64, out: Arg, cand: ?Arg) !void {
+        const IH: i64 = e.cfg.index_heads;
+        const ID: i64 = e.cfg.index_dim;
+        const cbs: i64 = e.cfg.candidate_block_size;
         const spg = try e.paging(ratio, false);
-        try e.triton("_scores", .{ n, std.math.divCeil(i64, nk, 64) catch unreachable, 1 }, &.{
-            .{ .name = "QI", .arg = try e.view(qi.t.role, .bf16, &.{ n, IH, ID }, &.{ IH * ID, ID, 1 }, 0) },
-            .{ .name = "W", .arg = iw },                                .{ .name = "w_stride", .arg = .{ .i = IH } },
-            .{ .name = "IK", .arg = try e.indexKeys(src) },             .{ .name = "OUT", .arg = scores },
-            .{ .name = "POS", .arg = try e.pos() },                     .{ .name = "KEYS", .arg = keys },
-            .{ .name = "k_stride", .arg = .{ .i = kst } },              .{ .name = "NK", .arg = .{ .i = nk } },
-            .{ .name = "o_stride", .arg = .{ .i = nk } },               .{ .name = "RATIO", .arg = .{ .i = ratio } },
-            .{ .name = "H", .arg = .{ .i = IH } },                      .{ .name = "D", .arg = .{ .i = ID } },
-            .{ .name = "BP", .arg = .{ .i = 64 } },                     .{ .name = "WS", .arg = .{ .f = 1.0 / @sqrt(@as(f64, @floatFromInt(IH))) } },
-            .{ .name = "SCALE", .arg = .{ .f = 1.0 / @sqrt(@as(f64, @floatFromInt(ID))) } }, .{ .name = "GATHER", .arg = .{ .b = reindex } },
-            .{ .name = "PT", .arg = spg.pt },                           .{ .name = "PSH", .arg = .{ .i = spg.psh } },
-            .{ .name = "KFP8", .arg = .{ .b = true } },                 .{ .name = "SL", .arg = .none },
-            .{ .name = "PTS", .arg = .{ .i = 0 } },                     .{ .name = "ROWS", .arg = .{ .b = false } },
-            .{ .name = "CBS", .arg = .{ .i = if (reindex) cbs else 0 } },
+        try e.triton("_scores", .{ rows, std.math.divCeil(i64, nk, 64) catch unreachable, 1 }, &.{
+            .{ .name = "QI", .arg = try e.view(qi.t.role, .bf16, &.{ rows, IH, ID }, &.{ IH * ID, ID, 1 }, a * IH * ID * 2) },
+            .{ .name = "W", .arg = try e.view(iw.t.role, .bf16, &.{ rows, IH }, &.{ IH, 1 }, a * IH * 2) },
+            .{ .name = "w_stride", .arg = .{ .i = IH } },               .{ .name = "IK", .arg = try e.indexKeys(src) },
+            .{ .name = "OUT", .arg = out },                             .{ .name = "POS", .arg = p },
+            .{ .name = "KEYS", .arg = cand orelse out },                .{ .name = "k_stride", .arg = .{ .i = if (cand != null) e.cfg.candidate_blocks else nk } },
+            .{ .name = "NK", .arg = .{ .i = nk } },                     .{ .name = "o_stride", .arg = .{ .i = nk } },
+            .{ .name = "RATIO", .arg = .{ .i = ratio } },               .{ .name = "H", .arg = .{ .i = IH } },
+            .{ .name = "D", .arg = .{ .i = ID } },                      .{ .name = "BP", .arg = .{ .i = 64 } },
+            .{ .name = "WS", .arg = .{ .f = 1.0 / @sqrt(@as(f64, @floatFromInt(IH))) } },
+            .{ .name = "SCALE", .arg = .{ .f = 1.0 / @sqrt(@as(f64, @floatFromInt(ID))) } },
+            .{ .name = "GATHER", .arg = .{ .b = cand != null } },       .{ .name = "PT", .arg = spg.pt },
+            .{ .name = "PSH", .arg = .{ .i = spg.psh } },               .{ .name = "KFP8", .arg = .{ .b = true } },
+            .{ .name = "SL", .arg = .none },                            .{ .name = "PTS", .arg = .{ .i = 0 } },
+            .{ .name = "ROWS", .arg = .{ .b = false } },                .{ .name = "CBS", .arg = .{ .i = if (cand != null) cbs else 0 } },
         });
-        try e.topk(L, scores, cand, nk, ratio);
+    }
+
+    /// backend._blocked (a window whose scores + sort keys pass the index budget: decode windows at long positions,
+    /// prod's 64 MiB holds 5 rows at 1M keys): row blocks of backend._row_blocks, each `_scores`, `_keys` and
+    /// index.top_positions (glue "topk"); a candidate source also its blocks (index.candidate_blocks: `_block_keys` +
+    /// top_positions); then the counts from the selection (glue "counts", backend.visible_counts). A block's first
+    /// position is Win.sub's (glue "block_pos", which row mode turns into the block's rows of the table); a one-slot
+    /// block scores to its own last row, a row-mode block (RowWin.sub) the bucket's keys.
+    fn blocked(e: *Emitter, L: u32, qi: Arg, iw: Arg, src: u32, ratio: i64, nvis: i64) !void {
+        const n = e.n;
+        const k: i64 = e.cfg.index_topk;
+        const cb: i64 = e.cfg.candidate_blocks;
+        const cbs: i64 = e.cfg.candidate_block_size;
+        const sel = try e.selection(L);
+        const cand_src = e.cfg.isCandidateSource(L);
+        const cand = try e.buf("w.cand", .{}, .i32, &.{ n, cb });
+        const st: i64 = if (n > 16) @max(16, @divFloor(e.o.index_budget, nvis * 12)) else n;
+        var a: i64 = 0;
+        var j: usize = 0;
+        while (a < n) : ({
+            a += st;
+            j += 1;
+        }) {
+            const rows = @min(st, n - a);
+            const p = if (st >= n) try e.pos() else try e.blockPos(j, a, rows);
+            const nk = if (st >= n or e.o.rows) nvis else @max(@divFloor(e.start + a + rows, ratio), 1);
+            const sc = try e.buf("L.scores", .{}, .f32, &.{ rows, nk });
+            try e.scoreRows(qi, iw, src, ratio, a, rows, p, nk, sc, null);
+            const keys = try e.buf("L.ix.keys", .{}, .i64, &.{ rows, nk });
+            try e.triton("_keys", .{ rows, std.math.divCeil(i64, nk, 1024) catch unreachable, 1 }, &.{
+                .{ .name = "S", .arg = sc },                .{ .name = "s_stride", .arg = .{ .i = nk } },
+                .{ .name = "K", .arg = keys },              .{ .name = "k_stride", .arg = .{ .i = nk } },
+                .{ .name = "POSN", .arg = sc },             .{ .name = "p_stride", .arg = .{ .i = nk } },
+                .{ .name = "NK", .arg = .{ .i = nk } },     .{ .name = "BLOCK", .arg = .{ .i = 1024 } },
+                .{ .name = "GATHER", .arg = .{ .b = false } },
+            });
+            try e.glue("topk", &.{ keys, try e.view(sel[0].t.role, .i32, &.{ rows, k }, &.{ k, 1 }, a * k * 4), .{ .i = k } });
+            if (!cand_src) continue;
+            const nb = std.math.divCeil(i64, nk, cbs) catch unreachable;
+            const bk = try e.buf("L.ix.bkeys", .{}, .i64, &.{ rows, nb });
+            try e.triton("_block_keys", .{ rows, std.math.divCeil(i64, nb, 256) catch unreachable, 1 }, &.{
+                .{ .name = "S", .arg = sc },                  .{ .name = "s_stride", .arg = .{ .i = nk } },
+                .{ .name = "K", .arg = bk },                  .{ .name = "k_stride", .arg = .{ .i = nb } },
+                .{ .name = "POS", .arg = p },                 .{ .name = "NB", .arg = .{ .i = nb } },
+                .{ .name = "RATIO", .arg = .{ .i = ratio } }, .{ .name = "BS", .arg = .{ .i = cbs } },
+                .{ .name = "TB", .arg = .{ .i = 256 } },      .{ .name = "ROWS", .arg = .{ .b = false } },
+            });
+            try e.glue("topk", &.{ bk, try e.view(cand.t.role, .i32, &.{ rows, cb }, &.{ cb, 1 }, a * cb * 4), .{ .i = cb } });
+        }
+        try e.glue("counts", &.{ sel[0], sel[1], try e.buf("w.pos64", .{}, .i64, &.{n}), .{ .i = ratio } });
+    }
+
+    /// Win.sub's first position (int32 [1]) of the row block [a, a + rows): the glue writes start + a; row mode reads
+    /// the block's rows of the table instead (rowmode.zig keys on the glue's `a` and `rows`).
+    fn blockPos(e: *Emitter, j: usize, a: i64, rows: i64) !Arg {
+        const p = try e.buf("L.ix.pos{d}", .{j}, .i32, &.{1});
+        try e.glue("block_pos", &.{ p, .{ .i = e.start + a }, .{ .i = a }, .{ .i = rows } });
+        return p;
     }
 
     /// attn_cuda topk over a window's `scores` [n, nk] of index layer L: up to two jobs in one launch (the list repeats a

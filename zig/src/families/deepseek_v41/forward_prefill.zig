@@ -290,7 +290,8 @@ fn ld(t: calls.Tensor) usize {
 }
 
 /// A prefill segment's glue steps (block_prefill.zig's module doc); the ones a decode window has too (positions,
-/// embed, exchange, kit_logits, engram_rows, trace) are the decode glue's.
+/// embed, exchange, kit_logits, engram_rows, trace, and the materialised selection's topk / counts / block_pos) are the
+/// decode glue's.
 fn glueFn(ctx: *anyopaque, r: *run.Runner, c: *const calls.Call) anyerror!void {
     const f: *Forward = @ptrCast(@alignCast(ctx));
     const st = &f.prefill_state;
@@ -311,26 +312,9 @@ fn glueFn(ctx: *anyopaque, r: *run.Runner, c: *const calls.Call) anyerror!void {
     if (eql(u8, step, "image_keep")) return vision_rows.keep(f, r, c);
     if (eql(u8, step, "image_split") or eql(u8, step, "image_merge")) return vision_rows.splitRows(f, r, c, eql(u8, step, "image_merge"));
     if (eql(u8, step, "gm_ticket_again")) return zero(r, try r.tensorAddr(x[0].arg.t), bytesOf(x[0].arg.t)); // vision.moe's text call: the same layer
-    if (eql(u8, step, "topk")) {
-        // index.top_positions: each row's `count` largest int64 keys as positions, ascending, -1 padded
-        const keys = x[0].arg.t;
-        const out = x[1].arg.t;
-        const count: usize = @intCast(x[2].arg.i);
-        if (dim(out, 0) != dim(keys, 0) or dim(out, 1) != count) return error.BadGlue;
-        return k.topPositions(try r.tensorAddr(keys), ld(keys), dim(keys, 0), dim(keys, 1), count, try r.tensorAddr(out));
-    }
     if (eql(u8, step, "cand_keys")) {
         const blocks = x[0].arg.t;
         return k.candKeys(try r.tensorAddr(blocks), ld(blocks), dim(blocks, 0), dim(blocks, 1), @intCast(x[2].arg.i), try r.tensorAddr(x[1].arg.t));
-    }
-    if (eql(u8, step, "counts")) {
-        const sel = x[0].arg.t;
-        return k.visibleCounts(try r.tensorAddr(sel), dim(sel, 1), try r.tensorAddr(x[2].arg.t), @intCast(x[3].arg.i), dim(sel, 0), try r.tensorAddr(x[1].arg.t));
-    }
-    if (eql(u8, step, "block_pos")) {
-        // Win.sub's first position: one int32
-        const v: i32 = @intCast(x[1].arg.i);
-        return r.d.check(r.d.api.cuMemsetD32Async(try r.tensorAddr(x[0].arg.t), @bitCast(v), 1, r.stream.handle), "cuMemsetD32Async");
     }
     if (eql(u8, step, "proj")) {
         // blocks._projection: f32(kv), or ratio 2 [f32(kv) | f32(gate)]

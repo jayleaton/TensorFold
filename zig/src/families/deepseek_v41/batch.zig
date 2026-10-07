@@ -140,7 +140,7 @@ pub const Batch = struct {
         const a = f.arena.allocator();
         for (rowtab.buckets) |R| {
             if (R > cap) break;
-            const cs = try block.emit(a, f.cfg, f.widths, f.opts, try f.backbone(a), R, f.opts.limit - R, true);
+            const cs = try block.emit(a, f.cfg, f.widths, rowOptions(f), try f.backbone(a), R, f.opts.limit - R, true);
             try p.add(try rowmode.transform(a, cs, R, .{ .slots = nslots, .rmax = cap, .pts = k.slot.max_pages }));
         }
     }
@@ -236,7 +236,7 @@ pub const Batch = struct {
         const f = b.f;
         const a = f.arena.allocator();
         const start = graphs.emitStart(key.rows, key.ctx, s, @intCast(f.opts.limit));
-        const one = try block.emit(a, f.cfg, f.widths, f.opts, try f.backbone(a), key.rows, start, true);
+        const one = try block.emit(a, f.cfg, f.widths, rowOptions(f), try f.backbone(a), key.rows, start, true);
         const cs = try rowmode.transform(a, one, key.rows, .{ .slots = b.ss.n, .rmax = b.cap, .pts = f.kv.?.slot.max_pages });
         try b.programs.put(b.gpa, key, cs);
         return cs;
@@ -513,6 +513,13 @@ pub const Batch = struct {
 };
 
 /// Bytes of one taps row (bf16 [3 x hidden]).
+/// The forward's options for a row-mode program (block.Options.rows: RowWin's selections).
+fn rowOptions(f: *const fwd.Forward) block.Options {
+    var o = f.opts;
+    o.rows = true;
+    return o;
+}
+
 fn tapsBytes(f: *const fwd.Forward) usize {
     return 2 * f.cfg.dspark_targets.items().len * @as(usize, f.cfg.hidden);
 }

@@ -12,6 +12,11 @@
 //!   PREV still the column (Python passes win.prev).
 //! - Split KV's dense exchange (glue "kx_dense") reads the stacked split table with the int32 rslot copy (the glue's
 //!   own args); a union (rows > 16) is refused: row windows stay within the dense exchange.
+//! - Long-context selections (backend.select past attn_cuda.plan, or past the index budget, with a RowWin): dtopk's
+//!   `_dtopk` and `_block_keys` take the table's `pos` with ROWS on (dtopk.select / blocks, index.candidate_blocks:
+//!   `rows=win.rows`); `_keys` has no row knobs. A row block of backend._blocked (block.zig's glue "block_pos" with its
+//!   first row and rows) is RowWin.sub: its `_scores` / `_block_keys` read rows [a, a + rows) of `pos` and `rslot`.
+//!   The visible counts (glue "counts", backend.visible_counts) read `pos`.
 //! A call with row-mode knobs this file does not know is refused by name (error.UnknownRowsCall), so a new kernel in
 //! block.zig cannot silently run one slot's arithmetic on every row.
 
@@ -34,14 +39,37 @@ pub const Spec = struct {
     pts: i64,
 };
 
+/// A row block of the program: rows [a, a + n).
+const Block = struct { a: i64, n: i64 };
+
 pub const Rewriter = struct {
     a: std.mem.Allocator,
     s: Spec,
     /// rows of the program (the bucket)
     R: i64,
+    /// backend._blocked's row blocks by their position role ("L.ix.pos<j>", from the glue "block_pos")
+    blocks: std.StringHashMapUnmanaged(Block) = .empty,
 
     fn col(w: *const Rewriter, c: rowtab.Col) Arg {
-        return .{ .t = .{ .role = .{ .buf = table_role }, .dt = .i64, .shape = w.dup(&.{w.R}), .stride = w.dup(&.{1}), .offset = @intCast(rowtab.colOffset(c, w.s.rmax)) } };
+        return w.colOf(c, .{ .a = 0, .n = w.R });
+    }
+
+    /// Rows [b.a, b.a + b.n) of column `c`.
+    fn colOf(w: *const Rewriter, c: rowtab.Col, b: Block) Arg {
+        return .{ .t = .{ .role = .{ .buf = table_role }, .dt = .i64, .shape = w.dup(&.{b.n}), .stride = w.dup(&.{1}), .offset = @intCast(rowtab.colOffset(c, w.s.rmax) + 8 * @as(usize, @intCast(b.a))) } };
+    }
+
+    /// The rows a call's POS names: a row block's, else the program's.
+    fn rowsOf(w: *const Rewriter, args: []const calls.Named) Block {
+        const p = find(args, "POS") orelse return .{ .a = 0, .n = w.R };
+        const role = switch (args[p].arg) {
+            .t => |t| switch (t.role) {
+                .buf => |b| b,
+                else => null,
+            },
+            else => null,
+        };
+        return if (role) |r| (w.blocks.get(r) orelse .{ .a = 0, .n = w.R }) else .{ .a = 0, .n = w.R };
     }
 
     fn dup(w: *const Rewriter, xs: []const i64) []const i64 {
@@ -84,13 +112,25 @@ pub const Rewriter = struct {
     }
 
     /// One call in row mode (a fresh Call; the input is not changed).
-    pub fn call(w: *const Rewriter, c: calls.Call) !calls.Call {
+    pub fn call(w: *Rewriter, c: calls.Call) !calls.Call {
         var out = c;
         const args = try w.a.alloc(calls.Named, c.args.len);
         for (c.args, args) |x, *y| y.* = .{ .name = x.name, .arg = try w.arg(x.arg) };
         out.args = args;
         if (c.glue) {
             if (eq(c.name, "glue.kx_union")) return error.UnionInRows;
+            if (eq(c.name, "glue.block_pos")) {
+                // [position role, start + a, a, rows]: the block's rows of the table from here on
+                if (args.len != 4 or args[0].arg != .t or args[0].arg.t.role != .buf) return error.BadCall;
+                const b: Block = .{ .a = args[2].arg.i, .n = args[3].arg.i };
+                if (b.a < 0 or b.n < 1 or b.a + b.n > w.R) return error.BadCall;
+                try w.blocks.put(w.a, args[0].arg.t.role.buf, b);
+            }
+            if (eq(c.name, "glue.counts")) {
+                // [sel, counts, positions int64 [R], ratio]: each row's own position
+                if (args.len != 4) return error.BadCall;
+                args[2].arg = w.col(.pos);
+            }
             return out;
         }
         if (c.triton) return w.triton(out);
@@ -119,14 +159,25 @@ pub const Rewriter = struct {
             args[p].arg = w.col(.pos);
             return c;
         }
+        const b = w.rowsOf(args);
+        if (eq(c.name, "_dtopk") or eq(c.name, "_block_keys")) {
+            // dtopk.select / blocks and index.candidate_blocks with rows=True: q = POS[r] (no slot: the scores are
+            // the row's already)
+            const p = find(args, "POS") orelse return error.BadCall;
+            const r = find(args, "ROWS") orelse return error.BadCall;
+            if (find(args, "SL") != null) return error.UnknownRowsCall;
+            args[p].arg = w.colOf(.pos, b);
+            args[r].arg = .{ .b = true };
+            return c;
+        }
         if (!writes and !reads) {
             // a call with row knobs that is not one of the above: refused rather than run with one slot's view
             for (args) |x| if (eq(x.name, "ROWS") or eq(x.name, "SL")) return error.UnknownRowsCall;
             return c;
         }
         for (args) |*x| {
-            if (eq(x.name, "POS")) x.arg = w.col(.pos);
-            if (eq(x.name, "SL")) x.arg = w.col(if (writes) .wslot else .rslot);
+            if (eq(x.name, "POS")) x.arg = w.colOf(.pos, b);
+            if (eq(x.name, "SL")) x.arg = w.colOf(if (writes) .wslot else .rslot, b);
             if (eq(x.name, "ROWS")) x.arg = .{ .b = true };
         }
         if (find(args, "PTS")) |i| {
@@ -147,7 +198,8 @@ pub const Rewriter = struct {
 /// The row-mode program of `cs` (block.emit's window of R rows); `cs` is not changed.
 pub fn transform(a: std.mem.Allocator, cs: []const calls.Call, R: u32, s: Spec) ![]const calls.Call {
     if (s.pts <= 0) return error.NoPool;
-    const w: Rewriter = .{ .a = a, .s = s, .R = R };
+    var w: Rewriter = .{ .a = a, .s = s, .R = R };
+    defer w.blocks.deinit(a);
     const out = try a.alloc(calls.Call, cs.len);
     for (cs, out) |c, *o| o.* = try w.call(c);
     return out;

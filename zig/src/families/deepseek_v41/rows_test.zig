@@ -63,12 +63,55 @@ fn roleOf(x: calls.Arg) ?[]const u8 {
     };
 }
 
-const Counts = struct { kv_store: usize = 0, pool_norm: usize = 0, index_k: usize = 0, scores: usize = 0, rope: usize = 0, attn: usize = 0, topk: usize = 0, dense: usize = 0 };
+/// Rows [a, a + n) of the table's column `c` (a row block of backend._blocked: RowWin.sub).
+fn isColAt(x: calls.Arg, c: rowtab.Col, b: Rows) bool {
+    const t = switch (x) {
+        .t => |t| t,
+        else => return false,
+    };
+    const role = switch (t.role) {
+        .buf => |r| r,
+        else => return false,
+    };
+    return std.mem.eql(u8, role, rowmode.table_role) and t.dt == .i64 and t.shape.len == 1 and t.shape[0] == b.n and t.offset == rowtab.colOffset(c, rmax) + 8 * @as(usize, @intCast(b.a));
+}
+
+const Rows = struct { a: i64, n: i64 };
+
+const Counts = struct {
+    kv_store: usize = 0,
+    pool_norm: usize = 0,
+    index_k: usize = 0,
+    scores: usize = 0,
+    rope: usize = 0,
+    attn: usize = 0,
+    topk: usize = 0,
+    dense: usize = 0,
+    // the long-context selections
+    dtopk: usize = 0,
+    keys: usize = 0,
+    block_keys: usize = 0,
+    counts: usize = 0,
+    blocks: usize = 0,
+};
 
 fn checkProgram(one: []const calls.Call, rows: []const calls.Call, R: i64, pts: i64) !Counts {
     var n: Counts = .{};
     try testing.expectEqual(one.len, rows.len);
+    // backend._blocked's row blocks (glue "block_pos" [role, start + a, a, rows]) by their position role
+    var blocks: std.StringHashMapUnmanaged(Rows) = .empty;
+    defer blocks.deinit(testing.allocator);
     for (one, rows) |o, c| {
+        if (c.glue and std.mem.eql(u8, c.name, "glue.block_pos")) {
+            try blocks.put(testing.allocator, roleOf(c.args[0].arg).?, .{ .a = c.args[2].arg.i, .n = c.args[3].arg.i });
+            n.blocks += 1;
+        }
+        if (c.glue and std.mem.eql(u8, c.name, "glue.counts")) {
+            // backend.visible_counts: each row's own position
+            try testing.expect(isColAt(c.args[2].arg, .pos, .{ .a = 0, .n = R }));
+            n.counts += 1;
+        }
+        const b: Rows = if (named(o, "POS")) |pv| (if (roleOf(pv)) |r| (blocks.get(r) orelse Rows{ .a = 0, .n = R }) else Rows{ .a = 0, .n = R }) else .{ .a = 0, .n = R };
         // the same launch: name, grid, argument count
         try testing.expectEqualStrings(o.name, c.name);
         try testing.expectEqual(o.grid, c.grid);
@@ -81,9 +124,21 @@ fn checkProgram(one: []const calls.Call, rows: []const calls.Call, R: i64, pts: 
                 try testing.expect(isCol(named(c, "POS").?, .pos, R));
                 n.rope += 1;
             }
+            if (std.mem.eql(u8, nm, "_dtopk") or std.mem.eql(u8, nm, "_block_keys")) {
+                // dtopk.select / blocks, index.candidate_blocks with rows=True: q = POS[r]
+                try testing.expect(isColAt(named(c, "POS").?, .pos, b));
+                try testing.expect(named(c, "ROWS").?.b);
+                try testing.expectEqual(b.n, c.grid[0]);
+                if (std.mem.eql(u8, nm, "_dtopk")) n.dtopk += 1 else n.block_keys += 1;
+            }
+            if (std.mem.eql(u8, nm, "_keys")) {
+                n.keys += 1;
+                for (o.args, c.args) |x, y| try testing.expectEqualDeep(x.arg, y.arg);
+            }
             if (writes or reads) {
-                try testing.expect(isCol(named(c, "POS").?, .pos, R));
-                try testing.expect(isCol(named(c, "SL").?, if (writes) .wslot else .rslot, R));
+                try testing.expect(isColAt(named(c, "POS").?, .pos, if (reads) b else Rows{ .a = 0, .n = R }));
+                try testing.expect(isColAt(named(c, "SL").?, if (writes) .wslot else .rslot, if (reads) b else Rows{ .a = 0, .n = R }));
+                if (reads) try testing.expectEqual(b.n, c.grid[0]);
                 try testing.expect(named(c, "ROWS").?.b);
                 // PTS where the kernel pages (compress._row_paging): the stacked tables' row stride with a table
                 if (named(c, "PTS")) |pv| {
@@ -200,4 +255,244 @@ test "row mode: split KV's dense exchange reads the stacked split table; a union
     try testing.expectError(error.UnionInRows, rowmode.transform(a, big, 24, .{ .slots = S, .rmax = 64, .pts = pts }));
     // the contiguous slot has no row mode
     try testing.expectError(error.NoPool, rowmode.transform(a, one, 8, .{ .slots = S, .rmax = rmax, .pts = 0 }));
+}
+
+// -- 1M context, 4 slots, prod's knobs (the 4 x 1M boot: rank 1 refused UnknownRowsCall on the Sparks, 2026-10-07) ----
+
+/// Python attn_cuda.plan's entries a thread (TOPK_THREADS 512, MAX_CL 8, ENTRIES_A_CTA 4096); past MAX_EPT 31 the
+/// Triton dtopk runs instead.
+fn pyEpt(nk: i64) i64 {
+    const cl = @max(1, @min(8, std.math.divCeil(i64, nk, 4096) catch unreachable));
+    var ept = @max(1, std.math.divCeil(i64, nk, cl * 512) catch unreachable);
+    ept += 1 - @mod(ept, 2);
+    return ept;
+}
+
+/// The selection launches Python's backend makes for one R-row window over `end` positions (backend.select /
+/// select_cand / reindex with TF_DSV41_ATTN_CUDA=1 and TF_DSV41_INDEX_DTOPK=1, blocks._select's order), written from
+/// backend.py / attn_cuda.py at 8474f31 independently of block.zig.
+fn pyExpect(cfg: *const Config, R: i64, end: i64, budget: i64) Counts {
+    var x: Counts = .{};
+    for (0..cfg.layers) |l| {
+        const L: u32 = @intCast(l);
+        const md = cfg.mode(L);
+        if (md != .full and md != .reindex) continue;
+        x.scores += 1;
+        if (md == .reindex) {
+            x.topk += 1; // attn_cuda.gather_cand over 2,048 x 8 keys
+            continue;
+        }
+        const cand = cfg.isCandidateSource(L);
+        const nvis = @max(@divFloor(end, cfg.compressRatio(L)), 1);
+        if (R * nvis * 12 > budget) {
+            // _blocked: _row_blocks' steps, each _scores + _keys (+ _block_keys), then visible_counts
+            const st = if (R > 16) @max(16, @divFloor(budget, nvis * 12)) else R;
+            const nb: usize = @intCast(std.math.divCeil(i64, R, st) catch unreachable);
+            x.scores += nb - 1;
+            x.keys += nb;
+            if (cand) x.block_keys += nb;
+            x.counts += 1;
+            if (nb > 1) x.blocks += nb;
+        } else if (pyEpt(nvis) <= 31) {
+            x.topk += 1; // attn_cuda.select (select_blocks: both jobs in one launch)
+        } else {
+            x.dtopk += 1; // dtopk.select
+            if (cand) {
+                if (pyEpt(std.math.divCeil(i64, nvis, cfg.candidate_block_size) catch unreachable) <= 31) x.topk += 1 else x.dtopk += 1;
+            }
+        }
+    }
+    return x;
+}
+
+fn prodOptions(limit: i64) block.Options {
+    var o: block.Options = .{ .limit = limit, .r1 = true, .expert_topp = 0.85, .index_budget = 64 << 20, .rows = true, .rope_rows = limit + 2048 };
+    o.pool = poolOf(limit, false);
+    return o;
+}
+
+fn expectSelections(got: Counts, want: Counts) !void {
+    inline for (.{ "scores", "keys", "block_keys", "dtopk", "topk", "counts", "blocks" }) |f| {
+        if (@field(got, f) != @field(want, f)) {
+            std.debug.print("selection count {s}: got {d}, Python's backend {d}\n", .{ f, @field(got, f), @field(want, f) });
+            return error.TestExpectedEqual;
+        }
+    }
+}
+
+test "row mode at 1M, 4 slots, prod's knobs: every bucket and context bucket rewrites, the selections are Python's" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const w = try widths(a);
+    const cfg: Config = .{};
+    var backbone: [40]u32 = undefined;
+    for (&backbone, 0..) |*l, i| l.* = @intCast(i);
+    const limit: i64 = 1 << 20;
+    const o = prodOptions(limit);
+    const pts = o.pool.?.pts;
+    const s: graphs.Settings = .{};
+    var seen_dtopk = false;
+    var seen_blocked = false;
+    var seen_multi = false;
+    for (rowtab.buckets) |R| {
+        if (R > rmax) break;
+        for ([_]u64{ 0, 5000, 130_000, 300_000, 700_000, @intCast(limit - 1) }) |last| {
+            const ctx = graphs.bucketOf(last, s.bucket, s.grow);
+            const start = graphs.emitStart(R, ctx, s, @intCast(limit));
+            if (start < 0) continue;
+            const end: i64 = start + R;
+            const one = try block.emit(a, &cfg, &w, o, &backbone, R, start, true);
+            const rows = try rowmode.transform(a, one, R, .{ .slots = S, .rmax = rmax, .pts = pts });
+            const n = try checkProgram(one, rows, R, pts);
+            try expectSelections(n, pyExpect(&cfg, R, end, o.index_budget));
+            seen_dtopk = seen_dtopk or n.dtopk > 0;
+            seen_blocked = seen_blocked or n.keys > 0;
+            seen_multi = seen_multi or n.blocks > 0;
+            // a blocked row-mode window scores the bucket's keys in every block (RowWin.sub keeps cap)
+            for (rows) |c| if (std.mem.eql(u8, c.name, "_scores") and !named(c, "GATHER").?.b)
+                try testing.expectEqual(@divFloor(end, named(c, "RATIO").?.i), named(c, "NK").?.i);
+        }
+    }
+    // the plan's windows (Batch.plan: every bucket up to the cap at the limit's end) and the roles they size
+    var pr: buffers.Plan = .{ .a = a };
+    for (rowtab.buckets) |R| {
+        if (R > rmax) break;
+        const one = try block.emit(a, &cfg, &w, o, &backbone, R, limit - R, true);
+        const rows = try rowmode.transform(a, one, R, .{ .slots = S, .rmax = rmax, .pts = pts });
+        const n = try checkProgram(one, rows, R, pts);
+        try expectSelections(n, pyExpect(&cfg, R, limit, o.index_budget));
+        try pr.add(rows);
+    }
+    // at the limit every full layer is past attn_cuda's plan; 16 rows x 1M keys pass the 64 MiB budget (_blocked)
+    try testing.expectEqual(@as(u64, 16 * (1 << 20) * 8), pr.sizes.get("L.ix.keys").?);
+    try testing.expectEqual(@as(u64, 16 * (1 << 20) * 4), pr.sizes.get("L.scores").?);
+    try testing.expectEqual(@as(u64, 16 * (1 << 17) * 8), pr.sizes.get("L.ix.bkeys").?);
+    try testing.expect(pr.sizes.get(rowmode.table_role).? <= rowtab.tableBytes(rmax));
+    try testing.expect(seen_dtopk and seen_blocked and !seen_multi);
+}
+
+test "row mode at 1M: buckets past 16 rows run backend._blocked's 16-row blocks on their rows of the table" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const w = try widths(a);
+    const cfg: Config = .{};
+    var backbone: [40]u32 = undefined;
+    for (&backbone, 0..) |*l, i| l.* = @intCast(i);
+    const limit: i64 = 1 << 20;
+    const o = prodOptions(limit);
+    const pts = o.pool.?.pts;
+    // these programs' table holds R rows (rmax = R, countsOf)
+    for ([_]u32{ 24, 32, 48, 64 }) |R| {
+        const one = try block.emit(a, &cfg, &w, o, &backbone, R, limit - R, true);
+        // the blocks: 16 rows each, every one scoring the limit's keys, POS = the block's rows
+        var blocks: usize = 0;
+        for (one) |c| if (c.glue and std.mem.eql(u8, c.name, "glue.block_pos")) {
+            // backend._row_blocks: 16 rows from each multiple of 16, the last block the rest
+            try testing.expectEqual(@as(i64, 0), @mod(c.args[2].arg.i, 16));
+            try testing.expectEqual(@min(16, @as(i64, R) - c.args[2].arg.i), c.args[3].arg.i);
+            blocks += 1;
+        };
+        try testing.expect(blocks > 0);
+        try expectSelections(try countsOf(a, one, R, pts), pyExpect(&cfg, R, limit, o.index_budget));
+    }
+}
+
+/// The selections of a program rewritten with rmax = R (buckets past the shared tests' 16-row table).
+fn countsOf(a: std.mem.Allocator, one: []const calls.Call, R: u32, pts: i64) !Counts {
+    const rows = try rowmode.transform(a, one, R, .{ .slots = S, .rmax = R, .pts = pts });
+    var n: Counts = .{};
+    var blocks: std.StringHashMapUnmanaged(Rows) = .empty;
+    defer blocks.deinit(testing.allocator);
+    for (one, rows) |o, c| {
+        if (c.glue and std.mem.eql(u8, c.name, "glue.block_pos")) {
+            try blocks.put(testing.allocator, roleOf(c.args[0].arg).?, .{ .a = c.args[2].arg.i, .n = c.args[3].arg.i });
+            n.blocks += 1;
+        }
+        if (c.glue and std.mem.eql(u8, c.name, "glue.counts")) n.counts += 1;
+        if (!c.triton) {
+            if (std.mem.eql(u8, c.name, "tf_dsv41_attn_cuda_v1.topk")) n.topk += 1;
+            continue;
+        }
+        const b: Rows = if (named(o, "POS")) |pv| (if (roleOf(pv)) |r| (blocks.get(r) orelse Rows{ .a = 0, .n = R }) else Rows{ .a = 0, .n = R }) else .{ .a = 0, .n = R };
+        const col = struct {
+            fn at(x: calls.Arg, c_: rowtab.Col, bb: Rows, rm: u32) bool {
+                const t = x.t;
+                return std.mem.eql(u8, t.role.buf, rowmode.table_role) and t.shape[0] == bb.n and t.offset == rowtab.colOffset(c_, rm) + 8 * @as(usize, @intCast(bb.a));
+            }
+        }.at;
+        if (std.mem.eql(u8, c.name, "_scores")) {
+            n.scores += 1;
+            try testing.expect(col(named(c, "POS").?, .pos, b, R) and col(named(c, "SL").?, .rslot, b, R));
+        }
+        if (std.mem.eql(u8, c.name, "_keys")) n.keys += 1;
+        if (std.mem.eql(u8, c.name, "_block_keys")) {
+            n.block_keys += 1;
+            try testing.expect(col(named(c, "POS").?, .pos, b, R) and named(c, "ROWS").?.b);
+        }
+        if (std.mem.eql(u8, c.name, "_dtopk")) n.dtopk += 1;
+    }
+    return n;
+}
+
+test "one slot at 1M with prod's budget: verify windows past 5 rows select through _keys as Python's backend does" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const w = try widths(a);
+    const cfg: Config = .{};
+    var backbone: [40]u32 = undefined;
+    for (&backbone, 0..) |*l, i| l.* = @intCast(i);
+    const limit: i64 = 1 << 20;
+    var o = prodOptions(limit);
+    o.rows = false;
+    // Forward.plan's windows (1..16 rows at the limit's end) and a window at 400K
+    for (1..17) |r| {
+        const R: i64 = @intCast(r);
+        for ([_]i64{ limit - R, 400_000 }) |start| {
+            const one = try block.emit(a, &cfg, &w, o, &backbone, R, start, true);
+            var n: Counts = .{};
+            for (one) |c| {
+                if (c.triton and std.mem.eql(u8, c.name, "_scores")) n.scores += 1;
+                if (c.triton and std.mem.eql(u8, c.name, "_keys")) n.keys += 1;
+                if (c.triton and std.mem.eql(u8, c.name, "_block_keys")) n.block_keys += 1;
+                if (c.triton and std.mem.eql(u8, c.name, "_dtopk")) {
+                    n.dtopk += 1;
+                    try testing.expect(!named(c, "ROWS").?.b);
+                }
+                if (std.mem.eql(u8, c.name, "tf_dsv41_attn_cuda_v1.topk")) n.topk += 1;
+                if (std.mem.eql(u8, c.name, "glue.counts")) n.counts += 1;
+            }
+            try expectSelections(n, pyExpect(&cfg, R, start + R, o.index_budget));
+        }
+    }
+    // a one-slot window over 16 rows past the stream threshold would stream (backend._stream_select): refused
+    try testing.expectError(error.Unsupported, block.emit(a, &cfg, &w, o, &backbone, 24, 400_000, true));
+}
+
+test "rowtab at 1M: four slots' windows at the limit's end, padded, within the limit" {
+    const limit: u64 = 1 << 20;
+    const mix = [_]rowtab.Seg{
+        .{ .slot = 3, .start = limit - 6, .rows = 6 },
+        .{ .slot = 0, .start = 900_000, .rows = 1 },
+        .{ .slot = 2, .start = 131_071, .rows = 4 },
+        .{ .slot = 1, .start = 0, .rows = 2 },
+    };
+    try rowtab.check(&mix, S, limit);
+    try testing.expectError(error.PastLimit, rowtab.check(&.{.{ .slot = 0, .start = limit - 1, .rows = 2 }}, S, limit));
+    const ids = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 };
+    const R = rowtab.bucketRows(rowtab.totalRows(&mix), rmax).?;
+    try testing.expectEqual(@as(u32, 16), R);
+    var t: [rowtab.ncol * rmax]i64 = undefined;
+    var r32: [rmax]i32 = undefined;
+    try rowtab.plan(&mix, &ids, R, rmax, S, &t, &r32);
+    const pos = t[@intFromEnum(rowtab.Col.pos) * rmax ..][0..R];
+    try testing.expectEqualSlices(i64, &.{ limit - 6, limit - 5, limit - 4, limit - 3, limit - 2, limit - 1, 900_000, 131_071, 131_072, 131_073, 131_074, 0, 1, 1, 1, 1 }, pos);
+    const ws = t[@intFromEnum(rowtab.Col.wslot) * rmax ..][0..R];
+    try testing.expectEqualSlices(i64, &.{ 3, 3, 3, 3, 3, 3, 0, 2, 2, 2, 2, 1, 1, -1, -1, -1 }, ws);
+    // the window's context bucket: the limit's last (its end is the limit)
+    const s: graphs.Settings = .{};
+    const ctx = graphs.bucketOf(rowtab.lastPos(&mix), s.bucket, s.grow);
+    try testing.expectEqual(limit - 1, graphs.bucketEnd(ctx, s.bucket, limit, s.grow));
 }

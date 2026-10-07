@@ -501,6 +501,33 @@ pub const Forward = struct {
         return error.GlueNotBuilt;
     }
 
+    /// The materialised selection's glue (backend._blocked in decode windows, prefill segments): index.top_positions
+    /// ("topk": each row's `count` largest int64 keys as positions, ascending, -1 padded), backend.visible_counts
+    /// ("counts") and Win.sub's first position ("block_pos": one int32; a row-mode block reads the table instead).
+    /// False: not one of them.
+    fn selectionGlue(k: anytype, r: *run.Runner, c: *const calls.Call, step: []const u8) !bool {
+        const x = c.args;
+        if (std.mem.eql(u8, step, "topk")) {
+            const keys = x[0].arg.t;
+            const out = x[1].arg.t;
+            const count: usize = @intCast(x[2].arg.i);
+            if (out.shape[0] != keys.shape[0] or out.shape[1] != count) return error.BadGlue;
+            try k.topPositions(try r.tensorAddr(keys), @intCast(keys.stride[0]), @intCast(keys.shape[0]), @intCast(keys.shape[1]), count, try r.tensorAddr(out));
+            return true;
+        }
+        if (std.mem.eql(u8, step, "counts")) {
+            const sel = x[0].arg.t;
+            try k.visibleCounts(try r.tensorAddr(sel), @intCast(sel.shape[1]), try r.tensorAddr(x[2].arg.t), @intCast(x[3].arg.i), @intCast(sel.shape[0]), try r.tensorAddr(x[1].arg.t));
+            return true;
+        }
+        if (std.mem.eql(u8, step, "block_pos")) {
+            const v: i32 = @intCast(x[1].arg.i);
+            try r.d.check(r.d.api.cuMemsetD32Async(try r.tensorAddr(x[0].arg.t), @bitCast(v), 1, r.stream.handle), "cuMemsetD32Async");
+            return true;
+        }
+        return false;
+    }
+
     fn numel(t: calls.Tensor) usize {
         var n: usize = 1;
         for (t.shape) |x| n *= @intCast(x);
@@ -522,6 +549,7 @@ pub const Forward = struct {
         if (std.mem.startsWith(u8, step, "kx_")) return (f.kv orelse return error.GlueNotBuilt).glue(r, c, step);
         const s = r.stream.handle;
         const k = r.kernels.others(r.stream);
+        if (try selectionGlue(k, r, c, step)) return;
         const p = f.slot.pending.?;
         const D: usize = f.cfg.hidden;
         const W: usize = f.comm.world();
