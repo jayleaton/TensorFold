@@ -309,9 +309,17 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
     # M2B_SAMP=1 (dsq-zig-samp-1): the reference also writes the sampled replies (--sampled: $REF/samp/trace.jsonl, its
     # prompt lengths in the AOT set); tools/zig/dsv41_samp/samp_step.sh runs on it after M4
     [[ "${M2B_SAMP:-0}" == 1 ]] && extra+=(--sampled)
+    # M2B_ENGRAM=1 (dsq-zig-speed-1, R3): the references read Engram's rows from packed shards they write first (sparse,
+    # records under the prompts' rows), the Zig ranks from the same files (TF_DSV41_ENGRAM_DIR): the real-row path
+    # under every gate. R0's and R1's references each get their own directory.
+    eng0=(); eng1=()
+    if [[ "${M2B_ENGRAM:-0}" == 1 ]]; then
+        eng0=(--engram-dir "$LOCAL/engram-r0" --engram-make); eng1=(--engram-dir "$LOCAL/engram-r1" --engram-make)
+        export TF_DSV41_ENGRAM_DIR=$LOCAL/engram-r0
+    fi
     refs=("$REF")
     if step m2b-ref "${M2B_REF_MIN:-18}" python -u -B "$Z/tools/zig/dsv41_m2b_ref.py" --pack "$LP" --out "$REF" \
-            --layers "0-$hi" --steps "${M2B_STEPS:-64}" "${refargs[@]}" "${extra[@]}" \
+            --layers "0-$hi" --steps "${M2B_STEPS:-64}" "${refargs[@]}" "${extra[@]}" "${eng0[@]}" \
        && step engram-host 3 python -B "$Z/tools/zig/dsv41_engram_host.py" --py-src /dsv41-tf/src \
             --config "$LP/config.json" --tokenizer "$LP/tokenizer.json" --out "$REF/engram-host.bin"; then
         if [[ -n "$PROMPTS" ]]; then
@@ -363,7 +371,7 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
             if (( mb >= 5 )) && (set -a; source "$Z/tools/zig/dsv41_m1/r1c-knobs.env"; set +a
                 export PYTHONPATH=/opt/r1c/src TORCH_EXTENSIONS_DIR=/opt/r1c/ext
                 step m2b-ref-r1 "$mb" python -u -B "$Z/tools/zig/dsv41_m2b_ref.py" --pack "$LP" --out "$REF1" \
-                    --layers "0-$hi" --steps "${M2B_STEPS:-64}" --port 29631 "${extra[@]}" "${prof[@]}"); then
+                    --layers "0-$hi" --steps "${M2B_STEPS:-64}" --port 29631 "${extra[@]}" "${prof[@]}" "${eng1[@]}"); then
                 cp "$REF/engram-host.bin" "$REF1/"
                 cp "$REF1"/prof-rank*.json "$RES/" 2>/dev/null
                 # DSpark's variants under R1 (M2B_CAPTURE_R1=P) for M4 on these assets
@@ -371,11 +379,13 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
                 mb=$(left); (( mb > 6 )) && mb=6
                 # the decode gap (M2B_PROF=1): this gate's eager windows profiled, then M2B_PROF_ROWS windows timed
                 (export M2B_PORT=29741 M2B_PROF=1 M2B_PROF_ROWS="${M2B_ZIG_PROF_ROWS:-}"
+                 (( ${#eng1[@]} )) && export TF_DSV41_ENGRAM_DIR=$LOCAL/engram-r1
                  step m2b-r1 "$mb" bash "$Z/tools/zig/dsv41_m1/m2b_ranks.sh" "$Z/bin/tf-dsv41-m1" "$LP" "$REF1" "$RES/m2b-r1") \
                     || rc=1
                 if [[ "${M2B_R1_GRAPHS:-0}" == 1 ]]; then
                     mb=$(left); (( mb > 6 )) && mb=6
                     (export TF_DSV41_GRAPHS=1 M2B_PROF=0 M2B_PROF_ROWS="${M2B_ZIG_PROF_ROWS:-}" M2B_PORT=29751
+                     (( ${#eng1[@]} )) && export TF_DSV41_ENGRAM_DIR=$LOCAL/engram-r1
                      step m2b-r1-graphs "$mb" bash "$Z/tools/zig/dsv41_m1/m2b_ranks.sh" "$Z/bin/tf-dsv41-m1" "$LP" "$REF1" "$RES/m2b-r1-graphs") \
                         || rc=1
                 fi
@@ -388,10 +398,14 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
     # (drafts, graphs, Zig prefill) answers prompts.txt over HTTP, then the CLI replays its trace (HTTP == CLI with the
     # drafts' counts), then again with drafts off (drafted == serial); each line reports its first differing token
     if [[ "${M2B_M4:-0}" == 1 ]]; then
-        A=${REF1:-$R0}; [[ -d "$A/aot" ]] || A=$R0
+        # the R0 reference's assets (its AOT set holds set P's DSpark variants: M2B_CAPTURE=P); M2B_M4_R1=1: the R1
+        # reference's (then M2B_CAPTURE_R1=P for DSpark's R1 variants)
+        A=$R0; eng=$LOCAL/engram-r0
+        if [[ "${M2B_M4_R1:-0}" == 1 && -d "${REF1:-}/aot" ]]; then A=$REF1; eng=$LOCAL/engram-r1; fi
         m4env=(TF_TP_WORLD=2 TF_DSV41_ASSETS="$A" TF_DSV41_LAYERS="0-$hi" TF_DSV41_GRAPHS=1 TF_DSV41_OWN_PREFILL=1
-               TF_DSV41_FAILFAST=0 TF_DSV41_EXPERT_TOPP=${M2B_TOPP:-0.85})
+               TF_DSV41_FAILFAST=0 TF_DSV41_EXPERT_TOPP=${M2B_TOPP:-0.85} TF_DSV41_PHASES=1 TF_DSV41_PHASES_OUT=$RES/m4/phases.json)
         [[ "$A" == "${REF1:-}" ]] && m4env+=(TF_DSV41_R1=1)
+        [[ "${M2B_ENGRAM:-0}" == 1 ]] && m4env+=(TF_DSV41_ENGRAM_DIR=$eng)
         # M2B_M4_ENV ("K=V ..."): more knobs on every M4 process, e.g. TF_DSV41_CALIB_FILE=<prod's calib-*.json> (the
         # served drafts priced by prod's table) or TF_DSV41_TREE=3 TF_DSV41_POOL_TOKENS=... TF_DSV41_KV_SPLIT=1
         [[ -n "${M2B_M4_ENV:-}" ]] && read -ra extra_m4 <<< "$M2B_M4_ENV" && m4env+=("${extra_m4[@]}")
@@ -410,7 +424,7 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
                 d=1; [[ "$mode" == serial ]] && d=0
                 port=$(( 29871 + d ))
                 (m4env+=(TF_DSV41_DRAFTS=$d); follow $port "$mode" & fp=$!
-                 step "m4-$mode" "$mb" env "${m4env[@]}" TF_DSV41_DRAFTS=$d TF_TP_RANK=0 TF_TP_DEVICE=0 TF_TP_PORT=$port \
+                 step "m4-$mode" "$mb" env "${m4env[@]}" TF_DSV41_DRAFTS=$d TF_DSV41_ENGRAM_PREFETCH=0 TF_TP_RANK=0 TF_TP_DEVICE=0 TF_TP_PORT=$port \
                      "$Z/bin/tf-dsv41-m1" generate "$LP" "$A" "$m4dir/trace.jsonl"; r=$?; wait $fp; exit $r) || rc=1
                 grep -h "^PASS\|^FAIL\|DSpark" "$RES/m4-$mode.log" | tee -a "$RES/steps.txt"
             done
@@ -425,6 +439,16 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
                 "$Z" "$LP" "${R0:-$REF}" "$hi" "$RES/samp" "$LOCAL/samp" || rc=1
             grep -h "^samp\|^PASS\|^FAIL" "$RES/samp/steps.txt" "$RES"/samp/samp-*.log 2>/dev/null | tee -a "$RES/steps.txt"
         else echo "samp skipped: $mb min left or no sampled reference" | tee -a "$RES/steps.txt"; rc=1; fi
+    fi
+    # dsq-zig-speed-1's tables (speed-gap.md: Zig eager / graphed vs Python R1 a window, GPU ms by family, M4's phases)
+    [[ -f "$Z/tools/zig/dsv41_perf/speed_step.sh" ]] && bash "$Z/tools/zig/dsv41_perf/speed_step.sh" "$Z" "$RES" 2>&1 | tail -20 | tee -a "$RES/steps.txt"
+    # M2B_SLOTS=1 (dsq-zig-slots-1): several live slots against Python's batched row mode (tools/zig/dsv41_slots/job.sh;
+    # the R1 twin's src has rowgraphs / slots: SLOTS_PYSRC), SLOTS_RUNS of its runs
+    if [[ "${M2B_SLOTS:-0}" == 1 ]]; then
+        (unset TF_DSV41_ENGRAM_DIR
+         export SLOTS_PYSRC=${SLOTS_PYSRC:-/opt/r1c/src} TORCH_EXTENSIONS_DIR=${SLOTS_EXT:-/opt/r1c/ext}
+         source "$Z/tools/zig/dsv41_slots/job.sh"; slots_gate) || rc=1
+        grep -h "^slots\|PASS slots\|FAIL slots" "$RES"/slots*.log "$RES"/slots-*/rank0.log 2>/dev/null | tee -a "$RES/steps.txt"
     fi
     for d in "${refs[@]}"; do
         o=$RES/m2b-ref; [[ -n "$PROMPTS" ]] && o=$RES/m2b-ref/$(basename "$d")

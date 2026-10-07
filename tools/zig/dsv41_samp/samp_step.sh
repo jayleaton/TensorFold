@@ -40,7 +40,7 @@ cp "$TRACE" "$RES/samp-trace.jsonl" 2>/dev/null
 if [[ -s "$TRACE" ]]; then
     env=(TF_DSV41_SAMPLING=1 TF_TP_WORLD=2 TF_DSV41_ASSETS="$A" TF_DSV41_LAYERS="0-$HI" TF_DSV41_GRAPHS="${SAMP_GRAPHS:-1}"
          TF_DSV41_OWN_PREFILL="${SAMP_OWN_PREFILL:-1}" TF_DSV41_FAILFAST=0)
-    for mode in serial drafts; do
+    for mode in ${SAMP_MODES:-serial drafts}; do
         d=0; [[ $mode == drafts ]] && d=1
         port=$(( 29881 + d ))
         env "${env[@]}" TF_DSV41_DRAFTS=$d TF_TP_RANK=1 TF_TP_DEVICE=1 TF_TP_PORT=$port \
