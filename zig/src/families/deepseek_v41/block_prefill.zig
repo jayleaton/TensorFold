@@ -52,6 +52,7 @@ const E = block.Emitter;
 const Arg = calls.Arg;
 const Dt = calls.Dt;
 const dense = dk.dense;
+const PfDense = @import("prod_knobs.zig").PfDense;
 
 // prod knobs and the Python engine's constants
 const ws_limit: i64 = 64 << 20; // TF_DSV41_PREFILL_WS_MIB: a workspace W_q's bytes at most (column blocks)
@@ -59,13 +60,13 @@ const had_scale: f64 = 0.08838834764831845; // exl3.prefill.HAD_SCALE (the liter
 const pf_rows: i64 = 256; // TF_DSV41_MHC_PF_ROWS / TF_DSV41_MHC_ROWS: mhc_pf and the wide `_site` tile from here
 const mhc_bm: i64 = 64; // TF_DSV41_MHC_BM
 const split_rows: i64 = 32; // TF_DSV41_MHC_SPLIT_ROWS: out-of-place boundaries, a program a stream
-const index_budget: i64 = 256 << 20; // TF_DSV41_INDEX_BUDGET_MIB: scores + sort keys a launch
 const stream_min: i64 = 4096; // TF_DSV41_INDEX_STREAM_MIN
 const bmq: i64 = 32; // TF_DSV41_PREFILL_ATTN_BMQ
 const kt: i64 = 32; // csa2.attn.KT
 const router_chunk: i64 = 2048; // router_gemv.CHUNK: rows a route launch
 const gm_bm: i64 = 64; // x3gm: members a pass of the gate/up (cfg 1) and down (cfg 0) tiles below 3,072 rows
 const gm_widths: u32 = 7; // x3gm.MAX_WIDTHS: the ticket's down half starts there
+const index_budget: i64 = 256 << 20; // TF_DSV41_INDEX_BUDGET_MIB's default: block.Options.index_budget is the run's
 const dtopk_rows: i64 = 64; // dtopk.MAX_ROWS: windows up to this many rows select with attn_cuda's top-k (backend._dt)
 
 fn size(dt: Dt) i64 {
@@ -110,6 +111,7 @@ const Seg = struct {
         const k2: i64 = try e.w.k2(w);
         const tw = 4 * k2;
         const nb = @divExact(n, 128);
+        if (e.o.pfd) |p| if (PfDense.eligible(k, n, @intCast(k2), form == .lanes)) return s.fused(p, w, form, x, k, n, y);
         // prefill_mm.column_blocks: whole 128-column blocks whose W_q fits the workspace (strips / lanes only)
         const per: i64 = if (k * n * 2 <= ws_limit or form == .stored) nb else @max(1, @divFloor(ws_limit, k * 2 * 128));
         const st = dense.strides(@intCast(k), @intCast(k2));
@@ -155,6 +157,37 @@ const Seg = struct {
                 .{ .name = "SCALE", .arg = .{ .f = had_scale } },
             });
         }
+    }
+
+    /// pfdense.matmul (TF_DSV41_PF_DENSE=fused): upstream's rot_in into the workspace, then one fused GEMM over the
+    /// whole layer (no W_q workspace, so no column blocks) reading the same words the unpack would.
+    fn fused(s: *Seg, p: *const PfDense, w: []const u8, form: Form, x: Arg, k: i64, n: i64, y: Out) !void {
+        const e = s.e;
+        const m = e.n;
+        const k2: u32 = try e.w.k2(w);
+        const tw: i64 = 4 * @as(i64, k2);
+        const nb = @divExact(n, 128);
+        const blk_words = @divExact(k, 16) * 8 * tw;
+        const xh = try e.buf("s.pf.xh", .{}, .f16, &.{ m, k });
+        try e.ext("tensorfold_exl3_linear_v4.rot_in", &.{ x, try e.weight("{s}.suh", .{w}, .f16, &.{k}), xh });
+        const st = dense.strides(@intCast(k), k2);
+        const words: Arg, const sk: i64, const snb: i64 = switch (form) {
+            .lanes => .{ try e.view(.{ .buf = try e.fmt("s.{s}.lanes", .{w}) }, .i32, &.{ nb, @divExact(k, 16), 8, tw }, &.{ blk_words, 8 * tw, tw, 1 }, 0), st[0], st[1] },
+            .strips => .{ if (n == 128)
+                try e.view(.{ .weight = try e.fmt("{s}.trellis", .{w}) }, .i32, &.{ 1, @divExact(k, 16), 8, tw }, &.{ 8 * tw, 8 * tw, tw, 1 }, 0)
+            else
+                try e.view(.{ .buf = try e.fmt("s.{s}.T", .{w}) }, .i32, &.{ nb, @divExact(k, 16), 8, tw }, &.{ blk_words, 8 * tw, tw, 1 }, 0), st[0], st[1] },
+            .stored => .{ try e.view(.{ .weight = try e.fmt("{s}.trellis", .{w}) }, .i32, &.{ @divExact(k, 16), @divExact(n, 16), tw }, &.{ @divExact(n, 16) * tw, tw, 1 }, 0), @divExact(n, 16) * tw, 8 * tw },
+        };
+        const c = p.pick(@intCast(k), @intCast(n), k2, @intCast(m));
+        try e.ext("tf_dsv41_pfdense_v1.gemm", &.{
+            xh,                                                          words,
+            .{ .i = sk },                                                .{ .i = snb },
+            try e.weight("{s}.svh", .{w}, .f16, &.{n}),                  .none,
+            try e.view(y.role, y.dt, &.{ m, n }, &.{ y.stride, 1 }, y.offset), .{ .i = k2 },
+            .{ .b = form == .lanes },                                    .{ .i = c[0] },
+            .{ .i = c[1] },
+        });
     }
 
     /// A projection into a whole contiguous buffer.
@@ -476,7 +509,7 @@ const Seg = struct {
 
     /// Row blocks of the materialised indexer (backend._row_blocks): `per_row` bytes a row under the index budget.
     fn step(e: *E, per_row: i64) i64 {
-        return if (e.n > 16) @max(16, @divFloor(index_budget, @max(1, per_row))) else e.n;
+        return if (e.n > 16) @max(16, @divFloor(e.o.index_budget, @max(1, per_row))) else e.n;
     }
 
     /// An index layer's selection (blocks._select over backend.select / select_cand / reindex).
@@ -496,7 +529,7 @@ const Seg = struct {
         const reindexing = md == .reindex and e.cfg.usesCandidates(L) and s.cand;
         const nvis = @max(@divFloor(e.end(), ratio), 1);
         const streamed = !e.cfg.isCandidateSource(L) and !reindexing and n > 16 and nvis >= stream_min and @popCount(topk) == 1;
-        const fits = if (reindexing) n * cb * cbs * 16 <= index_budget else n * nvis * 12 <= index_budget;
+        const fits = if (reindexing) n * cb * cbs * 16 <= e.o.index_budget else n * nvis * 12 <= e.o.index_budget;
         if (n <= dtopk_rows and fits and !streamed) {
             // the whole segment's scores, then attn_cuda's top-k (its job list picks a source's candidate blocks; a
             // Reindex layer scores over them) and visible counts
@@ -513,7 +546,7 @@ const Seg = struct {
         if (md == .reindex and e.cfg.usesCandidates(L) and s.cand) {
             // backend.reindex: the row's own scores over its candidates' positions, in row blocks under the budget
             const NK = cb * cbs;
-            const whole = n * NK * 16 <= index_budget;
+            const whole = n * NK * 16 <= e.o.index_budget;
             const st = if (whole) n else step(e, NK * 16);
             var a: i64 = 0;
             var j: usize = 0;
@@ -536,7 +569,7 @@ const Seg = struct {
                 try e.glue("counts", &.{ sel[0], sel[1], try e.buf("w.pos64", .{}, .i64, &.{n}), .{ .i = ratio } });
                 return;
             }
-            const whole = n * nvis * 12 <= index_budget;
+            const whole = n * nvis * 12 <= e.o.index_budget;
             const st = if (whole) n else step(e, nvis * 12);
             var a: i64 = 0;
             var j: usize = 0;
