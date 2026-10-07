@@ -103,6 +103,17 @@ def rank_main(rank: int, a) -> None:
             print(f"loaded layer {L} at {time.time() - t0:.0f} s", flush=True)
     tree = W.RankW(rank, 2, rank * vh, embed, layers, norm, head, None, {})
     rows = {L: IndexRows(cfg.engram_head_dim) for L in cfg.engram_layer_ids}
+    if a.engram_dir:               # the kit's packed shards (engram_host.ShardRows), as served; --engram-make writes them
+        from tensorfold.families.deepseek_v41.cuda.engram_host import open_shards
+
+        if a.engram_make:
+            sys.path.insert(0, str(Path(__file__).parent / "dsv41_perf"))
+            import engram_shards
+
+            ps = [torch.randint(3, cfg.vocab_size, (n,), generator=torch.Generator().manual_seed(a.seed)).tolist()
+                  for n in (a.prompts or [a.prompt])]
+            engram_shards.make(a.engram_dir, NgramHasher(cfg, tmap), ps, rank, 2)
+        rows = open_shards(a.engram_dir, rank, 2, cfg.engram_layer_ids, dim=cfg.engram_head_dim)
     kv = None
     if kvmode == "contig":
         fw = Forward(cfg, tree, csa2=Triton(128, cfg.num_attention_heads // 2, dev), comm=comm, device=dev,
@@ -385,6 +396,9 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--layers", default="0-24")
     ap.add_argument("--prompt", type=int, default=1536)
+    ap.add_argument("--engram-dir", default="", help="Engram rows from these packed shards (the Zig ranks' TF_DSV41_ENGRAM_DIR), "
+                    "not the index function")
+    ap.add_argument("--engram-make", action="store_true", help="write --engram-dir first: sparse shards, records under the prompts' rows")
     ap.add_argument("--profile", default="", help="row counts (\"1 4 8\"): time windows of each after the run")
     ap.add_argument("--aot-prompts", type=lambda v: [int(x) for x in v.split(",") if x], default=[],
                     help="more prompt lengths after the run, for their Triton variants only (e.g. 1,9,17,45,64,65,173,300,1025,2049,2600)")
