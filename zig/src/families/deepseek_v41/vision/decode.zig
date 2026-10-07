@@ -1,9 +1,12 @@
 //! Bytes -> Pillow's RGB (``decode`` + ``to_rgb``): the format from the magic, each format behind ``Decoder``.
-//! PNG and JPEG are ported bit for bit; other formats Pillow opens (GIF, WebP, BMP, TIFF, ...) are refused by name.
+//! PNG, JPEG, GIF (the first frame) and BMP are ported bit for bit; other formats Pillow opens (WebP, TIFF, ...) are
+//! refused by name.
 const std = @import("std");
 const pixels = @import("pixels.zig");
 const png = @import("png.zig");
 const jpeg = @import("jpeg.zig");
+const gif = @import("gif.zig");
+const bmp = @import("bmp.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Error = error{ Undecodable, TooManyPixels, Unsupported } || Allocator.Error;
@@ -38,9 +41,27 @@ fn decodeJpeg(gpa: Allocator, raw: []const u8, max_pixels: u64) Error!pixels.Ima
     };
 }
 
+fn decodeGif(gpa: Allocator, raw: []const u8, max_pixels: u64) Error!pixels.Image {
+    return gif.decode(gpa, raw, max_pixels) catch |e| switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.TooManyPixels => error.TooManyPixels,
+        error.BadGif => error.Undecodable,
+    };
+}
+fn decodeBmp(gpa: Allocator, raw: []const u8, max_pixels: u64) Error!pixels.Image {
+    return bmp.decode(gpa, raw, max_pixels) catch |e| switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.TooManyPixels => error.TooManyPixels,
+        error.UnsupportedBmp => error.Unsupported,
+        error.BadBmp => error.Undecodable,
+    };
+}
+
 pub const decoders = [_]Decoder{
     .{ .name = "PNG", .matches = isPng, .decode = decodePng },
     .{ .name = "JPEG", .matches = isJpeg, .decode = decodeJpeg },
+    .{ .name = "GIF", .matches = gif.isGif, .decode = decodeGif },
+    .{ .name = "BMP", .matches = bmp.isBmp, .decode = decodeBmp },
 };
 
 /// What a refused image is, for the message (formats Pillow would open but this engine does not).

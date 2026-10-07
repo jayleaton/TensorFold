@@ -5,6 +5,8 @@
 pub const pixels = @import("pixels.zig");
 pub const png = @import("png.zig");
 pub const jpeg = @import("jpeg.zig");
+pub const gif = @import("gif.zig");
+pub const bmp = @import("bmp.zig");
 pub const decode = @import("decode.zig");
 pub const resample = @import("resample.zig");
 pub const pyjson = @import("pyjson.zig");

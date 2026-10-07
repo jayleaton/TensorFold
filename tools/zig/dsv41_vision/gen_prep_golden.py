@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
-"""Goldens for the Zig image front end (zig/src/families/deepseek_v41/vision): images in every PNG / JPEG flavour
-Pillow opens, each decoded by Pillow (``decode`` + ``to_rgb``) and preprocessed by the prod engine's own
+"""Goldens for the Zig image front end (zig/src/families/deepseek_v41/vision): images in every PNG / JPEG / GIF / BMP
+flavour Pillow opens (GIF: the first frame; BMP: hand-built headers too), each decoded by Pillow (``decode`` + ``to_rgb``) and preprocessed by the prod engine's own
 ``vision_prep.preprocess`` (8474f31). Writes ``OUT/<name>`` (the file bytes) and ``OUT/golden.jsonl``:
 {name, size, rgb_sha256, grid [n_llm_h, n_llm_w, vit_h, vit_w], patches_sha256, digest, vids_sha256, vids_head}.
 
@@ -88,6 +88,117 @@ def png_bytes(arr, color: int, depth: int, interlace: bool = False, palette=None
     return out + chunk(b"IEND", b"")
 
 
+def bmp_bytes(arr, bits: int, *, palette=None, compression: int = 0, masks=None, top_down: bool = False,
+              core: bool = False, rle: bytes | None = None, header: int = 40):
+    """A BMP of ``arr`` (h x w [x channels]): Pillow cannot write 16-bit, bitfields, RLE, top-down or core headers."""
+
+    import numpy as np
+
+    arr = np.asarray(arr)
+    h, w = arr.shape[:2]
+    stride = ((w * bits + 31) >> 3) & ~3
+    rows = []
+    for y in range(h):
+        r = arr[y]
+        if bits == 24:
+            row = r[:, ::-1].astype("u1").tobytes()
+        elif bits == 32:
+            row = r.astype("<u4").tobytes() if r.ndim == 1 else r[:, [2, 1, 0, 3]].astype("u1").tobytes()
+        elif bits == 16:
+            row = r.astype("<u2").tobytes()
+        elif bits == 8:
+            row = r.astype("u1").tobytes()
+        else:
+            bs = "".join(format(int(v), f"0{bits}b") for v in r)
+            bs += "0" * (-len(bs) % 8)
+            row = bytes(int(bs[i:i + 8], 2) for i in range(0, len(bs), 8))
+        rows.append(row + b"\0" * (stride - len(row)))
+    data = rle if rle is not None else b"".join(rows if top_down else rows[::-1])
+    pal = b""
+    if palette is not None:
+        pal = b"".join(bytes([c[2], c[1], c[0]]) + (b"" if core else b"\0") for c in palette)
+    if core:
+        hdr = struct.pack("<IHHHH", 12, w, h, 1, bits)
+    else:
+        hh = (-h if top_down else h) & 0xFFFFFFFF
+        hdr = struct.pack("<IiIHHIIiiII", header, w, 0, 1, bits, compression, len(data), 2835, 2835,
+                          len(palette or []), 0)
+        hdr = hdr[:8] + struct.pack("<I", hh) + hdr[12:]
+        extra = b""
+        if masks is not None:
+            extra = b"".join(struct.pack("<I", m) for m in masks)
+        if header > 40:
+            hdr += (extra + b"\0" * 64)[:header - 40]
+            extra = b""
+        hdr += extra
+    off = 14 + len(hdr) + len(pal)
+    return b"BM" + struct.pack("<IHHI", off + len(data), 0, 0, off) + hdr + pal + data
+
+
+def rle8(arr):
+    """RLE8 rows (bottom-up): runs of equal bytes, absolute runs (word aligned), end of line / bitmap."""
+
+    out = bytearray()
+    for row in arr[::-1]:
+        row = [int(v) for v in row]
+        i = 0
+        while i < len(row):
+            j = i
+            while j < len(row) and row[j] == row[i] and j - i < 255:
+                j += 1
+            if j - i >= 3:
+                out += bytes([j - i, row[i]])
+                i = j
+                continue
+            k = min(len(row), i + 7)
+            run = row[i:k]
+            if len(run) >= 3:
+                out += bytes([0, len(run)]) + bytes(run) + (b"\0" if len(run) % 2 else b"")
+            else:
+                for v in run:
+                    out += bytes([1, v])
+            i = k
+        out += b"\0\0"
+    return bytes(out + b"\0\1")
+
+
+def rle4(arr):
+    out = bytearray()
+    for row in arr[::-1]:
+        row = [int(v) for v in row]
+        i = 0
+        while i < len(row):
+            n = min(len(row) - i, 6)
+            if n >= 4 and n % 2 == 0:   # an absolute run (n // 2 bytes, word aligned)
+                b = bytes((row[i + 2 * t] << 4) | row[i + 2 * t + 1] for t in range(n // 2))
+                out += bytes([0, n]) + b + (b"\0" if len(b) % 2 else b"")
+            else:
+                n = min(n, 2) if n >= 2 else 1
+                out += bytes([n, (row[i] << 4) | (row[i + 1] if n > 1 else row[i])])
+            i += n
+        out += b"\0\0"
+    return bytes(out + b"\0\1")
+
+
+def gif_offset(raw: bytes, grow: int, x0: int, y0: int) -> bytes:
+    """A GIF whose screen is ``grow`` px bigger than its first frame, the frame at (x0, y0) (Pillow writes neither)."""
+
+    b = bytearray(raw)
+    w, h = struct.unpack("<HH", b[6:10])
+    b[6:10] = struct.pack("<HH", w + grow, h + grow)
+    i = 13 + ((3 << ((b[10] & 7) + 1)) if b[10] & 128 else 0)
+    while b[i] != 0x2C:
+        if b[i] == 0x21:
+            i += 2
+            while b[i]:
+                i += 1 + b[i]
+            i += 1
+        else:
+            i += 1
+    b[i + 1:i + 5] = struct.pack("<HH", x0, y0)
+    return bytes(b)
+
+
 def images(small: bool):
     import numpy as np
     from PIL import Image
@@ -132,6 +243,37 @@ def images(small: bool):
     out.append(("q100.jpg", pil(rgb, "JPEG", quality=100, subsampling=0)))
     out.append(("tiny.jpg", pil(Image.fromarray(field(1, 2, 3).astype("u1"), "RGB"), "JPEG", subsampling=2)))
     out.append(("narrow.png", png_bytes(field(400, 3, 3), 2, 8)))
+    # GIF (the first frame) as Pillow writes it, then hand-made: a screen bigger than the frame, an offset frame
+    pimg = Image.fromarray(field(h, w, 1, 200)[..., 0].astype("u1"), "P")
+    pimg.putpalette(pal[:600])
+    out.append(("p.gif", pil(pimg, "GIF")))
+    out.append(("p-trns.gif", pil(pimg, "GIF", transparency=7)))
+    out.append(("p-flat.gif", pil(pimg, "GIF", interlace=False)))
+    out.append(("l.gif", pil(Image.fromarray(field(h, w, 1)[..., 0].astype("u1"), "L"), "GIF")))
+    out.append(("rgb.gif", pil(Image.fromarray(field(h, w, 3).astype("u1"), "RGB"), "GIF")))
+    out.append(("offset.gif", gif_offset(pil(pimg, "GIF", transparency=3), 9, 5, 4)))
+    out.append(("offset-opaque.gif", gif_offset(pil(pimg, "GIF", interlace=False), 6, 2, 3)))
+    out.append(("bits1.gif", pil(Image.fromarray((field(h, w, 1, 2)[..., 0] * 255).astype("u1"), "L").convert("1"), "GIF")))
+    # BMP: Pillow's own writer, then the layouts it reads but does not write
+    out.append(("rgb.bmp", pil(Image.fromarray(field(h, w, 3).astype("u1"), "RGB"), "BMP")))
+    out.append(("p.bmp", pil(pimg, "BMP")))
+    out.append(("l.bmp", pil(Image.fromarray(field(h, w, 1)[..., 0].astype("u1"), "L"), "BMP")))
+    out.append(("1.bmp", pil(Image.fromarray((field(h, w, 1, 2)[..., 0] * 255).astype("u1"), "L").convert("1"), "BMP")))
+    out.append(("rgba.bmp", pil(Image.fromarray(field(h, w, 4).astype("u1"), "RGBA"), "BMP")))
+    pal16 = [tuple(rng.integers(0, 256, 3)) for _ in range(16)]
+    out.append(("p4.bmp", bmp_bytes(field(h, w, 1, 16)[..., 0], 4, palette=pal16)))
+    out.append(("p1.bmp", bmp_bytes(field(h, w, 1, 2)[..., 0], 1, palette=[(10, 200, 30), (250, 5, 90)])))
+    out.append(("p8-core.bmp", bmp_bytes(field(h, w, 1, 200)[..., 0], 8, palette=[tuple(pal[3 * i:3 * i + 3]) for i in range(200)], core=True)))
+    out.append(("bgr-top.bmp", bmp_bytes(field(h, w, 3), 24, top_down=True)))
+    out.append(("bgr555.bmp", bmp_bytes(field(h, w, 1, 1 << 15)[..., 0], 16)))
+    out.append(("bgr565.bmp", bmp_bytes(field(h, w, 1, 1 << 16)[..., 0], 16, compression=3, masks=[0xF800, 0x7E0, 0x1F])))
+    out.append(("bgrx.bmp", bmp_bytes(field(h, w, 4), 32)))
+    out.append(("rgba-v4.bmp", bmp_bytes(field(h, w, 4), 32, compression=3, masks=[0xFF0000, 0xFF00, 0xFF, 0xFF000000], header=108)))
+    out.append(("abgr.bmp", bmp_bytes(field(h, w, 1, 1 << 30)[..., 0] * 4 + 3, 32, compression=3, masks=[0xFF000000, 0xFF0000, 0xFF00, 0xFF], header=56)))
+    p8 = field(h, w, 1, 200)[..., 0] // 40 * 40
+    out.append(("rle8.bmp", bmp_bytes(p8, 8, palette=[tuple(pal[3 * i:3 * i + 3]) for i in range(200)], compression=1, rle=rle8(p8))))
+    p4 = field(h, w, 1, 16)[..., 0] // 4 * 4
+    out.append(("rle4.bmp", bmp_bytes(p4, 4, palette=pal16, compression=2, rle=rle4(p4))))
     if small:
         return out
     big = Image.fromarray(field(900, 1500, 3).astype("u1"), "RGB")

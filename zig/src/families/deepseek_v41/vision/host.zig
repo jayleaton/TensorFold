@@ -73,7 +73,7 @@ pub const Host = struct {
         var rgb = decode.rgb(h.gpa, raw, h.s.max_pixels, &which) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.TooManyPixels => refuse(problem, try std.fmt.allocPrint(a, "image of more than {d} pixels (TF_DSV41_VISION_MAX_PIXELS)", .{h.s.max_pixels})),
-            error.Unsupported => refuse(problem, try std.fmt.allocPrint(a, "could not decode the image: {s} images are not supported by this engine (PNG and JPEG are)", .{which})),
+            error.Unsupported => refuse(problem, try std.fmt.allocPrint(a, "could not decode the image: {s} images are not supported by this engine (PNG, JPEG, GIF and BMP are)", .{which})),
             error.Undecodable => refuse(problem, try std.fmt.allocPrint(a, "could not decode the image ({s})", .{if (which.len > 0) which else "unknown format"})),
         };
         defer rgb.deinit(h.gpa);
@@ -120,10 +120,19 @@ pub const Host = struct {
     pub fn images(h: *Host, a: Allocator, urls: []const []const u8, problem: *parts.Problem) error{ Refused, OutOfMemory }![]*Shared {
         if (urls.len == 0) return &.{};
         if (urls.len > h.s.max_images) return refuse(problem, try std.fmt.allocPrint(a, "{d} images in one request: at most {d} (TF_DSV41_VISION_MAX_IMAGES)", .{ urls.len, h.s.max_images }));
-        if (h.preparing.fetchAdd(1, .acq_rel) >= h.s.prep_slots) {
-            _ = h.preparing.fetchSub(1, .acq_rel);
-            problem.* = .{ .message = "image processing capacity is busy; retry shortly", .busy = true };
-            return error.Refused;
+        // ``self.slots.acquire(timeout=60)``: a slot within 60 s, else busy (HTTP 503)
+        const give_up = std.Io.Clock.awake.now(h.io).nanoseconds + 60 * std.time.ns_per_s;
+        while (true) {
+            const cur = h.preparing.load(.acquire);
+            if (cur < h.s.prep_slots) {
+                if (h.preparing.cmpxchgWeak(cur, cur + 1, .acq_rel, .acquire) == null) break;
+                continue;
+            }
+            if (std.Io.Clock.awake.now(h.io).nanoseconds >= give_up) {
+                problem.* = .{ .message = "image processing capacity is busy; retry shortly", .busy = true };
+                return error.Refused;
+            }
+            std.Io.sleep(h.io, .fromMilliseconds(5), .awake) catch {};
         }
         defer _ = h.preparing.fetchSub(1, .acq_rel);
         const deadline = std.Io.Clock.awake.now(h.io).nanoseconds + @as(i96, @intFromFloat(h.s.fetch_total_s * 1e9));
