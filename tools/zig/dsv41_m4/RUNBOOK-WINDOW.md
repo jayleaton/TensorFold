@@ -5,7 +5,7 @@ One window, the whole model at TP=2 over RoCE, with every finished part on:
 - R3 Engram (the node's packed shards, as prod reads them);
 - keyed sampling;
 - DSpark drafts priced by prod's stored calibration table;
-- several live slots (row mode);
+- several live slots (row mode), with DSpark drafting per slot and a batched verify;
 - the paged pool, and split KV for long context.
 
 It answers three questions:
@@ -13,7 +13,7 @@ It answers three questions:
 2. **The served path holds.** Every HTTP reply of run A (greedy and sampled, drafts on) replays through the CLI to the same ids: `PASS M4 CLI == HTTP`.
 3. **Long context.** Split KV's measured boot check on the whole model. Prompt and decode tok/s at 32K / 128K / 512K tokens against prod.
 
-**Downtime: about 1 h 50 min, up to 2 h 30 min**, with prod down from step 3 to step 12. Steps 1–2 run before the window, while prod serves.
+**Downtime: about 2 h 20 min, up to 3 h**, with prod down from step 3 to step 12. Steps 1–2 run before the window, while prod serves.
 
 | part | time |
 |---|---|
@@ -21,7 +21,8 @@ It answers three questions:
 | row-mode AOT set | 8 min |
 | run A: 1 slot, all on (load, bench, requests) | 25 min |
 | run A's CLI replay | 15 min |
-| run B: 4 slots (load, bench) | 15 min |
+| run B: 4 slots, drafts off (load, bench) | 15 min |
+| run B2: 4 slots with drafts (load, bench, replay) | 30 min |
 | run C: long context, split KV (load, bench) | 25–30 min |
 | restore | 2 min |
 
@@ -49,8 +50,9 @@ It answers three questions:
 | 7 | dgx-01, second shell | when `out/a/server.log` says it is listening: `python3 bench_http.py --url http://127.0.0.1:8091 --label zig-1slot --out out/zig-a.json`, then `./requests.sh 8091 256`. Then stop the server (Ctrl-C); rank 1 ends on its own (else `docker stop dsv41-zig-m4-r1`) | 15 min |
 | 8 | both, within ~1 min | **run A's CLI replay:** dgx-01 `ASSETS=$A ./run_m4.sh 0 out/a generate`, dgx-02 `ASSETS=$A ./run_m4.sh 1 out/a follow`. **Check** `out/a/generate.log`: `PASS M4 CLI == HTTP: N/N replies equal` (the bench's sampled replies included), then `DSpark: D drafted, A accepted (rate)` | 15 min |
 | 9 | both, within ~1 min | **run B, 4 slots:** dgx-01 `ASSETS=$A SLOTS=4 POOL_TOKENS=1400000 INDEX_KV=fp8 ./run_m4.sh 0 out/b server`, dgx-02 the same with `1 out/b follow`. Then dgx-01: `python3 bench_http.py --url http://127.0.0.1:8091 --label zig-4slots --out out/zig-b.json`. Stop both | 15 min |
+| 9b | both, within ~1 min | **run B2, 4 slots with drafts (prod's shape):** dgx-01 `ASSETS=$A SLOTS=4 SLOT_DRAFTS=1 POOL_TOKENS=1400000 INDEX_KV=fp8 PHASES=1 ./run_m4.sh 0 out/b2 server`, dgx-02 the same with `1 out/b2 follow`. Then dgx-01: `python3 bench_http.py --url http://127.0.0.1:8091 --label zig-4slots-drafts --out out/zig-b2.json`, then `./requests.sh 8091 256`. Stop both. Then the replay at 4 streams: dgx-01 `ASSETS=$A SLOTS=4 SLOT_DRAFTS=1 POOL_TOKENS=1400000 INDEX_KV=fp8 GEN_STREAMS=4 ./run_m4.sh 0 out/b2 generate`, dgx-02 the same with `1 out/b2 follow`. **Check** `out/b2/generate.log`: `PASS M4 CLI == HTTP` and the `DSpark:` line | 30 min |
 | 10 | both, within ~1 min | **run C, long context:** dgx-01 `ASSETS=$A POOL_TOKENS=3000000 KV_SPLIT=1 INDEX_KV=fp8 ./run_m4.sh 0 out/c server`, dgx-02 the same with `1 out/c follow`. Note the boot check's lines in `out/c/server.log` (`grep -i "boot check\|pool" out/c/server.log`). Then dgx-01: `python3 bench_http.py --url http://127.0.0.1:8091 --label zig-split --long 32768,131072,524288 --out out/zig-long.json`. Stop both | 25–30 min |
-| 11 | dgx-01 | the tables: `python3 bench_http.py --compare out/prod.json out/zig-a.json`, the same for `out/zig-b.json`, and `--compare out/prod-long.json out/zig-long.json` | — |
+| 11 | dgx-01 | the tables: `python3 bench_http.py --compare out/prod.json out/zig-a.json`, the same for `out/zig-b.json` and `out/zig-b2.json`, and `--compare out/prod-long.json out/zig-long.json` | — |
 | 12 | dgx-01 | **restore prod:** `scripts/v2-rollback.sh perf1`, then `scripts/serve.sh status` (both ranks up, model `DeepSeek-V4.1-Flash-TF`) | 2 min |
 | 13 | dev box | collect `~/zig-window-kit/out/` from both nodes into `dsv41-exl3-quant/results/SPARK-ZIG-<date>/r0` and `r1` | 2 min |
 
@@ -59,6 +61,7 @@ It answers three questions:
 **What each run is:**
 - **A, the prod candidate's one slot:** drafts on, contiguous slot (4,096 positions). Its 4-stream cells queue on one slot: they measure the one-slot server under load, not batching.
 - **B, batching:** 4 live slots in row mode (graphs per row bucket), keyed sampling per slot, the paged pool at prod's 1.4M tokens. Drafts are off: DSpark is one slot's for now. Compare B's 4-stream cells with prod's 4-stream cells (prod drafts with 4 slots), and A's 1-stream cells with prod's 1-stream cells.
+- **B2, prod's shape:** 4 live slots with DSpark drafting in each and one batched verify a round, as prod's batcher runs `PARALLEL=4`. **This is the like-for-like run against prod: compare every cell of `out/zig-b2.json` with `out/prod.json`.** Its replay at 4 streams checks that batched, drafted replies are the same ids as the HTTP ones, and its `DSpark:` line gives the multi-slot acceptance to set against prod's.
 - **C, long context:** split KV (the comp rows sharded over the two ranks) on a 3.0M-token pool, drafts on. The measured boot check runs first. If it refuses the pool, it names the bytes it needs: lower `POOL_TOKENS` (2400000, then 1400000) on both ranks and restart.
 
 **Optional knobs:**
@@ -79,6 +82,7 @@ It answers three questions:
   - A missing Triton variant with `SLOTS=4`: step 5's set lacks it. Send `out/rows-aot.log`. Run B is then skipped.
   - Out of memory with `POOL_TOKENS`: lower it.
 - **Run C fails with drafts** (an error naming the pool or split): rerun C with `DRAFTS=0`. The long-context numbers still hold, without drafting.
+- **Run B2 refuses to load with `SLOT_DRAFTS=1`**, or its replay fails: run B's numbers stand without drafting. Send `out/b2/`.
 - **The CLI replay fails:** the line's `first_differing` names the token index. Send `out/a/`.
 - **Whatever happened, restore prod (step 12) first.**
 

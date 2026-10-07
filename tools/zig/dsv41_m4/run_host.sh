@@ -12,8 +12,9 @@
 # windows through CUDA graphs, both ranks alike; 0: eager), DRAFT_TIMED (0: drafts sized from the cost tables, the
 # same for a request whatever the load, so HTTP == CLI; 1: the measured round times).
 # The full-model window's knobs (both ranks alike; RUNBOOK-WINDOW.md):
-#   SAMPLING (1: keyed sampling, T > 0 served), SLOTS (1; N > 1: N live slots in row mode, drafts off, the server's
-#   --parallel N; needs POOL_TOKENS and the row-mode AOT variants of the rows-aot phase), POOL_TOKENS (the paged pool;
+#   SAMPLING (1: keyed sampling, T > 0 served), SLOTS (1; N > 1: N live slots in row mode, the server's --parallel N;
+#   needs POOL_TOKENS and the rows-aot phase's variants; drafts off unless SLOT_DRAFTS=1: DSpark per slot with a
+#   batched verify, as prod's batcher drafts), POOL_TOKENS (the paged pool;
 #   unset: the contiguous slot), KV_SPLIT (1: comp rows sharded over the ranks, needs POOL_TOKENS), INDEX_KV (prod: fp8),
 #   ENGRAM (1: R3, the node's packed Engram shards as prod reads them: ENGRAM_DIR, prod-perf1.env's HEAD_ENGRAM /
 #   WORKER_ENGRAM), CALIB (real: the drafts priced by prod's stored table, CACHE_VOL read-only; "": the built-in costs),
@@ -28,7 +29,8 @@ IMAGE=${IMAGE:-tensorfold-dsv41:e1e2-8474f31}
 if [[ "$RANK" == 0 ]]; then MODEL=/home/dgx01/ai/models/dsv41-q28-v2; else MODEL=/home/root/.cache/dsv41-q28-v2/model; fi
 MODEL=${PACK:-$MODEL}; ASSETS=${ASSETS:?ASSETS: rope.bin, engram-host.bin, aot/ (writable: dspark-aot merges into it)}; PORT=${PORT:-8091}
 DRAFTS=${DRAFTS:-1}; BACKEND=${BACKEND:-roce}; SLOTS=${SLOTS:-1}; CACHE_VOL=${CACHE_VOL:-dsv41-perf1-cache}
-(( SLOTS > 1 )) && DRAFTS=0                     # several live slots: DSpark is one slot's (refused by name otherwise)
+# several live slots: drafts only with SLOT_DRAFTS=1 (TF_DSV41_SLOT_DRAFTS: per-slot DSpark, batched verify); else off
+(( SLOTS > 1 )) && [[ "${SLOT_DRAFTS:-0}" != 1 ]] && DRAFTS=0
 if [[ "$RANK" == 0 ]]; then ENGRAM_DIR=${ENGRAM_DIR:-/home/dgx01/dsv41-engram}; else ENGRAM_DIR=${ENGRAM_DIR:-/home/root/dsv41-engram}; fi
 mkdir -p "$OUT"; OUT=$(cd "$OUT" && pwd)
 ARGS=(--rm --gpus all --ipc=host --network host --device /dev/infiniband --ulimit memlock=-1 --cap-add IPC_LOCK
@@ -46,6 +48,7 @@ ARGS=(--rm --gpus all --ipc=host --network host --device /dev/infiniband --ulimi
 [[ "${ENGRAM:-1}" == 1 ]] && ARGS+=(-v "$ENGRAM_DIR:/engram:ro" -e TF_DSV41_ENGRAM_DIR=/engram)
 [[ "${CALIB-real}" == real ]] && ARGS+=(-v "$CACHE_VOL:/cache:ro" -e TF_DSV41_CALIB=real -e TF_DSV41_CALIB_DIR=/cache/dsv41-calib)
 [[ -n "${TREE:-}" ]] && ARGS+=(-e TF_DSV41_TREE="$TREE")
+[[ "${SLOT_DRAFTS:-0}" == 1 ]] && ARGS+=(-e TF_DSV41_SLOT_DRAFTS=1)
 [[ "${PHASES:-0}" == 1 ]] && ARGS+=(-e TF_DSV41_PHASES=1 -e TF_DSV41_PHASES_OUT=/out/phases.json)
 NCCL='export TF_NCCL_LIB=$(python -c "import nvidia.nccl, os; print(os.path.join(os.path.dirname(nvidia.nccl.__file__), \"lib\", \"libnccl.so.2\"))" 2>/dev/null || echo libnccl.so.2)'
 case "$PHASE" in
@@ -54,7 +57,8 @@ case "$PHASE" in
         docker run "${ARGS[@]}" -e TF_DSV41_TRACE_TOKENS=/out/trace.jsonl --name dsv41-zig-m4-r0 --entrypoint bash "$IMAGE" \
             -c "$NCCL; exec /kit/tensorfold-dsv41 serve /model --port $PORT --parallel $SLOTS ${nd[*]}" 2>&1 | tee "$OUT/server.log" ;;
     generate)
-        docker run "${ARGS[@]}" --name dsv41-zig-m4-gen --entrypoint bash "$IMAGE" \
+        # GEN_STREAMS=N: N replies in flight (several slots: batched rows, as served)
+        docker run "${ARGS[@]}" -e TF_DSV41_GEN_STREAMS="${GEN_STREAMS:-1}" --name dsv41-zig-m4-gen --entrypoint bash "$IMAGE" \
             -c "$NCCL; exec /kit/tf-dsv41-m1 generate /model /assets /out/trace.jsonl" 2>&1 | tee "$OUT/generate.log" ;;
     dspark-aot)
         # DSpark's Triton variants on this GPU (the M2c-2 reference never drafts): a set P capture (one GPU, ~3 min) on
