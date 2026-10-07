@@ -149,7 +149,7 @@ case "$PHASE" in
             -e NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-enp1s0f1np1} -e NCCL_IB_HCA=${NCCL_IB_HCA:-rocep1s0f1,roceP2p1s0f1} \
             -e GLOO_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-enp1s0f1np1} --name "dsv41-zig-taps-r$RANK" \
             --entrypoint python "$IMAGE" -u -B /kit/tools/zig/dsv41_m2b_ref.py --pack /model --out /out/taps-aot --layers 0-39 \
-            --prompt 64 --steps 1 --aot-taps --aot-prompts "${AOT_PROMPTS-1,2,9,16,17,33,45,54,64,65,96,173,300,1025,2049,2600}" \
+            --prompt 64 --steps 1 --aot-taps --aot-prompts "${AOT_PROMPTS-1,2,9,16,17,33,45,54,64,65,96,173,300,1025,2049,2600,4090}" \
             --rank "$RANK" --master "$MASTER" --port 29841 > "$OUT/taps-aot.log" 2>&1 \
             || { echo "taps-aot reference failed: $OUT/taps-aot.log"; exit 1; }
         python3 "$KIT/tools/zig/dsv41_aot_merge.py" "$ASSETS/aot" "$TA/aot" | tee -a "$OUT/taps-aot.log" ;;
@@ -157,6 +157,8 @@ case "$PHASE" in
         # prompts prefilled into the paged pool (the `_fused` variants with PT, every row count's % 16 / == 1, every
         # layer kind): SLOTS > 1 or POOL_TOKENS serves every prompt there. dsv41_m2b_ref.py --pool (POOL_AOT_MODE=split:
         # --split, a tree whose Pool takes split=) at TP=2 over the two hosts on layers 0-24, merged into ASSETS/aot
+        # 4,090: a last segment whose key count is not % 16 while its candidate blocks (cdiv(n, 8)) are: layer 20's
+        # _block_keys (n = 113..127 mod 128); a served prompt's last segment ends anywhere
         # long prompts (CONTEXT past 4,096; their paged _scores / _stream variants): AOT_PROMPTS=8448 POOL_AOT_LIMIT=10496
         # decode windows at every key count's % 16 and past the top-k (the paged decode _scores): POOL_AOT_STEPS=600 decodes
         # that many steps from the POOL_AOT_PROMPT-token prompt (POOL_AOT_PROMPT=8448 POOL_AOT_STEPS=40: long positions)
@@ -172,7 +174,7 @@ case "$PHASE" in
             -e GLOO_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-enp1s0f1np1} --name "dsv41-zig-pool-r$RANK" \
             --entrypoint python "$IMAGE" -u -B /kit/tools/zig/dsv41_m2b_ref.py --pack /model --out /out/pool-aot --layers 0-24 \
             --"${POOL_AOT_MODE:-pool}" --prompt "${POOL_AOT_PROMPT:-64}" --steps "${POOL_AOT_STEPS:-1}" --aot-taps --limit "${POOL_AOT_LIMIT:-4096}" \
-            --aot-prompts "${AOT_PROMPTS-1,2,9,16,17,33,45,48,54,64,65,96,173,300,1025,2049,2600}" \
+            --aot-prompts "${AOT_PROMPTS-1,2,9,16,17,33,45,48,54,64,65,96,173,300,1025,2049,2600,4090}" \
             --rank "$RANK" --master "$MASTER" --port 29861 > "$OUT/pool-aot.log" 2>&1 \
             || { echo "pool-aot reference failed: $OUT/pool-aot.log"; exit 1; }
         python3 "$KIT/tools/zig/dsv41_aot_merge.py" "$ASSETS/aot" "$PA/aot" | tee -a "$OUT/pool-aot.log" ;;
