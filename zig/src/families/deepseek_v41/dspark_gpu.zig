@@ -38,6 +38,10 @@ pub const GpuPass = struct {
     conf: ?[]f32,
     arena: std.heap.ArenaAllocator,
     pass_calls: []const calls.Call = &.{},
+    /// where the pass's host step ("glue.ds_out") starts: `begin` launches the calls before it, `collect` the rest
+    head: usize = 0,
+    /// the ask a `begin` launched (TF_DSV41_SPEC_DRAFT, draft/spec.zig), until its `collect`
+    begun: ?iface.Ask = null,
     /// the first position whose ring rows are this slot's
     valid: u64 = 0,
     st: emit.Statics,
@@ -96,6 +100,10 @@ pub const GpuPass = struct {
             .hid = try gpa.alloc(f32, @as(usize, @intCast(n)) * cfg.hidden),
         };
         x.pass_calls = try emit.emitPass(x.arena.allocator(), cfg, f.widths, f.opts, n);
+        x.head = x.pass_calls.len;
+        for (x.pass_calls, 0..) |c, i| if (std.mem.eql(u8, c.name, "glue.ds_out")) {
+            x.head = i;
+        };
         f.drafter = .{ .ptr = x, .ingest = followIngest, .propose = followPropose, .reset = followReset };
         return x;
     }
@@ -127,7 +135,7 @@ pub const GpuPass = struct {
         return .{ .ptr = x, .vtable = &vtable };
     }
 
-    const vtable: iface.Pass.VTable = .{ .ingest = ingest, .propose = propose, .reset = reset, .markov = heads };
+    const vtable: iface.Pass.VTable = .{ .ingest = ingest, .propose = propose, .reset = reset, .markov = heads, .begin = begin, .collect = collect };
 
     fn self(p: *anyopaque) *GpuPass {
         return @ptrCast(@alignCast(p));
@@ -138,6 +146,7 @@ pub const GpuPass = struct {
     fn reset(p: *anyopaque, slot: u32) void {
         _ = slot;
         const x = self(p);
+        if (x.begun != null) std.log.err("dspark: a reset while a speculative pass is begun", .{});
         const op = fwd.Forward.dsResetOp();
         x.f.sendDrafter(&op) catch |e| std.log.err("dspark: the draft reset did not reach the followers ({t})", .{e});
         x.valid = 0;
@@ -156,6 +165,7 @@ pub const GpuPass = struct {
     fn ingest(p: *anyopaque, slot: u32, start: u64, taps: iface.Taps, rows: []const u32) anyerror!void {
         const x = self(p);
         if (slot != 0) return error.Slots;
+        if (x.begun != null) return error.PassBegun;
         if (rows.len == 0) return;
         for (rows, 0..) |r, i| if (r != rows[0] + i) return error.NotAPrefix;
         const n: u32 = @intCast(rows.len);
@@ -189,10 +199,43 @@ pub const GpuPass = struct {
     fn propose(p: *anyopaque, asks: []const iface.Ask, out: []iface.Proposal) anyerror!void {
         const x = self(p);
         if (asks.len != 1) return error.Slots;
+        if (x.begun != null) return error.PassBegun;
         const a = asks[0];
         const ops = fwd.Forward.dsProposeOp(a.anchor, a.start);
         try x.f.sendDrafter(&ops);
         try x.runPass(a.anchor, a.start);
+        return x.finish(a, out);
+    }
+
+    /// The speculative pass (draft/spec.zig): the followers get the same op_ds_propose and run the whole pass; this
+    /// rank launches the pass up to its host step and returns, so the GPU drafts while the lanes commit. Until
+    /// `collect`, only work without collectives may follow on the stream (the target's keep): the host step's gather
+    /// pairs with the followers' next one.
+    fn begin(p: *anyopaque, asks: []const iface.Ask) anyerror!void {
+        const x = self(p);
+        if (asks.len != 1) return error.Slots;
+        if (x.begun != null) return error.PassBegun;
+        const a = asks[0];
+        const ops = fwd.Forward.dsProposeOp(a.anchor, a.start);
+        try x.f.sendDrafter(&ops);
+        try x.stagePass(a.anchor, a.start);
+        try x.f.runner.window(x.pass_calls[0..x.head]);
+        x.begun = a;
+    }
+
+    fn collect(p: *anyopaque, out: []iface.Proposal) anyerror!void {
+        const x = self(p);
+        const a = x.begun orelse return error.NoPassBegun;
+        x.begun = null;
+        if (out.len != 1) return error.Slots;
+        const r = x.f.runner;
+        r.glue = .{ .ctx = x, .run = glueFn };
+        try r.window(x.pass_calls[x.head..]);
+        return x.finish(a, out);
+    }
+
+    /// The host's chain over the pass's gathered candidates (the last `runPass` or `collect`).
+    fn finish(x: *GpuPass, a: iface.Ask, out: []iface.Proposal) !void {
         // the chain (Python's chain_host): greedy at T = 0, keyed sampling at the ask's parameters
         const c: usize = x.f.comm.world() * x.k;
         var scratch = std.heap.ArenaAllocator.init(x.gpa);
@@ -215,6 +258,12 @@ pub const GpuPass = struct {
 
     /// The pass on this rank: statics staged, the launches, the host's candidates (every rank: the gather pairs up).
     fn runPass(x: *GpuPass, anchor: u32, start: u64) !void {
+        try x.stagePass(anchor, start);
+        try x.f.runner.window(x.pass_calls);
+    }
+
+    /// The pass's statics (Python's DraftInputs) on the device, and its glue in place.
+    fn stagePass(x: *GpuPass, anchor: u32, start: u64) !void {
         const st = x.st;
         const n: usize = @intCast(st.n);
         const W: usize = @intCast(st.window);
@@ -243,7 +292,6 @@ pub const GpuPass = struct {
         try cuda.DeviceBuffer.upload(.{ .d = r.d, .ptr = r.addressOf("w.ds.i64") orelse return error.Unbound, .len = 8 * x.h64.len }, 0, std.mem.sliceAsBytes(x.h64));
         try cuda.DeviceBuffer.upload(.{ .d = r.d, .ptr = r.addressOf("w.ds.i32") orelse return error.Unbound, .len = 4 * x.h32.len }, 0, std.mem.sliceAsBytes(x.h32));
         r.glue = .{ .ctx = x, .run = glueFn };
-        try r.window(x.pass_calls);
     }
 
     fn device(x: *GpuPass, slot: *?cuda.DeviceBuffer, bytes: usize) !u64 {
