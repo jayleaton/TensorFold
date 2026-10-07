@@ -97,6 +97,9 @@ pub const Forward = struct {
     ext: ?Ext = null,
     /// the keyed sampler (sampling_gpu.zig): a follower runs rank 0's sampled choices too (their gathers pair up)
     sampler: ?Sampler = null,
+    /// structured output (grammar_gpu.zig, TF_DSV41_GRAMMAR=1): staged grammar masks applied to "w.logits" before a
+    /// pick reads them; a follower runs rank 0's op_grammar messages
+    grammar: ?Grammar = null,
 
     pub fn init(gpa: std.mem.Allocator, cfg: *const Config, widths: *const block.Widths, opts: block.Options, runner: *run.Runner, comm: tp.collective.Collective) Forward {
         return .{ .gpa = gpa, .cfg = cfg, .widths = widths, .opts = opts, .runner = runner, .comm = comm, .arena = std.heap.ArenaAllocator.init(gpa) };
@@ -239,6 +242,7 @@ pub const Forward = struct {
         const pairs: []f64 = @alignCast(std.mem.bytesAsSlice(f64, hb[lb..need]));
         const dev = f.pick_dev.?;
         const logits = r.addressOf("w.logits") orelse return error.Unbound;
+        if (f.grammar) |g| try g.apply(g.ptr, 0, @intCast(n));
         try r.d.check(r.d.api.cuMemcpyDtoHAsync_v2(host.ptr, logits, 4 * n * V, r.stream.handle), "cuMemcpyDtoHAsync");
         try r.stream.synchronize();
         for (0..n) |row| {
@@ -325,6 +329,16 @@ pub const Forward = struct {
         if (f.leads()) try f.link.?.send(ints);
     }
     const op_tree_drop: i64 = 20;
+    /// 28-31: dsq-zig-grammar-1; 28: [op, sub (bind / step / release), ...] (grammar_gpu.zig)
+    pub const op_grammar: i64 = 28;
+
+    /// Structured output's side of the forward (grammar_gpu.zig): `apply` before a pick reads "w.logits" rows
+    /// [row0, row0 + n) (every rank, in the same order), `follow` a follower's op_grammar message.
+    pub const Grammar = struct {
+        ptr: *anyopaque,
+        follow: *const fn (ptr: *anyopaque, msg: []const i64) anyerror!void,
+        apply: *const fn (ptr: *anyopaque, row0: u32, n: u32) anyerror!void,
+    };
 
     /// A workstream's follower side: rank 0's message of an operation number this file does not know.
     pub const Ext = struct { ptr: *anyopaque, run: *const fn (ptr: *anyopaque, msg: []const i64) anyerror!void };
@@ -462,6 +476,10 @@ pub const Forward = struct {
                 },
                 op_sample => {
                     const x = f.sampler orelse return error.BadPlan;
+                    try x.follow(x.ptr, msg);
+                },
+                op_grammar => {
+                    const x = f.grammar orelse return error.BadPlan;
                     try x.follow(x.ptr, msg);
                 },
                 else => {
