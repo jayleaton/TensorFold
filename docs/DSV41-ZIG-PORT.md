@@ -99,6 +99,7 @@ Five agents work on `dsv41-zig` at once toward one combined pod gate and one Spa
   - 16–19: `dsq-zig-slots-1` (16 `op_select`, 17 `op_rows`, 18 `op_rows_keep`, 19 `op_rows_drop`: `slots.zig`);
   - 20–23: `dsq-zig-trees-1` (20: `op_tree_drop`, `Forward.drop`);
   - 24–27: `dsq-zig-speed-1` (none used: its hooks ride on `op_ds_propose`).
+  - 28–31: `dsq-zig-grammar-1` (28 `op_grammar`: bind / step / release, `grammar_gpu.zig`);
   - 40–43: `dsq-zig-mdraft-1` (40 `op_ingest`, 41 `op_propose`, 42 `op_reset`: `dspark_rows.zig`; 28–31 are `dsq-zig-grammar-1`'s `op_grammar`).
 - **Defaults.** Every new behaviour is behind a knob or a new code path, and defaults to today's. With every new knob off, the gates `check cap24-*/cap15/cap18/cap22` and `dcheck cap16` still give 0 mismatches. Run `tf-dsv41-m1 m5-emit cap18` before committing a change to an emitter.
 - **Pool vs contiguous.** A slot's KV is either the contiguous roles (`s.L<i>.comp.*`, `s.L<i>.ik`) or the pool (`block.Options.pool`, the `s.kv.*` roles). New code must work with both, or refuse the other by name.
@@ -373,6 +374,61 @@ The tree was `798b4f5`, built from a clean archive. The fatbins were the sm_120 
   - M4 at prod's calibration (`M2B_M4_ENV=TF_DSV41_CALIB_FILE=...`; prod's tables, copied read-only, are in `dsv41-zig-ref/calib-prod/`);
   - multi-slot drafting (`M2B_MDRAFT=1`, `dsq-zig-mdraft-1`).
 - **The gap-closing workstreams** (`dsq-zig-longpf-1`, `dsq-zig-spec-1`, `dsq-zig-grammar-1`, `dsq-zig-vision-1`) each ship `tools/zig/dsv41_<name>/job.sh` with a `<name>_gate`. The gate runs inside `M1_JOB=m2b` with slots_gate's environment, behind `M2B_LONGPF` / `M2B_SPEC` / `M2B_GRAMMAR` / `M2B_VISION` (`7618d35`). The ones not ready for the fix-up pod go on a second batched pod. The Spark window does not wait for them.
+
+- `dsq-zig-grammar-1` (structured output, `TF_DSV41_GRAMMAR=1`; design in "Structured output" below):
+  - **Pod step: `M2B_GRAMMAR=1`** (`M1_JOB=m2b`, 2 GPUs): `source "$Z/tools/zig/dsv41_grammar/job.sh"; grammar_gate`. Runs after `M2B_SAMP` (it reuses its AOT prompt lengths and the sampler's fatbin).
+    1. **grammar-ref** (about 3 min on the reference's own load with `dsv41_m2b_ref.py --grammar`, not built yet: a 3-line hook like `--sampled` calling `grammar_ref.run_cases(fw, cfg, rank, out/"grammar", pack, 48)`; standalone about 9 min with its own TP=2 load). Prod's grammar (`structured.Dsv41Grammars` + GLM `Constraint` over xgrammar 0.2.8) masks serial decoding of 6 cases: json_schema greedy / sampled, tool_choice required greedy, a named tool sampled, strict tools greedy, json_object sampled. Prompts 37, 50, 66, 83, 128 and 292 random ids (the sampled gate's lengths), 48 tokens. Output: `trace.jsonl` with each line's `structure`.
+    2. **grammar-drafts / grammar-serial** (about 5 min each): `tf-dsv41-m1 generate` on that trace with `TF_DSV41_GRAMMAR=1 TF_DSV41_SAMPLING=1`, drafts on then off. Expected in each: `PASS grammar drafts: Zig == Python: 6/6 replies equal` (generate's line, rewritten by job.sh).
+    3. **grammar-http** (about 6 min): `tensorfold-dsv41 serve` with `TF_DSV41_GRAMMAR=1` answers `requests.sh`'s 6 chat requests (response_format json_schema / json_object, tool_choice required / named, strict tools; greedy and seeded), each checked against its grammar (`PASS grammar http: 6/6`), then `generate` replays the server's trace under the recorded grammars: `PASS grammar http: CLI == HTTP: 6/6`. The logs also show `structured output: on (xgrammar 0.2.8 core, ...)`.
+    - **Assets:** the M2b R0 reference's (`aot/` with the six lengths, as `M2B_SAMP=1`'s `--sampled` writes them, `rope.bin`, `engram-host.bin`); the pack's `tokenizer.json` (in `LP`); the `dsv41_sampling.fatbin` copy as for `M2B_SAMP`. The Python side needs `xgrammar==0.2.8`: prod's E1E2 image has it, and the step installs it with `--no-deps` when it is missing.
+    - **Minutes:** about 14 with `--grammar` on the reference (16 with the standalone reference). `GRAMMAR_MODES` trims it ("drafts http": about 9).
+  - **Host gate:** `zig build test-grammar` (5/5). The goldens come from `zig/tests/grammar/gen_goldens.py`, which runs prod's own `grammar.py` / `structured.py` at 8474f31 over xgrammar 0.2.8's Python package; they are committed under `zig/tests/grammar/fixtures`. Both tokenizers pass: the synthetic one (always) with 589 masked rows, and DeepSeek-V4.1's (`TF_DSV41_MODEL`) with 667. Every row's bitmask equals xgrammar's (sha256 and allowed count), and so does every window's cut (keep, first constrained row, stop). The checks also cover the vocabulary views, the tokens never allowed, the think gate, the DSML structural tag JSON byte for byte, and the refusal messages. The masks on logits: `rows.maskRows` against the per-token rule on both ranks' halves.
+  - **Knob off** (the default): no grammar object exists, nothing is loaded or sent, and requests with structured output are refused as before. `check` cap24-1 / cap24-12 / cap24-16 / cap15 / cap18 / cap22 and `dcheck cap16`: 0 mismatches.
+
+### Structured output (`dsq-zig-grammar-1`, R9)
+
+**Decision: xgrammar's own C++ core through a C ABI, not a native Zig grammar engine.** The masks must be bit-identical to prod's, and prod's masks are xgrammar 0.2.8's. They come out of its JSON-schema converter, Earley parser, adaptive token-mask cache, the DSML structural tag, and the token decoding of the tokenizer info. A native engine would have to reproduce all of it, and every xgrammar version moves it. Building the same sources gives the same masks by construction, and the goldens check it.
+- `zig/third_party/xgrammar/`: the 0.2.8 sdist's `cpp/` (without the Python bindings), `include/`, picojson and dlpack, unmodified (sdist sha256 `8305646f…ccbb80`, Apache-2.0).
+- The library is built by Zig's C++ toolchain (`zig/build/grammar.zig`, always ReleaseFast).
+- `zig/src/core/grammar/xgr_c.{h,cc}`: a 20-call C ABI with Python's defaults; exceptions become a per-thread message.
+
+**Module `grammar`** (`zig/src/core/grammar/`, family-neutral):
+- `engine.zig`: the `Compiler` / `Compiled` / `Matcher` vtables; `xgr.zig` implements them.
+- `vocab.zig`: Python's `_vocab`. Added tokens are blanked except a view's kept ones (DeepSeek's tools view keeps `｜DSML｜`).
+- `grammars.zig`: GLM's `Grammars`. Two views; json_object is `{"type": "object"}`; at most 32 blanks; choice compiles to EBNF; tools go through `tags.zig`, xgrammar's `deepseek_v4_1` structural tag, written as pydantic writes it.
+- `constraint.zig`: GLM's `Constraint` (`cut` / `fill` / `advance` / `finished`, the think gate).
+- `pack.zig`: a spec for the followers.
+- `rows.zig` + `mask_kernel.zig`: the bitmask on logits. The kernel is Zig compiled to sm_80 PTX by the NVPTX backend and JIT-loaded by the driver, so no nvcc is needed.
+
+**Where the masks apply (as prod):**
+- `grammar_gpu.GrammarTarget` (rank 0) decorates the lanes target:
+  - at prefill it binds the slot's grammar (the think state is read from the prompt) and stages the reply's first token's mask on the prompt's last row;
+  - before each window it follows the committed tokens (kept drafts, then the pending token), cuts the drafts the grammar rejects (only R changes; rows are row-invariant), and stages the kept rows' masks;
+  - a cut row's choice is `maxInt(u32)`, so the lanes never accept past the cut.
+- A draft that ends the grammar (its stop token) is not cut. Its row and the rows after it run unconstrained, as prod's later windows run them (Python cuts it and emits it as the bonus instead): the same tokens, other round counts.
+- Trees with a grammar run as their main chain (Python builds no tree rows beside grammar masks).
+- `Masks` (every rank) applies the staged rows' -inf columns in "w.logits" at the first pick after the window, through the hooks in `Forward.greedy` and `GpuSampler.run`, on every rank's vocabulary half. Greedy, sampled and nucleus picks and the whole-row fallback then see Python's masked logits.
+- Fills run on `io.concurrent` tasks started before the forward and are awaited at the pick. The bits go to the device in one pinned copy, and one kernel launch covers all staged rows. Nothing runs for requests without a grammar.
+
+**Followers:** op 28 (`op_grammar`) carries:
+- bind: the packed spec and think state; the follower compiles the same grammar;
+- step: per slot, the tokens to follow, the cut and the window's tokens;
+- release.
+
+Each rank's matcher walks the same tokens, so every rank fills the same masks for its own half. No bitmask crosses the plan link.
+
+**Requests:**
+- `grammar_gpu.GrammarEngine` decorates the served engine (`info.structures = true`). It compiles each request's structure on its HTTP thread; a grammar that cannot be enforced fails at once with xgrammar's message.
+- It hands the compiled grammar to the target by prompt: admission is in submit order, and every request registers.
+- The server (`zig/src/server/grammar.zig` `toolSpec`, GLM's `_tool_spec`, with `TF_DSV41_TOOL_GRAMMAR`) holds tool_choice required / named and strict tools to the DSML grammar. It does so only when the engine enforces structures; otherwise tools are served as before.
+- `engine_api.Structure` gains `.tools`.
+- The trace (`TF_DSV41_TRACE_TOKENS`) records each request's structure, and `generate` replays it.
+
+**Open:**
+- A compile failure reaches the client as a failed reply, not Python's HTTP 400: the engine API has no pre-submit check.
+- A mid-reply grammar failure fails the whole round's requests, not only that slot's.
+- `TF_DSV41_SPEC_DRAFT`'s early pass with masks is not covered (not ported).
+- Fills overlap the forward but are awaited before the pick. At 4 slots × 16 rows the fill cost sits on the critical path only when it exceeds the forward. Measure it on the Spark window (`TF_DSV41_PHASES`).
 
 ### 0b. Several live slots and row buckets (`dsq-zig-slots-1`)
 
@@ -1306,7 +1362,7 @@ Effort is in engineering days for this agent team, assuming GPU windows are avai
 **M4. Server** (about 8–12 days).
 - `zig/src/native/cuda.zig`, wiring into `engines.zig` for Linux builds.
 - `encoding.zig`, `dsml.zig`, reasoning effort, `memory.zig` (the floor and adaptive prefill rows), admission and fairness for 4 slots, and `/metrics`.
-- Grammar: the Zig server's structured-output fields and the engine's grammar enforcement. Python uses xgrammar; this needs a decision (R9).
+- Grammar: the Zig server's structured-output fields and the engine's grammar enforcement: xgrammar 0.2.8's C++ core (R9, section 0a "Structured output").
 - **GPU:** both Sparks, then a soak.
 
 - **State:** the server side is done (`deepseek_v41/serve/**`, `zig/src/server/**`, commits `ad44e18..f66c019`).
@@ -1315,7 +1371,7 @@ Effort is in engineering days for this agent team, assuming GPU windows are avai
   - The real engine plugs in by implementing `engine_api.Engine`.
 - **Open items:**
   1. Native image input (`TF_DSV41_IMAGES=native`) is not supported.
-  2. Structured-output grammar (R9) waits for the engine.
+  2. Structured-output grammar (R9): built behind `TF_DSV41_GRAMMAR=1` (section 0a "Structured output"); its pod step is `M2B_GRAMMAR=1`.
   3. `tool_choice` required or named offers all tools, as Python does without grammar.
   4. Stop strings match only the answer, but Python's non-streamed no-tools path also matches the reasoning. **Decision: match Python exactly**, because reply text must equal prod's.
 
@@ -1366,6 +1422,6 @@ The Zig engine is not shipped to prod until it matches or beats these.
    - The Sparks belong to the Python-engine agent now.
    - M1 can run on a single same-architecture GPU (a RunPod RTX PRO 6000, after approval).
    - M2–M5 need both Sparks in planned windows.
-9. **R9, structured output.** Python uses xgrammar 0.2.8 with DeepSeek's structural tag. The Zig server validates grammar fields but has no xgrammar. Choose either a native grammar matcher (the lane core already masks per row) or serving without grammar at first, behind `TF_DSV41_GRAMMAR=0`.
+9. **R9, structured output.** Decided: xgrammar 0.2.8's own C++ core, built by Zig behind a C ABI (section 0a "Structured output"): masks bit-identical to prod's by construction, checked by `test-grammar`. `TF_DSV41_GRAMMAR` defaults to off in the Zig engine (prod's Python default is on): the kit must set it.
 10. **R10, the vision tower.** It runs on rank 0 only in Python (`TF_DSV41_IMAGES=native`). It is out of scope for M1–M5; image requests are refused or served as placeholders.
 11. **R11, upstream churn.** `zig-flashnext` moves fast. The family stays in its own directory, and touches of shared files are kept to one function each in `build.zig` and `zig/build/cuda.zig` (the latter is the kernel agent's).
