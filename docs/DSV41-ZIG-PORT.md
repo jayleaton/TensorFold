@@ -319,6 +319,15 @@ Rules from `ZIG-PREVIEW.md`:
   - **The first run failed with `MissingTritonVariant`:** the M2b reference installed its AOT recorder after the prompt, so the prefill kernels were not in the set. It now records from before the prompt.
   - **Held-pod note:** the hold job marks the pod's SID as run, so `run.sh zigm1` needs its own `DSQ_SID`. And never `pkill -f` a pattern that appears in the ssh command line itself.
   - **The kit's M4 now prefills with Zig prefill by default.** Prompts with a 1–16-row last segment still use decode windows (the same model, not Python's bits for those rows).
+- **Pod 24, held** (3a8a672, 28 min, $1.95, partial): **the captures for the ≤16-row segment, no fix or gate.** A host session restart took the pod's middle; the hard max ended it before the emitter could be written.
+  - **The captures, in `dsv41-zig-ref/`:**
+    - `cap24-12`: a 12-row prefill segment for sets A, B and D (`M1_PREFILL_ROWS=12`), 1,848 ops;
+    - `cap24-1` and `cap24-16`: set B at 1 and 16 rows, 725 ops each.
+    - Each includes decode windows of 1, 3 and 16 rows, plus weights, jit and aot.
+  - **Python's ≤16-row prefill segment, as captured** (the same kernel mix at 1, 12 and 16 rows):
+    - prefill side: `rot_in` / `unpack` / `_gemm` projections, x3gm experts, `_fused` attention at the segment's rows;
+    - decode side: `mhc_cuda.run` at the segment's rows, `attn_cuda.topk`, `_rms2`, `router_gemv`, and the L2 prefetch (`l2pf.segments`, `l2pace.paced`).
+  - **Not done:** the block_prefill path for these segments, and the gates for 2,060, 2,049, 2,064 and 2,600 rows. The runbook's limit note stays.
 - **Next, in order:**
   1. **The Spark window** (the kit's RUNBOOK.md): M2c-2 with R1, M4, and DSpark's acceptance. Spark prod has run R1's knobs since 10-07 at -6.5 % a window with the same bits: attention split 4 + qrope, mHC spin / defer + coef, the router's prune, downCombine bf16, x3seg rot_in with the q_norm fold. The gate is a capture on prod-knobs.env plus r1c-knobs.env's R1 line on the 8474f31 twin. It goes ahead of new glue fusions, which are estimated under 3 %.
   2. **The prefill runtime:** the 15 torch-glue steps as kernels, then `Forward.prefill` over 2,048-row chunks (NCCL exchanges).
