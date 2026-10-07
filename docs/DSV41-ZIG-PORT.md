@@ -139,15 +139,23 @@ Five agents work on `dsv41-zig` at once toward one combined pod gate and one Spa
     - `serve_cli.zig`: a trace line's `sampling`;
     - build: `zig/build/sampling.zig`. `cuda.zig` gets the optional `dsv41_sampling` image, `tf-dsv41-samp`, and `dsv41_serve` for `tf-dsv41-m1`, whose `core` is now `safetensors_root.zig`. `server.zig` gives `dsv41_serve` to the native engine.
   - **Host gate:** `zig build test-dsv41-sampling`. The committed serving goldens on two in-process ranks: 207/207 sampled rows equal Python's tokens, including 14 whole-row fallbacks. A window's rows pick as each row alone does, and as `exact_sampling.choose` over the whole row.
-  - **Slots and trees.** A mixed window calls `GpuSampler.choose` once per slot's rows: `row0` / `n`, one sampling each, one `op_sample` each. Tree chains go through `window`, so they sample too.
-  - **Pod step:** `tools/zig/dsv41_samp/samp_step.sh Z LP R0 HI RES LOCAL` (2 GPUs), inside `M1_JOB=m2b` after the M2b reference.
-    - **Assets:** the reference's `aot/`, `rope.bin` and `engram-host.bin`, with no R1. The Python side uses the same `TF_DSV41_EXPERT_TOPP` as the Zig side.
-    - **Minutes:** about 25 in all, or about 15 with `SAMP_TRACE` set. Each step's timeout is `SAMP_MIN`, 12.
-    1. `tf-dsv41-samp` on GPU 0 (under 1 min): the device steps against the host reference. Expected: `PASS tf-dsv41-samp: 0 checks failed`.
-    2. `dsv41_samp_ref.py` at TP=2 (about 10 min with its own load of layers 0-HI, about 2 min of decoding alone): 6 prompts (37, 50, 66, 83, 128 and 292 ids), 6 samplings (T 0.6–1.3; top_p 0.8–1.0; top_k 0 / 20; min_p 0 / 0.05; a seed above 2^63). To save the second Python load, call `dsv41_samp_ref.run_cases(fw, cfg, rank, out, prompts, steps)` at the end of `dsv41_m2b_ref.py` on both ranks and pass `SAMP_TRACE`.
-    3. `tf-dsv41-m1 generate` on that trace (about 6 min each: the Zig load, then 6 x 64 tokens), with `TF_DSV41_SAMPLING=1`, `TF_DSV41_DRAFTS=0`, then `1`. It compares Zig's sampled replies with Python's, token by token. Expected in each: `PASS M4 CLI == HTTP: 6/6 replies equal` (here it means Zig == Python).
-    - **AOT prompts:** with `SAMP_OWN_PREFILL=1` (the default), add `37,50,66,83,128,292` to `M2B_AOT_PROMPTS`, or set `SAMP_OWN_PREFILL=0`.
-    - The kernel fatbins must include `dsv41_sampling`. With `-Dnvcc=` it is built. With `-Dfatbins=` (`build-pod.sh`), copy `zig-dsv41-scratch/samp/fatbin/dsv41_sampling.fatbin` into the fatbin dir first. It was built with nvcc 13.3, the build's flags, for sm_120 and sm_121.
+  - **Slots (agreed with `dsq-zig-slots-1`; landed on the sampler side, the smaller one).**
+    - Row ranges: `Batch.targetWindow` packs each forward's segments back to back in "w.logits" rows [0, n), in segment order, so segment i owns rows [a_i, a_i + len_i).
+    - A sampled segment (T > 0) gets one `GpuSampler.choose(a_i, len_i, its sampling, its draws)`, so one `op_sample` per sampled segment, sent after the forward's `op_greedy`.
+    - `op_greedy` is sent only when one of that forward's segments is greedy.
+    - A slot's prefill choice goes through `target.prefill` (`pickOne` on its last row), as with one slot.
+  - **Trees.** Tree chains go through `window`, so they sample too.
+  - **Trace replay.** The HTTP recorder (`TF_DSV41_TRACE_TOKENS`) saves each request's `sampling`, seed included, so sampled HTTP replies replay through `generate` (M4 CLI == HTTP).
+  - **Pod step: `M2B_SAMP=1`** (`M1_JOB=m2b`, 2 GPUs). With `M2B_M4=1` set too, it runs after M4.
+    - **Reference.** `dsv41_m2b_ref.py --sampled` writes the sampled replies on the reference's own load: no second Python load, about 2 min of decoding. That is `dsv41_samp_ref.run_cases`, before the AOT dump, so its prompt lengths' Triton variants land in the set: nothing to add to `M2B_AOT_PROMPTS`. The 6 prompts are 37, 50, 66, 83, 128 and 292 ids; the 6 samplings cover T 0.6–1.3, top_p 0.8–1.0, top_k 0 / 20, min_p 0 / 0.05 and a seed above 2^63. The output is `$REF/samp/trace.jsonl`.
+    - **Then `tools/zig/dsv41_samp/samp_step.sh`**, about 13 min (each step capped at `left()`, at most 12):
+      1. `tf-dsv41-samp` on GPU 0 (under 1 min): the device steps against the host reference. Expected: `PASS tf-dsv41-samp: 0 checks failed`.
+      2. `tf-dsv41-m1 generate` on the trace, `TF_DSV41_SAMPLING=1`, `TF_DSV41_DRAFTS=0` then `1` (about 6 min each: the Zig load, then 6 x 64 tokens). It compares Zig's sampled replies with Python's, token by token. Expected in each: `PASS M4 CLI == HTTP: 6/6 replies equal` (here it means Zig == Python).
+    - **Assets:**
+      - the R0 reference (`aot/` with the sampled lengths, `rope.bin`, `engram-host.bin`; no R1);
+      - the reference's `TF_DSV41_EXPERT_TOPP` (`M2B_TOPP`), inherited by the Zig side;
+      - **the fatbin copy:** before `build-pod.sh`, `cp zig-dsv41-scratch/samp/fatbin/dsv41_sampling.fatbin zig-dsv41-scratch/zig-out/fatbin/` (nvcc 13.3, the build's flags, sm_120 + sm_121). Without it the build still succeeds but `tf-dsv41-samp` and the sampler refuse to load (`SamplingKernelNotBuilt`).
+    - **Standalone** (no `--sampled`): `samp_step.sh Z LP R0 HI RES LOCAL` runs `dsv41_samp_ref.py` itself (about 10 min more). With the Zig prefill it then needs `37,50,66,83,128,292` in `M2B_AOT_PROMPTS`, or `SAMP_OWN_PREFILL=0`.
 - `dsq-zig-speed-1` (decode speed):
   - **Found: the served engine never read Engram's table.** Every Zig path took M2a's index rows (`engram_host.indexRows`), so the Spark window's M4 replies were not the model's, and its 46.7 tok/s paid no NVMe reads at all. M2c-2 passed because its reference used the same index rows.
   - **R3, built:**
