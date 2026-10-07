@@ -13,6 +13,7 @@ pub const vids = @import("vids.zig");
 pub const parts = @import("parts.zig");
 pub const host = @import("host.zig");
 pub const mode = @import("mode.zig");
+pub const held = @import("held.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
