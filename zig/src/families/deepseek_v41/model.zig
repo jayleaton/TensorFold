@@ -58,6 +58,14 @@ pub fn layersEnv(gpa: std.mem.Allocator) !?[]const u32 {
     return ls;
 }
 
+/// TF_DSV41_CONTEXT (Python's context, prod 1,048,576): the slot's positions; null: block.Options' 4,096
+pub fn contextEnv() !?i64 {
+    const v = std.c.getenv("TF_DSV41_CONTEXT") orelse return null;
+    const c = try std.fmt.parseInt(i64, std.mem.span(v), 10);
+    if (c < 1) return error.BadContext;
+    return c;
+}
+
 /// TF_DSV41_OWN_PREFILL=0: prompts as 16-row decode windows (every rank must agree: the plans differ)
 pub fn ownPrefillEnv() bool {
     const v = std.c.getenv("TF_DSV41_OWN_PREFILL") orelse return true;
@@ -159,6 +167,11 @@ pub const Model = struct {
         const r1 = if (std.c.getenv("TF_DSV41_R1")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
         m.f = fwd.Forward.init(gpa, &m.cfg, &m.widths, .{ .world = world, .expert_topp = topp, .r1 = r1, .taps = o.drafts }, &m.runner, comm);
         m.f.layers = backbone;
+        // the rope tables cover the limit + a prefill segment (dsv41_rope_tables.py --rows: the assets' rope.bin)
+        if (try contextEnv()) |c| {
+            m.f.opts.limit = c;
+            m.f.opts.rope_rows = c + 2048;
+        }
         m.slots = try slots_mod.countFromEnv();
         if (try kvs.optionsFromEnv(@intCast(m.f.opts.limit), world)) |ko_| {
             var ko = ko_;
@@ -188,8 +201,14 @@ pub const Model = struct {
         }
         const rope = try cwd.readFileAlloc(io, try std.fs.path.join(a, &.{ assets, "rope.bin" }), a, .limited(1 << 28));
         const half = (rope.len - 16) / 2;
+        // rope.bin must hold the limit's rows (f32 [rows, 64] a table): a shorter one would leave positions unrotated
+        const want: usize = @intCast(m.f.opts.rope_rows * 64 * 4);
+        if (half < want) {
+            std.log.scoped(.dsv41).err("rope.bin holds {d} positions, the limit needs {d} (dsv41_rope_tables.py --rows)", .{ half / 256, want / 256 });
+            return error.RopeTooShort;
+        }
         for ([_][]const u8{ "s.rope.main", "s.rope.comp" }, 0..) |role, i| if (m.runner.addressOf(role)) |p|
-            try cuda.DeviceBuffer.upload(.{ .d = &m.driver, .ptr = p, .len = half }, 0, rope[16 + i * half ..][0..half]);
+            try cuda.DeviceBuffer.upload(.{ .d = &m.driver, .ptr = p, .len = want }, 0, rope[16 + i * half ..][0..want]);
         const ehb = try cwd.readFileAllocOptions(io, try std.fs.path.join(a, &.{ assets, "engram-host.bin" }), a, .limited(1 << 26), .@"4", null);
         m.host = try eh.Host.load(ehb, m.cfg.engram_heads, m.cfg.engram_pad, m.cfg.engram_vocab, &m.lbuf);
         m.f.engram = &m.host;
