@@ -84,6 +84,9 @@ pub const Stats = struct {
     loop_period: ?u32 = null,
     /// Prompt prefill duration measured by the engine host, in seconds.
     prefill_seconds: ?f64 = null,
+    /// Decode duration (the end of prefill to the last token) measured by the engine host, in seconds; null: the
+    /// server measures it from the events.
+    decode_seconds: ?f64 = null,
     /// The drafter's own counters as a JSON object, or empty.
     telemetry_json: []const u8 = "",
 };
