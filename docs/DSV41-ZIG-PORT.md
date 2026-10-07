@@ -287,8 +287,18 @@ Rules from `ZIG-PREVIEW.md`:
   - `tf-dsv41-m1 follow` runs the ranks > 0. `tf-dsv41-m1 generate` replays a trace through the same engine and requires the same ids ("HTTP tokens == CLI").
   - The Spark runbook is `tools/zig/dsv41_m4/` (run_host.sh, RUNBOOK.md). The whole model does not fit a PRO 6000, so its first run is a Spark window.
 - **The night's pods:** runs 15–21 for M3 cost **$8.50**: 15–19 $6.17, 20–21 $2.33.
+- **Pod 22, held** (b-hold 750vz54tgburg9, 42 min, $2.92): **R1 PASS.** The pod stayed up through the whole fix loop: capture, check locally, fix, re-check, push the binary, gate.
+  - **The capture:** decode-only R1 (A, B, D with layer 8, P) on `r1c-fix.tar.gz` (the r1c twin with 8474f31's FastLinear `norm` fix; the R1 kernels are identical).
+  - **The blind emitter had one mismatch class:** attn_cuda's ticket is 1,024 words under the split kernel (36 calls). The R1 drafter takes R1 only partly: the attention gets split 1 and rope 0 and keeps its own q `_rope` and both `_rms`; the mHC run gets the tail args with a `coef` after its first site; the final mHC gets the tail args; the router gets the prune list. Fixed in 219abeb.
+  - **Host check on the R1 capture:** decode windows 0 mismatches, drafter (dcheck) 0 mismatches; cap15 / cap18 unchanged.
+  - **The R1 M2b gate at TP=2 against Python R1:** both ranks 64/64 tokens, 64/64 logits, 25/25 first-window blocks, **graphs off and on** (1 capture, 62 replays).
+  - **Held-pod notes:** an ssh session lacks the container's `LIBRARY_PATH` (Triton's launcher link fails). Load `/proc/1/environ` first, and call job.sh directly, since `run.sh` runs once a pod.
+- **The Spark kit** (`~/Documents/Projects/spark-work/zig-m2c2-kit`, tree b4723d5) **with R1 on:**
+  - aarch64 `tf-dsv41-m1` and `tensorfold-dsv41`, built against dsq-zig-kern-1's sm_121 fatbins from 81f0477 (26 modules; no kernel source changed since), from a clean archive of the tree;
+  - `RUNBOOK.md` is the one window: M2c-2 (with R1) → DSpark's AOT set on each host → the M4 server and requests → the CLI replay (HTTP == CLI) and DSpark's acceptance → restore with `scripts/v2-rollback.sh perf1`. **About 1 h 45 min of downtime, up to 2 h 15 min.**
+- **The night's pods:** runs 15–22 cost **$11.42** in all: 15–19 $6.17, 20–21 $2.33, 22 $2.92.
 - **Next, in order:**
-  1. **Finish R1:** an R1 capture with `M1_PREFILL_ROWS=0` (sets A, B, D, P, on r1c-fix.tar.gz), then `tf-dsv41-m1 check` call for call against it, then the R1 M2b gate. One 2-GPU pod, about 20 min. Spark prod has run R1's knobs since 10-07 at -6.5 % a window with the same bits: attention split 4 + qrope, mHC spin / defer + coef, the router's prune, downCombine bf16, x3seg rot_in with the q_norm fold. The gate is a capture on prod-knobs.env plus r1c-knobs.env's R1 line on the 8474f31 twin. It goes ahead of new glue fusions, which are estimated under 3 %.
+  1. **The Spark window** (the kit's RUNBOOK.md): M2c-2 with R1, M4, and DSpark's acceptance. Spark prod has run R1's knobs since 10-07 at -6.5 % a window with the same bits: attention split 4 + qrope, mHC spin / defer + coef, the router's prune, downCombine bf16, x3seg rot_in with the q_norm fold. The gate is a capture on prod-knobs.env plus r1c-knobs.env's R1 line on the 8474f31 twin. It goes ahead of new glue fusions, which are estimated under 3 %.
   2. **The prefill runtime:** the 15 torch-glue steps as kernels, then `Forward.prefill` over 2,048-row chunks (NCCL exchanges).
   3. **The M2c-2 kit rebuilt with the DSpark pass**, so the Spark run measures acceptance with real taps.
 - **The DSpark GPU pass** (`dspark_emit.zig`, `dspark_gpu.zig`):
