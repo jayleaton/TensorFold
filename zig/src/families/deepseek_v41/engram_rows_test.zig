@@ -163,6 +163,52 @@ test "engram rows: issued ahead, then waited for; bulk reads past the cache; evi
     }
 }
 
+test "engram rows: a prompt segment's bulk reads issued ahead wait through one unrelated read, then serve it" {
+    // TF_DSV41_PREFETCH_AHEAD (forward_prefill.readAhead): segment k + 1's rows are issued before segment k reads its
+    // own; that read (a few of the same rows) must not drop the batch, and segment k + 1's read must find every row
+    const a = testing.allocator;
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var lut_sha: [32]u8 = undefined;
+    const fx = try parseFx(arena.allocator(), &lut_sha);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeShard(a, io, tmp.dir, fx);
+    const all = try a.alloc(i64, fx.rows);
+    defer a.free(all);
+    for (all, 0..) |*x, k| x.* = @intCast(fx.lo + k);
+    try testing.expect(all.len > 4096 / 4); // a bulk batch: read through, not cached
+    const big = try a.alloc(u16, all.len * 256);
+    defer a.free(big);
+    for ([_]bool{ false, true }) |uring| {
+        const r = try openRows(a, io, &tmp, uring);
+        defer r.close();
+        try r.issue(0, all);
+        const s = fx.sets[0];
+        const o = try a.alloc(u16, s.idx.len * 256);
+        defer a.free(o);
+        try r.rows(0, s.idx, 256, o); // segment k: waits for the rows it shares with the batch, the batch stays
+        try testing.expectEqual(s.sha, sha(o));
+        const reads = r.stats.reads;
+        try r.rows(0, all, 256, big); // segment k + 1: every row from the batch issued ahead
+        try testing.expectEqual(@as(u64, 0), r.stats.misses);
+        try testing.expectEqual(reads, r.stats.reads);
+        for (all, 0..) |x, k| for (0..256) |j| {
+            const row: u64 = @intCast(x);
+            try testing.expectEqual(r.lut[@as(usize, recordByte(row, 256 + j / 32)) << 8 | recordByte(row, j)], big[k * 256 + j]);
+        };
+        // a wrong guess: issued, then two unrelated reads of its table, then it is gone (read again on demand)
+        try r.issue(0, all);
+        try r.rows(0, s.idx, 256, o);
+        try r.rows(0, s.idx, 256, o);
+        const misses = r.stats.misses;
+        try r.rows(0, all, 256, big);
+        try testing.expect(r.stats.misses > misses);
+        for (r.batches.items) |b| try testing.expect(!b.in_use);
+    }
+}
+
 test "engram rows: shard headers" {
     var b: [48]u8 = undefined;
     for ([_]u64{ er.magic, 14, 10, 20, 100, er.row_bytes }, 0..) |v, i| std.mem.writeInt(u64, b[8 * i ..][0..8], v, .little);

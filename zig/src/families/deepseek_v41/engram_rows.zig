@@ -87,6 +87,12 @@ const Batch = struct {
     left: u32,
     failed: bool = false,
     in_use: bool = true,
+    /// a `rows` call took at least half its rows (a bulk batch is read through once read); `taken`: this call's count
+    read: bool = false,
+    taken: u32 = 0,
+    /// `rows` calls on its table that settled it unread: a bulk batch issued a prompt segment ahead
+    /// (TF_DSV41_PREFETCH_AHEAD) waits through one of them, then a wrong guess is dropped
+    unread: u8 = 0,
 
     /// The record of `rows[k]` (k found by the caller).
     fn record(b: *const Batch, k: usize, lo: u64) []const u8 {
@@ -235,8 +241,11 @@ pub const Rows = struct {
 
     pub fn close(r: *Rows) void {
         // every read in flight lands before its buffer goes
-        for (r.batches.items, 0..) |b, i| if (b.in_use) r.wait(@intCast(i)) catch {};
-        r.settle();
+        for (r.batches.items, 0..) |*b, i| if (b.in_use) {
+            r.wait(@intCast(i)) catch {};
+            b.read = true;
+        };
+        r.settle(null);
         if (r.ring) |*g| g.deinit();
         for (r.tables) |*t| r.closeTable(t);
         r.gpa.free(r.tables);
@@ -401,12 +410,17 @@ pub const Rows = struct {
         if (r.batches.items[bi].failed) return error.EngramReadFailed;
     }
 
-    /// Finished batches into the caches (bulk ones read through), their buffers freed.
-    fn settle(r: *Rows) void {
+    /// Finished batches into the caches (bulk ones read through), their buffers freed; `li`: the table whose `rows`
+    /// call settles (an unread bulk batch of it waits through one such call), null: none.
+    fn settle(r: *Rows, li: ?usize) void {
         for (r.batches.items) |*b| {
             if (!b.in_use or b.left > 0) continue;
             const t = &r.tables[b.table];
             const keep = !b.failed and b.rows.len <= r.cap / 4;
+            if (!keep and !b.failed and !b.read and b.unread < 1) {
+                if (li == b.table) b.unread += 1;
+                continue;
+            }
             for (b.rows, 0..) |x, k| {
                 if (!keep) {
                     _ = t.map.remove(x);
@@ -446,6 +460,7 @@ pub const Rows = struct {
                     r.stats.hits += 1;
                 },
                 .pending => |bi| {
+                    r.batches.items[bi].taken += 1;
                     if (std.mem.indexOfScalar(u32, r.want.items, bi) == null) try r.want.append(r.gpa, bi);
                     r.stats.waited += 1;
                 },
@@ -453,10 +468,17 @@ pub const Rows = struct {
         }
         if (miss.items.len > 0) {
             r.stats.misses += miss.items.len;
-            try r.want.append(r.gpa, try r.start(@intCast(li), miss.items));
+            const bi = try r.start(@intCast(li), miss.items);
+            r.batches.items[bi].read = true;
+            try r.want.append(r.gpa, bi);
         }
         const t0 = nowNs();
-        for (r.want.items) |bi| try r.wait(bi);
+        for (r.want.items) |bi| {
+            try r.wait(bi);
+            const b = &r.batches.items[bi];
+            if (2 * @as(usize, b.taken) >= b.rows.len) b.read = true;
+            b.taken = 0;
+        }
         r.stats.wait_ns += nowNs() - t0;
         for (u, 0..) |x, k| switch (t.map.get(x).?) {
             .ready => {},
@@ -471,7 +493,7 @@ pub const Rows = struct {
             const o = out[p * dim ..][0..dim];
             for (o, 0..) |*v, j| v.* = r.lut[@as(usize, rec[values + j / 32]) << 8 | rec[j]];
         }
-        r.settle();
+        r.settle(li);
     }
 };
 
