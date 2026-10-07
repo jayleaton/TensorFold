@@ -36,6 +36,8 @@ ARGS=(--rm --gpus all --ipc=host --network host --device /dev/infiniband --ulimi
       -e NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-enp1s0f1np1} -e NCCL_IB_HCA=${NCCL_IB_HCA:-rocep1s0f1,roceP2p1s0f1}
       -e GLOO_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-enp1s0f1np1})
 KNOBS=(); while read -r kv; do [[ "$kv" =~ ^TF_ ]] && KNOBS+=(-e "$kv"); done < "$KIT/tools/zig/dsv41_m1/prod-knobs.env"
+# R1=1 (default; prod-perf1 runs it): r1c-knobs.env on top, and ours follows the reference's env (block.zig Options.r1)
+if [[ "${R1:-1}" == 1 ]]; then while read -r kv; do [[ "$kv" =~ ^TF_ ]] && KNOBS+=(-e "$kv"); done < "$KIT/tools/zig/dsv41_m1/r1c-knobs.env"; fi
 
 port=29811
 for seed in $SEEDS; do

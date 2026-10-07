@@ -147,7 +147,7 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=4101)
     ap.add_argument("--port", type=int, default=29611)
     ap.add_argument("--rank", type=int, default=-1, help="two hosts: this host's rank (one process); -1: both ranks here")
-    ap.add_argument("--extra-rows", type=lambda v: [int(x) for x in v.split(",") if x], default=[2, 3, 4, 5, 6],
+    ap.add_argument("--extra-rows", type=lambda v: [int(x) for x in v.split(",") if x], default=[2, 3, 4, 5, 6, 16],
                     help="windows of these rows after the steps (their Triton variants in the AOT set)")
     ap.add_argument("--master", default="127.0.0.1", help="rank 0's address (two hosts: the head's CX7 address)")
     a = ap.parse_args()
