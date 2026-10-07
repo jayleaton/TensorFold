@@ -12,6 +12,7 @@
 //! - `TF_DSV41_PREFILL`: full (Zig's prefill) | replay (Python's CED replay, not ported: warned at boot).
 const std = @import("std");
 const dk = @import("dsv41_kernels");
+const Config = @import("config.zig").Config;
 
 const pfd = dk.ops.pfd;
 
@@ -173,6 +174,28 @@ pub fn indexBudget(get: Get) !?i64 {
 fn badBudget(raw: []const u8) error{BadKnob} {
     std.log.warn("TF_DSV41_INDEX_BUDGET_MIB={s}: expected 1..4096", .{raw});
     return error.BadKnob;
+}
+
+/// block_prefill's stream threshold (TF_DSV41_INDEX_STREAM_MIN, prod 4,096 visible keys): the emitter's constant.
+pub const stream_min: i64 = 4096;
+
+/// The long-prompt stream top-k's scratch ("L.ix.stream", longpf.zig) the buffer plan holds for a slot of `limit`
+/// positions and `rows`-row segments: the largest one any streamed layer takes at the limit (stream_topk.plan's rows x
+/// splits x 2 K int64, at most stream_topk.BUDGET), 0 when no layer reaches the threshold. Python allocates it per
+/// launch, so its measured terms (kv/budget.zig Serve) hold none; Zig plans it at boot, resident.
+pub fn streamScratch(cfg: *const Config, limit: i64, rows: i64) u64 {
+    const longpf = @import("longpf.zig");
+    const k: i64 = cfg.index_topk;
+    if (rows <= 16 or @popCount(k) != 1) return 0;
+    var most: i64 = 0;
+    for (0..cfg.layers) |i| {
+        const L: u32 = @intCast(i);
+        if (cfg.mode(L) != .full or !cfg.isIndexSource(L) or cfg.isCandidateSource(L)) continue;
+        const keys = @divFloor(limit, cfg.compressRatio(L));
+        if (keys < stream_min) continue;
+        most = @max(most, longpf.plan(rows, keys, k) * longpf.splits(keys) * 2 * k * 8);
+    }
+    return @intCast(most);
 }
 
 pub const PrefillMode = enum { full, replay };

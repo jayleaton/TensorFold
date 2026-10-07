@@ -173,3 +173,27 @@ test "TF_DSV41_PF_DENSE=fused on the prefill emitter: one fused GEMM a projectio
         for (on) |c| for (c.args) |x| if (x.arg == .t) try testing.expect(!std.mem.eql(u8, roleName(x.arg.t), "s.pf.w"));
     }
 }
+
+test "the stream top-k's resident scratch for the boot check: none under the threshold, stream_topk.BUDGET at 1M" {
+    const cfg: Config = .{};
+    // 4,096 positions: no layer sees 4,096 compressed keys
+    try testing.expectEqual(@as(u64, 0), pk.streamScratch(&cfg, 4096, 2048));
+    // prod's 1M context: a ratio-2 layer's 512K keys are 32 splits, 256 KiB a row, so stream_topk.plan takes 1,024 of a
+    // 2,048-row segment's rows a launch = stream_topk.BUDGET (256 MiB); a 512-row segment fits whole: 128 MiB
+    try testing.expectEqual(@as(u64, 256 << 20), pk.streamScratch(&cfg, 1 << 20, 2048));
+    try testing.expectEqual(@as(u64, 128 << 20), pk.streamScratch(&cfg, 1 << 20, 512));
+    // the emitter's own L.ix.stream at the limit's last segment is the same size
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    var w = try widths(aa);
+    const layers = [_]u32{ 0, 1, 2, 3 };
+    const cs = try bp.emitPrefill(aa, &cfg, &w, .{ .limit = 1 << 20, .rope_rows = (1 << 20) + 2048 }, &layers, 2048, (1 << 20) - 2048, false);
+    var most: u64 = 0;
+    for (cs) |c| for (c.args) |x| if (x.arg == .t and x.arg.t.role == .buf and std.mem.eql(u8, x.arg.t.role.buf, "L.ix.stream")) {
+        var n: u64 = 8;
+        for (x.arg.t.shape) |d| n *= @intCast(d);
+        most = @max(most, n);
+    };
+    try testing.expectEqual(pk.streamScratch(&cfg, 1 << 20, 2048), most);
+}
