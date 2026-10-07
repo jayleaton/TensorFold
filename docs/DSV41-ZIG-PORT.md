@@ -535,6 +535,26 @@ Pod 30 failed the vision tower (1 bf16 ulp off from block 0, 0/3 images). The fi
 - **Afterwards (both nodes):** `docker run --rm -v $PWD/out/vision:/out --entrypoint rm tensorfold-dsv41:e1e2-8474f31 -rf /out/ref /out/img /out/zig-p1 /out/zig-p2 /out/zig-p3 /out/zig-p4 /out/zig-p5 /out/zig-p6` (state dumps and AOT copies, several GB; root-owned), keeping the logs.
 - All five PASS = images can go on in the kit (`IMAGES=native BIAS_VL=1`) from the next window; record it in the pod 29 / 30 table's images row.
 
+### FOR THE NIGHT RUN: R1's timed windows (`dsq-zig-arch-1`; fix `a585336`, kit knob `3ea37ef`)
+
+**What was wrong.** On pods 29 and 30, Zig's R1 run died with `CUDA_ERROR_ILLEGAL_ADDRESS` in `tf_dsv41_mhc_cuda_v1.run` at 4-row timed windows. The cause is the M2b gate driver's buffer plan, not R1: it planned only 1-row windows, so the timed 2- and 4-row windows overran the decode-only roles (`L.mhc.part`, ...). The served model plans every window size (1 to max(prefill rows, DSpark block + 1)) and was never affected: `run_m4.sh`'s runs need nothing. Only the M2c-2 gate with timed rows exercises the fix.
+
+**Rebuild** (dev box, once; the same rebuild serves the images section above):
+1. Tree: a clean `git archive` of `dsv41-zig` at or after `3ea37ef` (it holds `a585336`, `eacab35` and the `PROF_ROWS` knob).
+2. FATBINS: `~/Documents/Projects/spark-work/dsv41-zig-ref/fatbin-kit` (the sm_121 set the kits use: base 81f0477 + `dsv41_kvsplit` + `dsv41_sampling` + `dsv41_vision`). If the images fix is also being rerun, first replace its `dsv41_vision.fatbin` as the images section says.
+3. `KIT_COMMIT=<hash> FATBINS=<dir> TP_FATBIN=~/Documents/Projects/spark-work/zig-m2c2-kit/tp_mailbox.fatbin bash tools/zig/dsv41_m2c2/build-kit.sh <new kit dir>` (it runs under `heavy.sh`), then rsync to both nodes and `sha256sum -c` as the runbook's step 2.
+
+**Rerun on the Sparks** (prod stopped, lease free, no other `dsv41` container; about 40 min: one whole-model Python load, then ours):
+
+| step | where | command | pass |
+|---|---|---|---|
+| R1a | both, within ~1 min | `PROF_ROWS="1 2 4" STEPS=64 ./run_host.sh R out/r1prof` (R1 is on by default; `PREFILL` off) | `out/r1prof/run.log`: `PASS M2b rank R: tokens 64/64, logits 64/64, first window blocks 40/40`; `out/r1prof/seed4101/zig.log` has `rank R: decode steps: tokens 64/64, logits 64/64`, then `rank R: 1-row windows ... ms`, `2-row ...`, `4-row ...` with **no** `CudaFailed` / illegal address |
+| R1b | dgx-01 | record the R1 timing table: Zig's `N-row windows <mean> ms` lines (`seed4101/zig.log`, both ranks) and Python's per-row timings (`seed4101/ref.log`, `--profile`) | the table, Zig vs Python at 1 / 2 / 4 rows (whole model, R1, RoCE) |
+
+**If R1a still faults at 4 rows:** rerun once with `TF_DSV41_SYNC_EACH=1` added to the Zig docker run (it names the faulting call), save `out/r1prof/`, and note it in the window report: it would then be a different bug from `a585336`'s. Either way the served runs (A / B / B2 / C) are unaffected.
+
+**Not needed tonight:** the x3gm v2 check fix (`eacab35`) is host-only (pod 30's capture: 0 mismatches); `GM_V2` stays off until a GPU replay of a v2 capture.
+
 ### 0b. Several live slots and row buckets (`dsq-zig-slots-1`)
 
 `TF_DSV41_SLOTS=N` (1 by default: today's one-slot path, nothing changes) gives the GPU path N live slots with batched decode windows, as Python's batcher runs them (row mode, G8: `rowtab.py`, `rowmode.py`, `rowgraphs.py`). It needs the paged pool (`TF_DSV41_POOL_TOKENS`); the contiguous slot is refused by name.
