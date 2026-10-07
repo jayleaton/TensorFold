@@ -34,6 +34,8 @@ const Box = struct {
     mutex: std.Io.Mutex = .init,
     tokens: std.ArrayList(u32) = .empty,
     done: ?api.Reason = null,
+    drafted: u64 = 0,
+    accepted: u64 = 0,
     gpa: std.mem.Allocator,
 
     fn event(ctx: *anyopaque, _: api.Id, e: *const api.Event) void {
@@ -42,7 +44,11 @@ const Box = struct {
         defer b.mutex.unlock(b.io);
         switch (e.*) {
             .tokens => |t| b.tokens.appendSlice(b.gpa, t) catch {},
-            .finished => |f| b.done = f.reason,
+            .finished => |f| {
+                b.drafted = f.stats.drafted;
+                b.accepted = f.stats.accepted;
+                b.done = f.reason;
+            },
             else => {},
         }
     }
@@ -70,6 +76,8 @@ pub fn generate(gpa: std.mem.Allocator, io: std.Io, pack: []const u8, assets: []
     var n: usize = 0;
     var equal: usize = 0;
     var id: api.Id = 1;
+    var drafted: u64 = 0;
+    var accepted: u64 = 0;
     while (lines.next()) |line| : (id += 1) {
         const Line = struct { prompt: []const u32, tokens: []const u32 };
         const rec = try std.json.parseFromSliceLeaky(Line, a, line, .{ .ignore_unknown_fields = true });
@@ -81,9 +89,14 @@ pub fn generate(gpa: std.mem.Allocator, io: std.Io, pack: []const u8, assets: []
         const same = std.mem.eql(u32, box.tokens.items, rec.tokens);
         n += 1;
         equal += @intFromBool(same);
-        std.debug.print("{{\"line\": {d}, \"prompt\": {d}, \"tokens\": {d}, \"recorded\": {d}, \"finished\": \"{t}\", \"equal\": {}}}\n", .{ n, rec.prompt.len, box.tokens.items.len, rec.tokens.len, why, same });
+        drafted += box.drafted;
+        accepted += box.accepted;
+        std.debug.print("{{\"line\": {d}, \"prompt\": {d}, \"tokens\": {d}, \"recorded\": {d}, \"finished\": \"{t}\", \"equal\": {}, \"drafted\": {d}, \"accepted\": {d}}}\n", .{ n, rec.prompt.len, box.tokens.items.len, rec.tokens.len, why, same, box.drafted, box.accepted });
     }
     const ok = n > 0 and equal == n;
     std.debug.print("{s} M4 CLI == HTTP: {d}/{d} replies equal\n", .{ if (ok) "PASS" else "FAIL", equal, n });
+    // DSpark's acceptance on these replies (drafts on): accepted / drafted, and tokens a verify round
+    const rate: f64 = if (drafted > 0) @as(f64, @floatFromInt(accepted)) / @as(f64, @floatFromInt(drafted)) else 0;
+    std.debug.print("DSpark: {d} drafted, {d} accepted ({d:.3})\n", .{ drafted, accepted, rate });
     return if (ok) 0 else 1;
 }

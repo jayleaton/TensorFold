@@ -285,10 +285,12 @@ const Ds = struct {
             try e.weight("L{d}.attn.sink", .{L}, .f32, &.{H}),         try e.ropeTable(),
             try e.buf("s.attn.po", .{}, .f32, &.{rows_scr * 512}),     try e.buf("s.attn.pm", .{}, .f32, &.{rows_scr}),
             try e.buf("s.attn.pl", .{}, .f32, &.{rows_scr}),           o,
-            try e.buf("s.attn.ticket", .{}, .i32, &.{256}),            .{ .i = ringRows(cf) },
+            try e.buf("s.attn.ticket", .{}, .i32, &.{e.ticketLen()}), .{ .i = ringRows(cf) },
             .{ .i = 0 },                                               .{ .i = 0 },
             .{ .i = 4 },
         });
+        // R1: the split kernel's CTAs a chunk; q arrives rotated (the drafter keeps its `_rope`: no ATTN_ROPE fold)
+        if (e.o.r1) try d.appendArgs(&.{ .{ .i = E.attnSplit(n) }, .{ .i = 0 } });
         // o: wo_a's groups over the heads' columns, then wo_b (this rank's fp32 partial)
         const g: usize = cf.o_groups / e.o.world;
         const gk: i64 = @divExact(H * hd, @as(i64, @intCast(g)));
@@ -329,6 +331,17 @@ const Ds = struct {
             .{ .f = E.dec(d.cfg().eps) },                                     .{ .f = E.dec(d.cfg().hc_eps) },
             .{ .f = E.dec(d.cfg().hc_post_alpha) },                           .{ .i = d.cfg().hc_sinkhorn_iters },
         });
+        if (e.o.r1) try d.appendArgs(&.{ .{ .i = e.o.mhc_spin }, .{ .i = 0 } }); // MHC_TAIL; a final mixes nothing
+    }
+
+    /// R1's trailing arguments onto the last call.
+    fn appendArgs(d: *Ds, args: []const Arg) !void {
+        const e = d.e;
+        const last = &e.out.items[e.out.items.len - 1];
+        const more = try e.a.alloc(calls.Named, last.args.len + args.len);
+        @memcpy(more[0..last.args.len], last.args);
+        for (more[last.args.len..], args) |*m, x| m.* = .{ .arg = x };
+        last.args = more;
     }
 
     /// One pass of `n` rows: the embedded block, the blocks, the final norm, the head, then the host's step.

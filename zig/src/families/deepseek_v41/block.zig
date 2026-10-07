@@ -445,6 +445,16 @@ pub const Emitter = struct {
         return .{ try e.buf("w.sel{d}", .{src}, .i32, &.{ e.n, e.cfg.index_topk }), try e.buf("w.cnt{d}", .{src}, .i32, &.{e.n}) };
     }
 
+    /// attn_cuda's ticket words: a (row, head tile)'s ranks, 4 with R1's split kernel (MAX_SPLIT)
+    pub fn ticketLen(e: *const Emitter) i64 {
+        return if (e.o.r1) 1024 else 256;
+    }
+
+    /// attn_cuda.split: CTAs a chunk with R1 (ATTN_SPLIT 4 up to ATTN_SPLIT_ROWS = 2 rows, 1 above)
+    pub fn attnSplit(n: i64) i64 {
+        return if (n <= 2) 4 else 1;
+    }
+
     /// Triton `_rms` (rmsnorm.rms: a weight, bf16 in and out): R1's kv_norm beside the SWA store.
     pub fn rms(e: *Emitter, x: Arg, w: Arg, out: Arg, k: i64) !void {
         try e.triton("_rms", .{ e.n, 1, 1 }, &.{
@@ -573,7 +583,7 @@ pub const Emitter = struct {
             try e.empty(.i32),                                                  try e.weight("L{d}.attn.sink", .{L}, .f32, &.{H}),
             try e.ropeTable(),                                                  try e.buf("s.attn.po", .{}, .f32, &.{rows_scr * 512}),
             try e.buf("s.attn.pm", .{}, .f32, &.{rows_scr}),                    try e.buf("s.attn.pl", .{}, .f32, &.{rows_scr}),
-            o,                                                                  try e.buf("s.attn.ticket", .{}, .i32, &.{256}),
+            o,                                                                  try e.buf("s.attn.ticket", .{}, .i32, &.{e.ticketLen()}),
             .{ .i = 2 * @as(i64, e.cfg.window) },                               .{ .i = 0 },
             .{ .i = 0 },                                                        .{ .i = 4 },
         });
@@ -582,7 +592,7 @@ pub const Emitter = struct {
             const last = &e.out.items[e.out.items.len - 1];
             const more = try e.a.alloc(calls.Named, last.args.len + 2);
             @memcpy(more[0..last.args.len], last.args);
-            more[last.args.len] = .{ .arg = .{ .i = if (n <= 2) 4 else 1 } };
+            more[last.args.len] = .{ .arg = .{ .i = attnSplit(n) } };
             more[last.args.len + 1] = .{ .arg = .{ .i = 1 } };
             last.args = more;
         }

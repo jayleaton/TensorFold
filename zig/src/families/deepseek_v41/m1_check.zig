@@ -131,7 +131,9 @@ pub const Flow = struct {
 
     pub fn call(f: *Flow, c: *const calls.Call, op: std.json.ObjectMap, log: *std.Io.Writer, where: []const u8) !void {
         var bs: std.ArrayList(Binding) = .empty;
-        for (c.args, op.get("args").?.array.items) |x, y| try bindings(f.a, x.arg, y, &bs);
+        const got = op.get("args").?.array.items;
+        const m = @min(c.args.len, got.len); // a count mismatch is calls.check's to report
+        for (c.args[0..m], got[0..m]) |x, y| try bindings(f.a, x.arg, y, &bs);
         const bufs = op.get("buffers").?.array.items;
         for (bs.items) |b| {
             const o = for (bufs) |v| {
