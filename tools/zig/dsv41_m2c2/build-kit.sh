@@ -28,8 +28,8 @@ cp tools/zig/dsv41_m4/requests.sh tools/zig/dsv41_m4/prompts.txt "$KIT/"
 cp tools/zig/dsv41_m4/RUNBOOK-OVERNIGHT.md "$KIT/RUNBOOK.md"
 cp "$HERE/bench_http.py" tools/zig/dsv41_m4/restore.sh "$KIT/"
 mkdir -p "$KIT/tools/zig/dsv41_slots" && cp tools/zig/dsv41_slots/ref.py "$KIT/tools/zig/dsv41_slots/"
-# the images' tower rerun (port doc 0a, dsq-zig-vision-1): vision_ref.py --tower-only (it imports ../dsv41_m2b_ref.py)
-mkdir -p "$KIT/tools/zig/dsv41_vision" && cp tools/zig/dsv41_vision/vision_ref.py "$KIT/tools/zig/dsv41_vision/"
+# the images' Spark gate (port doc 0a, dsq-zig-vision-1, FOR THE NIGHT RUN): spark.sh + vision_ref.py (it imports ../dsv41_m2b_ref.py)
+mkdir -p "$KIT/tools/zig/dsv41_vision" && cp tools/zig/dsv41_vision/vision_ref.py tools/zig/dsv41_vision/spark.sh "$KIT/tools/zig/dsv41_vision/"
 # long context (the long-aot phase's rope tables) and the serving / ops steps (RUNBOOK.md part 4)
 cp tools/zig/dsv41_rope_tables.py "$KIT/tools/zig/"
 mkdir -p "$KIT/tools/zig/dsv41_ops" && cp tools/zig/dsv41_ops/WINDOW-STEPS.md tools/zig/dsv41_ops/wire_probe.py "$KIT/tools/zig/dsv41_ops/"
