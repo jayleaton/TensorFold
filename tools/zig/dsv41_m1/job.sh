@@ -84,7 +84,7 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
         if [[ "$b" =~ ^layer-([0-9]+)\.safetensors$ ]]; then
             L=$(( 10#${BASH_REMATCH[1]} ))
             # M2B_CAPTURE with set P: DSpark's target layers 36-39 come too (the capture's backbone blocks)
-            (( L > hi )) && ! { [[ ",${M2B_CAPTURE:-}," == *,P,* ]] && (( L >= 36 && L <= 39 )); } && continue
+            (( L > hi )) && ! { [[ ",${M2B_CAPTURE:-},${M2B_CAPTURE_R1:-}," == *,P,* ]] && (( L >= 36 && L <= 39 )); } && continue
         fi
         echo "$b" >> "$LOCAL/pack-files"
     done
@@ -100,26 +100,32 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
     if [[ -f "$Z/e1e2x.tar.gz" ]]; then tar -xzf "$Z/e1e2x.tar.gz" -C / && export TORCH_EXTENSIONS_DIR=/opt/e1e2-120; fi
     # M2B_CAPTURE (sets, e.g. P,B): a capture on GPU 0 first, on prod's knobs + x3gm v2 (TF_DSV41_GM_V2=1, as prod
     # 8474f31) with an M1_PREFILL_ROWS-row prefill segment (2048: prod's chunk), replayed bit for bit by our loader;
-    # its small files (ops, meta, weights, manifest, AOT set) come back for the offline emitters (DSpark pass, prefill)
-    if [[ -n "${M2B_CAPTURE:-}" ]]; then
-        CAP=$LOCAL/capture
-        rm -rf "$CAP"
-        if (set -a; source "$Z/tools/zig/dsv41_m1/prod-knobs.env"; set +a
+    # its small files (ops, meta, weights, manifest, AOT set) come back for the offline emitters (DSpark pass, prefill).
+    # M2B_CAPTURE_R1 (sets): a second capture with r1c-knobs.env's R1 on top, on the R1 twin (r1c.tar.gz: decode1
+    # 78b703d), into capture-r1 / m1-r1: block.zig's R1 path (Options.r1, from the capture's env) checked the same way
+    capture_set() { # NAME SETS R1(0/1): capture, M1_MODE over it, small files to $RES/NAME
+        local name=$1 sets=$2 r1=$3 dir=$LOCAL/$1
+        rm -rf "$dir"
+        if (set -a; source "$Z/tools/zig/dsv41_m1/prod-knobs.env"
+            (( r1 )) && source "$Z/tools/zig/dsv41_m1/r1c-knobs.env"; set +a
+            (( r1 )) && export PYTHONPATH=/opt/r1c/src TORCH_EXTENSIONS_DIR=/opt/r1c/ext
             export TF_DSV41_GM_V2=1 CUDA_VISIBLE_DEVICES=0 M1_PREFILL_ROWS=${M1_PREFILL_ROWS:-2048}
-            step capture "${M1_CAPTURE_MIN:-12}" python -B "$Z/tools/zig/dsv41_m1_capture.py" --pack "$LP" --out "$CAP" \
-                --sets "$M2B_CAPTURE"); then
-            du -sh "$CAP" | tee "$RES/capture-size.txt"
+            step "$name" "${M1_CAPTURE_MIN:-12}" python -B "$Z/tools/zig/dsv41_m1_capture.py" --pack "$LP" --out "$dir" \
+                --sets "$sets"); then
+            du -sh "$dir" | tee "$RES/$name-size.txt"
             # M1_MODE=both: also our emitters' launches on our buffers (block.zig, block_prefill.zig, dspark_emit.zig)
-            CUDA_VISIBLE_DEVICES=0 step m1 "${M1_REPLAY_MIN:-10}" "$Z/bin/tf-dsv41-m1" "${M1_MODE:-replay}" "$LP" "$CAP" "$RES/m1" || rc=1
+            "$Z/bin/tf-dsv41-m1" check "$dir" > "$RES/$name-check.log" 2>&1; tail -1 "$RES/$name-check.log" | tee -a "$RES/steps.txt"
+            CUDA_VISIBLE_DEVICES=0 step "m1-$name" "${M1_REPLAY_MIN:-10}" "$Z/bin/tf-dsv41-m1" "${M1_MODE:-replay}" "$LP" "$dir" "$RES/m1-$name" || rc=1
         else rc=1; fi
-        mkdir -p "$RES/capture"
-        for f in meta.json weights.json manifest.json jit.json; do [[ -f "$CAP/$f" ]] && cp "$CAP/$f" "$RES/capture/"; done
-        [[ -d "$CAP/aot" ]] && tar -czf "$RES/capture/aot.tar.gz" -C "$CAP" aot
-        [[ -f "$CAP/ops.jsonl" ]] && gzip -c "$CAP/ops.jsonl" > "$RES/capture/ops.jsonl.gz"
-        [[ -f "$CAP/launches.json" ]] && gzip -c "$CAP/launches.json" > "$RES/capture/launches.json.gz"
-        rm -rf "$CAP/blobs"
-        mkdir -p "$RES/m1" && cp "$CAP/meta.json" "$RES/m1/capture-meta.json" 2>/dev/null
-    fi
+        mkdir -p "$RES/$name"
+        for f in meta.json weights.json manifest.json jit.json; do [[ -f "$dir/$f" ]] && cp "$dir/$f" "$RES/$name/"; done
+        [[ -d "$dir/aot" ]] && tar -czf "$RES/$name/aot.tar.gz" -C "$dir" aot
+        [[ -f "$dir/ops.jsonl" ]] && gzip -c "$dir/ops.jsonl" > "$RES/$name/ops.jsonl.gz"
+        [[ -f "$dir/launches.json" ]] && gzip -c "$dir/launches.json" > "$RES/$name/launches.json.gz"
+        rm -rf "$dir/blobs"
+    }
+    [[ -n "${M2B_CAPTURE_R1:-}" ]] && capture_set capture-r1 "$M2B_CAPTURE_R1" 1
+    if [[ -n "${M2B_CAPTURE:-}" ]]; then capture_set capture "$M2B_CAPTURE" 0; CAP=$LOCAL/capture; fi
     # M2B_TOPP unset: top-p off (M2b); set (prod: 0.85): the same gate with prod's expert prune (M2c's first stage)
     unset TF_DSV41_EXPERT_TOPP
     [[ -n "${M2B_TOPP:-}" ]] && export TF_DSV41_EXPERT_TOPP=$M2B_TOPP
@@ -149,6 +155,24 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
              step "m3-$k" "$mb" bash "$Z/tools/zig/dsv41_m1/m2b_ranks.sh" "$Z/bin/tf-dsv41-m1" "$LP" "$REF" "$RES/m3-$k") \
                 || rc=1
         done
+        # M2B_R1=1: the M2b gate on R1 (the reference with r1c-knobs.env on the R1 twin; ours follows its env)
+        if [[ "${M2B_R1:-0}" == 1 ]]; then
+            REF1=$LOCAL/m2b-ref-r1
+            rm -rf "$REF1"
+            mb=$(left); (( mb > 8 )) && mb=8
+            if (( mb >= 5 )) && (set -a; source "$Z/tools/zig/dsv41_m1/r1c-knobs.env"; set +a
+                export PYTHONPATH=/opt/r1c/src TORCH_EXTENSIONS_DIR=/opt/r1c/ext
+                step m2b-ref-r1 "$mb" python -u -B "$Z/tools/zig/dsv41_m2b_ref.py" --pack "$LP" --out "$REF1" \
+                    --layers "0-$hi" --steps "${M2B_STEPS:-64}" --port 29631); then
+                cp "$REF/engram-host.bin" "$REF1/"
+                mb=$(left); (( mb > 6 )) && mb=6
+                (export M2B_PORT=29741
+                 step m2b-r1 "$mb" bash "$Z/tools/zig/dsv41_m1/m2b_ranks.sh" "$Z/bin/tf-dsv41-m1" "$LP" "$REF1" "$RES/m2b-r1") \
+                    || rc=1
+                mkdir -p "$RES/m2b-ref-r1"
+                for f in ref.json rank0.json rank1.json; do [[ -f "$REF1/$f" ]] && cp "$REF1/$f" "$RES/m2b-ref-r1/"; done
+            else echo "m2b-r1 skipped or its reference failed" | tee -a "$RES/steps.txt"; rc=1; fi
+        fi
     else rc=1; fi
     mkdir -p "$RES/m2b-ref"
     for f in ref.json rank0.json rank1.json manifest.json; do [[ -f "$REF/$f" ]] && cp "$REF/$f" "$RES/m2b-ref/"; done

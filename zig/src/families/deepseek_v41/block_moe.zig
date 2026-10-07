@@ -70,6 +70,24 @@ pub fn mhc(e: *E, layer: ?u32, which: []const u8, mode: Mode) !void {
         .{ .f = E.dec(e.cfg.eps) },                                      .{ .f = E.dec(e.cfg.hc_eps) },
         .{ .f = E.dec(e.cfg.hc_post_alpha) },                            .{ .i = e.cfg.hc_sinkhorn_iters },
     });
+    if (e.o.r1) {
+        // MHC_TAIL (the parallel finish: SM cycles a CTA waits) and MHC_DEFER (a mixing site's coefficient items as
+        // their own launch after it: Python's side stream, joined before the next reader)
+        const last = &e.out.items[e.out.items.len - 1];
+        const more = try e.a.alloc(calls.Named, last.args.len + 2);
+        @memcpy(more[0..last.args.len], last.args);
+        more[last.args.len] = .{ .arg = .{ .i = e.o.mhc_spin } };
+        more[last.args.len + 1] = .{ .arg = .{ .i = @intFromBool(mix) } };
+        last.args = more;
+        if (mix) try e.ext("tf_dsv41_mhc_cuda_v1.coef", &.{
+            try e.buf("L.mhc.part", .{}, .f32, &.{ n, 4, 40, 32 }), hc[1],
+            hc[2],                                                   next[0],
+            next[1],                                                 next[2],
+            .{ .i = n },                                             .{ .f = E.dec(e.cfg.eps) },
+            .{ .f = E.dec(e.cfg.hc_eps) },                           .{ .f = E.dec(e.cfg.hc_post_alpha) },
+            .{ .i = e.cfg.hc_sinkhorn_iters },
+        });
+    }
     if (mix) e.coef = 1 - e.coef;
     if (mode == .boundary) e.cur = 1 - e.cur;
 }
@@ -104,8 +122,9 @@ pub fn moe(e: *E, L: u32) !void {
     const n = e.n;
     const D: i64 = e.cfg.hidden;
     const backbone = e.cfg.isBackbone(L);
-    // the router folds kit rounding + grouping into its tail whenever no prune follows it (moe.py route_fold)
-    const fold = !backbone or e.o.expert_topp == null;
+    // the router folds kit rounding + grouping into its tail whenever no prune follows it (moe.py route_fold); R1
+    // (RG_PRUNE + PRUNE_KIT) folds the prune in too
+    const fold = !backbone or e.o.expert_topp == null or e.o.r1;
     const ex = e.cfg.expertsOf(L);
     const slots: i64 = ex.topk + 1;
     const Et: i64 = ex.count + 1;
@@ -133,6 +152,17 @@ pub fn moe(e: *E, L: u32) !void {
         if (!fold) try e.empty(.i32) else ucount,                 if (!fold) try e.t(.empty, .i32, &.{ 0, 1 }) else members,
         .{ .i = if (!fold) 0 else Et },                           .{ .b = fold },
     });
+    if (e.o.r1) {
+        // prune.fold_args: [min_w, topp, scale, min_k, orig, drop, dup] (empty: no rule, a DSpark block's)
+        const pa: []const Arg = if (backbone and e.o.expert_topp != null) &.{
+            .{ .f = 0.0 }, .{ .f = e.o.expert_topp.? }, .{ .f = scale }, .{ .i = 3 }, .{ .i = 0 }, .{ .i = ex.count }, .{ .i = 0 },
+        } else &.{};
+        const last = &e.out.items[e.out.items.len - 1];
+        const more = try e.a.alloc(calls.Named, last.args.len + 1);
+        @memcpy(more[0..last.args.len], last.args);
+        more[last.args.len] = .{ .arg = .{ .list = try e.a.dupe(Arg, pa) } };
+        last.args = more;
+    }
     if (!fold) {
         try e.triton("_prune", .{ std.math.divCeil(i64, n, 16) catch unreachable, 1, 1 }, &.{
             .{ .name = "PICK", .arg = pick },               .{ .name = "WTS", .arg = wts },
@@ -192,7 +222,7 @@ pub fn moe(e: *E, L: u32) !void {
         z,                                                pick,
         try e.buf("{s}.svh_d", .{pre}, .f16, &.{ Et, D }), try e.buf("{s}.y", .{sc}, .f32, &.{ rows * slots, D }),
         // after a prune, kit_weights' fp16 rounding (a pointwise op the forward runs) gives new weights
-        if (!fold) try e.buf("L.wts16", .{}, .f32, &.{ n, slots }) else wts, try e.buf("L.moe", .{}, .f32, &.{ n, D }),
+        if (!fold) try e.buf("L.wts16", .{}, .f32, &.{ n, slots }) else wts, try e.buf("L.moe", .{}, if (e.o.r1 and backbone) .bf16 else .f32, &.{ n, D }),
         .{ .i = n },                                      .{ .i = P },
         .{ .i = D },                                      .{ .i = 1 },
         .{ .i = slots },                                  .{ .i = Et },

@@ -109,7 +109,13 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, ref: []con
     // M2B_TOPP (the reference's TF_DSV41_EXPERT_TOPP): unset = top-p off (no prune; the router's tail folds kit
     // rounding and grouping), else prod's prune at that mass
     const topp: ?f64 = if (std.c.getenv("M2B_TOPP")) |v| try std.fmt.parseFloat(f64, std.mem.span(v)) else null;
-    var f = fwd.Forward.init(gpa, &cfg, &wd, .{ .expert_topp = topp }, &runner, comm);
+    // R1 when the reference ran its knobs (ref.json's env: r1c-knobs.env on prod's)
+    const r1 = blk: {
+        const env = meta.object.get("env") orelse break :blk false;
+        const v = env.object.get("TF_DSV41_MHC_DEFER") orelse break :blk false;
+        break :blk v == .string and std.mem.eql(u8, v.string, "1");
+    };
+    var f = fwd.Forward.init(gpa, &cfg, &wd, .{ .expert_topp = topp, .r1 = r1 }, &runner, comm);
     defer f.deinit();
     f.layers = layers;
     var bp = blk: {

@@ -173,6 +173,22 @@ pub const Flow = struct {
 };
 
 /// A captured phase: a decode window ("w<n>") or a prefill segment ("p<n>", `prefill`).
+/// The emitter options a capture ran with, from meta.json's env: R1 when its knobs were set (r1c-knobs.env).
+pub fn optionsOf(a: std.mem.Allocator, io: std.Io, dir: []const u8) !block.Options {
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ dir, "meta.json" }), a, .limited(1 << 24));
+    const meta = try std.json.parseFromSliceLeaky(Value, a, text, .{});
+    var o: block.Options = .{};
+    const env = meta.object.get("env") orelse return o;
+    const on = struct {
+        fn f(e: Value, k: []const u8) bool {
+            const v = e.object.get(k) orelse return false;
+            return v == .string and std.mem.eql(u8, v.string, "1");
+        }
+    }.f;
+    o.r1 = on(env, "TF_DSV41_MHC_DEFER") and on(env, "TF_DSV41_RG_PRUNE") and on(env, "TF_DSV41_ATTN_ROPE") and on(env, "TF_DSV41_RMS_FOLD");
+    return o;
+}
+
 pub const Window = struct { set: []const u8, phase: []const u8, layers: []const u32, n: i64, start: i64, ops: []std.json.ObjectMap, prefill: bool = false };
 
 /// The capture's phases in order: each set's decode windows (meta.json "windows") from the prompt's end, then its
@@ -274,6 +290,8 @@ pub fn checkAll(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, experts: []
     const cfg: Config = .{};
     const ws = try windows(a, io, dir);
     try gmWidths(a, &w, ws);
+    const opts = try optionsOf(a, io, dir);
+    if (opts.r1) try log.print("options: R1 (the capture's knobs)\n", .{});
     var bad: usize = 0;
     // the variant gate when the capture's AOT set carries the specialization (dsv41_m1_capture.py pack_aot, 2026-10-06+)
     var variants: ?Variants = null;
@@ -290,9 +308,9 @@ pub fn checkAll(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, experts: []
         }
         last_set = win.set;
         const cs = try calls.launches(a, if (win.prefill)
-            try block_prefill.emitPrefill(a, &cfg, &w, .{}, win.layers, win.n, win.start, true)
+            try block_prefill.emitPrefill(a, &cfg, &w, opts, win.layers, win.n, win.start, true)
         else
-            try block.emit(a, &cfg, &w, .{}, win.layers, win.n, win.start, true));
+            try block.emit(a, &cfg, &w, opts, win.layers, win.n, win.start, true));
         var equal: usize = 0;
         var shown: usize = 0;
         const m = @min(cs.len, win.ops.len);

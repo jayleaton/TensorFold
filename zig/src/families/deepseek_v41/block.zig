@@ -59,6 +59,13 @@ pub const Options = struct {
     taps: bool = false,
     /// rows a prefill segment holds at most (forward.pchunk): sizes the SWA staging ring (block_prefill.zig)
     prefill_rows: i64 = 2048,
+    /// R1 (prod-perf1's decode knobs, docs DSV41-DECODE-R1.md; the same bits): attention split 4 with q's RoPE in the
+    /// kernel (ATTN_SPLIT, ATTN_ROPE), mHC's parallel tail + deferred coefficients (MHC_TAIL, MHC_DEFER), the router's
+    /// prune + kit rounding (RG_PRUNE, PRUNE_KIT), a bf16 MoE partial (MOE_BF16), q_norm folded into its consumers'
+    /// rot_in (RMS_FOLD)
+    r1: bool = false,
+    /// MHC_TAIL_SPIN (SM cycles a CTA waits for the last arrival)
+    mhc_spin: i64 = 8000,
 };
 
 pub const Emitter = struct {
@@ -177,9 +184,16 @@ pub const Emitter = struct {
     /// One projection of a fused group: weight prefix, input, output (a whole buffer; `col` its first column), K x N.
     pub const Proj = struct { w: []const u8, x: Arg, y: Arg, col: usize = 0, k: usize, n: usize };
 
+    /// R1's RMS_FOLD: rot_in norms its rows itself (rms(x, w, eps), rmsnorm's order) before the rotation.
+    pub const Norm = struct { w: Arg, eps: f64 };
+
     /// x3seg rot_in, then dense3 a width (fused_proj.run): the group's projections in one rot_in launch, one linear
     /// launch for each K2 in first-appearance order. `tag` names the group's scratch.
     pub fn fused(e: *Emitter, tag: []const u8, ps: []const Proj) !void {
+        return e.fusedNorm(tag, ps, null);
+    }
+
+    pub fn fusedNorm(e: *Emitter, tag: []const u8, ps: []const Proj, norm: ?Norm) !void {
         const m: usize = @intCast(e.n);
         const segs = try e.a.alloc(dense.Seg, ps.len);
         for (ps, segs, 0..) |p, *s, i| {
@@ -196,7 +210,11 @@ pub const Emitter = struct {
             o.* = @intCast(lay.xh_off[i]);
         }
         const xh = try e.buf("L.{s}.xh", .{tag}, .f16, &.{@intCast(lay.xh_total)});
-        try e.ext("tf_dsv41_x3seg_v3.rot_in", &.{ .{ .list = xs }, .{ .list = suh }, xh, try e.ints(offs), .{ .b = false } });
+        if (norm) |nm| {
+            const ws = try e.a.alloc(Arg, ps.len);
+            @memset(ws, nm.w);
+            try e.ext("tf_dsv41_x3seg_v3.rot_in", &.{ .{ .list = xs }, .{ .list = suh }, xh, try e.ints(offs), .{ .b = false }, .{ .list = ws }, .{ .f = nm.eps } });
+        } else try e.ext("tf_dsv41_x3seg_v3.rot_in", &.{ .{ .list = xs }, .{ .list = suh }, xh, try e.ints(offs), .{ .b = false } });
         const z: Arg = if (lay.z_total > 0) try e.buf("L.{s}.z", .{tag}, .f32, &.{@intCast(lay.z_total)}) else .none;
         const counters = try e.buf("L.{s}.cnt", .{tag}, .i32, &.{@intCast(lay.c_total)});
         for (lay.launches[0..lay.n_launches]) |l| {
@@ -427,6 +445,24 @@ pub const Emitter = struct {
         return .{ try e.buf("w.sel{d}", .{src}, .i32, &.{ e.n, e.cfg.index_topk }), try e.buf("w.cnt{d}", .{src}, .i32, &.{e.n}) };
     }
 
+    /// Triton `_rms` (rmsnorm.rms: a weight, bf16 in and out): R1's kv_norm beside the SWA store.
+    pub fn rms(e: *Emitter, x: Arg, w: Arg, out: Arg, k: i64) !void {
+        try e.triton("_rms", .{ e.n, 1, 1 }, &.{
+            .{ .name = "X", .arg = x },                                                .{ .name = "x_rs", .arg = .{ .i = k } },
+            .{ .name = "W", .arg = w },                                                .{ .name = "OUT", .arg = out },
+            .{ .name = "o_rs", .arg = .{ .i = k } },                                   .{ .name = "K", .arg = .{ .i = k } },
+            .{ .name = "inv_k", .arg = .{ .f = 1.0 / @as(f64, @floatFromInt(k)) } }, .{ .name = "eps", .arg = .{ .f = dec(e.cfg.eps) } },
+            .{ .name = "BK", .arg = .{ .i = 512 } },                                   .{ .name = "HAS_W", .arg = .{ .b = true } },
+            .{ .name = "NARROW", .arg = .{ .b = true } },                              .{ .name = "PDL", .arg = .{ .b = false } },
+        });
+    }
+
+    /// The SWA store of the window's kv rows (R1: kv_norm runs here, RMS_FOLD's `Normed.tensor()`).
+    fn swaStore(e: *Emitter, L: u32, kv: Arg, kvn: Arg) !void {
+        if (e.o.r1) try e.rms(kv, try e.weight("L{d}.attn.kv_norm", .{L}, .f32, &.{e.cfg.head_dim}), kvn, e.cfg.head_dim);
+        try e.kvStore(kvn, L, 0);
+    }
+
     pub fn attention(e: *Emitter, L: u32) !void {
         const n = e.n;
         const D: i64 = e.cfg.hidden;
@@ -465,7 +501,9 @@ pub const Emitter = struct {
         try e.fused("x", ps[0..xg.ws.len]);
         const qn = try e.buf("L.qn", .{}, .bf16, &.{ n, e.cfg.q_lora });
         const kvn = try e.buf("L.kvn", .{}, .bf16, &.{ n, hd });
-        try e.triton("_rms2", .{ n, 2, 1 }, &.{
+        // R1 (RMS_FOLD): no launch here; q_norm runs in its consumers' rot_in, kv_norm beside the SWA store
+        const qnorm: ?Norm = if (e.o.r1) .{ .w = try e.weight("L{d}.attn.q_norm", .{L}, .f32, &.{e.cfg.q_lora}), .eps = dec(e.cfg.eps) } else null;
+        if (!e.o.r1) try e.triton("_rms2", .{ n, 2, 1 }, &.{
             .{ .name = "XA", .arg = qa },                                                      .{ .name = "xa_rs", .arg = .{ .i = e.cfg.q_lora } },
             .{ .name = "WA", .arg = try e.weight("L{d}.attn.q_norm", .{L}, .f32, &.{e.cfg.q_lora}) }, .{ .name = "OA", .arg = qn },
             .{ .name = "oa_rs", .arg = .{ .i = e.cfg.q_lora } },                              .{ .name = "KA", .arg = .{ .i = e.cfg.q_lora } },
@@ -476,7 +514,7 @@ pub const Emitter = struct {
             .{ .name = "eps", .arg = .{ .f = dec(e.cfg.eps) } },                              .{ .name = "BK", .arg = .{ .i = 512 } },
             .{ .name = "NARROW", .arg = .{ .b = true } },                                     .{ .name = "PDL", .arg = .{ .b = false } },
         });
-        if (!indexer) try e.kvStore(kvn, L, 0);
+        if (!indexer) try e.swaStore(L, kv, kvn);
         if (own_kv) {
             // the compressor: pooled rows, normed, into the pool; the indexer's keys from the same rows
             const lat = try e.buf("L.lat", .{}, .bf16, &.{ n, hd });
@@ -505,13 +543,13 @@ pub const Emitter = struct {
                 .{ .name = "ROWS", .arg = .{ .b = false } },                                     .{ .name = "PDL", .arg = .{ .b = false } },
             });
         }
-        if (indexer) try e.index(L, qn, iw);
+        if (indexer) try e.index(L, if (e.o.r1) qa else qn, iw, qnorm);
         // q group: wq_b
         const q = try e.buf("L.q", .{}, .bf16, &.{ n, H * hd });
-        try e.fused("q", &.{.{ .w = try e.fmt("L{d}.attn.wq_b", .{L}), .x = qn, .y = q, .k = e.cfg.q_lora, .n = @intCast(H * hd) }});
+        try e.fusedNorm("q", &.{.{ .w = try e.fmt("L{d}.attn.wq_b", .{L}), .x = if (e.o.r1) qa else qn, .y = q, .k = e.cfg.q_lora, .n = @intCast(H * hd) }}, qnorm);
         try e.prefetchO(L);
-        try e.rope(q, H, hd, hd - 64);
-        if (indexer) try e.kvStore(kvn, L, 0);
+        if (!e.o.r1) try e.rope(q, H, hd, hd - 64); // R1 (ATTN_ROPE): the attention kernel rotates q as it loads it
+        if (indexer) try e.swaStore(L, kv, kvn);
         // attention over the SWA ring and (a compressed layer) the source's pool at the source's selection
         const o = try e.buf("L.o", .{}, .bf16, &.{ n, H, hd });
         const swa = try e.pool(L, 0);
@@ -539,6 +577,15 @@ pub const Emitter = struct {
             .{ .i = 2 * @as(i64, e.cfg.window) },                               .{ .i = 0 },
             .{ .i = 0 },                                                        .{ .i = 4 },
         });
+        if (e.o.r1) {
+            // ATTN_SPLIT 4 (a cluster of 4 a chunk up to ATTN_SPLIT_ROWS = 2 rows, 1 above) and ATTN_ROPE
+            const last = &e.out.items[e.out.items.len - 1];
+            const more = try e.a.alloc(calls.Named, last.args.len + 2);
+            @memcpy(more[0..last.args.len], last.args);
+            more[last.args.len] = .{ .arg = .{ .i = if (n <= 2) 4 else 1 } };
+            more[last.args.len + 1] = .{ .arg = .{ .i = 1 } };
+            last.args = more;
+        }
         // o: wo_a's groups over the heads' columns, then wo_b (this rank's partial)
         const g: usize = e.cfg.o_groups / e.o.world;
         const gk: i64 = @divExact(H * hd, @as(i64, @intCast(g)));
@@ -558,12 +605,12 @@ pub const Emitter = struct {
 
     /// The indexer: query projection and rope, scores over the keys, top-k (a candidate source also picks candidate
     /// blocks for the Reindex layers; a Reindex layer scores only those).
-    fn index(e: *Emitter, L: u32, qn: Arg, iw: Arg) !void {
+    fn index(e: *Emitter, L: u32, qn: Arg, iw: Arg, qnorm: ?Norm) !void {
         const n = e.n;
         const IH: i64 = e.cfg.index_heads;
         const ID: i64 = e.cfg.index_dim;
         const qi = try e.buf("L.qi", .{}, .bf16, &.{ n, IH * ID });
-        try e.fused("qi", &.{.{ .w = try e.fmt("L{d}.attn.ix_wq_b", .{L}), .x = qn, .y = qi, .k = e.cfg.q_lora, .n = @intCast(IH * ID) }});
+        try e.fusedNorm("qi", &.{.{ .w = try e.fmt("L{d}.attn.ix_wq_b", .{L}), .x = qn, .y = qi, .k = e.cfg.q_lora, .n = @intCast(IH * ID) }}, qnorm);
         try e.rope(qi, IH, ID, ID - 64);
         const reindex = e.cfg.mode(L) == .reindex;
         const src = if (reindex) e.cfg.kvSource(L).? else L;
@@ -634,7 +681,11 @@ pub const Emitter = struct {
             try moe.mhc(e, L, "hc_ffn", .boundary);
             try moe.moe(e, L);
             if (i + 1 < layers.len) try e.prefetchX(layers[i + 1]);
-            try e.glue("exchange_f32", &.{ try e.buf("L.moe", .{}, .f32, &.{ e.n, D }), try e.buf("w.recv.moe", .{}, .bf16, &.{ e.o.world, e.n, D }) });
+            // R1 (MOE_BF16): down_combine stores the partial as bf16, the exchange takes it as is
+            if (e.o.r1)
+                try e.glue("exchange", &.{ try e.buf("L.moe", .{}, .bf16, &.{ e.n, D }), try e.buf("w.recv.moe", .{}, .bf16, &.{ e.o.world, e.n, D }) })
+            else
+                try e.glue("exchange_f32", &.{ try e.buf("L.moe", .{}, .f32, &.{ e.n, D }), try e.buf("w.recv.moe", .{}, .bf16, &.{ e.o.world, e.n, D }) });
             if (e.o.trace) {
                 const y = try e.buf("w.trace", .{}, .bf16, &.{ e.n, 4 * D });
                 try moe.postOnly(e, y);
