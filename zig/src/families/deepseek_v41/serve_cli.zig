@@ -7,7 +7,8 @@
 //!                               greedy request of the recorded prompt and length; PASS when every reply's ids equal
 //!                               the recorded ones (M4's "HTTP tokens == CLI"); a line's "sampling" ({seed,
 //!                               temperature, top_k, top_p, min_p}: dsv41_samp_ref.py's replies) makes it that keyed
-//!                               request (the sampled gate: Python's tokens for the same request and seed);
+//!                               request (the sampled gate: Python's tokens for the same request and seed); a line's
+//!                               "structure" ({kind, text}) replays it under that grammar (TF_DSV41_GRAMMAR=1);
 //!                               TF_DSV41_GEN_STREAMS=N keeps N requests in flight (with TF_DSV41_SLOTS: batched rows)
 //!
 //! TF_DSV41_DRAFTS=0: no DSpark (serial windows through the same lanes), as the server's --no-drafts.
@@ -76,7 +77,9 @@ pub fn generate(gpa: std.mem.Allocator, io: std.Io, pack: []const u8, assets: []
     defer se.Served.close(s);
     const eng = s.engine();
     const Keyed = struct { seed: u64, temperature: f64, top_k: u32, top_p: f64, min_p: f64 = 0 };
-    const Line = struct { prompt: []const u32, tokens: []const u32, drafted: ?u64 = null, sampling: ?Keyed = null };
+    // "structure" ({kind, text}: the request's grammar, TF_DSV41_GRAMMAR=1): replayed under the same grammar
+    const Structured = struct { kind: []const u8, text: []const u8 = "" };
+    const Line = struct { prompt: []const u32, tokens: []const u32, drafted: ?u64 = null, sampling: ?Keyed = null, structure: ?Structured = null };
     var recs: std.ArrayList(Line) = .empty;
     var lines = std.mem.tokenizeScalar(u8, text, '\n');
     while (lines.next()) |line| try recs.append(a, try std.json.parseFromSliceLeaky(Line, a, line, .{ .ignore_unknown_fields = true }));
@@ -96,6 +99,7 @@ pub fn generate(gpa: std.mem.Allocator, io: std.Io, pack: []const u8, assets: []
             boxes[i] = .{ .io = io, .gpa = gpa };
             const smp: ?api.Sampling = if (rec.sampling) |k| .{ .seed = k.seed, .temperature = k.temperature, .top_k = k.top_k, .top_p = k.top_p, .min_p = k.min_p } else null;
             reqs[i] = .{ .prompt = rec.prompt, .max_tokens = @intCast(rec.tokens.len), .drafts = drafts(), .sampling = smp };
+            if (rec.structure) |st| reqs[i].structure = .{ .kind = std.meta.stringToEnum(@FieldType(api.Structure, "kind"), st.kind) orelse return error.BadStructure, .text = st.text };
             try eng.submit(@intCast(i + 1), &reqs[i], .{ .ctx = &boxes[i], .event = Box.event });
         }
         for (at..end) |i| {
