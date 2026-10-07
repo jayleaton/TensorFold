@@ -105,6 +105,16 @@ pub fn main(init: std.process.Init) !u8 {
             std.debug.print("FAIL tf-dsv41-m1 vision: {t}\n", .{e});
             return 1;
         };
+    if (args.len == 3 and std.mem.eql(u8, args[1], "vision-emit")) { // the image bias's split MoE vs plain segments (vision_emit.zig)
+        var buf: [4096]u8 = undefined;
+        var out = std.Io.File.stdout().writer(init.io, &buf);
+        const bad = @import("vision_emit.zig").run(init.gpa, init.io, args[2], @embedFile("fixtures/q28v2-expert-k2.txt"), &out.interface) catch |e| {
+            std.debug.print("FAIL tf-dsv41-m1 vision-emit: {t}\n", .{e});
+            return 1;
+        };
+        out.interface.flush() catch {};
+        return if (bad == 0) 0 else 1;
+    }
     if (args.len == 3 and std.mem.eql(u8, args[1], "dcheck")) {
         var buf: [4096]u8 = undefined;
         var out = std.Io.File.stdout().writer(init.io, &buf);
