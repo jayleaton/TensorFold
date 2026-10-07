@@ -78,6 +78,8 @@ pub const Forward = struct {
     kv: ?*kvs.Kv = null,
     /// M5: the session store (sessions_gpu.zig): the ids each keep commits, and the operations a follower runs
     sess: ?Sess = null,
+    /// the keyed sampler (sampling_gpu.zig): a follower runs rank 0's sampled choices too (their gathers pair up)
+    sampler: ?Sampler = null,
 
     pub fn init(gpa: std.mem.Allocator, cfg: *const Config, widths: *const block.Widths, opts: block.Options, runner: *run.Runner, comm: tp.collective.Collective) Forward {
         return .{ .gpa = gpa, .cfg = cfg, .widths = widths, .opts = opts, .runner = runner, .comm = comm, .arena = std.heap.ArenaAllocator.init(gpa) };
@@ -278,6 +280,19 @@ pub const Forward = struct {
     const op_sess_restore: i64 = 9;
     const op_release: i64 = 10;
     const op_ds_reset: i64 = 11;
+    /// 12-15: dsq-zig-samp-1 (the keyed sampler); 12: [op, row0, n, T, top_k, top_p, min_p]
+    pub const op_sample: i64 = 12;
+
+    /// The sampler's side of a follower (sampling_gpu.zig): rank 0's op_sample message, run on this rank.
+    pub const Sampler = struct {
+        ptr: *anyopaque,
+        follow: *const fn (ptr: *anyopaque, msg: []const i64) anyerror!void,
+    };
+
+    /// Rank 0: a sampled choice's message to the followers (before its gathers).
+    pub fn sendSample(f: *Forward, ints: []const i64) !void {
+        if (f.leads()) try f.link.?.send(ints);
+    }
     const op_tree_drop: i64 = 20;
 
     /// The session store's side of the forward (sessions_gpu.zig): `commit` hears every committed id (keep, prefill
@@ -407,6 +422,10 @@ pub const Forward = struct {
                 op_ds_propose => {
                     const d = f.drafter orelse return error.BadPlan;
                     try d.propose(d.ptr, @intCast(msg[1]), @intCast(msg[2]));
+                },
+                op_sample => {
+                    const x = f.sampler orelse return error.BadPlan;
+                    try x.follow(x.ptr, msg);
                 },
                 else => return error.BadPlan,
             }
