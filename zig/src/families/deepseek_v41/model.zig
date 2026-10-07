@@ -32,6 +32,8 @@ const dspark_emit = @import("dspark_emit.zig");
 const dspark_gpu = @import("dspark_gpu.zig");
 const kvs = @import("kv_state.zig");
 const sg = @import("sessions_gpu.zig");
+const slots_mod = @import("slots.zig");
+const batch = @import("batch.zig");
 const samp = @import("sampling_gpu.zig");
 
 pub const Options = struct {
@@ -85,6 +87,10 @@ pub const Model = struct {
     pass: ?*dspark_gpu.GpuPass = null,
     /// M5: the session store over the paged pool (with TF_DSV41_POOL_TOKENS)
     sessions: ?*sg.Sessions = null,
+    /// live slots (TF_DSV41_SLOTS; > 1: stacked state and row-mode windows, batch.zig)
+    slots: u32 = 1,
+    slot_set: ?*slots_mod.SlotSet = null,
+    rows: ?*batch.Batch = null,
     /// the keyed sampler, every rank (requests with T > 0; the followers run its gathers from forward.follow)
     sampler: ?*samp.GpuSampler = null,
 
@@ -145,7 +151,10 @@ pub const Model = struct {
         const r1 = if (std.c.getenv("TF_DSV41_R1")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
         m.f = fwd.Forward.init(gpa, &m.cfg, &m.widths, .{ .world = world, .expert_topp = topp, .r1 = r1, .taps = o.drafts }, &m.runner, comm);
         m.f.layers = backbone;
-        if (try kvs.optionsFromEnv(@intCast(m.f.opts.limit), world)) |ko| {
+        m.slots = try slots_mod.countFromEnv();
+        if (try kvs.optionsFromEnv(@intCast(m.f.opts.limit), world)) |ko_| {
+            var ko = ko_;
+            ko.slots = m.slots;
             try kvs.bootCheck(&m.ctx, &m.cfg, ko, m.tcfg.rank, world);
             m.f.kv = try kvs.Kv.init(gpa, &m.driver, &m.ctx, &m.cfg, ko, &m.runner, comm);
             m.f.opts.pool = m.f.kv.?.options();
@@ -157,6 +166,8 @@ pub const Model = struct {
         var bp = try m.f.plan(buckets[0..nb]);
         if (o.drafts) try dspark_gpu.GpuPass.plan(m.f.arena.allocator(), &m.f, &bp, nb);
         if (o.own_prefill) try m.f.planPrefill(&bp, @intCast(m.f.opts.prefill_rows));
+        const rows_cap = try batch.capFromEnv();
+        if (m.slots > 1) try batch.Batch.plan(&m.f, &bp, m.slots, rows_cap);
         if (m.f.kv) |k| try k.bind(&m.runner, &bp);
         try m.runner.bind(&bp);
         const src: forms.Source = .{ .d = &m.driver, .weights = &m.weights, .plan = &m.pl };
@@ -175,9 +186,10 @@ pub const Model = struct {
         m.host = try eh.Host.load(ehb, m.cfg.engram_heads, m.cfg.engram_pad, m.cfg.engram_vocab, &m.lbuf);
         m.f.engram = &m.host;
         if (world > 1) m.f.link = &m.session.plan;
-        if (m.f.kv != null) m.sessions = try sg.Sessions.init(gpa, io, &m.f, &bp, try sg.optionsFromEnv());
+        if (m.f.kv != null and m.slots == 1) m.sessions = try sg.Sessions.init(gpa, io, &m.f, &bp, try sg.optionsFromEnv());
         m.gt = .{ .f = &m.f, .prefill_rows = o.prefill_rows, .max_rows = nb, .own_prefill = o.own_prefill, .sessions = m.sessions };
         if (o.drafts) m.pass = try dspark_gpu.GpuPass.init(gpa, &m.f, nb);
+        if (m.slots > 1) try m.openRows(rows_cap, &bp);
         m.sampler = try samp.GpuSampler.init(gpa, &m.f);
         m.gt.sampler = m.sampler;
         try m.driver.check(m.driver.api.cuCtxSynchronize(), "cuCtxSynchronize");
@@ -185,8 +197,24 @@ pub const Model = struct {
         return m;
     }
 
+    /// Several live slots (slots.zig / batch.zig): the stacked roles' bases, the row runner, the followers' row ops;
+    /// one-slot graphs off (row windows have their own), sessions not opened (one slot's roles only).
+    fn openRows(m: *Model, cap: u32, bp: *const buffers.Plan) !void {
+        std.log.scoped(.dsv41).info("slots: {d} live, row windows of up to {d} rows (sessions off with several slots)", .{ m.slots, cap });
+        const ss = try slots_mod.SlotSet.init(m.gpa, &m.f, m.slots);
+        errdefer ss.deinit();
+        try ss.bindBases(bp);
+        m.slot_set = ss;
+        m.rows = try batch.Batch.init(m.gpa, &m.f, ss, cap);
+        m.f.ext = m.rows.?.ext();
+        m.f.graphs_read = true;
+        m.gt.rows = m.rows;
+    }
+
     pub fn close(m: *Model) void {
         const gpa = m.gpa;
+        if (m.rows) |b| b.deinit();
+        if (m.slot_set) |ss| ss.deinit();
         if (m.pass) |p| p.deinit();
         if (m.sampler) |x| x.deinit();
         if (m.sessions) |x| x.deinit();
