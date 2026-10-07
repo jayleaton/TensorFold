@@ -65,9 +65,18 @@ pub fn main(init: std.process.Init) !u8 {
         .family = fam,
         .served = hub.servedName(args.name, args.model, dir),
         .sampling = try sampling(a, io, dir, args, fam != null),
+        // DeepSeek-V4.1's Python app is the Spark server's: the same HTTP surface (TENSORFOLD_WIRE overrides)
+        .wire = wire(init.environ_map, fam != null) orelse return fail("TENSORFOLD_WIRE: expected spark or tensorfold"),
         .environ = init.environ_map,
         .started = started,
     });
+}
+
+fn wire(env: ?*const std.process.Environ.Map, family_default: bool) ?@import("spark.zig").Wire {
+    const raw = if (env) |m| m.get("TENSORFOLD_WIRE") else null;
+    const t = std.mem.trim(u8, raw orelse "", " \t");
+    if (t.len == 0) return if (family_default) .spark else .tensorfold;
+    return std.meta.stringToEnum(@import("spark.zig").Wire, t);
 }
 
 fn fail(message: []const u8) u8 {

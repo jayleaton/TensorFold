@@ -77,6 +77,8 @@ pub const Setup = struct {
     on_listen: ?*const fn (port: u16) void = null,
     /// The checkpoint family's own chat rules (DeepSeek-V4.1), or null.
     family: ?@import("family.zig").Family = null,
+    /// The HTTP surface (spark.zig): a family whose Python app is the Spark server's answers as it does.
+    wire: @import("spark.zig").Wire = .tensorfold,
 };
 
 fn env(s: Setup, name: []const u8) ?[]const u8 {
@@ -107,6 +109,10 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         std.debug.print("tensorfold: TENSORFOLD_SEED_SALT={s}: an integer\n", .{t});
         return 1;
     } else 0;
+    const spark_settings = @import("spark.zig").Settings.fromEnv(s.environ, &problem) catch {
+        std.debug.print("tensorfold: {s}\n", .{problem});
+        return 1;
+    };
     const config: server_mod.Config = .{
         .served_name = s.served,
         .model_ids = ids.items,
@@ -121,6 +127,8 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         .request_log = env(s, "TENSORFOLD_REQUEST_LOG"),
         .dashboard = args.dashboard,
         .family = s.family,
+        .wire = s.wire,
+        .spark = spark_settings,
     };
     const srv = server_mod.Server.init(gpa, io, s.engine, s.text, config, if (store.enabled()) &store else null) catch {
         std.debug.print("tensorfold: the server could not start\n", .{});
@@ -151,6 +159,10 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         s.served,                            args.host,                                                                                   port,   shownSampling(a, s.sampling),
         if (args.no_drafts) "off" else "on", if (window > 0) std.fmt.bufPrint(&window_text, "{d}", .{window}) catch "?" else "unlimited", loaded,
     });
+    if (greedy(s.sampling))
+        log.line("WARNING: default sampling is greedy (temperature <= 0) - a client that omits `temperature` decodes greedily, which on a long agentic turn can loop in reasoning and return empty content", .{});
+    // the Spark ops scripts read this line for the slot count (scripts/serve.sh check_slots)
+    if (s.wire == .spark) log.line("serving: {d} slot(s) x {d} tokens; wire spark; health {t}; request log {s}; disconnect {s}", .{ srv.info.lanes, window, spark_settings.health, if (spark_settings.log) |l| l.path else "off", if (spark_settings.disconnect) "on" else "off" });
     if (args.thinking and std.mem.indexOf(u8, s.text.templateSource(), "enable_thinking") != null)
         log.line("thinking on (the chat template's default): replies reason in reasoning_content before the answer in content, and max_tokens counts both. --no-thinking turns it off; a request can send chat_template_kwargs {{\"enable_thinking\": false}}", .{});
     live.columns_env = env(s, "COLUMNS");
@@ -172,6 +184,17 @@ fn resolve(io: std.Io, host: []const u8, port: u16) ?std.Io.net.IpAddress {
     if (std.Io.net.IpAddress.parse(host, port)) |ip| return ip else |_| {}
     if (std.ascii.eqlIgnoreCase(host, "localhost")) return .{ .ip4 = .loopback(port) };
     return std.Io.net.IpAddress.resolve(io, host, port) catch null;
+}
+
+/// Whether requests that name no temperature decode greedily (public PR #14's startup warning).
+fn greedy(sampling: ?json.Value) bool {
+    const v = sampling orelse return true;
+    const t = v.get("temperature") orelse return true;
+    return switch (t) {
+        .float => |f| f <= 0,
+        .int => |i| (std.fmt.parseFloat(f64, i) catch 0) <= 0,
+        else => true,
+    };
 }
 
 /// The serving line's sampling: greedy, or each default as ``name value``.

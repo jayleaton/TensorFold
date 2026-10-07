@@ -25,9 +25,19 @@ fn flag(cx: *Cx, body: Value, name: []const u8, default: bool) errors.Refused!bo
 fn tokenize(srv: *Server, cx: *Cx, body: Value) errors.Refused!Value {
     const a = cx.a;
     if (body != .object) return cx.refuse("the request body must be a JSON object");
-    const strings = try flag(cx, body, "return_token_strs", false);
+    const spark_wire = srv.config.wire == .spark;
+    const strings = if (spark_wire) false else try flag(cx, body, "return_token_strs", false);
     var ids: []const u32 = undefined;
-    if (body.has("messages") and srv.family != null) {
+    if (spark_wire and !(body.get("messages") != null and body.get("messages").? == .array)) {
+        // the Spark server: a string prompt (add_special_tokens, default true) or a list of messages
+        const text = body.get("prompt");
+        if (text == null or text.? != .string) return cx.refuse("tokenize needs a string prompt or a list of messages");
+        const special = if (body.get("add_special_tokens")) |v| v.truthy() else true;
+        ids = srv.text.encode(a, text.?.string, special) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Template => return cx.other("the tokenizer cannot encode this prompt"),
+        };
+    } else if (body.has("messages") and srv.family != null) {
         // rendered exactly as a chat request with the same body
         const fam = srv.family.?;
         const generation = try flag(cx, body, "add_generation_prompt", true);
@@ -71,7 +81,7 @@ fn tokenize(srv: *Server, cx: *Cx, body: Value) errors.Refused!Value {
         const strs = try a.alloc(Value, ids.len);
         for (ids, strs) |t, *slot| slot.* = .{ .string = srv.text.tokenString(a, t) catch "" };
         try o.put(a, "token_strs", .{ .array = strs });
-    }
+    } else if (spark_wire) try o.put(a, "token_strs", .null);
     return .{ .object = o };
 }
 

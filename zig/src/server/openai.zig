@@ -15,6 +15,8 @@ const request_log = @import("request_log.zig");
 const sse = @import("sse.zig");
 const http_body = @import("http_body.zig");
 const routes = @import("routes.zig");
+const spark = @import("spark.zig");
+const pyrepr = @import("pyrepr.zig");
 const Server = @import("server.zig").Server;
 const Conn = @import("http_conn.zig").Conn;
 const Value = json.Value;
@@ -39,12 +41,16 @@ pub const Out = struct {
 /// POST /v1/chat/completions or /v1/completions, read from the client and answered to it.
 pub fn post(srv: *Server, conn: *Conn, a: Allocator, is_chat: bool) void {
     var cx: Cx = .{ .a = a };
+    const spark_wire = srv.config.wire == .spark;
     const body = http_body.readJson(conn, &cx) catch {
+        if (spark_wire) return routes.sendValue(conn, a, if (cx.kind == .capacity) 503 else 400, spark.errorBody(a, if (cx.kind == .other) "the request body is not JSON" else cx.message, "invalid_request_error", null, null) catch return);
         const err = errorBody(a, &cx, if (is_chat) "messages" else "prompt") catch return;
         return routes.sendValue(conn, a, cx.status(), wrapError(a, err) catch return);
     };
+    if (spark_wire and body != .object) return routes.sendValue(conn, a, 400, spark.errorBody(a, "the request body must be a JSON object", "invalid_request_error", null, null) catch return);
     var client: ClientOut = .{ .conn = conn, .a = a };
-    run(srv, a, client.out(), .{ .conn = conn }, is_chat, body);
+    // GLM53_TF_DISCONNECT / TF_DSV41_DISCONNECT=0: only a failed streamed write stops a request
+    run(srv, a, client.out(), .{ .conn = conn, .on = !spark_wire or srv.config.spark.disconnect }, is_chat, body);
 }
 
 /// A chat reply written straight to the client.
@@ -75,7 +81,9 @@ const ClientOut = struct {
 /// Whether the client has gone, read between rounds (Python's socket_cancellation).
 pub const Gone = struct {
     conn: *Conn,
+    on: bool = true,
     pub fn check(g: Gone) bool {
+        if (!g.on) return false;
         return g.conn.peerGone();
     }
 };
@@ -101,6 +109,7 @@ pub fn wrapError(a: Allocator, body: Value) Allocator.Error!Value {
 
 /// The id a reply names: the one asked for when this endpoint answers to it, else the served name.
 pub fn replyModel(srv: *const Server, body: Value) []const u8 {
+    if (srv.config.wire == .spark) return srv.config.served_name; // the Spark servers name the served model always
     if (body.get("model")) |m| if (m == .string) for (srv.config.model_ids) |known| if (std.mem.eql(u8, known, m.string)) return m.string;
     return srv.config.served_name;
 }
@@ -116,9 +125,11 @@ const Plan = struct {
 /// Everything checked before a reply starts (a refusal here is a 400 with no stream opened).
 fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
     const body = try fields.parseNumbers(cx, raw);
-    try fields.validateModalities(cx, body);
-    try fields.probabilityOptions(cx, body);
-    if (srv.config.request_log) |path| request_log.append(cx.a, path, body);
+    if (srv.config.wire != .spark) { // the Spark servers ignore these fields (and log requests their own way)
+        try fields.validateModalities(cx, body);
+        try fields.probabilityOptions(cx, body);
+        if (srv.config.request_log) |path| request_log.append(cx.a, path, body);
+    }
     var input: chat.Input = .{ .fields = undefined, .body = body };
     if (srv.family) |fam| if (is_chat) {
         // a family renders the client's messages and tools itself (its encoding reads OpenAI's shapes)
@@ -214,11 +225,22 @@ fn promptText(srv: *Server, cx: *Cx, p: Value) errors.Refused![]const u8 {
 /// The chat or completion reply to ``raw`` (already decoded), written to ``out``.
 pub fn run(srv: *Server, a: Allocator, out: Out, gone: Gone, is_chat: bool, raw: Value) void {
     const field: []const u8 = if (is_chat) "messages" else "prompt";
-    const id = ids.make(a, if (is_chat) "chatcmpl-" else "cmpl-", 32) catch return;
+    const spark_wire = srv.config.wire == .spark;
+    const id = ids.make(a, if (is_chat) "chatcmpl-" else "cmpl-", if (spark_wire) spark.id_digits else 32) catch return;
     var cx: Cx = .{ .a = a };
+    if (spark_wire) {
+        // ``App.check`` before anything renders, then strict health's refusal after a fatal engine error
+        const problem = sparkCheck(srv, &cx, is_chat, raw) catch return;
+        if (problem) |message| {
+            logRefused(id, message.text);
+            return out.vt.reply(out.ctx, 400, spark.errorBody(a, message.text, "invalid_request_error", null, message.param) catch return);
+        }
+        if (srv.health.?.reject(a)) |why| return out.vt.reply(out.ctx, 503, spark.errorBody(a, why, "server_error", null, null) catch return);
+    }
     var p = plan(srv, &cx, is_chat, raw) catch |e| {
         if (e == error.OutOfMemory) cx.message = "out of memory";
         logRefused(id, cx.message);
+        if (spark_wire) return out.vt.reply(out.ctx, cx.status(), sparkError(a, &cx, field) catch return);
         const body = (if (cx.kind == .other) errorOther(a, cx.message) else errorBody(a, &cx, field)) catch return;
         out.vt.reply(out.ctx, cx.status(), wrapError(a, body) catch return);
         return;
@@ -226,6 +248,33 @@ pub fn run(srv: *Server, a: Allocator, out: Out, gone: Gone, is_chat: bool, raw:
     p.input.id = id;
     var r: Run = .{ .srv = srv, .a = a, .out = out, .is_chat = is_chat, .plan = p, .id = id, .created = std.Io.Clock.real.now(srv.io).toSeconds() };
     if (p.stream) r.stream(gone, field) else r.whole(gone, field);
+}
+
+const Problem = struct { text: []const u8, param: ?[]const u8 = null };
+
+/// The Spark server's ``App.check`` on a raw body: the first field it cannot use, or null.
+fn sparkCheck(srv: *Server, cx: *Cx, is_chat: bool, body: Value) Allocator.Error!?Problem {
+    const a = cx.a;
+    if (body.get("messages")) |m| if (m != .array) return .{ .text = "messages must be a list" };
+    if (spark.stopProblem(body)) |t| return .{ .text = t };
+    if (body.get("chat_template_kwargs")) |k| if (k != .null and k != .object) return .{ .text = "chat_template_kwargs must be a JSON object or null" };
+    if (try spark.numbersProblem(a, body)) |t| return .{ .text = t };
+    if (!is_chat) if (body.get("prompt")) |p| if (p == .array) if (try spark.tokenIdsProblem(a, p.array, srv.text.vocabSize())) |t| return .{ .text = t, .param = "prompt" };
+    if (body.field("n")) |n| {
+        const one = (n == .int and std.mem.eql(u8, n.int, "1")) or (n == .float and n.float == 1) or (n == .bool and n.bool);
+        if (!one) return .{ .text = try std.fmt.allocPrint(a, "n must be 1 on this server (got {s}): it returns one choice a request", .{try pyrepr.repr(a, n)}) };
+    }
+    if (body.field("tf_knobs") != null) return .{ .text = "this model's CUDA engine has no per-request knobs (tf_knobs)" };
+    return null;
+}
+
+/// A refusal in the Spark server's shape: the context limit with its code and param, 503 / 500 as server errors.
+fn sparkError(a: Allocator, cx: *const Cx, field: []const u8) Allocator.Error!Value {
+    return switch (cx.kind) {
+        .context_length => spark.errorBody(a, cx.message, "invalid_request_error", "context_length_exceeded", field),
+        .capacity, .server => spark.errorBody(a, cx.message, "server_error", null, null),
+        else => spark.errorBody(a, cx.message, "invalid_request_error", null, null),
+    };
 }
 
 /// Why a request got an error reply, logged before it: its access line shows only the status.
@@ -267,7 +316,7 @@ const Run = struct {
         } else {
             try choice.put(a, "text", delta orelse .{ .string = "" });
             try choice.put(a, "finish_reason", if (finish) |f| .{ .string = f } else .null);
-            try choice.put(a, "logprobs", .null);
+            if (r.srv.config.wire != .spark) try choice.put(a, "logprobs", .null);
         }
         const list = try a.alloc(Value, 1);
         list[0] = .{ .object = choice };
@@ -288,6 +337,7 @@ const Run = struct {
         const cached = try json.newObject(a);
         try cached.put(a, "cached_tokens", try json.intValue(a, reply.cached_tokens));
         try o.put(a, "prompt_tokens_details", .{ .object = cached });
+        if (r.srv.config.wire == .spark) return .{ .object = o };
         const thought = try json.newObject(a);
         try thought.put(a, "reasoning_tokens", try json.intValue(a, reply.reasoning_tokens));
         try o.put(a, "completion_tokens_details", .{ .object = thought });
@@ -296,10 +346,25 @@ const Run = struct {
 
     /// ``response_extras``: exact_mode, the matched stop, the runtime and the draft counters.
     fn extras(r: *Run, o: *json.Object, reply: *const chat.Reply) Allocator.Error!void {
+        if (r.srv.config.wire == .spark) return o.put(r.a, "tensorfold", try r.sparkStats(reply));
         try o.put(r.a, "exact_mode", .{ .string = "exact" });
         if (reply.stop_sequence) |s| try o.put(r.a, "stop_sequence", .{ .string = s });
         try o.put(r.a, "tensorfold", reply.runtime);
         try o.put(r.a, "speculative", reply.speculative);
+    }
+
+    /// The engine's stats as the Spark server sends them (``tensorfold``), with ``return_token_ids``'s ids.
+    fn sparkStats(r: *Run, reply: *const chat.Reply) Allocator.Error!Value {
+        const a = r.a;
+        const outcome = reply.outcome orelse return .{ .object = try json.newObject(a) };
+        const s = try outcome.value(a);
+        if (r.plan.input.body.get("return_token_ids")) |want| if (want.truthy()) {
+            const list = try a.alloc(Value, reply.token_ids.len);
+            for (reply.token_ids, list) |t, *slot| slot.* = try json.intValue(a, t);
+            try s.put(a, "token_ids", .{ .array = list });
+        };
+        if (reply.images_omitted > 0) try s.put(a, "images_omitted", try json.intValue(a, reply.images_omitted));
+        return .{ .object = s };
     }
 
     /// ``ToolCallPolicy.finish``: the reply's calls parsed out of its content.
@@ -320,6 +385,7 @@ const Run = struct {
 
     fn fail(r: *Run, cx: *const Cx, field: []const u8) void {
         const a = r.a;
+        if (r.srv.config.wire == .spark) return r.out.vt.reply(r.out.ctx, if (cx.kind == .server) 500 else cx.status(), sparkError(a, cx, field) catch return);
         const kind_ok = cx.kind != .other and cx.kind != .server;
         const body = (if (kind_ok) errorBody(a, cx, field) else errorOther(a, cx.message)) catch return;
         r.out.vt.reply(r.out.ctx, if (kind_ok) 400 else 500, wrapError(a, body) catch return);
@@ -361,7 +427,8 @@ const Run = struct {
             const message = try json.newObject(a);
             try message.put(a, "role", .{ .string = "assistant" });
             const empty_null = r.srv.family != null and reply.content.len == 0; // the family's Python app: ``content or None``
-            try message.put(a, "content", if (calls != null or empty_null) .null else .{ .string = reply.content });
+            const keeps_text = r.srv.config.wire == .spark; // the Spark server keeps a call's prose
+            try message.put(a, "content", if ((calls != null and !keeps_text) or empty_null) .null else .{ .string = reply.content });
             if (reply.reasoning) |t| if (t.len > 0) {
                 if (r.srv.family) |fam| {
                     const d = try fam.reasoningDelta(a, t);
@@ -374,7 +441,7 @@ const Run = struct {
         } else {
             try choice.put(a, "text", .{ .string = reply.content });
             try choice.put(a, "finish_reason", .{ .string = reply.finish_reason });
-            try choice.put(a, "logprobs", .null);
+            if (r.srv.config.wire != .spark) try choice.put(a, "logprobs", .null);
         }
         const list = try a.alloc(Value, 1);
         list[0] = .{ .object = choice };
@@ -462,7 +529,8 @@ const Run = struct {
             const message = if (e == error.Refused) cx.message else if (e == error.OutOfMemory) "out of memory" else "the reply failed";
             log.line("stream error: {s}", .{message});
             const err = json.newObject(a) catch return;
-            err.put(a, "message", .{ .string = message }) catch return;
+            const shown = if (r.srv.config.wire == .spark) std.fmt.allocPrint(a, "{s}: {s}", .{ if (e == error.OutOfMemory) "MemoryError" else "RuntimeError", message[0..@min(message.len, 480)] }) catch return else message;
+            err.put(a, "message", .{ .string = shown }) catch return;
             err.put(a, "type", .{ .string = "server_error" }) catch return;
             r.emit(wrapError(a, .{ .object = err }) catch return) catch return;
             r.out.vt.event(r.out.ctx, null) catch {};
@@ -487,6 +555,13 @@ const Run = struct {
             }
         }
         const last = r.chunk(.{ .string = "" }, if (reply.finish_reason.len > 0) reply.finish_reason else "length") catch return;
+        if (r.srv.config.wire == .spark) {
+            // the last chunk carries usage only when asked for, then the engine's stats
+            if (r.plan.separate_usage) last.object.put(a, "usage", r.usage(&reply) catch return) catch return;
+            r.extras(last.object, &reply) catch return;
+            r.emit(last) catch return;
+            return r.out.vt.event(r.out.ctx, null) catch {};
+        }
         r.extras(last.object, &reply) catch return;
         const use = r.usage(&reply) catch return;
         if (!r.plan.separate_usage) last.object.put(a, "usage", use) catch return;

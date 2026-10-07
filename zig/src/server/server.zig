@@ -19,6 +19,7 @@ const tool_specs = @import("tool_specs.zig");
 const chunk_plan = @import("chunk_plan.zig");
 const log = @import("log.zig");
 const family_mod = @import("family.zig");
+const spark = @import("spark.zig");
 const Value = json.Value;
 const Cx = errors.Cx;
 const Allocator = std.mem.Allocator;
@@ -42,6 +43,10 @@ pub const Config = struct {
     timeouts: http_conn.Timeouts = .{},
     /// The checkpoint family's own chat rules (DeepSeek-V4.1); null: the chat template path.
     family: ?family_mod.Family = null,
+    /// The HTTP surface: upstream TensorFold's, or the Spark servers' (spark.zig: GLM / DeepSeek-V4.1 prod).
+    wire: spark.Wire = .tensorfold,
+    /// The Spark surface's knobs (request log, disconnect, health mode).
+    spark: spark.Settings = .{},
 };
 
 pub const Server = struct {
@@ -63,6 +68,10 @@ pub const Server = struct {
     metrics: metrics.Metrics,
     store: responses.Store,
     family: ?family_mod.Family = null,
+    /// The Spark surface's /health bookkeeping and request log (``Config.wire`` spark).
+    health: ?*spark.Health = null,
+    reqlog: ?*spark.RequestLog = null,
+    created: i64 = 0,
     next_id: std.atomic.Value(u64) = .init(1),
     /// Connections open now; a stop waits for them before freeing what they read.
     open_connections: std.atomic.Value(u32) = .init(0),
@@ -74,6 +83,15 @@ pub const Server = struct {
         const srv = try gpa.create(Server);
         srv.* = .{ .gpa = gpa, .io = io, .engine = engine, .info = engine.info(), .text = text, .config = config, .keys = keys, .metrics = .{ .gpa = gpa }, .store = .{ .gpa = gpa }, .arena = .init(gpa), .family = config.family };
         const a = srv.arena.allocator();
+        srv.created = std.Io.Clock.real.now(io).toSeconds();
+        if (config.wire == .spark) {
+            srv.health = try a.create(spark.Health);
+            srv.health.?.* = .init(gpa, io, config.spark);
+            if (config.spark.log) |l| {
+                srv.reqlog = try a.create(spark.RequestLog);
+                srv.reqlog.?.* = .init(gpa, io, l, .{ .user = text.tokenId("<|user|>"), .assistant = text.tokenId("<|assistant|>"), .observation = text.tokenId("<|observation|>") });
+            }
+        }
         srv.eos = try a.dupe(u32, text.eosIds());
         if (text.tokenId(reply_text.channel_markers.close) != null) srv.markers = reply_text.channel_markers;
         srv.effort_levels = try fields.effortLevels(a, text.templateSource());
@@ -93,6 +111,8 @@ pub const Server = struct {
     }
 
     pub fn deinit(srv: *Server) void {
+        if (srv.health) |h| h.deinit();
+        if (srv.reqlog) |l| l.deinit();
         srv.arena.deinit();
         srv.store.deinit();
         srv.gpa.destroy(srv);
@@ -205,6 +225,7 @@ pub const Server = struct {
         var conn = http_conn.Conn.init(srv.gpa, accepted.fd, peer) catch return;
         defer conn.deinit();
         conn.timeouts = srv.config.timeouts;
+        conn.spark_wire = srv.config.wire == .spark;
         conn.auth_enabled = srv.keys != null and srv.keys.?.enabled();
         if (conn.auth_enabled) conn.hook = .{ .ctx = srv, .call = countReply };
         var arena: std.heap.ArenaAllocator = .init(srv.gpa);

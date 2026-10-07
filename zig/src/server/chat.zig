@@ -13,6 +13,7 @@ const ids = @import("ids.zig");
 const clock = @import("clock.zig");
 const Server = @import("server.zig").Server;
 const family_mod = @import("family.zig");
+const spark = @import("spark.zig");
 const Value = json.Value;
 const Cx = errors.Cx;
 const Allocator = std.mem.Allocator;
@@ -56,6 +57,10 @@ pub const Reply = struct {
     speculative: Value,
     /// A family's parsed calls (OpenAI tool-call objects); null: the route parses the content itself.
     calls: ?[]Value = null,
+    /// The engine run as the Spark server reports it (``tensorfold``), the counted ids, image parts replaced.
+    outcome: ?spark.Outcome = null,
+    token_ids: []const u32 = &.{},
+    images_omitted: u32 = 0,
 };
 
 pub const Failure = error{ Refused, Cancelled, Failed, OutOfMemory };
@@ -163,7 +168,12 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
     if (rendered.ids.len == 0) return cx.refuse("rendered prompt is empty");
     const window: i64 = srv.info.context_window;
     const n: i64 = @intCast(rendered.ids.len);
-    if (window > 0) {
+    if (window > 0 and srv.config.wire == .spark) {
+        // ``context_problem``: the prompt plus the reply asked for (1 without max_tokens) must fit the limit
+        const reply_max: ?u64 = if (input.max_tokens) |m| (if (m > 0) @intCast(m) else null) else null;
+        if (@as(u64, @intCast(n)) + (reply_max orelse 1) > @as(u64, @intCast(window))) return cx.fail(.context_length, "{s}", .{try spark.contextMessage(a, rendered.ids.len, reply_max, srv.info.context_window, input.prompt == null)});
+        limit = @min(limit, window - n);
+    } else if (window > 0) {
         const room = window - n;
         if (room < 1) return cx.fail(.context_length, "{s} {d} tokens{s}, but the rendered prompt has {d} tokens and leaves no room for a reply, which exceeds the context window. Compact or shorten the conversation.", .{ errors.context_limit, window, if (srv.info.context_fitted) ", the most this server's memory budget fits" else "", n });
         if (input.max_tokens != null and limit > room) return cx.fail(.context_length, "{s} {d} tokens, but the rendered prompt has {d} tokens and requests {d} reply tokens, which exceeds the context window. Reduce the prompt to at most {d} prompt tokens or request at most {d} reply tokens, including chat template and thinking tokens.", .{ errors.context_limit, window, n, limit, @max(0, window - limit), room });
@@ -232,13 +242,20 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
     defer box.deinit();
     const id = srv.next_id.fetchAdd(1, .monotonic);
     const submitted = nowNs(io);
-    srv.engine.submit(id, &request, .{ .ctx = &box, .event = Mailbox.onEvent }) catch |e| return switch (e) {
-        error.Busy => cx.fail(.capacity, "the engine is busy; retry shortly", .{}),
-        error.Closed => cx.fail(.other, "the scheduler is closed", .{}),
+    // the Spark surface: the run in /health's bookkeeping and the request log, from here to its end
+    const hid: ?u64 = if (srv.health) |h| h.begin(prepared.prompt_len) else null;
+    const ticket = if (srv.reqlog) |l| l.begin(request.prompt) else null;
+    srv.engine.submit(id, &request, .{ .ctx = &box, .event = Mailbox.onEvent }) catch |e| {
+        if (hid) |x| srv.health.?.end(x, .{ .failed = .{ .value_error = true, .message = "busy" } });
+        if (srv.reqlog) |l| l.end(ticket, input.body, .{ .chat = input.prompt == null, .finish = null, .completion_tokens = null, .outcome = null, .err = "EngineBusy", .thinking = thinking and input.prompt == null, .max_tokens_eff = effMax(srv, input) });
+        return switch (e) {
+            error.Busy => cx.fail(.capacity, "the engine is busy; retry shortly", .{}),
+            error.Closed => cx.fail(.other, "the scheduler is closed", .{}),
+        };
     };
     release(srv, preparing); // a background request waits only while a foreground one prepares
     preparing = false;
-    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools };
+    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .hid = hid, .ticket = ticket, .submitted = submitted, .prompt_len = prepared.prompt_len };
     defer srv.noteRequest(prepared.prompt_len, gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
     const result: Failure!Reply = blk: {
@@ -249,7 +266,43 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
         break :blk gen.finish(cx, prepared.prompt_len, received, submitted, thinking, effort, prepared.sampled, prepared.drafts, prepared.images_omitted);
     };
     if (result) |_| {} else |e| logEnded(input.id, e, cx.message, prepared.prompt_len, gen.collected.items.len, seconds(nowNs(io) - received));
+    if (hid != null or ticket != null) sparkEnd(srv, &gen, input, thinking, result, cx.message);
     return result;
+}
+
+/// ``max_tokens or max_completion_tokens or the server's default``: the request log's ``max_tokens_eff``.
+fn effMax(srv: *const Server, input: Input) i64 {
+    if (input.max_tokens) |m| if (m > 0) return m;
+    return srv.config.default_max_tokens;
+}
+
+/// The Spark surface's end of a run: /health's ``end`` (a cancelled run counts as finished, an engine failure is
+/// fatal) and the request log's line.
+fn sparkEnd(srv: *Server, g: *Generation, input: Input, thinking: bool, result: Failure!Reply, message: []const u8) void {
+    var outcome: ?spark.Outcome = null;
+    var failed: ?[]const u8 = null;
+    if (result) |reply| outcome = reply.outcome else |e| switch (e) {
+        error.Cancelled => {
+            if (!g.engine_done) g.cancel();
+            outcome = g.outcome(true);
+        },
+        error.OutOfMemory => failed = "MemoryError",
+        else => failed = "RuntimeError",
+    }
+    if (failed != null and !g.engine_done) g.cancel();
+    if (g.hid) |x| srv.health.?.end(x, if (outcome) |o| .{ .ok = o } else .{ .failed = .{ .value_error = false, .message = if (message.len > 0) message else failed.? } });
+    const l = srv.reqlog orelse return;
+    const chat_ = input.prompt == null;
+    const reply: ?Reply = result catch null;
+    l.end(g.ticket, input.body, .{
+        .chat = chat_,
+        .finish = if (reply) |r| r.finish_reason else null,
+        .completion_tokens = if (reply) |r| r.completion_tokens else if (outcome) |o| o.completion else null,
+        .outcome = outcome,
+        .err = failed,
+        .thinking = thinking and chat_,
+        .max_tokens_eff = effMax(srv, input),
+    });
 }
 
 /// The ``ended`` line of a submitted reply that ends without one: its client left, or it failed.
@@ -335,6 +388,30 @@ const Generation = struct {
     deltas: std.ArrayList(Value) = .empty,
     stop_hit: bool = false,
     stop_at: usize = 0,
+    // the Spark surface: the run's /health entry and request-log ticket
+    hid: ?u64 = null,
+    ticket: ?*spark.RequestLog.Ticket = null,
+    submitted: i96 = 0,
+    prompt_len: usize = 0,
+
+    /// The run's stats as the Spark server reports them (the Python batch engine's ``job.stats``).
+    fn outcome(g: *const Generation, cancelled: bool) spark.Outcome {
+        const m = g.box;
+        const s = m.stats;
+        const end_ns = nowNs(g.srv.io);
+        return .{
+            .prompt = g.prompt_len,
+            .cached = m.cached orelse 0,
+            .ttft_s = if (g.first_ns) |f| @max(0, seconds(f - g.submitted)) else null,
+            .cancelled = cancelled,
+            .completion = m.tokens.items.len,
+            .prefill_s = s.prefill_seconds,
+            .decode_s = s.decode_seconds orelse if (m.prefilled_ns) |p| @max(0, seconds(end_ns - p)) else null,
+            .rounds = s.rounds,
+            .drafted = s.drafted,
+            .accepted = s.accepted,
+        };
+    }
 
     fn eos(g: *const Generation, t: u32) bool {
         return !g.ignore_eos and std.mem.indexOfScalar(u32, g.srv.eos, t) != null;
@@ -416,6 +493,7 @@ const Generation = struct {
     }
 
     fn emit(g: *Generation, sink: Sink, delta: Value) Failure!void {
+        if (g.srv.reqlog) |l| l.first(g.ticket);
         sink.call(sink.ctx, delta) catch {
             g.cancel();
             return error.Cancelled;
@@ -465,6 +543,8 @@ const Generation = struct {
                 return error.Cancelled;
             }
             const tokens = chunk orelse continue;
+            // /health hears the tokens once they are read (a stop string they hold has cancelled the run by then)
+            defer if (g.hid) |x| g.srv.health.?.progress(x, tokens.len);
             if (g.reason == null) try g.commit(tokens);
         }
     }
@@ -679,6 +759,9 @@ const Generation = struct {
             .runtime = .{ .object = runtime },
             .speculative = .{ .object = spec },
             .calls = calls,
+            .outcome = if (g.srv.config.wire == .spark) g.outcome(m.reason == .cancelled and g.reason == null) else null,
+            .token_ids = g.collected.items[0..@min(used, g.collected.items.len)],
+            .images_omitted = images_omitted,
         };
         if (std.mem.eql(u8, reason, "length") and thinking and reply_text.pyStrip(content).len == 0)
             log.line("warning: a reply reached max_tokens while still thinking, so its content is empty and its text is all in reasoning_content; raise max_tokens, or send chat_template_kwargs {{\"enable_thinking\": false}} (server: --no-thinking)", .{});
