@@ -25,6 +25,7 @@ const buffers = @import("buffers.zig");
 const run = @import("run.zig");
 const block_prefill = @import("block_prefill.zig");
 const longpf = @import("longpf.zig");
+const vision_rows = @import("vision_rows.zig");
 const fwd = @import("forward.zig");
 const Forward = fwd.Forward;
 
@@ -68,7 +69,7 @@ pub fn plan(f: *Forward, p: *buffers.Plan, rows: u32) !void {
         for ([_]i64{ 0, top }) |start| {
             var ea = std.heap.ArenaAllocator.init(f.gpa);
             defer ea.deinit();
-            try p.add(try block_prefill.emitPrefill(ea.allocator(), f.cfg, f.widths, f.opts, layers, n, start, true));
+            try p.add(try block_prefill.emitPrefill(ea.allocator(), f.cfg, f.widths, vision_rows.planOptions(f), layers, n, start, true));
         }
     }
 }
@@ -133,7 +134,7 @@ fn segment(f: *Forward, ids: []const u32, head: bool) !void {
     const layers = try f.backbone(a);
     const start = f.slot.pos;
     if (f.kv) |kx| try kx.reserve(start + n);
-    const cs = block_prefill.emitPrefill(a, f.cfg, f.widths, f.opts, layers, n, @intCast(start), head) catch |e| {
+    const cs = block_prefill.emitPrefill(a, f.cfg, f.widths, vision_rows.segmentOptions(f, ids), layers, n, @intCast(start), head) catch |e| {
         if (e == error.Unsupported) log.warn("prefill: the {d}-row segment at {d} is not on the prefill path (block_prefill: Unsupported)", .{ n, start });
         return e;
     };
@@ -275,6 +276,7 @@ fn glueFn(ctx: *anyopaque, r: *run.Runner, c: *const calls.Call) anyerror!void {
     }
     if (eql(u8, step, "stream_merge")) return longpf.merge(&st.long, f.gpa, r, c);
     if (eql(u8, step, "zeros")) return zero(r, try r.tensorAddr(x[0].arg.t), bytesOf(x[0].arg.t));
+    if (eql(u8, step, "image_keep")) return vision_rows.keep(f, r, c);
     if (eql(u8, step, "topk")) {
         // index.top_positions: each row's `count` largest int64 keys as positions, ascending, -1 padded
         const keys = x[0].arg.t;
