@@ -131,6 +131,7 @@ pub fn checkAll(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, experts: []
     var programs: usize = 0;
     for ([_]bool{ false, true }) |split| {
         var opts = try check.optionsOf(a, io, dir);
+        opts.gm_v2 = check.gmMode(ws);
         opts.pool = poolOf(opts.limit, split);
         const P = opts.pool.?;
         for (ws) |win| {
