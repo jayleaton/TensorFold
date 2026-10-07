@@ -296,6 +296,8 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, ref: []con
     }
     const dec_s = @as(f64, @floatFromInt(tw0.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds())) / 1e9;
     f.trace = null;
+    // the decode steps' tallies before anything else runs (a fault in the timed rows below still leaves them)
+    std.debug.print("rank {d}: decode steps: tokens {d}/{d}, logits {d}/{d}\n", .{ rank, tokens_equal, steps, logits_equal, steps });
     // M2B_PROF_ROWS ("1 4 8"): after the gate, windows of each row count timed (wall, the stream synced: eager, or
     // graphed with TF_DSV41_GRAPHS=1), 3 warm + 16 timed, each kept whole; the decode gap's per-window figures
     if (std.c.getenv("M2B_PROF_ROWS")) |spec| {

@@ -137,14 +137,30 @@ pub const Runner = struct {
         if (!try rp.call(r.kernels, r.stream, c.name[0..dot], c.name[dot + 1 ..], args, &.{}, &scratch)) return error.NoBinding;
     }
 
-    /// Issues a window's calls in order.
+    /// Issues a window's calls in order. TF_DSV41_SYNC_EACH=1 (diagnosis): the stream synced after every call, and a
+    /// failing call named with its index and row count (an asynchronous fault otherwise surfaces windows later).
     pub fn window(r: *Runner, cs: []const calls.Call) !void {
+        if (syncEach()) return r.windowChecked(cs);
         for (cs) |*c| try r.issue(c);
+    }
+
+    fn windowChecked(r: *Runner, cs: []const calls.Call) !void {
+        for (cs, 0..) |*c, i| {
+            r.issue(c) catch |e| {
+                std.log.err("sync-each: call {d}/{d} {s} failed to issue ({t})", .{ i, cs.len, c.name, e });
+                return e;
+            };
+            r.stream.synchronize() catch |e| {
+                std.log.err("sync-each: call {d}/{d} {s} faulted ({t})", .{ i, cs.len, c.name, e });
+                return e;
+            };
+        }
     }
 
     /// An eager decode window, each call timed when TF_DSV41_PROFILE is set (never inside a graph capture).
     pub fn timedWindow(r: *Runner, cs: []const calls.Call) !void {
         const p = r.prof orelse return r.window(cs);
+        if (syncEach()) return r.windowChecked(cs);
         p.begin();
         for (cs) |*c| {
             try p.before(r.stream, c);
@@ -154,3 +170,11 @@ pub const Runner = struct {
         try p.end(r.stream);
     }
 };
+
+var sync_each: ?bool = null;
+fn syncEach() bool {
+    if (sync_each) |v| return v;
+    const v = if (std.c.getenv("TF_DSV41_SYNC_EACH")) |x| std.mem.eql(u8, std.mem.span(x), "1") else false;
+    sync_each = v;
+    return v;
+}

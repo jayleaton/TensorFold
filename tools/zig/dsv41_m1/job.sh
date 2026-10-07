@@ -402,6 +402,16 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
                      step m2b-r1-graphs "$mb" bash "$Z/tools/zig/dsv41_m1/m2b_ranks.sh" "$Z/bin/tf-dsv41-m1" "$LP" "$REF1" "$RES/m2b-r1-graphs") \
                         || rc=1
                 fi
+                # M2B_R1_DIAG=1 (pod 29: rank 1's illegal address in the profiled 4-row R1 windows): eager, no event
+                # profile, every call synced (TF_DSV41_SYNC_EACH: the faulting call named), timed rows 1 / 2 / 4
+                if [[ "${M2B_R1_DIAG:-0}" == 1 ]]; then
+                    mb=$(left); (( mb > 7 )) && mb=7
+                    (export M2B_PROF=0 TF_DSV41_SYNC_EACH=1 M2B_PROF_ROWS="${M2B_R1_DIAG_ROWS:-1 2 4}" M2B_PORT=29761
+                     (( ${#eng1[@]} )) && export TF_DSV41_ENGRAM_DIR=$LOCAL/engram-r1
+                     step m2b-r1-diag "$mb" bash "$Z/tools/zig/dsv41_m1/m2b_ranks.sh" "$Z/bin/tf-dsv41-m1" "$LP" "$REF1" "$RES/m2b-r1-diag") \
+                        || rc=1
+                    grep -h "sync-each\|rows windows\|-row windows\|^PASS\|^FAIL" "$RES"/m2b-r1-diag/rank*.log 2>/dev/null | tee -a "$RES/steps.txt"
+                fi
                 mkdir -p "$RES/m2b-ref-r1"
                 for f in ref.json rank0.json rank1.json; do [[ -f "$REF1/$f" ]] && cp "$REF1/$f" "$RES/m2b-ref-r1/"; done
             else echo "m2b-r1 skipped or its reference failed" | tee -a "$RES/steps.txt"; rc=1; fi
