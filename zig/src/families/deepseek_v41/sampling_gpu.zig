@@ -52,6 +52,7 @@ pub const GpuSampler = struct {
         const f = x.f;
         const V: u64 = f.cfg.vocab / f.comm.world();
         const lg = (f.runner.addressOf("w.logits") orelse return error.Unbound) + 4 * V * row0;
+        if (f.grammar) |g| try g.apply(g.ptr, row0, n);
         try x.p.choose(x.gpu.device(), lg, n, s, draws, out);
         if (x.p.whole_rows > 0) std.log.scoped(.dsv41).debug("sampling: {d} of {d} rows taken whole", .{ x.p.whole_rows, n });
     }
