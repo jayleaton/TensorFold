@@ -229,6 +229,14 @@ fn ready(f: *Forward) !void {
         const src = r.addressOf(try std.fmt.bufPrint(&nb, "s.L{d}.ex.{s}", .{ L, t[1] })) orelse return error.NoExpertTable;
         try copy(r, dst, src, 8 * @as(usize, f.cfg.expertsOf(L).count));
     };
+    // x3gm v2's width tables (gm2pf.zig, x3gm.Ragged.k2g / k2d): the routed experts' K2s, then a 0 sentinel
+    for (try f.backbone(la.allocator())) |L| for ([_][2][]const u8{ .{ "k2g", "k2_g" }, .{ "k2d", "k2_d" } }) |t| {
+        const dst = r.addressOf(try std.fmt.bufPrint(&nb, "s.L{d}.gm.{s}", .{ L, t[0] })) orelse continue;
+        const src = r.addressOf(try std.fmt.bufPrint(&nb, "s.L{d}.ex.{s}", .{ L, t[1] })) orelse return error.NoK2Table;
+        const Et: usize = f.cfg.expertsOf(L).count;
+        try copy(r, dst, src, 4 * Et);
+        try zero(r, dst + 4 * Et, 4);
+    };
     // a segment's exchange send and Engram rows at their largest (decode's would grow them on the first segment)
     const rows: usize = @intCast(f.opts.prefill_rows);
     const W: usize = f.comm.world();
@@ -365,6 +373,8 @@ fn glueFn(ctx: *anyopaque, r: *run.Runner, c: *const calls.Call) anyerror!void {
         const down = x[7].arg.b;
         const bm: usize = @intCast(x[8].arg.i);
         const Et: usize = @intCast(x[9].arg.i);
+        // k2 0 (x3gm._run_v2's one plan, gm2pf.zig): every pick, no width mask
+        if (k2 == 0) return r.kernels.experts(r.stream).gmPlan(try r.tensorAddr(pk), P, Et, bm, try r.tensorAddr(x[1].arg.t), try r.tensorAddr(x[2].arg.t), try r.tensorAddr(x[3].arg.t), try r.tensorAddr(x[4].arg.t), try r.tensorAddr(x[5].arg.t));
         var nb: [64]u8 = undefined;
         // forms' "s.L<i>.ex.k2_{g,d}": each routed expert's K2 (gate = up), the shared expert's past Et (never read)
         const tab = r.addressOf(try std.fmt.bufPrint(&nb, "s.L{d}.ex.k2_{s}", .{ st.layer, if (down) "d" else "g" })) orelse return error.NoK2Table;
