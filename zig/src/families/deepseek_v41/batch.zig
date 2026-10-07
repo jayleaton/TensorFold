@@ -33,6 +33,10 @@ const samp = @import("sampling_gpu.zig");
 
 pub const Error = error{ BadWindow, NotAChain, RowsCap, BadPlan, TreeWindow, Sampling, Slots };
 
+/// With taps (drafts): each slot's taps rows of a round's earlier forwards, [S, seg_max, taps width] bf16 (an external
+/// persistent role: dspark_slots.zig's ingest reads a stashed slot's rows here).
+pub const taps_stash_role = "s.rows.taps";
+
 /// TF_DSV41_ROWS_CAP: rows one forward takes (a bucket; default 16).
 pub fn capFromEnv() !u32 {
     const v = std.c.getenv("TF_DSV41_ROWS_CAP") orelse return 16;
@@ -54,6 +58,8 @@ pub const Batch = struct {
     tab: Table,
     /// each ratio-2 kv source's projection rows of pending slots, [S, seg_max, 2D] bf16 (a round split over forwards)
     stash: std.ArrayList(Stash) = .empty,
+    /// with taps: the pending windows' taps rows of a round split over forwards (taps_stash_role), null without
+    taps_stash: ?cuda.DeviceBuffer = null,
     stages: std.ArrayList(graphs.EngramStage) = .empty,
     /// each key's row program (emitted once, the forward's arena)
     programs: std.AutoHashMapUnmanaged(graphs.Key, []const calls.Call) = .empty,
@@ -83,6 +89,10 @@ pub const Batch = struct {
             };
         }
         try r.external(rowmode.table_role, b.tab.dev.ptr);
+        if (f.opts.taps) {
+            b.taps_stash = try cuda.DeviceBuffer.alloc(r.d, tapsBytes(f) * rowtab.seg_max * @as(usize, ss.n));
+            try r.external(taps_stash_role, b.taps_stash.?.ptr);
+        }
         // every buffer a row window bakes in, at its largest: the exchanges' send, Engram's gathered rows
         const D: usize = f.cfg.hidden;
         const W: usize = f.comm.world();
@@ -113,6 +123,7 @@ pub const Batch = struct {
         if (b.g) |*g| g.deinit();
         for (b.stash.items) |*x| x.buf.free();
         b.stash.deinit(b.gpa);
+        if (b.taps_stash) |*x| x.free();
         for (b.stages.items) |*st| st.deinit();
         b.stages.deinit(b.gpa);
         b.programs.deinit(b.gpa);
@@ -138,14 +149,16 @@ pub const Batch = struct {
         return b.pend[slot];
     }
 
-    /// The slot's rows of the last window's taps (draft/iface.zig Taps).
+    /// The slot's rows of the last window's taps (draft/iface.zig Taps); a stashed window's from the taps stash.
     pub fn tapsOf(b: *const Batch, slot: u32) ?struct { address: u64, rows: u32 } {
         const p = b.pend[slot] orelse return null;
-        if (p.stashed) return null;
-        const D: u64 = b.f.cfg.hidden;
-        const k: u64 = b.f.cfg.dspark_targets.items().len;
+        const row = tapsBytes(b.f);
+        if (p.stashed) {
+            const x = b.taps_stash orelse return null;
+            return .{ .address = x.ptr + row * rowtab.seg_max * slot, .rows = p.n };
+        }
         const base = b.f.runner.addressOf("w.taps") orelse return null;
-        return .{ .address = base + 2 * @as(u64, p.a) * k * D, .rows = p.n };
+        return .{ .address = base + row * p.a, .rows = p.n };
     }
 
     // -------------------------------------------------------------------------------------------------------------
@@ -277,6 +290,11 @@ pub const Batch = struct {
             for (b.stash.items) |*x| {
                 const src = r.addressOf(try std.fmt.bufPrint(&nb, "w.L{d}.comp", .{x.layer})) orelse return error.Unbound;
                 try r.d.check(r.d.api.cuMemcpyDtoDAsync_v2(x.buf.ptr + 2 * w * rowtab.seg_max * s, src + 2 * w * p.a, 2 * w * p.n, r.stream.handle), "cuMemcpyDtoDAsync");
+            }
+            if (b.taps_stash) |x| {
+                const t = tapsBytes(b.f);
+                const src = r.addressOf("w.taps") orelse return error.Unbound;
+                try r.d.check(r.d.api.cuMemcpyDtoDAsync_v2(x.ptr + t * rowtab.seg_max * s, src + t * p.a, t * p.n, r.stream.handle), "cuMemcpyDtoDAsync");
             }
             p.stashed = true;
         };
@@ -493,6 +511,11 @@ pub const Batch = struct {
         return h.final();
     }
 };
+
+/// Bytes of one taps row (bf16 [3 x hidden]).
+fn tapsBytes(f: *const fwd.Forward) usize {
+    return 2 * f.cfg.dspark_targets.items().len * @as(usize, f.cfg.hidden);
+}
 
 /// This rank's columns of an Engram row (its heads' share).
 fn engramCols(f: *const fwd.Forward, h: *const eh.Host) usize {
