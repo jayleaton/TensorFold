@@ -11,6 +11,8 @@ pub const exl3 = @import("kernels_exl3.zig");
 pub const dense = @import("kernels_dense.zig");
 pub const replay = @import("kernels_replay.zig");
 pub const ops = @import("kernels_ops.zig");
+/// sampling.cu (its own module, loaded by the keyed sampler)
+pub const sampling = @import("sampling_kernels.zig");
 
 fn Blob(comptime import_name: []const u8) type {
     return struct {

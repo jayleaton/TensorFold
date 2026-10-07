@@ -56,6 +56,7 @@ const dsv41_kernels = [_]Kernel{
     .{ .name = "dsv41_engram_gate", .src = "deepseek_v41/engram_gate", .flags = &.{ "-O3", "-lineinfo" } }, // tf_dsv41_engram_gate_v1
     .{ .name = "dsv41_l2pace", .src = "deepseek_v41/l2pace", .flags = &.{"-O3"} }, // tf_dsv41_l2pace_v1
     .{ .name = "dsv41_l2pf", .src = "deepseek_v41/l2pf", .flags = &.{"-O3"} }, // tf_dsv41_l2pf_v1 (glm5_next/spark/l2pf.cu)
+    .{ .name = "dsv41_sampling", .src = "deepseek_v41/sampling", .flags = &.{ "-O3", "--fmad=false" } }, // ours: nucleus.row_stats + cand_gather's pack
 };
 
 /// The DeepSeek-V4.1 kernel module (zig/src/families/deepseek_v41/kernels.zig) over `cuda`; empty `images`: host-only.
@@ -159,7 +160,8 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-test", .root_module = dsv41_runner }));
     const dsv41_m1 = b.createModule(.{ .root_source_file = b.path("zig/src/families/deepseek_v41/m1_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     dsv41_m1.addImport("cuda", cuda);
-    dsv41_m1.addImport("core", mods.core);
+    // the checkpoint reader alone (the family's only use of core): the serving module brings the tokenizer itself
+    dsv41_m1.addImport("core", b.createModule(.{ .root_source_file = b.path("zig/src/core/safetensors_root.zig"), .target = target, .optimize = optimize, .link_libc = true }));
     dsv41_m1.addImport("dsv41_kernels", dsv41);
     const m1_tp = @import("tp.zig").module(b, target, optimize, cuda);
     dsv41_m1.addImport("tp", m1_tp); // M2's forward: the TP collectives
@@ -170,6 +172,8 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const dsv41_api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true });
     dsv41_api.addImport("lanes", dsv41_lanes);
     dsv41_m1.addImport("engine_api", dsv41_api);
+    dsv41_m1.addImport("dsv41_serve", @import("sampling.zig").serve(b, target, optimize, dsv41_lanes).serve); // the keyed sampler's Picker
+    @import("sampling.zig").gpu(b, target, optimize, cuda, dsv41); // tf-dsv41-samp: the keyed sampler's device steps
     b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-m1", .root_module = dsv41_m1 }));
     // M4 on the GPU: tensorfold-dsv41, the native server with DeepSeek-V4.1's CUDA engine (rank 0; the other ranks run
     // tf-dsv41-m1 follow)

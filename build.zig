@@ -4,6 +4,7 @@ const cuda_build = @import("zig/build/cuda.zig");
 const server_build = @import("zig/build/server.zig");
 const tp_build = @import("zig/build/tp.zig");
 const kv_build = @import("zig/build/kv.zig");
+const sampling_build = @import("zig/build/sampling.zig");
 
 comptime {
     const required = std.mem.trim(u8, @embedFile(".zig-version"), "\r\n");
@@ -94,6 +95,7 @@ pub fn build(b: *std.Build) void {
     server_build.tests(b, test_step);
     tp_build.add(b, target, optimize, test_step);
     kv_build.add(b, target, optimize, test_step, tp_build.module);
+    sampling_build.add(b, test_step);
     const flash_host = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/flashnext_host.zig"), .target = target, .optimize = optimize, .link_libc = true }) });
     b.step("compile-flashnext-host", "Compile FlashNext CPU metadata contracts without running them").dependOn(&flash_host.step);
     const flash_host_run = b.addRunArtifact(flash_host);

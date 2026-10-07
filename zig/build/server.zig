@@ -46,6 +46,7 @@ fn server(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
     if (natives) |n| {
         n.addImport("engine_api", api);
         n.addImport("lanes", lanes); // an engine on the lane core shares the server's (engine_api's) lanes types
+        n.addImport("dsv41_serve", serve); // and its serving module (DeepSeek-V4.1's exact sampler)
         m.addImport("native_engines", n);
     }
     return .{ .json = json, .serve = serve, .server = m, .api = api };
