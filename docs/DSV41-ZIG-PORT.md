@@ -66,6 +66,62 @@ Rules for every owner:
   - `sampling.accept(window: []u32, chosen: []u32) -> usize`: drafts kept from a chain window `[pending, d1, ...]`; the round emits `chosen[0..accepted + 1]`.
   - `tokenizer.Tokenizer.load(gpa, io, dir)`, `Encoder.encode`, `Detokenizer.push`; `template.render(a, messages, Options, *Problem)` (reasoning effort: `template.effortOf`, the Python app's names — medium is 75, not the release template's 62); `tools.parse` / `tools.Stream.feed`. The server reaches the engine only through `engine_api.Engine`.
 
+## 0a. Parallel workstreams (2026-10-07, integration: `dsq-zig-arch-1`)
+
+Five agents work on `dsv41-zig` at once toward one combined pod gate and one Spark window. Each owns its new files; hooks into shared files stay small and are reviewed by the integrator.
+
+| Agent | Workstream | Owns (new files) | Hooks it may add to shared files |
+|---|---|---|---|
+| `dsq-zig-arch-1` (integrator) | the Spark window's fixes, M5 (paged pool, split / compact KV, sessions, boot check), the combined pod job, the Spark kit and runbook | `forward.zig`, `forward_prefill.zig`, `block*.zig`, `target.zig`, `model.zig`, `run.zig`, `kv_state.zig`, `sessions_gpu.zig`, `profile.zig`, `m5*.zig`, `m2b.zig`, `tools/zig/dsv41_m1/job.sh`, `tools/zig/dsv41_m2c2/**`, `tools/zig/dsv41_m4/**` | — |
+| `dsq-zig-samp-1` | exact sampling (== Python's keyed sampling, top-p / top-k / temperature) | its own sampling files | `target.zig` (the `sampling` / `draw` path of prefill and window), `forward.zig` (a candidates call next to `greedy`) |
+| `dsq-zig-slots-1` | several live slots and graph row buckets (row mode) | its own slot / row-mode files | `forward.zig` (slot state by index), `target.zig` (`Slots` refusals), `graphs.zig`, the emitters' row-mode arguments (`SL`, `PTS`, `ROWS`, `rslot`) |
+| `dsq-zig-trees-1` | DSpark draft trees (`parents`), drafted == serial | its own tree files | `target.zig` (`TreeWindow` refusal), `keep(path)` |
+| `dsq-zig-speed-1` | graphs on in M4, R3 Engram, host overhead, the per-round timing tool | its own speed files | `forward.zig` (the window path), `serve_engine.zig`, `graphs.zig`, `profile.zig` (extend, don't replace) |
+
+**State the workstreams start from** (do not rebase away):
+- `cf1cd20`, the Spark window's fixes:
+  - `op_release`: every rank's slot resets on release;
+  - prefill selects with `attn_cuda` top-k at up to 64 rows (`backend._dt`);
+  - deterministic drafting: `op_ds_reset` reaches the followers, and lanes `Config.timed` is off in the served engine;
+  - `TF_DSV41_PROFILE` / `profile.zig`, and `M2B_PROF_ROWS`;
+  - kit M4 with graphs on;
+  - `dsv41_m2b_ref.py` `--aot-prompts` / `--profile`;
+  - `job.sh` `M2B_M4`.
+- `7aefcc4`, M5:
+  - `block.Pool` and the `s.kv.*` roles, `kv_state.zig`, `sessions_gpu.zig`;
+  - `tf-dsv41-m1 m5-emit` / `m5`;
+  - the session ops `op_sess_save` / `op_sess_restore`;
+  - `Forward.sess`, and `Forward.kv`.
+
+**Interface rules.**
+- **Plan-link operation numbers** (`forward.zig`): 1–11 are taken (window, greedy, keep, stop, ds_ingest, ds_propose, prefill, sess_save, sess_restore, release, ds_reset). Reserve new ones by appending to this list in this section, in the same commit that adds them:
+  - 12–15: `dsq-zig-samp-1`;
+  - 16–19: `dsq-zig-slots-1`;
+  - 20–23: `dsq-zig-trees-1`;
+  - 24–27: `dsq-zig-speed-1`.
+- **Defaults.** Every new behaviour is behind a knob or a new code path, and defaults to today's. With every new knob off, the gates `check cap24-*/cap15/cap18/cap22` and `dcheck cap16` still give 0 mismatches. Run `tf-dsv41-m1 m5-emit cap18` before committing a change to an emitter.
+- **Pool vs contiguous.** A slot's KV is either the contiguous roles (`s.L<i>.comp.*`, `s.L<i>.ik`) or the pool (`block.Options.pool`, the `s.kv.*` roles). New code must work with both, or refuse the other by name.
+- **Collectives.** Leader and followers make the same collective calls in the same order. Anything rank 0 decides (sampling draws, tree shapes, slot admission) travels on the plan link before the work that depends on it.
+- **Commits.**
+  - Use `git add <your paths>` only, then `git -c user.name="Jay Leaton" -c user.email="jayleaton@gmail.com" commit`, with the message ending in `Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>`. No push.
+  - Build with at most `-j4`.
+  - Pod binaries are built from a clean `git archive` tree.
+  - Hook commits to shared files: one small commit each, its message naming the hook, so the integrator can review it.
+- **Pod steps.** No workstream launches a pod: the integrator runs one combined held 2x PRO 6000 pod (cap $5). Each workstream lists its pod step here, under "Pod steps", as follows:
+  - the `job.sh` knob or the command;
+  - what it compares, and against what;
+  - the minutes it needs;
+  - any assets it needs (captures, references, AOT prompts).
+
+**Pod steps** (filled in by each workstream):
+- `dsq-zig-arch-1`:
+  - the window fixes;
+  - prefill gates at 45 / 173 / 9 tokens (64-row top-k, odd key counts);
+  - the R1 decode gate, eager (profiled) and graphed;
+  - M4 on the pod (HTTP == CLI with drafts, drafted == serial);
+  - M5 `paged` / `split` / `compact` / `park` (`M1_JOB=m5`);
+  - the boot check (host goldens).
+
 ## 1. How the Zig engine is built
 
 | Part | Where | What it does |
