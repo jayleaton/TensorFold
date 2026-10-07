@@ -94,7 +94,7 @@ case "$PHASE" in
         docker run --rm --gpus all --ipc=host -v "$TF:/dsv41-tf:ro" -v "$MODEL:/model:ro" -v "$KIT:/kit:ro" -v "$OUT:/out" \
             -v "${CACHE_VOL:-dsv41-perf1-cache}:/cache" "${KN[@]}" -e TF_DSV41_GM_V2=1 -e M1_PREFILL_ROWS=0 \
             -e PYTHONPATH=/dsv41-tf/src:/cache/pylib -e TORCH_EXTENSIONS_DIR=/cache/torch_extensions -e TRITON_CACHE_DIR=/cache/triton \
-            --entrypoint python "$IMAGE" -u -B /kit/tools/zig/dsv41_m1_capture.py --pack /model --out /out/capture-p --sets P \
+            --name "dsv41-zig-capp-r$RANK" --entrypoint python "$IMAGE" -u -B /kit/tools/zig/dsv41_m1_capture.py --pack /model --out /out/capture-p --sets P \
             > "$OUT/capture-p.log" 2>&1 || { echo "capture P failed: $OUT/capture-p.log"; exit 1; }
         # the blobs are the container's (root-owned): removed as root in the image; the merge does not depend on it
         docker run --rm -v "$OUT:/out" --entrypoint rm "$IMAGE" -rf /out/capture-p/blobs || echo "warning: $CAP/blobs left"
@@ -127,12 +127,12 @@ case "$PHASE" in
              -e TF_DSV41_GM_V2=1 -e TF_DSV41_EXPERT_TOPP=0.85 -e PYTHONPATH=/dsv41-tf/src:/cache/pylib
              -e TORCH_EXTENSIONS_DIR=/cache/torch_extensions -e TRITON_CACHE_DIR=/cache/triton
              -e NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-enp1s0f1np1} -e NCCL_IB_HCA=${NCCL_IB_HCA:-rocep1s0f1,roceP2p1s0f1}
-             -e GLOO_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-enp1s0f1np1} --entrypoint python "$IMAGE")
-        "${RUN[@]}" -u -B /kit/tools/zig/dsv41_m2b_ref.py --pack /model --out /out/long-aot --layers 0-24 --prompt 8448 \
+             -e GLOO_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-enp1s0f1np1} --entrypoint python)
+        "${RUN[@]}" --name "dsv41-zig-long-r$RANK" "$IMAGE" -u -B /kit/tools/zig/dsv41_m2b_ref.py --pack /model --out /out/long-aot --layers 0-24 --prompt 8448 \
             --steps 1 --limit 10496 --rank "$RANK" --master "$MASTER" --port 29831 > "$OUT/long-aot.log" 2>&1 \
             || { echo "long-aot reference failed: $OUT/long-aot.log"; exit 1; }
         python3 "$KIT/tools/zig/dsv41_aot_merge.py" "$ASSETS/aot" "$LA/aot" | tee -a "$OUT/long-aot.log"
-        "${RUN[@]}" -B /kit/tools/zig/dsv41_rope_tables.py --config /model/config.json --rows "${LONG_ROWS:-1050624}" \
+        "${RUN[@]}" --name "dsv41-zig-rope-r$RANK" "$IMAGE" -B /kit/tools/zig/dsv41_rope_tables.py --config /model/config.json --rows "${LONG_ROWS:-1050624}" \
             --out /out/rope-long.bin >> "$OUT/long-aot.log" 2>&1 && cp "$OUT/rope-long.bin" "$ASSETS/rope.bin" \
             && echo "rope.bin: ${LONG_ROWS:-1050624} rows" | tee -a "$OUT/long-aot.log" ;;
     follow)
