@@ -198,6 +198,14 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, step: *std.Build.S
     graphs.addImport("cuda", cuda);
     graphs.addImport("tp", @import("tp.zig").module(b, host, .debug, cuda));
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = graphs })).step);
+    // DSV4.1 row mode (several slots): rowtab's tables and rowmode's program over the real emitter (block.emit)
+    const rows = b.createModule(.{ .root_source_file = b.path("zig/src/families/deepseek_v41/rows_test.zig"), .target = host, .optimize = .debug, .link_libc = true });
+    rows.addImport("cuda", cuda);
+    rows.addImport("dsv41_kernels", dsv41Kernels(b, host, .debug, cuda, &.{}));
+    rows.addImport("tp", @import("tp.zig").module(b, host, .debug, cuda));
+    const rows_run = b.addRunArtifact(b.addTest(.{ .root_module = rows }));
+    b.step("test-dsv41-rows", "DeepSeek-V4.1 row mode (several slots) on the real emitter, host only").dependOn(&rows_run.step);
+    step.dependOn(&rows_run.step);
     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = host, .optimize = .debug, .link_libc = true });
     cli.addImport("cuda", cuda);
     cli.addImport("core", mods.core);
