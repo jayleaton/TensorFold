@@ -40,7 +40,7 @@ pub const Functions = struct {
         errdefer m.unload();
         var f: Functions = undefined;
         f.module = m;
-        inline for (@typeInfo(@TypeOf(names)).@"struct".fields) |fld| @field(f, fld.name) = try m.function(@field(names, fld.name));
+        inline for (@typeInfo(@TypeOf(names)).@"struct".field_names) |name| @field(f, name) = try m.function(@field(names, name));
         return f;
     }
 
