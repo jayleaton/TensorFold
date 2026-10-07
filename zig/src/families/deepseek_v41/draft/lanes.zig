@@ -14,6 +14,7 @@ const calib = @import("calib.zig");
 const costs_mod = @import("costs.zig");
 const Policy = @import("policy.zig").Policy;
 const branches = @import("branches.zig");
+const spec_mod = @import("spec.zig");
 
 pub const max_block = 16;
 
@@ -24,6 +25,7 @@ pub const Options = struct {
     sib_rows: u32 = 4, // a sibling branch's rows at most (TF_DSV41_TREE_ROWS)
     dup: tree.Dup = .{}, // tree.plan's sibling pricing (Python's: TF_DSV41_TREE_DUP_MS a sibling, its pending row counted)
     slots: u32 = 4, // streams at once
+    spec: spec_mod.Settings = .{}, // the speculative pass (TF_DSV41_SPEC_DRAFT / _SPEC_NUCLEUS)
 };
 
 /// A stream's slot and what the backend holds for it between rounds.
@@ -66,6 +68,10 @@ pub const Lanes = struct {
     conf: []f32,
     cand: []i32,
     base: []f32,
+    /// the speculative pass (null: off)
+    spec: ?spec_mod.Spec = null,
+    /// each slot's stream state (null: free)
+    by_slot: []?*St,
 
     pub fn init(gpa: Allocator, target: iface.Target, pass: iface.Pass, costs: costs_mod.Costs, opts: Options) !*Lanes {
         const x = try gpa.create(Lanes);
@@ -84,8 +90,11 @@ pub const Lanes = struct {
             .conf = try gpa.alloc(f32, opts.slots * b),
             .cand = try gpa.alloc(i32, opts.slots * b * c),
             .base = try gpa.alloc(f32, opts.slots * b * c),
+            .by_slot = try gpa.alloc(?*St, opts.slots),
         };
+        @memset(x.by_slot, null);
         x.policy.owner = x;
+        if (opts.spec.on) x.spec = try spec_mod.Spec.init(gpa, opts.spec, opts.slots, b, c);
         var s = opts.slots;
         while (s > 0) : (s -= 1) try x.free.append(gpa, s - 1);
         return x;
@@ -103,6 +112,8 @@ pub const Lanes = struct {
         x.gpa.free(x.conf);
         x.gpa.free(x.cand);
         x.gpa.free(x.base);
+        if (x.spec) |*sp| sp.deinit();
+        x.gpa.free(x.by_slot);
         x.gpa.destroy(x);
     }
 
@@ -113,6 +124,13 @@ pub const Lanes = struct {
 
     pub fn backend(x: *Lanes) be.Backend {
         return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .probabilities = probabilities, .tree = heldTree, .release = release } };
+    }
+
+    /// The speculative pass's counts (Python's describe()) on stderr, when it is on: the gates' and the server's line.
+    pub fn reportSpec(x: *const Lanes) void {
+        const sp = x.spec orelse return;
+        var buf: [256]u8 = undefined;
+        std.debug.print("dsv41 spec: {s}\n", .{sp.describe(&buf)});
     }
 
     /// Put the DSpark depth in charge of the engine's rows.
@@ -172,6 +190,8 @@ pub const Lanes = struct {
         const st = try x.gpa.create(St);
         errdefer x.gpa.destroy(st);
         st.* = .{ .slot = slot };
+        try x.settle();
+        if (x.spec) |*sp| sp.forget(slot);
         x.pass.reset(slot);
         x.policy.depth.reset(slot);
         const ids = s.prompt();
@@ -182,6 +202,7 @@ pub const Lanes = struct {
         for (rows, 0..) |*r, i| r.* = @intCast(i);
         try x.ingest(st, 0, rows);
         try x.streams.put(x.gpa, s, st);
+        x.by_slot[slot] = st;
     }
 
     fn first(ptr: *anyopaque, s: *Stream, position: u64) anyerror!u64 {
@@ -197,6 +218,8 @@ pub const Lanes = struct {
         const st = try x.get(s);
         if (position != st.len + 1) return error.PositionMismatch;
         const token = [_]u32{x.value(feed)};
+        try x.settle();
+        if (x.spec) |*sp| sp.clear(); // an undrafted window: no speculation
         var choice: [1]u32 = undefined;
         var out = [_][]u32{&choice};
         try x.target.window(&.{.{ .slot = st.slot, .start = st.len, .tokens = &token, .parents = null, .draws = &.{position}, .sampling = s.sampling }}, &out);
@@ -213,6 +236,7 @@ pub const Lanes = struct {
 
     fn verify(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
         const x = self(ptr);
+        try x.settle();
         _ = x.scratch.reset(.retain_capacity);
         const a = x.scratch.allocator();
         const segs = try a.alloc(iface.Segment, windows.len);
@@ -236,7 +260,47 @@ pub const Lanes = struct {
             st.base = st.len;
             st.len += w.rows();
         }
+        if (x.spec != null) try x.speculate(a, windows, segs, choices);
     }
+
+    /// Collects a speculative pass still running (before any other pass, target or ingest work).
+    fn settle(x: *Lanes) !void {
+        if (x.spec) |*sp| try sp.settle(x.pass);
+    }
+
+    /// After a window: the next round's pass for its DSpark windows (spec.zig), their kept rows ingested first.
+    fn speculate(x: *Lanes, a: Allocator, windows: []const be.Window, segs: []const iface.Segment, choices: []const []u32) !void {
+        const sp = &x.spec.?;
+        var tree_round = false;
+        var nucleus = false;
+        for (windows) |w| {
+            tree_round = tree_round or w.parents != null;
+            nucleus = nucleus or spec_mod.isNucleus(w.stream.sampling);
+        }
+        if (!sp.roundAllowed(tree_round, nucleus)) return sp.clear();
+        const cands = try a.alloc(spec_mod.Candidate, windows.len);
+        var n: usize = 0;
+        for (windows, segs, choices) |w, g, c| {
+            const st = try x.get(w.stream);
+            // a DSpark round: the window verifies the pass's drafts (none when the depth chose 0), no host drafts
+            if (st.n == 0 or w.tokens.len != 0) continue;
+            var acc: u32 = 0;
+            while (acc + 1 < g.tokens.len and g.tokens[acc + 1] == c[acc]) acc += 1;
+            cands[n] = .{ .slot = st.slot, .start = g.start, .accepted = acc, .bonus = c[acc], .sampling = g.sampling };
+            n += 1;
+        }
+        const asks = sp.launch(cands[0..n]);
+        if (asks.len == 0) return;
+        const rows = try a.alloc(u32, lanes_max_rows);
+        for (rows, 0..) |*r, i| r.* = @intCast(i);
+        for (asks) |ask| {
+            const st = x.by_slot[ask.slot] orelse return error.UnknownStream;
+            try x.ingest(st, st.base, rows[0 .. ask.start - st.base]);
+        }
+        try sp.run(x.pass, x.opts.siblings > 0);
+    }
+
+    const lanes_max_rows = 64;
 
     fn keep(ptr: *anyopaque, windows: []const be.Window, paths: []const []const u32) anyerror!void {
         const x = self(ptr);
@@ -249,6 +313,7 @@ pub const Lanes = struct {
 
     fn draft(ptr: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
         const x = self(ptr);
+        try x.settle();
         _ = x.scratch.reset(.retain_capacity);
         const a = x.scratch.allocator();
         const asks = try a.alloc(iface.Ask, requests.len);
@@ -260,7 +325,8 @@ pub const Lanes = struct {
             var at = st.len;
             if (r.rows) |path| {
                 if (r.start != st.base) return error.PositionMismatch;
-                try x.ingest(st, r.start, path); // a shared round drafts before its keep: the path, not st.len
+                const done = if (x.spec) |*sp| sp.ingested(st.slot, r.start, path) else false;
+                if (!done) try x.ingest(st, r.start, path); // a shared round drafts before its keep: the path, not st.len
                 at = r.start + path.len;
             }
             if (r.position != at + 1) return error.PositionMismatch;
@@ -286,7 +352,8 @@ pub const Lanes = struct {
             .cand = if (markov != null) x.cand[i * b * c ..][0 .. b * c] else null,
             .base = if (markov != null) x.base[i * b * c ..][0 .. b * c] else null,
         };
-        try x.pass.propose(asks[0..n], props);
+        const took = if (x.spec) |*sp| sp.take(asks[0..n], props) else false;
+        if (!took) try x.pass.propose(asks[0..n], props);
         for (props, whose[0..n], depths[0..n], asks[0..n]) |p, st, d, ask| {
             st.n = @min(d, b);
             @memcpy(st.held[0..st.n], p.drafts[0..st.n]);
@@ -350,6 +417,9 @@ pub const Lanes = struct {
         const x = self(ptr);
         const kv = x.streams.fetchRemove(s) orelse return;
         const st = kv.value;
+        x.settle() catch |e| std.log.err("dsv41 lanes: the speculative pass did not settle ({t})", .{e});
+        if (x.spec) |*sp| sp.forget(st.slot);
+        x.by_slot[st.slot] = null;
         x.target.release(st.slot);
         x.pass.reset(st.slot);
         x.policy.depth.reset(st.slot);

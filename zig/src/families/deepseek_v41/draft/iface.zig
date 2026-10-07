@@ -77,6 +77,12 @@ pub const Pass = struct {
         reset: *const fn (ptr: *anyopaque, slot: u32) void,
         /// The Markov / confidence heads on the host, for trees (null: no trees).
         markov: *const fn (ptr: *anyopaque) ?dspark.Markov,
+        /// Start a pass over `asks` whose results `collect` returns: the device drafts while the host goes on
+        /// (spec.zig, TF_DSV41_SPEC_DRAFT). Between the two, only target work without collectives may run (`keep`).
+        /// Null: `propose` only.
+        begin: ?*const fn (ptr: *anyopaque, asks: []const Ask) anyerror!void = null,
+        /// The begun pass's results, in its asks' order (as `propose` gives them).
+        collect: ?*const fn (ptr: *anyopaque, out: []Proposal) anyerror!void = null,
     };
 
     pub fn ingest(p: Pass, slot: u32, start: u64, taps: Taps, rows: []const u32) !void {

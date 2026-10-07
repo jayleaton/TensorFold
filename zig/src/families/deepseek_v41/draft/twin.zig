@@ -289,13 +289,22 @@ pub const Drafter = struct {
     w2: []u16,
     cw: []f32,
     passes: u64 = 0,
+    ingests: u64 = 0, // ingest calls (tests)
+    /// `begin` / `collect` (passAsync): the pass reads the rings at `begin`, as a GPU stream orders it, and the host
+    /// takes its results at `collect`; sized for every slot
+    stash_drafts: []u32,
+    stash_conf: []f32,
+    stash_cand: []i32,
+    stash_base: []f32,
+    stash_n: usize = 0,
+    begun: bool = false,
 
     pub fn init(gpa: Allocator, t: *Twin, slots: usize) !*Drafter {
         const v = t.dims.vocab;
         const rank = std.math.ceilPowerOfTwo(u32, v) catch unreachable;
         const shape: dspark.Shape = .{ .block = t.dims.block, .noise = v - 1, .window = t.dims.window, .rank = rank, .hidden = t.dims.dim, .candidates = v };
         const x = try gpa.create(Drafter);
-        x.* = .{ .gpa = gpa, .t = t, .shape = shape, .rings = try gpa.alloc([]f32, slots), .tags = try gpa.alloc([]i64, slots), .w1 = try gpa.alloc(u16, @as(usize, v) * rank), .w2 = try gpa.alloc(u16, @as(usize, v) * rank), .cw = try gpa.alloc(f32, t.dims.dim + rank) };
+        x.* = .{ .gpa = gpa, .t = t, .shape = shape, .rings = try gpa.alloc([]f32, slots), .tags = try gpa.alloc([]i64, slots), .w1 = try gpa.alloc(u16, @as(usize, v) * rank), .w2 = try gpa.alloc(u16, @as(usize, v) * rank), .cw = try gpa.alloc(f32, t.dims.dim + rank), .stash_drafts = try gpa.alloc(u32, slots * shape.block), .stash_conf = try gpa.alloc(f32, slots * shape.block), .stash_cand = try gpa.alloc(i32, slots * shape.block * v), .stash_base = try gpa.alloc(f32, slots * shape.block * v) };
         const ring = shape.ring();
         for (x.rings, x.tags) |*r, *g| {
             r.* = try gpa.alloc(f32, @as(usize, ring) * t.dims.dim);
@@ -322,6 +331,10 @@ pub const Drafter = struct {
         x.gpa.free(x.w1);
         x.gpa.free(x.w2);
         x.gpa.free(x.cw);
+        x.gpa.free(x.stash_drafts);
+        x.gpa.free(x.stash_conf);
+        x.gpa.free(x.stash_cand);
+        x.gpa.free(x.stash_base);
         x.gpa.destroy(x);
     }
 
@@ -333,6 +346,41 @@ pub const Drafter = struct {
         return .{ .ptr = x, .vtable = &.{ .ingest = ingest, .propose = propose, .reset = reset, .markov = markovFn } };
     }
 
+    /// The same pass with `begin` / `collect` (iface.Pass): the speculative pass's device path on the CPU.
+    pub fn passAsync(x: *Drafter) iface.Pass {
+        return .{ .ptr = x, .vtable = &.{ .ingest = ingest, .propose = propose, .reset = reset, .markov = markovFn, .begin = begin, .collect = collect } };
+    }
+
+    fn stashed(x: *Drafter, i: usize) iface.Proposal {
+        const b = x.shape.block;
+        const v = x.t.dims.vocab;
+        return .{ .drafts = x.stash_drafts[i * b ..][0..b], .conf = x.stash_conf[i * b ..][0..b], .cand = x.stash_cand[i * b * v ..][0 .. b * v], .base = x.stash_base[i * b * v ..][0 .. b * v] };
+    }
+
+    fn begin(ptr: *anyopaque, asks: []const iface.Ask) anyerror!void {
+        const x = self(ptr);
+        if (x.begun) return error.PassBegun;
+        var props: [16]iface.Proposal = undefined;
+        if (asks.len > props.len or asks.len * x.shape.block > x.stash_drafts.len) return error.TooManySlots;
+        for (props[0..asks.len], 0..) |*p, i| p.* = x.stashed(i);
+        try propose(ptr, asks, props[0..asks.len]);
+        x.stash_n = asks.len;
+        x.begun = true;
+    }
+
+    fn collect(ptr: *anyopaque, out: []iface.Proposal) anyerror!void {
+        const x = self(ptr);
+        if (!x.begun or out.len != x.stash_n) return error.NoPassBegun;
+        x.begun = false;
+        for (out, 0..) |o, i| {
+            const p = x.stashed(i);
+            @memcpy(o.drafts, p.drafts[0..o.drafts.len]);
+            @memcpy(o.conf, p.conf[0..o.conf.len]);
+            if (o.cand) |c| @memcpy(c, p.cand.?[0..c.len]);
+            if (o.base) |b| @memcpy(b, p.base.?[0..b.len]);
+        }
+    }
+
     fn self(ptr: *anyopaque) *Drafter {
         return @ptrCast(@alignCast(ptr));
     }
@@ -341,6 +389,8 @@ pub const Drafter = struct {
         const x = self(ptr);
         const d = x.t.dims.dim;
         const ring = x.shape.ring();
+        if (x.begun) return error.PassBegun; // the lanes collect a begun pass before any other pass work
+        x.ingests += 1;
         const src: [*]const f32 = @ptrFromInt(taps.address);
         for (rows, 0..) |r, i| {
             if (r >= taps.rows) return error.TapOutOfRange;
@@ -360,6 +410,7 @@ pub const Drafter = struct {
 
     fn propose(ptr: *anyopaque, asks: []const iface.Ask, out: []iface.Proposal) anyerror!void {
         const x = self(ptr);
+        if (x.begun) return error.PassBegun;
         const t = x.t;
         const d = t.dims.dim;
         const n = x.shape.block;

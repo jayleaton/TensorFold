@@ -18,6 +18,7 @@ pub const drive = @import("drive.zig");
 pub const branches = @import("branches.zig");
 pub const calib_env = @import("calib_env.zig");
 pub const branches_oracle = @import("branches_oracle.zig");
+pub const spec = @import("spec.zig");
 
 test {
     _ = costs;
@@ -39,4 +40,6 @@ test {
     _ = @import("drive_test.zig");
     _ = @import("lanes_test.zig");
     _ = @import("golden_test.zig");
+    _ = spec;
+    _ = @import("spec_test.zig");
 }

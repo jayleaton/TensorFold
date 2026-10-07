@@ -99,7 +99,7 @@ pub const Result = struct { tokens: []u32, drafted: u64, accepted: u64, trees: u
 pub fn generate(gpa: std.mem.Allocator, target: iface.Target, pass: iface.Pass, shape: dspark.Shape, prompt: []const u32, max_new: u32, set: tree.Settings) !Result {
     var c = try costs_mod.defaults(gpa, 64);
     defer c.deinit(gpa);
-    const x = try ln.Lanes.init(gpa, target, pass, c, .{ .shape = shape, .slots = 1, .siblings = set.siblings, .sib_rows = set.sib_rows, .dup = set.dup });
+    const x = try ln.Lanes.init(gpa, target, pass, c, .{ .shape = shape, .slots = 1, .siblings = set.siblings, .sib_rows = set.sib_rows, .dup = set.dup, .spec = try @import("spec.zig").Settings.fromEnv() });
     defer x.deinit();
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -113,5 +113,6 @@ pub fn generate(gpa: std.mem.Allocator, target: iface.Target, pass: iface.Pass, 
     defer s.deinit(gpa);
     try e.addStream(&s);
     while (e.activeCount() > 0) try e.step();
+    x.reportSpec();
     return .{ .tokens = try gpa.dupe(u32, s.emitted()), .drafted = e.drafted, .accepted = e.accepted, .trees = x.policy.trees, .sib_wins = x.policy.sib_wins, .rounds = s.rounds };
 }
