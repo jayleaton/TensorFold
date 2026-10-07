@@ -19,6 +19,9 @@
 #   ENGRAM (1: R3, the node's packed Engram shards as prod reads them: ENGRAM_DIR, prod-perf1.env's HEAD_ENGRAM /
 #   WORKER_ENGRAM), CALIB (real: the drafts priced by prod's stored table, CACHE_VOL read-only; "": the built-in costs),
 #   TREE (DSpark draft trees, e.g. 3; "": chains), PHASES (1: per-round phase times into OUTDIR/phases.json),
+#   GRAMMAR (1: structured output), IMAGES (native | placeholder), BIAS_VL (1: prod's /cache/dsv41-bias-vl, with
+#   IMAGES=native), GM_V2 (1: x3gm v2 prefill), PF_DENSE (fused: prod's fused dense prefill + its table),
+#   PREFETCH_AHEAD (1: the next segment's Engram reads early; needs ENGRAM=1); each on only once its pod gate passed.
 #   SPEC (1: the speculative DSpark pass, prod's TF_DSV41_SPEC_DRAFT=1; 0: off), CONTEXT (the served slot limit, prod
 #   1048576; unset: 4,096; needs the long-aot phase's rope.bin and _stream variants).
 # long-aot (both hosts, once, before CONTEXT past 4,096): Python's prefill of one 8,448-token prompt on layers 0-24 at TP=2
@@ -56,7 +59,16 @@ ARGS=(--rm --gpus all --ipc=host --network host --device /dev/infiniband --ulimi
 [[ "${KV_SPLIT:-0}" == 1 ]] && ARGS+=(-e TF_DSV41_KV_SPLIT=1)
 [[ -n "${INDEX_KV:-}" ]] && ARGS+=(-e TF_DSV41_INDEX_KV="$INDEX_KV")
 [[ "${ENGRAM:-1}" == 1 ]] && ARGS+=(-v "$ENGRAM_DIR:/engram:ro" -e TF_DSV41_ENGRAM_DIR=/engram)
-[[ "${CALIB-real}" == real ]] && ARGS+=(-v "$CACHE_VOL:/cache:ro" -e TF_DSV41_CALIB=real -e TF_DSV41_CALIB_DIR=/cache/dsv41-calib)
+# prod's cache volume (read-only): the calibration tables, bias_vl, the pfdense table
+if [[ "${CALIB-real}" == real || "${BIAS_VL:-0}" == 1 || -n "${PF_DENSE:-}" ]]; then ARGS+=(-v "$CACHE_VOL:/cache:ro"); fi
+[[ "${CALIB-real}" == real ]] && ARGS+=(-e TF_DSV41_CALIB=real -e TF_DSV41_CALIB_DIR=/cache/dsv41-calib)
+# the features gated on pods 29 / 30 (each off unless set; prod-perf1.env's values when on)
+[[ "${GRAMMAR:-0}" == 1 ]] && ARGS+=(-e TF_DSV41_GRAMMAR=1 -e TF_DSV41_TOOL_GRAMMAR=0)
+[[ -n "${IMAGES:-}" ]] && ARGS+=(-e TF_DSV41_IMAGES="$IMAGES")
+[[ "${BIAS_VL:-0}" == 1 ]] && ARGS+=(-e TF_DSV41_BIAS_VL=/cache/dsv41-bias-vl)
+[[ "${GM_V2:-0}" == 1 ]] && ARGS+=(-e TF_DSV41_GM_V2=1)
+[[ -n "${PF_DENSE:-}" ]] && ARGS+=(-e TF_DSV41_PF_DENSE="$PF_DENSE" -e TF_DSV41_PF_DENSE_TABLE=/cache/pfdense-table.json)
+[[ "${PREFETCH_AHEAD:-0}" == 1 ]] && ARGS+=(-e TF_DSV41_PREFETCH_AHEAD=1)
 [[ -n "${TREE:-}" ]] && ARGS+=(-e TF_DSV41_TREE="$TREE")
 [[ "${SLOT_DRAFTS:-0}" == 1 ]] && ARGS+=(-e TF_DSV41_SLOT_DRAFTS=1)
 [[ "${SPEC:-1}" == 1 ]] && ARGS+=(-e TF_DSV41_SPEC_DRAFT=1)    # prod's SPEC_DRAFT=1: the next round's pass early
