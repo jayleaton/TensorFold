@@ -98,8 +98,10 @@ pub const Engine = struct {
         if (try e.forcedNext(s)) |t| feed = .{ .value = t };
         var asked: ?u32 = null;
         if (e.cfg.family_mtp and s.drafts) {
-            // the head reads the prompt's last row and the first token, and drafts the one after it
-            const d: u32 = @intCast(try e.rule.depth(win.who(s)));
+            // the head reads the prompt's last row and the first token, and drafts the one after it; a head with
+            // node probabilities drafts its whole reach as in every later round (headDepth), and its row policy cuts
+            var who = win.who(s);
+            const d: u32 = @intCast(if (e.cfg.node_probabilities) try e.rule.headDepth(&who, null, win.probe(e)) else try e.rule.depth(who));
             asked = d;
             try e.backend.draft(&.{.{ .stream = s, .follow = &.{}, .first = feed, .rows = null, .start = s.prompt_len, .position = position + 1, .depth = d }});
             s.dropHeld(e.gpa);
