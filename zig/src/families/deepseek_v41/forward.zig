@@ -640,7 +640,7 @@ pub const Forward = struct {
 
     /// R3: the Engram rows' source, opened on first use: TF_DSV41_ENGRAM_DIR's shards on every rank alike (null:
     /// M2a's index rows, the gates' references). TF_DSV41_ENGRAM_CACHE: records a layer (65,536).
-    fn engramSource(f: *Forward, h: *const eh.Host) !?eh.Source {
+    pub fn engramSource(f: *Forward, h: *const eh.Host) !?eh.Source {
         if (!f.engram_opened) {
             f.engram_opened = true;
             if (std.c.getenv("TF_DSV41_ENGRAM_PREFETCH")) |v| f.engram_prefetch = !std.mem.eql(u8, std.mem.span(v), "0");
