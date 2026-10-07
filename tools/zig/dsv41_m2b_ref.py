@@ -199,6 +199,8 @@ def rank_main(rank: int, a) -> None:
     # alone (Triton specializes integer arguments on % 16 and == 1: rows, key counts and strides of every prefill
     # path, the 64-row CUDA top-k and the `_keys` one; the Spark window's 45-token chat prompt had none). Nothing
     # recorded comes from them, and the slot is fresh again after them.
+    if a.aot_taps:      # as a drafting server prefills: DSpark's taps kept (the prefill `_site`'s TAP_ON variants)
+        fw.keep_taps = True
     for n in a.aot_prompts:
         if kv is None:
             fw.slots[0] = fw.new_slot(contiguous=True)
@@ -421,6 +423,8 @@ def main() -> int:
     ap.add_argument("--profile", default="", help="row counts (\"1 4 8\"): time windows of each after the run")
     ap.add_argument("--aot-prompts", type=lambda v: [int(x) for x in v.split(",") if x], default=[],
                     help="more prompt lengths after the run, for their Triton variants only (e.g. 1,9,17,45,64,65,173,300,1025,2049,2600)")
+    ap.add_argument("--aot-taps", action="store_true",
+                    help="--aot-prompts with DSpark's taps kept (Forward taps=True), for a drafting server's prefill variants")
     ap.add_argument("--prompts", type=lambda v: [int(x) for x in v.split(",") if x], default=[],
                     help="several prompts in one load, each from a fresh slot into DIR/p<N> (both ranks here)")
     ap.add_argument("--steps", type=int, default=64)

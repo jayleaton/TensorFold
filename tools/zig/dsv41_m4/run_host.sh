@@ -135,8 +135,26 @@ case "$PHASE" in
         "${RUN[@]}" --name "dsv41-zig-rope-r$RANK" "$IMAGE" -B /kit/tools/zig/dsv41_rope_tables.py --config /model/config.json --rows "${LONG_ROWS:-1050624}" \
             --out /out/rope-long.bin >> "$OUT/long-aot.log" 2>&1 && cp "$OUT/rope-long.bin" "$ASSETS/rope.bin" \
             && echo "rope.bin: ${LONG_ROWS:-1050624} rows" | tee -a "$OUT/long-aot.log" ;;
+    taps-aot)
+        # a drafting server's prefill keeps DSpark's taps (the tap layers' `_site` with TAP_ON): Python's prefill of
+        # the AOT prompt lengths with taps kept, at TP=2 over the two hosts on the whole model, merged into ASSETS/aot
+        C=8474f3164ea60cb9c9f8e9bd5a4493fdf13eaa47
+        if [[ "$RANK" == 0 ]]; then TF=/home/dgx01/ai/src/dsv41-prod/$C; else TF=/home/root/ai/src/dsv41-prod/$C; fi
+        KN=(); for f in prod-knobs.env r1c-knobs.env; do while read -r kv; do [[ "$kv" =~ ^TF_ ]] && KN+=(-e "$kv"); done < "$KIT/tools/zig/dsv41_m1/$f"; done
+        TA=$OUT/taps-aot; rm -rf "$TA"
+        docker run --rm --gpus all --ipc=host --network host --device /dev/infiniband --ulimit memlock=-1 --cap-add IPC_LOCK \
+            -v "$TF:/dsv41-tf:ro" -v "$MODEL:/model:ro" -v "$KIT:/kit:ro" -v "$OUT:/out" -v "$CACHE_VOL:/cache" "${KN[@]}" \
+            -e TF_DSV41_EXPERT_TOPP=0.85 -e PYTHONPATH=/dsv41-tf/src:/cache/pylib \
+            -e TORCH_EXTENSIONS_DIR=/cache/torch_extensions -e TRITON_CACHE_DIR=/cache/triton \
+            -e NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-enp1s0f1np1} -e NCCL_IB_HCA=${NCCL_IB_HCA:-rocep1s0f1,roceP2p1s0f1} \
+            -e GLOO_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-enp1s0f1np1} --name "dsv41-zig-taps-r$RANK" \
+            --entrypoint python "$IMAGE" -u -B /kit/tools/zig/dsv41_m2b_ref.py --pack /model --out /out/taps-aot --layers 0-39 \
+            --prompt 64 --steps 1 --aot-taps --aot-prompts "${AOT_PROMPTS-1,2,9,16,17,33,45,54,64,65,96,173,300,1025,2049,2600}" \
+            --rank "$RANK" --master "$MASTER" --port 29841 > "$OUT/taps-aot.log" 2>&1 \
+            || { echo "taps-aot reference failed: $OUT/taps-aot.log"; exit 1; }
+        python3 "$KIT/tools/zig/dsv41_aot_merge.py" "$ASSETS/aot" "$TA/aot" | tee -a "$OUT/taps-aot.log" ;;
     follow)
         docker run "${ARGS[@]}" --name dsv41-zig-m4-r$RANK --entrypoint bash "$IMAGE" \
             -c "$NCCL; exec /kit/tf-dsv41-m1 follow /model /assets" 2>&1 | tee -a "$OUT/follow.log" ;;
-    *) echo "phase: server | generate | follow | dspark-aot | rows-aot | long-aot"; exit 2 ;;
+    *) echo "phase: server | generate | follow | dspark-aot | rows-aot | long-aot | taps-aot"; exit 2 ;;
 esac
