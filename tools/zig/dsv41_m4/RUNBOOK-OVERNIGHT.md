@@ -81,7 +81,7 @@ Long prompts past 4,096 keys (run C's `CONTEXT`) are host-gated, and their pod g
 - Long context: prompt tok/s (prompt tokens over the time to the first token) and the 128-token answer's decode tok/s, against prod's. Replies differ for the same reason.
 - `out/a/phases.json` and `out/b2/phases.json`: Zig's per-round phase times.
 
-**R1's 4-row fault (pods 29 / 30, sm_120):** `mhc_cuda.run` faults at 4-row R1 windows on the pods (1- and 2-row windows run; Python's launch of the same kernel does not fault). The Sparks served R1 with drafts on 2026-10-07 without it. If a run dies with `CudaFailed` / an illegal address, restore that run's containers and rerun it with `R1=0` on both ranks; record which.
+**R1 on the pods (pods 29 / 30):** a fault in `mhc_cuda.run` at 4-row R1 windows turned out to be the M2b test driver's 1-row buffer plan (fixed `a585336`); the served model plans every window size and is not affected. Last resort only: if a run with R1 dies with `CudaFailed` / an illegal address, restore that run's containers, rerun it with `R1=0` on both ranks, and record it.
 
 **On failure (beyond restore):**
 - **Exit 3 at a start:** the lease is held. Wait; touch nothing.
