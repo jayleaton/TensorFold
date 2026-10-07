@@ -62,6 +62,7 @@ const kt: i64 = 32; // csa2.attn.KT
 const router_chunk: i64 = 2048; // router_gemv.CHUNK: rows a route launch
 const gm_bm: i64 = 64; // x3gm: members a pass of the gate/up (cfg 1) and down (cfg 0) tiles below 3,072 rows
 const gm_widths: u32 = 7; // x3gm.MAX_WIDTHS: the ticket's down half starts there
+const dtopk_rows: i64 = 64; // dtopk.MAX_ROWS: windows up to this many rows select with attn_cuda's top-k (backend._dt)
 
 fn size(dt: Dt) i64 {
     return switch (dt) {
@@ -485,15 +486,21 @@ const Seg = struct {
         const cbs: i64 = e.cfg.candidate_block_size;
         const cb: i64 = e.cfg.candidate_blocks;
         const sel = try selection(e, L);
-        if (s.short) {
+        // backend._dt: a segment of at most 64 rows whose materialised scores fit the index budget selects with
+        // attn_cuda's top-k (the decode window's job list), not `_keys` + torch's top-k (pod 25: Python's 45-row
+        // prompt launches no `_keys`); past the stream threshold the stream top-k is not ported (below)
+        const reindexing = md == .reindex and e.cfg.usesCandidates(L) and s.cand;
+        const nvis = @max(@divFloor(e.end(), ratio), 1);
+        const streamed = !e.cfg.isCandidateSource(L) and !reindexing and n > 16 and nvis >= stream_min and @popCount(topk) == 1;
+        const fits = if (reindexing) n * cb * cbs * 16 <= index_budget else n * nvis * 12 <= index_budget;
+        if (n <= dtopk_rows and fits and !streamed) {
             // the whole segment's scores, then attn_cuda's top-k (its job list picks a source's candidate blocks; a
             // Reindex layer scores over them) and visible counts
             const cand = try e.buf("w.cand", .{}, .i32, &.{ n, cb });
-            if (md == .reindex and e.cfg.usesCandidates(L) and s.cand) {
+            if (reindexing) {
                 const sc = try s.scores(src, ratio, 0, n, try pos(e), cb * cbs, cand, cbs);
                 return e.topk(L, sc, cand, cb * cbs, ratio);
             }
-            const nvis = @max(@divFloor(e.end(), ratio), 1);
             const sc = try s.scores(src, ratio, 0, n, try pos(e), nvis, null, 0);
             try e.topk(L, sc, cand, nvis, ratio);
             if (e.cfg.isCandidateSource(L)) s.cand = true;
@@ -519,7 +526,6 @@ const Seg = struct {
             }
         } else {
             const cand = e.cfg.isCandidateSource(L);
-            const nvis = @max(@divFloor(e.end(), ratio), 1);
             // backend.select's stream path (full-mode layers without the candidates' scores): not ported
             if (!cand and n > 16 and nvis >= stream_min and @popCount(topk) == 1) return error.Unsupported;
             const whole = n * nvis * 12 <= index_budget;

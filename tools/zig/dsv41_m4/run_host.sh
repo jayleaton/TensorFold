@@ -8,7 +8,9 @@
 #   ASSETS a writable copy: cp -r OUTDIR/seedN/ref/{rope.bin,engram-host.bin,aot} OUTDIR/m4-assets/)
 # Knobs: ASSETS (a dir with rope.bin, engram-host.bin, aot/: an M2c-2 seed's ref/ dir has all three; DSpark's Triton
 # variants come from a set P capture merged in, else run DRAFTS=0), PORT (8091), DRAFTS (1), BACKEND (roce | nccl),
-# OWN_PREFILL (1: prompts through the Zig prefill; 0: 16-row decode windows; both ranks alike).
+# OWN_PREFILL (1: prompts through the Zig prefill; 0: 16-row decode windows; both ranks alike), GRAPHS (1: decode
+# windows through CUDA graphs, both ranks alike; 0: eager), DRAFT_TIMED (0: drafts sized from the cost tables, the
+# same for a request whatever the load, so HTTP == CLI; 1: the measured round times).
 set -u
 RANK=${1:?rank}; OUT=${2:?outdir}; PHASE=${3:?server|generate|follow}
 KIT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -23,6 +25,7 @@ ARGS=(--rm --gpus all --ipc=host --network host --device /dev/infiniband --ulimi
       -e TF_TP_WORLD=2 -e TF_TP_RANK="$RANK" -e TF_TP_DEVICE=0 -e TF_TP_MASTER="$MASTER" -e TF_TP_PORT=29851
       -e TF_COMM_BACKEND="$BACKEND" -e TF_TP_ROCE_FALLBACK=error -e TF_TP_KERNEL_IMAGE=/kit/tp_mailbox.fatbin
       -e TF_DSV41_ASSETS=/assets -e TF_DSV41_EXPERT_TOPP=0.85 -e TF_DSV41_R1="${R1:-1}" -e TF_DSV41_DRAFTS="$DRAFTS" -e TF_DSV41_OWN_PREFILL="${OWN_PREFILL:-1}"
+      -e TF_DSV41_GRAPHS="${GRAPHS:-1}" -e TF_DSV41_DRAFT_TIMED="${DRAFT_TIMED:-0}"
       -e TF_DSV41_PLAN_TIMEOUT=1800 -e NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-enp1s0f1np1}
       -e NCCL_IB_HCA=${NCCL_IB_HCA:-rocep1s0f1,roceP2p1s0f1})
 NCCL='export TF_NCCL_LIB=$(python -c "import nvidia.nccl, os; print(os.path.join(os.path.dirname(nvidia.nccl.__file__), \"lib\", \"libnccl.so.2\"))" 2>/dev/null || echo libnccl.so.2)'

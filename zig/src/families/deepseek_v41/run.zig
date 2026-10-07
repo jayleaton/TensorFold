@@ -12,6 +12,7 @@ const buffers = @import("buffers.zig");
 const load = @import("load.zig");
 const tc = @import("triton_call.zig");
 const rp = dk.replay;
+const profile = @import("profile.zig");
 
 pub const Runner = struct {
     gpa: std.mem.Allocator,
@@ -26,6 +27,8 @@ pub const Runner = struct {
     scratch: ?cuda.DeviceBuffer = null,
     /// the forward's glue steps (forward.zig: positions, exchanges over the Collective, Engram rows, kit roundings)
     glue: ?Glue = null,
+    /// TF_DSV41_PROFILE: the eager decode windows' calls timed (profile.zig)
+    prof: ?*profile.Profile = null,
 
     pub const Glue = struct {
         ctx: *anyopaque,
@@ -137,5 +140,17 @@ pub const Runner = struct {
     /// Issues a window's calls in order.
     pub fn window(r: *Runner, cs: []const calls.Call) !void {
         for (cs) |*c| try r.issue(c);
+    }
+
+    /// An eager decode window, each call timed when TF_DSV41_PROFILE is set (never inside a graph capture).
+    pub fn timedWindow(r: *Runner, cs: []const calls.Call) !void {
+        const p = r.prof orelse return r.window(cs);
+        p.begin();
+        for (cs) |*c| {
+            try p.before(r.stream, c);
+            try r.issue(c);
+            try p.after(r.stream);
+        }
+        try p.end(r.stream);
     }
 };

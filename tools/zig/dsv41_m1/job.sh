@@ -280,7 +280,7 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
             # M1_MODE=both: also our emitters' launches on our buffers (block.zig, block_prefill.zig, dspark_emit.zig)
             "$Z/bin/tf-dsv41-m1" check "$dir" > "$RES/$name-check.log" 2>&1; tail -1 "$RES/$name-check.log" | tee -a "$RES/steps.txt"
             [[ ",$sets," == *,P,* ]] && { "$Z/bin/tf-dsv41-m1" dcheck "$dir" > "$RES/$name-dcheck.log" 2>&1; tail -1 "$RES/$name-dcheck.log" | tee -a "$RES/steps.txt"; }
-            CUDA_VISIBLE_DEVICES=0 step "m1-$name" "${M1_REPLAY_MIN:-10}" "$Z/bin/tf-dsv41-m1" "${M1_MODE:-replay}" "$LP" "$dir" "$RES/m1-$name" || rc=1
+            [[ "${M1_MODE:-replay}" == skip ]] || CUDA_VISIBLE_DEVICES=0 step "m1-$name" "${M1_REPLAY_MIN:-10}" "$Z/bin/tf-dsv41-m1" "${M1_MODE:-replay}" "$LP" "$dir" "$RES/m1-$name" || rc=1
         else rc=1; fi
         mkdir -p "$RES/$name"
         for f in meta.json weights.json manifest.json jit.json; do [[ -f "$dir/$f" ]] && cp "$dir/$f" "$RES/$name/"; done
@@ -301,9 +301,12 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
     PROMPTS=${M2B_PROMPTS:-}
     refargs=(--prompt "${M2B_PROMPT:-1536}")
     [[ -n "$PROMPTS" ]] && refargs=(--prompts "$(echo $PROMPTS | tr ' ' ',')")
+    # M2B_AOT_PROMPTS (1,9,45,...): more prompt lengths for their Triton variants (every prefill path; M4's assets);
+    # M2B_PROFILE_ROWS ("1 4 8"): the Python side of the decode gap (dsv41_m2b_ref.py --profile) on the R1 reference
+    extra=(); [[ -n "${M2B_AOT_PROMPTS:-}" ]] && extra=(--aot-prompts "$M2B_AOT_PROMPTS")
     refs=("$REF")
     if step m2b-ref "${M2B_REF_MIN:-18}" python -u -B "$Z/tools/zig/dsv41_m2b_ref.py" --pack "$LP" --out "$REF" \
-            --layers "0-$hi" --steps "${M2B_STEPS:-64}" "${refargs[@]}" \
+            --layers "0-$hi" --steps "${M2B_STEPS:-64}" "${refargs[@]}" "${extra[@]}" \
        && step engram-host 3 python -B "$Z/tools/zig/dsv41_engram_host.py" --py-src /dsv41-tf/src \
             --config "$LP/config.json" --tokenizer "$LP/tokenizer.json" --out "$REF/engram-host.bin"; then
         if [[ -n "$PROMPTS" ]]; then
@@ -349,20 +352,60 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
             REF1=$LOCAL/m2b-ref-r1
             rm -rf "$REF1"
             mb=$(left); (( mb > 8 )) && mb=8
+            prof=(); [[ -n "${M2B_PROFILE_ROWS:-}" ]] && prof=(--profile "$M2B_PROFILE_ROWS")
             if (( mb >= 5 )) && (set -a; source "$Z/tools/zig/dsv41_m1/r1c-knobs.env"; set +a
                 export PYTHONPATH=/opt/r1c/src TORCH_EXTENSIONS_DIR=/opt/r1c/ext
                 step m2b-ref-r1 "$mb" python -u -B "$Z/tools/zig/dsv41_m2b_ref.py" --pack "$LP" --out "$REF1" \
-                    --layers "0-$hi" --steps "${M2B_STEPS:-64}" --port 29631); then
+                    --layers "0-$hi" --steps "${M2B_STEPS:-64}" --port 29631 "${extra[@]}" "${prof[@]}"); then
                 cp "$REF/engram-host.bin" "$REF1/"
+                cp "$REF1"/prof-rank*.json "$RES/" 2>/dev/null
+                # DSpark's variants under R1 (M2B_CAPTURE_R1=P) for M4 on these assets
+                [[ -d "$LOCAL/capture-r1/aot" ]] && python -B "$Z/tools/zig/dsv41_aot_merge.py" "$REF1/aot" "$LOCAL/capture-r1/aot" | tee -a "$RES/steps.txt"
                 mb=$(left); (( mb > 6 )) && mb=6
-                (export M2B_PORT=29741
+                # the decode gap (M2B_PROF=1): this gate's eager windows profiled, then M2B_PROF_ROWS windows timed
+                (export M2B_PORT=29741 M2B_PROF=1 M2B_PROF_ROWS="${M2B_ZIG_PROF_ROWS:-}"
                  step m2b-r1 "$mb" bash "$Z/tools/zig/dsv41_m1/m2b_ranks.sh" "$Z/bin/tf-dsv41-m1" "$LP" "$REF1" "$RES/m2b-r1") \
                     || rc=1
+                if [[ "${M2B_R1_GRAPHS:-0}" == 1 ]]; then
+                    mb=$(left); (( mb > 6 )) && mb=6
+                    (export TF_DSV41_GRAPHS=1 M2B_PROF=0 M2B_PROF_ROWS="${M2B_ZIG_PROF_ROWS:-}" M2B_PORT=29751
+                     step m2b-r1-graphs "$mb" bash "$Z/tools/zig/dsv41_m1/m2b_ranks.sh" "$Z/bin/tf-dsv41-m1" "$LP" "$REF1" "$RES/m2b-r1-graphs") \
+                        || rc=1
+                fi
                 mkdir -p "$RES/m2b-ref-r1"
                 for f in ref.json rank0.json rank1.json; do [[ -f "$REF1/$f" ]] && cp "$REF1/$f" "$RES/m2b-ref-r1/"; done
             else echo "m2b-r1 skipped or its reference failed" | tee -a "$RES/steps.txt"; rc=1; fi
         fi
     else rc=1; fi
+    # M2B_M4=1: M4 on the pod (the backbone prefix, R1 with the R1 reference's assets when it ran): the server on rank 0
+    # (drafts, graphs, Zig prefill) answers prompts.txt over HTTP, then the CLI replays its trace (HTTP == CLI with the
+    # drafts' counts), then again with drafts off (drafted == serial); each line reports its first differing token
+    if [[ "${M2B_M4:-0}" == 1 ]]; then
+        A=${REF1:-$R0}; [[ -d "$A/aot" ]] || A=$R0
+        m4env=(TF_TP_WORLD=2 TF_DSV41_ASSETS="$A" TF_DSV41_LAYERS="0-$hi" TF_DSV41_GRAPHS=1 TF_DSV41_OWN_PREFILL=1
+               TF_DSV41_FAILFAST=0 TF_DSV41_EXPERT_TOPP=${M2B_TOPP:-0.85})
+        [[ "$A" == "${REF1:-}" ]] && m4env+=(TF_DSV41_R1=1)
+        m4dir=$RES/m4; mkdir -p "$m4dir"
+        follow() { env "${m4env[@]}" TF_TP_RANK=1 TF_TP_DEVICE=1 TF_TP_PORT=$1 "$Z/bin/tf-dsv41-m1" follow "$LP" "$A" > "$m4dir/follow-$2.log" 2>&1; }
+        mb=$(left)
+        if (( mb >= 8 )); then
+            follow 29861 server & fpid=$!
+            env "${m4env[@]}" TF_TP_RANK=0 TF_TP_DEVICE=0 TF_TP_PORT=29861 TF_DSV41_TRACE_TOKENS="$m4dir/trace.jsonl" \
+                "$Z/bin/tensorfold-dsv41" serve "$LP" --port 8091 --parallel 1 > "$m4dir/server.log" 2>&1 & spid=$!
+            t=0; until grep -q "serving model" "$m4dir/server.log" 2>/dev/null || (( t > 600 )) || ! kill -0 $spid 2>/dev/null; do sleep 5; t=$((t + 5)); done
+            step m4-requests 6 bash "$Z/tools/zig/dsv41_m4/requests.sh" 8091 "${M2B_M4_TOKENS:-128}" || rc=1
+            kill $spid 2>/dev/null; wait $spid 2>/dev/null; wait $fpid 2>/dev/null
+            for mode in drafts serial; do
+                mb=$(left); (( mb >= 3 )) || { echo "m4-$mode skipped: $mb min left" | tee -a "$RES/steps.txt"; rc=1; continue; }
+                d=1; [[ "$mode" == serial ]] && d=0
+                port=$(( 29871 + d ))
+                (m4env+=(TF_DSV41_DRAFTS=$d); follow $port "$mode" & fp=$!
+                 step "m4-$mode" "$mb" env "${m4env[@]}" TF_DSV41_DRAFTS=$d TF_TP_RANK=0 TF_TP_DEVICE=0 TF_TP_PORT=$port \
+                     "$Z/bin/tf-dsv41-m1" generate "$LP" "$A" "$m4dir/trace.jsonl"; r=$?; wait $fp; exit $r) || rc=1
+                grep -h "^PASS\|^FAIL\|DSpark" "$RES/m4-$mode.log" | tee -a "$RES/steps.txt"
+            done
+        else echo "m4 skipped: $mb min left" | tee -a "$RES/steps.txt"; rc=1; fi
+    fi
     for d in "${refs[@]}"; do
         o=$RES/m2b-ref; [[ -n "$PROMPTS" ]] && o=$RES/m2b-ref/$(basename "$d")
         mkdir -p "$o"

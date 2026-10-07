@@ -56,6 +56,7 @@ pub const Config = struct {
     head_lanes: u32 = 0, // a lone stream's lanes at most, the planner picking each round's (0: the depth rule's chain)
     head_depth: u32 = 16, // and their depth at most
     own_prices: bool = true, // the planner prices each pick from the stream's own measured rounds (seeded from the table)
+    timed: bool = true, // false: rounds priced from the cost tables alone, no wall clock (a request drafts the same whatever the load or the requests before it)
     depth_prior: []f64,
     family_costs: Table,
     shared_costs: Table,

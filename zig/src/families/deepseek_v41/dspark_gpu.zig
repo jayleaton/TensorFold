@@ -96,7 +96,7 @@ pub const GpuPass = struct {
             .hid = try gpa.alloc(f32, @as(usize, @intCast(n)) * cfg.hidden),
         };
         x.pass_calls = try emit.emitPass(x.arena.allocator(), cfg, f.widths, f.opts, n);
-        f.drafter = .{ .ptr = x, .ingest = followIngest, .propose = followPropose };
+        f.drafter = .{ .ptr = x, .ingest = followIngest, .propose = followPropose, .reset = followReset };
         return x;
     }
 
@@ -133,8 +133,17 @@ pub const GpuPass = struct {
         return @ptrCast(@alignCast(p));
     }
 
+    /// A new request's draft context, on every rank: the followers' `valid` decides their half of the candidates, so a
+    /// follower that kept the last request's (the Spark window: the same request drafted 207 vs 199) drafts differently.
     fn reset(p: *anyopaque, slot: u32) void {
         _ = slot;
+        const x = self(p);
+        const op = fwd.Forward.dsResetOp();
+        x.f.sendDrafter(&op) catch |e| std.log.err("dspark: the draft reset did not reach the followers ({t})", .{e});
+        x.valid = 0;
+    }
+
+    fn followReset(p: *anyopaque) void {
         self(p).valid = 0;
     }
 

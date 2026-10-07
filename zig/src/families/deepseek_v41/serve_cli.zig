@@ -20,7 +20,7 @@ fn drafts() bool {
 }
 
 pub fn follow(gpa: std.mem.Allocator, io: std.Io, pack: []const u8, assets: []const u8) !u8 {
-    const m = try model.Model.open(gpa, io, pack, assets, .{ .drafts = drafts(), .own_prefill = model.ownPrefillEnv() });
+    const m = try model.Model.open(gpa, io, pack, assets, .{ .drafts = drafts(), .own_prefill = model.ownPrefillEnv(), .layers = try model.layersEnv(gpa) });
     defer m.close();
     if (m.rank() == 0) return error.RankZeroServes;
     std.debug.print("rank {d}: loaded, following rank 0\n", .{m.rank()});
@@ -79,7 +79,7 @@ pub fn generate(gpa: std.mem.Allocator, io: std.Io, pack: []const u8, assets: []
     var drafted: u64 = 0;
     var accepted: u64 = 0;
     while (lines.next()) |line| : (id += 1) {
-        const Line = struct { prompt: []const u32, tokens: []const u32 };
+        const Line = struct { prompt: []const u32, tokens: []const u32, drafted: ?u64 = null };
         const rec = try std.json.parseFromSliceLeaky(Line, a, line, .{ .ignore_unknown_fields = true });
         var box: Box = .{ .io = io, .gpa = gpa };
         defer box.tokens.deinit(gpa);
@@ -87,11 +87,13 @@ pub fn generate(gpa: std.mem.Allocator, io: std.Io, pack: []const u8, assets: []
         try eng.submit(id, &req, .{ .ctx = &box, .event = Box.event });
         const why = box.wait();
         const same = std.mem.eql(u32, box.tokens.items, rec.tokens);
+        // the first token index where the replay leaves the recorded reply (-1: none), and both draft counts
+        const first: i64 = if (same) -1 else @intCast(std.mem.indexOfDiff(u32, box.tokens.items, rec.tokens) orelse @min(box.tokens.items.len, rec.tokens.len));
         n += 1;
         equal += @intFromBool(same);
         drafted += box.drafted;
         accepted += box.accepted;
-        std.debug.print("{{\"line\": {d}, \"prompt\": {d}, \"tokens\": {d}, \"recorded\": {d}, \"finished\": \"{t}\", \"equal\": {}, \"drafted\": {d}, \"accepted\": {d}}}\n", .{ n, rec.prompt.len, box.tokens.items.len, rec.tokens.len, why, same, box.drafted, box.accepted });
+        std.debug.print("{{\"line\": {d}, \"prompt\": {d}, \"tokens\": {d}, \"recorded\": {d}, \"finished\": \"{t}\", \"equal\": {}, \"first_differing\": {d}, \"drafted\": {d}, \"recorded_drafted\": {?d}, \"accepted\": {d}}}\n", .{ n, rec.prompt.len, box.tokens.items.len, rec.tokens.len, why, same, first, box.drafted, rec.drafted, box.accepted });
     }
     const ok = n > 0 and equal == n;
     std.debug.print("{s} M4 CLI == HTTP: {d}/{d} replies equal\n", .{ if (ok) "PASS" else "FAIL", equal, n });

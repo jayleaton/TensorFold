@@ -3,7 +3,7 @@
 //! run `tf-dsv41-m1 follow PACK ASSETS`, which loads the same rank and replays rank 0's forward operations until the
 //! server stops. One slot (GpuTarget's): the host serves one stream at a time.
 //!
-//! TF_DSV41_ASSETS: the assets dir (model.zig). TF_DSV41_TRACE_TOKENS=<file>: every finished reply's prompt and reply
+//! TF_DSV41_ASSETS: the assets dir (model.zig). TF_DSV41_LAYERS=<lo>-<hi>: a backbone prefix only (a pod gate's model). TF_DSV41_TRACE_TOKENS=<file>: every finished reply's prompt and reply
 //! ids appended as a JSON line, for the gate that `tf-dsv41-m1 generate` replays the same prompt through the same
 //! engine without HTTP and must emit the same ids.
 
@@ -57,7 +57,7 @@ pub const Served = struct {
 
     /// Rank 0's engine over a loaded model (`drafts`: DSpark's pass, else serial windows through the same lanes).
     pub fn open(gpa: Allocator, io: std.Io, dir: []const u8, assets: []const u8, drafts: bool, context: ?i64) !*Served {
-        const m = try model.Model.open(gpa, io, dir, assets, .{ .drafts = drafts, .own_prefill = model.ownPrefillEnv() });
+        const m = try model.Model.open(gpa, io, dir, assets, .{ .drafts = drafts, .own_prefill = model.ownPrefillEnv(), .layers = try model.layersEnv(gpa) });
         errdefer m.close();
         if (m.rank() != 0) return error.NotRankZero; // the other ranks run `tf-dsv41-m1 follow`
         const s = try gpa.create(Served);
@@ -71,6 +71,9 @@ pub const Served = struct {
         s.x = try ln.Lanes.init(gpa, m.gt.target(), pass, s.costs, .{ .shape = m3.shapeOf(&m.f), .slots = 1 });
         s.arena = std.heap.ArenaAllocator.init(gpa);
         s.cfg = try lanes.Config.init(gpa, try s.x.model(s.arena.allocator(), 64), 16, 15);
+        // drafts sized from the cost tables, not the wall clock: a request drafts (and so verifies) the same whatever the
+        // load or the requests before it, so HTTP == CLI replay holds (TF_DSV41_DRAFT_TIMED=1: the measured pricing)
+        s.cfg.timed = if (std.c.getenv("TF_DSV41_DRAFT_TIMED")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
         s.clock = .{ .io = io };
         s.core = lanes.Engine.init(gpa, &s.cfg, s.x.backend(), s.clock.clock());
         s.x.attach(&s.core);
@@ -119,7 +122,7 @@ pub const Recorder = struct {
     /// every recorded line so far (the file is rewritten whole: one reply at a time)
     log: std.ArrayList(u8) = .empty,
 
-    const Rec = struct { r: *Recorder, sink: api.Sink, prompt: []u32, out: std.ArrayList(u32) = .empty };
+    const Rec = struct { r: *Recorder, sink: api.Sink, prompt: []u32, out: std.ArrayList(u32) = .empty, drafted: u64 = 0 };
 
     pub fn init(gpa: Allocator, io: std.Io, inner: api.Engine) Recorder {
         return .{ .gpa = gpa, .io = io, .inner = inner, .path = if (std.c.getenv("TF_DSV41_TRACE_TOKENS")) |p| std.mem.span(p) else null };
@@ -182,7 +185,10 @@ pub const Recorder = struct {
         const r = x.r;
         switch (ev.*) {
             .tokens => |t| x.out.appendSlice(r.gpa, t) catch {},
-            .finished => r.write(x),
+            .finished => |fin| {
+                x.drafted = fin.stats.drafted;
+                r.write(x);
+            },
             else => {},
         }
         x.sink.event(x.sink.ctx, id, ev);
@@ -197,7 +203,7 @@ pub const Recorder = struct {
     fn write(r: *Recorder, x: *const Rec) void {
         var line: std.Io.Writer.Allocating = .init(r.gpa);
         defer line.deinit();
-        std.json.Stringify.value(.{ .prompt = x.prompt, .tokens = x.out.items }, .{}, &line.writer) catch return;
+        std.json.Stringify.value(.{ .prompt = x.prompt, .tokens = x.out.items, .drafted = x.drafted }, .{}, &line.writer) catch return;
         line.writer.writeByte('\n') catch return;
         r.log.appendSlice(r.gpa, line.written()) catch return;
         std.Io.Dir.cwd().writeFile(r.io, .{ .sub_path = r.path.?, .data = r.log.items }) catch {};

@@ -186,7 +186,7 @@ pub const Forward = struct {
         f.ids = ids;
         f.slot.pending = .{ .start = f.slot.pos, .n = @intCast(ids.len) };
         f.runner.glue = .{ .ctx = f, .run = glueFn };
-        try f.runner.window(cs);
+        try f.runner.timedWindow(cs);
     }
 
     /// Greedy choices of the last window's rows (Python's forward.greedy): each rank's max a row (the lowest column on
@@ -276,6 +276,8 @@ pub const Forward = struct {
     const op_prefill: i64 = 7;
     const op_sess_save: i64 = 8;
     const op_sess_restore: i64 = 9;
+    const op_release: i64 = 10;
+    const op_ds_reset: i64 = 11;
 
     /// The session store's side of the forward (sessions_gpu.zig): `commit` hears every committed id (keep, prefill
     /// segments); `save` / `restore` are the leader's operations the followers run in its order.
@@ -284,7 +286,18 @@ pub const Forward = struct {
         commit: *const fn (ptr: *anyopaque, ids: []const u32) anyerror!void,
         save: *const fn (ptr: *anyopaque) anyerror!void,
         restore: *const fn (ptr: *anyopaque, id: u32) anyerror!void,
+        /// the slot empty: its pages back, the committed ids cleared
+        reset: *const fn (ptr: *anyopaque) anyerror!void,
     };
+
+    /// Frees the slot for the next stream on every rank (the Spark window's fix: a follower kept its position, so the
+    /// next request ran rank 1 from a stale slot): position 0, no Engram tail, no pending window, the pool's pages back.
+    pub fn release(f: *Forward) !void {
+        if (f.leads()) try f.link.?.send(&.{op_release});
+        if (f.sess) |x| return x.reset(x.ptr);
+        if (f.kv) |k| try k.release();
+        f.slot = .{};
+    }
 
     /// Rank 0: a session operation to the followers (before running it).
     pub fn sendSess(f: *Forward, op: enum { save, restore }, id: u32) !void {
@@ -296,7 +309,13 @@ pub const Forward = struct {
         ptr: *anyopaque,
         ingest: *const fn (ptr: *anyopaque, start: u64, row0: u32, n: u32, avail: u32) anyerror!void,
         propose: *const fn (ptr: *anyopaque, anchor: u32, start: u64) anyerror!void,
+        /// the slot's draft context restarts (a new request): every rank's, or their candidates differ
+        reset: *const fn (ptr: *anyopaque) void,
     };
+
+    pub fn dsResetOp() [1]i64 {
+        return .{op_ds_reset};
+    }
 
     /// Rank 0: a drafter operation to the followers (before running it).
     pub fn sendDrafter(f: *Forward, ints: []const i64) !void {
@@ -357,6 +376,7 @@ pub const Forward = struct {
                     if (prompt.items.len == total) try f.prefill(prompt.items);
                 },
                 op_keep => try f.keep(@intCast(msg[1])),
+                op_release => try f.release(),
                 op_stop => return,
                 op_sess_save => {
                     const x = f.sess orelse return error.BadPlan;
@@ -369,6 +389,10 @@ pub const Forward = struct {
                 op_ds_ingest => {
                     const d = f.drafter orelse return error.BadPlan;
                     try d.ingest(d.ptr, @intCast(msg[1]), @intCast(msg[2]), @intCast(msg[3]), @intCast(msg[4]));
+                },
+                op_ds_reset => {
+                    const d = f.drafter orelse return error.BadPlan;
+                    d.reset(d.ptr);
                 },
                 op_ds_propose => {
                     const d = f.drafter orelse return error.BadPlan;

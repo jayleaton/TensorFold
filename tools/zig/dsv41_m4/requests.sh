@@ -13,5 +13,5 @@ while IFS= read -r p; do
     t0=$(date +%s.%N)
     out=$(curl -s --max-time 600 "localhost:$PORT/v1/chat/completions" -H 'content-type: application/json' -d "$body")
     t1=$(date +%s.%N)
-    python3 -c 'import json, sys; d = json.loads(sys.argv[1]); u = d.get("usage", {}); print(json.dumps({"n": int(sys.argv[2]), "seconds": round(float(sys.argv[4]) - float(sys.argv[3]), 2), "usage": u, "text": (d.get("choices") or [{}])[0].get("message", {}).get("content", "")[:80]}))' "$out" "$n" "$t0" "$t1" || echo "request $n failed: ${out:0:200}"
+    python3 -c 'import json, sys; d = json.loads(sys.argv[1]); u = d.get("usage", {}); print(json.dumps({"n": int(sys.argv[2]), "seconds": round(float(sys.argv[4]) - float(sys.argv[3]), 2), "usage": u, "text": ((d.get("choices") or [{}])[0].get("message", {}).get("content") or "")[:80]}))' "$out" "$n" "$t0" "$t1" || echo "request $n failed: ${out:0:200}"
 done < "$HERE/prompts.txt"

@@ -131,6 +131,57 @@ def rank_main(rank: int, a) -> None:
             else:
                 kv.fresh(fw)
         one(rank, a, fw, cfg, greedy, Seg, digest, prompt, out, lo, hi, t0, load_s, i == len(dirs) - 1, kv)
+    # --profile "1 4 8": after the run, windows of each row count on the last prompt's slot: wall time a window (the
+    # stream synced; 3 warm + 16 timed, each kept whole) and the CUDA kernel time by name under torch.profiler, into
+    # DIR/prof-rank<r>.json (the decode gap's Python side: tf-dsv41-m1 m2b's M2B_PROF_ROWS + TF_DSV41_PROFILE)
+    if a.profile:
+        prof = {"rows": {}, "kernels": {}}
+        tok = 11
+        for n in [int(x) for x in a.profile.split()]:
+            ts = []
+            for i in range(19):
+                torch.cuda.synchronize()
+                t1 = time.perf_counter()
+                fw.run([Seg(0, fw.slot.pos, tuple([tok] * n))])
+                torch.cuda.synchronize()
+                if i >= 3:
+                    ts.append((time.perf_counter() - t1) * 1e3)
+                fw.keep(0, n - 1)
+            prof["rows"][str(n)] = {"ms_mean": sum(ts) / len(ts), "ms_min": min(ts)}
+            from torch.profiler import ProfilerActivity, profile as tprofile
+
+            with tprofile(activities=[ProfilerActivity.CUDA]) as pr:
+                for _ in range(8):
+                    fw.run([Seg(0, fw.slot.pos, tuple([tok] * n))])
+                    fw.keep(0, n - 1)
+                torch.cuda.synchronize()
+            ks = {}
+            for ev in pr.key_averages():
+                t = getattr(ev, "device_time_total", None) or getattr(ev, "cuda_time_total", 0)
+                if t:
+                    ks[ev.key] = {"calls": ev.count / 8, "ms": t / 1e3 / 8}
+            prof["kernels"][str(n)] = ks
+            if rank == 0:
+                print(f"profile: {n}-row windows {prof['rows'][str(n)]['ms_mean']:.3f} ms mean, "
+                      f"kernels {sum(v['ms'] for v in ks.values()):.3f} ms a window", flush=True)
+        (Path(a.out) / f"prof-rank{rank}.json").write_text(json.dumps(prof, indent=1) + "\n")
+    # --aot-prompts: more prompt lengths, each from a fresh slot, prefilled and decoded a step for their Triton variants
+    # alone (Triton specializes integer arguments on % 16 and == 1: rows, key counts and strides of every prefill
+    # path, the 64-row CUDA top-k and the `_keys` one; the Spark window's 45-token chat prompt had none). Nothing
+    # recorded comes from them, and the slot is fresh again after them.
+    for n in a.aot_prompts:
+        if kv is None:
+            fw.slots[0] = fw.new_slot(contiguous=True)
+        else:
+            kv.fresh(fw)
+        g = torch.Generator().manual_seed(a.seed + n)
+        ids = torch.randint(3, cfg.vocab_size, (n,), generator=g).tolist()
+        tok = int(greedy(fw, fw.prompt(ids)[-1:])[0])
+        fw.run([Seg(0, fw.slot.pos, (tok,))])
+        fw.keep(0, 0)
+        torch.cuda.synchronize()
+        if rank == 0:
+            print(f"aot prompt of {n}: done", flush=True)
     run_s = time.time() - t0 - load_s
     top = Path(a.out)
     cache = Path(os.environ.get("TRITON_CACHE_DIR", Path.home() / ".triton" / "cache"))
@@ -334,6 +385,9 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--layers", default="0-24")
     ap.add_argument("--prompt", type=int, default=1536)
+    ap.add_argument("--profile", default="", help="row counts (\"1 4 8\"): time windows of each after the run")
+    ap.add_argument("--aot-prompts", type=lambda v: [int(x) for x in v.split(",") if x], default=[],
+                    help="more prompt lengths after the run, for their Triton variants only (e.g. 1,9,17,45,64,65,173,300,1025,2049,2600)")
     ap.add_argument("--prompts", type=lambda v: [int(x) for x in v.split(",") if x], default=[],
                     help="several prompts in one load, each from a fresh slot into DIR/p<N> (both ranks here)")
     ap.add_argument("--steps", type=int, default=64)

@@ -109,6 +109,9 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, ref: []con
     const wd = try m2a.widths(a, &w, &pl);
     var runner: run.Runner = .{ .gpa = gpa, .d = &driver, .stream = stream, .kernels = &kernels, .triton = &aot, .weights = &w };
     defer runner.deinit();
+    // TF_DSV41_PROFILE=<file>: every eager decode window's calls timed (profile.zig), written at the end
+    runner.prof = try @import("profile.zig").Profile.fromEnv(gpa, &driver);
+    defer if (runner.prof) |p| p.close(io);
     // M2B_TOPP (the reference's TF_DSV41_EXPERT_TOPP): unset = top-p off (no prune; the router's tail folds kit
     // rounding and grouping), else prod's prune at that mass
     const topp: ?f64 = if (std.c.getenv("M2B_TOPP")) |v| try std.fmt.parseFloat(f64, std.mem.span(v)) else null;
@@ -265,6 +268,30 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, ref: []con
     }
     const dec_s = @as(f64, @floatFromInt(tw0.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds())) / 1e9;
     f.trace = null;
+    // M2B_PROF_ROWS ("1 4 8"): after the gate, windows of each row count timed (wall, the stream synced: eager, or
+    // graphed with TF_DSV41_GRAPHS=1), 3 warm + 16 timed, each kept whole; the decode gap's per-window figures
+    if (std.c.getenv("M2B_PROF_ROWS")) |spec| {
+        var it = std.mem.tokenizeScalar(u8, std.mem.span(spec), ' ');
+        while (it.next()) |word| {
+            const n = try std.fmt.parseInt(u32, word, 10);
+            const ids = try a.alloc(u32, n);
+            @memset(ids, tok);
+            var best: f64 = std.math.floatMax(f64);
+            var sum: f64 = 0;
+            for (0..19) |rep_i| {
+                const tr = std.Io.Clock.awake.now(io);
+                try f.window(ids);
+                try stream.synchronize();
+                const ms = @as(f64, @floatFromInt(tr.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds())) / 1e6;
+                try f.keep(n - 1);
+                if (rep_i < 3) continue;
+                best = @min(best, ms);
+                sum += ms;
+            }
+            try log.writer.print("{{\"prof_rows\": {d}, \"graphs\": {}, \"ms_mean\": {d:.3}, \"ms_min\": {d:.3}}}\n", .{ n, f.graphed != null and f.graphed.?.settings.on, sum / 16.0, best });
+            std.debug.print("rank {d}: {d}-row windows {d:.3} ms mean, {d:.3} min\n", .{ rank, n, sum / 16.0, best });
+        }
+    }
     const nl = mine.get("layers_first_window").?.object.count();
     const pre_ok = if (prefill_report) |pr| pr.ok() else true;
     if (prefill_report) |pr| try log.writer.print("{{\"prefill\": {{\"rows\": {d}, \"seconds\": {d:.2}, \"roles_equal\": {d}, \"roles\": {d}, \"first_differing_role\": \"{s}\", \"pos_equal\": {}, \"tail_equal\": {}, \"first_token\": {d}, \"want\": {d}}}}}\n", .{ pr.rows, pr.seconds, pr.equal, pr.roles, pr.first_bad, pr.pos_ok, pr.tail_ok, pr.first, pr.want_first });

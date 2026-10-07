@@ -95,7 +95,7 @@ pub const Sessions = struct {
         }
         errdefer if (s.disk) |d| d.close();
         s.store = try Store.init(gpa, io, &kx.pool, kx.dev.store(), s.disk, .{ .ram_bytes = o.ram_bytes, .chats = o.resident, .resident_bytes = o.resident_bytes });
-        f.sess = .{ .ptr = s, .commit = commitFn, .save = saveFn, .restore = restoreFn };
+        f.sess = .{ .ptr = s, .commit = commitFn, .save = saveFn, .restore = restoreFn, .reset = resetFn };
         return s;
     }
 
@@ -107,6 +107,11 @@ pub const Sessions = struct {
     fn saveFn(ptr: *anyopaque) anyerror!void {
         const s: *Sessions = @ptrCast(@alignCast(ptr));
         _ = try s.save();
+    }
+
+    fn resetFn(ptr: *anyopaque) anyerror!void {
+        const s: *Sessions = @ptrCast(@alignCast(ptr));
+        try s.reset();
     }
 
     fn restoreFn(ptr: *anyopaque, id: u32) anyerror!void {

@@ -119,12 +119,11 @@ pub const GpuTarget = struct {
             // the turn kept for the next one (a pending window is the reply's last token: committed first)
             if (t.f.slot.pending) |w| t.f.keep(w.n - 1) catch |e| std.log.err("sessions: keep before save failed ({t})", .{e});
             _ = ss.save() catch |e| {
-                std.log.err("sessions: save failed ({t}); the slot is reset", .{e});
-                ss.reset() catch {};
+                std.log.err("sessions: save failed ({t}); the slot is released", .{e});
+                t.f.release() catch |e2| std.log.err("dsv41 target: releasing the slot on the other ranks failed ({t})", .{e2});
             };
             return;
         }
-        if (t.f.kv) |kx| kx.release() catch {};
-        t.f.slot = .{};
+        t.f.release() catch |e| std.log.err("dsv41 target: releasing the slot on the other ranks failed ({t})", .{e});
     }
 };

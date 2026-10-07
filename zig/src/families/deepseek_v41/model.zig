@@ -43,6 +43,18 @@ pub const Options = struct {
     layers: ?[]const u32 = null,
 };
 
+/// TF_DSV41_LAYERS=<lo>-<hi>: load and run only that backbone prefix (a pod gate's model; null: every layer)
+pub fn layersEnv(gpa: std.mem.Allocator) !?[]const u32 {
+    const v = std.mem.span(std.c.getenv("TF_DSV41_LAYERS") orelse return null);
+    var it = std.mem.tokenizeScalar(u8, v, '-');
+    const lo = try std.fmt.parseInt(u32, it.next() orelse return error.BadLayers, 10);
+    const hi = try std.fmt.parseInt(u32, it.next() orelse return error.BadLayers, 10);
+    if (hi < lo) return error.BadLayers;
+    const ls = try gpa.alloc(u32, hi - lo + 1);
+    for (ls, 0..) |*l, i| l.* = lo + @as(u32, @intCast(i));
+    return ls;
+}
+
 /// TF_DSV41_OWN_PREFILL=0: prompts as 16-row decode windows (every rank must agree: the plans differ)
 pub fn ownPrefillEnv() bool {
     const v = std.c.getenv("TF_DSV41_OWN_PREFILL") orelse return true;

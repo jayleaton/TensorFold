@@ -6,7 +6,7 @@
 # Start it on both hosts within about a minute (each phase's rendezvous waits up to 30 min for the other host):
 #   dgx-01:  ./run_host.sh 0 OUTDIR
 #   dgx-02:  ./run_host.sh 1 OUTDIR
-# Prod must be stopped first (RUNBOOK.md). Knobs: STEPS (512), SEEDS ("4101"), PROMPT (1536), BACKEND (roce | nccl), LANES (1: also M3's lanes gate, about +12 min), PREFILL (1: Zig's own prefill gate, about +10 min).
+# Prod must be stopped first (RUNBOOK.md). Knobs: STEPS (512), SEEDS ("4101"), PROMPT (1536), BACKEND (roce | nccl), LANES (1: also M3's lanes gate, about +12 min), PREFILL (1: Zig's own prefill gate, about +10 min), AOT_PROMPTS (the reference's extra prompt lengths for M4's Triton variants: every prefill path; "" for none).
 set -u
 RANK=${1:?rank}; OUT=${2:?outdir}
 KIT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -48,7 +48,7 @@ for seed in $SEEDS; do
     log "seed $seed: Python reference (layers 0-39, prompt $PROMPT, $STEPS greedy steps, top-p 0.85)"
     t0=$(date +%s)
     docker run "${ARGS[@]}" "${KNOBS[@]}" -e TF_DSV41_EXPERT_TOPP=0.85 --name "dsv41-zig-ref-r$RANK" \
-        --entrypoint python "$IMAGE" -u -B /kit/tools/zig/dsv41_m2b_ref.py --pack /model --out "$R/ref" \
+        --entrypoint python "$IMAGE" -u -B /kit/tools/zig/dsv41_m2b_ref.py --pack /model --out "$R/ref" --aot-prompts "${AOT_PROMPTS-1,2,9,16,17,33,45,64,65,96,173,300,1025,2049,2600}" \
         --layers 0-39 --prompt "$PROMPT" --steps "$STEPS" --seed "$seed" --rank "$RANK" --master "$MASTER" --port $port \
         > "$OUT/seed$seed/ref.log" 2>&1
     rc=$?; log "seed $seed: reference rc $rc in $(( $(date +%s) - t0 )) s ($(tail -1 "$OUT/seed$seed/ref.log"))"
