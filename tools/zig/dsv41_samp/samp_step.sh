@@ -38,7 +38,7 @@ if [[ -z "$TRACE" ]]; then
 fi
 cp "$TRACE" "$RES/samp-trace.jsonl" 2>/dev/null
 if [[ -s "$TRACE" ]]; then
-    env=(TF_TP_WORLD=2 TF_DSV41_ASSETS="$A" TF_DSV41_LAYERS="0-$HI" TF_DSV41_GRAPHS="${SAMP_GRAPHS:-1}"
+    env=(TF_DSV41_SAMPLING=1 TF_TP_WORLD=2 TF_DSV41_ASSETS="$A" TF_DSV41_LAYERS="0-$HI" TF_DSV41_GRAPHS="${SAMP_GRAPHS:-1}"
          TF_DSV41_OWN_PREFILL="${SAMP_OWN_PREFILL:-1}" TF_DSV41_FAILFAST=0)
     for mode in serial drafts; do
         d=0; [[ $mode == drafts ]] && d=1

@@ -56,8 +56,12 @@ const dsv41_kernels = [_]Kernel{
     .{ .name = "dsv41_engram_gate", .src = "deepseek_v41/engram_gate", .flags = &.{ "-O3", "-lineinfo" } }, // tf_dsv41_engram_gate_v1
     .{ .name = "dsv41_l2pace", .src = "deepseek_v41/l2pace", .flags = &.{"-O3"} }, // tf_dsv41_l2pace_v1
     .{ .name = "dsv41_l2pf", .src = "deepseek_v41/l2pf", .flags = &.{"-O3"} }, // tf_dsv41_l2pf_v1 (glm5_next/spark/l2pf.cu)
-    .{ .name = "dsv41_sampling", .src = "deepseek_v41/sampling", .flags = &.{ "-O3", "--fmad=false" } }, // ours: nucleus.row_stats + cand_gather's pack
 };
+
+/// The keyed sampler's kernel (sampling.cu: nucleus.row_stats + cand_gather's pack), optional: built with -Dnvcc, taken
+/// from -Dfatbins when that dir holds dsv41_sampling.fatbin, else empty (the sampler then refuses to load).
+const dsv41_sampling: Kernel = .{ .name = "dsv41_sampling", .src = "deepseek_v41/sampling", .flags = &.{ "-O3", "--fmad=false" } };
+var dsv41_sampling_image: ?std.Build.LazyPath = null;
 
 /// The DeepSeek-V4.1 kernel module (zig/src/families/deepseek_v41/kernels.zig) over `cuda`; empty `images`: host-only.
 pub fn dsv41Kernels(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, images: []const ?std.Build.LazyPath) *std.Build.Module {
@@ -70,6 +74,8 @@ pub fn dsv41Kernels(b: *std.Build, target: std.Build.ResolvedTarget, optimize: s
     m.addImport("cuda", cuda);
     m.addOptions("dsv41_kernel_options", options);
     if (with) for (dsv41_kernels, images) |k, image| m.addAnonymousImport(b.fmt("dsv41_fatbin_{s}", .{k.name}), .{ .root_source_file = image.? });
+    const sampling = if (with) dsv41_sampling_image else null;
+    m.addAnonymousImport("dsv41_fatbin_dsv41_sampling", .{ .root_source_file = sampling orelse b.addWriteFiles().add("empty.fatbin", "") });
     return m;
 }
 
@@ -143,6 +149,13 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
         }
         if (image.*) |file| fatbin_step.dependOn(&b.addInstallFile(file, b.fmt("fatbin/{s}.fatbin", .{k.name})).step);
     }
+    if (prebuilt) |dir| {
+        const file = b.pathJoin(&.{ dir, "dsv41_sampling.fatbin" });
+        if (std.Io.Dir.cwd().access(b.graph.io, file, .{})) |_| {
+            dsv41_sampling_image = b.graph.cwdRelativePath(file);
+        } else |_| {}
+    } else if (nvcc) |tool| dsv41_sampling_image = fatbin(b, tool, version.?, dsv41_sampling, sms);
+    if (dsv41_sampling_image) |file| fatbin_step.dependOn(&b.addInstallFile(file, "fatbin/dsv41_sampling.fatbin").step);
     const dsv41 = dsv41Kernels(b, target, optimize, cuda, if (nvcc != null or prebuilt != null) &dsv41_images else &.{});
     const mods = family(b, target, optimize, cuda, draft_ids);
     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = target, .optimize = optimize, .link_libc = true });

@@ -1,14 +1,17 @@
 //! sampling.cu's launches (the `dsv41_kernels` module): a window's nucleus statistics and the candidates' packed rows,
-//! its own fatbin and module (`dsv41_sampling`, loaded beside `Kernels`).
+//! its own fatbin and module (`dsv41_sampling`, loaded beside `Kernels`). The fatbin is optional (zig/build/cuda.zig):
+//! an empty image, and `load` refuses.
 
 const std = @import("std");
 const cuda = @import("cuda");
-const options = @import("dsv41_kernel_options");
 
-const image: []const u8 = if (options.with_kernels) &Blob.bytes else &.{};
 const Blob = struct {
     pub const bytes align(16) = @embedFile("dsv41_fatbin_dsv41_sampling").*;
 };
+const image: []const u8 = &Blob.bytes;
+
+/// The build embedded the kernel (-Dnvcc, or -Dfatbins with dsv41_sampling.fatbin).
+pub const available = image.len > 0;
 
 pub const Functions = struct {
     module: cuda.Module,
@@ -16,7 +19,7 @@ pub const Functions = struct {
     pack_fn: cuda.Function,
 
     pub fn load(d: *const cuda.Driver) !Functions {
-        if (!options.with_kernels) return error.BuiltWithoutKernels;
+        if (!available) return error.SamplingKernelNotBuilt;
         var m = try cuda.Module.load(d, image);
         errdefer m.unload();
         return .{
