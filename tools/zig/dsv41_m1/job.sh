@@ -449,6 +449,18 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
          export SLOTS_PYSRC=${SLOTS_PYSRC:-/opt/r1c/src} TORCH_EXTENSIONS_DIR=${SLOTS_EXT:-/opt/r1c/ext}
          source "$Z/tools/zig/dsv41_slots/job.sh"; slots_gate) || rc=1
         grep -h "^slots\|PASS slots\|FAIL slots" "$RES"/slots*.log "$RES"/slots-*/rank0.log 2>/dev/null | tee -a "$RES/steps.txt"
+        # with M2B_SAMP: the sampled trace again at TF_DSV41_SLOTS=4, 4 replies in flight (samp_step.sh's slots4: a
+        # sampler a slot's rows == Python's serial replies), on the sampled reference's assets plus the slots
+        # reference's row-mode AOT variants
+        if [[ "${M2B_SAMP:-0}" == 1 && -s "$REF/samp/trace.jsonl" && -d "$LOCAL/slots-ref/aot" ]] && (( $(left) >= 5 )); then
+            sa=$LOCAL/samp-slots-assets
+            rm -rf "$sa"; cp -r "${R0:-$REF}" "$sa"
+            python -B "$Z/tools/zig/dsv41_aot_merge.py" "$sa/aot" "$LOCAL/slots-ref/aot" | tee -a "$RES/steps.txt"
+            mb=$(left); (( mb > 10 )) && mb=10
+            SAMP_KERNELS=0 SAMP_MODES=slots4 SAMP_TRACE=$REF/samp/trace.jsonl SAMP_MIN=$mb step samp-slots $(( mb + 1 )) \
+                bash "$Z/tools/zig/dsv41_samp/samp_step.sh" "$Z" "$LP" "$sa" "$hi" "$RES/samp" "$LOCAL/samp" || rc=1
+            grep -h "^PASS\|^FAIL" "$RES/samp/samp-slots4.log" 2>/dev/null | sed 's/^/samp-slots4: /' | tee -a "$RES/steps.txt"
+        fi
     fi
     for d in "${refs[@]}"; do
         o=$RES/m2b-ref; [[ -n "$PROMPTS" ]] && o=$RES/m2b-ref/$(basename "$d")

@@ -7,7 +7,8 @@
 //!                               greedy request of the recorded prompt and length; PASS when every reply's ids equal
 //!                               the recorded ones (M4's "HTTP tokens == CLI"); a line's "sampling" ({seed,
 //!                               temperature, top_k, top_p, min_p}: dsv41_samp_ref.py's replies) makes it that keyed
-//!                               request (the sampled gate: Python's tokens for the same request and seed)
+//!                               request (the sampled gate: Python's tokens for the same request and seed);
+//!                               TF_DSV41_GEN_STREAMS=N keeps N requests in flight (with TF_DSV41_SLOTS: batched rows)
 //!
 //! TF_DSV41_DRAFTS=0: no DSpark (serial windows through the same lanes), as the server's --no-drafts.
 
@@ -74,30 +75,43 @@ pub fn generate(gpa: std.mem.Allocator, io: std.Io, pack: []const u8, assets: []
     const s = try se.Served.open(gpa, io, pack, assets, drafts(), null);
     defer se.Served.close(s);
     const eng = s.engine();
+    const Keyed = struct { seed: u64, temperature: f64, top_k: u32, top_p: f64, min_p: f64 = 0 };
+    const Line = struct { prompt: []const u32, tokens: []const u32, drafted: ?u64 = null, sampling: ?Keyed = null };
+    var recs: std.ArrayList(Line) = .empty;
     var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| try recs.append(a, try std.json.parseFromSliceLeaky(Line, a, line, .{ .ignore_unknown_fields = true }));
+    // TF_DSV41_GEN_STREAMS=N: N requests in flight at once (the lanes batch them over the live slots); 1: one by one
+    const streams: usize = if (std.c.getenv("TF_DSV41_GEN_STREAMS")) |v| @max(1, std.fmt.parseInt(usize, std.mem.span(v), 10) catch 1) else 1;
+    const boxes = try a.alloc(Box, recs.items.len);
+    const reqs = try a.alloc(api.Request, recs.items.len);
     var n: usize = 0;
     var equal: usize = 0;
-    var id: api.Id = 1;
     var drafted: u64 = 0;
     var accepted: u64 = 0;
-    while (lines.next()) |line| : (id += 1) {
-        const Keyed = struct { seed: u64, temperature: f64, top_k: u32, top_p: f64, min_p: f64 = 0 };
-        const Line = struct { prompt: []const u32, tokens: []const u32, drafted: ?u64 = null, sampling: ?Keyed = null };
-        const rec = try std.json.parseFromSliceLeaky(Line, a, line, .{ .ignore_unknown_fields = true });
-        var box: Box = .{ .io = io, .gpa = gpa };
-        defer box.tokens.deinit(gpa);
-        const smp: ?api.Sampling = if (rec.sampling) |k| .{ .seed = k.seed, .temperature = k.temperature, .top_k = k.top_k, .top_p = k.top_p, .min_p = k.min_p } else null;
-        const req: api.Request = .{ .prompt = rec.prompt, .max_tokens = @intCast(rec.tokens.len), .drafts = drafts(), .sampling = smp };
-        try eng.submit(id, &req, .{ .ctx = &box, .event = Box.event });
-        const why = box.wait();
-        const same = std.mem.eql(u32, box.tokens.items, rec.tokens);
-        // the first token index where the replay leaves the recorded reply (-1: none), and both draft counts
-        const first: i64 = if (same) -1 else @intCast(std.mem.indexOfDiff(u32, box.tokens.items, rec.tokens) orelse @min(box.tokens.items.len, rec.tokens.len));
-        n += 1;
-        equal += @intFromBool(same);
-        drafted += box.drafted;
-        accepted += box.accepted;
-        std.debug.print("{{\"line\": {d}, \"prompt\": {d}, \"tokens\": {d}, \"recorded\": {d}, \"finished\": \"{t}\", \"equal\": {}, \"first_differing\": {d}, \"drafted\": {d}, \"recorded_drafted\": {?d}, \"accepted\": {d}}}\n", .{ n, rec.prompt.len, box.tokens.items.len, rec.tokens.len, why, same, first, box.drafted, rec.drafted, box.accepted });
+    var at: usize = 0;
+    while (at < recs.items.len) : (at += streams) {
+        const end = @min(recs.items.len, at + streams);
+        for (at..end) |i| {
+            const rec = recs.items[i];
+            boxes[i] = .{ .io = io, .gpa = gpa };
+            const smp: ?api.Sampling = if (rec.sampling) |k| .{ .seed = k.seed, .temperature = k.temperature, .top_k = k.top_k, .top_p = k.top_p, .min_p = k.min_p } else null;
+            reqs[i] = .{ .prompt = rec.prompt, .max_tokens = @intCast(rec.tokens.len), .drafts = drafts(), .sampling = smp };
+            try eng.submit(@intCast(i + 1), &reqs[i], .{ .ctx = &boxes[i], .event = Box.event });
+        }
+        for (at..end) |i| {
+            const rec = recs.items[i];
+            const box = &boxes[i];
+            defer box.tokens.deinit(gpa);
+            const why = box.wait();
+            const same = std.mem.eql(u32, box.tokens.items, rec.tokens);
+            // the first token index where the replay leaves the recorded reply (-1: none), and both draft counts
+            const first: i64 = if (same) -1 else @intCast(std.mem.indexOfDiff(u32, box.tokens.items, rec.tokens) orelse @min(box.tokens.items.len, rec.tokens.len));
+            n += 1;
+            equal += @intFromBool(same);
+            drafted += box.drafted;
+            accepted += box.accepted;
+            std.debug.print("{{\"line\": {d}, \"prompt\": {d}, \"tokens\": {d}, \"recorded\": {d}, \"finished\": \"{t}\", \"equal\": {}, \"first_differing\": {d}, \"drafted\": {d}, \"recorded_drafted\": {?d}, \"accepted\": {d}, \"streams\": {d}}}\n", .{ n, rec.prompt.len, box.tokens.items.len, rec.tokens.len, why, same, first, box.drafted, rec.drafted, box.accepted, streams });
+        }
     }
     const ok = n > 0 and equal == n;
     std.debug.print("{s} M4 CLI == HTTP: {d}/{d} replies equal\n", .{ if (ok) "PASS" else "FAIL", equal, n });
