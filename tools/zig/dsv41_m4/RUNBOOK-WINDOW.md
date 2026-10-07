@@ -56,7 +56,7 @@ It answers three questions:
 | 12 | dgx-01 | **restore prod:** `scripts/v2-rollback.sh perf1`, then `scripts/serve.sh status` (both ranks up, model `DeepSeek-V4.1-Flash-TF`) | 2 min |
 | 13 | dev box | collect `~/zig-window-kit/out/` from both nodes into `dsv41-exl3-quant/results/SPARK-ZIG-<date>/r0` and `r1` | 2 min |
 
-**Defaults of `run_m4.sh`** (both ranks must match): R1, graphs, Zig prefill, drafts, keyed sampling (`SAMPLING=1`), R3 Engram from the node's shards (`ENGRAM=1`: `/home/dgx01/dsv41-engram`, `/home/root/dsv41-engram`), drafts priced by prod's stored table (`CALIB=real`: the `dsv41-perf1-cache` volume read-only at `/cache`, `TF_DSV41_CALIB_DIR=/cache/dsv41-calib`), expert top-p 0.85, RoCE. Each can be turned off: `ENGRAM=0`, `CALIB=`, `SAMPLING=0`, `DRAFTS=0`, `GRAPHS=0`, `OWN_PREFILL=0`.
+**Defaults of `run_m4.sh`** (both ranks must match): R1, graphs, Zig prefill, drafts with prod's speculative pass (`SPEC=1`), keyed sampling (`SAMPLING=1`), R3 Engram from the node's shards (`ENGRAM=1`: `/home/dgx01/dsv41-engram`, `/home/root/dsv41-engram`), drafts priced by prod's stored table (`CALIB=real`: the `dsv41-perf1-cache` volume read-only at `/cache`, `TF_DSV41_CALIB_DIR=/cache/dsv41-calib`), expert top-p 0.85, RoCE. Each can be turned off: `ENGRAM=0`, `CALIB=`, `SAMPLING=0`, `SPEC=0`, `DRAFTS=0`, `GRAPHS=0`, `OWN_PREFILL=0`.
 
 **What each run is:**
 - **A, the prod candidate's one slot:** drafts on, contiguous slot (4,096 positions). Its 4-stream cells queue on one slot: they measure the one-slot server under load, not batching.
@@ -70,6 +70,7 @@ It answers three questions:
 - `BACKEND=nccl`: NCCL only.
 
 **What the numbers mean:**
+- The step 11 tables end with `T0 replies equal: N/M`: Zig's greedy replies against prod's, text for text (the same prompts, knobs and model, so they must all be equal). A difference names a bug to report, not a speed result.
 - The step 11 tables give Zig's tok/s against prod's per cell (best of 2 reps; 4 streams: the aggregate while all four are live).
 - Long context gives prompt tok/s (prompt tokens over the time to the first token) and the 128-token answer's decode tok/s.
 - `out/a/phases.json` holds Zig's per-round phase times: the host's share of a round, against Python's own phase report.

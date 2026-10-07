@@ -18,7 +18,8 @@
 #   unset: the contiguous slot), KV_SPLIT (1: comp rows sharded over the ranks, needs POOL_TOKENS), INDEX_KV (prod: fp8),
 #   ENGRAM (1: R3, the node's packed Engram shards as prod reads them: ENGRAM_DIR, prod-perf1.env's HEAD_ENGRAM /
 #   WORKER_ENGRAM), CALIB (real: the drafts priced by prod's stored table, CACHE_VOL read-only; "": the built-in costs),
-#   TREE (DSpark draft trees, e.g. 3; "": chains), PHASES (1: per-round phase times into OUTDIR/phases.json).
+#   TREE (DSpark draft trees, e.g. 3; "": chains), PHASES (1: per-round phase times into OUTDIR/phases.json),
+#   SPEC (1: the speculative DSpark pass, prod's TF_DSV41_SPEC_DRAFT=1; 0: off).
 # rows-aot (both hosts, once, before SLOTS > 1): the slots reference (tools/zig/dsv41_slots/ref.py) at TP=2 over the
 # two hosts on prod's tree, its row-mode Triton variants merged into ASSETS/aot (about 8 min).
 set -u
@@ -49,6 +50,7 @@ ARGS=(--rm --gpus all --ipc=host --network host --device /dev/infiniband --ulimi
 [[ "${CALIB-real}" == real ]] && ARGS+=(-v "$CACHE_VOL:/cache:ro" -e TF_DSV41_CALIB=real -e TF_DSV41_CALIB_DIR=/cache/dsv41-calib)
 [[ -n "${TREE:-}" ]] && ARGS+=(-e TF_DSV41_TREE="$TREE")
 [[ "${SLOT_DRAFTS:-0}" == 1 ]] && ARGS+=(-e TF_DSV41_SLOT_DRAFTS=1)
+[[ "${SPEC:-1}" == 1 ]] && ARGS+=(-e TF_DSV41_SPEC_DRAFT=1)    # prod's SPEC_DRAFT=1: the next round's pass early
 [[ "${PHASES:-0}" == 1 ]] && ARGS+=(-e TF_DSV41_PHASES=1 -e TF_DSV41_PHASES_OUT=/out/phases.json)
 NCCL='export TF_NCCL_LIB=$(python -c "import nvidia.nccl, os; print(os.path.join(os.path.dirname(nvidia.nccl.__file__), \"lib\", \"libnccl.so.2\"))" 2>/dev/null || echo libnccl.so.2)'
 case "$PHASE" in

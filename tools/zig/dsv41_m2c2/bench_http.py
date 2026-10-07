@@ -14,6 +14,7 @@ N are live (m2bench ``steady``). Standard library only (runs on the Spark hosts 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import threading
 import time
@@ -48,7 +49,7 @@ def one(url: str, model: str, msg: str, temp: float, max_tokens: int, out: dict)
         body.update(top_p=0.95, seed=1234)
     req = urllib.request.Request(f"{url}/v1/chat/completions", data=json.dumps(body).encode(),
                                  headers={"content-type": "application/json"})
-    times, usage, t0 = [], None, time.perf_counter()
+    times, usage, t0, text = [], None, time.perf_counter(), []
     with urllib.request.urlopen(req, timeout=900) as r:
         for raw in r:
             line = raw.decode().strip()
@@ -61,9 +62,11 @@ def one(url: str, model: str, msg: str, temp: float, max_tokens: int, out: dict)
                 delta = c.get("delta") or {}
                 if delta.get("content") or delta.get("reasoning_content"):
                     times.append(time.perf_counter())
+                    text.append(delta.get("content") or delta.get("reasoning_content") or "")
     n = (usage or {}).get("completion_tokens") or len(times)
     out.update(t0=t0, first=times[0] if times else None, last=times[-1] if times else None, tokens=n,
                prompt_tokens=(usage or {}).get("prompt_tokens"),
+               sha=hashlib.sha256("".join(text).encode()).hexdigest()[:16],
                decode_tok_s=round((n - 1) / (times[-1] - times[0]), 2) if len(times) > 1 and times[-1] > times[0] else None,
                ttft_s=round(times[0] - t0, 3) if times else None)
 
@@ -84,7 +87,8 @@ def cell(url: str, model: str, work: str, temp: float, streams: int, max_tokens:
         agg = round(sum(r["decode_tok_s"] * (hi - lo) for r in res if r.get("decode_tok_s")) / (hi - lo), 2)
     return {"work": work, "temp": temp, "streams": streams, "per_stream": rates,
             "mean_tok_s": round(sum(rates) / len(rates), 2) if rates else None, "aggregate_tok_s": agg,
-            "ttft_s": [r.get("ttft_s") for r in res], "tokens": [r.get("tokens") for r in res]}
+            "ttft_s": [r.get("ttft_s") for r in res], "tokens": [r.get("tokens") for r in res],
+            "sha": [r.get("sha") for r in res]}
 
 
 def document(n: int) -> str:
@@ -122,6 +126,16 @@ def compare(a_path: str, b_path: str) -> None:
     for k in sorted(pa):
         if k in pb and pa[k] and pb[k]:
             print(f"| {k[0]} | {k[1]} | {k[2]} | {pa[k]:.1f} | {pb[k]:.1f} | {100 * (pb[k] / pa[k] - 1):+.1f} % |")
+    # greedy (T0) replies: the same text on both sides, prompt by prompt (Zig's tokens == prod's)
+    eq = tot = 0
+    for ca in a["cells"]:
+        for cb in b["cells"]:
+            if key(ca) == key(cb) and ca["temp"] == 0 and ca.get("sha") and cb.get("sha") and ca.get("rep") == cb.get("rep"):
+                for x, y in zip(ca["sha"], cb["sha"]):
+                    tot += 1
+                    eq += x == y
+    if tot:
+        print(f"\nT0 replies equal ({b['label']} vs {a['label']}): {eq}/{tot}")
     la = {c["work"]: c for c in a["cells"] if c["work"].startswith("long-")}
     lb = {c["work"]: c for c in b["cells"] if c["work"].startswith("long-")}
     if la and lb:
