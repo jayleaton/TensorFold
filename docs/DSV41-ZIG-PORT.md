@@ -1120,6 +1120,73 @@ Rules from `ZIG-PREVIEW.md`:
 - **`roce.cu` wait fix (bb0cff8, Python):** nothing to port. The Zig TP runtime's one flag wait (`fabric/tp/mailbox.cu` `wait_flag`, used by the mailbox and `tp_roce`) only times out when `now > t0`, so a `%globaltimer` read below the start can't end it early. The Zig port is what found the Python bug.
 
 
+### Spark overnight window, 2026-10-07/08 (`dsq-zig-night-1`): outcome
+
+Both Sparks. **Prod (Python perf1) down 15:16:36 -> 22:42:12 UTC (7 h 25 min)**, restored with `scripts/v2-rollback.sh perf1`
+(17 x 23 -> 391, `serve.sh status` both ranks on 8474f31, a chat completion answered, watchdog + rearm timers on, lease
+removed; `config/prod.env` byte-identical to before the window, the zig-serve script copies replaced by the originals). Logs: the quant repo's
+`results/zig-night-20261007/` (`r0/`, `r1/`, `NOTES.md`). Kits were rebuilt eight times as fixes landed (clean `git archive`,
+aarch64, sm_121 fatbins = `dsv41-zig-ref/fatbin-kit` with the vision fix's `dsv41_vision.fatbin` 6f2ab33a); the last is
+tree `acae981`. Prod's own numbers were measured first (perf1, before the stop).
+
+| step | result |
+| --- | --- |
+| M2c-2, whole model, TP=2 over RoCE, R1, top-p 0.85 (kit 4144278) | **PASS** both ranks: tokens 512/512, logits 512/512, first-window blocks 40/40 |
+| `PREFILL=1`, 1,536 rows | **PASS** both ranks: state roles 95/95, first token 223 == 223, then 512/512 |
+| R1 timed windows (`PROF_ROWS="1 2 4" STEPS=64`, a585336) | **PASS** both ranks: 64/64 tokens + logits, 40/40 blocks, no fault. Zig R1 1 / 2 / 4-row windows 30.39 / 31.26 / 32.30 ms mean (both ranks alike) |
+| run A, 1 slot, drafts + spec pass + sampling + R3 Engram + graphs | **PASS** after 3 fixes: 16/16 bench cells, 8/8 requests; CLI replay **49/49 equal**, DSpark 9,682 / 14,460 = 0.670, speculative passes 800 / 800 used |
+| run B, 4 slots, drafts off | **PASS** after the pool-aot phase: 16/16 cells |
+| run B2, 4 slots + per-slot drafts (prod's shape) | **PASS** after 1 fix: 16/16 cells, 8/8 requests; CLI replay at 4 streams **49/49 equal**, DSpark 9,482 / 14,231 = 0.666 |
+| run C, 1M context (replicated 1.4M pool, graphs off) | 32K and 131K **PASS** (128-token answers); 619,688-token prefill completed (no error) but the bench client's 900 s timeout left before the first token. Split KV not run (no Python tree with a split pool on the Sparks) |
+| Zig as prod (part 4, image `tensorfold-dsv41-zig:acae9818440c`, zig-serve + `2d80119`) | first boot ready after 810 s (44 prepared layer files written; `4 slot(s) x 4096` - `CONTEXT` never reached the engine, fixed in serve.sh `2d80119`); canaries chat / thinking / tool / json / tokenize ok; **fast boot 375 s** (44 read, 0 built; weights 367 s, 261 s of it upload + digest; Python: 33-48 s); wire probe: every shape == Python's except `/health` `prefill_seconds_total` (Python int 0 before any prefill); request log 41 keys a line; disconnect -> `finish: cancelled`, inflight 0; **fail-fast**: rank 1 killed 22:34:09, rank 0 exit 70 ~1 s later, the first watch tick healed, serving + 17 x 23 -> 391 at 22:40:52. **At `CONTEXT=1048576` with 4 slots rank 1 refused `UnknownRowsCall` at boot** (row mode does not rewrite the long-context selections; Python runs `_dtopk` / `_stream` with `ROWS=1`), then segfaulted on exit |
+| Zig prod vs Python prod, the same 8 greedy requests (`requests.sh`, thinking on, 41-60-token prompts) | **5/8 replies equal** (256 tokens each, same prompt hashes); 2, 5, 7 differ inside the reasoning (Zig stops at 240 / 217 tokens where Python runs to 256) |
+| images (V1-V5, `tools/zig/dsv41_vision/spark.sh`) | V1 PASS both ranks; **V2 FAIL 0/3**: first differing stage b0.attn, 3 / 12 / 8 elements (photo / wide / small) 1 bf16 ulp (pod 30: 0.35-0.6 % of elements); resync keeps b0.attn's counts. V3-V5 skipped. Keep `IMAGES` off |
+
+**Speed, Zig against prod (perf1), tok/s, best of 2, 384 tokens, thinking off:**
+
+| workload | T | streams | prod | run A (1 slot, 8914a48) | run B (4 slots, no drafts) | run B2 (4 slots + drafts, 2d92469) |
+|---|---|---|---:|---:|---:|---:|
+| code | 0 | 1 | 84.7 | 44.6 | 40.6 | 60.4 |
+| code | 0 | 4 | 143.6 | 45.5 | 93.6 | 82.2 |
+| code | 0.7 | 1 | 87.3 | 42.2 | 40.6 | 58.1 |
+| code | 0.7 | 4 | 141.8 | 45.8 | 90.4 | 90.8 |
+| prose | 0 | 1 | 51.6 | 22.3 | 40.2 | 34.3 |
+| prose | 0 | 4 | 96.4 | 23.6 | 94.2 | 57.4 |
+| prose | 0.7 | 1 | 47.4 | 22.5 | 40.2 | 35.2 |
+| prose | 0.7 | 4 | 95.5 | 23.7 | 91.2 | 55.9 |
+
+Run A predates `9bc88af` (the DSpark pass 31.5 -> 7.0 ms a round); B2 has it. **T0 replies equal to prod: 0/20** in every run
+(the bench keeps hashes only; see open items).
+
+**Long context (run C, eager decode):**
+
+| prompt tokens | prod TTFT s (tok/s) | Zig TTFT s (tok/s) | prod decode | Zig decode |
+|---:|---:|---:|---:|---:|
+| 37,974 | 15.6 (2,430) | 67.4 (563) | 50.5 | 36.4 |
+| 154,183 | 68.1 (2,263) | 263.4 (585) | 54.0 | 38.9 |
+| 619,688 | 371.2 (1,669) | ~1,319 (~470; prefill done, client gone) | 43.2 | not measured |
+
+**Fixes made in the window** (each general; own-hunk commits):
+- `5df2977` slots `ref.py`: Pool's `split=` / `rank=` only where the tree takes them (prod's 8474f31 Pool has neither: rows-aot failed).
+- `d44c167` `model.zig`: `rope.bin` read without the 256 MiB cap (the 1M limit's tables are 538 MB: every rank's load failed `StreamTooLong`).
+- `817ff07` kit `taps-aot` + `dsv41_m2b_ref.py --aot-taps`: a drafting server's prefill launches the tap layers' `_site` with `TAP_ON`; no reference recorded one.
+- `8914a48` `dspark_gpu.zig` / `dspark_slots.zig`: DSpark's host uploads on the runner's stream. A pageable `cuMemcpyHtoD` returns before its DMA lands and the non-blocking stream does not wait, so the candidates' all-gather could send stale bf16 partials as token ids (rank 0 panicked in `dspark.bias` on id 0x4002C00B = two bf16s). Gathered candidates are checked on every rank (`error.BadCandidates`); `2d92469` limits the slots' check to the pass's rows.
+- `9bc88af` `draft/dspark.zig`: candidates by a bounded selection under the same (value desc, id asc) order instead of sorting the rank's whole vocabulary a row (40.9 ms a pass; the same first k, tested against the full sort with ties).
+- `1ce0d7c`, `73418f9`, `fe661fd`, `607a561`, `943eb82` kit `pool-aot` (+ `dsv41_m5_kv.py` on prod's Pool): prompts and decode on the paged pool at the served limit - `_fused` / `_scores` / `_block_keys` / `_stream` / `_dtopk` variants the contiguous references never launch. Every one was a gap in the AOT set, not in Zig's arguments: Python passes the same values (`nsplit` is a runtime int: Triton folds 1, so a set with only one-split streams made Zig treat it as a constexpr).
+- `e4fce04` `aot.zig`: a missing variant's report lists the launch's constexprs.
+- `115b46e`, `acae981` `block.zig`: past attn_cuda's 8 x 512 x 31 entries a selection runs Python's Triton `_dtopk` (`dtopk.select`, then the candidate source's blocks as their own CUDA job, or `dtopk.blocks` past 126,976 blocks) as `backend.select` does when `attn_cuda.plan` is None (decode at 154K: `error.Shape` on both ranks; the 1M plan refused at boot).
+
+**Open, from the window:**
+- **Zig prod != Python prod on 3/8 short greedy requests** (and the bench's T0 cells 0/20, thinking off, streamed) while Zig's served path == its own CLI replay (49/49) and the M2c-2 / prefill gates are bit-exact. Prompts render alike (same head hashes and counts). Next: both engines with drafts off and the reasoning text kept, then with drafts on at one slot, to name the first differing token and whether the verify windows' row counts or the 4-slot row mode carry it.
+- **4 slots x 1M on Zig:** row mode needs the long-context selections (`_dtopk` / `_stream` with `ROWS=1`) before prod can switch; one slot at 1M works (run C).
+- **Fast boot is upload-bound:** 261 s of the 367 s is "upload + digest" with the prepared images already read.
+- **`/cache/roce-failed`** exists in prod's cache volume (preflight: "both ranks start on NCCL"); delete it to retry RoCE, if that is intended.
+- **Long prefill ~4x slower than prod** (563-585 tok/s vs 2,263-2,430): the stream top-k path and 2,048-row segments; profile with `TF_DSV41_PHASES`.
+- **Graphs with one slot on the paged pool** pad NK to the 2,048 context bucket: no reference decodes through Python's graph buckets (`_scores` paged NK 2048 missing); run C ran eager.
+- **Speed at short prompts:** B2 code T0 1-stream 60.4 vs 84.7; 4 streams 82-91 vs 142-144. The window's choice reads wait on the GPU forward; next is the per-round phase split (`out/b2/phases.json`).
+- **The AOT set is sampled, not complete:** a served shape no reference launched fails `MissingTritonVariant`. A fill step that compiles the emitter's specs straight from Python's Triton source (the same cubins its JIT builds) would close the class.
+- Images: V2 still 1 ulp at b0.attn (owner `dsq-zig-vision-1`).
+
 ### Spark window, 2026-10-07: outcome
 
 Prod was down 12:34-14:07 (93 min) and was restored on perf1 (`scripts/v2-rollback.sh perf1`: 17 x 23 -> 391,
