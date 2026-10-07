@@ -176,6 +176,15 @@ def rank_main(rank: int, a) -> None:
                 print(f"profile: {n}-row windows {prof['rows'][str(n)]['ms_mean']:.3f} ms mean, "
                       f"kernels {sum(v['ms'] for v in ks.values()):.3f} ms a window", flush=True)
         (Path(a.out) / f"prof-rank{rank}.json").write_text(json.dumps(prof, indent=1) + "\n")
+    # --sampled (dsq-zig-samp-1): the keyed sampling gate's reference on this load (dsv41_samp_ref.run_cases: its prompts
+    # from fresh slots, serial sampled decoding, DIR/samp/trace.jsonl for tf-dsv41-m1 generate); before the AOT dump, so
+    # its prompt lengths' Triton variants are in the set
+    if a.sampled:
+        if kv is not None:
+            raise SystemExit("--sampled: the contiguous slot only (no --pool / --split / --park)")
+        import dsv41_samp_ref
+
+        dsv41_samp_ref.run_cases(fw, cfg, rank, Path(a.out) / "samp", dsv41_samp_ref.PROMPTS, a.steps, a.seed)
     # --aot-prompts: more prompt lengths, each from a fresh slot, prefilled and decoded a step for their Triton variants
     # alone (Triton specializes integer arguments on % 16 and == 1: rows, key counts and strides of every prefill
     # path, the 64-row CUDA top-k and the `_keys` one; the Spark window's 45-token chat prompt had none). Nothing
@@ -405,6 +414,8 @@ def main() -> int:
     ap.add_argument("--prompts", type=lambda v: [int(x) for x in v.split(",") if x], default=[],
                     help="several prompts in one load, each from a fresh slot into DIR/p<N> (both ranks here)")
     ap.add_argument("--steps", type=int, default=64)
+    ap.add_argument("--sampled", action="store_true",
+                    help="also the keyed sampling gate's replies (dsv41_samp_ref.run_cases) into DIR/samp/trace.jsonl")
     ap.add_argument("--limit", type=int, default=4096)
     ap.add_argument("--seed", type=int, default=4101)
     ap.add_argument("--port", type=int, default=29611)

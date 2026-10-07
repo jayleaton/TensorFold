@@ -306,6 +306,9 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
     # M2B_AOT_PROMPTS (1,9,45,...): more prompt lengths for their Triton variants (every prefill path; M4's assets);
     # M2B_PROFILE_ROWS ("1 4 8"): the Python side of the decode gap (dsv41_m2b_ref.py --profile) on the R1 reference
     extra=(); [[ -n "${M2B_AOT_PROMPTS:-}" ]] && extra=(--aot-prompts "$M2B_AOT_PROMPTS")
+    # M2B_SAMP=1 (dsq-zig-samp-1): the reference also writes the sampled replies (--sampled: $REF/samp/trace.jsonl, its
+    # prompt lengths in the AOT set); tools/zig/dsv41_samp/samp_step.sh runs on it after M4
+    [[ "${M2B_SAMP:-0}" == 1 ]] && extra+=(--sampled)
     refs=("$REF")
     if step m2b-ref "${M2B_REF_MIN:-18}" python -u -B "$Z/tools/zig/dsv41_m2b_ref.py" --pack "$LP" --out "$REF" \
             --layers "0-$hi" --steps "${M2B_STEPS:-64}" "${refargs[@]}" "${extra[@]}" \
@@ -412,6 +415,16 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
                 grep -h "^PASS\|^FAIL\|DSpark" "$RES/m4-$mode.log" | tee -a "$RES/steps.txt"
             done
         else echo "m4 skipped: $mb min left" | tee -a "$RES/steps.txt"; rc=1; fi
+    fi
+    # M2B_SAMP=1: the keyed sampling gate (2 GPUs): tf-dsv41-samp, then tf-dsv41-m1 generate on the reference's sampled
+    # replies with drafts off and on (Zig == Python token for token: "PASS M4 CLI == HTTP: 6/6 replies equal" each)
+    if [[ "${M2B_SAMP:-0}" == 1 ]]; then
+        mb=$(left); (( mb > 12 )) && mb=12
+        if (( mb >= 4 )) && [[ -s "$REF/samp/trace.jsonl" ]]; then
+            SAMP_TRACE=$REF/samp/trace.jsonl SAMP_MIN=$mb step samp $(( 3 * mb )) bash "$Z/tools/zig/dsv41_samp/samp_step.sh" \
+                "$Z" "$LP" "${R0:-$REF}" "$hi" "$RES/samp" "$LOCAL/samp" || rc=1
+            grep -h "^samp\|^PASS\|^FAIL" "$RES/samp/steps.txt" "$RES"/samp/samp-*.log 2>/dev/null | tee -a "$RES/steps.txt"
+        else echo "samp skipped: $mb min left or no sampled reference" | tee -a "$RES/steps.txt"; rc=1; fi
     fi
     for d in "${refs[@]}"; do
         o=$RES/m2b-ref; [[ -n "$PROMPTS" ]] && o=$RES/m2b-ref/$(basename "$d")
