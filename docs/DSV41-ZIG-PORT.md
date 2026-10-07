@@ -95,7 +95,7 @@ Five agents work on `dsv41-zig` at once toward one combined pod gate and one Spa
 
 **Interface rules.**
 - **Plan-link operation numbers** (`forward.zig`): 1–11 are taken (window, greedy, keep, stop, ds_ingest, ds_propose, prefill, sess_save, sess_restore, release, ds_reset). Reserve new ones by appending to this list in this section, in the same commit that adds them:
-  - 12–15: `dsq-zig-samp-1`;
+  - 12–15: `dsq-zig-samp-1` (12 taken: `op_sample`, `[op, row0, n, T, top_k, top_p, min_p]`);
   - 16–19: `dsq-zig-slots-1`;
   - 20–23: `dsq-zig-trees-1` (20: `op_tree_drop`, `Forward.drop`);
   - 24–27: `dsq-zig-speed-1`.
@@ -121,6 +121,28 @@ Five agents work on `dsv41-zig` at once toward one combined pod gate and one Spa
   - M4 on the pod (HTTP == CLI with drafts, drafted == serial);
   - M5 `paged` / `split` / `compact` / `park` (`M1_JOB=m5`);
   - the boot check (host goldens).
+- `dsq-zig-samp-1` (keyed sampling on the GPU path):
+  - **What it is.** `sampling_pipe.zig` runs Python's steps on every rank, so the collectives pair up and every rank decides alike:
+    - each rank's top `count` (`pick.top`), all-gathered;
+    - `vsample.merge`;
+    - the nucleus statistics plus the whole-row fallback (`nucleus.finish`);
+    - `serve/sampling.zig`'s `Picker` (= `Batcher._choose`), keyed at the row's position.
+  - **Device side.** `sampling_dev.zig` (`topk_keys.cu` + the new `sampling.cu`: `row_stats`, the packed rows) behind `sampling_pipe.Device`. `HostDevice` is the reference the host tests run.
+  - **The other files.** `sampling_gpu.zig` holds `GpuSampler`: model.zig makes one on every rank; rank 0 sends `op_sample` before its gathers, and the followers run it from `follow`. `sampling_kernels.zig` loads its own fatbin `dsv41_sampling`.
+  - **Hooks:**
+    - `forward.zig`: `Forward.sampler` and `op_sample`;
+    - `target.zig`: prefill and window choices with T > 0 go to `sampler`; without one they are refused (`error.Sampling`);
+    - `model.zig`: init / deinit;
+    - `serve_cli.zig`: a trace line's `sampling`;
+    - build: `zig/build/sampling.zig`. `cuda.zig` gets the `dsv41_sampling` kernel, `tf-dsv41-samp`, and `dsv41_serve` for `tf-dsv41-m1`, whose `core` is now `safetensors_root.zig`. `server.zig` gives `dsv41_serve` to the native engine.
+  - **Host gate:** `zig build test-dsv41-sampling`. The committed serving goldens on two in-process ranks: 207/207 sampled rows equal Python's tokens, including 14 whole-row fallbacks. A window's rows pick as each row alone does, and as `exact_sampling.choose` over the whole row.
+  - **Slots and trees.** A mixed window calls `GpuSampler.choose` once per slot's rows: `row0` / `n`, one sampling each, one `op_sample` each. Tree chains go through `window`, so they sample too.
+  - **Pod step:** `tools/zig/dsv41_samp/samp_step.sh Z LP ASSETS HI RES LOCAL`, inside `M1_JOB=m2b` after the M2b reference (its assets: aot / rope / engram-host). About 1 min, plus a Python load if `SAMP_TRACE` is unset, plus 2 x (Zig load + 6 x 64 tokens). It runs:
+    1. `tf-dsv41-samp` on GPU 0. Expected: `PASS tf-dsv41-samp: 0 checks failed`.
+    2. `dsv41_samp_ref.py` at TP=2: 6 prompts (37, 50, 66, 83, 128 and 292 ids), 6 samplings (T 0.6–1.3; top_p 0.8–1.0; top_k 0 / 20; min_p 0 / 0.05; a seed above 2^63). To save the second Python load, call `dsv41_samp_ref.run_cases(fw, cfg, rank, out, prompts, steps)` at the end of `dsv41_m2b_ref.py` on both ranks and pass `SAMP_TRACE`.
+    3. `tf-dsv41-m1 generate` on that trace, `TF_DSV41_DRAFTS=0`, then `1`. Expected in each: `PASS M4 CLI == HTTP: 6/6 replies equal` (here it means Zig == Python).
+    - With `SAMP_OWN_PREFILL=1` (the default), the prompt lengths need their Triton variants: add `37,50,66,83,128,292` to `M2B_AOT_PROMPTS`, or set `SAMP_OWN_PREFILL=0`.
+    - The kernel fatbins must include `dsv41_sampling`. With `-Dnvcc=` it is built. With `-Dfatbins=` (`build-pod.sh`), copy `zig-dsv41-scratch/samp/fatbin/dsv41_sampling.fatbin` into the fatbin dir first. It was built with nvcc 13.3, the build's flags, for sm_120 and sm_121.
 - `dsq-zig-trees-1` (draft trees on the GPU target; design below):
   - **`M2B_LANES=4`** (`M1_JOB=m2b`, 2 GPUs, about 4 min after the shared load): lanes with first-position trees (2 siblings) and the tree oracle's drafts over the GPU target at TP=2. Rank 0's tokens must equal the reference's serial greedy tokens, with trees > 0 and 0 < sibling wins < trees. Expected lines: `PASS M3 lanes mode 4 rank 0: tokens 64/64 equal, drafted N, accepted M, trees T, sibling wins W, ...` and `PASS M3 lanes mode 4 rank 1`. `m3-4/m3-rank0.json` also records `chains` and `rerun_rows`. No new assets.
   - **`M2B_LANES=3` with `TF_DSV41_TREE=3`** (about 4 min): DSpark's own siblings (gathered `[block, 128]` candidates) through the same path. The gate is tokens equal and drafted > 0. On the 0–24 prefix the taps are zeros, so the tree counts are informational. `job.sh` runs one mode list with one environment, so this needs its own mode token. The suggested hook is `3t` → `M2B_LANES=3 TF_DSV41_TREE=3`, with the result dir `m3-3t`.
