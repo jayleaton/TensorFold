@@ -346,6 +346,8 @@ The hooks:
     7. `scripts/v2-rollback.sh perf1`.
   - **Assets:** the kit's `m4-assets` on both nodes (`HEAD_ASSETS` / `WORKER_ASSETS` of `config/prod-zig.env`), and the gated sm_121 fatbins for the image's build context.
 
+- `dsq-zig-knobs-1` (prod knob parity; section 0e): `tools/zig/dsv41_knobs/job.sh`, `knobs_gate` inside `M1_JOB=m2b` after the M2b reference (`M2B_KNOBS=1`, the integrator's hook). Six runs of the `M2B_PREFILL` gate with one prod knob each on the Zig ranks (fused dense prefill, 1,024- / 512-row segments, 64 MiB index budget, Engram read-ahead, all together): 65/65 roles and 64/64 tokens each, about 18 min, no Python load. Details in 0e.
+
 ### Pod 26, the combined gate (2026-10-07, 57 min, $3.97)
 
 The tree was `798b4f5`, built from a clean archive. The fatbins were the sm_120 base set plus `dsv41_kvsplit` and `dsv41_sampling`. Logs are in the quant repo, `results/20261007-comb26-pod26`.
@@ -574,6 +576,83 @@ Where the Zig numbers are more faithful than prod's:
 - `canary.py --skip`.
 - `docs/ZIG-SERVE.md`.
 - The watchdog tick (`/health` + exit 70) and the systemd units need no change.
+
+### 0e. Prod knob parity: the engine knobs (`dsq-zig-knobs-1`)
+
+Every key of `dsv41-tensorfold-spark/config/prod.env` (PERF1, engine 8474f31), checked against the Zig port and the Python reference (`tensorfold-decode1` at 8474f31). Classes:
+- **(a)** changes the bits, and the Zig emitters already match it: the captures were taken with prod's knobs (`M1_KNOBS=prod`, `tools/zig/dsv41_m1/prod-knobs.env`; R1 through `r1c-knobs.env`);
+- **(b)** changes the bits, and Zig does not match it;
+- **(c)** speed only;
+- **(d)** memory or admission;
+- **(e)** serving or ops (`dsq-zig-ops-1`, section 0d);
+- **(f)** Python-only, with no Zig meaning.
+
+**(a) Matched bits.** The evidence is the M1 replays and the block forward on prod's captures (pods 8 / 9: 1,254 / 1,254 launches, 717 / 717 calls), the 2,048-row prefill capture (pod 15, cap15), the short segments (cap24-1 / 12 / 16), the R1 capture (pod 22, cap22: decode and DSpark 0 mismatches, the R1 M2b gate graphs off and on), M2c-1 (pod 14: top-p 0.85) and the prefill gates (pods 23 / 25).
+
+| Knobs | How Zig matches them |
+|---|---|
+| `TF_DSV41_PREFILL_KERNELS=fast`, `FAST_EXPERTS=gm`, `PF_COPIES=1`, `MHC_PF=1`, `PREFILL_GATHER=bf16`, `PREFILL_ATTN=fused`, `_ATTN_BMQ=32`, `_ATTN_WARPS=8`, `PREFILL_ROUTER=gemv`, `INDEX_STREAM_MIN=4096`, `PLAIN_TRITON=1`, `ROPE_INPLACE=1`, `MHC_BM=64`, `MHC_WARPS=8`, `EXPERT_PREFILL=0` | the prefill emitter (`block_prefill.zig`) is prod's path; cap15 / cap18 / cap24-* check 0 mismatches |
+| `ROUTER=gemv`, `DENSE=0`, `MHC_DEC=1`, `MHC_FIN2=1`, `RMS_PAIR=1`, `PARTIAL_BF16=1`, `RG_NARROW=2`, `RG_TAIL=1`, `INDEX_DTOPK=1`, `ENGRAM_FUSE_DEC=1`, `MHC_FN=bf16`, `MHC_CUDA=1`, `ATTN_CUDA=1`, `DENSE_V3=1`, `PDL=0`, `INDEX_KV=fp8`, `EXPERT_LOADS=1`, `KV_DTYPE=fp8` (serve.sh's `--kv-dtype`) | the decode emitter (`block.zig`, `block_moe.zig`) is prod's path; M1 pods 8 / 9, `check` on every capture |
+| `EXPERT_TOPP=0.85`, `EXPERT_MIN_K=3`, `EXPERT_RENORM=kept` | `TF_DSV41_EXPERT_TOPP` (same name), min-k 3 and kept renorm in the emitter; M2c-1 PASS |
+| `ATTN_SPLIT=4`, `ATTN_ROPE=1`, `MHC_TAIL=1`, `MHC_DEFER=1`, `MOE_BF16=1`, `PRUNE_KIT=1`, `RG_PRUNE=1`, `RMS_FOLD=1` (R1; the same bits) | `block.Options.r1`; cap22 0 mismatches, R1 M2b PASS. **Ported here:** the served model also turns R1 on from these eight Python names at prod's values (`prod_knobs.r1`; it only read `TF_DSV41_R1=1` before, which still wins). A partial set is logged and runs without R1 |
+| `TF_DSV41_ENGRAM_DIR` | R3 (`engram_rows.zig`, `dsq-zig-speed-1`): the table's own rows; without it the served engine used synthetic rows |
+| `BRANCHES_PRIO=side`, `L2PF*` | their launches are in the captures (L2 prefetch replayed for timing); see (c) for `BRANCHES` |
+
+**(b) Bits not matched.**
+
+| Knob | State |
+|---|---|
+| `TF_DSV41_PREFILL=replay` | **Not ported.** Prod prefills with CED bounded replay (`replay.py`): the encoder pass (layers 0–19 and layer 20's attention site and compressor) over every prompt row, a stash of the rows entering layer 20, then layers 20–39 over the prompt's last ≤ 127 rows with every SWA window starting at R0, and the last token as a full 40-layer verify row. It is approximate by design and carries its own session tag. Zig runs full prefill (every layer over every row), which equals replay only for prompts of 128 tokens or fewer. Longer prompts leave a different decoder state and can change replies. The served model now logs a warning at boot when `TF_DSV41_PREFILL=replay` is set. What a port needs: `block_prefill` with an `upto` layer and layer 20's partial site; the stash roles (`[KEEP, 4D]` streams, `[KEEP, D]` normed input, coefficients); a decoder pass from the stash with `lo` = R0 on the fused attention and its Triton variant; the plan's `Mode.replay` (already encoded in `rounds.zig`) driving it; and session snapshots carrying the stash. The gate is a replay capture (`M1_PREFILL_MODE=replay` in `dsv41_m1_capture.py`: the encoder segment, the stash, the finish pass) plus `M2B_PREFILL` with the reference in replay mode. It is the largest open parity item; until it lands, Zig's replies equal Python's with `TF_DSV41_PREFILL=full`, not prod's. |
+
+**(c) Speed only.**
+
+| Knob | State |
+|---|---|
+| `TF_DSV41_PF_DENSE=fused`, `PF_DENSE_TABLE=/cache/pfdense-table.json` | **Ported** (`prod_knobs.zig`, `block_prefill.Seg.fused`). Upstream's `rot_in`, then one `tf_dsv41_pfdense_v1.gemm` a projection over the whole layer, with the words the unpack read and the outputs the `_gemm` column blocks wrote, and no W_q workspace (`s.pf.w`, 64 MiB, leaves the plan). The configuration is `pfdense.pick`'s: `_CFG` override, then the JSON table (its `small` at ≤ `small_rows`), then the heuristic on 48 SMs. Ineligible widths (lanes 16, K2 < 8) keep the old path, as in Python. The same bits by pfdense.py's proof. Off by default. |
+| `TF_DSV41_PREFETCH_AHEAD=1` | **Ported** (`forward_prefill.readAhead`). Before a prompt segment runs, the next segment's Engram reads are issued with the lookback they will see. `engram_rows` keeps an unread bulk batch through one read of its table (dropped after a second: a wrong guess costs a read, never a bit). Needs `TF_DSV41_ENGRAM_DIR`; `TF_DSV41_ENGRAM_PREFETCH=0` turns it off with the rest of R3's read-ahead. Off by default. |
+| `TF_DSV41_PLAN_LINK=rdma`, `PLAN_PIN=auto` | **Ported, as an equivalent** (`tp/config.zig`, `tp/planlink.zig`). Python sends the plan through the RoCE host mailbox and rank 1 spins on a flag. Zig keeps its TCP plan link; with `rdma` the follower polls the socket for `TF_DSV41_PLAN_SPIN_US` (5,000) before it blocks, so a plan is read without waking a sleeping thread. `PLAN_PIN=N|auto` pins the sending (rank 0) and receiving threads at their first plan; `auto` picks the highest `cpu_capacity` other than the RoCE proxy's CPU, and stays unpinned where the capacities are all equal. `tcp` / `nccl` / unset: as before. Only the Sparks measure it: rank 1's window-entry lag (Python G14: +130 → −9 µs). |
+| `GLM53_TF_COMM_BACKEND=roce`, `GLM53_TF_ROCE_MAX_KB=1024`, (`GLM53_TF_ROCE_FALLBACK`) | **Ported:** `tp.Config` reads prod's names where `TF_COMM_BACKEND` / `TF_TP_MAILBOX_MAX_KB` / `TF_TP_ROCE_FALLBACK` are unset (ours win). 1,024 KiB keeps 64-row lanes rounds on RoCE. |
+| `GLM53_TF_ROCE_FAST=1` | **Partly matched.** Python's `gather_fast_kernel` makes seven changes to one exchange's critical path. Zig's `tp_roce` (`mailbox.cu`) already has one: the local shard is copied while the peer's travels. The others are not ported: a one-round-trip prologue, lean release/acquire order without `fence.sc.sys`, per-block waits, staggered pollers, no system-scope tail read, and two loads before stores. It is kernel work for `dsq-zig-tp-1` and only a two-Spark run can measure it. Zig's exchange is 8.9 µs against NCCL's 21 µs today. |
+| `TF_DSV41_ENGRAM_GATE=1` | **Not ported.** In Python the GPU, not the host, waits for decode's Engram rows (`engram_gate.cu`: it spins on a host-mapped word, then copies, before layers 1 / 14; C2 / C4 +3.5 / +2.6 %). The kernel and its launcher are in Zig (`dsv41_engram_gate`, `kernels_ops`). Missing: the emitter's `gate_copy` calls at layers 1 / 14 under a knob, the forward's host-mapped rows and flags, and the reads completing into them while the graph runs. It needs a GPU bits gate (on == off). Owner suggestion: `dsq-zig-speed-1`, next to R3's read-ahead. |
+| `TF_DSV41_GM_V2=1` | **Not ported.** x3gm v2 (one gm2 launch a projection; the same bits; prefill +7 %): the launchers exist (`kernels_ops.gm2Gateup` / `gm2Down`, replayed), but `block_prefill` emits v1's calls, as the captures did (pod 15's twin predated v2). Porting it needs a v2 prefill capture to check the emitter against. |
+| `TF_DSV41_BRANCHES=1` | **Not matched:** Zig issues the indexer / compressor on the main stream (the same bits), while Python forks them to a side stream (1-row window −0.53 ms). It needs fork / join events in `run.zig` and graph capture across two streams. |
+| `TF_DSV41_FULL_CONE=1` | **Inert in prod.** It only acts with `TF_DSV41_PREFILL=full` (`cone.py`); prod runs replay. It shares replay's encoder / decoder split, so it comes with the CED port. |
+| `TF_DSV41_ENGRAM_NATIVE=1`, `NATIVE_DIR` | Matched by an equivalent: `engram_rows.zig` is native (O_DIRECT, io_uring) for prefill and decode alike. |
+| `TF_DSV41_GRAPH_MODE=rows` | Equivalent: row graphs with several slots (`TF_DSV41_SLOTS`, `TF_DSV41_GRAPHS=1`; section 0b). |
+| `TF_DSV41_SPEC_DRAFT=1` | `dsq-zig-spec-1`. |
+| `TF_DSV41_CALIB=real`, `CALIB_DIR`, `DEPTH_JOINT=0` | Draft pricing policy: `draft/calib_env.zig` reads them by these names. |
+
+**(d) Memory and admission.**
+
+| Knob | State |
+|---|---|
+| `TF_DSV41_PREFILL_CHUNK=2048`, `PREFILL_ROWS=2048` | **Ported:** a segment's rows = the smaller of the two (multiples of 16 in 32–2,048), read at boot before the buffer plan, on the served model and the M2b driver. Prefill is segmentation-invariant (memory.py, G19), so the bits do not change. |
+| `TF_DSV41_PREFILL_ADAPT` (default 1), `PREFILL_ADAPT_GIB=4.5` | **Zig equivalent: static.** Python steps a round's rows down to 1,024 / 512 because torch allocates the chunk's transient each round. Zig has no per-round transient: the prefill program's buffers are in the boot buffer plan (`planPrefill`), behind the measured boot check. The memory a smaller segment would save is chosen at boot with `TF_DSV41_PREFILL_CHUNK`. |
+| `TF_DSV41_INDEX_BUDGET_MIB=64` | **Ported** (`block.Options.index_budget`): the prefill indexer's scores / sort keys in row blocks under prod's 64 MiB, not 256 (the same bits; csa2 backend). The default stays 256, which the captures used. `longpf`'s stream top-k keeps its own 256 MiB BUDGET (`stream_topk.plan`), as Python does. |
+| `TF_DSV41_POOL_TOKENS=1400000`, `FLOOR_HARD_GIB=4` | M5 (`kv_state.zig`, `kv/budget.zig`): the pool and its measured boot check. |
+| `TF_DSV41_FLOOR_GIB=5` | Validated against the hard floor; the measured boot check warns under it (section 0d, `dsq-zig-ops-1`). |
+| `MALLOC_ARENA_MAX=4`, `MIMALLOC_ALLOW_THP=0` | (f) for the engine (torch's allocators). Zig's host allocations are its own; glibc's arenas still apply to libc calls, so serve.sh may keep passing them. |
+
+**(e) Serving and ops** (`dsq-zig-ops-1`): `WORKER_SSH`, `HEAD_IP`, `HEAD_SSH`, `NCCL_SOCKET_IFNAME`, `NCCL_IB_HCA`, `MASTER_PORT` (Zig: `TF_TP_PORT`; the plan link at +7 as Python), `TF_REPO`, `TF_COMMIT`, `HEAD_TF_ROOT`, `WORKER_TF_ROOT`, `BASE_IMAGE`, `IMAGE`, `CACHE_VOL`, `PYLIB`, `HEAD_MODEL`, `WORKER_MODEL`, `HEAD_ENGRAM`, `WORKER_ENGRAM` (→ `TF_DSV41_ENGRAM_DIR`), `HEAD_STATE`, `WORKER_STATE`, `NAME`, `HOST`, `PORT`, `SERVED_NAME`, `ALIASES`, `CONTEXT` (→ `TF_DSV41_CONTEXT`, longpf), `PARALLEL` (→ `TF_DSV41_SLOTS`), `MAX_TOKENS`, `TF_DSV41_SESSIONS`, `SESSION_RAM_MIB`, `SESSION_DISK`, `SESSION_DISK_GIB`, `SESSION_DISK_MIN` (read by `sessions_gpu.zig`), `TF_DSV41_GRAMMAR`, `TOOL_GRAMMAR` (`dsq-zig-grammar-1`), `TF_DSV41_THINKING`, `DEFAULT_EFFORT`, `SCHEMA_PROMPT` (the server reads them), `TF_DSV41_REQUEST_LOG`, `DISCONNECT`, `TF_DSV41_IMAGES`, `BIAS_VL`, `VISION_PREP_MB` (`dsq-zig-vision-1`), `DROP_CACHES`, `MEM_GATE_GIB`, `MEM_GATE_TIMEOUT`, `CANARY`, `READY_TIMEOUT`, `PREFLIGHT`, `WATCH_HEAL`, `WATCH_FAILS`.
+
+`TF_DSV41_PREPARED`, `PREPARED_WRITE` (boot time) are ported by `prepared.zig` (section 0d).
+
+**(f) Python-only:** `TF_DSV41_NATIVE_DIR` (the C reader's build dir), `PYLIB`, `MIMALLOC_ALLOW_THP`.
+
+**Defaults and gates.** Every port is off unless its prod knob is set; R1 by its Python names is the one exception (the same bits, already gated). With the knobs unset, the emitters are unchanged: `check` cap24-1 / cap24-12 / cap24-16 / cap15 / cap18 / cap22, `dcheck cap16` and `m5-emit cap18` give 0 mismatches. Host: `zig build test-dsv41-knobs` (the readers; the fused dense prefill on the real emitter at 2,048 / 300 / 12 rows: every other call unchanged and in order, each fused GEMM fed by `rot_in`'s workspace, whole-layer words and outputs, Python's pick), `test-dsv41` (`engram_rows`: a bulk batch issued ahead survives one unrelated read and serves the next with 0 misses; a wrong guess is dropped after two), `test-tp` (prod's names, the spin with a plan arriving late, the pin).
+
+**Pod step** (`tools/zig/dsv41_knobs/job.sh`, `knobs_gate`; sourced inside `M1_JOB=m2b` like `dsv41_slots`; the integrator adds `M2B_KNOBS=1`):
+- **Needs:** the M2b reference (`refs`) with a prompt over 2,048 rows (`M2B_PROMPTS="2600"` or more, with `M2B_PREFILL_GATE=1`). `ahead` and `prod` need `M2B_ENGRAM=1`. Optional: prod's `/cache/pfdense-table.json`, copied read-only from the Spark cache volume `dsv41-perf1-cache`, as `KNOBS_PFD_TABLE`.
+- **Runs** (`KNOBS_RUNS`, default `pfd rows1024 rows512 budget64 ahead prod`): each one is the `M2B_PREFILL` gate (`tf-dsv41-m1 m2b`: Zig's prefill from an empty slot against the reference's dump), with one setting on the Zig ranks:
+  - `TF_DSV41_PF_DENSE=fused`;
+  - `TF_DSV41_PREFILL_CHUNK=1024`, then `512`;
+  - `TF_DSV41_INDEX_BUDGET_MIB=64`;
+  - `TF_DSV41_PREFETCH_AHEAD=1`;
+  - all of prod's together.
+- **Compares:** bits on == off, since the reference is the knobs-off truth. Each `knobs/<run>/rank*.log` must give `PASS Zig prefill rank r: ... state roles 65/65 equal ...` and the decode gate's PASS (64/64 tokens and logits). Rank 0 logs `prod knobs: ...` with the run's settings.
+- **Speed:** each run's prefill seconds against the `m2b-prefill` run on the same prompt. `pfd` gives the fused GEMM's gain.
+- **Minutes:** about 3 a run (no Python load), about 18 for all six. The `rows512` run also proves that the reference's AOT set covers 512- and 1,024-row segments; on `MissingTritonVariant`, add `--aot-prompts` with those lengths.
+- **Spark only** (not a pod): the plan link spin and pin (rank 1's window-entry lag with `TF_DSV41_PHASES`), prod's `GLM53_*` names on the hybrid, and the fused dense prefill's speed on GB10 with prod's table.
 
 ## 1. How the Zig engine is built
 
