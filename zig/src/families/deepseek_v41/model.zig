@@ -36,6 +36,7 @@ const sg = @import("sessions_gpu.zig");
 const slots_mod = @import("slots.zig");
 const batch = @import("batch.zig");
 const samp = @import("sampling_gpu.zig");
+const grammar_gpu = @import("grammar_gpu.zig");
 const dspark_rows = @import("dspark_rows.zig");
 const dspark_slots = @import("dspark_slots.zig");
 const iface = @import("draft/iface.zig");
@@ -107,6 +108,8 @@ pub const Model = struct {
     slot_pass: ?*dspark_slots.SlotPass = null,
     /// the keyed sampler, every rank with TF_DSV41_SAMPLING=1 (requests with T > 0; followers run its gathers in follow)
     sampler: ?*samp.GpuSampler = null,
+    /// structured output, every rank with TF_DSV41_GRAMMAR=1 (grammar_gpu.zig: the masks and the followers' matchers)
+    grammar: ?*grammar_gpu.Masks = null,
 
     /// The served engine's DSpark pass: several slots' (slot_pass), else the one-slot pass; null without drafts.
     pub fn draftPass(m: *Model) ?iface.Pass {
@@ -132,6 +135,7 @@ pub const Model = struct {
         m.rows = null;
         m.slot_pass = null;
         m.sampler = null;
+        m.grammar = null;
         m.arena = std.heap.ArenaAllocator.init(gpa);
         errdefer m.arena.deinit();
         const a = m.arena.allocator();
@@ -268,6 +272,12 @@ pub const Model = struct {
         // TF_DSV41_SAMPLING=1: keyed sampling (T > 0) on every rank; off: such requests are refused (error.Sampling)
         m.sampler = if (samp.enabled()) try samp.GpuSampler.init(gpa, &m.f) else null;
         m.gt.sampler = m.sampler;
+        // TF_DSV41_GRAMMAR=1: the checkpoint's grammar compilers on every rank (tokenizer.json from the pack, or
+        // TF_DSV41_GRAMMAR_TOKENIZER's dir); masks for up to 64 rows a pick (Python's row cap)
+        if (try grammar_gpu.enabled()) {
+            const tok_dir = if (std.c.getenv("TF_DSV41_GRAMMAR_TOKENIZER")) |d| std.mem.span(d) else pack_dir;
+            m.grammar = try grammar_gpu.Masks.init(gpa, io, &m.f, tok_dir, m.slots, 64);
+        }
         try m.driver.check(m.driver.api.cuCtxSynchronize(), "cuCtxSynchronize");
         try comm.barrier();
         return m;
@@ -294,6 +304,7 @@ pub const Model = struct {
         if (m.slot_set) |ss| ss.deinit();
         if (m.pass) |p| p.deinit();
         if (m.sampler) |x| x.deinit();
+        if (m.grammar) |x| x.deinit();
         if (m.sessions) |x| x.deinit();
         if (m.f.kv) |k| k.deinit();
         m.f.deinit();
