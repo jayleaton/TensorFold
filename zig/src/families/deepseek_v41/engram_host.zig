@@ -11,6 +11,21 @@ pub const max_layers = 4;
 pub const max_ngram = 8;
 pub const max_cols = 64;
 
+/// Where a window's table rows come from (docs/DSV41-ZIG-PORT.md 4b, `EngramSource`): the local NVMe shards
+/// (engram_rows.zig) or a remote table service; none: M2a's index rows (the gates' references). Every source gives
+/// the table's bytes, so the forward's bits do not depend on which one serves them.
+pub const Source = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        /// Starts fetching Engram layer index `li`'s rows `idx` (this rank's heads' global rows); returns at once.
+        issue: *const fn (ptr: *anyopaque, li: usize, idx: []const i64) anyerror!void,
+        /// Layer index `li`'s rows `idx` as bf16 bits [idx.len, dim] (waits for any still in flight).
+        rows: *const fn (ptr: *anyopaque, li: usize, idx: []const i64, dim: usize, out: []u16) anyerror!void,
+    };
+};
+
 pub const Host = struct {
     layer_ids: []const u32,
     max_ngram: u32,
@@ -89,6 +104,41 @@ pub const Host = struct {
         return .{ h0, @min(h0 + part, n) - h0 };
     }
 
+    /// This rank's heads' global rows of Engram layer `layer` for a window's `ids` after `lookback`: idx [n][heads].
+    pub fn shardIndex(h: *const Host, a: std.mem.Allocator, ids: []const u32, lookback: []const u32, layer: u32, rank: u32, world: u32) ![]i64 {
+        const li = std.mem.indexOfScalar(u32, h.layer_ids, layer) orelse return error.NotEngram;
+        const L = h.layer_ids.len;
+        const C = h.cols();
+        const sh = h.headShard(rank, world);
+        const hashes = try a.alloc(i64, ids.len * L * C);
+        defer a.free(hashes);
+        h.hash(ids, lookback, hashes);
+        const idx = try a.alloc(i64, ids.len * sh[1]);
+        for (0..ids.len) |t| @memcpy(idx[t * sh[1] ..][0..sh[1]], hashes[(t * L + li) * C + sh[0] ..][0..sh[1]]);
+        return idx;
+    }
+
+    /// The window's rows of Engram layer `layer`, this rank's heads, bf16 [ids.len, heads x dim] into `out`: from
+    /// `src`, or M2a's index rows without one.
+    pub fn windowRows(h: *const Host, a: std.mem.Allocator, source: ?Source, ids: []const u32, lookback: []const u32, layer: u32, rank: u32, world: u32, dim: usize, out: []u16) !void {
+        const idx = try h.shardIndex(a, ids, lookback, layer, rank, world);
+        defer a.free(idx);
+        const s = source orelse return indexRows(idx, dim, out);
+        const li = std.mem.indexOfScalar(u32, h.layer_ids, layer).?;
+        return s.vtable.rows(s.ptr, li, idx, dim, out);
+    }
+
+    /// R3: starts the reads of a coming window's rows (`ids` after `lookback`) on every Engram layer; a wrong guess
+    /// only costs a read at the window (the rows are the table's either way). Errors are logged, never raised.
+    pub fn prefetch(h: *const Host, a: std.mem.Allocator, source: ?Source, ids: []const u32, lookback: []const u32, rank: u32, world: u32) void {
+        const s = source orelse return;
+        for (h.layer_ids, 0..) |layer, li| {
+            const idx = h.shardIndex(a, ids, lookback, layer, rank, world) catch return;
+            defer a.free(idx);
+            s.vtable.issue(s.ptr, li, idx) catch |e| std.log.scoped(.dsv41).warn("engram: prefetch of layer {d} failed ({t})", .{ layer, e });
+        }
+    }
+
     /// Loads tools/zig/dsv41_engram_host.py's file (the map borrowed from `bytes`, which must outlive the host).
     pub fn load(bytes: []const u8, heads: u32, pad_token: u32, vocab_size: u64, layer_buf: []u32) !Host {
         if (bytes.len < 24 or !std.mem.eql(u8, bytes[0..8], "DSV41EH1")) return error.BadEngramHost;
@@ -111,6 +161,21 @@ pub const Host = struct {
         return h;
     }
 };
+
+/// The committed ids just before position `start` (Engram's lookback, the last `keep_n`) when the next window will
+/// start there: the slot's `tail` (committed up to `pos`), then the leading rows of the window in flight at `pos`
+/// (`pending`, not kept yet) that a start past it implies were kept. Null: `start` is not reachable from this state.
+pub fn lookbackAt(tail: []const u32, pos: u64, pending: ?[]const u32, start: u64, keep_n: usize, buf: []u32) ?[]const u32 {
+    if (start < pos) return null;
+    const k: usize = @intCast(start - pos);
+    const extra: []const u32 = if (pending) |p| (if (k <= p.len) p[0..k] else return null) else if (k == 0) &.{} else return null;
+    if (tail.len + extra.len > buf.len) return null;
+    @memcpy(buf[0..tail.len], tail);
+    @memcpy(buf[tail.len..][0..extra.len], extra);
+    const m = tail.len + extra.len;
+    const n = @min(m, keep_n);
+    return buf[m - n .. m];
+}
 
 /// Python engram_host._is_prime: small primes, then Miller-Rabin with bases 2, 7, 61 (exact below 4.7e9).
 pub fn isPrime(n: u64) bool {

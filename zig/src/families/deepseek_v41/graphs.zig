@@ -14,7 +14,8 @@
 //!   trace gate's downloads (a traced program is never graphed: `audit`).
 //!
 //! One slot, rows exact (Python's per-width graphs): padding rows to a bucket needs the stacked multi-slot state
-//! (row mode) and comes with it. Knobs: TF_DSV41_GRAPHS (0 by default here until a pod shows graphed == eager),
+//! (row mode) and comes with it. Knobs: TF_DSV41_GRAPHS (unset: on for M4's served model, model.zig; off for the gates'
+//! drivers; pods 17 / 22 showed graphed == eager, tokens and logits, R1 included),
 //! TF_DSV41_GRAPHS_MAX (48), TF_DSV41_GRAPH_BUCKET (2048), TF_DSV41_GRAPH_BUCKET_GROW (1.25),
 //! TF_DSV41_GRAPH_ROWS_MAX (64), TF_DSV41_GRAPH_FLOOR_GIB (5.0).
 
@@ -39,7 +40,13 @@ pub const Settings = struct {
     floor_gib: f64 = 5.0,
 
     pub fn fromEnv() !Settings {
-        var s: Settings = .{};
+        return fromEnvOr(false);
+    }
+
+    /// The knobs, graphs `on_default` when TF_DSV41_GRAPHS is unset (M4's served model: on; every rank alike, since
+    /// a graphed rank's capture agreements are collectives).
+    pub fn fromEnvOr(on_default: bool) !Settings {
+        var s: Settings = .{ .on = on_default };
         if (std.c.getenv("TF_DSV41_GRAPHS")) |v| s.on = !std.mem.eql(u8, std.mem.span(v), "0");
         if (std.c.getenv("TF_DSV41_GRAPHS_MAX")) |v| s.max = try std.fmt.parseInt(u32, std.mem.span(v), 10);
         if (std.c.getenv("TF_DSV41_GRAPH_BUCKET")) |v| s.bucket = try std.fmt.parseInt(u32, std.mem.span(v), 10);
