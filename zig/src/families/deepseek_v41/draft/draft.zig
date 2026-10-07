@@ -16,6 +16,7 @@ pub const Lanes = lanes.Lanes;
 pub const twin = @import("twin.zig");
 pub const drive = @import("drive.zig");
 pub const branches = @import("branches.zig");
+pub const calib_env = @import("calib_env.zig");
 pub const branches_oracle = @import("branches_oracle.zig");
 
 test {
@@ -31,6 +32,8 @@ test {
     _ = twin;
     _ = drive;
     _ = branches;
+    _ = calib_env;
+    _ = @import("calib_env_test.zig");
     _ = branches_oracle;
     _ = @import("branches_test.zig");
     _ = @import("drive_test.zig");
