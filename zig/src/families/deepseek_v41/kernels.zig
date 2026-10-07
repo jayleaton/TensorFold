@@ -13,6 +13,8 @@ pub const replay = @import("kernels_replay.zig");
 pub const ops = @import("kernels_ops.zig");
 /// sampling.cu (its own module, loaded by the keyed sampler)
 pub const sampling = @import("sampling_kernels.zig");
+/// vision.cu (its own module, loaded by the vision tower on rank 0)
+pub const vision = @import("vision_kernels.zig");
 
 fn Blob(comptime import_name: []const u8) type {
     return struct {
