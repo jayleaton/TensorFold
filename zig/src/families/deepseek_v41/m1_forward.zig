@@ -306,7 +306,8 @@ pub fn runAll(f: *Forward, out_dir: []const u8, experts: []const u8) !Counts {
     const ws = try check.windows(a, f.io, f.dir);
     var wg = w;
     try check.gmWidths(a, &wg, ws);
-    const opts = try check.optionsOf(a, f.io, f.dir);
+    var opts = try check.optionsOf(a, f.io, f.dir);
+    opts.gm_v2 = check.gmMode(ws);
     var last_set: []const u8 = "";
     var roles: calls.Roles = .{ .a = a };
     for (ws) |win| {
