@@ -64,6 +64,9 @@ pub const Session = struct {
         }
         try s.agreeVar(&b);
         s.plan = planlink.PlanLink.init(cfg.rank, cfg.world, b.releasePlan());
+        s.plan.spin_ns = cfg.plan_spin_ns;
+        s.plan.pin = cfg.plan_pin;
+        s.plan.avoid = cfg.roce_cpu;
         if (cfg.failfast) {
             s.fate = Fate.init(cfg, b.release());
             s.fate.?.onFail(.{ .ctx = s, .call = abortHook });

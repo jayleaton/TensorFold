@@ -15,6 +15,9 @@ pub const Fallback = enum { nccl, @"error" };
 
 pub const Error = error{BadSetting};
 
+/// TF_DSV41_PLAN_PIN: the CPU the plan threads pin to at their first plan (auto: the highest cpu_capacity).
+pub const PlanPin = union(enum) { auto, cpu: u32 };
+
 pub const Config = struct {
     world: u32 = 2,
     rank: u32 = 0,
@@ -48,6 +51,10 @@ pub const Config = struct {
     /// `shm` runs the RoCE protocol on one host without RDMA (tests); `verbs` is the real wire.
     roce_wire: enum { verbs, shm } = .verbs,
     roce_fallback: Fallback = .nccl,
+    /// TF_DSV41_PLAN_LINK=rdma (Python's RoCE host mailbox, whose follower spins on a flag): the follower polls the
+    /// plan socket this long before it blocks (TF_DSV41_PLAN_SPIN_US, 5,000); 0 (tcp, nccl, unset): it blocks at once.
+    plan_spin_ns: u64 = 0,
+    plan_pin: ?PlanPin = null,
 
     /// Reads every setting from `get` (the environment in `fromEnv`); unset names keep the defaults.
     pub fn parse(get: *const fn ([]const u8) ?[]const u8) Error!Config {
@@ -59,11 +66,13 @@ pub const Config = struct {
         c.link_port = try int(u16, get, "TF_DSV41_PLAN_PORT", c.port + 7, 1, 65535);
         c.connect_timeout_ns = try seconds(get, "TF_DSV41_PLAN_TIMEOUT", 300, 0.1, 86400);
         c.device = try int(u32, get, "TF_TP_DEVICE", c.device, 0, 63);
-        if (get("TF_COMM_BACKEND")) |b| c.backend = std.meta.stringToEnum(Backend, std.mem.trim(u8, b, " ")) orelse {
-            std.log.warn("TF_COMM_BACKEND={s}: expected nccl, mailbox or roce", .{b});
+        // prod.env's names (GLM53_TF_*) where ours are unset: the same meaning, ours win
+        const backend = alias(get, "TF_COMM_BACKEND", "GLM53_TF_COMM_BACKEND");
+        if (get(backend)) |b| c.backend = std.meta.stringToEnum(Backend, std.mem.trim(u8, b, " ")) orelse {
+            std.log.warn("{s}={s}: expected nccl, mailbox or roce", .{ backend, b });
             return error.BadSetting;
         };
-        c.mailbox_max_bytes = 1024 * try int(usize, get, "TF_TP_MAILBOX_MAX_KB", 256, 4, 16 * 1024);
+        c.mailbox_max_bytes = 1024 * try int(usize, get, alias(get, "TF_TP_MAILBOX_MAX_KB", "GLM53_TF_ROCE_MAX_KB"), 256, 4, 16 * 1024);
         c.mailbox_timeout_ns = try seconds(get, "TF_TP_MAILBOX_TIMEOUT_S", 120, 0.001, 86400);
         if (get("TF_DSV41_FAILFAST")) |v| c.failfast = !(std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "off"));
         c.grace_ns = try seconds(get, "TF_DSV41_FAILFAST_GRACE_S", 1.0, 0, 60);
@@ -77,10 +86,28 @@ pub const Config = struct {
             std.log.warn("TF_TP_ROCE_WIRE={s}: expected verbs or shm", .{w});
             return error.BadSetting;
         };
-        if (get("TF_TP_ROCE_FALLBACK")) |f| c.roce_fallback = std.meta.stringToEnum(Fallback, f) orelse {
-            std.log.warn("TF_TP_ROCE_FALLBACK={s}: expected nccl or error", .{f});
+        const fallback = alias(get, "TF_TP_ROCE_FALLBACK", "GLM53_TF_ROCE_FALLBACK");
+        if (get(fallback)) |f| c.roce_fallback = std.meta.stringToEnum(Fallback, f) orelse {
+            std.log.warn("{s}={s}: expected nccl or error", .{ fallback, f });
             return error.BadSetting;
         };
+        if (get("TF_DSV41_PLAN_LINK")) |l| {
+            const mode = std.mem.trim(u8, l, " ");
+            if (std.mem.eql(u8, mode, "rdma")) {
+                c.plan_spin_ns = 1000 * try int(u64, get, "TF_DSV41_PLAN_SPIN_US", 5000, 0, 10_000_000);
+            } else if (!std.mem.eql(u8, mode, "tcp") and !std.mem.eql(u8, mode, "nccl")) {
+                std.log.warn("TF_DSV41_PLAN_LINK={s}: expected nccl, tcp or rdma", .{l});
+                return error.BadSetting;
+            }
+        }
+        if (get("TF_DSV41_PLAN_PIN")) |raw| {
+            const v = std.mem.trim(u8, raw, " ");
+            if (std.mem.eql(u8, v, "auto")) {
+                c.plan_pin = .auto;
+            } else if (!std.mem.eql(u8, v, "-1") and !std.mem.eql(u8, v, "off")) {
+                c.plan_pin = .{ .cpu = try int(u32, get, "TF_DSV41_PLAN_PIN", 0, 0, 4095) };
+            }
+        }
         return c;
     }
 
@@ -102,6 +129,11 @@ pub const Config = struct {
         return out;
     }
 };
+
+/// `ours` when it is set, else prod.env's name for the same setting.
+fn alias(get: *const fn ([]const u8) ?[]const u8, ours: []const u8, prod: []const u8) []const u8 {
+    return if (get(ours) != null) ours else prod;
+}
 
 fn envGet(name: []const u8) ?[]const u8 {
     var buf: [64]u8 = undefined;
@@ -175,4 +207,28 @@ test "bad settings are refused and the digest ignores the rank" {
     try std.testing.expectEqualSlices(u8, &a.digest(), &b.digest());
     b.mailbox_max_bytes = 1024;
     try std.testing.expect(!std.mem.eql(u8, &a.digest(), &b.digest()));
+}
+
+test "prod.env's names: GLM53_TF_* where ours are unset, the plan link's spin and pin" {
+    Fake.pairs = &.{ .{ "GLM53_TF_COMM_BACKEND", "roce" }, .{ "GLM53_TF_ROCE_MAX_KB", "1024" }, .{ "GLM53_TF_ROCE_FALLBACK", "error" }, .{ "TF_DSV41_PLAN_LINK", "rdma" }, .{ "TF_DSV41_PLAN_PIN", "auto" } };
+    const p = try Config.parse(&Fake.get);
+    try std.testing.expectEqual(Backend.roce, p.backend);
+    try std.testing.expectEqual(@as(usize, 1024 * 1024), p.mailbox_max_bytes);
+    try std.testing.expectEqual(Fallback.@"error", p.roce_fallback);
+    try std.testing.expectEqual(@as(u64, 5000 * 1000), p.plan_spin_ns);
+    try std.testing.expectEqual(PlanPin.auto, p.plan_pin.?);
+    // ours win; tcp blocks at once; an explicit CPU; off
+    Fake.pairs = &.{ .{ "TF_COMM_BACKEND", "nccl" }, .{ "GLM53_TF_COMM_BACKEND", "roce" }, .{ "TF_TP_MAILBOX_MAX_KB", "64" }, .{ "GLM53_TF_ROCE_MAX_KB", "1024" }, .{ "TF_DSV41_PLAN_LINK", "tcp" }, .{ "TF_DSV41_PLAN_PIN", "7" } };
+    const o = try Config.parse(&Fake.get);
+    try std.testing.expectEqual(Backend.nccl, o.backend);
+    try std.testing.expectEqual(@as(usize, 64 * 1024), o.mailbox_max_bytes);
+    try std.testing.expectEqual(@as(u64, 0), o.plan_spin_ns);
+    try std.testing.expectEqual(PlanPin{ .cpu = 7 }, o.plan_pin.?);
+    Fake.pairs = &.{ .{ "TF_DSV41_PLAN_LINK", "rdma" }, .{ "TF_DSV41_PLAN_SPIN_US", "200" }, .{ "TF_DSV41_PLAN_PIN", "-1" } };
+    const s = try Config.parse(&Fake.get);
+    try std.testing.expectEqual(@as(u64, 200 * 1000), s.plan_spin_ns);
+    try std.testing.expect(s.plan_pin == null);
+    Fake.pairs = &.{.{ "TF_DSV41_PLAN_LINK", "udp" }};
+    try std.testing.expectError(error.BadSetting, Config.parse(&Fake.get));
+    Fake.pairs = &.{};
 }
