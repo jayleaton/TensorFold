@@ -46,6 +46,9 @@ pub const Options = struct {
     union_cap: u64 = 128 << 20,
     /// live slots (slots.zig, TF_DSV41_SLOTS): the pool's slots and the device tables' rows
     slots: u32 = 1,
+    /// bytes the Zig plan holds resident that the measured terms (Python's) never held: the long-prompt stream
+    /// scratch (prod_knobs.streamScratch); added to the boot growth
+    resident: u64 = 0,
 };
 
 /// TF_DSV41_POOL_TOKENS / TF_DSV41_KV_SPLIT / TF_DSV41_KV_SPLIT_UNION_MIB (null: no pool, the contiguous slot).
@@ -80,8 +83,14 @@ pub fn bootCheck(ctx: *const cuda.Context, cfg: *const Config, o: Options, rank:
         std.log.err("kv: TF_DSV41_FLOOR_HARD_GIB={d} / TF_DSV41_FLOOR_GIB={d}: expected 0 < hard <= target", .{ knobs.hard_gib, target });
         return error.BadFloor;
     }
+    // the prefill price's knobs by prod's names (TF_DSV41_PREFILL_ROWS, TF_DSV41_INDEX_BUDGET_MIB)
+    if (std.c.getenv("TF_DSV41_PREFILL_ROWS")) |v| knobs.prefill_rows = try std.fmt.parseInt(u32, std.mem.span(v), 10);
+    if (std.c.getenv("TF_DSV41_INDEX_BUDGET_MIB")) |v| knobs.index_budget_mib = try std.fmt.parseInt(u32, std.mem.span(v), 10);
     var layout = try kv.Layout.fromConfig(cfg, .{ .split = o.split and world > 1 });
-    const r = budget.serveCheck(knobs, .{ .rank = rank, .avail_gib = @as(f64, @floatFromInt(mi.available)) / budget.GiB, .terms = try budget.Serve.fromEnv(rank) }, layout.pool(), world, o.tokens);
+    var terms = try budget.Serve.fromEnv(rank);
+    terms.growth += @as(f64, @floatFromInt(o.resident)) / budget.GiB;
+    if (o.resident > 0) std.log.info("kv: boot growth + {d:.3} GiB the plan holds resident (the long-prompt stream top-k's scratch)", .{@as(f64, @floatFromInt(o.resident)) / budget.GiB});
+    const r = budget.serveCheck(knobs, .{ .rank = rank, .avail_gib = @as(f64, @floatFromInt(mi.available)) / budget.GiB, .terms = terms }, layout.pool(), world, o.tokens);
     var buf: [1024]u8 = undefined;
     if (!r.ok) {
         std.log.err("kv: {s}", .{r.message(&buf)});
