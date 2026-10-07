@@ -68,6 +68,8 @@ pub const Request = struct {
     structure: ?Structure = null,
     /// Stop a short exact cycle while the think block is open.
     loop_guard: bool = false,
+    /// The prompt's prepared images (DeepSeek-V4.1 ``vision/held.zig``, rank 0), held by the server until ``finished``.
+    images: ?*const anyopaque = null,
 };
 
 pub const Reason = enum { stop, length, cancelled, failed };
