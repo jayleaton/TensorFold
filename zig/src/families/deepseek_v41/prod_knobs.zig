@@ -210,18 +210,19 @@ pub fn prefillMode(get: Get) !PrefillMode {
 }
 
 /// The knobs onto a forward before its buffer plan, on every rank (model.zig serving, m2b.zig's gates): the fused
-/// dense prefill GEMM, the segment rows, the indexer's budget, the Engram read-ahead of the next segment;
+/// dense prefill GEMM, the segment rows, the indexer's budget, the Engram read-ahead of the next segment, x3gm v2;
 /// `TF_DSV41_PREFILL=replay` is logged. R1 is read where the forward is made (`r1`).
 pub fn apply(f: *@import("forward.zig").Forward, a: std.mem.Allocator, io: std.Io, rank: u32) !void {
     f.opts.pfd = try pfDense(a, io, &env);
     if (try prefillRows(&env)) |r| f.opts.prefill_rows = r;
     if (try indexBudget(&env)) |b| f.opts.index_budget = b;
     f.prefill_state.ahead = prefetchAhead(&env);
+    f.opts.gm_v2 = try @import("gm2pf.zig").mode(&env);
     if (rank != 0) return;
     const log = std.log.scoped(.dsv41);
     if (try prefillMode(&env) == .replay)
         log.warn("TF_DSV41_PREFILL=replay: the Zig engine runs full prefill (CED replay is not ported); prompts over 128 tokens leave other state than Python prod's", .{});
-    log.info("prod knobs: pf_dense {s}, prefill rows {d}, index budget {d} MiB, R1 {s}, prefetch ahead {s}", .{ if (f.opts.pfd != null) "fused" else "off", f.opts.prefill_rows, f.opts.index_budget >> 20, if (f.opts.r1) "on" else "off", if (f.prefill_state.ahead) "on" else "off" });
+    log.info("prod knobs: pf_dense {s}, prefill rows {d}, index budget {d} MiB, R1 {s}, prefetch ahead {s}, x3gm v2 {t}", .{ if (f.opts.pfd != null) "fused" else "off", f.opts.prefill_rows, f.opts.index_budget >> 20, if (f.opts.r1) "on" else "off", if (f.prefill_state.ahead) "on" else "off", f.opts.gm_v2 });
 }
 
 pub fn env(name: []const u8) ?[]const u8 {
