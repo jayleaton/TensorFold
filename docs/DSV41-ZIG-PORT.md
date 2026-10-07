@@ -224,6 +224,34 @@ Five agents work on `dsv41-zig` at once toward one combined pod gate and one Spa
     - `branches_test.zig`;
     - `calib_env_test.zig`, against `fixtures/calib-golden.json` from `tools/calib_golden.py` run on prod's 8474f31 `calib.py` / `depth.py`. It checks the same entry picked from a directory, the same shared table bit for bit, and 400 depth / tree choices equal.
 
+- `dsq-zig-spec-1` (the speculative DSpark pass, `TF_DSV41_SPEC_DRAFT=1` as prod runs it, and `TF_DSV41_SPEC_NUCLEUS`; design below):
+  - **Knob / command:** `M2B_SPEC=1` inside `M1_JOB=m2b` (job.sh's gate loop sources `tools/zig/dsv41_spec/job.sh`, `spec_gate`). No Python twin, no second Python load. It runs after the other gates and reuses them.
+  - **Runs and what each compares** (each prints `PASS spec <run>: ...` / `FAIL spec <run>: ...` into `$RES/spec-<run>.log` and `steps.txt`):
+    1. `spec-m3-3`: lanes mode 3 (DSpark's GPU pass: `begin` / `collect` on rank 0, the whole pass on rank 1) with the knob on. Tokens must equal the reference's serial greedy tokens (Python's). Drafted and accepted must equal the knob-off run's (`$RES/m3-3` when `M2B_LANES` held 3, else its own `spec-off-3` run). At least one speculation must be used (`dsv41 spec: speculative DSpark passes L launched, H used, ...` in rank 0's log).
+    2. `spec-m3-3t` (DSpark's trees, `TF_DSV41_TREE=3`) and `spec-m3-4` (the tree oracle), knob on: their lanes PASS must still hold. Tree rounds are not speculated; the chain rounds around them are.
+    3. `spec-m4` (with `M2B_M4=1`): `generate` replays the M4 server's trace (recorded knob off) with drafts and the knob on, in M4's `m4env`. `PASS M4 CLI == HTTP` then means tokens and drafted counts equal the knob-off server's; M4's own `m4-serial` is drafted == serial.
+    4. `spec-samp` (opt-in, `SPEC_SAMP=1`, needs `M2B_SAMP`'s reference and the sampling fatbin): the sampled replies with drafts, `TF_DSV41_SPEC_DRAFT=1` and `TF_DSV41_SPEC_NUCLEUS=1` (top-p-without-top-k rows speculate) must equal Python's sampled replies.
+  - **Minutes:** about 5 a lanes run (the Zig load plus 64 tokens), plus 5 for `spec-off-3` when mode 3 did not run. `spec-m4` takes about 6–8. The default (`SPEC_RUNS="3 3t 4"`, `spec-m4`) is about 20 min; `SPEC_RUNS="3 4"` fits 15. `SPEC_SAMP` adds about 8.
+  - **Assets:** none new. It uses the M2b reference (`$R0` / `$REF`: `ref.json`, `aot/`, `rope.bin`, `engram-host.bin`), no new prompt lengths, plus M4's trace and env when `M2B_M4` ran.
+  - **Python's acceptance and tokens a round:** the pod runs layers 0–`$hi`, without DSpark's target layers, so its acceptance means nothing against Python's. The comparison is a Spark-window item. Run Zig's M4 with prod's knobs (`TF_DSV41_SPEC_DRAFT=1`, prod's calibration) on the 8 prompts. Read drafted, accepted and rounds from the trace, and the `dsv41 spec:` line at the server's close. Compare them with prod's own run of the same prompts (m2bench's per-round counts and its `describe()` line). Tokens must be equal. Drafted and accepted should be close (the host chain sums in a different fp32 order) and unchanged by the knob, which the pod proves exactly.
+  - **Host gate:** `zig build test-dsv41-draft` (`spec_test.zig`). It covers:
+    - the decisions replayed against Python's `spec.py` (`fixtures/spec-golden.json`, from `draft/tools/spec_golden.py` on prod's 8474f31): 560 operations, with every rate, probe, hit and miss reason equal;
+    - on the CPU twin, through `propose` and through `begin` / `collect`: speculated == unspeculated == serial (greedy, keyed, shared rounds over 3 slots, nucleus rows with and without the knob, trees), the same drafted / accepted / kept counts, and passes and ingests accounted exactly.
+  - **Default off:** with the knob unset, nothing launches early and no emitter is touched. `check` cap24-1 / cap24-12 / cap24-16 / cap15 / cap18 / cap22 and `dcheck cap16` give 0 mismatches.
+
+**The speculative DSpark pass (`draft/spec.zig`, `dsq-zig-spec-1`).** Python's spec.py starts the next round's pass right after a verify window, before the hosts sample, commit and plan. Here the window's choices are on the host when `Target.window` returns, so Lanes already knows each DSpark window's accepted count, bonus token and next start; the GPU still drafts while the lane core commits, emits and plans. The decisions are Python's, replayed bit for bit:
+- **Launch (after a window):** an unused speculation is dropped first. A window is a candidate when its slot's last pass held drafts and the window carries no host drafts. Its slot must also be `wanted`: the decayed hit rate (0.8) at least 0.3, or a probe every 8 skips. Rounds with a tree window are not speculated, and nor are rounds with a top-p-without-top-k row unless `TF_DSV41_SPEC_NUCLEUS=1`. The kept rows (0..accepted) are ingested at once, then `Pass.begin` launches the pass at (bonus, start + accepted + 1).
+- **Commit:** the ingest is skipped when the kept path is the speculated one (`ingested`). Otherwise the commit ingests as before.
+- **Draft:** `take` hands the speculated proposals over when the round drafts exactly the speculated slots at the same (anchor, start, keyed params) with every commit matched. Otherwise the pass runs as before.
+- **Exactness:** a used speculation is the pass the round would have run on the same rings. Drafts only propose.
+- **The device contract** (`iface.Pass.begin` / `collect`, optional):
+  - `GpuPass.begin` sends `op_ds_propose` (the followers run the whole pass, as before) and launches the pass up to its host step (`glue.ds_out`). `collect` runs the host step (its gather pairs with the followers') and the chain.
+  - Between the two, only work without collectives may follow on the stream: the target's `keep` (carry kernels and `op_keep`). Lanes collects before any window, ingest, pass, prefill or release.
+  - A pass without `begin` (the multi-slot pass until it adds one) is run through `propose` at launch, which is still exact, just without the overlap.
+  - One pass serves every speculated slot, so `dsq-zig-mdraft-1`'s multi-slot pass gets the overlap by implementing `begin` / `collect` over several asks.
+- **Hooks** (one commit each): `dspark_gpu.zig` (`begin` / `collect`), `serve_engine.zig` (the knobs, and the counts line at close), `phases.zig` + `phases_timed.zig` (`spec`: the launch; the collect counts as `draft.pass`), `core/lanes/engine.zig` (the first round, below).
+- **The first round** (M3 open item 2): the lane core asked the prompt's first draft request at the lanes' prior depth (`Rule.depth`). Python's planner asks every DSpark round at the cap (`lookup.Planner.window`: `min(cap, room)`), the first included, and the depth then cuts from the pass's confidences. The core now asks a head with node probabilities its whole reach in the first round too (`headDepth`, as every later round), so the policy picks the first window's k from a full block. Only DeepSeek's lanes set `draft_probabilities`.
+
 **Draft pricing (`draft/calib_env.zig`).** The served engine prices drafts as prod does, with Python's knob names. Followers price nothing: the lanes run on rank 0 only.
 - **Modes (`TF_DSV41_CALIB`):**
   - `cached` (the default) reads Python's stored `calib-<key>.json` from `TF_DSV41_CALIB_DIR`, by default `~/.cache/tensorfold/dsv41-calib`.
@@ -1112,8 +1140,8 @@ Effort is in engineering days for this agent team, assuming GPU windows are avai
 - **GPU:** both Sparks.
 - **State:** the host side is done (`draft/**`, `core/lanes/trim.zig`, commits `4d94c92..a49ea13`, `zig build test-dsv41-draft` 17/17, upstream lanes 37/37; interface in section 0).
 - **Open items:**
-  1. The speculative early pass (`TF_DSV41_SPEC_DRAFT`) and the nucleus candidate path (`TF_DSV41_SPEC_NUCLEUS`) are not ported.
-  2. The first round drafts at the lane's prior depth, not a full DSpark block.
+  1. Done: the speculative early pass (`TF_DSV41_SPEC_DRAFT`) and its nucleus rounds (`TF_DSV41_SPEC_NUCLEUS`) (`draft/spec.zig`, section 0a). Its pod gate is `M2B_SPEC=1`. Python's acceptance on the same prompts is compared in the Spark window.
+  2. Done: the first round drafts a full DSpark block, and the depth cuts it, as in Python (section 0a).
   3. The cost of verify windows over 32 rows is to be measured once M2's forward exists.
   4. Load the real prod calibration table (`calib-*.json` from the Sparks' `/cache`, through `Costs.parseJson`) once the Spark agent can copy it.
   5. M2 contract: a chain window's rows stay in the target's state until `keep()` is called, because in a shared round the lane core asks for drafts before it keeps. Ingest reads the kept path from the window's taps, not from the pool.
