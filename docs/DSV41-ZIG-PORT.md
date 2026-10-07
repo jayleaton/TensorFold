@@ -478,12 +478,21 @@ Logs are in the quant repo: `results/20261007-fix29-pod29` (pod 29, tree 4d91532
 | M5 split / park / compact | PASS on the 2,060-row prompt (61/61 roles, 64/64; park through RAM and NVMe) on pod 29; the 9-row prompt after it in the same load tripped the dump check on stale ring rows (tokens + logits 64/64) | gate fixed `a4caf46` (a fresh slot a prompt); rerun on pod 30 |
 | images (`TF_DSV41_IMAGES=native`, `BIAS_VL`) | **FAIL** (30): the tower is not bit-exact, 0/3 images; block 0 already differs by one bf16 ulp in 0.35-0.6 % of elements, compounding over 32 blocks (final span up to ~0.1); every image prefill differs from block 0 (first token still equal) | torch SDPA / cuBLAS summation order; `dsq-zig-vision-1` reopened. **Keep `IMAGES` off overnight** |
 | long prompts (`TF_DSV41_CONTEXT`, stream top-k, split row blocks) | not run: both Zig runs stopped at load with `MissingTritonVariant _prune` | gate bug: `m5.zig` turns the m2b job's `M2B_TOPP=0.85` into the expert top-p while the reference ran with it off; fixed `33be853`. **Run C overnight is the first GPU run of long prompts** |
-| R1 eager with the timing rows | FAIL (29): rank 1 `CUDA_ERROR_ILLEGAL_ADDRESS` in the profiled 4-row R1 windows **after** the 64-step gate; R1 graphs and 1-row windows ran | diagnosis tooling `6596725` (`TF_DSV41_SYNC_EACH=1` names the faulting call; `M2B_R1_DIAG`); pod 30 result below |
-| slots + multi-slot drafting | not run on 29: its `ref.py` failed twice (pool `split=` on the r1c twin, then `SlotsForward` lacks `engram_inputs_eager`) | fixed `c081aa9` (midprofile twin) and `fcaebe1` (`DecodeForward`); pod 30 result below |
+| R1 decode gate (eager, 64 steps) | **PASS** (30): 64/64 tokens + logits, both ranks | |
+| R1 timed windows (`M2B_PROF_ROWS`) | **FAIL** (29, 30): `CUDA_ERROR_ILLEGAL_ADDRESS` at **4-row** R1 windows; 1- and 2-row windows run (12.3 / 12.4 ms eager on the 25-layer prefix). `TF_DSV41_SYNC_EACH=1` names the call: **`tf_dsv41_mhc_cuda_v1.run`, call 18 of the 720-call window** (layer 0's mHC), both ranks. Python's R1 reference ran the same 4-row windows through the same kernel without a fault, and Zig's launch matches the binding (grid NB x 4, NT, `R * ROWB` dynamic shared memory), so a Zig argument differs at R = 4 in R1's tail / defer path (`spin` = 8000, `defer`, `w.mhc.cnt` [4] i32, `L.mhc.part` [n, 4, 40, 32]). Not fixed yet. The 2026-10-07 Spark window served R1 with DSpark's multi-row verify windows on GB10 without a fault | **Overnight:** if a run with R1 dies with `CudaFailed` / illegal address, rerun it with `R1=0` (the same model without R1's kernel knobs) and record it |
+| slots, 4 slots, row graphs | **FAIL** at boot (30): `batch.zig` set the row graphs' optional to `undefined` before its init; ReleaseSafe's `.?` panicked on every rank | **fixed `a36c4c2`.** The overnight kit must be built from HEAD at or after `a36c4c2` for runs B / B2 (4 slots, graphs on by default) |
+| multi-slot drafting (`TF_DSV41_SLOT_DRAFTS`), eager | **PASS** (30): batched == Python 4/4, alone == Python 4/4, batched == alone 4/4; passes over several slots (256 drafted, 130 passes over 256 slots) | first GPU run; the graphs run hit the boot panic above |
+| prod knobs: `PREFILL_ROWS` 1,024 / 512 | not run: `MissingTritonVariant _kv_store` (the knobs gate has no Python load, and the reference ran 2,048-row segments) | gate-asset gap only; prod and the kit use 2,048 |
+| prod knobs: `INDEX_BUDGET_MIB=64` | **PASS** (30) | |
+| prod knobs: read-ahead, all together | skipped (they need `M2B_ENGRAM` shards) | |
 
 Pod-side lessons for anyone running pods: the shared `runpod/idle-guard.sh` deletes a pod whose container log is unchanged 60 min (pod 29 at 19:40): a job driven over ssh must write a heartbeat to `/proc/1/fd/1`. `vision_kernels.zig` did not compile with `dsv41_vision.fatbin` embedded (Zig 0.17: `field_names`), fixed `8278ede`.
 
-**For the overnight run (`dsq-zig-night-1`):** the kit at e19bb41 predates `33be853`, `1c863d2` and the pod-30 fixes below; they only change pod gate scripts, except where a row says otherwise. Kit knobs: keep `IMAGES` off; `GRAMMAR=1` and `PF_DENSE=fused` are gated (both PASS here).
+**For the overnight run (`dsq-zig-night-1`):**
+- **Rebuild the kit from HEAD at or after `a36c4c2`** (the row graphs' boot panic: runs B and B2 crash at boot on e19bb41's binaries).
+- If an R1 run dies with an illegal address (the 4-row `mhc_cuda` fault above), rerun it with `R1=0`.
+- Kit knobs: keep `IMAGES` off (the tower is not bit-exact); `GRAMMAR=1`, `PF_DENSE=fused` and the 64 MiB index budget are gated (PASS here); `SLOT_DRAFTS=1` is gated eager.
+- Long prompts (run C) have no GPU gate yet: run C is their first GPU run.
 
 ### 0b. Several live slots and row buckets (`dsq-zig-slots-1`)
 
