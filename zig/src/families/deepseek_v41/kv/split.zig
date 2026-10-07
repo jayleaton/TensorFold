@@ -6,6 +6,11 @@
 //! - dense (decode windows, row mode: fixed shapes, inside CUDA graphs): entry (r, j) of the [R, K] selection becomes token owner*R*K + r*K + j;
 //! - union (prefill segments, host-synced): the sorted unique rows, each owner's list padded to the longest; token owner*M + index in its list;
 //!   halves of the segment's rows while send + receive pass the cap (rows are independent in every attention kernel).
+//! - packed (TF_DSV41_KV_SPLIT_COMPACT, kvsplit.py's dense_packed / kvsplit_pack.pack2): dense with each owner's valid entries packed in list
+//!   order. Every rank computes, from the selection and the page residues alike, each entry's owner o and its place i among o's valid entries;
+//!   rank r gathers its owned rows to send[0:c_r], lens[r] = c_r x row bytes, entry (r, j) becomes token o*R*K + i. The stride stays R x K
+//!   rows (dense's buffers and fit); a transport that takes device lengths (`Collective.allGatherV`: RoCE) moves only c_r rows of rank r,
+//!   any other the whole strides. The same rows behind the same entries in the same order: the same bits as dense, about half the bytes.
 
 const std = @import("std");
 const tp = @import("tp");
@@ -34,6 +39,43 @@ pub const DenseArgs = extern struct {
     tok: u64,
 };
 
+/// One selection's packed gather (`Exchange.densePacked`): DenseArgs' fields at the same offsets, plus this rank and the lengths.
+pub const PackArgs = extern struct {
+    /// int32 [R, K] logical rows (-1: none)
+    sel: u64,
+    rows: u32,
+    k: u32,
+    /// int32 split page tables, as DenseArgs
+    table: u64,
+    pts: u32,
+    /// int32 [R] or 0, as DenseArgs
+    rslot: u64,
+    psh: u32,
+    /// this rank (sends the entries whose owner it is)
+    rank: u32,
+    base: u64,
+    row_bytes: u32,
+    world: u32,
+    /// out: [R x K, row bytes] (this rank's owned rows in list order in the first c_rank; the rest unspecified), int32 [R, K] tokens,
+    /// and int32 [world]: each owner's count x row bytes
+    send: u64,
+    tok: u64,
+    lens: u64,
+
+    pub fn of(a: DenseArgs, rank: u32, lens: u64) PackArgs {
+        return .{ .sel = a.sel, .rows = a.rows, .k = a.k, .table = a.table, .pts = a.pts, .rslot = a.rslot, .psh = a.psh, .rank = rank, .base = a.base, .row_bytes = a.row_bytes, .world = a.world, .send = a.send, .tok = a.tok, .lens = lens };
+    }
+
+    pub fn dense(p: PackArgs) DenseArgs {
+        return .{ .sel = p.sel, .rows = p.rows, .k = p.k, .table = p.table, .pts = p.pts, .rslot = p.rslot, .psh = p.psh, .base = p.base, .row_bytes = p.row_bytes, .world = p.world, .send = p.send, .tok = p.tok };
+    }
+};
+
+comptime {
+    std.debug.assert(@sizeOf(DenseArgs) == 80 and @sizeOf(PackArgs) == 88);
+    std.debug.assert(@offsetOf(PackArgs, "rank") == 44 and @offsetOf(PackArgs, "base") == @offsetOf(DenseArgs, "base") and @offsetOf(PackArgs, "lens") == 80);
+}
+
 /// The device work around the all-gather: the dense gather + remap and a gather by row list (the kernel agent's .cu; HostKernels below).
 pub const Kernels = struct {
     ptr: *anyopaque,
@@ -41,6 +83,9 @@ pub const Kernels = struct {
 
     pub const VTable = struct {
         dense: *const fn (ptr: *anyopaque, a: DenseArgs, stream: Stream) anyerror!void,
+        /// The packed gather: tokens, this rank's owned rows into send[0:c_rank], lens (kvsplit.cu pack_kernel: one launch, any W <= 8).
+        /// Null: a Kernels without it (Exchange.densePacked refuses: error.Unsupported).
+        pack: ?*const fn (ptr: *anyopaque, a: PackArgs, stream: Stream) anyerror!void = null,
         /// send[i] = base row phys[i] (uint32 [n])
         gather: *const fn (ptr: *anyopaque, base: u64, row_bytes: u32, phys: u64, n: u32, send: u64, stream: Stream) anyerror!void,
     };
@@ -49,7 +94,39 @@ pub const Kernels = struct {
 /// The kernels on host memory (addresses are host pointers): the reference the device kernels must equal, and the host ranks' path.
 pub const HostKernels = struct {
     pub fn kernels(h: *HostKernels) Kernels {
-        return .{ .ptr = h, .vtable = &.{ .dense = dense, .gather = gather } };
+        return .{ .ptr = h, .vtable = &.{ .dense = dense, .gather = gather, .pack = pack } };
+    }
+
+    /// One pass in list order: an owner's running count is each entry's place (pack_kernel's prefix sums).
+    fn pack(_: *anyopaque, a: PackArgs, _: Stream) anyerror!void {
+        if (a.world < 1 or a.world > max_world or a.rank >= a.world) return error.BadWorld;
+        const n = @as(usize, a.rows) * a.k;
+        const sel: [*]const i32 = @ptrFromInt(a.sel);
+        const tab: [*]const i32 = @ptrFromInt(a.table);
+        const rslot: ?[*]const i32 = if (a.rslot == 0) null else @ptrFromInt(a.rslot);
+        const base: [*]const u8 = @ptrFromInt(a.base);
+        const send: [*]u8 = @ptrFromInt(a.send);
+        const tok: [*]i32 = @ptrFromInt(a.tok);
+        const lens: [*]i32 = @ptrFromInt(a.lens);
+        const mask = (@as(u32, 1) << @intCast(a.psh)) - 1;
+        var count: [max_world]u32 = @splat(0);
+        for (0..n) |i| {
+            if (sel[i] < 0) {
+                tok[i] = -1;
+                continue;
+            }
+            const t: u32 = @intCast(sel[i]);
+            const o = ownerOf(t, a.psh, a.world);
+            const at = count[o];
+            count[o] += 1;
+            tok[i] = @intCast(o * n + at);
+            if (o != a.rank) continue;
+            const s: usize = if (rslot) |rs| @intCast(rs[i / a.k]) else 0;
+            const local: u32 = @intCast(tab[s * a.pts + (t >> @intCast(a.psh))]);
+            const phys = (@as(usize, local) << @intCast(a.psh)) | (t & mask);
+            @memcpy(send[at * a.row_bytes ..][0..a.row_bytes], base[phys * a.row_bytes ..][0..a.row_bytes]);
+        }
+        for (0..a.world) |o| lens[o] = @intCast(count[o] * a.row_bytes);
     }
 
     fn dense(_: *anyopaque, a: DenseArgs, _: Stream) anyerror!void {
@@ -189,10 +266,62 @@ fn orderU32(a: u32, b: u32) std.math.Order {
     return std.math.order(a, b);
 }
 
+/// TF_DSV41_KV_SPLIT_COMPACT: off (0, dense), on (1: packed where every rank's transport takes device lengths and the shard fits), force
+/// (packed on any transport: the bits are tested on any).
+pub const Compact = enum { off, on, force };
+
+pub const compact_env = "TF_DSV41_KV_SPLIT_COMPACT";
+
+pub fn parseCompact(text: []const u8) error{BadCompactMode}!Compact {
+    const v = std.mem.trim(u8, text, " \t");
+    const eq = std.ascii.eqlIgnoreCase;
+    if (v.len == 0 or eq(v, "0") or eq(v, "off") or eq(v, "no") or eq(v, "false")) return .off;
+    if (eq(v, "1") or eq(v, "on") or eq(v, "yes") or eq(v, "true")) return .on;
+    if (eq(v, "force")) return .force;
+    return error.BadCompactMode;
+}
+
+/// The knob from the environment (unset: off).
+pub fn compactMode() error{BadCompactMode}!Compact {
+    const raw = std.mem.span(std.c.getenv(compact_env) orelse return .off);
+    return parseCompact(raw) catch |e| {
+        std.log.err("[tensorfold] {s}={s}: 0 / 1 / force", .{ compact_env, raw });
+        return e;
+    };
+}
+
 /// The exchange itself: kernels to fill the send buffer, the communicator's all-gather to fill the receive buffer.
 pub const Exchange = struct {
     comm: tp.Collective,
     kernels: Kernels,
+    compact: Compact = .off,
+    /// Every rank's transport takes device lengths (`Collective.varAgreed`, asked once at `init` when compact is on).
+    var_ok: bool = false,
+
+    /// An exchange under `mode` (`compactMode()` for the knob). Every rank calls it alike, outside any graph: `on` asks the
+    /// communicator's once-per-communicator agreement.
+    pub fn init(comm: tp.Collective, kernels: Kernels, mode: Compact) !Exchange {
+        return .{ .comm = comm, .kernels = kernels, .compact = mode, .var_ok = mode == .on and try comm.varAgreed() };
+    }
+
+    /// Whether a dense exchange of `nbytes`-byte shards (R x K x row bytes) goes packed: the same answer on every rank.
+    pub fn packs(x: Exchange, nbytes: u64) bool {
+        return x.compact == .force or (x.compact == .on and x.var_ok and x.comm.varFits(@intCast(nbytes)));
+    }
+
+    /// The window's exchange as the knob says: densePacked where `packs`, else dense (a.lens unused then).
+    pub fn window(x: Exchange, a: PackArgs, recv: DevicePtr, stream: Stream) !void {
+        if (x.packs(@as(u64, a.rows) * a.k * a.row_bytes)) return x.densePacked(a, recv, stream);
+        return x.dense(a.dense(), recv, stream);
+    }
+
+    /// Packed: send [R x K, rb] (this rank's c_rank owned rows first), tokens and lens [W] by one kernel, then recv [W, R x K, rb] with
+    /// owner o's c_o rows at o x R x K (persistent buffers, no host sync: graph-capturable; recv past each owner's rows unspecified).
+    pub fn densePacked(x: Exchange, a: PackArgs, recv: DevicePtr, stream: Stream) !void {
+        const f = x.kernels.vtable.pack orelse return error.Unsupported;
+        try f(x.kernels.ptr, a, stream);
+        try x.comm.allGatherV(a.send, recv, @as(usize, a.rows) * a.k * a.row_bytes, a.lens, .u8, stream);
+    }
 
     /// Dense: send [R x K, rb] gathered and tokens remapped, then recv [W, R x K, rb] (persistent buffers: graph-capturable).
     pub fn dense(x: Exchange, a: DenseArgs, recv: DevicePtr, stream: Stream) !void {
