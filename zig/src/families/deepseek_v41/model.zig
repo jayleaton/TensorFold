@@ -21,6 +21,7 @@ const Pack = @import("pack.zig").Pack;
 const plan = @import("plan.zig");
 const named = @import("named.zig");
 const load = @import("load.zig");
+const prepared = @import("prepared.zig");
 const buffers = @import("buffers.zig");
 const forms = @import("forms.zig");
 const run = @import("run.zig");
@@ -159,19 +160,48 @@ pub const Model = struct {
         const blocks = if (o.drafts) try std.mem.concat(a, u32, &.{ backbone, dspark_emit.blocks(&m.cfg, &ds) }) else backbone;
         m.pl = try plan.build(gpa, &m.cfg, &m.pack, .{ .rank = m.tcfg.rank, .world = world, .blocks = blocks, .top = true, .dspark = o.drafts });
         m.weights = .{ .gpa = gpa };
-        for (m.pl.layers) |*l| {
+        // TF_DSV41_PREPARED (prepared.zig): each layer's host images read back instead of rebuilt from the pack
+        var cache = try prepared.Cache.fromEnv(gpa, io, &m.pack, .{ .rank = m.tcfg.rank, .world = world, .o_groups = m.cfg.o_groups, .blocks = blocks, .dspark = o.drafts });
+        defer if (cache) |*c| c.deinit();
+        var t_build: i96 = 0;
+        var t_upload: i96 = 0;
+        const t_load = std.Io.Clock.awake.now(io).toNanoseconds();
+        for (m.pl.layers, 0..) |*l, i| {
             var b: named.Builder = .{ .gpa = gpa, .io = io, .pack = &m.pack };
             defer b.deinit();
-            try b.layer(l, m.cfg.o_groups, m.tcfg.rank, world);
+            var tag_buf: [16]u8 = undefined;
+            const tag = try std.fmt.bufPrint(&tag_buf, "L{d}", .{i});
+            const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
+            if (cache == null or !try cache.?.get(&b, tag)) {
+                try b.layer(l, m.cfg.o_groups, m.tcfg.rank, world);
+                if (cache) |*c| c.put(&b, tag) catch |e| std.log.warn("dsv41 prepared: {s} not written ({t})", .{ tag, e });
+            }
+            const t1 = std.Io.Clock.awake.now(io).toNanoseconds();
             try m.weights.upload(&m.driver, &b);
+            t_build += t1 - t0;
+            t_upload += std.Io.Clock.awake.now(io).toNanoseconds() - t1;
         }
         {
             var b: named.Builder = .{ .gpa = gpa, .io = io, .pack = &m.pack };
             defer b.deinit();
-            try b.top(&m.pl);
-            try b.dspark(&m.pl);
+            const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
+            if (cache == null or !try cache.?.get(&b, "top")) {
+                try b.top(&m.pl);
+                try b.dspark(&m.pl);
+                if (cache) |*c| c.put(&b, "top") catch |e| std.log.warn("dsv41 prepared: top not written ({t})", .{e});
+            }
+            const t1 = std.Io.Clock.awake.now(io).toNanoseconds();
             try m.weights.upload(&m.driver, &b);
+            t_build += t1 - t0;
+            t_upload += std.Io.Clock.awake.now(io).toNanoseconds() - t1;
         }
+        const ms = struct {
+            fn of(ns: i96) f64 {
+                return @as(f64, @floatFromInt(ns)) / 1e6;
+            }
+        }.of;
+        if (cache) |c| std.log.info("dsv41 load: weights {d:.0} ms ({d:.0} ms images, {d:.0} ms upload + digest), {d:.1} GiB; prepared {s}: {d} read ({d:.1} GiB in {d:.0} ms), {d} built, {d} written ({d:.0} ms)", .{ ms(std.Io.Clock.awake.now(io).toNanoseconds() - t_load), ms(t_build), ms(t_upload), @as(f64, @floatFromInt(m.weights.bytes)) / (1 << 30), c.root, c.stats.hits, @as(f64, @floatFromInt(c.stats.read_bytes)) / (1 << 30), ms(c.stats.read_ns), c.stats.misses, c.stats.written, ms(c.stats.write_ns) })
+        else std.log.info("dsv41 load: weights {d:.0} ms ({d:.0} ms images from the pack, {d:.0} ms upload + digest), {d:.1} GiB; TF_DSV41_PREPARED unset", .{ ms(std.Io.Clock.awake.now(io).toNanoseconds() - t_load), ms(t_build), ms(t_upload), @as(f64, @floatFromInt(m.weights.bytes)) / (1 << 30) });
         m.aot = try cuda.aot.Set.load(gpa, io, &m.driver, m.ctx.device, try std.fs.path.join(a, &.{ assets, "aot" }));
         m.widths = try m2a.widths(a, &m.weights, &m.pl);
         m.runner = .{ .gpa = gpa, .d = &m.driver, .stream = m.stream, .kernels = &m.kernels, .triton = &m.aot, .weights = &m.weights };
@@ -229,7 +259,8 @@ pub const Model = struct {
         m.host = try eh.Host.load(ehb, m.cfg.engram_heads, m.cfg.engram_pad, m.cfg.engram_vocab, &m.lbuf);
         m.f.engram = &m.host;
         if (world > 1) m.f.link = &m.session.plan;
-        if (m.f.kv != null and m.slots == 1) m.sessions = try sg.Sessions.init(gpa, io, &m.f, &bp, try sg.optionsFromEnv());
+        const so = try sg.optionsFromEnv();
+        if (m.f.kv != null and m.slots == 1 and so.enabled) m.sessions = try sg.Sessions.init(gpa, io, &m.f, &bp, so);
         m.gt = .{ .f = &m.f, .prefill_rows = o.prefill_rows, .max_rows = nb, .own_prefill = o.own_prefill, .sessions = m.sessions };
         if (o.drafts) m.pass = try dspark_gpu.GpuPass.init(gpa, &m.f, nb);
         if (m.slots > 1) try m.openRows(rows_cap, &bp);
