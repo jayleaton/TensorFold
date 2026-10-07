@@ -412,7 +412,21 @@ The tree was `798b4f5`, built from a clean archive. The fatbins were the sm_120 
     - Checked equal and left as they were: `_rms` (float mean: vt0 4, input_vec 4; factor 1/D; `rsqrtf`), `_rope` (`theta ** e` as `powf`, `1.0 / x` as `reciprocal` IEEE div, `arange / dim` as a multiply by the exact 1/32), `_rotate`, SiLU (`x / (1 + exp(-x))` in fp32, bf16, then `* u`), GELU (`x * 0.5 * (1 + erf(x * M_SQRT1_2))`), the residual add, FA2's tile shape, column order and quad reductions, `scale_softmax_log2` (fp64 product cast to fp32).
     - **Host-checked:** the engine builds with every fatbin embedded (`zig build -Dfatbins=<pod 30's set + the new dsv41_vision.fatbin>`, ptxas: no errors); `zig test vision_blas.zig` (torch's `_getAlignment`). Not GPU-run: no pods without the user, and the Sparks are the overnight agent's.
     - **Rerun on a pod** (`M2B_VISION=1`, the pod-step block above, at or after `1de1ccf`): put the new `dsv41_vision.fatbin` (sha256 above) in the job's `-Dfatbins` dir. Pass: `PASS vision vit` (3/3, every stage), then the prefill / generate lines. On a vit FAIL, `vision-vit-ops.log` lists every op still off.
-    - **Rerun on the Sparks:** see "FOR THE NIGHT RUN: images" below section 0a's pod 29 / 30 notes (`tools/zig/dsv41_vision/spark.sh`: the whole gate over both Sparks). `vision_ref.py --tower-only --vdir DIR --pack PACK` stays for a one-GPU tower check without a model load.
+    - **Rerun on one Spark (overnight window, prod down, dgx-01 only, GPU 0, about 5 min; nothing on dgx-02).** It needs the kit rebuilt from HEAD at or after `1de1ccf`, with the new `dsv41_vision.fatbin` (sha256 above, it holds sm_121) in `FATBINS`; `build-kit.sh` now ships `tools/zig/dsv41_vision/vision_ref.py` (into a kit built before, copy that file to `~/zig-window-kit/tools/zig/dsv41_vision/` on dgx-01). Then on dgx-01 in `~/zig-window-kit`, with no other `dsv41` container running:
+
+      ```
+      C=8474f3164ea60cb9c9f8e9bd5a4493fdf13eaa47; M=/home/dgx01/ai/models/dsv41-q28-v2; I=tensorfold-dsv41:e1e2-8474f31
+      mkdir -p out/vision
+      docker run --rm --gpus all --ipc=host -v /home/dgx01/ai/src/dsv41-prod/$C:/dsv41-tf:ro -v $M:/model:ro -v $PWD:/kit:ro \
+        -v $PWD/out/vision:/out -e PYTHONPATH=/dsv41-tf/src --name dsv41-zig-vision-ref --entrypoint python $I \
+        -u -B /kit/tools/zig/dsv41_vision/vision_ref.py --tower-only --vdir /out/img --pack /model 2>&1 | tee out/vision/ref.log
+      docker run --rm --gpus all --ipc=host -v $M:/model:ro -v $PWD:/kit:ro -v $PWD/out/vision:/out \
+        --name dsv41-zig-vision-vit --entrypoint /kit/tf-dsv41-m1 $I vision /model /out/img 2>&1 | tee out/vision/vit.log
+      docker run --rm --gpus all --ipc=host -v $M:/model:ro -v $PWD:/kit:ro -v $PWD/out/vision:/out -e TF_DSV41_VISION_RESYNC=1 \
+        --name dsv41-zig-vision-ops --entrypoint /kit/tf-dsv41-m1 $I vision /model /out/img 2>&1 | tee out/vision/vit-ops.log
+      ```
+
+      `--tower-only` runs `vision_ref.py`'s steps 1-2 alone (prod's `vision_prep` on the 3 seeded images, then the tower's stage dumps from the pack's vision tensors on cuda:0; no model load). **Pass:** `ref.log` ends with three `vision ref <name>: ... span ... rows` lines, and `vit.log` with `PASS vision ViT + aligner == Python: 3/3 images`. **Fail:** keep `vit.log` and `vit-ops.log` (the second lists each op still off: count, first index, largest difference) and report them. Either way, delete `out/vision/img` afterwards (a few hundred MB of stage dumps). This gates the tower only. `IMAGES=native` stays off in the kit's runs until the pod's prefill / generate steps pass too.
   - **Gaps (prod accepts, Zig refuses by name):** WebP (libwebp's VP8 / VP8L / alpha and the animation decoder Pillow uses, to its fancy upsampler: a port of its own) and TIFF (Pillow's libtiff paths: LZW / Deflate / PackBits / JPEG / CCITT, YCbCr, premultiplied alpha, tiles); an https image host with only IPv6 addresses (std's client pins an IPv4 literal) and an internationalized host name (no IDNA); arithmetic-coded and 12-bit JPEGs (libjpeg-turbo decodes them).
 
 - `dsq-zig-gm2pf-1` (x3gm v2 on Zig's prefill, `TF_DSV41_GM_V2`; `gm2pf.zig`):
@@ -503,36 +517,7 @@ Pod-side lessons for anyone running pods: the shared `runpod/idle-guard.sh` dele
 - R1's 4-row `mhc_cuda` fault was the M2b test driver's 1-row buffer plan (fixed `a585336`); the served path plans every window size, so no `R1=0` fallback is expected (keep it as a last resort).
 - Kit knobs: keep `IMAGES` off (the tower is not bit-exact); `GRAMMAR=1`, `PF_DENSE=fused` and the 64 MiB index budget are gated (PASS here); `SLOT_DRAFTS=1` is gated eager.
 - Long prompts (run C) have no GPU gate yet: run C is their first GPU run.
-- **Images (`IMAGES=native` + `BIAS_VL`):** the tower fix's gate runs on the Sparks this night: "FOR THE NIGHT RUN: images" just below. Keep `IMAGES` off in the kit's other runs whatever it prints.
-
-### FOR THE NIGHT RUN: images (`dsq-zig-vision-1`, TF_DSV41_IMAGES=native + BIAS_VL)
-
-Pod 30 failed the vision tower (1 bf16 ulp off from block 0, 0/3 images). The fix is `b3c699b` + `ea8198d` (section 0a, "Pod 30 FAIL: diagnosis and fix"); it has not run on a GPU. This gates it on the Sparks: the tower, the image prefill with and without prod's image routing bias, and the served replies, Zig against prod's Python (8474f31) on the same load shape. About 45 min, prod down, both nodes. Nothing here changes the kit's other runs; `IMAGES` stays off in them.
-
-**Build (dev box), before the window:**
-1. Tree: HEAD of `dsv41-zig` at or after `VISIONNIGHT` (the fix; `tools/zig/dsv41_vision/spark.sh`; `dsv41_m2b_ref.py --prompts` with `--rank`; `build-kit.sh` ships both vision scripts).
-2. FATBINS: the kit's sm_121 fatbin dir with **`dsv41_vision.fatbin` replaced** by `~/Documents/Projects/spark-work/zig-dsv41-scratch/vision/fatbin/dsv41_vision.fatbin` (sha256 `6f2ab33a7c012d2969db39362ca9f7db19d31e1019594fcd29ede067b0bcd6fe`, sm_120 + sm_121, nvcc 13.3, `-O3` without `--fmad=false`). Any older `dsv41_vision.fatbin` (pod 30's included) carries the bug.
-3. `FATBINS=<that dir> TP_FATBIN=<tp_mailbox.fatbin, sm_121> bash tools/zig/dsv41_m2c2/build-kit.sh <kit>` from a clean archive of the tree, then the kit's usual rsync to both nodes and `sha256sum -c --quiet SHA256SUMS`. Check: `<kit>/tools/zig/dsv41_vision/spark.sh` and `vision_ref.py` exist.
-
-**Assets:** none to stage. Each node already has what the steps read: the pack (`dsv41-q28-v2` at the kit's paths), prod's tree `~/ai/src/dsv41-prod/8474f3164ea60cb9c9f8e9bd5a4493fdf13eaa47`, the image `tensorfold-dsv41:e1e2-8474f31`, and prod's cache volume `dsv41-perf1-cache` (`/cache/dsv41-bias-vl`: the release's 43 `gate.bias_vl`, prod's `TF_DSV41_BIAS_VL`; its Triton / extension caches). The three images are generated (seeded) by the reference on each node; Engram rows are the index function on both sides (as M2b), so no Engram shards.
-
-**Steps** (in `~/zig-window-kit` on each node, `R` = 0 on dgx-01, 1 on dgx-02; prod stopped and no other `dsv41` container running; "both" = start within about a minute of each other). Every step appends `PASS ...` / `FAIL ...` to `out/vision/vision-steps.txt`:
-
-| step | where | command | pass | time |
-|---|---|---|---|---|
-| V1 | both | `./tools/zig/dsv41_vision/spark.sh R out/vision ref` | `PASS vision ref rank R: 6 prompts, both traces` on both | ~15 min |
-| V2 | dgx-01 | `./tools/zig/dsv41_vision/spark.sh 0 out/vision vit` | `PASS vision vit` (the log: `PASS vision ViT + aligner == Python: 3/3 images`) | ~2 min |
-| V3 | both | `./tools/zig/dsv41_vision/spark.sh R out/vision prefill` | `PASS vision prefill pN ...` for p1..p3 and `pN bias_vl` for p4..p6, on both | ~15 min |
-| V4 | dgx-01 + dgx-02 | dgx-01 `./tools/zig/dsv41_vision/spark.sh 0 out/vision generate`, dgx-02 `./tools/zig/dsv41_vision/spark.sh 1 out/vision follow` | `PASS vision generate (replies == Python's)` | ~5 min |
-| V5 | dgx-01 + dgx-02 | the same with a last argument `bias` on both (`... generate bias`, `... follow bias`) | `PASS vision generate-bias (replies == Python's)` | ~5 min |
-
-- V1 runs prod's Python at TP=2 over the two nodes on layers 0-24 (as the pod gate): prod's `vision_prep` on the 3 images, the tower's stage dumps on rank 0 (`out/vision/img`), 6 image prompts x 32 greedy tokens (p4..p6 after `vision.attach_bias_vl` from `/cache/dsv41-bias-vl`), state dumps, each node's AOT set, `trace.jsonl` / `trace-bias.jsonl`, then `engram-host.bin`.
-- V2: the Zig tower against those dumps, stage by stage (embed, block 0's every op, blocks 0 / 1 / 15 / 31, vit, gelu, span). On a FAIL it reruns with `TF_DSV41_VISION_RESYNC=1` (`vision-vit-ops.log`: every op still off, apart) and stops. **On a V2 FAIL skip V3-V5** (they would differ from the tower's bits) and report `vision-vit.log` + `vision-vit-ops.log`.
-- V3: `tf-dsv41-m1 m2b` with `M2B_PREFILL=1` a prompt (the Zig prefill from an empty slot, the image rows into rank 0's embedding, Engram's keep, p4..p6 the image rows' own MoE call with `gate.bias_vl`): every state role == Python's, then the tokens. 20 min cap a prompt (`timeout`). `PROMPTS="1 4"` trims.
-- V4 / V5: the served engine (`tf-dsv41-m1 generate`, drafts off, `TF_DSV41_LAYERS=0-24`, p1's assets) replays the traces; 15 min cap. If rank 0 stops, `docker stop dsv41-zig-vgen-r1` on dgx-02.
-- **On failure:** a step's log is `out/vision/vision-<step>.log` on each node; keep them and `vision-steps.txt` from both nodes, go on with the night's other runs (no restore needed: these steps leave prod stopped as they found it).
-- **Afterwards (both nodes):** `docker run --rm -v $PWD/out/vision:/out --entrypoint rm tensorfold-dsv41:e1e2-8474f31 -rf /out/ref /out/img /out/zig-p1 /out/zig-p2 /out/zig-p3 /out/zig-p4 /out/zig-p5 /out/zig-p6` (state dumps and AOT copies, several GB; root-owned), keeping the logs.
-- All five PASS = images can go on in the kit (`IMAGES=native BIAS_VL=1`) from the next window; record it in the pod 29 / 30 table's images row.
+- **Images' tower rerun (optional, about 5 min on dgx-01 while prod is down):** the commands are in section 0a, `dsq-zig-vision-1`, "Rerun on one Spark". They need the kit built at or after `1de1ccf` with the new `dsv41_vision.fatbin` (sha256 `6f2ab33a…`). Keep `IMAGES` off in the kit's runs whatever it prints.
 
 ### 0b. Several live slots and row buckets (`dsq-zig-slots-1`)
 
