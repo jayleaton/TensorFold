@@ -65,7 +65,7 @@ var dsv41_sampling_image: ?std.Build.LazyPath = null;
 
 /// The vision tower's kernels (vision.cu, TF_DSV41_IMAGES=native), optional the same way (dsv41_vision.fatbin): an
 /// empty image, and native images refuse at boot.
-const dsv41_vision: Kernel = .{ .name = "dsv41_vision", .src = "deepseek_v41_vision/vision", .flags = &.{ "-O3", "--fmad=false" } };
+const dsv41_vision: Kernel = .{ .name = "dsv41_vision", .src = "deepseek_v41_vision/vision", .flags = &.{"-O3"} }; // nvcc defaults as torch: fmad on
 var dsv41_vision_image: ?std.Build.LazyPath = null;
 
 /// The DeepSeek-V4.1 kernel module (zig/src/families/deepseek_v41/kernels.zig) over `cuda`; empty `images`: host-only.
