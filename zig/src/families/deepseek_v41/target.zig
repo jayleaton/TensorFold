@@ -1,6 +1,7 @@
 //! M3's GPU target: draft/iface.zig's `Target` over forward.zig, so the lanes backend (draft/lanes.zig) drives the real
 //! model as it drives the CPU twin. This first form is one slot, chain windows (a draft chain under the pending token),
-//! greedy choices and the prefill as consecutive decode windows; trees (`parents`), sampling (`lanes.Sampling` keyed
+//! greedy choices and the prefill as consecutive decode windows; trees (`parents`) run as chain windows on the slot
+//! (draft/branches.zig: the main chain, then a winning sibling's path in place of it); sampling (`lanes.Sampling` keyed
 //! at `draws`) and several slots are refused by name until state.zig (per-slot pools) and the sampler land.
 //! M5 (`sessions`, with the paged pool): a prompt resumes the longest saved entry that strictly prefixes it (RAM or
 //! NVMe) and prefills only the rest; a released slot is saved as an entry (its pages shared, its bounded state kept),
@@ -11,6 +12,7 @@ const iface = @import("draft/iface.zig");
 const lanes = @import("lanes");
 const fwd = @import("forward.zig");
 const sg = @import("sessions_gpu.zig");
+const branches = @import("draft/branches.zig");
 
 pub const Error = error{ TreeWindow, Sampling, Slots, NotAChain, WindowRows };
 
@@ -28,6 +30,8 @@ pub const GpuTarget = struct {
     own_prefill: bool = false,
     /// M5: the session store over the paged pool (null: every prompt from an empty slot, nothing kept)
     sessions: ?*sg.Sessions = null,
+    /// draft trees (`parents`): resolved as chain windows on the slot (draft/branches.zig), the last one kept by path
+    tree: branches.Resolver = .{},
 
     pub fn target(t: *GpuTarget) iface.Target {
         return .{ .ptr = t, .vtable = &vtable };
@@ -44,6 +48,7 @@ pub const GpuTarget = struct {
         const t = self_(p);
         if (slot != 0) return error.Slots;
         if (sampling != null) return error.Sampling;
+        t.tree.clear();
         if (t.resume_first) |first| if (t.f.slot.pos == ids.len and t.f.slot.pending == null) return first;
         // a saved entry that prefixes the prompt: the slot continues at its position, the rest is prefilled
         const at: usize = if (t.sessions) |ss| @intCast(try ss.resume_(ids)) else 0;
@@ -80,7 +85,8 @@ pub const GpuTarget = struct {
         if (segments.len != 1) return error.Slots;
         const s = segments[0];
         if (s.slot != 0) return error.Slots;
-        if (s.parents != null) return error.TreeWindow;
+        if (s.parents != null) return t.tree.window(.{ .ptr = t, .vtable = &chains }, s, choices[0]);
+        t.tree.clear();
         if (s.sampling != null) return error.Sampling;
         // a chain window never kept keeps every row (iface.Target.window): lanes' undrafted step (queue) sends the
         // next row without a keep
@@ -97,6 +103,7 @@ pub const GpuTarget = struct {
     fn keep(p: *anyopaque, slot: u32, path: []const u32) anyerror!void {
         const t = self_(p);
         if (slot != 0) return error.Slots;
+        if (t.tree.live) return t.f.keep(try t.tree.keep(path));
         // a chain keeps rows 0..k: the forward commits row 0 + k accepted drafts
         for (path, 0..) |row, i| if (row != i) return error.NotAChain;
         if (path.len == 0) return error.NotAChain;
@@ -109,12 +116,26 @@ pub const GpuTarget = struct {
         const n: u32 = if (t.f.slot.pending) |w| w.n else @intCast(t.f.ids.len);
         const D: u32 = t.f.cfg.hidden;
         const k: u32 = @intCast(t.f.cfg.dspark_targets.items().len);
-        return .{ .address = t.f.runner.addressOf("w.taps") orelse 0, .rows = n, .stride = k * D };
+        return .{ .address = t.f.runner.addressOf("w.taps") orelse 0, .rows = n, .stride = k * D, .map = t.tree.map() };
+    }
+
+    /// The tree resolver's chains: a chain window through `window` (its rules and refusals), dropped on every rank.
+    const chains: branches.Chains.VTable = .{ .run = chainRun, .drop = chainDrop };
+
+    fn chainRun(p: *anyopaque, slot: u32, start: u64, tokens: []const u32, draws: []const u64, sampling: ?lanes.Sampling, out: []u32) anyerror!void {
+        var one = [_][]u32{out};
+        return window(p, &.{.{ .slot = slot, .start = start, .tokens = tokens, .parents = null, .draws = draws, .sampling = sampling }}, &one);
+    }
+
+    fn chainDrop(p: *anyopaque, slot: u32) anyerror!void {
+        if (slot != 0) return error.Slots;
+        return self_(p).f.drop();
     }
 
     fn release(p: *anyopaque, slot: u32) void {
         const t = self_(p);
         if (slot != 0) return;
+        t.tree.clear();
         if (t.sessions) |ss| {
             // the turn kept for the next one (a pending window is the reply's last token: committed first)
             if (t.f.slot.pending) |w| t.f.keep(w.n - 1) catch |e| std.log.err("sessions: keep before save failed ({t})", .{e});
