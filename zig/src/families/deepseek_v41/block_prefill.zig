@@ -47,6 +47,7 @@ const block = @import("block.zig");
 const config = @import("config.zig");
 const moe = @import("block_moe.zig");
 const longpf = @import("longpf.zig");
+const gm2pf = @import("gm2pf.zig");
 const Config = config.Config;
 const E = block.Emitter;
 const Arg = calls.Arg;
@@ -863,7 +864,7 @@ const Seg = struct {
         try e.glue("gm_picks", &.{ pick, wts, pk, w6 });
         // x3gm._run_ragged: one row block (X / Y in the experts' scratch z, Xd in its xg), rot, a gate/up launch a
         // gate width present, a down launch a down width present, upstream's combine
-        const widths = e.w.gm.get(L) orelse return error.NoWidth;
+        const widths = e.w.gm.get(L);
         const rows: i64 = e.o.expert_rows;
         const zb = rows * (topk + 1) * @max(4 * 2 * I, D); // the scratch z's floats (block_moe)
         if (P * D > zb or P * I > rows * (topk + 1) * D) return error.Unsupported; // x3gm.Buffers: rows halve
@@ -880,11 +881,13 @@ const Seg = struct {
         try e.glue(if (again) "gm_ticket_again" else "gm_ticket", &.{ticket});
         const tmax = @divFloor(P, gm_bm) + Et + 1;
         const lim: f64 = E.dec(e.cfg.swiglu_limit);
-        for (0..2) |down| {
+        // TF_DSV41_GM_V2 (gm2pf.zig): x3gm._run_v2's gm2_kernel launches in place of the loop below
+        if (e.o.gm_v2 != .off) try gm2pf.emit(e, e.o.gm_v2, .{ .L = L, .pre = pre, .P = P, .Et = Et, .D = D, .I = I, .pk = pk, .xg = xg, .xu = xu, .xd = xd, .y = y, .ticket = ticket, .limit = lim, .widths = widths }) else for (0..2) |down| {
+            const wd = (widths orelse return error.NoWidth)[down];
             var j: i64 = 0;
             for (0..32) |kk| {
                 const k2: i64 = @intCast(kk);
-                if (widths[down] >> @intCast(kk) & 1 == 0) continue;
+                if (wd >> @intCast(kk) & 1 == 0) continue;
                 const tag = if (down == 1) "d" else "g";
                 const plan = [5]Arg{
                     try e.buf("L.gm.{s}{d}.order", .{ tag, j }, .i32, &.{P}),
