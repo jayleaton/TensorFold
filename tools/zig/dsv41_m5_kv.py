@@ -124,7 +124,7 @@ class KV:
              "scramble": self.scramble, "slot_pages": [int(x) for x in self.ps.pages],
              "holder_pages": [int(x) for x in self.other.pages], "table_len": int(self.ps.table.numel()),
              "shift": {str(L): s for L, s in self.shifts(fw).items()},
-             "families": {f.name: {"layer": f.layer, "ratio": f.ratio, "row_bytes": f.row_bytes, "split": f.split,
+             "families": {f.name: {"layer": f.layer, "ratio": f.ratio, "row_bytes": f.row_bytes, "split": getattr(f, "split", False),
                                    "dtype": str(p.phys[f.name].dtype).replace("torch.", ""),
                                    "shape": list(p.phys[f.name].shape)} for f in p.fams}}
         if self.split:
