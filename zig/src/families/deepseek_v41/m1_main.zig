@@ -36,6 +36,7 @@ const usage =
     \\       tf-dsv41-m1 m2b PACK REF OUT (M2b: a rank of TP=2 over NCCL vs tools/zig/dsv41_m2b_ref.py; TF_TP_RANK ...)
     \\       tf-dsv41-m1 follow PACK ASSETS (a served model's rank > 0: rank 0's forward operations until it stops)
     \\       tf-dsv41-m1 generate PACK ASSETS TRACE (rank 0: TRACE's prompts through the served engine, ids == recorded)
+    \\       tf-dsv41-m1 mdraft PACK ASSETS TRACE... (rank 0: drafts over several live slots, batched == alone == recorded)
     \\  PACK     the EXL3 pack (config.json, index, shards)
     \\  CAPTURE  tools/zig/dsv41_m1_capture.py's output (ops.jsonl, blobs/, weights.json, aot/, meta.json)
     \\  OUT      weights.jsonl, replay.jsonl, forward.jsonl, summary.json
@@ -85,6 +86,15 @@ pub fn main(init: std.process.Init) !u8 {
             std.debug.print("FAIL tf-dsv41-m1 slots: {t}\n", .{e});
             return 1;
         };
+    if (args.len >= 5 and std.mem.eql(u8, args[1], "mdraft")) {
+        // TRACE...: the several-slot drafting gate (dsq-zig-mdraft-1)
+        const traces = try init.arena.allocator().alloc([]const u8, args.len - 4);
+        for (traces, args[4..]) |*t, x| t.* = x;
+        return @import("mdraft_cli.zig").main(init.gpa, init.io, args[2], args[3], traces) catch |e| {
+            std.debug.print("FAIL tf-dsv41-m1 mdraft: {t}\n", .{e});
+            return 1;
+        };
+    }
     if (args.len == 5 and std.mem.eql(u8, args[1], "generate"))
         return @import("serve_cli.zig").generate(init.gpa, init.io, args[2], args[3], args[4]) catch |e| {
             std.debug.print("FAIL tf-dsv41-m1 generate: {t}\n", .{e});
