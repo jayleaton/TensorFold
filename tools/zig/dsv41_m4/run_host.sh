@@ -19,7 +19,11 @@
 #   ENGRAM (1: R3, the node's packed Engram shards as prod reads them: ENGRAM_DIR, prod-perf1.env's HEAD_ENGRAM /
 #   WORKER_ENGRAM), CALIB (real: the drafts priced by prod's stored table, CACHE_VOL read-only; "": the built-in costs),
 #   TREE (DSpark draft trees, e.g. 3; "": chains), PHASES (1: per-round phase times into OUTDIR/phases.json),
-#   SPEC (1: the speculative DSpark pass, prod's TF_DSV41_SPEC_DRAFT=1; 0: off).
+#   SPEC (1: the speculative DSpark pass, prod's TF_DSV41_SPEC_DRAFT=1; 0: off), CONTEXT (the served slot limit, prod
+#   1048576; unset: 4,096; needs the long-aot phase's rope.bin and _stream variants).
+# long-aot (both hosts, once, before CONTEXT past 4,096): Python's prefill of one 8,448-token prompt on layers 0-24 at TP=2
+# over the two hosts (the stream top-k's _stream variants past 4,096 visible keys) merged into ASSETS/aot, and ASSETS'
+# rope.bin rebuilt with LONG_ROWS rows (1,050,624 = 1M + 2,048) (about 10 min).
 # rows-aot (both hosts, once, before SLOTS > 1): the slots reference (tools/zig/dsv41_slots/ref.py) at TP=2 over the
 # two hosts on prod's tree, its row-mode Triton variants merged into ASSETS/aot (about 8 min).
 set -u
@@ -51,6 +55,7 @@ ARGS=(--rm --gpus all --ipc=host --network host --device /dev/infiniband --ulimi
 [[ -n "${TREE:-}" ]] && ARGS+=(-e TF_DSV41_TREE="$TREE")
 [[ "${SLOT_DRAFTS:-0}" == 1 ]] && ARGS+=(-e TF_DSV41_SLOT_DRAFTS=1)
 [[ "${SPEC:-1}" == 1 ]] && ARGS+=(-e TF_DSV41_SPEC_DRAFT=1)    # prod's SPEC_DRAFT=1: the next round's pass early
+[[ -n "${CONTEXT:-}" ]] && ARGS+=(-e TF_DSV41_CONTEXT="$CONTEXT")  # the served slot limit (rope.bin: CONTEXT + 2,048 rows)
 [[ "${PHASES:-0}" == 1 ]] && ARGS+=(-e TF_DSV41_PHASES=1 -e TF_DSV41_PHASES_OUT=/out/phases.json)
 NCCL='export TF_NCCL_LIB=$(python -c "import nvidia.nccl, os; print(os.path.join(os.path.dirname(nvidia.nccl.__file__), \"lib\", \"libnccl.so.2\"))" 2>/dev/null || echo libnccl.so.2)'
 case "$PHASE" in
@@ -95,8 +100,26 @@ case "$PHASE" in
             --layers 0-24 --slots 4 --steps "${ROWS_STEPS:-8}" --rank "$RANK" --master "$MASTER" --port 29821 \
             > "$OUT/rows-aot.log" 2>&1 \
             && python3 "$KIT/tools/zig/dsv41_aot_merge.py" "$ASSETS/aot" "$RA/aot" | tee -a "$OUT/rows-aot.log" ;;
+    long-aot)
+        C=8474f3164ea60cb9c9f8e9bd5a4493fdf13eaa47
+        if [[ "$RANK" == 0 ]]; then TF=/home/dgx01/ai/src/dsv41-prod/$C; else TF=/home/root/ai/src/dsv41-prod/$C; fi
+        KN=(); for f in prod-knobs.env r1c-knobs.env; do while read -r kv; do [[ "$kv" =~ ^TF_ ]] && KN+=(-e "$kv"); done < "$KIT/tools/zig/dsv41_m1/$f"; done
+        LA=$OUT/long-aot; rm -rf "$LA"
+        RUN=(docker run --rm --gpus all --ipc=host --network host --device /dev/infiniband --ulimit memlock=-1 --cap-add IPC_LOCK
+             -v "$TF:/dsv41-tf:ro" -v "$MODEL:/model:ro" -v "$KIT:/kit:ro" -v "$OUT:/out" -v "$CACHE_VOL:/cache" "${KN[@]}"
+             -e TF_DSV41_GM_V2=1 -e TF_DSV41_EXPERT_TOPP=0.85 -e PYTHONPATH=/dsv41-tf/src:/cache/pylib
+             -e TORCH_EXTENSIONS_DIR=/cache/torch_extensions -e TRITON_CACHE_DIR=/cache/triton
+             -e NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-enp1s0f1np1} -e NCCL_IB_HCA=${NCCL_IB_HCA:-rocep1s0f1,roceP2p1s0f1}
+             -e GLOO_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-enp1s0f1np1} --entrypoint python "$IMAGE")
+        "${RUN[@]}" -u -B /kit/tools/zig/dsv41_m2b_ref.py --pack /model --out /out/long-aot --layers 0-24 --prompt 8448 \
+            --steps 1 --limit 10496 --rank "$RANK" --master "$MASTER" --port 29831 > "$OUT/long-aot.log" 2>&1 \
+            || { echo "long-aot reference failed: $OUT/long-aot.log"; exit 1; }
+        python3 "$KIT/tools/zig/dsv41_aot_merge.py" "$ASSETS/aot" "$LA/aot" | tee -a "$OUT/long-aot.log"
+        "${RUN[@]}" -B /kit/tools/zig/dsv41_rope_tables.py --config /model/config.json --rows "${LONG_ROWS:-1050624}" \
+            --out /out/rope-long.bin >> "$OUT/long-aot.log" 2>&1 && cp "$OUT/rope-long.bin" "$ASSETS/rope.bin" \
+            && echo "rope.bin: ${LONG_ROWS:-1050624} rows" | tee -a "$OUT/long-aot.log" ;;
     follow)
         docker run "${ARGS[@]}" --name dsv41-zig-m4-r$RANK --entrypoint bash "$IMAGE" \
             -c "$NCCL; exec /kit/tf-dsv41-m1 follow /model /assets" 2>&1 | tee -a "$OUT/follow.log" ;;
-    *) echo "phase: server | generate | follow | dspark-aot | rows-aot"; exit 2 ;;
+    *) echo "phase: server | generate | follow | dspark-aot | rows-aot | long-aot"; exit 2 ;;
 esac

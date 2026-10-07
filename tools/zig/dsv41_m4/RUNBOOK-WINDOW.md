@@ -13,12 +13,13 @@ It answers three questions:
 2. **The served path holds.** Every HTTP reply of run A (greedy and sampled, drafts on) replays through the CLI to the same ids: `PASS M4 CLI == HTTP`.
 3. **Long context.** Split KV's measured boot check on the whole model. Prompt and decode tok/s at 32K / 128K / 512K tokens against prod.
 
-**Downtime: about 2 h 20 min, up to 3 h**, with prod down from step 3 to step 12. Steps 1–2 run before the window, while prod serves.
+**Downtime: about 2 h 30 min, up to 3 h 10 min (part 1)**, with prod down from step 3 to step 12. Steps 1–2 run before the window, while prod serves.
 
 | part | time |
 |---|---|
 | prod baseline (prod up) | 20–25 min |
 | row-mode AOT set | 8 min |
+| long-context assets (`_stream` variants, 1M rope tables) | 10 min |
 | run A: 1 slot, all on (load, bench, requests) | 25 min |
 | run A's CLI replay | 15 min |
 | run B: 4 slots, drafts off (load, bench) | 15 min |
@@ -46,12 +47,13 @@ It answers three questions:
 | 3 | dgx-01 | **stop prod:** `cd ~/ai/src/dsv41-tensorfold-spark && CONFIG=config/prod.env scripts/serve.sh stop`. `docker ps` must show no `dsv41` container on either node | 1 min |
 | 4 | both | **assets:** `mkdir -p out && cp -r ~/zig-m2c2-kit/out/m4-assets out/assets` (the last window's set: M2c-2's prefill variants plus DSpark's). If it is missing, run `ASSETS=$A ./run_m4.sh R out dspark-aot` after copying a seed's `ref/{rope.bin,engram-host.bin,aot}` | 1 min |
 | 5 | both, within ~1 min | **row-mode AOT set:** `ASSETS=$A ./run_m4.sh R out rows-aot`. Each ends with `{"added": N, ...}` | 8 min |
+| 5b | both, within ~1 min | **long-context assets:** `ASSETS=$A ./run_m4.sh R out long-aot`: Python prefills one 8,448-token prompt (the stream top-k's `_stream` variants, used past 4,096 visible keys) and `rope.bin` is rebuilt for 1,050,624 positions. Each ends with `{"added": N, ...}` and `rope.bin: 1050624 rows`. Without it, run C's long prompts fail with `MissingTritonVariant` or `RopeTooShort` | 10 min |
 | 6 | both, within ~1 min | **run A, 1 slot, all on:** dgx-01 `ASSETS=$A PHASES=1 ./run_m4.sh 0 out/a server`, dgx-02 `ASSETS=$A ./run_m4.sh 1 out/a follow` | 8 min load |
 | 7 | dgx-01, second shell | when `out/a/server.log` says it is listening: `python3 bench_http.py --url http://127.0.0.1:8091 --label zig-1slot --out out/zig-a.json`, then `./requests.sh 8091 256`. Then stop the server (Ctrl-C); rank 1 ends on its own (else `docker stop dsv41-zig-m4-r1`) | 15 min |
 | 8 | both, within ~1 min | **run A's CLI replay:** dgx-01 `ASSETS=$A ./run_m4.sh 0 out/a generate`, dgx-02 `ASSETS=$A ./run_m4.sh 1 out/a follow`. **Check** `out/a/generate.log`: `PASS M4 CLI == HTTP: N/N replies equal` (the bench's sampled replies included), then `DSpark: D drafted, A accepted (rate)` | 15 min |
 | 9 | both, within ~1 min | **run B, 4 slots:** dgx-01 `ASSETS=$A SLOTS=4 POOL_TOKENS=1400000 INDEX_KV=fp8 ./run_m4.sh 0 out/b server`, dgx-02 the same with `1 out/b follow`. Then dgx-01: `python3 bench_http.py --url http://127.0.0.1:8091 --label zig-4slots --out out/zig-b.json`. Stop both | 15 min |
 | 9b | both, within ~1 min | **run B2, 4 slots with drafts (prod's shape):** dgx-01 `ASSETS=$A SLOTS=4 SLOT_DRAFTS=1 POOL_TOKENS=1400000 INDEX_KV=fp8 PHASES=1 ./run_m4.sh 0 out/b2 server`, dgx-02 the same with `1 out/b2 follow`. Then dgx-01: `python3 bench_http.py --url http://127.0.0.1:8091 --label zig-4slots-drafts --out out/zig-b2.json`, then `./requests.sh 8091 256`. Stop both. Then the replay at 4 streams: dgx-01 `ASSETS=$A SLOTS=4 SLOT_DRAFTS=1 POOL_TOKENS=1400000 INDEX_KV=fp8 GEN_STREAMS=4 ./run_m4.sh 0 out/b2 generate`, dgx-02 the same with `1 out/b2 follow`. **Check** `out/b2/generate.log`: `PASS M4 CLI == HTTP` and the `DSpark:` line | 30 min |
-| 10 | both, within ~1 min | **run C, long context:** dgx-01 `ASSETS=$A POOL_TOKENS=3000000 KV_SPLIT=1 INDEX_KV=fp8 ./run_m4.sh 0 out/c server`, dgx-02 the same with `1 out/c follow`. Note the boot check's lines in `out/c/server.log` (`grep -i "boot check\|pool" out/c/server.log`). Then dgx-01: `python3 bench_http.py --url http://127.0.0.1:8091 --label zig-split --long 32768,131072,524288 --out out/zig-long.json`. Stop both | 25–30 min |
+| 10 | both, within ~1 min | **run C, long context:** dgx-01 `ASSETS=$A CONTEXT=1048576 POOL_TOKENS=3000000 KV_SPLIT=1 INDEX_KV=fp8 ./run_m4.sh 0 out/c server`, dgx-02 the same with `1 out/c follow`. Note the boot check's lines in `out/c/server.log` (`grep -i "boot check\|pool" out/c/server.log`). Then dgx-01: `python3 bench_http.py --url http://127.0.0.1:8091 --label zig-split --long 32768,131072,524288 --out out/zig-long.json`. Stop both | 25–30 min |
 | 11 | dgx-01 | the tables: `python3 bench_http.py --compare out/prod.json out/zig-a.json`, the same for `out/zig-b.json` and `out/zig-b2.json`, and `--compare out/prod-long.json out/zig-long.json` | — |
 | 12 | dgx-01 | **restore prod:** `scripts/v2-rollback.sh perf1`, then `scripts/serve.sh status` (both ranks up, model `DeepSeek-V4.1-Flash-TF`) | 2 min |
 | 13 | dev box | collect `~/zig-window-kit/out/` from both nodes into `dsv41-exl3-quant/results/SPARK-ZIG-<date>/r0` and `r1` | 2 min |
@@ -62,7 +64,7 @@ It answers three questions:
 - **A, the prod candidate's one slot:** drafts on, contiguous slot (4,096 positions). Its 4-stream cells queue on one slot: they measure the one-slot server under load, not batching.
 - **B, batching:** 4 live slots in row mode (graphs per row bucket), keyed sampling per slot, the paged pool at prod's 1.4M tokens. Drafts are off: DSpark is one slot's for now. Compare B's 4-stream cells with prod's 4-stream cells (prod drafts with 4 slots), and A's 1-stream cells with prod's 1-stream cells.
 - **B2, prod's shape:** 4 live slots with DSpark drafting in each and one batched verify a round, as prod's batcher runs `PARALLEL=4`. **This is the like-for-like run against prod: compare every cell of `out/zig-b2.json` with `out/prod.json`.** Its replay at 4 streams checks that batched, drafted replies are the same ids as the HTTP ones, and its `DSpark:` line gives the multi-slot acceptance to set against prod's.
-- **C, long context:** split KV (the comp rows sharded over the two ranks) on a 3.0M-token pool, drafts on. The measured boot check runs first. If it refuses the pool, it names the bytes it needs: lower `POOL_TOKENS` (2400000, then 1400000) on both ranks and restart.
+- **C, long context:** split KV (the comp rows sharded over the two ranks) on a 3.0M-token pool, drafts on, prod's 1M served context (`CONTEXT=1048576`: prompts past 4,096 keys go through the stream top-k and split KV's row blocks). The measured boot check runs first. If it refuses the pool, it names the bytes it needs: lower `POOL_TOKENS` (2400000, then 1400000) on both ranks and restart.
 
 **Optional knobs:**
 - `TREE=3` on run A: DSpark draft trees as prod's `TF_DSV41_TREE=3` runs them. Compare drafted / accepted / rounds with prod's on the same prompts; tokens must stay equal (the CLI replay).
@@ -75,6 +77,13 @@ It answers three questions:
 - Long context gives prompt tok/s (prompt tokens over the time to the first token) and the 128-token answer's decode tok/s.
 - `out/a/phases.json` holds Zig's per-round phase times: the host's share of a round, against Python's own phase report.
 - Run A's generate line is pass / fail. The acceptance rate compares with prod's draft statistics.
+
+**Part 2 (optional, its own window if part 1 ran long): Zig as prod, the serving and ops checks.** `tools/zig/dsv41_ops/WINDOW-STEPS.md`, about 55–75 min:
+- build the Zig image natively on dgx-01 (prod mirror branch `zig-serve`: `scripts/zig-image.sh`, `config/prod-zig.env`);
+- `scripts/v2-rollback.sh zig` (Zig serves as prod; the first boot writes the prepared files), then a restart for the fast-boot time against Python's 33–48 s;
+- `wire_probe.py` against Zig and then Python, the request log, a client disconnect, a fail-fast kill of rank 1 with the watchdog's heal;
+- `scripts/v2-rollback.sh perf1`.
+Its assets are part 1's: copy `out/assets` to `HEAD_ASSETS` / `WORKER_ASSETS` of `config/prod-zig.env`. Prod's `PARALLEL=4` with NVMe sessions is not Zig's yet (sessions are refused with 4 slots), so part 2 runs Zig with the sessions tier closed at 4 slots.
 
 **On failure:**
 - **A run fails to load** (`out/*/server.log`, `follow.log`):

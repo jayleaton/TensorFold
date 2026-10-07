@@ -28,6 +28,9 @@ cp tools/zig/dsv41_m4/RUNBOOK.md "$KIT/RUNBOOK-M4.md"
 # the full window (RUNBOOK-WINDOW.md): the speed client against prod, the slots reference for the row-mode AOT set
 cp tools/zig/dsv41_m4/RUNBOOK-WINDOW.md "$HERE/bench_http.py" "$KIT/"
 mkdir -p "$KIT/tools/zig/dsv41_slots" && cp tools/zig/dsv41_slots/ref.py "$KIT/tools/zig/dsv41_slots/"
+# long context (the long-aot phase's rope tables) and the serving / ops steps (RUNBOOK-WINDOW.md part 2)
+cp tools/zig/dsv41_rope_tables.py "$KIT/tools/zig/"
+mkdir -p "$KIT/tools/zig/dsv41_ops" && cp tools/zig/dsv41_ops/WINDOW-STEPS.md tools/zig/dsv41_ops/wire_probe.py "$KIT/tools/zig/dsv41_ops/"
 chmod +x "$KIT/run_host.sh" "$KIT/run_m4.sh" "$KIT/requests.sh" "$KIT/tf-dsv41-m1" "$KIT/tensorfold-dsv41"
 git rev-parse HEAD > "$KIT/COMMIT" 2>/dev/null || echo "${KIT_COMMIT:?KIT_COMMIT: the commit of an archived tree (no .git)}" > "$KIT/COMMIT"
 (cd "$KIT" && find . -type f ! -name SHA256SUMS | sort | xargs sha256sum > SHA256SUMS)
