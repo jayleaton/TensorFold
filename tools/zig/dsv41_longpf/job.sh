@@ -53,7 +53,7 @@ longpf_gate() {
         [[ $mode == pool ]] && args+=(--pool)
         [[ $mode == split ]] && args+=(--split --compact 0)
         if ! (set -a; source "$Z/tools/zig/dsv41_m1/prod-knobs.env"; set +a
-              unset TF_DSV41_EXPERT_TOPP
+              unset TF_DSV41_EXPERT_TOPP M2B_TOPP   # m5.zig turns M2B_TOPP (the m2b job's 0.85) into the expert top-p
               export TF_DSV41_KV_SPLIT_UNION_MIB=${LONGPF_UNION_MIB:-8} TF_DSV41_KV_SPLIT_LOG=1
               if [[ $mode != contig ]]; then export PYTHONPATH=$twin/src TORCH_EXTENSIONS_DIR=$twin/ext; fi
               step "longpf-ref-$run" "$mb" python -u -B "$Z/tools/zig/dsv41_m2b_ref.py" --pack "$LP" --out "$ref" \
@@ -82,7 +82,7 @@ longpf_gate() {
         mb=$(left); (( mb > ${LONGPF_MIN:-8} )) && mb=${LONGPF_MIN:-8}
         (( mb >= 3 )) || { echo "longpf-$run skipped: $(left) min left" | tee -a "$RES/longpf-gate/summary.log"; ok=1; continue; }
         if (set -a; source "$Z/tools/zig/dsv41_m1/prod-knobs.env"; set +a
-            unset TF_DSV41_EXPERT_TOPP
+            unset TF_DSV41_EXPERT_TOPP M2B_TOPP   # m5.zig turns M2B_TOPP (the m2b job's 0.85) into the expert top-p
             export TF_TP_PORT=29761 TF_DSV41_CONTEXT=$limit M5_POOL_TOKENS=$pool \
                    TF_DSV41_KV_SPLIT_UNION_MIB=${LONGPF_UNION_MIB:-8}
             step "longpf-$run" "$mb" bash "$Z/tools/zig/dsv41_m1/m5_ranks.sh" "$Z/bin/tf-dsv41-m1" "$run" "$LP" "$ref" "$out"); then
