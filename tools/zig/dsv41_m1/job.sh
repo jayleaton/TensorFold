@@ -132,28 +132,44 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
     [[ -n "${M2B_TOPP:-}" ]] && export TF_DSV41_EXPERT_TOPP=$M2B_TOPP
     REF=$LOCAL/m2b-ref
     rm -rf "$REF"
+    # M2B_PROMPTS ("2060 2049 ..."): one reference load for several prompts, each from a fresh slot into $REF/p<N>; the
+    # M2b gate runs on the first's state, the prefill gate (M2B_PREFILL_GATE=1) on every one's
+    PROMPTS=${M2B_PROMPTS:-}
+    refargs=(--prompt "${M2B_PROMPT:-1536}")
+    [[ -n "$PROMPTS" ]] && refargs=(--prompts "$(echo $PROMPTS | tr ' ' ',')")
+    refs=("$REF")
     if step m2b-ref "${M2B_REF_MIN:-18}" python -u -B "$Z/tools/zig/dsv41_m2b_ref.py" --pack "$LP" --out "$REF" \
-            --layers "0-$hi" --steps "${M2B_STEPS:-64}" --prompt "${M2B_PROMPT:-1536}" \
+            --layers "0-$hi" --steps "${M2B_STEPS:-64}" "${refargs[@]}" \
        && step engram-host 3 python -B "$Z/tools/zig/dsv41_engram_host.py" --py-src /dsv41-tf/src \
             --config "$LP/config.json" --tokenizer "$LP/tokenizer.json" --out "$REF/engram-host.bin"; then
+        if [[ -n "$PROMPTS" ]]; then
+            refs=(); for p in $PROMPTS; do cp "$REF/engram-host.bin" "$REF/p$p/"; refs+=("$REF/p$p"); done
+        fi
+        R0=${refs[0]}
         # DSpark's Triton variants (the reference never drafts): capture P's AOT set merged into the reference's
-        if [[ -d "${CAP:-}/aot" ]]; then python -B "$Z/tools/zig/dsv41_aot_merge.py" "$REF/aot" "$CAP/aot" | tee -a "$RES/steps.txt"; fi
+        if [[ -d "${CAP:-}/aot" ]]; then for d in "${refs[@]}"; do python -B "$Z/tools/zig/dsv41_aot_merge.py" "$d/aot" "$CAP/aot" | tee -a "$RES/steps.txt"; done; fi
         mb=$(left); (( mb > 16 )) && mb=16
-        step m2b "$mb" bash "$Z/tools/zig/dsv41_m1/m2b_ranks.sh" "$Z/bin/tf-dsv41-m1" "$LP" "$REF" "$RES/m2b" \
+        step m2b "$mb" bash "$Z/tools/zig/dsv41_m1/m2b_ranks.sh" "$Z/bin/tf-dsv41-m1" "$LP" "$R0" "$RES/m2b" \
             || rc=1
         # M2B_PREFILL_GATE=1: Zig's own prefill from an empty slot (M2B_PREFILL=1): every state role == the
         # reference's dump and its first token, then the decode gate (M2B_PROMPT 2600: a 2,048-row chunk + a ragged one)
         if [[ "${M2B_PREFILL_GATE:-0}" == 1 ]]; then
-            mb=$(left); (( mb > 10 )) && mb=10
-            (export M2B_PREFILL=1 M2B_PORT=29717
-             step m2b-prefill "$mb" bash "$Z/tools/zig/dsv41_m1/m2b_ranks.sh" "$Z/bin/tf-dsv41-m1" "$LP" "$REF" "$RES/m2b-prefill") \
-                || rc=1
+            i=0
+            for d in "${refs[@]}"; do
+                name=m2b-prefill; [[ -n "$PROMPTS" ]] && name=m2b-prefill-$(basename "$d")
+                mb=$(left); (( mb > 10 )) && mb=10
+                (( mb >= 3 )) || { echo "$name skipped: $mb min left" | tee -a "$RES/steps.txt"; rc=1; continue; }
+                (export M2B_PREFILL=1 M2B_PORT=$(( 29717 + i ))
+                 step "$name" "$mb" bash "$Z/tools/zig/dsv41_m1/m2b_ranks.sh" "$Z/bin/tf-dsv41-m1" "$LP" "$d" "$RES/$name") \
+                    || rc=1
+                i=$(( i + 1 ))
+            done
         fi
         # M2B_GRAPHS=1: the same gate again with graphed decode windows (TF_DSV41_GRAPHS=1, R4): == the reference
         if [[ "${M2B_GRAPHS:-0}" == 1 ]]; then
             mb=$(left); (( mb > 8 )) && mb=8
             (export TF_DSV41_GRAPHS=1 M2B_PORT=29719
-             step m2b-graphs "$mb" bash "$Z/tools/zig/dsv41_m1/m2b_ranks.sh" "$Z/bin/tf-dsv41-m1" "$LP" "$REF" "$RES/m2b-graphs") \
+             step m2b-graphs "$mb" bash "$Z/tools/zig/dsv41_m1/m2b_ranks.sh" "$Z/bin/tf-dsv41-m1" "$LP" "$R0" "$RES/m2b-graphs") \
                 || rc=1
         fi
         # M2B_LANES ("1 2"): M3's gates, the same reference through lanes on rank 0 (1: drafts off; 2: oracle drafts)
@@ -161,7 +177,7 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
             mb=$(left); (( mb > 8 )) && mb=8
             (( mb >= 3 )) || { echo "m3-$k skipped: $mb min left" | tee -a "$RES/steps.txt"; rc=1; continue; }
             (export M2B_LANES=$k M2B_PORT=$(( 29720 + k ))
-             step "m3-$k" "$mb" bash "$Z/tools/zig/dsv41_m1/m2b_ranks.sh" "$Z/bin/tf-dsv41-m1" "$LP" "$REF" "$RES/m3-$k") \
+             step "m3-$k" "$mb" bash "$Z/tools/zig/dsv41_m1/m2b_ranks.sh" "$Z/bin/tf-dsv41-m1" "$LP" "$R0" "$RES/m3-$k") \
                 || rc=1
         done
         # M2B_R1=1: the M2b gate on R1 (the reference with r1c-knobs.env on the R1 twin; ours follows its env)
@@ -183,8 +199,11 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
             else echo "m2b-r1 skipped or its reference failed" | tee -a "$RES/steps.txt"; rc=1; fi
         fi
     else rc=1; fi
-    mkdir -p "$RES/m2b-ref"
-    for f in ref.json rank0.json rank1.json manifest.json; do [[ -f "$REF/$f" ]] && cp "$REF/$f" "$RES/m2b-ref/"; done
+    for d in "${refs[@]}"; do
+        o=$RES/m2b-ref; [[ -n "$PROMPTS" ]] && o=$RES/m2b-ref/$(basename "$d")
+        mkdir -p "$o"
+        for f in ref.json rank0.json rank1.json manifest.json; do [[ -f "$d/$f" ]] && cp "$d/$f" "$o/"; done
+    done
     [[ -d "$REF/aot" ]] && tar -czf "$RES/m2b-ref/aot.tar.gz" -C "$REF" aot
     km=$(left); (( km > 15 )) && km=15
     if (( km >= 6 )); then

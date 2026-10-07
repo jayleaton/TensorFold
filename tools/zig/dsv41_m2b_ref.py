@@ -8,6 +8,10 @@ this host's rope tables.
 
     python dsv41_m2b_ref.py --pack PACK --out DIR [--layers 0-27] [--prompt 1536] [--steps 64] [--port 29611]
 Writes DIR/ref.json, DIR/rank<r>/state/*, DIR/rope.bin, DIR/aot/.
+
+``--prompts 2060,2049,...`` (both ranks on this host): one load, each prompt from a fresh slot (Forward.new_slot, the
+stores zeroed as a new Forward's) into DIR/p<N>/, a whole reference dir each (the AOT set and rope tables of every
+prompt's kernels in each).
 """
 from __future__ import annotations
 
@@ -31,6 +35,8 @@ def digest(t) -> str:
 
 def rank_main(rank: int, a) -> None:
     sys.path.insert(0, str(HERE))
+    import shutil
+
     import torch
 
     dev_index = rank if a.rank < 0 else 0     # two hosts: each rank on its own GPU 0
@@ -68,18 +74,48 @@ def rank_main(rank: int, a) -> None:
                  limit=a.limit, chunk=128, engram_rows=rows, hasher=NgramHasher(cfg, tmap), slots=1,
                  contiguous=True, pchunk=2048)
     load_s = time.time() - t0
-    g = torch.Generator().manual_seed(a.seed)
-    ids = torch.randint(3, cfg.vocab_size, (a.prompt,), generator=g).tolist()
     rec = None
     if rank == 0 or a.rank >= 0:   # the AOT set (and rope tables) on each host of a two-host run, the prompt's prefill
         import triton_aot_manifest as aot   # kernels included (Zig's own prefill launches them: M2B_PREFILL)
 
         rec = aot.Recorder().install()
+    dirs = [Path(a.out) / f"p{p}" for p in a.prompts] if a.prompts else [Path(a.out)]
+    for i, (prompt, out) in enumerate(zip(a.prompts or [a.prompt], dirs)):
+        if i > 0:
+            fw.slots[0] = fw.new_slot(contiguous=True)
+        one(rank, a, fw, cfg, greedy, Seg, digest, prompt, out, lo, hi, t0, load_s, i == len(dirs) - 1)
+    run_s = time.time() - t0 - load_s
+    top = Path(a.out)
+    if rank == 0 or a.rank >= 0:   # the AOT set and rope tables on each host of a two-host run
+        tabs = RO.tables(cfg, a.limit + 2048)
+        (top / "rope.bin").write_bytes(b"DSV41RP1" + struct.pack("<II", *tabs[0].cs.shape)
+                                       + tabs[0].cs.contiguous().numpy().tobytes()
+                                       + tabs[1].cs.contiguous().numpy().tobytes())
+        rec.dump(top / "launches.json")
+        cache = Path(os.environ.get("TRITON_CACHE_DIR", Path.home() / ".triton" / "cache"))
+        aot.build(cache, top / "launches.json", top / "manifest.json", None)
+        pack_aot(top / "manifest.json", cache, top / "aot", specialization())
+        for d in dirs:
+            if d != top:
+                shutil.copy(top / "rope.bin", d / "rope.bin")
+                shutil.copytree(top / "aot", d / "aot", dirs_exist_ok=True)
+        print(f"rank 0: {len(dirs)} prompt(s), load {load_s:.0f} s, run {run_s:.0f} s", flush=True)
+    comm.barrier()
+
+
+def one(rank, a, fw, cfg, greedy, Seg, digest, prompt, out, lo, hi, t0, load_s, last) -> None:
+    """One prompt from the slot as it is: its state dump, greedy steps and digests into ``out``."""
+
+    import torch
+
+    g = torch.Generator().manual_seed(a.seed)
+    ids = torch.randint(3, cfg.vocab_size, (prompt,), generator=g).tolist()
+    t1 = time.time()
     logits = fw.prompt(ids)
     tok = int(greedy(fw, logits[-1:])[0])
     torch.cuda.synchronize()
     if rank == 0:
-        print(f"prompt of {a.prompt} at {time.time() - t0:.0f} s, first token {tok}", flush=True)
+        print(f"prompt of {prompt} at {time.time() - t0:.0f} s, first token {tok}", flush=True)
     # the slot after the prompt, by our forward's role names (block.zig: s.L<i>.swa / comp .v .s, .ik, .carry)
     sd = out / f"rank{rank}" / "state"
     sd.mkdir(parents=True, exist_ok=True)
@@ -115,25 +151,14 @@ def rank_main(rank: int, a) -> None:
     fw.trace = None
     # windows of 2.. rows after every recorded step (nothing recorded comes from them): their Triton variants join
     # the AOT set (a 1 specializes), for M3's lanes gates whose verify windows hold drafts
-    for n in a.extra_rows:
-        fw.run([Seg(0, fw.slot.pos, tuple([tok] * n))])
-        fw.keep(0, n - 1)
+    if last:
+        for n in a.extra_rows:
+            fw.run([Seg(0, fw.slot.pos, tuple([tok] * n))])
+            fw.keep(0, n - 1)
     torch.cuda.synchronize()
-    run_s = time.time() - t0 - load_s
-    mine = {"rank": rank, "load_s": round(load_s, 1), "run_s": round(run_s, 1), "tokens": tokens,
+    mine = {"rank": rank, "load_s": round(load_s, 1), "run_s": round(time.time() - t1, 1), "tokens": tokens,
             "logits_sha256": digests, "layers_first_window": layers_d, "prompt_ids": ids}
     (out / f"rank{rank}.json").write_text(json.dumps(mine) + "\n")
-    if rank == 0 or a.rank >= 0:   # the AOT set and rope tables on each host of a two-host run
-        tabs = RO.tables(cfg, a.limit + 2048)
-        (out / "rope.bin").write_bytes(b"DSV41RP1" + struct.pack("<II", *tabs[0].cs.shape)
-                                       + tabs[0].cs.contiguous().numpy().tobytes()
-                                       + tabs[1].cs.contiguous().numpy().tobytes())
-        rec.dump(out / "launches.json")
-        cache = Path(os.environ.get("TRITON_CACHE_DIR", Path.home() / ".triton" / "cache"))
-        aot.build(cache, out / "launches.json", out / "manifest.json", None)
-        pack_aot(out / "manifest.json", cache, out / "aot", specialization())
-        print(f"rank 0: {len(tokens)} tokens, load {load_s:.0f} s, run {run_s:.0f} s", flush=True)
-    comm.barrier()
 
 
 def main() -> int:
@@ -142,6 +167,8 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--layers", default="0-24")
     ap.add_argument("--prompt", type=int, default=1536)
+    ap.add_argument("--prompts", type=lambda v: [int(x) for x in v.split(",") if x], default=[],
+                    help="several prompts in one load, each from a fresh slot into DIR/p<N> (both ranks here)")
     ap.add_argument("--steps", type=int, default=64)
     ap.add_argument("--limit", type=int, default=4096)
     ap.add_argument("--seed", type=int, default=4101)
@@ -151,6 +178,8 @@ def main() -> int:
                     help="windows of these rows after the steps (their Triton variants in the AOT set)")
     ap.add_argument("--master", default="127.0.0.1", help="rank 0's address (two hosts: the head's CX7 address)")
     a = ap.parse_args()
+    if a.prompts and a.rank >= 0:
+        ap.error("--prompts runs both ranks on this host")
     Path(a.out).mkdir(parents=True, exist_ok=True)
     if a.rank >= 0:                         # two hosts: this host's rank alone (the other host runs the other)
         rank_main(a.rank, a)
@@ -166,18 +195,22 @@ def main() -> int:
     import torch.multiprocessing as mp
 
     mp.spawn(rank_main, args=(a,), nprocs=2, join=True)
-    r0 = json.loads((Path(a.out) / "rank0.json").read_text())
-    r1 = json.loads((Path(a.out) / "rank1.json").read_text())
-    if r0["tokens"] != r1["tokens"]:
-        print("the ranks' greedy tokens differ", flush=True)
-        return 1
-    meta = {"layers": a.layers, "prompt": a.prompt, "steps": a.steps, "seed": a.seed, "limit": a.limit,
-            "tokens": r0["tokens"], "prompt_ids": r0["prompt_ids"],
-            "env": {k: v for k, v in os.environ.items() if k.startswith("TF_DSV41")},
-            "ranks": [{k: r[k] for k in ("load_s", "run_s", "logits_sha256", "layers_first_window")} for r in (r0, r1)]}
-    (Path(a.out) / "ref.json").write_text(json.dumps(meta, indent=1) + "\n")
-    print(json.dumps({"tokens": len(meta["tokens"]), "first": meta["tokens"][:8]}), flush=True)
-    return 0
+    st = 0
+    for prompt in a.prompts or [a.prompt]:
+        d = Path(a.out) / f"p{prompt}" if a.prompts else Path(a.out)
+        r0 = json.loads((d / "rank0.json").read_text())
+        r1 = json.loads((d / "rank1.json").read_text())
+        if r0["tokens"] != r1["tokens"]:
+            print(f"prompt {prompt}: the ranks' greedy tokens differ", flush=True)
+            st = 1
+            continue
+        meta = {"layers": a.layers, "prompt": prompt, "steps": a.steps, "seed": a.seed, "limit": a.limit,
+                "tokens": r0["tokens"], "prompt_ids": r0["prompt_ids"],
+                "env": {k: v for k, v in os.environ.items() if k.startswith("TF_DSV41")},
+                "ranks": [{k: r[k] for k in ("load_s", "run_s", "logits_sha256", "layers_first_window")} for r in (r0, r1)]}
+        (d / "ref.json").write_text(json.dumps(meta, indent=1) + "\n")
+        print(json.dumps({"prompt": prompt, "tokens": len(meta["tokens"]), "first": meta["tokens"][:8]}), flush=True)
+    return st
 
 
 if __name__ == "__main__":
