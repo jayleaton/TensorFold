@@ -22,7 +22,7 @@ const emit = @import("dspark_emit.zig");
 const iface = @import("draft/iface.zig");
 const dspark = @import("draft/dspark.zig");
 
-pub const Error = error{ Slots, NotAPrefix, NoWeight, CandidateWidth };
+pub const Error = error{ Slots, NotAPrefix, NoWeight, CandidateWidth, BadCandidates };
 
 pub const GpuPass = struct {
     gpa: std.mem.Allocator,
@@ -188,7 +188,7 @@ pub const GpuPass = struct {
         const r = x.f.runner;
         try r.stream.synchronize();
         const pos: i32 = @intCast(start);
-        try cuda.DeviceBuffer.upload(.{ .d = r.d, .ptr = r.addressOf("w.ds.pos") orelse return error.Unbound, .len = 4 }, 0, std.mem.asBytes(&pos));
+        try cuda.DeviceBuffer.uploadAsync(.{ .d = r.d, .ptr = r.addressOf("w.ds.pos") orelse return error.Unbound, .len = 4 }, 0, std.mem.asBytes(&pos), r.stream.handle);
         var la = std.heap.ArenaAllocator.init(x.gpa);
         defer la.deinit();
         const cs = try emit.emitIngest(la.allocator(), x.f.cfg, x.f.widths, x.f.opts, n, row0);
@@ -289,8 +289,8 @@ pub const GpuPass = struct {
         x.h32[@intCast(st.anchor())] = @intCast(anchor);
         const r = x.f.runner;
         try r.stream.synchronize();
-        try cuda.DeviceBuffer.upload(.{ .d = r.d, .ptr = r.addressOf("w.ds.i64") orelse return error.Unbound, .len = 8 * x.h64.len }, 0, std.mem.sliceAsBytes(x.h64));
-        try cuda.DeviceBuffer.upload(.{ .d = r.d, .ptr = r.addressOf("w.ds.i32") orelse return error.Unbound, .len = 4 * x.h32.len }, 0, std.mem.sliceAsBytes(x.h32));
+        try cuda.DeviceBuffer.uploadAsync(.{ .d = r.d, .ptr = r.addressOf("w.ds.i64") orelse return error.Unbound, .len = 8 * x.h64.len }, 0, std.mem.sliceAsBytes(x.h64), r.stream.handle);
+        try cuda.DeviceBuffer.uploadAsync(.{ .d = r.d, .ptr = r.addressOf("w.ds.i32") orelse return error.Unbound, .len = 4 * x.h32.len }, 0, std.mem.sliceAsBytes(x.h32), r.stream.handle);
         r.glue = .{ .ctx = x, .run = glueFn };
     }
 
@@ -372,7 +372,7 @@ pub const GpuPass = struct {
         const bytes = 4 * packed_.len;
         const src = try x.device(&x.send, bytes);
         const dst = try x.device(&x.gathered, bytes * Wd);
-        try cuda.DeviceBuffer.upload(.{ .d = r.d, .ptr = src, .len = bytes }, 0, std.mem.sliceAsBytes(packed_));
+        try cuda.DeviceBuffer.uploadAsync(.{ .d = r.d, .ptr = src, .len = bytes }, 0, std.mem.sliceAsBytes(packed_), r.stream.handle);
         try comm.allGather(src, dst, packed_.len, .f32, r.stream.handle); // bits only (ids as fp32 bit patterns)
         try r.stream.synchronize();
         const all = try gpa.alloc(f32, packed_.len * Wd);
@@ -385,5 +385,15 @@ pub const GpuPass = struct {
             @memcpy(x.cval[i * c + w * k ..][0..k], src_row[0..k]);
             for (src_row[k..], x.cand[i * c + w * k ..][0..k]) |v, *o| o.* = @bitCast(v);
         };
+        try checkCandidates(x.cand, x.f.cfg.vocab);
     }
 };
+
+/// The gathered candidates are token ids (or -1): anything else is a gather that read its source before the upload
+/// landed, or a mis-paired collective. Named here on every rank, before the chain indexes the Markov tables with it.
+pub fn checkCandidates(cand: []const i32, vocab: usize) error{BadCandidates}!void {
+    for (cand, 0..) |id, i| if (id < -1 or id >= @as(i64, @intCast(vocab))) {
+        std.log.err("dspark: gathered candidate {d} at {d} is not a token id", .{ id, i });
+        return error.BadCandidates;
+    };
+}

@@ -164,7 +164,7 @@ pub const SlotPass = struct {
         const r = x.f.runner;
         try r.stream.synchronize();
         const pos: i32 = @intCast(start);
-        try cuda.DeviceBuffer.upload(.{ .d = r.d, .ptr = r.addressOf("w.ds.pos") orelse return error.Unbound, .len = 4 }, 0, std.mem.asBytes(&pos));
+        try cuda.DeviceBuffer.uploadAsync(.{ .d = r.d, .ptr = r.addressOf("w.ds.pos") orelse return error.Unbound, .len = 4 }, 0, std.mem.asBytes(&pos), r.stream.handle);
         var la = std.heap.ArenaAllocator.init(x.gpa);
         defer la.deinit();
         const sl: emit.Slots = .{ .ring_slots = x.nslots, .slot = slot, .taps_role = if (at.src == 1) batch.taps_stash_role else "w.taps" };
@@ -233,8 +233,8 @@ pub const SlotPass = struct {
         rows.stage(lay, n, f.cfg.window, @intCast(emit.ringRows(f.cfg)), x.one.shape.noise, ms, x.h64, x.h32);
         const r = f.runner;
         try r.stream.synchronize();
-        try cuda.DeviceBuffer.upload(.{ .d = r.d, .ptr = r.addressOf("w.ds.i64") orelse return error.Unbound, .len = 8 * @as(usize, @intCast(lay.len64)) }, 0, std.mem.sliceAsBytes(x.h64[0..@intCast(lay.len64)]));
-        try cuda.DeviceBuffer.upload(.{ .d = r.d, .ptr = r.addressOf("w.ds.i32") orelse return error.Unbound, .len = 4 * @as(usize, @intCast(lay.end32)) }, 0, std.mem.sliceAsBytes(x.h32[0..@intCast(lay.end32)]));
+        try cuda.DeviceBuffer.uploadAsync(.{ .d = r.d, .ptr = r.addressOf("w.ds.i64") orelse return error.Unbound, .len = 8 * @as(usize, @intCast(lay.len64)) }, 0, std.mem.sliceAsBytes(x.h64[0..@intCast(lay.len64)]), r.stream.handle);
+        try cuda.DeviceBuffer.uploadAsync(.{ .d = r.d, .ptr = r.addressOf("w.ds.i32") orelse return error.Unbound, .len = 4 * @as(usize, @intCast(lay.end32)) }, 0, std.mem.sliceAsBytes(x.h32[0..@intCast(lay.end32)]), r.stream.handle);
         x.stats.passes += 1;
         x.stats.slots += ms.len;
         r.glue = .{ .ctx = x, .run = glueFn };
@@ -342,11 +342,12 @@ pub const SlotPass = struct {
         const bytes = 4 * packed_.len;
         const src = try x.device(&x.send, bytes);
         const dst = try x.device(&x.gathered, bytes * Wd);
-        try cuda.DeviceBuffer.upload(.{ .d = r.d, .ptr = src, .len = bytes }, 0, std.mem.sliceAsBytes(packed_));
+        try cuda.DeviceBuffer.uploadAsync(.{ .d = r.d, .ptr = src, .len = bytes }, 0, std.mem.sliceAsBytes(packed_), r.stream.handle);
         try comm.allGather(src, dst, packed_.len, .f32, r.stream.handle);
         try r.stream.synchronize();
         const all = x.all[0 .. packed_.len * Wd];
         try cuda.DeviceBuffer.download(.{ .d = r.d, .ptr = dst, .len = 4 * all.len }, 0, std.mem.sliceAsBytes(all));
         rows.ungather(all, Wd, R, k, x.cand, x.cval);
+        try gpu.checkCandidates(x.cand, x.f.cfg.vocab);
     }
 };
