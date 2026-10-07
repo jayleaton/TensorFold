@@ -782,7 +782,43 @@ const Seg = struct {
 
     fn moeBlock(s: *Seg, L: u32) !void {
         const e = s.e;
+        if (e.o.image_rows != 0) return s.moeSplit(L);
+        const D: i64 = e.cfg.hidden;
+        return s.moeRows(L, e.n, try e.buf("w.out", .{}, .bf16, &.{ e.n, D }), "bias", try e.buf("L.moe16", .{}, .bf16, &.{ e.n, D }), false);
+    }
+
+    /// vision.moe (TF_DSV41_BIAS_VL): the segment's image rows through the MoE as their own call, routed with
+    /// gate.bias_vl, then the text rows with gate.bias, each a whole prefill_moe.forward at its own row count; the
+    /// partials go back to their rows (glue image_split / image_merge: the positions from the segment's ids).
+    /// image_rows < 0 (the buffer plan): both calls at the segment's rows, so every role is sized for any split.
+    fn moeSplit(s: *Seg, L: u32) !void {
+        const e = s.e;
+        const D: i64 = e.cfg.hidden;
         const n = e.n;
+        const ni: i64 = if (e.o.image_rows < 0) n else e.o.image_rows;
+        const nt: i64 = if (e.o.image_rows < 0) n else n - ni;
+        const x = try e.buf("w.out", .{}, .bf16, &.{ n, D });
+        const xi = try e.buf("w.out.img", .{}, .bf16, &.{ ni, D });
+        const xt: Arg = if (nt > 0) try e.buf("w.out.txt", .{}, .bf16, &.{ nt, D }) else try e.empty(.bf16);
+        try e.glue("image_split", &.{ x, xi, xt });
+        const pi = try e.buf("L.moe16.img", .{}, .bf16, &.{ ni, D });
+        try s.moeRows(L, ni, xi, "bias_vl", pi, false);
+        var pt = try e.empty(.bf16);
+        if (nt > 0) {
+            pt = try e.buf("L.moe16.txt", .{}, .bf16, &.{ nt, D });
+            try s.moeRows(L, nt, xt, "bias", pt, true);
+        }
+        try e.glue("image_merge", &.{ pi, pt, try e.buf("L.moe16", .{}, .bf16, &.{ n, D }) });
+    }
+
+    /// prefill_moe.forward over `n` rows at `x`: the router with gate.<bias>, x3gm's ragged launches, the shared
+    /// expert, bf16(routed + shared) into `part`; `again`: the layer's second call (its MoE ticket, not the next layer's)
+    fn moeRows(s: *Seg, L: u32, n: i64, x: Arg, comptime bias: []const u8, part: Arg, again: bool) !void {
+        const e = s.e;
+        // the call's own rows are the emitter's rows (the projections' M, their scratch): a plain n-row segment's MoE
+        const seg_rows = e.n;
+        e.n = n;
+        defer e.n = seg_rows;
         const D: i64 = e.cfg.hidden;
         const ex = e.cfg.expertsOf(L);
         const topk: i64 = ex.topk;
@@ -790,7 +826,6 @@ const Seg = struct {
         const Et: i64 = ex.count;
         const I: i64 = e.cfg.expert_width / e.o.world;
         const P = n * topk;
-        const x = try e.buf("w.out", .{}, .bf16, &.{ n, D });
         const pick = try e.buf("L.pick", .{}, .i32, &.{ n, slots });
         const wts = try e.buf("L.wts", .{}, .f32, &.{ n, slots });
         // router_gemv.route over every row (one CHUNK), prefill's config (8 warps, 2 experts a warp); at most 16 rows
@@ -801,7 +836,7 @@ const Seg = struct {
         const cfg: [2]i64 = if (n <= 16) .{ 2, 0 } else .{ 8, 2 };
         try e.ext("tf_dsv41_router_gemv_v2.route", &.{
             x,                                                        try e.weight("L{d}.moe.gate", .{L}, .bf16, &.{ Et, D }),
-            try e.weight("L{d}.moe.bias", .{L}, .f32, &.{Et}),       pick,
+            try e.weight("L{d}.moe." ++ bias, .{L}, .f32, &.{Et}),   pick,
             wts,                                                      try e.buf("L.logits", .{}, .f32, &.{ n, Et }),
             try e.buf("s.router.cnt", .{}, .i32, &.{128}),           .{ .i = topk },
             .{ .i = slots },                                          .{ .f = E.dec(e.cfg.routed_scale) },
@@ -842,7 +877,7 @@ const Seg = struct {
             xg, xu,          .{ .i = D }, .{ .i = topk }, .{ .i = P }, .{ .i = 2 },
         });
         const ticket = try e.buf("L.gm.ticket", .{}, .i32, &.{2 * gm_widths});
-        try e.glue("gm_ticket", &.{ticket});
+        try e.glue(if (again) "gm_ticket_again" else "gm_ticket", &.{ticket});
         const tmax = @divFloor(P, gm_bm) + Et + 1;
         const lim: f64 = E.dec(e.cfg.swiglu_limit);
         for (0..2) |down| {
@@ -889,7 +924,6 @@ const Seg = struct {
         const routed = try e.buf("L.routed", .{}, .f32, &.{ n, D });
         try e.ext("tensorfold_exl3_experts_v1.combine", &.{ y, w6, routed, .{ .i = n }, .{ .i = D }, .{ .i = topk } });
         // the shared expert: gate and up GEMMs, the clamped SiLU product (torch), the down GEMM
-        const part = try e.buf("L.moe16", .{}, .bf16, &.{ n, D });
         if (e.cfg.shared_experts > 0) {
             const sh = try e.fmt("{s}.shared.0", .{pre});
             const g = try e.buf("L.sh.g", .{}, .f32, &.{ n, I });
