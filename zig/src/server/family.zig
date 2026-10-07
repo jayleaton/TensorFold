@@ -23,7 +23,20 @@ pub const Prompt = struct {
     body: Value = .null,
 };
 
-pub const Rendered = struct { ids: []const u32, images_omitted: u32 = 0 };
+pub const Rendered = struct { ids: []const u32, images_omitted: u32 = 0, images: ?Images = null };
+
+/// A rendered prompt's prepared images (TF_DSV41_IMAGES=native): ``held`` goes to ``api.Request.images``; they stay
+/// alive until ``release`` (the request's end). ``token`` is the image token /tokenize shows at their positions.
+pub const Images = struct {
+    held: *const anyopaque,
+    token: u32,
+    ctx: *anyopaque,
+    release_fn: *const fn (ctx: *anyopaque) void,
+
+    pub fn release(im: Images) void {
+        im.release_fn(im.ctx);
+    }
+};
 
 /// A finished reply's parts, calls as OpenAI tool-call objects.
 pub const Parsed = struct { reasoning: []const u8, content: []const u8, calls: []Value };
