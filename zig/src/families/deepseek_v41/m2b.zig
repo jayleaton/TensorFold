@@ -140,8 +140,19 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, ref: []con
     var bp = blk: {
         // the plan at both trace settings (the traced program adds one role)
         f.opts.trace = true;
-        // M2B_LANES windows hold the pending token + a DSpark block of drafts
-        var p = try f.plan(if (lanes_mode != 0) rows_lanes[0 .. cfg.dspark_block + 1] else &.{1});
+        // M2B_LANES windows hold the pending token + a DSpark block of drafts; M2B_PROF_ROWS' timed windows (after
+        // the gate) need their row counts planned too: a 1-row plan left the decode-only roles (L.mhc.part
+        // [n, 4, 40, 32], ...) one row deep, and R1's mHC tail read past them at 4 rows (pods 29 / 30)
+        var rows: std.ArrayList(u32) = .empty;
+        try rows.appendSlice(a, if (lanes_mode != 0) rows_lanes[0 .. cfg.dspark_block + 1] else &.{1});
+        if (std.c.getenv("M2B_PROF_ROWS")) |spec| {
+            var it = std.mem.tokenizeScalar(u8, std.mem.span(spec), ' ');
+            while (it.next()) |word| {
+                const n = try std.fmt.parseInt(u32, word, 10);
+                if (std.mem.indexOfScalar(u32, rows.items, n) == null) try rows.append(a, n);
+            }
+        }
+        var p = try f.plan(rows.items);
         if (lanes_mode == 3) try dspark_gpu.GpuPass.plan(f.arena.allocator(), &f, &p, cfg.dspark_block + 1);
         if (own_prefill) try f.planPrefill(&p, @intCast(f.opts.prefill_rows));
         f.programs.clearRetainingCapacity();
