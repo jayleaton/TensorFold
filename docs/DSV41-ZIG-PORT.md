@@ -97,7 +97,7 @@ Five agents work on `dsv41-zig` at once toward one combined pod gate and one Spa
 - **Plan-link operation numbers** (`forward.zig`): 1–11 are taken (window, greedy, keep, stop, ds_ingest, ds_propose, prefill, sess_save, sess_restore, release, ds_reset). Reserve new ones by appending to this list in this section, in the same commit that adds them:
   - 12–15: `dsq-zig-samp-1`;
   - 16–19: `dsq-zig-slots-1`;
-  - 20–23: `dsq-zig-trees-1`;
+  - 20–23: `dsq-zig-trees-1` (20: `op_tree_drop`, `Forward.drop`);
   - 24–27: `dsq-zig-speed-1`.
 - **Defaults.** Every new behaviour is behind a knob or a new code path, and defaults to today's. With every new knob off, the gates `check cap24-*/cap15/cap18/cap22` and `dcheck cap16` still give 0 mismatches. Run `tf-dsv41-m1 m5-emit cap18` before committing a change to an emitter.
 - **Pool vs contiguous.** A slot's KV is either the contiguous roles (`s.L<i>.comp.*`, `s.L<i>.ik`) or the pool (`block.Options.pool`, the `s.kv.*` roles). New code must work with both, or refuse the other by name.
@@ -121,6 +121,32 @@ Five agents work on `dsv41-zig` at once toward one combined pod gate and one Spa
   - M4 on the pod (HTTP == CLI with drafts, drafted == serial);
   - M5 `paged` / `split` / `compact` / `park` (`M1_JOB=m5`);
   - the boot check (host goldens).
+- `dsq-zig-trees-1` (draft trees on the GPU target; design below):
+  - **`M2B_LANES=4`** (`M1_JOB=m2b`, 2 GPUs, about 4 min after the shared load): lanes with first-position trees (2 siblings) and the tree oracle's drafts over the GPU target at TP=2. Rank 0's tokens must equal the reference's serial greedy tokens, with trees > 0 and 0 < sibling wins < trees. Expected lines: `PASS M3 lanes mode 4 rank 0: tokens 64/64 equal, drafted N, accepted M, trees T, sibling wins W, ...` and `PASS M3 lanes mode 4 rank 1`. `m3-4/m3-rank0.json` also records `chains` and `rerun_rows`. No new assets.
+  - **`M2B_LANES=3` with `TF_DSV41_TREE=3`** (about 4 min): DSpark's own siblings (gathered `[block, 128]` candidates) through the same path. The gate is tokens equal and drafted > 0. On the 0–24 prefix the taps are zeros, so the tree counts are informational. `job.sh` runs one mode list with one environment, so this needs its own mode token. The suggested hook is `3t` → `M2B_LANES=3 TF_DSV41_TREE=3`, with the result dir `m3-3t`.
+  - **Pool and split with trees:** the `M2B_M4=1` step again, with `TF_DSV41_TREE=3 TF_DSV41_POOL_TOKENS=<the M5 step's> TF_DSV41_KV_SPLIT=1` added to `m4env`. It checks HTTP == CLI with drafts, and drafts == serial. Trees use no private pages (below), so this checks `Forward.drop` against the pool's reserved pages and split's exchange.
+  - **Spark window (whole model):** M4 with `TF_DSV41_TREE=3` against Python prod's engine with `TF_DSV41_TREE=3` on the same 8 prompts, at the same calibration table. Tokens must be equal. Drafted, accepted, rounds, trees and sibling wins should be close to Python's, not identical: the host `_chain` order is fp32 (as for chains).
+  - Host: `zig build test-dsv41-draft` (`branches_test.zig`).
+
+**Draft trees on the GPU target (`dsq-zig-trees-1`, `draft/branches.zig`).** Python's `tree.py` runs each sibling branch as its own chain window on a shadow slot. The shadow holds a copy of the slot's rings and carries, and gets private pages under the window. Ours runs the branches on the slot itself, lazily, as chain windows:
+- the window first runs the chain of first children from row 0;
+- when the target's choice after a row is a later child of it, that chain is dropped uncommitted (`Forward.drop`, op 20, on every rank), and the path so far plus the sibling's chain runs instead;
+- the accepted path is then a prefix of the last chain, which `keep(path)` commits.
+
+What follows from this:
+- **Exactness:** every chain is an ordinary chain window, so each row's bits are the serial decode's. A re-run row must choose as before (`error.BranchUnstable`).
+- **No shadow state:** the paged pool, split KV and sessions see plain windows. Python refuses trees with split KV.
+- **Cost:** a losing sibling costs no row. A winning one costs a second window of its path (Python: the duplicated pending row plus the sibling's rows in the same window).
+- **Pricing:** the plan prices trees as Python does (`TF_DSV41_TREE_DUP_MS` with the pending row counted), so the rounds' choices are Python's.
+
+The hooks:
+- `target.zig`: `GpuTarget.tree`, the `parents` path in `window`, `keep`, `taps().map`;
+- `forward.zig`: `drop`;
+- `serve_engine.zig`: the knobs;
+- `m3.zig`: `shapeOf.candidates`, the gathered width (128 at TP=2: lanes' siblings read `[block, world × k]`, as Python's `last_tree`), and `generateTrees`;
+- `m2b.zig`: mode 4.
+
+`iface.Taps.map` maps the tree's rows to the last chain's taps rows for lanes' ingest. Parent-conditioned trees (`TF_DSV41_TREE_PC=1`) are refused by name.
 
 ## 1. How the Zig engine is built
 
