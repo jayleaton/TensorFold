@@ -426,7 +426,7 @@ def main() -> int:
     ap.add_argument("--aot-taps", action="store_true",
                     help="--aot-prompts with DSpark's taps kept (Forward taps=True), for a drafting server's prefill variants")
     ap.add_argument("--prompts", type=lambda v: [int(x) for x in v.split(",") if x], default=[],
-                    help="several prompts in one load, each from a fresh slot into DIR/p<N> (both ranks here)")
+                    help="several prompts in one load, each from a fresh slot into DIR/p<N> (with --rank: this host's rank)")
     ap.add_argument("--steps", type=int, default=64)
     ap.add_argument("--grammar", action="store_true",
                     help="also the structured-output gate's replies (dsv41_grammar/grammar_ref.py) into DIR/grammar/trace.jsonl")
@@ -445,8 +445,6 @@ def main() -> int:
     ap.add_argument("--park", action="store_true", help="M5: save / park / restore after the prompt (implies --pool)")
     ap.add_argument("--no-scramble", action="store_true", help="M5: no page holder (the slot's pages 0, 1, 2 ...)")
     a = ap.parse_args()
-    if a.prompts and a.rank >= 0:
-        ap.error("--prompts runs both ranks on this host")
     a.kv = "split" if a.split else ("pool" if a.pool or a.park else "contig")
     if a.compact is not None:
         if not a.split:
@@ -459,18 +457,20 @@ def main() -> int:
     Path(a.out).mkdir(parents=True, exist_ok=True)
     if a.rank >= 0:                         # two hosts: this host's rank alone (the other host runs the other)
         rank_main(a.rank, a)
-        mine = json.loads((Path(a.out) / f"rank{a.rank}.json").read_text())
-        ranks = [None, None]
-        ranks[a.rank] = {k: mine[k] for k in ("load_s", "run_s", "logits_sha256", "layers_first_window")}
-        meta = {"layers": a.layers, "prompt": a.prompt, "steps": a.steps, "seed": a.seed, "limit": a.limit,
-                "tokens": mine["tokens"], "prompt_ids": mine["prompt_ids"], "host_rank": a.rank,
-                "env": {k: v for k, v in os.environ.items() if k.startswith("TF_DSV41")}, "ranks": ranks}
-        if a.kv != "contig":
-            meta["kv"] = a.kv
-            if "park" in mine:
-                ranks[a.rank]["park"] = mine["park"]
-        (Path(a.out) / "ref.json").write_text(json.dumps(meta, indent=1) + "\n")
-        print(json.dumps({"rank": a.rank, "tokens": len(mine["tokens"]), "first": mine["tokens"][:8]}), flush=True)
+        for prompt in a.prompts or [a.prompt]:      # --prompts: each prompt's DIR/p<N> as a one-prompt run's DIR
+            d = Path(a.out) / f"p{prompt}" if a.prompts else Path(a.out)
+            mine = json.loads((d / f"rank{a.rank}.json").read_text())
+            ranks = [None, None]
+            ranks[a.rank] = {k: mine[k] for k in ("load_s", "run_s", "logits_sha256", "layers_first_window")}
+            meta = {"layers": a.layers, "prompt": prompt, "steps": a.steps, "seed": a.seed, "limit": a.limit,
+                    "tokens": mine["tokens"], "prompt_ids": mine["prompt_ids"], "host_rank": a.rank,
+                    "env": {k: v for k, v in os.environ.items() if k.startswith("TF_DSV41")}, "ranks": ranks}
+            if a.kv != "contig":
+                meta["kv"] = a.kv
+                if "park" in mine:
+                    ranks[a.rank]["park"] = mine["park"]
+            (d / "ref.json").write_text(json.dumps(meta, indent=1) + "\n")
+            print(json.dumps({"rank": a.rank, "prompt": prompt, "tokens": len(mine["tokens"]), "first": mine["tokens"][:8]}), flush=True)
         return 0
     import torch.multiprocessing as mp
 
