@@ -339,11 +339,26 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
             refs=(); for p in $PROMPTS; do cp "$REF/engram-host.bin" "$REF/p$p/"; refs+=("$REF/p$p"); done
         fi
         R0=${refs[0]}
+    ws_gates() {
+        # the gap-closing workstreams (each tools/zig/dsv41_<name>/job.sh with a <name>_gate, same env as slots_gate):
+        # M2B_LONGPF (long prompts past 4,096 keys), M2B_SPEC (SPEC_DRAFT early pass), M2B_GRAMMAR (structured output),
+        # M2B_VISION (image input), M2B_KNOBS (prod engine knobs on the Zig side), M2B_SESS4 (sessions with several slots)
+        for name in longpf spec grammar vision knobs sess4; do
+            knob=M2B_${name^^}
+            [[ "${!knob:-0}" == 1 ]] || continue
+            if [[ -f "$Z/tools/zig/dsv41_$name/job.sh" ]]; then
+                (source "$Z/tools/zig/dsv41_$name/job.sh"; "${name}_gate") || rc=1
+                grep -h "PASS $name\|FAIL $name" "$RES"/$name*.log "$RES"/$name-*/*.log 2>/dev/null | tee -a "$RES/steps.txt"
+            else echo "$name skipped: no tools/zig/dsv41_$name/job.sh" | tee -a "$RES/steps.txt"; rc=1; fi
+        done
+    }
         # DSpark's Triton variants (the reference never drafts): capture P's AOT set merged into the reference's
         if [[ -d "${CAP:-}/aot" ]]; then for d in "${refs[@]}"; do python -B "$Z/tools/zig/dsv41_aot_merge.py" "$d/aot" "$CAP/aot" | tee -a "$RES/steps.txt"; done; fi
         mb=$(left); (( mb > 16 )) && mb=16
         step m2b "$mb" bash "$Z/tools/zig/dsv41_m1/m2b_ranks.sh" "$Z/bin/tf-dsv41-m1" "$LP" "$R0" "$RES/m2b" \
             || rc=1
+        # M2B_GATES_FIRST=1: the workstream gates (never run on a GPU) before R1 / M4 / sampling / slots (gated before)
+        [[ "${M2B_GATES_FIRST:-0}" == 1 ]] && ws_gates
         # M2B_PREFILL_GATE=1: Zig's own prefill from an empty slot (M2B_PREFILL=1): every state role == the
         # reference's dump and its first token, then the decode gate (M2B_PROMPT 2600: a 2,048-row chunk + a ragged one)
         if [[ "${M2B_PREFILL_GATE:-0}" == 1 ]]; then
@@ -501,17 +516,9 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
             grep -h "^mdraft\|PASS mdraft\|FAIL mdraft" "$RES"/mdraft*.log "$RES"/mdraft-*/rank0.log 2>/dev/null | tee -a "$RES/steps.txt"
         else echo "mdraft skipped: no tools/zig/dsv41_mdraft/job.sh" | tee -a "$RES/steps.txt"; rc=1; fi
     fi
-    # the gap-closing workstreams (each tools/zig/dsv41_<name>/job.sh with a <name>_gate, same env as slots_gate):
-    # M2B_LONGPF (long prompts past 4,096 keys), M2B_SPEC (SPEC_DRAFT early pass), M2B_GRAMMAR (structured output),
-    # M2B_VISION (image input), M2B_KNOBS (prod engine knobs on the Zig side), M2B_SESS4 (sessions with several slots)
-    for name in longpf spec grammar vision knobs sess4; do
-        knob=M2B_${name^^}
-        [[ "${!knob:-0}" == 1 ]] || continue
-        if [[ -f "$Z/tools/zig/dsv41_$name/job.sh" ]]; then
-            (source "$Z/tools/zig/dsv41_$name/job.sh"; "${name}_gate") || rc=1
-            grep -h "PASS $name\|FAIL $name" "$RES"/$name*.log "$RES"/$name-*/*.log 2>/dev/null | tee -a "$RES/steps.txt"
-        else echo "$name skipped: no tools/zig/dsv41_$name/job.sh" | tee -a "$RES/steps.txt"; rc=1; fi
-    done
+    # the gap-closing workstreams (ws_gates, defined after the M2b reference): here, unless M2B_GATES_FIRST=1 ran them
+    # right after the M2b decode gate
+    [[ "${M2B_GATES_FIRST:-0}" == 1 ]] || ! declare -F ws_gates > /dev/null || ws_gates
     for d in "${refs[@]}"; do
         o=$RES/m2b-ref; [[ -n "$PROMPTS" ]] && o=$RES/m2b-ref/$(basename "$d")
         mkdir -p "$o"
