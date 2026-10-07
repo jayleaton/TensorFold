@@ -15,9 +15,11 @@
 //! - TF_DSV41_KV_SPLIT_COMPACT (kv/split.zig's compact mode): the dense exchange packs each owner's rows and moves only
 //!   those where the transport takes device lengths.
 //!
-//! Not here yet: a prefill union past TF_DSV41_KV_SPLIT_UNION_MIB (Python runs the segment's attention in row blocks;
-//! this runtime refuses it with error.UnionSplit: never at the gates' 4,096 positions, possible at 1M), row mode (several
-//! live slots in one window).
+//! - A prefill union past TF_DSV41_KV_SPLIT_UNION_MIB (long prompts): the halves plan.py makes are kept in `blocks`
+//!   and longpf.zig runs the segment's attention in those row blocks, each block's rows exchanged right before it
+//!   (Python's _attend_blocks), for the index layer and its reuse layers alike.
+//!
+//! Not here yet: row mode (several live slots in one window).
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -31,7 +33,7 @@ const Config = @import("config.zig").Config;
 
 const sessions = kv.sessions;
 
-pub const Error = error{ UnionSplit, PoolTooSmall, BadGlue, NoPool };
+pub const Error = error{ PoolTooSmall, BadGlue, NoPool };
 
 pub const Options = struct {
     /// TF_DSV41_POOL_TOKENS (whole pages of every residue)
@@ -72,6 +74,12 @@ pub fn bootCheck(ctx: *const cuda.Context, cfg: *const Config, o: Options, rank:
     if (!budget.measuredApplies(budget.modeFromEnv(), integrated, dev.total, mi.total)) return;
     var knobs: budget.Knobs = .{};
     if (std.c.getenv("TF_DSV41_FLOOR_HARD_GIB")) |v| knobs.hard_gib = try std.fmt.parseFloat(f64, std.mem.span(v));
+    // TF_DSV41_FLOOR_GIB (5): the floor target the load plans for (memory.py floor_settings: 0 < hard <= target)
+    const target: f64 = if (std.c.getenv("TF_DSV41_FLOOR_GIB")) |v| try std.fmt.parseFloat(f64, std.mem.span(v)) else @max(5.0, knobs.hard_gib);
+    if (!(knobs.hard_gib > 0 and knobs.hard_gib <= target)) {
+        std.log.err("kv: TF_DSV41_FLOOR_HARD_GIB={d} / TF_DSV41_FLOOR_GIB={d}: expected 0 < hard <= target", .{ knobs.hard_gib, target });
+        return error.BadFloor;
+    }
     var layout = try kv.Layout.fromConfig(cfg, .{ .split = o.split and world > 1 });
     const r = budget.serveCheck(knobs, .{ .rank = rank, .avail_gib = @as(f64, @floatFromInt(mi.available)) / budget.GiB, .terms = try budget.Serve.fromEnv(rank) }, layout.pool(), world, o.tokens);
     var buf: [1024]u8 = undefined;
@@ -80,6 +88,7 @@ pub fn bootCheck(ctx: *const cuda.Context, cfg: *const Config, o: Options, rank:
         return error.PoolDoesNotFit;
     }
     std.log.info("kv: {s}", .{r.message(&buf)});
+    if (r.worst < target) std.log.warn("kv: memory: floor {d:.2} GiB is under the {d} GiB target (TF_DSV41_FLOOR_GIB)", .{ r.worst, target });
 }
 
 pub const Kv = struct {
@@ -104,6 +113,11 @@ pub const Kv = struct {
     ops: Ops = undefined,
     lens: ?cuda.DeviceBuffer = null,
     stats: Stats = .{},
+    /// the last union when it took several row blocks (empty: one block, already exchanged): each block's rows
+    /// sit in `phys` at its offset, its tokens in the call's token rows; longpf.zig exchanges them block by block
+    blocks: std.ArrayList(kv.split.Block) = .empty,
+    block_phys: std.ArrayList(u32) = .empty,
+    union_at: struct { comp: u64 = 0, send: u64 = 0, recv: u64 = 0 } = .{},
 
     pub const Stats = struct { dense: u64 = 0, unions: u64 = 0, union_rows_max: u64 = 0, bytes: u64 = 0 };
 
@@ -130,6 +144,9 @@ pub const Kv = struct {
     }
 
     pub fn deinit(k: *Kv) void {
+        k.dropBlocks();
+        k.blocks.deinit(k.gpa);
+        k.block_phys.deinit(k.gpa);
         if (k.phys) |*b| b.free();
         if (k.lens) |*b| b.free();
         k.dev.deinit();
@@ -195,6 +212,7 @@ pub const Kv = struct {
     // split KV's exchange (block.zig Emitter.exchange: sel, comp family, split table, send, recv, tokens, psh)
 
     pub fn glue(k: *Kv, r: *run.Runner, c: *const calls.Call, step: []const u8) !void {
+        k.dropBlocks();
         if (std.mem.eql(u8, step, "kx_dense")) return k.dense(r, c);
         if (std.mem.eql(u8, step, "kx_union")) return k.unionOf(r, c);
         return error.BadGlue;
@@ -250,7 +268,7 @@ pub const Kv = struct {
             blocks.deinit(k.gpa);
         }
         try kv.split.planUnion(k.gpa, .{ .sel = sel, .k = kk, .table = table, .psh = a.psh, .world = k.world, .rank = k.rank, .row_bytes = block.Pool.row_bytes, .cap = k.opts.union_cap }, &blocks);
-        if (blocks.items.len != 1) return error.UnionSplit;
+        if (blocks.items.len != 1) return k.keepBlocks(r, a.comp, a.send, a.recv, a.tok, kk, &blocks);
         const b = blocks.items[0];
         if (k.phys == null or k.phys.?.len < 4 * b.phys.len) {
             if (k.phys) |*p| p.free();
@@ -259,6 +277,40 @@ pub const Kv = struct {
         try cuda.DeviceBuffer.upload(k.phys.?, 0, std.mem.sliceAsBytes(b.phys));
         try cuda.DeviceBuffer.upload(.{ .d = r.d, .ptr = a.tok, .len = 4 * b.tokens.len }, 0, std.mem.sliceAsBytes(b.tokens));
         try k.x.unionBlock(a.comp, block.Pool.row_bytes, k.phys.?.ptr, b.m, a.send, a.recv, r.stream.handle);
+        k.stats.unions += 1;
+        k.stats.union_rows_max = @max(k.stats.union_rows_max, @as(u64, b.m) * k.world);
+        k.stats.bytes += @as(u64, b.m) * block.Pool.row_bytes * k.world;
+    }
+
+    fn dropBlocks(k: *Kv) void {
+        for (k.blocks.items) |*b| b.deinit(k.gpa);
+        k.blocks.clearRetainingCapacity();
+    }
+
+    /// A union of several row blocks: every block's rows to send (one upload, the stream idle after the plan's sync)
+    /// and its tokens (rows [a, b) of the token buffer); the exchanges wait for `fetchBlock`.
+    fn keepBlocks(k: *Kv, r: *run.Runner, comp: u64, send: u64, recv: u64, tok: u64, kk: u32, blocks: *std.ArrayList(kv.split.Block)) !void {
+        k.block_phys.clearRetainingCapacity();
+        for (blocks.items) |b| {
+            try k.block_phys.appendSlice(k.gpa, b.phys);
+            try cuda.DeviceBuffer.upload(.{ .d = r.d, .ptr = tok + 4 * @as(u64, b.a) * kk, .len = 4 * b.tokens.len }, 0, std.mem.sliceAsBytes(b.tokens));
+        }
+        const bytes = 4 * k.block_phys.items.len;
+        if (k.phys == null or k.phys.?.len < bytes) {
+            if (k.phys) |*p| p.free();
+            k.phys = try cuda.DeviceBuffer.alloc(r.d, @max(bytes, 256));
+        }
+        try cuda.DeviceBuffer.upload(k.phys.?, 0, std.mem.sliceAsBytes(k.block_phys.items));
+        k.union_at = .{ .comp = comp, .send = send, .recv = recv };
+        std.mem.swap(std.ArrayList(kv.split.Block), &k.blocks, blocks);
+    }
+
+    /// Block j of the kept union: its rows from their owners into the receive buffer (on the compute stream).
+    pub fn fetchBlock(k: *Kv, r: *run.Runner, j: usize) !void {
+        var off: u64 = 0;
+        for (k.blocks.items[0..j]) |b| off += b.phys.len;
+        const b = k.blocks.items[j];
+        try k.x.unionBlock(k.union_at.comp, block.Pool.row_bytes, k.phys.?.ptr + 4 * off, b.m, k.union_at.send, k.union_at.recv, r.stream.handle);
         k.stats.unions += 1;
         k.stats.union_rows_max = @max(k.stats.union_rows_max, @as(u64, b.m) * k.world);
         k.stats.bytes += @as(u64, b.m) * block.Pool.row_bytes * k.world;
