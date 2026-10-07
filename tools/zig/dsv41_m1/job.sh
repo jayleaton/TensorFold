@@ -480,8 +480,8 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
     fi
     # the gap-closing workstreams (each tools/zig/dsv41_<name>/job.sh with a <name>_gate, same env as slots_gate):
     # M2B_LONGPF (long prompts past 4,096 keys), M2B_SPEC (SPEC_DRAFT early pass), M2B_GRAMMAR (structured output),
-    # M2B_VISION (image input)
-    for name in longpf spec grammar vision; do
+    # M2B_VISION (image input), M2B_KNOBS (prod engine knobs on the Zig side)
+    for name in longpf spec grammar vision knobs; do
         knob=M2B_${name^^}
         [[ "${!knob:-0}" == 1 ]] || continue
         if [[ -f "$Z/tools/zig/dsv41_$name/job.sh" ]]; then
