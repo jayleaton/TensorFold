@@ -439,9 +439,10 @@ pub const Functions = struct {
     kv_dense: cuda.Function,
     kv_gather: cuda.Function,
     glue: [10]cuda.Function, // glue.syms order
+    pfglue: [pfglue.syms.len]cuda.Function, // pfglue.syms order
 
     /// `pf`: the four pfdense modules (K2 8, 10, 12, 16).
-    pub fn resolve(m_attn: cuda.Module, m_topk: cuda.Module, m_mhc: cuda.Module, m_mhc_pf: cuda.Module, m_rg: cuda.Module, pf: [4]cuda.Module, m_gate: cuda.Module, m_pace: cuda.Module, m_l2pf: cuda.Module, m_keys: cuda.Module, m_pw: cuda.Module, m_kv: cuda.Module, m_glue: cuda.Module, optin: u32) !Functions {
+    pub fn resolve(m_attn: cuda.Module, m_topk: cuda.Module, m_mhc: cuda.Module, m_mhc_pf: cuda.Module, m_rg: cuda.Module, pf: [4]cuda.Module, m_gate: cuda.Module, m_pace: cuda.Module, m_l2pf: cuda.Module, m_keys: cuda.Module, m_pw: cuda.Module, m_kv: cuda.Module, m_glue: cuda.Module, m_pfglue: cuda.Module, optin: u32) !Functions {
         var f: Functions = undefined;
         inline for (0..8) |i| f.attn[i] = try m_attn.function(attn.symbol(if (i >= 4) 4 else 2, (i & 2) != 0, (i & 1) != 0));
         inline for (f.attn, 0..) |fun, i| {
@@ -487,6 +488,7 @@ pub const Functions = struct {
         f.kv_dense = try m_kv.function("_ZN13dsv41_kvsplit12dense_kernelENS_9DenseArgsE");
         f.kv_gather = try m_kv.function("_ZN13dsv41_kvsplit13gather_kernelEPKhjPKjjPh");
         inline for (glue.syms, 0..) |name, i| f.glue[i] = try m_glue.function(name);
+        inline for (pfglue.syms, 0..) |name, i| f.pfglue[i] = try m_pfglue.function(name);
         return f;
     }
 };
@@ -536,6 +538,23 @@ pub const glue = struct {
     fn grid(n: u64) usize {
         return @intCast(@max(1, @min((n + 255) / 256, 4096)));
     }
+};
+
+/// prefill_glue.cu: the prefill segment's torch glue (block_prefill.zig's glue steps), torch's integers and casts.
+pub const pfglue = struct {
+    pub const syms = [_][:0]const u8{
+        "_ZN12dsv41_pfglue20top_positions_kernelEPKxxiiPi",
+        "_ZN12dsv41_pfglue16cand_keys_kernelEPKixiiiPi",
+        "_ZN12dsv41_pfglue13counts_kernelEPKiiPKxiiPi",
+        "_ZN12dsv41_pfglue15gm_picks_kernelEPKiPKfiiiPiPf",
+        "_ZN12dsv41_pfglue17width_mask_kernelEPKixS1_iiPi",
+        "_ZN12dsv41_pfglue19f64_bf16_f32_kernelEPKdPfx",
+        "_ZN12dsv41_pfglue16widen_cat_kernelEPKtS1_iiPf",
+        "_ZN12dsv41_pfglue16ring_copy_kernelEPKhiPhixxx",
+    };
+    pub const Kind = enum(u3) { top_positions, cand_keys, counts, gm_picks, width_mask, f64_bf16_f32, widen_cat, ring_copy };
+    /// index.top_positions' largest `count` (TOPK 512, TOPK_BLOCKS 2,048)
+    pub const max_count = 2048;
 };
 
 /// topk_keys.cu: pick.top's bounds (C columns a row within pick.COLS, k within the shared sort).
@@ -837,6 +856,112 @@ pub const Ops = struct {
         a.add(dst);
         a.add(@as(i64, @intCast(n)));
         try o.glueGo(.widen_f32, n, &a);
+    }
+
+    fn pfGo(o: Ops, kind: pfglue.Kind, n: u64, args: *cuda.Args) !void {
+        try o.go(o.f.pfglue[@intFromEnum(kind)], .{ glue.grid(n), 1, 1 }, 256, 0, null, args);
+    }
+
+    /// index.top_positions: each of R rows' `count` largest int64 keys (row stride ld, n a row) as their positions,
+    /// ascending, -1 padded: out int32 [R, count]. One CTA a row.
+    pub fn topPositions(o: Ops, keys: u64, ld: usize, R: usize, n: usize, count: usize, out: u64) !void {
+        if (count < 1 or count > pfglue.max_count) return error.Shape;
+        if (R == 0) return;
+        var a: cuda.Args = .{};
+        a.add(keys);
+        a.add(@as(i64, @intCast(ld)));
+        a.add(@as(c_int, @intCast(n)));
+        a.add(@as(c_int, @intCast(count)));
+        a.add(out);
+        try o.go(o.f.pfglue[@intFromEnum(pfglue.Kind.top_positions)], .{ R, 1, 1 }, 1024, 0, null, &a);
+    }
+
+    /// index.candidate_keys: blocks int32 [R, nb] (row stride ld) -> out int32 [R, nb * bs].
+    pub fn candKeys(o: Ops, blocks: u64, ld: usize, R: usize, nb: usize, bs: usize, out: u64) !void {
+        if (R * nb == 0) return;
+        var a: cuda.Args = .{};
+        a.add(blocks);
+        a.add(@as(i64, @intCast(ld)));
+        for ([_]usize{ R, nb, bs }) |v| a.add(@as(c_int, @intCast(v)));
+        a.add(out);
+        try o.pfGo(.cand_keys, R * nb * bs, &a);
+    }
+
+    /// backend.visible_counts: out int32 [R] = #(sel >= 0 and sel < (pos + 1) / ratio), sel int32 [R, K], pos int64 [R].
+    pub fn visibleCounts(o: Ops, sel: u64, K: usize, pos: u64, ratio: u32, R: usize, out: u64) !void {
+        if (R == 0) return;
+        if (ratio < 1) return error.Shape;
+        var a: cuda.Args = .{};
+        a.add(sel);
+        a.add(@as(c_int, @intCast(K)));
+        a.add(pos);
+        a.add(@as(c_int, @intCast(ratio)));
+        a.add(@as(c_int, @intCast(R)));
+        a.add(out);
+        try o.go(o.f.pfglue[@intFromEnum(pfglue.Kind.counts)], .{ (R + 7) / 8, 1, 1 }, 256, 0, null, &a);
+    }
+
+    /// prefill_moe's routed picks: pk int32 [n, routed] = pick[:, :routed], w6 fp32 [n, routed] = f32(f16(wts[:, :routed]))
+    /// (pick / wts [n, ld], the shared slot past topk).
+    pub fn gmPicks(o: Ops, pick: u64, wts: u64, ld: usize, routed: usize, n: usize, pk: u64, w6: u64) !void {
+        if (n * routed == 0) return;
+        var a: cuda.Args = .{};
+        a.add(pick);
+        a.add(wts);
+        for ([_]usize{ ld, routed, n }) |v| a.add(@as(c_int, @intCast(v)));
+        a.add(pk);
+        a.add(w6);
+        try o.pfGo(.gm_picks, n * routed, &a);
+    }
+
+    /// x3gm._run_ragged's picks of one width: out[p] = k2tab[pick[p]] == k2 ? pick[p] : E (k2tab int32 [E]; picks
+    /// outside [0, E) never match), the input of gmPlan.
+    pub fn widthMask(o: Ops, pick: u64, P: usize, k2tab: u64, E: usize, k2: u32, out: u64) !void {
+        if (P == 0) return;
+        var a: cuda.Args = .{};
+        a.add(pick);
+        a.add(@as(i64, @intCast(P)));
+        a.add(k2tab);
+        a.add(@as(c_int, @intCast(E)));
+        a.add(@as(c_int, @intCast(k2)));
+        a.add(out);
+        try o.pfGo(.width_mask, P, &a);
+    }
+
+    /// The indexer head weights' casts: y fp32 = f32(bf16(f32(x fp64))), n elements (glue step ix_w).
+    pub fn f64Bf16F32(o: Ops, x: u64, y: u64, n: usize) !void {
+        if (n == 0) return;
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(y);
+        a.add(@as(i64, @intCast(n)));
+        try o.pfGo(.f64_bf16_f32, n, &a);
+    }
+
+    /// blocks._projection's fp32: out [n, hd] = f32(kv), or (gate != 0, ratio 2) [n, 2 hd] = [f32(kv) | f32(gate)].
+    pub fn widenCat(o: Ops, kv: u64, gate: u64, n: usize, hd: usize, out: u64) !void {
+        if (n == 0) return;
+        var a: cuda.Args = .{};
+        a.add(kv);
+        a.add(gate);
+        a.add(@as(c_int, @intCast(n)));
+        a.add(@as(c_int, @intCast(hd)));
+        a.add(out);
+        try o.pfGo(.widen_cat, n * hd * @as(usize, if (gate != 0) 2 else 1), &a);
+    }
+
+    /// blocks.stage_rows of one tensor: dst row p % dst_ring = src row p % src_ring for p in [lo, hi), row_bytes a row.
+    pub fn ringCopy(o: Ops, src: u64, src_ring: usize, dst: u64, dst_ring: usize, row_bytes: usize, lo: u64, hi: u64) !void {
+        if (hi <= lo) return;
+        var a: cuda.Args = .{};
+        a.add(src);
+        a.add(@as(c_int, @intCast(src_ring)));
+        a.add(dst);
+        a.add(@as(c_int, @intCast(dst_ring)));
+        a.add(@as(i64, @intCast(row_bytes)));
+        a.add(@as(i64, @intCast(lo)));
+        a.add(@as(i64, @intCast(hi)));
+        try o.pfGo(.ring_copy, (hi - lo) * (row_bytes / 4 + 1), &a);
     }
 
     /// positions with `start` read from the device (int32 at `start_dev`): a graphed window's form, the same values.

@@ -312,6 +312,105 @@ def pointwise_case(out: Path, g) -> dict:
          {"g": gg, "u": uu, "act": act, "a": a, "b": b, "sum32": s32, "sum16": y16})
     return {"rows": R}
 
+KEY_NONE = -(2 ** 63)
+
+
+def top_positions(k: torch.Tensor, count: int) -> torch.Tensor:
+    """index.top_positions at 8474f31, verbatim."""
+    R, n = k.shape
+    top = torch.topk(k, min(count, n), dim=1, sorted=False).values
+    pos = torch.where(top == KEY_NONE, torch.full_like(top, -1), 0x7FFFFFFF - (top & 0xFFFFFFFF))
+    pos = torch.where(pos < 0, torch.full_like(pos, 2 ** 31 - 1), pos)
+    pos = torch.sort(pos, dim=1).values
+    pos = torch.where(pos == 2 ** 31 - 1, torch.full_like(pos, -1), pos)
+    if pos.shape[1] < count:
+        pos = torch.cat([pos, torch.full((R, count - pos.shape[1]), -1, dtype=pos.dtype, device=pos.device)], 1)
+    return pos.to(torch.int32).contiguous()
+
+
+def pfglue_case(out: Path, g) -> dict:
+    """prefill_glue.cu's references: block_prefill.zig's glue steps as the Python engine runs them (8474f31:
+    index.top_positions / candidate_keys, backend.visible_counts, prefill_moe's kit picks, x3gm._run_ragged's width
+    mask, the indexer head weights' casts, blocks._projection, blocks.stage_rows), on edge inputs."""
+    arrays, params = {}, {"kind": "pfglue"}
+    # top_positions: unique keys (score bits above, 0x7FFFFFFF - position below, as sort_keys builds them), KEY_NONE
+    # pads, low halves past 0x7FFFFFFF (a negative position: dropped), rows shorter and longer than count
+    tp = [(4, 3000, 512), (3, 300, 512), (2, 20000, 2048), (2, 1500, 2048)]
+    for i, (R, n, count) in enumerate(tp):
+        hi = torch.randint(-(2 ** 31), 2 ** 31, (R, n), generator=g, dtype=torch.int64)
+        hi[:, : n // 7] = hi[0, 0]                                    # many equal scores: the positions decide
+        lo = torch.stack([torch.randperm(n, generator=g) for _ in range(R)]).to(torch.int64)
+        k = (hi << 32) | (0x7FFFFFFF - lo)
+        k[:, 1::13] = KEY_NONE
+        k[0, 2::29] = (hi[0, 2::29] << 32) | 0xFFFFFFF0               # low half past 0x7FFFFFFF
+        k = k.to(DEV)
+        arrays[f"tp{i}_keys"] = k
+        arrays[f"tp{i}_want"] = top_positions(k, count)
+        params.update({f"tp{i}_R": R, f"tp{i}_n": n, f"tp{i}_count": count})
+    params["tp"] = len(tp)
+    # candidate_keys: ascending blocks, -1 padded
+    R, nb, bs = 3, 2048, 8
+    blocks = torch.sort(torch.randint(0, 50000, (R, nb), generator=g), dim=1).values.to(torch.int32)
+    blocks[:, 1900:] = -1
+    blocks = blocks.to(DEV)
+    j = blocks.to(torch.int64)[:, :, None] * bs + torch.arange(bs, device=DEV)
+    j = torch.where(blocks[:, :, None] >= 0, j, torch.full_like(j, -1))
+    arrays.update(ck_blocks=blocks, ck_want=j.reshape(R, -1).to(torch.int32).contiguous())
+    params.update(ck_R=R, ck_nb=nb, ck_bs=bs)
+    # visible_counts over top_positions' selections, ratios 4 and 128
+    sel = arrays["tp0_want"]
+    pos = torch.tensor([0, 1500, 9000, 2 ** 20], dtype=torch.int64, device=DEV)
+    for ratio in (4, 128):
+        nvis = (pos + 1) // ratio
+        arrays[f"vc{ratio}_want"] = ((sel >= 0) & (sel.to(torch.long) < nvis[:, None])).sum(1).to(torch.int32)
+    arrays["vc_pos"] = pos
+    # the prefill MoE's picks: 6 routed slots + the shared one, kit weights through fp16 (edges included)
+    n, slots, topk = 37, 7, 6
+    pick = torch.randint(0, 384, (n, slots), generator=g, dtype=torch.int32)
+    pick[:, topk:] = 384
+    wts = torch.rand(n, slots, generator=g) * 2
+    wts[0, :6] = torch.tensor([65520.0, 1e-8, 6.1e-5, float("nan"), -0.0, 1.0 + 2 ** -11])
+    pick, wts = pick.to(DEV), wts.to(DEV)
+    arrays.update(gp_pick=pick, gp_wts=wts, gp_pk=pick[:, :topk].contiguous(),
+                  gp_w6=wts.to(torch.float16).to(torch.float32)[:, :topk].contiguous())
+    params.update(gp_n=n, gp_slots=slots, gp_topk=topk)
+    # x3gm._run_ragged's width mask (picks of E: the masked shared slot)
+    E, P = 384, 999
+    tab = torch.tensor([[4, 6, 8, 10][i % 4] for i in range(E)], dtype=torch.int32)
+    pk = torch.randint(0, E + 1, (P,), generator=g, dtype=torch.int32)
+    tab, pk = tab.to(DEV), pk.to(DEV)
+    k2w = torch.cat([tab, torch.zeros(1, dtype=torch.int32, device=DEV)])
+    for k2 in (4, 10):
+        arrays[f"wm{k2}_want"] = torch.where(k2w[pk.long()] == k2, pk, torch.full_like(pk, E))
+    arrays.update(wm_pick=pk, wm_tab=tab)
+    params.update(wm_E=E, wm_P=P)
+    # the indexer head weights: fp64 -> bf16 -> fp32 (double rounding cases, NaN, inf, overflow, denormals)
+    w = torch.randn(4096, generator=g, dtype=torch.float64) * 3
+    w[:12] = torch.tensor([float("nan"), float("inf"), -float("inf"), 1e300, -1e300, 1e-300, 4e-39,
+                           1.0 + 2 ** -8 + 2 ** -30, 1.0 + 2 ** -8 - 2 ** -30, 1.0 + 2 ** -8, 3.4e38, -0.0],
+                          dtype=torch.float64)
+    w = w.to(DEV)
+    arrays.update(f64_in=w, f64_want=w.to(torch.bfloat16).to(torch.float32))
+    # blocks._projection: [kv | gate] fp32 and kv alone
+    n2, hd = 33, 512
+    kv = torch.randn(n2, hd, generator=g).to(torch.bfloat16).to(DEV)
+    gate = torch.randn(n2, hd, generator=g).to(torch.bfloat16).to(DEV)
+    arrays.update(pj_kv=kv, pj_gate=gate, pj_two=torch.cat([kv.float(), gate.float()], 1).contiguous(),
+                  pj_one=kv.float().contiguous())
+    params.update(pj_n=n2, pj_hd=hd)
+    # blocks.stage_rows: a window of rows between rings of different sizes (4-byte and byte rows)
+    for i, (sr, dr, rb, lo, hi) in enumerate([(4096, 256, 512, 1500, 1627), (256, 4096, 6, 9000, 9128)]):
+        src = torch.randint(0, 256, (sr, rb), generator=g, dtype=torch.uint8).to(DEV)
+        dst = torch.randint(0, 256, (dr, rb), generator=g, dtype=torch.uint8).to(DEV)
+        want = dst.clone()
+        p = torch.arange(lo, hi, dtype=torch.long, device=DEV)
+        want[p % dr] = src[p % sr]
+        arrays.update({f"rc{i}_src": src, f"rc{i}_dst": dst, f"rc{i}_want": want})
+        params.update({f"rc{i}_sr": sr, f"rc{i}_dr": dr, f"rc{i}_rb": rb, f"rc{i}_lo": lo, f"rc{i}_hi": hi})
+    torch.cuda.synchronize()
+    save(out, params, arrays)
+    return {"cases": 8}
+
 
 def glue_case(out: Path, g) -> dict:
     """The window's torch glue (forward.py / pick.py) on edge values: ids out of the rank's range, -0 / +0, NaN,
@@ -424,6 +523,7 @@ def main() -> None:
     if want("topk_keys"): report["topk_keys"] = topk_case(out / "topk_keys", g)
     if want("pointwise"): report["pointwise"] = pointwise_case(out / "pointwise", g)
     if want("glue"): report["glue"] = glue_case(out / "glue", g)
+    if want("pfglue"): report["pfglue"] = pfglue_case(out / "pfglue", g)
     (out.parent / "oracle.json").write_text(json.dumps({"device": torch.cuda.get_device_name(0), **report}, indent=1))
     print(json.dumps(report, indent=1))
 

@@ -231,6 +231,24 @@ Each item gets a small `.cu` here (ours, checked bit-equal to torch on fixtures)
 | staging ring `index_copy_`, replay stash `cat` / `clone`, shadow-slot `copy_` | prefill, tree verify | device memcpy (`cuMemcpyAsync`); no kernel |
 | the window's glue (block.zig's `glue.*` steps): `embed_rows`' masked send and `allsum` (+ repeat x4), the MoE partial `.to(bf16)`, `kit_weights`, `kit_logits`, `Win.make`'s positions, `gather_cols`, the ratio-2 compressor carry | every window | **done**: `Z/glue.cu` (`--fmad=false`; casts through `__float2bfloat16` / `__float2half`, the intrinsics torch's CUDA casts use), `ops.Ops.embedSend / embedSum / castBf16 / kitWeights / kitLogits / positions / gatherCols / carry`, checked against torch on edge values (oracle kind `glue`) |
 
+**The prefill segment's glue (`Z/prefill_glue.cu`, 2026-10-07).** block_prefill.zig's glue steps, as torch runs them:
+
+| glue step | Python (8474f31) | Zig |
+| --- | --- | --- |
+| `topk` | `index.top_positions` (int64 radix select, count <= 2,048) | `ops.Ops.topPositions` |
+| `cand_keys` | `index.candidate_keys` | `candKeys` |
+| `counts` | `backend.visible_counts` | `visibleCounts` |
+| `gm_picks` | prefill_moe's kit picks | `gmPicks` |
+| `gm_plan` | x3gm._run_ragged's width mask, then x3gm.plan | `widthMask` + `exl3.Ops.gmPlan` |
+| `ix_w` | the indexer head weights fp64 -> bf16 -> fp32 | `f64Bf16F32` |
+| `proj` | `blocks._projection` | `widenCat` |
+| `stage_in` / `stage_out` | `blocks.stage_rows`, a tensor at a time | `ringCopy` |
+| `proj_carry`, `zeros`, `gm_ticket`, `block_pos` | `torch.cat` / zeros / a scalar | `cuMemcpyDtoDAsync` / `cuMemsetD8Async` / `cuMemsetD32Async`: no kernel |
+| `swiglu`, `moe_sum`, `kit_logits`, `positions`, `embed`, `exchange` | | pointwise.cu / glue.cu (above) |
+
+- **GPU check:** oracle kind `pfglue` (edge keys: `KEY_NONE` pads, negative positions, rows shorter than `count`; fp64 double-rounding cases; NaN / inf), checked bit for bit by `tf-dsv41-test all`.
+- **Build:** 0 spills, `--fmad=false`.
+
 ## 3.2b x3gm v2 and the R1 decode kernels
 
 **x3gm v2** (`gm2_kernel`, dsq-x3gm-1, `ENGINE-X3GM2.md`) is the primary prefill x3gm. It runs one launch a

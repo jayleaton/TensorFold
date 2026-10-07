@@ -109,6 +109,8 @@ fn all(gpu: check.Gpu, k: *const dsv41.Kernels, root: []const u8) !void {
             experts.pointwiseCases(gpu, k, path)
         else if (std.mem.eql(u8, kind.slice(), "glue"))
             experts.glueCases(gpu, k, path)
+        else if (std.mem.eql(u8, kind.slice(), "pfglue"))
+            experts.pfglueCases(gpu, k, path)
         else if (std.mem.eql(u8, kind.slice(), "replay")) blk: {
             const o = replay_case.run(gpu, k, path) catch |e| break :blk e;
             if (o == .skipped) {
