@@ -28,4 +28,8 @@ test {
     _ = engram_host;
     _ = buffers;
     _ = @import("host_test.zig");
+    // dsq-zig-speed-1: Engram's shard rows (R3), greedy's host step, the phase timers
+    _ = @import("engram_rows_test.zig");
+    _ = @import("greedy.zig");
+    _ = @import("phases.zig");
 }
