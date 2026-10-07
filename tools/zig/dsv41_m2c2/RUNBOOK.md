@@ -53,16 +53,17 @@ One prod window, three runs in order. Each run gates the next:
   - The checks: every state role (SWA rings, compressed pools, index keys, ratio-2 carries) bytes-equal to Python's dump, the same position and Engram tail, the same first token, then the decode gate from that state.
   - The pass line: `PASS Zig prefill rank N: ... state roles K/K equal ...`, then `PASS M2b rank N` in `out/seed*/prefill.log`.
   - `PROMPT=2600` makes the prompt cross a segment boundary (2,048 + 552).
-  - **Passed on 2x PRO 6000** (pod 23, layers 0–24, TP=2): a 2,600-row prompt (2,048 + 552) from an empty slot gave 65/65 state roles equal to Python's dump, the same position, Engram tail and first token, then 64/64 tokens and logits.
-  - **M4 (steps 7 and 10) prefills with the Zig prefill** (the default; `OWN_PREFILL=0` goes back to 16-row decode windows).
-    - The Zig prefill is Python's bits for every segment of 17–2,048 rows.
-    - **A prompt whose last segment has 1–16 rows** (length mod 2,048 in 1..16, or a prompt of 16 tokens or fewer) runs that tail as decode windows. That is the same model but not Python's prefill bits for those rows. Pod 23's 2,060-row case: 4/65 roles equal, first token equal.
-    - The 8 prompts in `prompts.txt` are single segments of more than 16 rows.
+  - **Passed on 2x PRO 6000** (layers 0–24, TP=2, prod's knobs without R1). From an empty slot, each prompt gave 65/65 state roles equal to Python's dump, the same position, Engram tail and first token, then 64/64 tokens and logits:
+    - 2,600 rows (2,048 + 552, pod 23);
+    - 2,060, 2,049 and 2,064 rows (2,048 + a 12-, 1- and 16-row segment) and a 9-token prompt (pod 25).
+    - So the Zig prefill is Python's bits for every prompt length: segments of 16 rows or fewer take Python's short-segment kernels.
+  - **R1:** those gates ran without R1. This step on the Sparks (R1 on by default) is the first prefill gate under R1. **If it fails while M2c-2 passed, run M4 (steps 7 and 10) with `OWN_PREFILL=0`** and send `out/` back.
+  - **M4 (steps 7 and 10) prefills with the Zig prefill** (the default; `OWN_PREFILL=0` goes back to 16-row decode windows, the same model but not Python's prefill bits).
 - M4: `DRAFTS=0` serves without DSpark (then step 6 is not needed). `TF_DSV41_GRAPHS=1` on both ranks enables decode graphs.
 
 **What the numbers mean:**
 - M2c-2 and M4 are pass / fail.
-- The acceptance is the number to compare with prod's own draft statistics on similar prompts (the Python engine's `/metrics` or its draft log). The Zig engine serves one slot with 16-row prefill windows. Its prefill is not yet Python's (the prefill emitter and glue kernels exist, the forward does not use them yet), so the prompt state is not bit-identical to Python's: compare acceptance, not tokens, against prod.
+- The acceptance is the number to compare with prod's own draft statistics on similar prompts (the Python engine's `/metrics` or its draft log). The Zig engine serves one slot, and prod's replies come from other prompts and requests: compare acceptance, not tokens, against prod.
 
 **On failure:**
 - **Exit 2 at the start:** the preflight found a running `dsv41` container, a checksum mismatch, or a missing tree or pack.

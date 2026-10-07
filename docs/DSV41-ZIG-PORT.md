@@ -301,7 +301,7 @@ Rules from `ZIG-PREVIEW.md`:
   - **The runner:** `forward.prefill(ids)` (forward_prefill.zig) runs block_prefill's segments, 2,048 rows each (Python's PREFILL_CHUNK, the last ragged).
     - The exchanges (20 MiB a rank) go through NCCL in the hybrid, as recorded above.
     - All 21 glue steps run on dsq-zig-kern-1's prefill glue kernels (gated == torch, pod 20) or as plain async copies / memsets.
-    - **Each segment is committed as Python's `keep`:** the ratio-2 carry from its fp32 projection's last row, the Engram tail, the position. A tail of 16 rows or fewer goes through decode windows. The head runs on the last segment only; `f.last_rows` tells greedy how many rows it left.
+    - **Each segment is committed as Python's `keep`:** the ratio-2 carry from its fp32 projection's last row, the Engram tail, the position. A segment of 16 rows or fewer is block_prefill's short segment (pod 25 below). The head runs on the last segment only; `f.last_rows` tells greedy how many rows it left.
     - **Leader / follower:** the prompt is sent in frames (`op_prefill`); the followers run the same segments.
     - **Tables filled on the first prefill:** the bf16 Hadamard, and the x3gm pointer tables (forms' `tp_*`). `m2a.widths` now fills `Widths.gm`.
   - **M4:** GpuTarget and the served model prefill through it (`TF_DSV41_OWN_PREFILL=0`: back to 16-row decode windows).
@@ -327,7 +327,34 @@ Rules from `ZIG-PREVIEW.md`:
   - **Python's ≤16-row prefill segment, as captured** (the same kernel mix at 1, 12 and 16 rows):
     - prefill side: `rot_in` / `unpack` / `_gemm` projections, x3gm experts, `_fused` attention at the segment's rows;
     - decode side: `mhc_cuda.run` at the segment's rows, `attn_cuda.topk`, `_rms2`, `router_gemv`, and the L2 prefetch (`l2pf.segments`, `l2pace.paced`).
-  - **Not done:** the block_prefill path for these segments, and the gates for 2,060, 2,049, 2,064 and 2,600 rows. The runbook's limit note stays.
+  - **Not done on that pod:** the block_prefill path for these segments, and the gates (pod 25 below).
+- **Short segments (6587de9), offline:** block_prefill takes segments of 1–16 rows as Python does.
+  - **Kept from the prefill path:** the projections (`rot_in` / `unpack` / `_gemm`), the indexer's `_plain` / `_scores` with the fp32 head weights, the fused attention, x3gm and the shared expert's GEMMs.
+  - **Taken from the decode window:**
+    - mhc_cuda for every site, post-only and the final norm (no `_finish_k`; R1's tail and coefficient launch as in decode);
+    - the L2 prefetch at the o, f and x sites;
+    - attn_cuda's top-k job list (a Reindex layer scores over its candidate blocks with `GATHER`; no `_keys` or torch top-k);
+    - the narrow router config `(rows_pad, 2, 0)`.
+  - **Glue roles:** the exchanges land in `w.recv.*` (mhc_cuda's). At one row, the picks keep torch's `[1, topk]` view of the `[1, slots]` rows: `.contiguous()` does not copy a one-row tensor.
+  - **R1:** the R1 twin's route always takes the prune list (empty in prefill). That now applies to every prefill segment, from the source; no R1 prefill capture exists.
+  - **The runtime:** forward_prefill runs every segment through the program; the decode-window tail is gone.
+  - **Host checks:** pod 24's captures, call by call: p12 for sets A / B / D 744/744, p1 290/290, p16 290/290. Regression: cap15 / cap18 p2048 320/320, cap22 (R1) clean, `dcheck` cap16 / 18 / 22 clean. cap6 / cap8 (pods 6 / 8, old knobs) fail as they did before.
+  - **m1 check:** roles one of our glue steps touched are no longer flagged when their bytes equal what a freed storage held. x3gm's gate and down plans of a few picks often hold the same bytes.
+- **Pod 25, held** (779a303, 16 min, $1.11): **the Zig prefill gate passes for every prompt length tested.**
+  - **One reference load for five prompts** (`--prompts`, a fresh `Forward.new_slot` each; `job.sh` `M2B_PROMPTS`): 94 s in all. The 2,060- and 2,600-row first tokens equal pod 23's single-prompt references.
+  - **The M2b decode gate** on 2,060's state: 64/64 tokens and logits, 25/25 blocks, both ranks.
+  - **The prefill gate from an empty slot** (layers 0–24, TP=2, prod's knobs without R1). Each prompt gave 65/65 state roles equal, the same position, Engram tail and first token, then 64/64 tokens and logits, on both ranks:
+
+    | prompt | segments | first token |
+    |---|---|---|
+    | 2,060 | 2,048 + 12 | 129275 |
+    | 2,049 | 2,048 + 1 | 129275 |
+    | 2,064 | 2,048 + 16 | 26039 |
+    | 2,600 | 2,048 + 552 | 59756 |
+    | 9 | 9 | 5744 |
+
+  - Each gate took about 105 s, mostly the load. The prefill itself (a timing, not a benchmark) took 0.35–0.46 s on rank 0 and 2.5–2.6 s on rank 1 for the 2,048+ prompts; 0.65 / 0.08 s for the 9-token prompt. Rank 1's gap is not yet explained.
+  - **The kit runbook's limit note is gone.** M4 prefills with the Zig prefill for every prompt length. The kit's `PREFILL=1` step runs under R1, the first prefill gate with it.
 - **Next, in order:**
   1. **The Spark window** (the kit's RUNBOOK.md): M2c-2 with R1, M4, and DSpark's acceptance. Spark prod has run R1's knobs since 10-07 at -6.5 % a window with the same bits: attention split 4 + qrope, mHC spin / defer + coef, the router's prune, downCombine bf16, x3seg rot_in with the q_norm fold. The gate is a capture on prod-knobs.env plus r1c-knobs.env's R1 line on the 8474f31 twin. It goes ahead of new glue fusions, which are estimated under 3 %.
   2. **The prefill runtime:** the 15 torch-glue steps as kernels, then `Forward.prefill` over 2,048-row chunks (NCCL exchanges).

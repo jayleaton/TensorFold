@@ -23,5 +23,6 @@
 
 **Known limits:**
 - One slot: the server takes one request at a time.
-- Prefill runs as 16-row decode windows, because Zig's own prefill has its emitter and glue kernels but no forward yet.
+- Prefill runs on the Zig prefill (2,048-row segments; Python's bits for every prompt length, gated without R1 on 2x
+  PRO 6000). `OWN_PREFILL=0` on both ranks goes back to 16-row decode windows.
 - Graphs are off unless `TF_DSV41_GRAPHS=1` on both ranks.
