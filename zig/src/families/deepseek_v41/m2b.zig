@@ -127,7 +127,7 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, ref: []con
     defer f.deinit();
     f.layers = layers;
     // TF_DSV41_IMAGES=native + TF_DSV41_VISION_HOLD (vision_rows.zig): the vision gate's image prompts
-    try @import("vision_rows.zig").boot(gpa, io, &f, &pack, &driver, rank);
+    try @import("vision_rows.zig").boot(gpa, io, &f, &pack, &driver, rank, &w);
     defer @import("vision_rows.zig").close(&f);
     // prod's knobs the emitters do not fix (TF_DSV41_PF_DENSE, _PREFILL_CHUNK / _ROWS, _INDEX_BUDGET_MIB,
     // _PREFETCH_AHEAD): the knobs gate runs this driver with them (tools/zig/dsv41_knobs/job.sh)
