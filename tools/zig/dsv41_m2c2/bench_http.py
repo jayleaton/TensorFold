@@ -7,6 +7,9 @@ N are live (m2bench ``steady``). Standard library only (runs on the Spark hosts 
 
     python3 bench_http.py --url http://127.0.0.1:8000 --out prod.json [--streams 1,4] [--temps 0,0.7] [--reps 2]
     python3 bench_http.py --compare prod.json zig.json      # the table: Zig vs prod a cell
+    python3 bench_http.py --url ... --out long.json --long 32768,131072,524288   # long context, one stream a length:
+        an N-token document (about N tokens: the reply's usage.prompt_tokens is the exact count) and a question; the
+        prompt's tok/s (prompt tokens / time to the first token) and the decode tok/s of a 128-token answer
 """
 from __future__ import annotations
 
@@ -60,6 +63,7 @@ def one(url: str, model: str, msg: str, temp: float, max_tokens: int, out: dict)
                     times.append(time.perf_counter())
     n = (usage or {}).get("completion_tokens") or len(times)
     out.update(t0=t0, first=times[0] if times else None, last=times[-1] if times else None, tokens=n,
+               prompt_tokens=(usage or {}).get("prompt_tokens"),
                decode_tok_s=round((n - 1) / (times[-1] - times[0]), 2) if len(times) > 1 and times[-1] > times[0] else None,
                ttft_s=round(times[0] - t0, 3) if times else None)
 
@@ -83,6 +87,28 @@ def cell(url: str, model: str, work: str, temp: float, streams: int, max_tokens:
             "ttft_s": [r.get("ttft_s") for r in res], "tokens": [r.get("tokens") for r in res]}
 
 
+def document(n: int) -> str:
+    """About n tokens of distinct text (numbered paragraphs of the prose prompts, ~0.75 words a token) and a question."""
+    paras, words, i = [], 0, 0
+    base = [p.replace("Write a 400-word essay on ", "").replace("\n", " ") for p in PROMPTS["prose"] + PROMPTS["code"]]
+    while words < 0.75 * n:
+        t = f"Section {i}: note {i * 7919 % 100003} on {base[i % len(base)]}"
+        paras.append(t)
+        words += len(t.split())
+        i += 1
+    return "\n\n".join(paras) + f"\n\nWhich note number does section {i // 2} carry? Then summarize the document in 100 words."
+
+
+def long_cell(url: str, model: str, n: int, max_tokens: int) -> dict:
+    r: dict = {}
+    one(url, model, document(n), 0.0, max_tokens, r)
+    pt = r.get("prompt_tokens")
+    return {"work": f"long-{n}", "temp": 0.0, "streams": 1, "prompt_tokens": pt, "ttft_s": r.get("ttft_s"),
+            "prompt_tok_s": round(pt / r["ttft_s"], 1) if pt and r.get("ttft_s") else None,
+            "mean_tok_s": r.get("decode_tok_s"), "aggregate_tok_s": None, "per_stream": [r.get("decode_tok_s")],
+            "tokens": [r.get("tokens")]}
+
+
 def compare(a_path: str, b_path: str) -> None:
     a, b = json.load(open(a_path)), json.load(open(b_path))
 
@@ -96,6 +122,16 @@ def compare(a_path: str, b_path: str) -> None:
     for k in sorted(pa):
         if k in pb and pa[k] and pb[k]:
             print(f"| {k[0]} | {k[1]} | {k[2]} | {pa[k]:.1f} | {pb[k]:.1f} | {100 * (pb[k] / pa[k] - 1):+.1f} % |")
+    la = {c["work"]: c for c in a["cells"] if c["work"].startswith("long-")}
+    lb = {c["work"]: c for c in b["cells"] if c["work"].startswith("long-")}
+    if la and lb:
+        print(f"\n| long context | prompt tokens | {a['label']} prompt tok/s | {b['label']} prompt tok/s | "
+              f"{a['label']} TTFT s | {b['label']} TTFT s |")
+        print("|---|---:|---:|---:|---:|---:|")
+        for w in sorted(la, key=lambda x: int(x[5:])):
+            if w in lb:
+                print(f"| {w} | {la[w]['prompt_tokens']} | {la[w]['prompt_tok_s']} | {lb[w]['prompt_tok_s']} | "
+                      f"{la[w]['ttft_s']} | {lb[w]['ttft_s']} |")
 
 
 def _group(cs, key):
@@ -118,12 +154,21 @@ def main() -> int:
     ap.add_argument("--reps", type=int, default=2)
     ap.add_argument("--out", default="")
     ap.add_argument("--compare", nargs=2, metavar=("A", "B"))
+    ap.add_argument("--long", default="", help="long-context lengths (tokens, comma separated): one stream each, T0")
     a = ap.parse_args()
     if a.compare:
         compare(*a.compare)
         return 0
     cell(a.url, a.model, "code", 0.0, 1, 32)                                 # warm-up, not recorded
     cells = []
+    if a.long:
+        for n in [int(x) for x in a.long.split(",")]:
+            c = long_cell(a.url, a.model, n, 128)
+            cells.append(c)
+            print(json.dumps(c), flush=True)
+        if a.out:
+            json.dump({"label": a.label or a.url, "cells": cells}, open(a.out, "w"), indent=1)
+        return 0
     for rep in range(a.reps):
         for work in a.work.split(","):
             for temp in [float(t) for t in a.temps.split(",")]:

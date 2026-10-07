@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Builds the Spark kit (dev box, no Spark): tf-dsv41-m1 and tensorfold-dsv41 for aarch64 with the sm_121 fatbins
 # embedded, the TP mailbox / RoCE fatbin, the Python tools, run_host.sh (M2c-2), run_m4.sh + requests.sh + prompts.txt
-# (M4), RUNBOOK.md (the combined window) and RUNBOOK-M4.md, SHA256SUMS. Run it from a clean archive of the tree
+# (M4), RUNBOOK.md (the combined window), RUNBOOK-M4.md, RUNBOOK-WINDOW.md + bench_http.py + the slots reference (the full
+# window), SHA256SUMS. Run it from a clean archive of the tree
 # (KIT_COMMIT=<hash>): the shared worktree may hold other agents' uncommitted files.
 #   FATBINS=<dir of sm_121 dsv41_*.fatbin> TP_FATBIN=<tp_mailbox.fatbin (sm_121)> bash build-kit.sh KITDIR
 set -euo pipefail
@@ -21,6 +22,9 @@ cp "$HERE/run_host.sh" "$HERE/RUNBOOK.md" "$KIT/"
 cp tools/zig/dsv41_m4/run_host.sh "$KIT/run_m4.sh"
 cp tools/zig/dsv41_m4/requests.sh tools/zig/dsv41_m4/prompts.txt "$KIT/"
 cp tools/zig/dsv41_m4/RUNBOOK.md "$KIT/RUNBOOK-M4.md"
+# the full window (RUNBOOK-WINDOW.md): the speed client against prod, the slots reference for the row-mode AOT set
+cp tools/zig/dsv41_m4/RUNBOOK-WINDOW.md "$HERE/bench_http.py" "$KIT/"
+mkdir -p "$KIT/tools/zig/dsv41_slots" && cp tools/zig/dsv41_slots/ref.py "$KIT/tools/zig/dsv41_slots/"
 chmod +x "$KIT/run_host.sh" "$KIT/run_m4.sh" "$KIT/requests.sh" "$KIT/tf-dsv41-m1" "$KIT/tensorfold-dsv41"
 git rev-parse HEAD > "$KIT/COMMIT" 2>/dev/null || echo "${KIT_COMMIT:?KIT_COMMIT: the commit of an archived tree (no .git)}" > "$KIT/COMMIT"
 (cd "$KIT" && find . -type f ! -name SHA256SUMS | sort | xargs sha256sum > SHA256SUMS)

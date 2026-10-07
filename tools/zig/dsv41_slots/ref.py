@@ -13,6 +13,7 @@ alone. A slot stops after the end-of-sequence id or `--steps` tokens.
   row-mode Triton variants (ROWS, int64 POS, SL / PTS) the Zig engine's row programs launch.
 
     python ref.py --pack PACK --out DIR [--layers 0-24] [--slots 4] [--prompts 45,173,9,640] [--steps 64]
+    (two hosts, e.g. the Spark kit's rows-aot phase: --rank R --master HEAD on each, one GPU each)
 Writes DIR/trace.jsonl (one line a prompt: {"slot", "prompt", "tokens"}: the Zig `tf-dsv41-m1 slots` input),
 DIR/ref.json, DIR/rope.bin and DIR/aot/ (rank 0's set; the run is replicated, both ranks launch the same variants).
 """
@@ -34,7 +35,8 @@ def rank_main(rank: int, a) -> None:
     sys.path.insert(0, str(ZT))
     import torch
 
-    torch.cuda.set_device(rank)
+    gpu = 0 if a.rank >= 0 else rank          # two hosts: each host's one GPU
+    torch.cuda.set_device(gpu)
     from dsv41_m1_capture import IndexRows, pack_aot, specialization
     from tensorfold.cuda.comm import open_comm
     from tensorfold.families.deepseek_v41.cuda import pool as PO
@@ -51,8 +53,8 @@ def rank_main(rank: int, a) -> None:
     from tensorfold.families.glm5_next.spark import kvpool
 
     t0 = time.time()
-    dev = torch.device(f"cuda:{rank}")
-    comm = open_comm(rank, 2, "127.0.0.1", a.port)
+    dev = torch.device(f"cuda:{gpu}")
+    comm = open_comm(rank, 2, a.master, a.port)
     pack = Path(a.pack)
     cfg = Config.from_file(pack / "config.json")
     tmap, _ = token_map(pack / "tokenizer.json")
@@ -78,7 +80,8 @@ def rank_main(rank: int, a) -> None:
     load_s = time.time() - t0
     import triton_aot_manifest as aot
 
-    rec = aot.Recorder().install() if rank == 0 else None
+    dumps = rank == 0 or a.rank >= 0          # two hosts: each host keeps its own AOT set (the same variants)
+    rec = aot.Recorder().install() if dumps else None
     rg = RG.RowGraphs(fw) if a.graphs else None
     eos = int(getattr(cfg, "eos_token_id", 1) or 1)
     out = Path(a.out)
@@ -126,7 +129,7 @@ def rank_main(rank: int, a) -> None:
             for sg in mix:
                 fw.keep(sg.slot, len(sg.ids) - 1)
         torch.cuda.synchronize()
-    if rank == 0:
+    if dumps:
         cache = Path(os.environ.get("TRITON_CACHE_DIR", Path.home() / ".triton" / "cache"))
         tabs = RO.tables(cfg, a.limit + 2048)
         (out / "rope.bin").write_bytes(b"DSV41RP1" + struct.pack("<II", *tabs[0].cs.shape)
@@ -153,6 +156,8 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=4096, help="a slot's positions (the Zig engine's opts.limit)")
     ap.add_argument("--rows-cap", type=int, default=16, help="row-mode buckets warmed for the AOT set")
     ap.add_argument("--port", type=int, default=29640)
+    ap.add_argument("--rank", type=int, default=-1, help="two hosts: this host's rank (one process, GPU 0); -1: both here")
+    ap.add_argument("--master", default="127.0.0.1", help="rank 0's address (two hosts: the head's CX7 address)")
     ap.add_argument("--graphs", dest="graphs", action="store_true", default=True)
     ap.add_argument("--no-graphs", dest="graphs", action="store_false")
     a = ap.parse_args()
@@ -165,6 +170,11 @@ def main() -> int:
     os.environ.pop("TF_DSV41_KV_SPLIT", None)
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
+    if a.rank >= 0:                         # two hosts: this host's rank alone; its tokens, AOT set and rope tables
+        rank_main(a.rank, a)
+        mine = json.loads((out / f"rank{a.rank}.json").read_text())
+        print(json.dumps({"rank": a.rank, "slots": a.slots, "tokens": [len(t) for t in mine["tokens"]]}), flush=True)
+        return 0
     import torch.multiprocessing as mp
 
     mp.spawn(rank_main, args=(a,), nprocs=2, join=True)
