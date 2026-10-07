@@ -6,6 +6,9 @@
 # (KIT_COMMIT=<hash>): the shared worktree may hold other agents' uncommitted files.
 #   FATBINS=<dir of sm_121 dsv41_*.fatbin> TP_FATBIN=<tp_mailbox.fatbin (sm_121)> bash build-kit.sh KITDIR
 set -euo pipefail
+# the dev box's shared build lock (spark-work/heavy.sh: one heavy job at a time, 8 GiB, -j4), when it exists
+H=$HOME/Documents/Projects/spark-work/heavy.sh
+[[ -n "${HEAVY_HELD:-}" || ! -x "$H" ]] || exec env HEAVY_HELD=1 "$H" bash "$0" "$@"
 KIT=${1:?kit dir}; FB=${FATBINS:?sm_121 fatbin dir}; TPF=${TP_FATBIN:?tp_mailbox.fatbin}
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); TREE=$(cd "$HERE/../../.." && pwd)
 export PATH=$HOME/.local/opt/zig:$PATH
