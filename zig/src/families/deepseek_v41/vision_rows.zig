@@ -274,21 +274,27 @@ const fwd = @import("forward.zig");
 const run = @import("run.zig");
 const calls = @import("calls.zig");
 const block = @import("block.zig");
+const load = @import("load.zig");
 const pack_mod = @import("pack.zig");
 const mode_mod = @import("dsv41_serve").vision.mode;
 
 /// TF_DSV41_IMAGES at boot, every rank: native sets `f.images` (Engram's keep at image positions, the same program on
-/// every rank) and, on rank 0, loads the tower and the rows (`f.vision`). The image routing bias (TF_DSV41_BIAS_VL)
-/// needs the MoE's image rows as their own call (vision.moe), which the prefill emitter does not have yet: refused.
-pub fn boot(gpa: Allocator, io: std.Io, f: *fwd.Forward, pack: *const pack_mod.Pack, d: *const cuda.Driver, rank: u32) !void {
+/// every rank) and, on rank 0, loads the tower and the rows (`f.vision`). TF_DSV41_BIAS_VL (a folder holding the
+/// release's `layers.<i>.ffn.gate.bias_vl`, as bias_vl_fetch.py writes it) is loaded on every rank as
+/// "L<i>.moe.bias_vl" (the router is replicated): image rows then take their own MoE call routed with it
+/// (vision.moe, block_prefill's moeSplit).
+pub fn boot(gpa: Allocator, io: std.Io, f: *fwd.Forward, pack: *const pack_mod.Pack, d: *const cuda.Driver, rank: u32, w: *load.Weights) !void {
     const raw: ?[]const u8 = if (std.c.getenv("TF_DSV41_IMAGES")) |v| std.mem.span(v) else null;
     const mode = mode_mod.parse(raw) orelse return error.BadImagesMode;
     if (mode != .native) return;
-    if (std.c.getenv("TF_DSV41_BIAS_VL")) |v| if (std.mem.trim(u8, std.mem.span(v), " ").len > 0) {
-        log.err("TF_DSV41_IMAGES=native with TF_DSV41_BIAS_VL: the image rows' own MoE call (vision.moe) is not in the Zig prefill yet; unset TF_DSV41_BIAS_VL (image rows then route with the text bias, as Python without it)", .{});
-        return error.BiasVlNotPorted;
-    };
     f.images = true;
+    if (std.c.getenv("TF_DSV41_BIAS_VL")) |v| {
+        const dir = std.mem.trim(u8, std.mem.span(v), " ");
+        if (dir.len > 0) {
+            try loadBiasVl(gpa, io, f, d, dir, w);
+            f.image_bias = true;
+        }
+    }
     if (rank != 0) return;
     const t = try tower_mod.Tower.load(gpa, io, d, pack, .{});
     errdefer t.deinit();
@@ -297,7 +303,49 @@ pub fn boot(gpa: Allocator, io: std.Io, f: *fwd.Forward, pack: *const pack_mod.P
     f.vision = r;
     // the gates' replays (tf-dsv41-m1 generate / m2b): the reference's prepared images held for the whole run
     if (std.c.getenv("TF_DSV41_VISION_HOLD")) |dir| try holdDir(r, gpa, io, std.mem.span(dir));
-    log.info("images (TF_DSV41_IMAGES=native): tower {d:.2} GB on rank 0; image routing bias not loaded (image rows route with the text bias)", .{@as(f64, @floatFromInt(t.bytes)) / 1e9});
+    log.info("images (TF_DSV41_IMAGES=native): tower {d:.2} GB on rank 0; image routing bias {s}", .{ @as(f64, @floatFromInt(t.bytes)) / 1e9, if (f.image_bias) "loaded" else "MISSING (TF_DSV41_BIAS_VL unset): image rows route with the text bias" });
+}
+
+/// ``attach_bias_vl``: every backbone layer's `layers.<i>.ffn.gate.bias_vl` from `dir`, fp32 [E] (a missing one is
+/// refused, as Python refuses it).
+fn loadBiasVl(gpa: Allocator, io: std.Io, f: *fwd.Forward, d: *const cuda.Driver, dir: []const u8, w: *load.Weights) !void {
+    var src = try pack_mod.Pack.open(gpa, io, dir);
+    defer src.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var n: usize = 0;
+    for (try f.backbone(a)) |L| {
+        const E = f.cfg.expertsOf(L).count;
+        const name = try std.fmt.allocPrint(a, "layers.{d}.ffn.gate.bias_vl", .{L});
+        const info = src.get(name) orelse {
+            log.err("{s}: no {s} (bias_vl_fetch.py writes all 43)", .{ dir, name });
+            return error.MissingBiasVl;
+        };
+        if (info.rank != 1 or info.shape[0] != E) return error.BiasVlShape;
+        const raw = try a.alloc(u8, @intCast(info.nbytes));
+        try src.read(io, info, .{ .offset = 0, .len = info.nbytes }, raw);
+        const vals = try a.alloc(f32, E);
+        switch (info.dtype) {
+            .f32 => @memcpy(std.mem.sliceAsBytes(vals), raw[0 .. 4 * E]),
+            .bf16 => for (vals, 0..) |*x, i| {
+                x.* = @bitCast(@as(u32, std.mem.readInt(u16, raw[2 * i ..][0..2], .little)) << 16);
+            },
+            else => return error.BiasVlDtype,
+        }
+        const bytes = std.mem.sliceAsBytes(vals);
+        var sha: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &sha, .{});
+        var buf = try cuda.DeviceBuffer.fromHost(d, bytes);
+        errdefer buf.free();
+        try w.bufs.append(w.gpa, buf);
+        var shape: [4]usize = @splat(1);
+        shape[0] = E;
+        try w.map.put(w.gpa, try std.fmt.allocPrint(w.gpa, "L{d}.moe.bias_vl", .{L}), .{ .ptr = buf.ptr, .len = bytes.len, .kind = .f32, .sha256 = sha, .shape = shape, .rank = 1 });
+        w.bytes += bytes.len;
+        n += 1;
+    }
+    log.info("images: gate.bias_vl of {d} layers from {s} (TF_DSV41_BIAS_VL)", .{ n, dir });
 }
 
 pub fn close(f: *fwd.Forward) void {
@@ -309,18 +357,56 @@ pub fn close(f: *fwd.Forward) void {
     f.vision = null;
 }
 
-/// The emitter's options for a segment of `ids`: Engram's keep when it holds an image position.
+/// The emitter's options for a segment of `ids`: Engram's keep when it holds an image position; with the image bias
+/// the image rows' count (their MoE call apart).
 pub fn segmentOptions(f: *const fwd.Forward, ids: []const u32) block.Options {
     var o = f.opts;
     o.image_keep = f.images and hasImage(ids);
+    if (o.image_keep and f.image_bias) {
+        var n: i64 = 0;
+        for (ids) |t| n += @intFromBool(isVid(t));
+        o.image_rows = n;
+    }
     return o;
 }
 
-/// The options the buffer plan sizes with: the keep buffer exists when images are on.
+/// The options the buffer plan sizes with: the keep buffer exists when images are on, both MoE calls at full rows
+/// with the image bias.
 pub fn planOptions(f: *const fwd.Forward) block.Options {
     var o = f.opts;
     o.image_keep = f.images;
+    if (f.image_bias) o.image_rows = -1;
     return o;
+}
+
+/// Glue image_split (x [n, D] -> image rows, text rows) / image_merge (the two partials -> [n, D]): rows by the
+/// segment's ids, one copy a run (vision.moe's index_select and its scatter).
+pub fn splitRows(f: *fwd.Forward, r: *run.Runner, c: *const calls.Call, merge: bool) !void {
+    const whole = if (merge) c.args[2].arg.t else c.args[0].arg.t;
+    const img = if (merge) c.args[0].arg.t else c.args[1].arg.t;
+    const txt = if (merge) c.args[1].arg.t else c.args[2].arg.t;
+    const n = f.ids.len;
+    if (@as(usize, @intCast(whole.shape[0])) != n) return error.BadGlue;
+    const row: usize = @as(usize, @intCast(whole.shape[1])) * 2;
+    const wa = try r.tensorAddr(whole);
+    const ia = try r.tensorAddr(img);
+    const ta: u64 = if (txt.shape[0] > 0) try r.tensorAddr(txt) else 0;
+    var at: usize = 0;
+    var ni: usize = 0;
+    var nt: usize = 0;
+    while (at < n) {
+        const image = isVid(f.ids[at]);
+        var end = at + 1;
+        while (end < n and isVid(f.ids[end]) == image) end += 1;
+        const k = end - at;
+        const part = if (image) ia + ni * row else ta + nt * row;
+        const dst = if (merge) wa + at * row else part;
+        const src = if (merge) part else wa + at * row;
+        try r.d.check(r.d.api.cuMemcpyDtoDAsync_v2(dst, src, k * row, r.stream.handle), "cuMemcpyDtoDAsync");
+        if (image) ni += k else nt += k;
+        at = end;
+    }
+    if (ni != @as(usize, @intCast(img.shape[0])) or nt != @as(usize, @intCast(@max(txt.shape[0], 0)))) return error.BadGlue;
 }
 
 /// Glue "image_keep" (vision.window's ``keep``): fp32 [n], 0 at image positions, 1 elsewhere.

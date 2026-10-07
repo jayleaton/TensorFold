@@ -12,10 +12,13 @@
    then dsv41_m2b_ref.py's own ``one`` runs each prompt from a fresh slot (state dump, greedy steps, digests) into
    OUT/p<i>/ (``--prompts 1,2,3``: prompt i is ``PROMPTS[i - 1]``), so tf-dsv41-m1 m2b's prefill gate reads them as
    any M2b reference; ``OUT/trace.jsonl`` holds every prompt and its tokens for ``tf-dsv41-m1 generate``.
+4. ``--prompts 1,2,3,4,5,6`` with ``--bias-vl DIR``: prompts 4..6 are 1..3 again (the same ids) after
+   ``vision.attach_bias_vl(fw.blocks, DIR)`` on both ranks: image rows route with ``gate.bias_vl`` in their own MoE
+   call (``vision.moe``), as prod with TF_DSV41_BIAS_VL; ``OUT/trace-bias.jsonl``.
 
-Image rows route with the text bias (TF_DSV41_BIAS_VL unset: the Zig prefill refuses the bias for now).
+Prompts 1..3 route image rows with the text bias (as Python without TF_DSV41_BIAS_VL).
 
-    python -u -B vision_ref.py --vdir VDIR -- --pack PACK --out OUT --layers 0-24 --steps 32 --prompts 1,2,3
+    python -u -B vision_ref.py --vdir VDIR [--bias-vl DIR] -- --pack PACK --out OUT --layers 0-24 --steps 32 --prompts 1,2,3,4,5,6
 """
 from __future__ import annotations
 
@@ -166,7 +169,14 @@ def one_image(rank, a, fw, cfg, greedy, Seg, digest, prompt, out, *rest):
             imgs = list(_STATE["images"].values())
             V.STORE.hold(enc.table(imgs))
             del enc.tower.t                      # the rows are in the store; the tower's weights go
-    ids = prompt_ids(PROMPTS[prompt - 1], _STATE["images"], cfg.vocab_size, a.seed + prompt)
+    k = (prompt - 1) % len(PROMPTS) + 1                 # 4..6: 1..3 again, with the image routing bias
+    if prompt > len(PROMPTS) and not _STATE.get("bias"):
+        folder = os.environ.get("DSV41_VISION_BIAS", "")
+        if not folder:
+            raise SystemExit("vision ref: prompts past 3 need --bias-vl")
+        print(f"rank {rank}: gate.bias_vl of {V.attach_bias_vl(fw.blocks, folder)} routers from {folder}", flush=True)
+        _STATE["bias"] = True
+    ids = prompt_ids(PROMPTS[k - 1], _STATE["images"], cfg.vocab_size, a.seed + k)
     real = torch.randint
 
     def once(*x, **k):                                       # one() draws its prompt with torch.randint, first
@@ -204,16 +214,21 @@ def main() -> int:
     if "--vdir" not in argv or "--" not in argv:
         raise SystemExit(__doc__)
     os.environ["DSV41_VISION_DIR"] = argv[argv.index("--vdir") + 1]
-    os.environ.pop("TF_DSV41_BIAS_VL", None)
+    if "--bias-vl" in argv:
+        os.environ["DSV41_VISION_BIAS"] = argv[argv.index("--bias-vl") + 1]
+    os.environ.pop("TF_DSV41_BIAS_VL", None)             # the loader takes none: prompts 4..6 attach it themselves
     sys.argv = [sys.argv[0]] + argv[argv.index("--") + 1:]
     rc = M2B.main()
     out = Path(sys.argv[sys.argv.index("--out") + 1])
-    lines = []
-    for i in range(1, len(PROMPTS) + 1):
-        ref = json.loads((out / f"p{i}" / "ref.json").read_text())
-        lines.append(json.dumps({"prompt": ref["prompt_ids"], "tokens": ref["tokens"]}))
-    (out / "trace.jsonl").write_text("\n".join(lines) + "\n")
-    print(f"vision ref: {len(lines)} image prompts, trace {out / 'trace.jsonl'}", flush=True)
+    for name, lo in (("trace.jsonl", 1), ("trace-bias.jsonl", len(PROMPTS) + 1)):
+        lines = []
+        for i in range(lo, lo + len(PROMPTS)):
+            if (out / f"p{i}" / "ref.json").exists():
+                ref = json.loads((out / f"p{i}" / "ref.json").read_text())
+                lines.append(json.dumps({"prompt": ref["prompt_ids"], "tokens": ref["tokens"]}))
+        if lines:
+            (out / name).write_text("\n".join(lines) + "\n")
+            print(f"vision ref: {len(lines)} image prompts, {out / name}", flush=True)
     return rc
 
 
