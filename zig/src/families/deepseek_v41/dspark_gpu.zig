@@ -21,6 +21,7 @@ const fwd = @import("forward.zig");
 const emit = @import("dspark_emit.zig");
 const iface = @import("draft/iface.zig");
 const dspark = @import("draft/dspark.zig");
+const dsd = @import("dspark_dev.zig");
 
 pub const Error = error{ Slots, NotAPrefix, NoWeight, CandidateWidth, BadCandidates };
 
@@ -53,6 +54,11 @@ pub const GpuPass = struct {
     cand: []i32,
     cval: []f32,
     hid: []f32,
+    /// TF_DSV41_DRAFT_GRAPHS (dspark_dev.zig): candidates on the device, the pass graphed; null: the host step
+    dev: ?*dsd.Dev = null,
+    /// the last eager pass's logits (a check pass compares the device candidates with the host's on them)
+    last_logits: u64 = 0,
+    last_v: usize = 0,
 
     /// The buffer roles DSpark adds to the forward's plan (call before Runner.bind).
     pub fn plan(a: std.mem.Allocator, f: *const fwd.Forward, p: *buffers.Plan, ingest_rows: u32) !void {
@@ -105,12 +111,23 @@ pub const GpuPass = struct {
             x.head = i;
         };
         f.drafter = .{ .ptr = x, .ingest = followIngest, .propose = followPropose, .reset = followReset };
+        const mode = try dsd.modeFromEnv();
+        if (mode != .host) {
+            if (r.kernels.others(r.stream).f.ds_cands == null) {
+                std.log.scoped(.dsv41).warn("draft graphs: TF_DSV41_DRAFT_GRAPHS set, but the glue fatbin has no ds_cands kernel: the host step", .{});
+            } else {
+                // every buffer a graphed pass bakes in, at its largest: the embedding's and exchanges' send
+                _ = try x.device(&x.send, 2 * @as(usize, @intCast(n)) * cfg.hidden);
+                x.dev = try dsd.Dev.init(gpa, r.d, f.comm, r.stream, mode, k, cfg.hidden, @intCast(n), conf != null, @intCast(8 * st.len64() + 4 * st.len32()), 1);
+            }
+        }
         return x;
     }
 
     pub fn deinit(x: *GpuPass) void {
         const gpa = x.gpa;
         x.f.drafter = null;
+        if (x.dev) |d| d.deinit();
         if (x.send) |*b| b.free();
         if (x.gathered) |*b| b.free();
         gpa.free(x.w1);
@@ -218,6 +235,12 @@ pub const GpuPass = struct {
         const a = asks[0];
         const ops = fwd.Forward.dsProposeOp(a.anchor, a.start);
         try x.f.sendDrafter(&ops);
+        if (x.devOn()) {
+            // the whole pass, its candidates and their copy back: nothing in it waits for the host
+            try x.devLaunch(a.anchor, a.start);
+            x.begun = a;
+            return;
+        }
         try x.stagePass(a.anchor, a.start);
         try x.f.runner.window(x.pass_calls[0..x.head]);
         x.begun = a;
@@ -228,6 +251,10 @@ pub const GpuPass = struct {
         const a = x.begun orelse return error.NoPassBegun;
         x.begun = null;
         if (out.len != 1) return error.Slots;
+        if (x.devOn()) {
+            try x.devCollect(true);
+            return x.finish(a, out);
+        }
         const r = x.f.runner;
         r.glue = .{ .ctx = x, .run = glueFn };
         try r.window(x.pass_calls[x.head..]);
@@ -258,40 +285,86 @@ pub const GpuPass = struct {
 
     /// The pass on this rank: statics staged, the launches, the host's candidates (every rank: the gather pairs up).
     fn runPass(x: *GpuPass, anchor: u32, start: u64) !void {
+        if (x.devOn()) {
+            try x.devLaunch(anchor, start);
+            return x.devCollect(x.f.comm.rank() == 0 or x.f.link == null);
+        }
         try x.stagePass(anchor, start);
         try x.f.runner.window(x.pass_calls);
     }
 
+    fn devOn(x: *const GpuPass) bool {
+        const d = x.dev orelse return false;
+        return d.on();
+    }
+
+    /// The device path: the statics from pinned staging (no sync), the pass (its key's graph once the checks passed),
+    /// the event the host waits on.
+    fn devLaunch(x: *GpuPass, anchor: u32, start: u64) !void {
+        const d = x.dev.?;
+        const st = x.st;
+        const sv = try d.statics(0, @intCast(st.len64()), @intCast(st.len32()));
+        x.fillStatics(anchor, start, sv[0], sv[1]);
+        const r = x.f.runner;
+        try cuda.DeviceBuffer.uploadAsync(.{ .d = r.d, .ptr = r.addressOf("w.ds.i64") orelse return error.Unbound, .len = 8 * sv[0].len }, 0, std.mem.sliceAsBytes(sv[0]), r.stream.handle);
+        try cuda.DeviceBuffer.uploadAsync(.{ .d = r.d, .ptr = r.addressOf("w.ds.i32") orelse return error.Unbound, .len = 4 * sv[1].len }, 0, std.mem.sliceAsBytes(sv[1]), r.stream.handle);
+        r.glue = .{ .ctx = x, .run = glueFn };
+        const extra = [_]u64{ if (x.send) |b| b.ptr else 0, if (x.send) |b| b.len else 0 };
+        try d.issue(0, dsd.fingerprint(r, d, &extra), .{ .ctx = x, .run = passBody });
+        try d.mark();
+    }
+
+    fn passBody(ctx: *anyopaque, stream: cuda.Stream) anyerror!void {
+        const x: *GpuPass = @ptrCast(@alignCast(ctx));
+        _ = stream; // the runner's stream
+        try x.f.runner.window(x.pass_calls);
+    }
+
+    /// The device pass's results on the host (`unpack`: rank 0's chain reads them), a check pass's comparison, and
+    /// the ranks' verdict after the checks.
+    fn devCollect(x: *GpuPass, unpack: bool) !void {
+        const d = x.dev.?;
+        try d.wait();
+        if (d.checked < dsd.check_passes) try d.check(x.last_logits, x.last_v, @intCast(x.st.n), 0);
+        if (unpack) try d.unpack(@intCast(x.st.n), 0, x.f.cfg.vocab, x.cand, x.cval, if (x.conf != null) x.hid else null);
+        try d.settle();
+    }
+
     /// The pass's statics (Python's DraftInputs) on the device, and its glue in place.
     fn stagePass(x: *GpuPass, anchor: u32, start: u64) !void {
-        const st = x.st;
-        const n: usize = @intCast(st.n);
-        const W: usize = @intCast(st.window);
-        @memset(x.h64, 0);
-        @memset(x.h32, 0);
-        const ring: u64 = @intCast(emit.ringRows(x.f.cfg));
-        for (0..n) |i| {
-            x.h64[@intCast(st.ids() + @as(i64, @intCast(i)))] = if (i == 0) anchor else x.shape.noise;
-            x.h64[@intCast(st.positions() + @as(i64, @intCast(i)))] = @intCast(start + i);
-            x.h64[@intCast(st.readRows() + @as(i64, @intCast(i)))] = 0; // slot 0's ring
-            x.h64[@intCast(st.writeRows() + @as(i64, @intCast(i)))] = 0;
-        }
-        const ctx = dspark.Context.of(x.shape, start, x.valid);
-        x.h32[@intCast(st.start())] = @intCast(start);
-        const tok = x.h32[@intCast(st.tokens())..][0 .. n * W];
-        @memset(tok, -1);
-        for (0..n) |i| for (0..ctx.count) |j| {
-            tok[i * W + j] = @intCast((ctx.first + j) % ring);
-        };
-        @memset(x.h32[@intCast(st.counts())..][0..n], @intCast(ctx.count));
-        @memset(x.h32[@intCast(st.lo())..][0..n], @intCast(start));
-        @memset(x.h32[@intCast(st.hi())..][0..n], @intCast(start + n - 1));
-        x.h32[@intCast(st.anchor())] = @intCast(anchor);
+        x.fillStatics(anchor, start, x.h64, x.h32);
         const r = x.f.runner;
         try r.stream.synchronize();
         try cuda.DeviceBuffer.uploadAsync(.{ .d = r.d, .ptr = r.addressOf("w.ds.i64") orelse return error.Unbound, .len = 8 * x.h64.len }, 0, std.mem.sliceAsBytes(x.h64), r.stream.handle);
         try cuda.DeviceBuffer.uploadAsync(.{ .d = r.d, .ptr = r.addressOf("w.ds.i32") orelse return error.Unbound, .len = 4 * x.h32.len }, 0, std.mem.sliceAsBytes(x.h32), r.stream.handle);
         r.glue = .{ .ctx = x, .run = glueFn };
+    }
+
+    /// The statics (Python's DraftInputs, one slot) into `h64` / `h32`.
+    fn fillStatics(x: *GpuPass, anchor: u32, start: u64, h64: []i64, h32: []i32) void {
+        const st = x.st;
+        const n: usize = @intCast(st.n);
+        const W: usize = @intCast(st.window);
+        @memset(h64, 0);
+        @memset(h32, 0);
+        const ring: u64 = @intCast(emit.ringRows(x.f.cfg));
+        for (0..n) |i| {
+            h64[@intCast(st.ids() + @as(i64, @intCast(i)))] = if (i == 0) anchor else x.shape.noise;
+            h64[@intCast(st.positions() + @as(i64, @intCast(i)))] = @intCast(start + i);
+            h64[@intCast(st.readRows() + @as(i64, @intCast(i)))] = 0; // slot 0's ring
+            h64[@intCast(st.writeRows() + @as(i64, @intCast(i)))] = 0;
+        }
+        const ctx = dspark.Context.of(x.shape, start, x.valid);
+        h32[@intCast(st.start())] = @intCast(start);
+        const tok = h32[@intCast(st.tokens())..][0 .. n * W];
+        @memset(tok, -1);
+        for (0..n) |i| for (0..ctx.count) |j| {
+            tok[i * W + j] = @intCast((ctx.first + j) % ring);
+        };
+        @memset(h32[@intCast(st.counts())..][0..n], @intCast(ctx.count));
+        @memset(h32[@intCast(st.lo())..][0..n], @intCast(start));
+        @memset(h32[@intCast(st.hi())..][0..n], @intCast(start + n - 1));
+        h32[@intCast(st.anchor())] = @intCast(anchor);
     }
 
     fn device(x: *GpuPass, slot: *?cuda.DeviceBuffer, bytes: usize) !u64 {
@@ -336,7 +409,14 @@ pub const GpuPass = struct {
         }
         if (std.mem.eql(u8, step, "widen")) // q.to(fp32): exact
             return k.widenF32(try r.tensorAddr(c.args[0].arg.t), try r.tensorAddr(c.args[1].arg.t), numel(c.args[0].arg.t));
-        if (std.mem.eql(u8, step, "ds_out")) return x.hostStep(r, c.args[0].arg.t, c.args[1].arg.t);
+        if (std.mem.eql(u8, step, "ds_out")) {
+            if (x.dev) |dv| if (dv.on()) {
+                x.last_logits = try r.tensorAddr(c.args[0].arg.t);
+                x.last_v = @intCast(c.args[0].arg.t.shape[1]);
+                return dv.launch(r, c.args[0].arg.t, c.args[1].arg.t, @intCast(x.st.n), 0);
+            };
+            return x.hostStep(r, c.args[0].arg.t, c.args[1].arg.t);
+        }
         return error.GlueNotBuilt;
     }
 

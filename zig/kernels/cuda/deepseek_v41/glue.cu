@@ -14,6 +14,8 @@
 //   widen_f32    y = f32(x) of bf16 x                                                (q.float(): exact, the DSpark pass)
 //   gather_cols  out[i][w c + j] = recv[w][i][j]                                      (permute(1, 0, 2).reshape)
 //   carry        carry[j] = f32(src[row][j]), row = *accepted (device) or the host's   (the ratio-2 compressor carry)
+//   ds_cands     DSpark's candidates (dspark.candidates / draft/dspark.zig): each row's best k fp32 logits by (value
+//                desc, column asc), -0.0 == +0.0, as [vals k | ids k as int bits] (an exact selection: integers only)
 
 #include <cstdint>
 #include <cuda_bf16.h>
@@ -114,6 +116,93 @@ __global__ void __launch_bounds__(256) widen_f32_kernel(const uint16_t* __restri
                                                         long long n) {
     for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x)
         y[i] = bf(x[i]);
+}
+
+// DSpark's candidates: one CTA a row of fp32 logits [rows, V] (row stride ld). Keys
+//   u = (mono(bits(x + 0.0)) << 32) | (0xFFFFFFFF - col)
+// are unique in a row and order rows by (value desc, column asc) with -0.0 == +0.0, the host rule (dspark.candidates).
+// A radix select of the k-th largest key, 8 bits a pass from the top, stops at the pass whose digit holds exactly the
+// keys still needed (after 4 passes when the k-th value is unique); the winners are the keys whose selected top bits are
+// >= the prefix, exactly c = min(k, V) of them; a bitonic sort (descending) gives the host's order. Out: packed
+// [rows][2 k] fp32: values then id0 + column as int bits; slots past c: -inf and id -1 (the host's padding).
+constexpr int DS_NT = 1024, DS_KMAX = 128;
+
+__device__ __forceinline__ unsigned long long ds_key(float x, int col) {
+    const unsigned int b = __float_as_uint(x + 0.0f);                      // -0.0 + 0.0 = +0.0
+    const unsigned int mono = (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+    return (static_cast<unsigned long long>(mono) << 32) | (0xFFFFFFFFull - static_cast<unsigned int>(col));
+}
+
+__global__ void __launch_bounds__(DS_NT) ds_cands_kernel(const float* __restrict__ lg, long long ld, int V, int k,
+                                                         int id0, float* __restrict__ out) {
+    __shared__ int hist[256];
+    __shared__ unsigned long long s_prefix, s_mask;
+    __shared__ int s_need, s_done, s_n;
+    __shared__ unsigned long long key_sh[DS_KMAX];
+    const int tid = threadIdx.x;
+    const float* row = lg + (long long)blockIdx.x * ld;
+    float* o = out + (long long)blockIdx.x * 2 * k;
+    const int c = V < k ? V : k;
+    if (tid == 0) { s_prefix = 0; s_mask = 0; s_need = c; s_done = 0; }
+    __syncthreads();
+    for (int shift = 56; shift >= 0 && c > 0; shift -= 8) {
+        if (tid < 256) hist[tid] = 0;
+        __syncthreads();
+        const unsigned long long prefix = s_prefix, mask = s_mask;
+        for (int i = tid; i < V; i += DS_NT) {
+            const unsigned long long u = ds_key(row[i], i);
+            if ((u & mask) == prefix) atomicAdd(&hist[(u >> shift) & 255], 1);
+        }
+        __syncthreads();
+        if (tid == 0) {
+            int need = s_need, d = 255;
+            for (; d > 0 && hist[d] < need; --d) need -= hist[d];
+            s_need = need;
+            s_prefix = prefix | ((unsigned long long)d << shift);
+            s_mask = mask | (255ull << shift);
+            s_done = hist[d] == need;                                       // the digit's keys: all winners
+        }
+        __syncthreads();
+        if (s_done) break;
+    }
+    const unsigned long long prefix = s_prefix, mask = s_mask;
+    if (tid == 0) s_n = 0;
+    __syncthreads();
+    for (int i = tid; i < V && c > 0; i += DS_NT) {
+        const unsigned long long u = ds_key(row[i], i);
+        if ((u & mask) >= prefix) {
+            const int at = atomicAdd(&s_n, 1);
+            if (at < DS_KMAX) key_sh[at] = u;
+        }
+    }
+    __syncthreads();
+    int m = 1;
+    while (m < c) m <<= 1;
+    for (int i = c + tid; i < m; i += DS_NT) key_sh[i] = 0;                // sorts last
+    __syncthreads();
+    for (int size = 2; size <= m; size <<= 1) {
+        for (int stride = size >> 1; stride > 0; stride >>= 1) {
+            for (int i = tid; i < m; i += DS_NT) {
+                const int j = i ^ stride;
+                if (j > i) {
+                    const bool desc = (i & size) == 0;
+                    const unsigned long long a = key_sh[i], b = key_sh[j];
+                    if (desc ? a < b : a > b) { key_sh[i] = b; key_sh[j] = a; }
+                }
+            }
+            __syncthreads();
+        }
+    }
+    for (int i = tid; i < k; i += DS_NT) {
+        if (i < c) {
+            const int col = (int)(0xFFFFFFFFull - (key_sh[i] & 0xFFFFFFFFull));
+            o[i] = row[col];
+            o[k + i] = __int_as_float(id0 + col);
+        } else {
+            o[i] = -__int_as_float(0x7F800000);
+            o[k + i] = __int_as_float(-1);
+        }
+    }
 }
 
 }  // namespace dsv41_glue
