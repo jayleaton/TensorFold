@@ -110,6 +110,9 @@ pub const SlotPass = struct {
         errdefer gpa.destroy(x);
         const n: usize = f.cfg.dspark_block;
         const R = n * group;
+        // the device round unpacks every group of the round at its slots' offset (devFinishRound: g[0] x n), so the
+        // candidates / values / head hidden cover every live slot's rows (Dev's rows_max), not one group's
+        const Rr = n * @max(group, nslots);
         const c: usize = f.comm.world() * one.k;
         const lay = emit.Layout.of(group, @intCast(n), f.cfg.window);
         const V: usize = f.cfg.vocab / f.comm.world();
@@ -124,9 +127,9 @@ pub const SlotPass = struct {
             .programs = undefined,
             .h64 = try gpa.alloc(i64, @intCast(lay.len64)),
             .h32 = try gpa.alloc(i32, @intCast(lay.len32)),
-            .cand = try gpa.alloc(i32, R * c),
-            .cval = try gpa.alloc(f32, R * c),
-            .hid = try gpa.alloc(f32, R * f.cfg.hidden),
+            .cand = try gpa.alloc(i32, Rr * c),
+            .cval = try gpa.alloc(f32, Rr * c),
+            .hid = try gpa.alloc(f32, Rr * f.cfg.hidden),
             .logits = try gpa.alloc(f32, R * V),
             .hid16 = try gpa.alloc(u16, R * f.cfg.hidden),
             .packed_ = try gpa.alloc(f32, R * 2 * one.k),
