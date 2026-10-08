@@ -1,4 +1,4 @@
-//! Decode windows of more than 16 rows (block_wide.zig, TF_DSV41_WIDE_ROWS) on the real emitter, host only: every
+//! Decode windows of more than 16 rows (block_wide.zig, TF_DSV41_ROWS_CAP past 16) on the real emitter, host only: every
 //! mHC launch and the router's configuration against a table derived from Python's rules at 8474f31, independently of
 //! block_wide.zig:
 //!

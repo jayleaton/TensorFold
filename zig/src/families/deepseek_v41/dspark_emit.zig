@@ -371,7 +371,7 @@ const Ds = struct {
     fn final(d: *Ds) !void {
         const e = d.e;
         const n = e.n;
-        // a pass of more than 16 rows (4 slots: 20, TF_DSV41_WIDE_ROWS): mhc.final on Triton (block_wide.zig)
+        // a pass of more than 16 rows (4 slots: 20, TF_DSV41_ROWS_CAP past 16): mhc.final on Triton (block_wide.zig)
         if (n > wide.cuda_rows) return wide.mhc(e, null, "", .final, false, "dspark.norm", null);
         const D: i64 = d.cfg().hidden;
         const f0 = try e.empty(.f32);

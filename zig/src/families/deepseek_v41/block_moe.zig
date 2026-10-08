@@ -28,7 +28,7 @@ pub fn mhc(e: *E, layer: ?u32, which: []const u8, mode: Mode) !void {
 /// `mhc`, a boundary writing the streams in place when `in_place` (a run without the second streams buffer: CED's
 /// decoder replay, replay.finish's Streams has no `alt`).
 pub fn mhcInto(e: *E, layer: ?u32, which: []const u8, mode: Mode, in_place: bool) !void {
-    // past mhc_cuda's 16 rows (TF_DSV41_WIDE_ROWS): Python's Triton `_site` + `_finish_k` (block_wide.zig)
+    // past mhc_cuda's 16 rows (TF_DSV41_ROWS_CAP past 16): Python's Triton `_site` + `_finish_k` (block_wide.zig)
     if (e.n > wide.cuda_rows) return wide.decode(e, layer, which, mode, in_place);
     const n = e.n;
     const D: i64 = e.cfg.hidden;

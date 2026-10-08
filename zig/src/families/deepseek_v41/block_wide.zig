@@ -1,4 +1,4 @@
-//! Decode windows of more than 16 rows (TF_DSV41_WIDE_ROWS, batch.zig / dspark_slots.zig): what Python's decode path
+//! Decode windows of more than 16 rows (TF_DSV41_ROWS_CAP past 16: batch.zig's row windows, dspark_rows.zig's slot passes): what Python's decode path
 //! runs past mhc_cuda's 16 rows (8474f31 mhc.py, router_gemv.py), emitted for block_moe.zig's decode calls.
 //!
 //! - **mHC** (`mhc.site` / `boundary` / `final`): `mhc_cuda.run` declines more than MAX_ROWS (16) rows and `mhc_dec`
@@ -124,13 +124,6 @@ pub fn routerCfg(n: i64) [3]i64 {
     if (n > cuda_rows) return .{ 16, 8, 2 };
     const t = std.math.ceilPowerOfTwo(u64, @intCast(n)) catch unreachable;
     return .{ @intCast(t), 2, 0 };
-}
-
-/// TF_DSV41_WIDE_ROWS=1: decode windows (row mode) and DSpark slot passes of up to 64 rows in one forward, as
-/// Python's row buckets (default off: windows of more than 16 rows run as several forwards). Every rank alike.
-pub fn enabled() bool {
-    const v = std.c.getenv("TF_DSV41_WIDE_ROWS") orelse return false;
-    return std.mem.eql(u8, std.mem.span(v), "1");
 }
 
 test "wide rows: router config as router_gemv.config / row_tile" {

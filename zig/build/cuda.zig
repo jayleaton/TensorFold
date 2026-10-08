@@ -279,7 +279,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, step: *std.Build.S
     const rows_run = b.addRunArtifact(b.addTest(.{ .root_module = rows }));
     b.step("test-dsv41-rows", "DeepSeek-V4.1 row mode (several slots) on the real emitter, host only").dependOn(&rows_run.step);
     step.dependOn(&rows_run.step);
-    // DSV4.1 decode windows past 16 rows (block_wide.zig, TF_DSV41_WIDE_ROWS) on the real emitter, against Python's rules
+    // DSV4.1 decode windows past 16 rows (block_wide.zig, TF_DSV41_ROWS_CAP past 16) on the real emitter, against Python's rules
     const wide = b.createModule(.{ .root_source_file = b.path("zig/src/families/deepseek_v41/wide_test.zig"), .target = host, .optimize = .debug, .link_libc = true });
     wide.addImport("cuda", cuda);
     wide.addImport("dsv41_kernels", dsv41Kernels(b, host, .debug, cuda, &.{}));
