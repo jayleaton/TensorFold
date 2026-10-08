@@ -6,12 +6,13 @@ const twin = @import("twin.zig");
 const ln = @import("lanes.zig");
 const costs_mod = @import("costs.zig");
 const depth = @import("depth.zig");
+const spec_mod = @import("spec.zig");
 
 const gpa = std.testing.allocator;
 
 const Case = struct { prompt: []const u32, max_new: u32 = 60, sampling: ?lanes.Sampling = null, drafts: bool = true, copies: bool = false };
 
-const Setup = struct { siblings: u32 = 0, joint: u2 = 1, skip: bool = true, costs: Prices = .prod, slots: u32 = 4, dims: twin.Dims = .{}, depth: depth.Settings = .{} };
+const Setup = struct { siblings: u32 = 0, joint: u2 = 1, skip: bool = true, costs: Prices = .prod, slots: u32 = 4, dims: twin.Dims = .{}, depth: depth.Settings = .{}, spec: bool = false };
 
 const Prices = enum { prod, flat, cheap };
 
@@ -33,6 +34,7 @@ const Run = struct {
     joint: u64,
     kept: [16]u64, // drafts kept by position (depth.Stats)
     widest: usize, // the most rows one forward held
+    spec: spec_mod.Stats = .{}, // the speculative pass's counts (Setup.spec)
 
     fn deinit(r: Run) void {
         for (r.out) |o| gpa.free(o);
@@ -60,7 +62,7 @@ fn run(cases: []const Case, setup: Setup) !Run {
         set.joint = setup.joint;
         set.skip = setup.skip;
         break :d set;
-    } });
+    }, .spec = .{ .on = setup.spec } });
     defer x.deinit();
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -84,9 +86,10 @@ fn run(cases: []const Case, setup: Setup) !Run {
     };
     for (streams) |*s| try e.addStream(s);
     while (e.activeCount() > 0) try e.step();
+    const spec_stats: spec_mod.Stats = if (x.spec) |sp| sp.stats else .{};
     const out = try gpa.alloc([]u32, cases.len);
     for (out, streams) |*o, *s| o.* = try gpa.dupe(u32, s.emitted());
-    return .{ .out = out, .drafted = e.drafted, .accepted = e.accepted, .zero = x.policy.depth.stats.zero, .trees = x.policy.trees, .sib_wins = x.policy.sib_wins, .joint = x.policy.depth.stats.joint[0], .kept = x.policy.depth.stats.kept, .widest = t.widest };
+    return .{ .out = out, .drafted = e.drafted, .accepted = e.accepted, .zero = x.policy.depth.stats.zero, .trees = x.policy.trees, .sib_wins = x.policy.sib_wins, .joint = x.policy.depth.stats.joint[0], .kept = x.policy.depth.stats.kept, .widest = t.widest, .spec = spec_stats };
 }
 
 /// The twin's own serial decode of a case (no lanes at all).
@@ -179,4 +182,25 @@ test "shared forwards past 32 rows (Python's 64) keep every stream serial" {
     defer r.deinit();
     try expectSerial(&cases, r, dims);
     try std.testing.expect(r.widest > 32 and r.widest <= 64);
+}
+
+test "the speculative pass runs on chain rounds (held drafts read back as host tokens) and changes no draft" {
+    // the lane core hands a chain's held drafts back as host tokens (Backend.tree): those windows are DSpark rounds,
+    // so the next pass is speculated after nearly every one, and the drafts, windows and tokens are spec-off's
+    for ([_]?lanes.Sampling{ null, warm }) |smp| {
+        const cases = [_]Case{.{ .prompt = &p1, .sampling = smp, .max_new = 120 }};
+        const off = try run(&cases, .{ .slots = 1 });
+        defer off.deinit();
+        const on = try run(&cases, .{ .slots = 1, .spec = true });
+        defer on.deinit();
+        try expectSerial(&cases, on, .{});
+        try std.testing.expectEqualSlices(u32, off.out[0], on.out[0]);
+        try std.testing.expectEqual(off.drafted, on.drafted);
+        try std.testing.expectEqual(off.accepted, on.accepted);
+        try std.testing.expectEqualSlices(u64, &off.kept, &on.kept);
+        const st = on.spec;
+        try std.testing.expect(st.launched > 0 and st.hit > 0);
+        // 120 tokens in rounds of up to 6: dozens of chain rounds, each speculated (before the fix: 1, the first)
+        try std.testing.expect(st.launched >= 20 and st.hit + st.missed() == st.launched);
+    }
 }

@@ -285,8 +285,12 @@ pub const Lanes = struct {
         var n: usize = 0;
         for (windows, segs, choices) |w, g, c| {
             const st = try x.get(w.stream);
-            // a DSpark round: the window verifies the pass's drafts (none when the depth chose 0), no host drafts
-            if (st.n == 0 or w.tokens.len != 0) continue;
+            // a DSpark round: the window verifies the pass's drafts (none when the depth chose 0), no host drafts.
+            // The lane core reads a chain's held drafts back as host tokens (Backend.tree after every draft), so a
+            // window of `w.tokens` that are a prefix of the slot's held chain is a DSpark round too (it was skipped:
+            // the night's run A speculated 800 of 7,493 passes)
+            if (st.n == 0) continue;
+            if (w.tokens.len != 0 and !(w.held == 0 and w.parents == null and w.tokens.len <= st.n and std.mem.eql(u32, w.tokens, st.held[0..w.tokens.len]))) continue;
             var acc: u32 = 0;
             while (acc + 1 < g.tokens.len and g.tokens[acc + 1] == c[acc]) acc += 1;
             cands[n] = .{ .slot = st.slot, .start = g.start, .accepted = acc, .bonus = c[acc], .sampling = g.sampling };
