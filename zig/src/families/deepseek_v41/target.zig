@@ -78,9 +78,9 @@ pub const GpuTarget = struct {
             // (a chain window never kept keeps every row; release keeps it before a session save)
             const sp = pk.promptSplit(rest.len, .verify);
             t.f.prefill_state.taps_rows = 0; // a one-token prompt prefills nothing: no stale taps handed over
-            // CED replay with sessions: the prompt's snapshot at its replay point (batch.py `save_at`, rounds.py
-            // `_save(slot, "prompt")`): its rows prefilled, an entry with the stash, then the rest
-            const save_at: ?u64 = if (t.sessions != null and t.f.prefill_state.mode == .replay) ced.savePoint(ids.len, at) else null;
+            // sessions: the prompt's snapshot at its replay point (batch.py `save_at`, rounds.py `_save(slot,
+            // "prompt")`): its rows prefilled, an entry (CED: with the stash), then the rest
+            const save_at: ?u64 = if (t.sessions != null) ced.savePoint(ids.len, at) else null;
             if (save_at) |s_at| {
                 const cut: usize = @intCast(s_at);
                 try t.f.prefill(ids[at..cut]);
@@ -213,9 +213,10 @@ pub const GpuTarget = struct {
         if (slot != 0) return;
         t.tree.clear();
         if (t.sessions) |ss| {
-            // CED replay keeps no turn snapshots (rounds.py `_finish`: a turn's end holds decoder rows a fresh prompt
-            // replays differently); the prompt was saved at its replay point
-            if (t.f.prefill_state.mode == .replay) {
+            // the served shape keeps no turn snapshots (rounds.py `_finish`: only the exact prefill tag in full mode
+            // does; Zig's prefill is the fast path, and CED replays a turn's decoder rows differently): the prompt
+            // was saved at its replay point
+            if (t.own_prefill and t.prompt_tail == .verify) {
                 t.f.release() catch |e| std.log.err("dsv41 target: releasing the slot on the other ranks failed ({t})", .{e});
                 return;
             }

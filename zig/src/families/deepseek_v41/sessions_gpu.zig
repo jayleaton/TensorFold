@@ -5,9 +5,10 @@
 //!   ("s.L<i>.swa.v" / ".s"), the ratio-2 carries ("s.L<i>.carry"), the position and the Engram tail. A RAM entry keeps
 //!   a host copy; a park writes the same pieces as named blobs next to the entry's pages;
 //! - `save`: an entry for the slot's committed ids (its pages shared, not copied), then the slot lets go of its pages;
-//! - CED replay (TF_DSV41_PREFILL=replay, ced.zig): no turn entries; `savePrompt` keeps an entry at the prompt's
-//!   replay point while the slot goes on prefilling, its bounded state with the stash ring ("s.ced.*") and the stash's
-//!   positions and ids; replay entries carry their own tag (ced.tag), so full and replay entries never resume each other;
+//! - the served shape (own prefill, verify tail; Python prod's fast prefill tag): no turn entries; `savePrompt` keeps an
+//!   entry at the prompt's replay point while the slot goes on prefilling (CED replay, ced.zig: its bounded state with
+//!   the stash ring "s.ced.*" and the stash's positions and ids); entries carry the fast tag, replay's its own
+//!   (ced.tag), so full and replay entries never resume each other, nor the old exact-tag turn entries;
 //! - `resume`: the longest saved entry that strictly prefixes a prompt, from RAM (full pages adopted, the partial last one
 //!   copied) or NVMe (streamed into fresh pages through the staging set), its bounded state uploaded: the slot continues at
 //!   the entry's position, and the caller prefills the rest of the prompt;
@@ -285,11 +286,12 @@ pub const Sessions = struct {
         return id;
     }
 
-    /// CED replay's prompt snapshot (batch.py `save_at`, rounds.py `_save(slot, "prompt")`): an entry for the committed
+    /// The served shape's prompt snapshot (batch.py `save_at`, rounds.py `_save(slot, "prompt")`): an entry for the committed
     /// ids at the slot's position (the prompt's replay point), its bounded state with the stash; the slot keeps its
     /// pages and goes on prefilling (it only writes positions past the entry's, which a resume rewrites before reading).
     pub fn savePrompt(s: *Sessions) !?u32 {
-        if (s.history.items.len != s.f.slot.pos or s.f.slot.pending != null or s.f.slot.ced.hi != s.f.slot.pos) return error.BadWindow;
+        if (s.history.items.len != s.f.slot.pos or s.f.slot.pending != null) return error.BadWindow;
+        if (s.f.prefill_state.mode == .replay and s.f.slot.ced.hi != s.f.slot.pos) return error.BadWindow;
         try s.f.sendSess(.prompt, 0);
         if (s.history.items.len == 0) return null;
         const snap = try s.snapshot();
@@ -306,7 +308,7 @@ pub const Sessions = struct {
 
     /// The entries' tag (sessions.Tag's CED field): replay entries never resume full ones, nor full ones replay's.
     fn tag(s: *const Sessions) u32 {
-        return if (s.f.prefill_state.mode == .replay) ced.tag else 0;
+        return if (s.f.prefill_state.mode == .replay) ced.tag else ced.tag_fast;
     }
 
     /// The slot empty, its pages back (a session entry may hold them).

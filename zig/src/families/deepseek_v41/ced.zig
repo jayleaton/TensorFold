@@ -35,8 +35,11 @@ pub const ring: u32 = 128;
 pub const grid: u64 = 16;
 /// rounds.py `session_min`: a prompt snapshot needs this many tokens
 pub const session_min: u64 = 64;
-/// sessions.Tag.code()'s CED field (MODES.index("replay") << 4): replay entries never resume full ones
-pub const tag: u32 = 1 << 4;
+/// sessions.Tag.code()'s prefill field: Zig's prefill is Python's fast prefill path (prefill_mm), so its entries are
+/// the fast tag's (prompt snapshots only); the old exact-tag (0) turn entries never resume them
+pub const tag_fast: u32 = 1 << 8;
+/// with the CED field (MODES.index("replay") << 4): replay entries never resume full ones
+pub const tag: u32 = tag_fast | 1 << 4;
 
 pub const Error = error{ NoDecoder, EngramInDecoder, StashGap };
 
