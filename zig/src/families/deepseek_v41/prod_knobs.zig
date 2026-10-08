@@ -247,6 +247,8 @@ pub fn apply(f: *@import("forward.zig").Forward, a: std.mem.Allocator, io: std.I
     f.prefill_state.ahead = prefetchAhead(&env);
     f.opts.gm_v2 = try @import("gm2pf.zig").mode(&env);
     f.prefill_state.mode = try prefillMode(&env);
+    // TF_DSV41_BRANCHES: the side stream exists before any capture
+    if (f.branches == null) f.branches = try @import("branches.zig").install(f.gpa, f, rank);
     if (f.prefill_state.mode == .replay) {
         const ced = @import("ced.zig");
         const d = ced.decoderStart(f.cfg) catch |e| {

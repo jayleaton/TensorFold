@@ -443,6 +443,9 @@ pub const Functions = struct {
     glue: [10]cuda.Function, // glue.syms order
     /// glue.cu's DSpark candidates (TF_DSV41_DRAFT_GRAPHS); null in a fatbin built before it (the host's candidates)
     ds_cands: ?cuda.Function = null,
+    /// glue.cu's device pick (TF_DSV41_GREEDY_GPU); null in a fatbin built before it (the pairs merged on the host)
+    pick_pack: ?cuda.Function = null,
+    pick_merge: ?cuda.Function = null,
     pfglue: [pfglue.syms.len]cuda.Function, // pfglue.syms order
 
     /// `pf`: the four pfdense modules (K2 8, 10, 12, 16).
@@ -494,6 +497,8 @@ pub const Functions = struct {
         f.kv_pack = m_kv.function("_ZN13dsv41_kvsplit11pack_kernelENS_8PackArgsE") catch null;
         inline for (glue.syms, 0..) |name, i| f.glue[i] = try m_glue.function(name);
         f.ds_cands = m_glue.function(glue.ds_cands_sym) catch null;
+        f.pick_pack = m_glue.function(glue.pick_pack_sym) catch null;
+        f.pick_merge = m_glue.function(glue.pick_merge_sym) catch null;
         inline for (pfglue.syms, 0..) |name, i| f.pfglue[i] = try m_pfglue.function(name);
         return f;
     }
@@ -563,6 +568,11 @@ pub const glue = struct {
     pub const ds_cands_sym: [:0]const u8 = "_ZN10dsv41_glue15ds_cands_kernelEPKfxiiiPf";
     /// the most candidates a rank (the kernel's shared sort)
     pub const ds_cands_max = 128;
+    /// the device pick (optional, as ds_cands)
+    pub const pick_pack_sym: [:0]const u8 = "_ZN10dsv41_glue16pick_pack_kernelEPKfPKxixPd";
+    pub const pick_merge_sym: [:0]const u8 = "_ZN10dsv41_glue17pick_merge_kernelEPKdiiPKxxPx";
+    /// the most rows pick_merge takes (one block)
+    pub const pick_max_rows = 1024;
 
     fn grid(n: u64) usize {
         return @intCast(@max(1, @min((n + 255) / 256, 4096)));
@@ -1041,6 +1051,33 @@ pub const Ops = struct {
         for ([_]usize{ W, n, c }) |v| a.add(@as(c_int, @intCast(v)));
         a.add(out);
         try o.glueGo(.gather_cols, @as(u64, W) * n * c, &a);
+    }
+
+    /// glue.cu pick_pack: f64 (value, column + id0) pairs [n][2] from topk_keys' k-1 vals fp32 [n] / cols int64 [n].
+    pub fn pickPack(o: Ops, vals: u64, cols: u64, n: usize, id0: u64, pairs: u64) !void {
+        const f = o.f.pick_pack orelse return error.NoPickKernel;
+        var a: cuda.Args = .{};
+        a.add(vals);
+        a.add(cols);
+        a.add(@as(c_int, @intCast(n)));
+        a.add(@as(i64, @intCast(id0)));
+        a.add(pairs);
+        try o.go(f, .{ glue.grid(n), 1, 1 }, 256, 0, null, &a);
+    }
+
+    /// glue.cu pick_merge: out int64 [n + 3] = each row's pick over the ranks' pairs [W][n][2], then the chain's
+    /// accepted rows, the bonus and the next start (ids: the window's tokens int64 [n], 0: no chain).
+    pub fn pickMerge(o: Ops, all: u64, W: usize, n: usize, ids: u64, start: i64, out: u64) !void {
+        const f = o.f.pick_merge orelse return error.NoPickKernel;
+        if (n == 0 or n > glue.pick_max_rows) return error.Shape;
+        var a: cuda.Args = .{};
+        a.add(all);
+        a.add(@as(c_int, @intCast(W)));
+        a.add(@as(c_int, @intCast(n)));
+        a.add(ids);
+        a.add(start);
+        a.add(out);
+        try o.go(f, .{ 1, 1, 1 }, @intCast(@max(32, std.mem.alignForward(usize, n, 32))), 0, null, &a);
     }
 
     /// The compressor's carry: carry fp32 [cols] = bf16 row of src (row stride ld elements); the row is *accepted

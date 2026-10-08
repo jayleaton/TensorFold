@@ -33,6 +33,7 @@ test {
     _ = @import("greedy.zig");
     _ = @import("phases.zig");
     _ = @import("l2pf.zig");
+    _ = @import("engram_gate.zig");
     // dsq-zig-ops-1: prepared weight folders (TF_DSV41_PREPARED)
     _ = @import("prepared.zig");
 }

@@ -34,6 +34,12 @@ pub const Runner = struct {
     l2pf: ?*Side = null,
     /// rows of the window being issued (0: unknown): a window wider than `Side.rows` skips every prefetch site
     rows: u32 = 0,
+    /// TF_DSV41_BRANCHES (branches.zig): the side stream of the calls the emitter tagged `side`, forked / joined at
+    /// their marks (the ext launchers take no scratch: kernels_replay.call leaves it unused). null: every call on main
+    br: ?*Side = null,
+    /// TF_DSV41_MHC_DEFER (branches.zig): the stream of the mHC coefficient launches tagged `defer_side`, joined by the
+    /// next mHC call (`defer_join`, mhc.await_coefs)
+    dfr: ?*Side = null,
 
     /// l2pf.py's Prefetcher on the device: the side stream, the fork / join events, whether a fork is open.
     pub const Side = struct {
@@ -133,6 +139,36 @@ pub const Runner = struct {
     /// the side stream, forked here so they start after every launch before them (l2pf.py `mark`); without
     /// TF_DSV41_L2PF they are skipped.
     pub fn issue(r: *Runner, c: *const calls.Call) !void {
+        if (r.br) |b| {
+            if (c.join) try r.joinBranch();
+            if (c.fork) {
+                try b.fork.record(r.stream);
+                try b.stream.wait(b.fork);
+                b.open = true;
+                b.launches += 1;
+            }
+            if (c.side) {
+                if (!b.open) return error.BranchNotForked;
+                // the call and anything it runs (a glue step's launches) on the side stream
+                const main = r.stream;
+                r.stream = b.stream;
+                defer r.stream = main;
+                return r.issueOn(b.stream, c, r.scratch);
+            }
+        }
+        if (r.dfr) |d| {
+            if (c.defer_join) try r.joinDeferred();
+            if (c.defer_side) {
+                try d.fork.record(r.stream);
+                try d.stream.wait(d.fork);
+                d.open = true;
+                d.launches += 1;
+                const main = r.stream;
+                r.stream = d.stream;
+                defer r.stream = main;
+                return r.issueOn(d.stream, c, r.scratch);
+            }
+        }
         if (std.mem.startsWith(u8, c.name, "tf_dsv41_l2p")) {
             const p = r.l2pf orelse return;
             if (r.rows > p.rows) {
@@ -143,14 +179,34 @@ pub const Runner = struct {
             try p.stream.wait(p.fork);
             p.open = true;
             p.launches += 1;
-            return r.issueOn(p.stream, c);
+            return r.issueOn(p.stream, c, r.scratch);
         }
-        return r.issueOn(r.stream, c);
+        return r.issueOn(r.stream, c, r.scratch);
+    }
+
+    /// The main stream waits for the deferred coefficients' stream (mhc.await_coefs).
+    fn joinDeferred(r: *Runner) !void {
+        const d = r.dfr orelse return;
+        if (!d.open) return;
+        d.open = false;
+        try d.join.record(d.stream);
+        try r.stream.wait(d.join);
+    }
+
+    /// The main stream waits for the branches' side stream (its open fork, if any).
+    fn joinBranch(r: *Runner) !void {
+        const b = r.br orelse return;
+        if (!b.open) return;
+        b.open = false;
+        try b.join.record(b.stream);
+        try r.stream.wait(b.join);
     }
 
     /// The main stream waits for the side stream's prefetches (l2pf.py `join`): every window joins before it returns,
     /// so a captured graph holds no open fork.
     pub fn join(r: *Runner) !void {
+        try r.joinBranch();
+        try r.joinDeferred();
         const p = r.l2pf orelse return;
         if (!p.open) return;
         p.open = false;
@@ -158,7 +214,13 @@ pub const Runner = struct {
         try r.stream.wait(p.join);
     }
 
-    fn issueOn(r: *Runner, stream: cuda.Stream, c: *const calls.Call) !void {
+    fn dropForks(r: *Runner) void {
+        if (r.l2pf) |p| p.open = false;
+        if (r.br) |b| b.open = false;
+        if (r.dfr) |d| d.open = false;
+    }
+
+    fn issueOn(r: *Runner, stream: cuda.Stream, c: *const calls.Call, scratch_buf: ?cuda.DeviceBuffer) !void {
         if (c.glue) {
             const g = r.glue orelse return error.NoGlue;
             return g.run(g.ctx, r, c);
@@ -176,7 +238,7 @@ pub const Runner = struct {
         const dot = std.mem.lastIndexOfScalar(u8, c.name, '.') orelse return error.BadName;
         const args = try a.alloc(rp.Arg, c.args.len);
         for (c.args, args) |x, *y| y.* = try r.extArg(a, x.arg);
-        var scratch: rp.Scratch = .{ .ptr = r.scratch.?.ptr, .len = r.scratch.?.len };
+        var scratch: rp.Scratch = .{ .ptr = scratch_buf.?.ptr, .len = scratch_buf.?.len };
         if (!try rp.call(r.kernels, stream, c.name[0..dot], c.name[dot + 1 ..], args, &.{}, &scratch)) return error.NoBinding;
     }
 
@@ -184,9 +246,7 @@ pub const Runner = struct {
     /// failing call named with its index and row count (an asynchronous fault otherwise surfaces windows later).
     pub fn window(r: *Runner, cs: []const calls.Call) !void {
         if (syncEach()) return r.windowChecked(cs);
-        errdefer if (r.l2pf) |p| {
-            p.open = false; // a failed window (or capture) leaves no fork for the next one to join
-        };
+        errdefer r.dropForks(); // a failed window (or capture) leaves no fork for the next one to join
         for (cs) |*c| try r.issue(c);
         try r.join();
     }
@@ -210,9 +270,7 @@ pub const Runner = struct {
         const p = r.prof orelse return r.window(cs);
         if (syncEach()) return r.windowChecked(cs);
         p.begin();
-        errdefer if (r.l2pf) |x| {
-            x.open = false;
-        };
+        errdefer r.dropForks();
         for (cs) |*c| {
             try p.before(r.stream, c);
             try r.issue(c);

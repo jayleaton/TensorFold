@@ -23,6 +23,7 @@ const block = @import("block.zig");
 const run = @import("run.zig");
 const fwd = @import("forward.zig");
 const eh = @import("engram_host.zig");
+const egate = @import("engram_gate.zig");
 const graphs = @import("graphs.zig");
 const rowtab = @import("rowtab.zig");
 const rowmode = @import("rowmode.zig");
@@ -358,6 +359,7 @@ pub const Batch = struct {
     pub fn keepPath(b: *Batch, slot: u32, path: []const u32) !void {
         if (slot >= b.ss.n or path.len == 0) return error.NotAChain;
         for (path, 0..) |row, i| if (row != i) return error.NotAChain;
+        try b.f.engramCheck(); // a gated window whose rows failed: its picks are not committed
         return b.keep(slot, @intCast(path.len - 1));
     }
 
@@ -422,13 +424,27 @@ pub const Batch = struct {
     /// padding rows the last real row's (Python's in-graph mirror gather, the same bytes).
     fn stageEngram(b: *Batch, mix: []const rowtab.Seg, ids: []const u32, R: u32) !void {
         const f = b.f;
+        f.gated = false;
         const h = f.engram orelse return;
         if (b.stages.items.len == 0) return;
         // the table opens on the forward's first Engram window (a prompt always comes first); never index rows instead
         if (std.c.getenv("TF_DSV41_ENGRAM_DIR") != null and f.engram_rows == null) return error.EngramNotOpen;
-        const src: ?eh.Source = if (f.engram_rows) |x| x.source() else null;
+        const src: ?eh.Source = try f.engramSource(h); // the gate's locked table while it lives
         const n = rowtab.totalRows(mix);
         const dim: usize = f.cfg.engram_head_dim;
+        // TF_DSV41_ENGRAM_GATE: the round to the gate's worker (the bucket's padding its last row, as below); the
+        // window's engram_rows steps launch the gate kernel
+        {
+            var items: [64]egate.Item = undefined;
+            var a: usize = 0;
+            for (mix, 0..) |m, i| {
+                const st = &b.ss.states[m.slot];
+                items[i] = .{ .ids = ids[a .. a + m.rows], .tail = st.tail[0..st.tail_len] };
+                a += m.rows;
+            }
+            f.gated = mix.len <= items.len and try f.armEngram(items[0..mix.len], R);
+            if (f.gated) return;
+        }
         // every slot's rows on every Engram layer in flight first (Python's round job: one batched read), so the
         // per-slot, per-layer waits below cost one read latency, not one a slot and layer
         if (src != null) {
@@ -479,6 +495,7 @@ pub const Batch = struct {
         if (std.mem.eql(u8, step, "engram_rows")) {
             const L: u32 = @intCast(c.args[1].arg.i);
             for (b.stages.items) |*st| if (st.layer == L) {
+                if (f.gated) try f.gateCopy(r, L, st.dev.ptr, R);
                 try f.comm.allGather(st.dev.ptr, f.gathered.?.ptr, R * st.cols, .bf16, s);
                 return k.gatherCols(f.gathered.?.ptr, W, R, st.cols, try r.tensorAddr(c.args[0].arg.t));
             };

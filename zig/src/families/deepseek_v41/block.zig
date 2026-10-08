@@ -49,6 +49,12 @@ pub const Options = struct {
     /// rows the routed experts' scratch holds: the backbone's and a DSpark block's
     expert_rows: i64 = 1024,
     dspark_rows: i64 = 64,
+    /// TF_DSV41_BRANCHES (branches.zig): the attention sublayer's indexer / compressor chains (and a non-index layer's
+    /// SWA store) tagged for the side stream at branches.plan's fork / join points, windows of up to `branch_rows`
+    branches: bool = false,
+    branch_rows: i64 = 64,
+    /// TF_DSV41_MHC_DEFER (with R1): R1's coefficient launch tagged for the deferred stream, the next mHC call joins it
+    mhc_defer: bool = false,
     /// TF_DSV41_L2PF_MB (bytes), _CHUNK_KB, _PACE_GBPS, _PACE_CTAS; the GPU's SMs (a segments launch's grid bound)
     l2pf_budget: u64 = 12 << 20,
     l2pf_chunk: i64 = 32768,
@@ -137,6 +143,14 @@ pub const Emitter = struct {
     begin: calls.Begin = .window,
     /// the current layer's compression ratio (picks its rope table)
     layer_ratio: u32 = 0,
+    /// TF_DSV41_BRANCHES: the stream the next calls go to, and the marks the next call carries
+    br_side: bool = false,
+    br_fork: bool = false,
+    br_join: bool = false,
+    /// TF_DSV41_MHC_DEFER: the next call is the coefficient launch / joins it; a coefficient launch not joined yet
+    df_side: bool = false,
+    df_join: bool = false,
+    df_pending: bool = false,
 
     pub fn fmt(e: *Emitter, comptime f: []const u8, args: anytype) ![]const u8 {
         return std.fmt.allocPrint(e.a, f, args);
@@ -175,6 +189,15 @@ pub const Emitter = struct {
         var x = c;
         x.begin = e.begin;
         e.begin = .none;
+        x.side = e.br_side;
+        x.fork = e.br_fork;
+        x.join = e.br_join;
+        e.br_fork = false;
+        e.br_join = false;
+        x.defer_side = e.df_side;
+        x.defer_join = e.df_join;
+        e.df_side = false;
+        e.df_join = false;
         try e.out.append(e.a, x);
     }
 
@@ -641,6 +664,26 @@ pub const Emitter = struct {
         try e.kvStore(kvn, L, 0);
     }
 
+    /// branches.plan's marks: `fork` (the next calls on the side stream, after everything main issued), `onMain`,
+    /// `join` (the next call on main after everything the side issued); nothing unless TF_DSV41_BRANCHES branches this
+    /// window
+    fn branching(e: *const Emitter) bool {
+        return e.o.branches and e.n <= e.o.branch_rows;
+    }
+    fn fork(e: *Emitter) void {
+        if (!e.branching()) return;
+        e.br_fork = true;
+        e.br_side = true;
+    }
+    fn onMain(e: *Emitter) void {
+        e.br_side = false;
+    }
+    fn join(e: *Emitter) void {
+        if (!e.branching()) return;
+        e.br_join = true;
+        e.br_side = false;
+    }
+
     pub fn attention(e: *Emitter, L: u32) !void {
         const n = e.n;
         const D: i64 = e.cfg.hidden;
@@ -656,6 +699,10 @@ pub const Emitter = struct {
         const own_kv = md == .full;
         // the indexer's head weights (a bf16 GEMV over the normed input)
         const iw = try e.buf("L.ix_w", .{}, .bf16, &.{ n, IH });
+        // branches.plan (index layer): fork, side ix_wp, main xproj (+ rms2), fork, side [compress] ix_wq_b rope_qi select,
+        // main wq_b l2pf_o rope_q kv_swa, join, attn; other layers: xproj, rms2, fork, side kv_swa, main wq_b l2pf_o
+        // rope_q, join, attn
+        if (indexer) e.fork();
         if (indexer) try e.triton("_plain", .{ n, IH, 1 }, &.{
             .{ .name = "X", .arg = x },                                                      .{ .name = "x_rs", .arg = .{ .i = D } },
             .{ .name = "W", .arg = try e.weight("L{d}.attn.ix_wp", .{L}, .f32, &.{ IH, D }) }, .{ .name = "w_rs", .arg = .{ .i = D } },
@@ -663,6 +710,7 @@ pub const Emitter = struct {
             .{ .name = "N", .arg = .{ .i = IH } },                                           .{ .name = "BK", .arg = .{ .i = 256 } },
             .{ .name = "PDL", .arg = .{ .b = false } },                                      .{ .name = "BF16", .arg = .{ .b = true } },
         });
+        e.onMain();
         // x group: wq_a, wkv (+ the compressor's on a KV source)
         const xg = try e.xGroup(L);
         const qa = try e.buf("L.qa", .{}, .bf16, &.{ n, e.cfg.q_lora });
@@ -692,7 +740,12 @@ pub const Emitter = struct {
             .{ .name = "eps", .arg = .{ .f = dec(e.cfg.eps) } },                              .{ .name = "BK", .arg = .{ .i = 512 } },
             .{ .name = "NARROW", .arg = .{ .b = true } },                                     .{ .name = "PDL", .arg = .{ .b = false } },
         });
-        if (!indexer) try e.swaStore(L, kv, kvn);
+        if (!indexer) {
+            e.fork();
+            try e.swaStore(L, kv, kvn); // R1 (RMS_FOLD): its kv_norm with it, on the side
+            e.onMain();
+        }
+        if (indexer) e.fork();
         if (own_kv) {
             // the compressor: pooled rows, normed, into the pool; the indexer's keys from the same rows
             const lat = try e.buf("L.lat", .{}, .bf16, &.{ n, hd });
@@ -723,12 +776,14 @@ pub const Emitter = struct {
             });
         }
         if (indexer) try e.index(L, if (e.o.r1) qa else qn, iw, qnorm);
+        e.onMain();
         // q group: wq_b
         const q = try e.buf("L.q", .{}, .bf16, &.{ n, H * hd });
         try e.fusedNorm("q", &.{.{ .w = try e.fmt("L{d}.attn.wq_b", .{L}), .x = if (e.o.r1) qa else qn, .y = q, .k = e.cfg.q_lora, .n = @intCast(H * hd) }}, qnorm);
         try e.prefetchO(L);
         if (!e.o.r1) try e.rope(q, H, hd, hd - 64); // R1 (ATTN_ROPE): the attention kernel rotates q as it loads it
         if (indexer) try e.swaStore(L, kv, kvn);
+        e.join(); // the attention core reads both streams' values
         // attention over the SWA ring and (a compressed layer) the source's pool at the source's selection
         const o = try e.buf("L.o", .{}, .bf16, &.{ n, H, hd });
         const swa = try e.pool(L, 0);

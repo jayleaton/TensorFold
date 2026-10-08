@@ -19,6 +19,8 @@ const graphs = @import("graphs.zig");
 const pf = @import("forward_prefill.zig");
 const kvs = @import("kv_state.zig");
 const er = @import("engram_rows.zig");
+const egate = @import("engram_gate.zig");
+const kops = @import("dsv41_kernels").ops;
 const greedy_host = @import("greedy.zig");
 const ph = @import("phases.zig");
 const hs = @import("host_stage.zig");
@@ -89,11 +91,23 @@ pub const Forward = struct {
     engram_opened: bool = false,
     /// R3's read-ahead at the DSpark pass (TF_DSV41_ENGRAM_PREFETCH=0: rows read when the window needs them; same bits)
     engram_prefetch: bool = true,
+    /// TF_DSV41_ENGRAM_GATE (engram_gate.zig): opened with the table; `gated`: the window being issued armed it, so its
+    /// engram_rows steps launch the gate kernel instead of copying staged rows
+    gate: ?*egate.Gate = null,
+    gated: bool = false,
+    /// TF_DSV41_BRANCHES / TF_DSV41_MHC_DEFER (branches.zig): the runner's side streams, owned here
+    branches: ?*@import("branches.zig").Branches = null,
     /// TF_DSV41_PHASES (phases.zig): the window path's timers
     phases: ?*ph.Phases = null,
     /// greedy's pinned logits / pairs staging and device pairs, kept across windows
     pick_host: ?cuda.HostBuffer = null,
     pick_dev: ?cuda.DeviceBuffer = null,
+    /// TF_DSV41_GREEDY_GPU=1 (Python's cand_gather): each rank's best column on the GPU (topk_keys, k 1), only the
+    /// (value, column) pairs copied back; null: not read yet
+    greedy_gpu: ?bool = null,
+    greedy_dev: ?cuda.DeviceBuffer = null,
+    /// the last GPU pick on the device (`pickDevice`), null when it was merged on the host
+    pick_last: ?PickDevice = null,
     /// the prefill's state (forward_prefill.zig)
     prefill_state: pf.State = .{},
     /// rows of "w.logits" the last prefill left (its last segment's, or its tail's): greedy takes out[0..last_rows]
@@ -127,9 +141,17 @@ pub const Forward = struct {
         if (f.gathered) |*b| b.free();
         for (&f.rows_stage) |*x| x.deinit();
         f.prefill_state.deinit(f.gpa);
+        if (f.gate) |x| x.close();
         if (f.engram_rows) |x| x.close();
+        if (f.branches) |b| {
+            f.runner.br = null;
+            f.runner.dfr = null;
+            b.deinit();
+            f.gpa.destroy(b);
+        }
         if (f.pick_host) |*b| b.free();
         if (f.pick_dev) |*b| b.free();
+        if (f.greedy_dev) |*b| b.free();
         f.programs.deinit(f.gpa);
         f.ids_own.deinit(f.gpa);
         f.arena.deinit();
@@ -174,6 +196,7 @@ pub const Forward = struct {
     pub fn prefill(f: *Forward, ids: []const u32) !void {
         if (f.slot.pending != null) return error.BadWindow;
         if (ids.len == 0) return;
+        f.gated = false; // prompt segments read their rows on the old path
         if (f.leads()) {
             // [op, total, offset, ids...] frames (planlink takes up to 64M words a frame; a prompt is a few)
             const frame: usize = 1 << 20;
@@ -218,7 +241,9 @@ pub const Forward = struct {
         defer tf.stop();
         f.runner.rows = @intCast(ids.len); // l2pf: wider windows skip the prefetch sites
         if (try f.graphedWindow(ids)) return;
-        f.issueEngram(ids, f.slot.tail[0..f.slot.tail_len]); // read while the window's calls are emitted and issued
+        // the gate (its worker reads every layer at once) or every layer's reads in flight while the calls are emitted
+        f.gated = try f.armEngram(&.{.{ .ids = ids, .tail = f.slot.tail[0..f.slot.tail_len] }}, @intCast(ids.len));
+        if (!f.gated) f.issueEngram(ids, f.slot.tail[0..f.slot.tail_len]);
         // the window's calls at its position (the indexer's scores and top-k grow with the cache: NK = end / ratio)
         var wa = std.heap.ArenaAllocator.init(f.gpa);
         defer wa.deinit();
@@ -256,13 +281,54 @@ pub const Forward = struct {
         const dev = f.pick_dev.?;
         const logits = r.addressOf("w.logits") orelse return error.Unbound;
         if (f.grammar) |g| try g.apply(g.ptr, 0, @intCast(n));
-        try r.d.check(r.d.api.cuMemcpyDtoHAsync_v2(host.ptr, logits, 4 * n * V, r.stream.handle), "cuMemcpyDtoHAsync");
-        try r.stream.synchronize();
-        for (0..n) |row| {
-            const vals = host[row * V ..][0..V];
-            const best = greedy_host.argmax(vals);
-            pairs[2 * row] = vals[best];
-            pairs[2 * row + 1] = @floatFromInt(best + f.comm.rank() * V);
+        if (f.greedy_gpu == null) f.greedy_gpu = if (std.c.getenv("TF_DSV41_GREEDY_GPU")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+        if (f.greedy_gpu.? and V <= 1 << 16) {
+            // Python's served pick (decode.cand_gather, count 1): topk_keys' best column a row (value descending, then the
+            // lower column), [n] fp32 values and [n] int64 columns back instead of the [n, V] logits
+            const vals_dev = try f.greedyScratch(r, n);
+            const cols_dev = vals_dev + std.mem.alignForward(u64, 4 * n, 16);
+            const k = r.kernels.others(r.stream);
+            try k.topKeys(logits, V, n, V, 1, vals_dev, cols_dev);
+            f.pick_last = null;
+            if (k.f.pick_pack != null and k.f.pick_merge != null and n <= kops.glue.pick_max_rows) {
+                // the pairs, their exchange and the merge on the device; one copy back (glue.cu pick_*)
+                const ids_dev = cols_dev + 8 * n;
+                const out_dev = ids_dev + 8 * n;
+                try k.pickPack(vals_dev, cols_dev, n, f.comm.rank() * V, dev.ptr);
+                try f.comm.allGather(dev.ptr, dev.ptr + 16 * n, 2 * n, .f64, r.stream.handle);
+                const chain = if (f.slot.pending) |p| p.n == n and f.ids.len >= n else false;
+                const start: i64 = if (f.slot.pending) |p| @intCast(p.start) else 0;
+                const ih: []i64 = @alignCast(std.mem.bytesAsSlice(i64, hb[0 .. 8 * n]));
+                if (chain) {
+                    for (ih, f.ids[0..n]) |*x, t| x.* = t;
+                    try r.d.check(r.d.api.cuMemcpyHtoDAsync_v2(ids_dev, ih.ptr, 8 * n, r.stream.handle), "cuMemcpyHtoDAsync");
+                }
+                try k.pickMerge(dev.ptr + 16 * n, W, n, if (chain) ids_dev else 0, start, out_dev);
+                const oh: []i64 = @alignCast(std.mem.bytesAsSlice(i64, hb[std.mem.alignForward(usize, 8 * n, 16)..][0 .. 8 * (n + 3)]));
+                try r.d.check(r.d.api.cuMemcpyDtoHAsync_v2(oh.ptr, out_dev, 8 * (n + 3), r.stream.handle), "cuMemcpyDtoHAsync");
+                try r.stream.synchronize();
+                for (out, oh[0..n]) |*o, x| o.* = @intCast(x);
+                f.pick_last = .{ .out = out_dev, .n = @intCast(n), .chain = chain };
+                return;
+            }
+            const vh: []f32 = @alignCast(std.mem.bytesAsSlice(f32, hb[0 .. 4 * n]));
+            const ch: []i64 = @alignCast(std.mem.bytesAsSlice(i64, hb[std.mem.alignForward(usize, 4 * n, 16)..][0 .. 8 * n]));
+            try r.d.check(r.d.api.cuMemcpyDtoHAsync_v2(vh.ptr, vals_dev, 4 * n, r.stream.handle), "cuMemcpyDtoHAsync");
+            try r.d.check(r.d.api.cuMemcpyDtoHAsync_v2(ch.ptr, cols_dev, 8 * n, r.stream.handle), "cuMemcpyDtoHAsync");
+            try r.stream.synchronize();
+            for (0..n) |row| {
+                pairs[2 * row] = vh[row];
+                pairs[2 * row + 1] = @floatFromInt(@as(usize, @intCast(ch[row])) + f.comm.rank() * V);
+            }
+        } else {
+            try r.d.check(r.d.api.cuMemcpyDtoHAsync_v2(host.ptr, logits, 4 * n * V, r.stream.handle), "cuMemcpyDtoHAsync");
+            try r.stream.synchronize();
+            for (0..n) |row| {
+                const vals = host[row * V ..][0..V];
+                const best = greedy_host.argmax(vals);
+                pairs[2 * row] = vals[best];
+                pairs[2 * row + 1] = @floatFromInt(best + f.comm.rank() * V);
+            }
         }
         try dev.uploadAsync(0, std.mem.sliceAsBytes(pairs[0 .. 2 * n]), r.stream.handle);
         try f.comm.allGather(dev.ptr, dev.ptr + 16 * n, 2 * n, .f64, r.stream.handle);
@@ -278,10 +344,32 @@ pub const Forward = struct {
         }
     }
 
+    /// The GPU pick's device scratch: [n] fp32 values, [n] int64 columns, [n] int64 window ids, [n + 3] int64 out.
+    fn greedyScratch(f: *Forward, r: *run.Runner, n: usize) !u64 {
+        const bytes = std.mem.alignForward(usize, 4 * n, 16) + 8 * n + 8 * n + 8 * (n + 3);
+        if (f.greedy_dev == null or f.greedy_dev.?.len < bytes) {
+            if (f.greedy_dev) |*b| b.free();
+            f.greedy_dev = null;
+            f.greedy_dev = try cuda.DeviceBuffer.alloc(r.d, @max(bytes, 4096));
+        }
+        return f.greedy_dev.?.ptr;
+    }
+
+    /// The last window's pick on the device (TF_DSV41_GREEDY_GPU with glue.cu's pick kernels), for work that starts
+    /// on the GPU before the host has the tokens (the DSpark pass's device start): `out` int64 [n + 3] = each row's
+    /// pick, then (a chain window, `chain`) the accepted drafts, the bonus token (= out[accepted]) and the next
+    /// position (window start + accepted + 1), valid in stream order after `greedy` returns until the next pick.
+    pub const PickDevice = struct { out: u64, n: u32, chain: bool };
+
+    pub fn pickDevice(f: *const Forward) ?PickDevice {
+        return f.pick_last;
+    }
+
     /// Commits the pending window's first row + `accepted` drafts (Python's Forward.keep).
     pub fn keep(f: *Forward, accepted: u32) !void {
         const p = f.slot.pending orelse return error.BadWindow;
         if (accepted >= p.n) return error.BadWindow;
+        try f.engramCheck(); // a gated window whose rows failed: its picks are not committed
         if (f.leads()) try f.link.?.send(&.{ op_keep, accepted });
         // the ratio-2 KV sources' carry: fp32 of the accepted row of the window's compressor projection
         const r = f.runner;
@@ -673,6 +761,17 @@ pub const Forward = struct {
         const W = f.comm.world();
         const cols = f.engramCols(h); // this rank's columns of a row
         const bytes = 2 * n * cols;
+        if (f.gated) {
+            // the gate: the GPU waits for the worker's rows and copies them where the staged copy would land
+            const send = try f.sendBuffer(r, bytes);
+            try f.gateCopy(r, L, send, n);
+            if (f.gathered == null or f.gathered.?.len < W * bytes) {
+                if (f.gathered) |*g| g.free();
+                f.gathered = try cuda.DeviceBuffer.alloc(r.d, W * bytes);
+            }
+            try f.comm.allGather(send, f.gathered.?.ptr, n * cols, .bf16, r.stream.handle);
+            return r.kernels.others(r.stream).gatherCols(f.gathered.?.ptr, W, n, cols, try r.tensorAddr(c.args[0].arg.t));
+        }
         // an earlier copy out of this layer's staging must have left it before it is rewritten: a prompt segment waits
         // for that copy alone (decode.LazyEngram: to_device past CHUNK rows, no stream sync), a smaller window for the
         // stream (Python's pageable copy)
@@ -716,8 +815,51 @@ pub const Forward = struct {
                 f.engram_rows = try er.Rows.open(f.gpa, std.mem.span(dir), f.comm.rank(), f.comm.world(), h.layer_ids, cap);
                 std.log.scoped(.dsv41).info("engram: rows from {s} (io_uring {s}, {d} records a layer cached)", .{ std.mem.span(dir), if (f.engram_rows.?.ring != null) "on" else "off", cap });
             } else std.log.scoped(.dsv41).warn("engram: TF_DSV41_ENGRAM_DIR unset: synthetic index rows (M2a's), not the model's table", .{});
+            const s = try egate.settings();
+            if (s.on) {
+                if (f.engram_rows) |x| {
+                    var la = std.heap.ArenaAllocator.init(f.gpa);
+                    defer la.deinit();
+                    var layers: std.ArrayList(u32) = .empty;
+                    for (try f.backbone(la.allocator())) |L| if (std.mem.indexOfScalar(u32, h.layer_ids, L) != null) try layers.append(la.allocator(), L);
+                    const g = try egate.Gate.open(std.heap.c_allocator, f.runner.d, h, x.source(), layers.items, f.comm.rank(), f.comm.world(), f.cfg.engram_head_dim, s);
+                    g.sync = .{ .ctx = f.runner, .run = syncRunner };
+                    f.gate = g;
+                } else std.log.scoped(.dsv41).warn("engram gate off: no packed table (TF_DSV41_ENGRAM_DIR)", .{});
+            }
         }
+        if (f.gate) |g| return g.source();
         return if (f.engram_rows) |x| x.source() else null;
+    }
+
+    /// TF_DSV41_ENGRAM_GATE: arms the gate for a window over `items` (`fill`: its rows with a bucket's padding); false
+    /// when the gate is off or the window is too wide (the old path stages its rows).
+    pub fn armEngram(f: *Forward, items: []const egate.Item, fill: u32) !bool {
+        const h = f.engram orelse return false;
+        _ = try f.engramSource(h); // the table and the gate open on the first Engram window
+        const g = f.gate orelse return false;
+        if (!g.eligible(fill)) return false;
+        const ts = ph.start(f.phases, .@"engram.wait");
+        defer ts.stop();
+        try g.arm(items, fill);
+        return true;
+    }
+
+    fn syncRunner(ctx: *anyopaque) anyerror!void {
+        const r: *run.Runner = @ptrCast(@alignCast(ctx));
+        try r.stream.synchronize();
+    }
+
+    /// The armed round's errors (a failed read, a GPU wait past the timeout); nothing when no window was gated.
+    pub fn engramCheck(f: *Forward) !void {
+        if (f.gate) |g| if (f.gated) try g.check();
+    }
+
+    /// The gate kernel of Engram layer L: `n` rows of the armed round's staging into `dst` once the worker published them.
+    pub fn gateCopy(f: *Forward, r: *run.Runner, L: u32, dst: u64, n: usize) !void {
+        const g = f.gate.?;
+        const k = g.slotOf(L) orelse return error.NotEngram;
+        return r.kernels.others(r.stream).engramGate(g.mem.ctl_dev, @intCast(egate.ctl_ready + k), egate.ctl_err, g.layerBase(k), g.parityStride(), dst, @intCast(2 * n * g.cols), g.timeout_ns, true);
     }
 
     /// Every Engram layer's reads of a window's rows `ids` (after `tail`) in flight at once, before the first layer
@@ -742,6 +884,8 @@ pub const Forward = struct {
         var buf: [2 * eh.max_ngram + 128]u32 = undefined;
         const pend: ?[]const u32 = if (f.slot.pending) |p| f.ids[0..p.n] else null;
         const lb = eh.lookbackAt(f.slot.tail[0..f.slot.tail_len], f.slot.pos, pend, start, h.max_ngram - 1, &buf) orelse return;
+        // the gate's worker owns the table between windows: a warm job (Python's `warm`), not a read on this thread
+        if (f.gate) |g| return g.warm(&.{.{ .ids = ids, .tail = lb }});
         h.prefetch(f.gpa, src, ids, lb, f.comm.rank(), f.comm.world());
     }
 
@@ -750,6 +894,7 @@ pub const Forward = struct {
         const L: u32 = @intCast(c.args[1].arg.i);
         const st = g.stageOf(L) orelse return error.NotEngram;
         const n = f.ids.len;
+        if (f.gated) try f.gateCopy(r, L, st.dev.ptr, n);
         try f.comm.allGather(st.dev.ptr, f.gathered.?.ptr, n * st.cols, .bf16, r.stream.handle);
         return r.kernels.others(r.stream).gatherCols(f.gathered.?.ptr, f.comm.world(), n, st.cols, try r.tensorAddr(c.args[0].arg.t));
     }
@@ -795,9 +940,10 @@ pub const Forward = struct {
         {
             const ts = ph.start(f.phases, .@"graph.stage");
             defer ts.stop();
-            f.issueEngram(ids, f.slot.tail[0..f.slot.tail_len]);
+            f.gated = try f.armEngram(&.{.{ .ids = ids, .tail = f.slot.tail[0..f.slot.tail_len] }}, n);
+            if (!f.gated) f.issueEngram(ids, f.slot.tail[0..f.slot.tail_len]);
             try g.statics.stage(r.stream, ids, f.slot.pos);
-            if (f.engram) |h| for (g.stages.items) |*st| {
+            if (f.engram) |h| if (!f.gated) for (g.stages.items) |*st| {
                 try f.fillEngramRows(h, st.layer, try st.begin(n));
                 try st.commit(r.stream, n);
             };

@@ -48,6 +48,16 @@ pub const Call = struct {
     name: []const u8,
     grid: [3]i64 = .{ 1, 1, 1 },
     args: []const Named,
+    /// TF_DSV41_BRANCHES (branches.zig): issued on the side stream; `fork`: the side stream first waits for every launch
+    /// issued on the main stream so far; `join`: the main stream first waits for the side stream (the launch itself is
+    /// the same either way: the captures and `check` compare launches, not streams)
+    side: bool = false,
+    fork: bool = false,
+    join: bool = false,
+    /// TF_DSV41_MHC_DEFER: an mHC coefficient launch on the deferred stream (forked from main first); `defer_join`:
+    /// the main stream waits for it first (the next mHC call, the coefficients' reader)
+    defer_side: bool = false,
+    defer_join: bool = false,
 };
 
 /// The calls a capture records (the glue steps left out), in order; a dropped step's scope start moves to the next.

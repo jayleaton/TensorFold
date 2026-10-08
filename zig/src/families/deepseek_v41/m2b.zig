@@ -170,6 +170,13 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, ref: []con
         const bytes = (try forms.build(ra.allocator(), &src, role)) orelse continue;
         try cuda.DeviceBuffer.upload(.{ .d = &driver, .ptr = runner.addressOf(role).?, .len = bytes.len }, 0, bytes);
     }
+    // TF_DSV41_L2PF as the served model installs it (l2pf.zig), so the gate covers the prefetch side stream too
+    const l2 = try @import("l2pf.zig").install(gpa, &f, &w);
+    defer if (l2) |p| {
+        runner.l2pf = null;
+        p.deinit();
+        gpa.destroy(p);
+    };
     const rope = try cwd.readFileAlloc(io, try std.fs.path.join(a, &.{ ref, "rope.bin" }), a, .limited(1 << 28));
     const half = (rope.len - 16) / 2;
     for ([_][]const u8{ "s.rope.main", "s.rope.comp" }, 0..) |role, i| if (runner.addressOf(role)) |p|

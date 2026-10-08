@@ -15,6 +15,7 @@ const rowmode = @import("rowmode.zig");
 const Config = @import("config.zig").Config;
 
 test {
+    _ = @import("branches_test.zig"); // TF_DSV41_BRANCHES / MHC_DEFER on the same emitter
     _ = rowtab;
     _ = rowmode;
     _ = @import("aot_needs.zig");

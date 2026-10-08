@@ -64,6 +64,7 @@ pub fn mhcInto(e: *E, layer: ?u32, which: []const u8, mode: Mode, in_place: bool
         .final => x,
         .boundary => if (in_place) x else try e.spare(),
     };
+    awaitCoefs(e);
     try e.ext("tf_dsv41_mhc_cuda_v1.run", &.{
         x,                                                               xout,
         // the exchange that ran last: the attention's partials at the FFN site, the MoE's at the next attention / final
@@ -88,6 +89,10 @@ pub fn mhcInto(e: *E, layer: ?u32, which: []const u8, mode: Mode, in_place: bool
         more[last.args.len] = .{ .arg = .{ .i = e.o.mhc_spin } };
         more[last.args.len + 1] = .{ .arg = .{ .i = @intFromBool(mix) } };
         last.args = more;
+        if (mix and e.o.mhc_defer) {
+            e.df_side = true; // MHC_DEFER: on the deferred stream, the next mHC call joins it
+            e.df_pending = true;
+        }
         if (mix) try e.ext("tf_dsv41_mhc_cuda_v1.coef", &.{
             try e.buf("L.mhc.part", .{}, .f32, &.{ n, 4, 40, 32 }), hc[1],
             hc[2],                                                   next[0],
@@ -101,6 +106,13 @@ pub fn mhcInto(e: *E, layer: ?u32, which: []const u8, mode: Mode, in_place: bool
     if (mode == .boundary and !in_place) e.cur = 1 - e.cur;
 }
 
+/// mhc.await_coefs: an mHC call reads the coefficients a deferred launch wrote: the main stream joins it first.
+fn awaitCoefs(e: *E) void {
+    if (!e.df_pending) return;
+    e.df_pending = false;
+    e.df_join = true;
+}
+
 /// mhc.post_only (Triton `_site`, POST_ON, no collapse or mix): the last exchange's post applied to the streams in
 /// place, before an Engram block that is not the window's first (Python's forward: post, Engram, then a site2).
 pub fn postOnly(e: *E, out: ?calls.Arg) !void {
@@ -109,6 +121,7 @@ pub fn postOnly(e: *E, out: ?calls.Arg) !void {
     const x = try e.streams();
     const xout = out orelse x;
     const prev = try coefs(e, e.coef);
+    awaitCoefs(e);
     try e.triton("_site", .{ std.math.divCeil(i64, n, 16) catch unreachable, 40, 1 }, &.{
         .{ .name = "X", .arg = x },                     .{ .name = "x_stride", .arg = .{ .i = 4 * D } },
         .{ .name = "XOUT", .arg = xout },               .{ .name = "G", .arg = try e.buf("w.recv.moe", .{}, .bf16, &.{ e.o.world, n, D }) },

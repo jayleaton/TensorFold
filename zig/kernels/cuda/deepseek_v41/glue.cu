@@ -16,6 +16,10 @@
 //   carry        carry[j] = f32(src[row][j]), row = *accepted (device) or the host's   (the ratio-2 compressor carry)
 //   ds_cands     DSpark's candidates (dspark.candidates / draft/dspark.zig): each row's best k fp32 logits by (value
 //                desc, column asc), -0.0 == +0.0, as [vals k | ids k as int bits] (an exact selection: integers only)
+//   pick_pack    pairs[r] = (f64 vals[r], f64 (cols[r] + id0))     (forward.greedy's pair: a rank's best, topk_keys k 1)
+//   pick_merge   out[r] = the id of the best pair over the ranks [W][n][2] (higher value; on a tie or NaN the lower
+//                rank: forward.greedy's merge, strict >); out[n] = accepted (rows 0.. whose pick is the next row's id:
+//                a chain window's kept drafts), out[n + 1] = bonus = out[accepted], out[n + 2] = start + accepted + 1
 
 #include <cstdint>
 #include <cuda_bf16.h>
@@ -202,6 +206,37 @@ __global__ void __launch_bounds__(DS_NT) ds_cands_kernel(const float* __restrict
             o[i] = -__int_as_float(0x7F800000);
             o[k + i] = __int_as_float(-1);
         }
+    }
+}
+
+// one thread a row
+__global__ void __launch_bounds__(256) pick_pack_kernel(const float* __restrict__ vals, const long long* __restrict__ cols,
+                                                        int n, long long id0, double* __restrict__ pairs) {
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n) return;
+    pairs[2 * r] = static_cast<double>(vals[r]);
+    pairs[2 * r + 1] = static_cast<double>(cols[r] + id0);
+}
+
+// one block: a thread a row picks, then thread 0 walks the chain (n <= 1024)
+__global__ void __launch_bounds__(1024) pick_merge_kernel(const double* __restrict__ all, int W, int n,
+                                                          const long long* __restrict__ ids, long long start,
+                                                          long long* __restrict__ out) {
+    const int r = threadIdx.x;
+    if (r < n) {
+        int bk = 0;
+        for (int k = 1; k < W; k++)
+            if (all[2 * (k * n + r)] > all[2 * (bk * n + r)]) bk = k;
+        out[r] = static_cast<long long>(all[2 * (bk * n + r) + 1]);
+    }
+    __syncthreads();
+    if (r == 0) {
+        int acc = 0;
+        if (ids != nullptr)
+            while (acc + 1 < n && ids[acc + 1] == out[acc]) acc++;
+        out[n] = acc;
+        out[n + 1] = out[acc];
+        out[n + 2] = start + acc + 1;
     }
 }
 
