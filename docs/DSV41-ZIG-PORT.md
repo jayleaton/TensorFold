@@ -2155,13 +2155,14 @@ it, `SESSIONS=1` + `SLOTS>1` boots with sessions off and a warning naming the kn
 | One store over every slot; LRU RAM tier trimmed past `ram_bytes` of `Bounded.nbytes` (sessions.py:187-230), park when `disk.accepts(pos)` (`>= DISK_MIN`), else drop; parks and NVMe reads synchronous inside the round | one `Store` over the pool's slots; `Snap.nbytes` is prod's measure (`kv/sess.zig` `Measure`: SWA rows below the decoder in replay mode, the float32 carries, the lookback, the stash's rows, the drafter's rows; slots.py:249-272, replay.py:98, drafter.py:296-317), so the 256 MiB tier trims at prod's saves; parks / restores synchronous (the store's sync policy) |
 | No covered-entry or delta rule; RAM default 256 MiB (stack.py:74, 87) | `TF_DSV41_SESSION_SKIP_COVERED` and `TF_DSV41_SESSION_DELTA` now default off (were on), `TF_DSV41_SESSION_RAM_MIB` default 256 (was 512); one slot gets the same policy |
 | Each slot's history: prefilled pieces and committed windows (rounds.py `_commit`) | `Sessions.hist[slot]`: prefill segments (`commit`) and row windows' keeps (`Batch.keep` -> `commitAt`) |
-| The drafter's rows ride in the snapshot; a restore sets `valid = pos - n` (drafter.py:306-317) | Zig keeps no DSpark rows in a snapshot. In replay mode the decoder replay's taps `[R0, n-1)` refill every row the drafter reads after a resume, as after a fresh prompt (`ced.handoff`), so the context is equal. In full mode a resume with fewer than 128 rows left restarts the context (acceptance only, not bits). The measure counts prod's rows (`ds_valid` a slot) |
+| The drafter's rows ride in the snapshot; a restore sets `valid = pos - n` (drafter.py:306-317) | Replay mode: the decoder replay's taps `[R0, n-1)` refill every row the drafter reads after a resume, as after a fresh prompt (`ced.handoff`), so the context is equal. Full mode: the drafter's rings ride in the entry and a restore sets the pass's `valid` (since `dsq-zig-sched-1`, section "Prod's round planner"). The measure counts prod's rows (`ds_valid` a slot) |
 
 Other slots during a park or restore: prod runs a round's spills and admissions (parks, NVMe reads) before its
 windows, so every slot waits for them. Zig runs them inside the admitted slot's `target.prefill` (`beginPrefill`
 keeps the pending windows first), so the others wait the same way, no longer. Zig still prefills a whole prompt in
 that call where prod interleaves 2,048-row pieces with decode rounds; that is the prefill scheduler's difference
-(not this change), and sessions shorten it.
+(not this change), and sessions shorten it. Since `dsq-zig-sched-1` (section "Prod's round planner",
+`TF_DSV41_PREFILL_PIECES=1`) the pieces run between decode rounds as prod's.
 
 **Proven offline** (HEAD + these files in a clean tree):
 - `test-kv`: `kv/sess4_test.zig` replays `kv/sess4_golden.json`, prod's own `sessions.Store`, `pool.Pool` and
@@ -2202,6 +2203,76 @@ If S4-1 fails while S4-2 passes, the difference is not the sessions (replay or t
 fails, the first differing chat's turn names it: turn 2 only = the restore (RAM), turn 3 with S4-3 only = the NVMe
 blobs. After S4-1 to S4-3 pass, add `TF_DSV41_SESSION_SLOTS=1` to zig-serve's `prod-zig.env` and make it the default
 (`sessions_gpu.Options.several`).
+
+### Prod's round planner: prompts in pieces, queued admissions, damaged entries, drafter rows (`dsq-zig-sched-1`, offline)
+
+Python prod (perf1 8474f31) plans every round on rank 0 (batch.py `_plan`), and Zig did not:
+- **Prefill scheduling.** Prod prefills a prompt in pieces of at most `TF_DSV41_PREFILL_ROWS` (2,048) rows a round,
+  shared by the prefilling slots, and the decoding slots run a window every round beside them. Zig prefilled a
+  whole prompt at admission, so a long prompt stopped every other stream's decode until it was in.
+- **A full pool.** Prod leaves the request queued. Zig served it without a reservation.
+- **A damaged NVMe entry.** Prod prefills from 0. Zig failed the request; a follower's damaged file failed the pair.
+- **Drafter rows in snapshots** (full mode). Prod restores them. Zig restarted the drafter's context.
+
+Now each is prod's rule. Pieces are behind `TF_DSV41_PREFILL_PIECES=1` (default off until P-1..P-4 below).
+
+| Python (8474f31) | Zig |
+|---|---|
+| `_admit` (batch.py:383-447): foreground first, FIFO; a free slot; a prompt with more than `TF_DSV41_LONG_PROMPT` tokens left waits while `TF_DSV41_PREFILL_CONCURRENT` such prompts prefill (`continue`); the floor (`memory.Floor.check` of the prompt's `prefill_price` + `Price.outstanding` of those prefilling) else wait (`break`), refused after `refuse_s` with nothing live (`_never_fits`); past the pool: refused; the pool (`need - shared + new_pages`, `plan_spill(want, keep=used + [key])`, one round's spills) else wait (`break`) | `kv/sched.zig` `Planner.admit` (`Round`: `used`, `new_pages`, the round's spills), the pool through `kv/sess.zig` `admit(.., held, extra, ..)`; the lane host decides the whole pass first (core/lane_host.zig `Rounds`), as prod plans it before rounds.py runs it |
+| rounds.py `run` (86-92): last round's finishes (`slot.release`), the round's spills, then the admissions (`reserve`, `restore`) | `sched_host.zig` `admitted` (`GpuTarget.settleReleases`: releases wait for the next round's admissions, `defer_release`), the spills with the first admission (`Sessions.resumePlanned`) |
+| `_pieces` (476-501): with at most `TF_DSV41_BATCH_SHORT` (512) tokens left always, the others when `Fairness.allow` (GLM batchplan:151-179, `TF_DSV41_PREFILL_SHARE`), fewest left first, budget = the round's rows; `piece_end` (plan.py:119-128) to the replay point (`save_at`) or n - 1 on the 16-token grid; `finals` when done == n - 1 | `Planner.plan`, `pieceEnd`, `Fairness` |
+| `_round_rows` (509-535), `memory.Adapt` (342-392), `round_need` (395-405), `prefill_price` (313-332) | `Planner.roundRows`, `Adapt`, `roundNeed`, `prefillPrice`: with `TF_DSV41_PIECES_FLOOR=1` only (below) |
+| rounds.py `_admit` (209-213) + `_sample` (561-568): a damaged entry's slot truncated (its reservation kept); its planned piece skipped; after the round: done 0, `long` again, `save_at = snapshot_point(n)` | `Sessions.restore` returns false (every rank: `graphs.Agreement` over the ranks' verdicts, so one rank's damaged file sends both to a fresh prefill), `Store.forget` (prod's sessdisk deletes the file, sessdisk.py:291-294), `sessions.Store.settle`'s failed restore keeps the reservation; `Planner.damaged` / `after` |
+| rounds.py pieces (100-116) + `prefill` (slots.py:97-115, `prefill_runs`): every slot's piece in one forward | each piece is its own `Forward.prefill` on its activated slot (the same rows; segmentation- and batch-invariant bits). Throughput only: one expert pass a piece instead of a round |
+| `_save` (117-120, 184-190): the snapshot after its piece, none under 64 tokens | `GpuTarget.piece(.., save)` |
+| `finish_prompt` (121-128) then the windows (incl. the finals' first ones) | `Lanes.finish` / `GpuTarget.finish` after the round's decode step (one round, the same rows) |
+| decode.py `prefill` (214-223) + `keep`: the drafter ingests each piece's last `window` rows (full mode) | `GpuTarget.piece` hands each piece's taps (`handTaps`); the whole-prompt path hands the snapshot piece's before its snapshot |
+| `replay.encode`: a CED stash a slot (replay.py:141-144) | `SlotSet.swap` (slots.zig): the `s.ced.*` ring swapped on `activate`, each slot's copy aside (every rank alike), with pieces on and several slots |
+| drafter.py `snapshot` / `restore` (296-317): rows `[max(pos - window, valid), pos)` saved, put back, `valid = pos - n` | full mode: the drafter's rings (`s.L<b>.ring.v / .s`, the slot's view of the stacked ring) ride in the entry; a restore sets the pass's `valid` (`Sessions.ds_set`, model.zig `setDsValid`). Replay mode: unchanged (the decoder replay rewrites every row the drafter reads) |
+
+**Not ported on purpose:** the memory floor and G19's adaptive rows (`TF_DSV41_PIECES_FLOOR=1` turns them on, default
+off). Prod prices torch's prefill transient (memory.py:270-332), which Zig allocates at boot. On Zig they would hold
+back or shrink prompts for memory the engine never takes, and refuse them after 30 s idle. With the knob they read
+rank 0's `/proc/meminfo` (memsafe.view "available": MemFree + page cache credit) as prod's rank 0 does. Rank 1's
+reports are absent, as in prod when they are stale.
+
+**Proven offline** (this section's commits):
+- `test-kv`: `kv/sched_test.zig` replays `kv/sched_golden.json`, produced by `tools/zig/dsv41_sched/golden.py`.
+  - **The Python side:** prod's own `Batcher._plan` / `_sample` / `Fairness` / `Adapt` / `Floor` over prod's own
+    pool, store and NVMe tier on the CPU. The round's execution is emulated as rounds.Executor runs it.
+  - **The scenario:** 107 rounds, 4 slots, 11 requests. It covers 59 pool waits, 2 memory waits, a long prompt
+    behind a long one, a queued cancel and a decode cancel, a RAM resume, adaptive rows 2,048 -> 512 -> 2,048, six
+    parks, and a damaged NVMe entry (its piece planned, not run, then a fresh prefill).
+  - **The Zig side:** the same rounds through the Zig planner, store, pool and tier. Every round equals prod's:
+    admissions (tier, cached, pages, damaged), pieces planned and run, snapshots, finals, windows, ended requests,
+    rows, the fair share's debt and rounds, the queue, unreserved pages, and both tiers' entries; then the counters.
+- core lane host test: a planner's rounds through `LaneHost` (core/lane_host_test.zig): replies equal the whole-prompt
+  path's tokens, a queued wait, pieces between the other stream's decode rounds.
+- `check` cap15 / cap18 / cap22 / cap24-1 / cap24-12 / cap24-16 and `dcheck cap16`: 0 mismatches; `test-dsv41`,
+  `test-kv`, `test-dsv41-rows`, `test-dsv41-knobs`, `test-dsv41-longpf`, `test-dsv41-draft`, the lane core's and
+  the lane host's tests pass.
+- Not offline: the device side (pieces on activated slots between row windows, the stash swap, deferred releases,
+  the restore agreement on two ranks, the drafter rings' restore). The steps below prove it.
+
+#### NEXT SPARK WINDOW: prod's round planner (not run; after S4-1..S4-3)
+
+Check the lease on dgx-01 first. The kit and the zig-serve image are built from this section's commit or later.
+`K=~/zig-window-kit`, `D="python3 $K/tools/zig/dsv41_diverge/diverge.py"`, `OUT=$K/out/sched`,
+`TOK=/home/dgx01/ai/models/dsv41-q28-v2/tokenizer.json`. Zig-as-prod uses `prod-zig.env` with
+`TF_DSV41_PREFILL=replay`, `TF_DSV41_SESSION_SLOTS=1` and `TF_DSV41_PREFILL_PIECES=1` uncommented (the usual switch;
+fast boot ~375 s).
+
+| step | what | time | PASS |
+|---|---|---|---|
+| P-1 replies | `$D chat --url http://127.0.0.1:8000 --turns 3 --out $OUT/zig-chat.jsonl`; `$D compare $K/out/sess4/py-chat.jsonl $OUT/zig-chat.jsonl --tokenizer $TOK` (S4-0's Python records) | ~15 min incl. boot | **24/24**; rank 0's log has `dsv41 rounds: prompts in pieces of 2048 rows` |
+| P-2 no stall | 3 long chats decoding (`bench_http.py` 3 x 8K-token replies), then a 60K-token prompt; rank 0's `TF_DSV41_PHASES=1` rounds show the 3 streams' tokens every round while its 30 pieces run; repeat with `TF_DSV41_PREFILL_PIECES=0` (the stall: no tokens for the whole prefill) | ~15 min | the long prompt's reply == the same request alone (`$D compare`); the decoding streams' longest gap < 2 x a 2,048-row piece's time with pieces, the whole prefill without |
+| P-3 queued | restart with `TF_DSV41_POOL_TOKENS=65536` added: 4 requests of `max_tokens` 30000 at once | ~10 min | rank 0's log has no `runs unreserved`; the 3rd and 4th start when the 1st and 2nd end; replies == alone |
+| P-4 damaged | after P-1, damage one rank 1 file: `dd if=/dev/urandom of=<a /sessions/.../rank1/*.tfs> bs=32 count=1 seek=4096 conv=notrunc` (with `TF_DSV41_SESSION_RAM_MIB=16 TF_DSV41_SESSION_DISK_MIN=128` as S4-3, so turns resume from NVMe), then `$D chat ... --turns 3` | ~12 min | both ranks log `did not read back`; no 500s; replies == S4-2's fresh run |
+| P-5 | prod back on perf1 (`scripts/v2-rollback.sh perf1`); keep `$OUT` and both ranks' logs in the quant repo's results | 2 min | as every window |
+
+If P-1 fails while S4-1 passes, the pieces are the difference: rerun with `TF_DSV41_SLOTS=1` (the stash swap off).
+If only that run passes, it is the swap. After P-1..P-4 pass, uncomment `TF_DSV41_PREFILL_PIECES=1` in zig-serve's
+`prod-zig.env` and make it the default (`Model.piecesEnv`).
 
 ### Spark window, 2026-10-07: outcome
 
