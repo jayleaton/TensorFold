@@ -1735,6 +1735,26 @@ and the host's launches and top-k then run with the GPU idle.
   `fatbin-kit` with `dsv41_glue.fatbin` rebuilt from `fc43fecd` with the build's flags (torch's flags, -O3,
   --fmad=false, sm_121). Every other kernel's SASS there equals `fatbin-kit`'s.
 
+**Why the speculative pass ran so rarely (`6237ee39`).** The night's run A speculated 800 of 7,493 passes (B2: 189 of
+3,530), and every launch was used: the count, not the hits, was low. The lane core reads a chain's held drafts back as
+host tokens after every draft (`Backend.tree`, `core/lanes/engine.zig`), so each drafted window arrived as `w.tokens`
+with `held` 0, and `lanes.speculate` took only `held` windows for DSpark rounds. A window whose host tokens are a prefix
+of the slot's held chain (no parents) now counts. CPU twin: speculations 65 / 36 (greedy / keyed) where there was 1
+each, every token, draft and kept count equal to spec off; the new test fails on the old code. On the GPU this moves
+the pass (7.0 ms, ~3.5 graphed) off the round's path on nearly every round, as prod's TF_DSV41_SPEC_DRAFT does.
+
+**Launch order (open, with `dsq-zig-rtparity-1`).** Python launches the speculative pass from the device before either
+host waits: `vsample` picks each row and computes (accepted, bonus, start) on the GPU, the window's taps go into the
+rings, `stage_device` writes the pass's statics from them, the graph replays (spec.py at 8474f31). Zig launches it
+after the host's greedy pick (`target.window` returns the choices) and the lanes' bookkeeping, so the GPU idles for
+the pick's download and host argmax, the gather round trip and the ingest's launch. rtparity moves the greedy pick onto
+the GPU (top candidates, small copy back), which shortens that idle most of the way. Python's full order needs: an
+accept kernel (accepted / bonus / start from the window's device choices and drafts), the window's whole-taps ingest
+without a host start, and a `stage_device` kernel for the pass's statics (dspark_dev.zig's pinned staging is the host
+side of it). Hook point: after the pick's device result and before its copy-back wait, in `target.window` / batch.zig
+(rtparity's files), calling `Pass.begin` with the device start; `SlotPass.begin` / `GpuPass.begin` take asks today,
+so the device form is a second entry. Not done: it needs rtparity's device pick first.
+
 **Checks (dev box, no GPU):** `check` cap15 / cap18 / cap22 / cap24-1 / cap24-12 / cap24-16 and `dcheck cap16` 0
 mismatches; `test-dsv41`, `test-dsv41-knobs`, `test-dsv41-draft`, `test-dsv41-rows`, `test-dsv41-mdraft` PASS. The
 kernel's selection steps, mirrored on the host, equal the host rule on 400 tie-heavy rows (integer ties, +-0.0, -inf).
