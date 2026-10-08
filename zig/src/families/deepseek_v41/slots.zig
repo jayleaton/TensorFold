@@ -10,14 +10,15 @@
 //!   before the same operation.
 //! - `deactivate()`: the roles back at the stacked bases (row mode's view), the active slot's state stored.
 //! Row mode needs the pool (Python: rowmode.ready); the contiguous slot is refused by name (error.RowsNeedPool).
-//! The session store (sessions_gpu.zig) snapshots one slot's roles: with several slots it is refused (open item).
+//! The session store (sessions_gpu.zig) runs on the activated slot: its views of the stacked roles (a slot's bytes),
+//! its `Forward.Slot`, the pool's current slot.
 
 const std = @import("std");
 const fwd = @import("forward.zig");
 const buffers = @import("buffers.zig");
 const rowmode = @import("rowmode.zig");
 
-pub const Error = error{ RowsNeedPool, SlotRange, NotBound, SessionsOneSlot };
+pub const Error = error{ RowsNeedPool, SlotRange, NotBound };
 
 /// Plan-link operations of this workstream (docs: 16-19).
 pub const op_select: i64 = 16;

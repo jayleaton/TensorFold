@@ -4,9 +4,11 @@
 //! (draft/branches.zig: the main chain, then a winning sibling's path in place of it); several slots are refused by
 //! name until state.zig (per-slot pools) lands. Sampling (`lanes.Sampling`, T > 0, keyed at `draws`) goes through
 //! `sampler` (sampling_gpu.zig: Python's candidates, nucleus statistics and keyed choice); without one it is refused.
-//! M5 (`sessions`, with the paged pool): a prompt resumes the longest saved entry that strictly prefixes it (RAM or
-//! NVMe) and prefills only the rest; a released slot is saved as an entry (its pages shared, its bounded state kept),
-//! the residency budget parking or dropping the least recently used chats.
+//! M5 (`sessions`, with the paged pool): a request is admitted by the pool pages it may write (`admit`: its reply budget;
+//! prod's batch.py `_admit`), then its prompt resumes the longest saved entry that strictly prefixes it (RAM or NVMe)
+//! and prefills only the rest; a released slot is saved as an entry (its pages shared, its bounded state kept), the
+//! residency budget parking or dropping the least recently used chats. With several slots (`rows`) the same runs on
+//! the activated slot while the other slots' windows wait, as prod's round runs its admissions before its windows.
 
 const std = @import("std");
 const iface = @import("draft/iface.zig");
@@ -51,12 +53,19 @@ pub const GpuTarget = struct {
     /// `ingest_window`: the drafter's context rows (DSpark's shape window)
     pass: ?iface.Pass = null,
     ingest_window: u32 = 0,
+    /// each slot's next request's reply budget (`admit`, before its prefill): its pool admission's price
+    max_new: [16]?u64 = @splat(null),
 
     pub fn target(t: *GpuTarget) iface.Target {
         return .{ .ptr = t, .vtable = &vtable };
     }
 
-    const vtable: iface.Target.VTable = .{ .prefill = prefill, .window = window, .keep = keep, .taps = taps, .release = release };
+    const vtable: iface.Target.VTable = .{ .prefill = prefill, .window = window, .keep = keep, .taps = taps, .release = release, .admit = admit };
+
+    fn admit(p: *anyopaque, slot: u32, max_new: u64) void {
+        const t = self_(p);
+        if (slot < t.max_new.len) t.max_new[slot] = max_new;
+    }
 
     fn self_(p: *anyopaque) *GpuTarget {
         return @ptrCast(@alignCast(p));
@@ -68,8 +77,14 @@ pub const GpuTarget = struct {
         const keyed = try t.keyedOf(sampling);
         t.tree.clear();
         if (t.resume_first) |first| if (t.f.slot.pos == ids.len and t.f.slot.pending == null) return first;
-        // a saved entry that prefixes the prompt: the slot continues at its position, the rest is prefilled
-        const at: usize = if (t.sessions) |ss| @intCast(try ss.resume_(ids)) else 0;
+        // the request's pool pages (its reply budget from `admit`), then a saved entry that prefixes the prompt: the
+        // slot continues at its position, the rest is prefilled
+        const max_new: ?u64 = if (slot < t.max_new.len) t.max_new[slot] else null;
+        if (slot < t.max_new.len) t.max_new[slot] = null;
+        // a failed prompt (a damaged NVMe blob, a pool that ran out) leaves the slot empty on every rank, its pages and
+        // reservation back (prod: the request fails, its slot finishes), not holding them for the next request
+        errdefer if (t.sessions != null) t.abandon(slot);
+        const at: usize = if (t.sessions) |ss| @intCast(try ss.resume_(ids, max_new)) else 0;
         const rest = ids[at..];
         if (t.own_prefill and t.prompt_tail == .verify) {
             // Python's server (batch.py `_pieces` / `finals`): the rows before the last token are prefilled, and the
@@ -207,9 +222,27 @@ pub const GpuTarget = struct {
         return self_(p).f.drop();
     }
 
+    /// The slot emptied on every rank without a session save (a prompt that failed part way).
+    fn abandon(t: *GpuTarget, slot: u32) void {
+        t.tree.clear();
+        const r = if (t.rows) |b| b.release(slot) else t.f.release();
+        r catch |e| std.log.err("dsv41 target: emptying slot {d} after a failed prompt failed ({t})", .{ slot, e });
+    }
+
     fn release(p: *anyopaque, slot: u32) void {
         const t = self_(p);
-        if (t.rows) |b| return b.release(slot) catch |e| std.log.err("dsv41 target: releasing slot {d} failed ({t})", .{ slot, e });
+        if (t.rows) |b| {
+            // outside the served shape the turn is kept for the next one, as the one-slot path below (prod's exact
+            // prefill tag in full mode, rounds.py `_finish`); the served shape saved its prompt at its replay point
+            if (t.sessions) |ss| if (!(t.own_prefill and t.prompt_tail == .verify)) {
+                b.saveTurn(slot, ss) catch |e| {
+                    std.log.err("sessions: save of slot {d} failed ({t}); the slot is released", .{ slot, e });
+                    b.release(slot) catch |e2| std.log.err("dsv41 target: releasing slot {d} failed ({t})", .{ slot, e2 });
+                };
+                return;
+            };
+            return b.release(slot) catch |e| std.log.err("dsv41 target: releasing slot {d} failed ({t})", .{ slot, e });
+        }
         if (slot != 0) return;
         t.tree.clear();
         if (t.sessions) |ss| {

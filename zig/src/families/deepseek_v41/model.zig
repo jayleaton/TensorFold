@@ -283,7 +283,17 @@ pub const Model = struct {
         m.f.engram = &m.host;
         if (world > 1) m.f.link = &m.session.plan;
         const so = try sg.optionsFromEnv();
-        if (m.f.kv != null and m.slots == 1 and so.enabled) m.sessions = try sg.Sessions.init(gpa, io, &m.f, &bp, so);
+        const several_ok = m.slots == 1 or so.several;
+        if (so.enabled and m.f.kv != null and !several_ok)
+            std.log.scoped(.dsv41).warn("sessions: off with {d} live slots (TF_DSV41_SESSION_SLOTS=1 opens them over every slot; its sess4 gate has not run on hardware)", .{m.slots});
+        if (so.enabled and m.f.kv == null and std.c.getenv("TF_DSV41_SESSIONS") != null)
+            std.log.scoped(.dsv41).warn("sessions: off, the store needs the paged pool (TF_DSV41_POOL_TOKENS)", .{});
+        if (m.f.kv != null and so.enabled and several_ok) {
+            // the drafter's blocks (prod's snapshot carries their rows: the RAM tier's measure)
+            var dsb: [8]u32 = undefined;
+            const ds_blocks: u32 = if (o.drafts) @intCast(dspark_emit.blocks(&m.cfg, &dsb).len) else 0;
+            m.sessions = try sg.Sessions.init(gpa, io, &m.f, &bp, so, .{ .slots = m.slots, .ds_blocks = ds_blocks });
+        }
         m.gt = .{ .f = &m.f, .prefill_rows = o.prefill_rows, .max_rows = nb, .own_prefill = o.own_prefill, .sessions = m.sessions };
         // TF_DSV41_PROMPT_TAIL (prod_knobs.promptTail): the prompt's last token as the first decode row, as Python's server
         m.gt.prompt_tail = try @import("prod_knobs.zig").promptTail(&@import("prod_knobs.zig").env);
@@ -295,6 +305,11 @@ pub const Model = struct {
         }
         if (o.drafts) m.pass = try dspark_gpu.GpuPass.init(gpa, &m.f, ingest_rows);
         if (m.slots > 1) try m.openRows(rows_cap, &bp);
+        // sessions over several slots: the operations on the activated slot, the row windows' kept ids committed
+        if (m.sessions) |x| if (m.rows) |b| {
+            x.slot_set = m.slot_set;
+            b.sess = x;
+        };
         if (slot_drafts) m.slot_pass = try dspark_slots.SlotPass.init(gpa, &m.f, m.pass.?, m.rows.?, m.slots, group);
         // the prompt's prefilled tail's taps (CED's decoder replay, or the last segment) to the pass the lanes drive
         m.gt.pass = m.draftPass();
@@ -316,9 +331,9 @@ pub const Model = struct {
     }
 
     /// Several live slots (slots.zig / batch.zig): the stacked roles' bases, the row runner, the followers' row ops;
-    /// one-slot graphs off (row windows have their own), sessions not opened (one slot's roles only).
+    /// one-slot graphs off (row windows have their own).
     fn openRows(m: *Model, cap: u32, bp: *const buffers.Plan) !void {
-        std.log.scoped(.dsv41).info("slots: {d} live, row windows of up to {d} rows (sessions off with several slots)", .{ m.slots, cap });
+        std.log.scoped(.dsv41).info("slots: {d} live, row windows of up to {d} rows, sessions {s}", .{ m.slots, cap, if (m.sessions != null) "on (every slot)" else "off" });
         const ss = try slots_mod.SlotSet.init(m.gpa, &m.f, m.slots);
         errdefer ss.deinit();
         try ss.bindBases(bp);

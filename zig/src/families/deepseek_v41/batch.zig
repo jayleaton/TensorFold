@@ -31,6 +31,7 @@ const slots_mod = @import("slots.zig");
 const iface = @import("draft/iface.zig");
 const buffers = @import("buffers.zig");
 const samp = @import("sampling_gpu.zig");
+const sessions_gpu = @import("sessions_gpu.zig");
 
 pub const Error = error{ BadWindow, NotAChain, RowsCap, BadPlan, TreeWindow, Sampling, Slots };
 
@@ -71,6 +72,8 @@ pub const Batch = struct {
     R: u32 = 0,
     current: []const calls.Call = &.{},
     stats: struct { windows: u64 = 0, rows: u64 = 0, padded: u64 = 0 } = .{},
+    /// the session store (model.zig): each slot's kept rows are its committed ids
+    sess: ?*sessions_gpu.Sessions = null,
 
     /// After Runner.bind and SlotSet.bindBases (the stacked roles have addresses): the table, the Engram stages.
     pub fn init(gpa: std.mem.Allocator, f: *fwd.Forward, ss: *slots_mod.SlotSet, cap: u32) !*Batch {
@@ -266,6 +269,7 @@ pub const Batch = struct {
             }
         };
         const st = b.ss.state(slot);
+        if (b.sess) |x| try x.commitAt(slot, p.ids[0 .. accepted + 1]);
         if (f.engram) |h| tailAfter(st, h.max_ngram - 1, p.ids[0 .. accepted + 1]);
         st.pos = p.start + accepted + 1;
         st.pending = null;
@@ -309,6 +313,16 @@ pub const Batch = struct {
         b.dropPending(slot);
         try b.ss.activate(slot);
         try b.f.release();
+    }
+
+    /// A slot leaves as a session turn (target.zig, outside the served shape): its pending window kept whole (a chain
+    /// window never kept keeps every row), the slot activated, the entry saved and the slot emptied (every rank:
+    /// op_rows_keep, op_select, op_sess_save).
+    pub fn saveTurn(b: *Batch, slot: u32, ss: *sessions_gpu.Sessions) !void {
+        if (slot >= b.ss.n) return error.Slots;
+        if (b.pend[slot]) |p| try b.keep(slot, p.n - 1);
+        try b.ss.activate(slot);
+        _ = try ss.save();
     }
 
     // -------------------------------------------------------------------------------------------------------------
