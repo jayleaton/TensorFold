@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sys
 import threading
 import time
 import urllib.request
@@ -49,6 +50,13 @@ NO_DRAFT = False     # --no-draft: every request with "draft": false (both serve
 
 
 def one(url: str, model: str, msg: str, temp: float, max_tokens: int, out: dict) -> None:
+    try:
+        stream_one(url, model, msg, temp, max_tokens, out)
+    except Exception as e:      # a refused / dropped connection: the stream failed (the cell records it, never averages it)
+        out["error"] = f"{type(e).__name__}: {e}"
+
+
+def stream_one(url: str, model: str, msg: str, temp: float, max_tokens: int, out: dict) -> None:
     body = {"model": model, "messages": [{"role": "user", "content": msg}], "max_tokens": max_tokens,
             "temperature": temp, "stream": True, "stream_options": {"include_usage": True},
             "reasoning_effort": "none", "chat_template_kwargs": {"enable_thinking": False}}
@@ -69,6 +77,8 @@ def one(url: str, model: str, msg: str, temp: float, max_tokens: int, out: dict)
                 usage = d["usage"]
             if d.get("tensorfold"):
                 tf = d["tensorfold"]
+            if d.get("error"):
+                out["error"] = str(d["error"])[:300]
             for c in d.get("choices") or []:
                 delta = c.get("delta") or {}
                 if delta.get("content") or delta.get("reasoning_content"):
@@ -106,6 +116,11 @@ def cell(url: str, model: str, work: str, temp: float, streams: int, max_tokens:
         t.start()
     for t in th:
         t.join()
+    errors = [r.get("error") or "no tokens" for r in res if r.get("error") or not r.get("first")]
+    if errors:
+        print(f"cell {work} T{temp} x{streams}: {len(errors)} stream(s) failed: {errors[:2]}", file=sys.stderr)
+    if len(errors) == streams:
+        raise RuntimeError(f"every stream failed: {errors[0]}")
     rates = [r["decode_tok_s"] for r in res if r.get("decode_tok_s")]
     lo = max(r["first"] for r in res if r.get("first"))
     hi = min(r["last"] for r in res if r.get("last"))
@@ -116,7 +131,7 @@ def cell(url: str, model: str, work: str, temp: float, streams: int, max_tokens:
             "mean_tok_s": round(sum(rates) / len(rates), 2) if rates else None, "aggregate_tok_s": agg,
             "ttft_s": [r.get("ttft_s") for r in res], "tokens": [r.get("tokens") for r in res],
             "sha": [r.get("sha") for r in res], "tpr": [r.get("tpr") for r in res],
-            "mean_tpr": mean([r.get("tpr") for r in res])}
+            "mean_tpr": mean([r.get("tpr") for r in res]), "failed_streams": len(errors), "errors": errors[:4]}
 
 
 def document(n: int) -> str:
@@ -138,7 +153,8 @@ def long_cell(url: str, model: str, n: int, max_tokens: int) -> dict:
     return {"work": f"long-{n}", "temp": 0.0, "streams": 1, "prompt_tokens": pt, "ttft_s": r.get("ttft_s"),
             "prompt_tok_s": round(pt / r["ttft_s"], 1) if pt and r.get("ttft_s") else None,
             "mean_tok_s": r.get("decode_tok_s"), "aggregate_tok_s": None, "per_stream": [r.get("decode_tok_s")],
-            "tokens": [r.get("tokens")], "sha": [r.get("sha")], "tpr": [r.get("tpr")], "mean_tpr": r.get("tpr")}
+            "tokens": [r.get("tokens")], "sha": [r.get("sha")], "tpr": [r.get("tpr")], "mean_tpr": r.get("tpr"),
+            "failed_streams": int(bool(r.get("error") or not r.get("first"))), "errors": [r["error"]] if r.get("error") else []}
 
 
 def compare(a_path: str, b_path: str) -> None:

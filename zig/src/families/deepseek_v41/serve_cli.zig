@@ -28,7 +28,10 @@ pub fn follow(gpa: std.mem.Allocator, io: std.Io, pack: []const u8, assets: []co
     defer m.close();
     if (m.rank() == 0) return error.RankZeroServes;
     std.debug.print("rank {d}: loaded, following rank 0\n", .{m.rank()});
-    try m.f.follow();
+    m.f.follow() catch |err| {
+        std.log.err("rank {d}: following rank 0 failed: {s}", .{ m.rank(), @errorName(err) });
+        return err;
+    };
     std.debug.print("rank {d}: rank 0 stopped\n", .{m.rank()});
     return 0;
 }

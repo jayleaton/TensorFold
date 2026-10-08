@@ -477,6 +477,7 @@ pub const LaneHost = struct {
 
     /// A failed round ends every stream it held, with the backend's error.
     fn failAll(h: *LaneHost, message: []const u8) void {
+        std.log.err("lane host: a round failed ({s}): every admitted stream fails", .{message});
         h.lock();
         const jobs = h.gpa.dupe(*Job, h.admitted.items) catch &.{};
         h.admitted.clearRetainingCapacity();

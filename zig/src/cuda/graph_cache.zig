@@ -146,7 +146,11 @@ pub fn Cache(comptime Key: type) type {
                 return c.eager(stream, body);
             }
             while (c.entries.count() >= c.cap) c.evictOldest();
-            const exec = c.engine.capture(c.engine.ctx, stream, body) catch null;
+            const exec = c.engine.capture(c.engine.ctx, stream, body) catch |err| blk: {
+                // the only trace of why graphs went off (the step then runs eagerly, which may fail the same way)
+                std.log.warn("graph capture failed: {s} (key {any}, {d} graphs held)", .{ @errorName(err), key, c.entries.count() });
+                break :blk null;
+            };
             if (!try c.agreed(exec != null)) {
                 if (exec) |x| c.engine.free(c.engine.ctx, x);
                 c.failed = true;
