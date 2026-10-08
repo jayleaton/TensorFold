@@ -1361,6 +1361,95 @@ If C1 fails, `first_differing_role` names the part: `s.L2x/3x.swa.*` = the decod
 the ring), `s.L20.comp.* / .ik` = the encoder's compressor, `s.L<20.*` = the encoder pass. Keep `TF_DSV41_PREFILL`
 commented in prod-zig.env until C1 and C3 pass.
 
+### Prod parity: prefill (`dsq-zig-pfparity-1`, offline)
+
+Every prefill knob of prod-perf1 (`config/prod.env`, engine 8474f31), checked against Python's source at 8474f31 and
+the Zig tree at `1f5e75c7`. CED replay itself is `dsq-zig-ced-1`'s (section above). Prod's speed baseline, from
+Python's own G17 study (`dsv41-tensorfold-spark/docs/G17-PREFILL.md` section 4, prod's knobs at 2,048 rows, x3gm v1):
+32K full **1,109** tok/s, 32K replay **2,285**; with x3gm v2 (+6.7 %) that is the served **2,430**. So the night's Zig
+571 tok/s (full) sat at 0.51x Python's *full* prefill: replay explains 2x of prod's lead, the rest is below.
+
+**Knobs** (status: *built in* = the emitter's constant at prod's value, checked launch by launch by the captures, which
+were taken with prod's knobs; *ported* = read under prod's name):
+
+| knob (prod) | Python (8474f31) | Zig status | evidence (Zig, HEAD `1f5e75c7`) | commit |
+|---|---|---|---|---|
+| `PREFILL_CHUNK=2048`, `PREFILL_ROWS=2048` | `forward.pchunk`, `batch.py` round budget | ported | `prod_knobs.zig:129-133` (a segment = min of the two) | 0e (`dsq-zig-knobs-1`) |
+| `PREFILL_ADAPT_GIB=4.5` (adaptive rows) | `memory.py`: a round steps down to 1,024 / 512 rows when the tighter rank is short | equivalent, static | `forward_prefill.plan` / `model.zig:251` (`planPrefill`): the segment's buffers in the boot plan, behind the measured boot check; adaptive only ever slows a round | - |
+| `PF_COPIES=1` | `csa2/attn_pf.py` group-major copies | built in | `block_prefill.zig:14`, `:347` (`_segment with PF_COPIES`) | M1 caps |
+| `MHC_PF=1`, `MHC_BM=64`, `MHC_WARPS=8` | `mhc_pf.py`, `mhc.py` | built in | `block_prefill.zig:62-63` (`pf_rows` 256, `mhc_bm` 64), `:253` (`tf_dsv41_mhc_pf_v1.run`); warps are the AOT variant's | M1 caps |
+| `FULL_CONE=1` | `rounds.py:217`: only when `mode == "full"`; prod runs replay | inert in prod | - (would only matter if Zig served `full`) | - |
+| `PREFILL_KERNELS=fast` | `prefill_mm.py` | built in | `block_prefill.zig:1-8` (rot_in, unpack, `_gemm` column blocks under `ws_limit` `:60`) | M1 caps |
+| `FAST_EXPERTS=gm` + `GM_V2=1` | `x3gm.py` `_run_ragged` / `_run_v2` | built in (v1); **v2 ported, now ON in prod-zig.env** | `block_prefill.zig:899-939` (x3gm rot / gateup / down), `:907` + `gm2pf.zig:37` (`TF_DSV41_GM_V2`) | `550a371..46b15c6`; zig-serve this pass |
+| `PF_DENSE=fused` + `PF_DENSE_TABLE` | `pfdense.py` | ported, ON in prod-zig.env | `prod_knobs.zig:102`, `block_prefill.zig:118`, `:166-168` (`Seg.fused`) | 0e; zig-serve ed716a5 |
+| `ENGRAM_NATIVE=1`, `NATIVE_DIR` | `engram_native.py` (pthread pool: 32 threads prefill, 64 decode) | equivalent | `engram_rows.zig:16` (`TF_DSV41_ENGRAM_QD`, 64 threads without io_uring), dd33a75 / d6c5e02; `NATIVE_DIR` is Python's C build dir | dd33a75, d6c5e02 |
+| `PREFETCH_AHEAD=1` | `prefetch.py` (one segment ahead; the next round keeps a bulk read in flight) | ported, ON; **its layer-14 batch was dropped before use: fixed** | `forward_prefill.zig:171`, `:181` (`readAhead`); `engram_rows.zig` `settle` | 19be37a7; **this pass** |
+| `INDEX_STREAM_MIN=4096` | `csa2/backend.py` | built in | `block_prefill.zig:65` (`stream_min`), `longpf.zig` | longpf |
+| `PLAIN_TRITON=1` | `plain_fp64.py` (weights_proj in one Triton launch) | built in | `block_prefill.zig:721-723` (`_plain`) | M1 caps |
+| `PREFILL_ATTN=fused`, `_ATTN_BMQ=32`, `_ATTN_WARPS=8` | `csa2/attn_pf.py` | built in | `block_prefill.zig:66` (`bmq`), `:772` (`_fused`, grid H / bmq); warps are the AOT variant's | M1 caps |
+| `PREFILL_GATHER=bf16` | `forward.py` / `mhc.py` (the exchange's bf16 gather) | built in | `block_prefill.zig:225` (`gathered`), the `exchange` glue (bf16 all-gather) | M1 caps |
+| `PREFILL_ROUTER=gemv` | `router_gemv.py` route over every row | built in | `block_prefill.zig:68` (`router_chunk` 2,048), `:855-861` (`tf_dsv41_router_gemv_v2.route`) | M1 caps |
+| `ROPE_INPLACE=1` | `rope.py` | built in | `block_prefill.zig:353-356` (`_rope` with `OUT` = `X`) | M1 caps |
+| `EXPERT_PREFILL=0` | `expert_prefill.py` (x3pf off) | built in (no x3pf launch) | `block_prefill.zig:888-939`: x3gm only | M1 caps |
+
+Nothing on the list is MISSING. Two were OFF in every night run (GM_V2, PREFETCH_AHEAD) and PF_DENSE in all but part
+4; all three are on in `prod-zig.env` now. One was ported but not working (read-ahead, below).
+
+**The segment loop, Python against Zig.**
+
+| | Python (`rounds.py`, `slots.py`, `forward.run`, `prefetch.py`) | Zig (`forward_prefill.prompt` / `segment`, `target.prefill`) |
+|---|---|---|
+| segments | the batcher's rounds: one 2,048-row piece a round, a plan per round to rank 1 | one `prefill` call a prompt: rank 1 gets the ids once (op), every rank loops over 2,048-row segments itself; no plan exchange between segments |
+| between segments | `keep`, then the next round's plan; the GPU drains at the plan exchange (G5's nsys: the only idle time is layer 1's Engram wait) | `commit` (carries copied on the stream), `emitPrefill` (1.9-3.8 ms host) while the GPU runs the previous segment's tail; the `embed` glue syncs before rewriting its pinned ids |
+| host syncs in a segment | `rows_src.rows(...).to(device)`: layer 1 and, lazily (`decode.DecodeForward`), layer 14 | `engramRows` syncs before layers 1 and 14 (the staging's reuse): the same two points |
+| Engram read-ahead | the round issues this segment's reads and the next one's (`ahead`); a bulk read in flight is kept | `readAhead` issues segment k + 1's reads before segment k runs; **before this pass `settle` dropped the k + 1 layer-14 batch at k + 1's layer-1 read**, so every layer-14 read was a synchronous miss with the GPU drained (~70-75 ms a segment with the reader pool, ~250 ms serial at the night). Fixed: an unread bulk batch is only aged by reads of its own table |
+| rank-1 exchange | the plan (RDMA mailbox) each round, then the forward's all-gathers | the segment's all-gathers only (> 1 MiB: NCCL, as Python above `ROCE_MAX_KB`) |
+
+**Changes in this pass** (engine `dsv41-zig`, HEAD + these files in a clean `git archive` tree):
+1. `engram_rows.zig` `settle`: a settle on another table never drops an unread bulk batch; it is still dropped at the
+   second read of its own table (a wrong guess costs one read, never a bit). `engram_rows_test.zig`: segment k + 1's
+   batches on two tables survive segment k's layer-1 then layer-14 reads and segment k + 1's layer-1 read, 0 misses on
+   both, value by value, in sync / pool / io_uring modes. The test fails on the old rule (verified) and passes on the
+   new one. Same bits: the rows are the file's whatever the path.
+2. Prefill attribution, the tool the Spark window needs (TF_DSV41_PROFILE did not cover prefill): `profile.zig` keeps
+   prefill segments in their own totals (JSON `"prefill"`: segments, wall, GPU, calls by name), `longpf.window` times
+   each call of a segment (and of the CED decoder pass) with an event pair, the glue included, so an Engram wait shows
+   as `glue.engram_rows` time; `dsv41_m2b_ref.py --profile-prefill N` times Python's prefill of the gate's prompt
+   shape (warm, timed, torch.profiler); `gap.py prefill` puts them side by side by family and by kernel; the M2c-2 kit
+   takes `PROF_PREFILL=1` and `LIMIT` (prompts past 4,096). Off unless set: nothing changes in the served engine.
+3. zig-serve `prod-zig.env`: `TF_DSV41_GM_V2=1`; the "left out" note now names the knobs built into the emitter.
+
+**Expected at 32K** (one stream, `bench_http.py --long 32768`; each row multiplies the one above; the basis column is
+the measured share or Python's own number):
+
+| step | tok/s | basis |
+|---|---:|---|
+| night (full, serial Engram, no read-ahead, PF_DENSE / GM_V2 off) | 571 | run C |
+| + reader pool (d6c5e02) and read-ahead that hits on both layers (this pass) | ~690 | 0.64 s of a 3.58 s segment were `engram.wait` |
+| + PF_DENSE fused with prod's table | ~720 | Python dense-t +4.1 % at 32K full |
+| + GM_V2 | ~770 | Python q28-v2 +6.7 % at 32K |
+| + CED replay (`dsq-zig-ced-1`, its gate first) | ~1,600 | Python replay / full 2.06x at 32K (2,285 / 1,109) |
+| prod | 2,430 | prod-long-bench.log |
+
+The last ~1.5x (Zig full ~770 against Python full ~1,180 with the same knobs) is not attributed offline: the launches
+are Python's (the captures), the exchanges take the same NCCL path, the host emits a segment in 2-4 ms, and the
+sessions commit per segment only appends ids. The P2 profile below names it by kernel family; the candidates are the
+Zig glue kernels that replace torch ops (`top_positions`, one CTA a row with shared-memory atomics against
+torch.topk's radix select; `ring_copy`, `widen_cat`, `cand_keys`) and GPU idle at the two Engram syncs.
+
+#### NEXT SPARK WINDOW: prefill parity (not run; after the CED gate C1, before C4)
+
+Check the lease on dgx-01 first. Kit (M2c-2) and zig-serve image from the engine commit with this section or later.
+`K` = the kit dir on both hosts, both hosts within a minute, prod down for P1-P2.
+
+| step | what | time | PASS / record |
+|---|---|---|---|
+| P1 GM_V2 gate | dgx-01 `cd $K && PREFILL=1 GM_V2=1 PROMPT=2600 AOT_PROMPTS="" ./run_host.sh 0 $K/out/pf-gm2`, dgx-02 the same with rank `1` (two segments: the read-ahead's path) | ~35 min | `prefill.log`: `prod knobs: ... x3gm v2 one`, **`PASS Zig prefill rank r: ... state roles N/N equal`, first token equal, `PASS M2b ... 512/512`** on both ranks. FAIL: comment `TF_DSV41_GM_V2=1` out of prod-zig.env |
+| P2 prefill profile at 32K | `PREFILL=1 GM_V2=1 PROF_PREFILL=1 PROMPT=32768 LIMIT=36864 STEPS=16 AOT_PROMPTS="" ./run_host.sh 0 $K/out/pf-prof` (rank 1 likewise); then on dgx-01 `python3 $K/tools/zig/dsv41_perf/gap.py prefill --py $K/out/pf-prof/seed4101/ref/prof-rank0.json --zig-profile $K/out/pf-prof/seed4101/zig-prefill/prof-rank0.json --top 25 > $K/out/pf-prof/gap-prefill.md` (add `PREFILL_MODE=replay` for the replay shape once C1 passes) | ~40 min | the prefill gate PASS as P1; **record** `gap-prefill.md`: wall and GPU a prompt on both sides, the family with the largest `Zig - Python`, `glue.engram_rows`' ms (the GPU waiting on Engram) |
+| P3 served 32K | Zig-as-prod (prod-zig.env as committed, `TF_DSV41_PHASES=1 TF_DSV41_PHASES_OUT=/state/phases.json` added for the window): `python3 $K/bench_http.py --url http://127.0.0.1:8000 --label zig-pf --long 32768,131072 --out $K/out/zig-pf-long.json` | ~25 min | 32K **> 700 tok/s full** (> 1,500 with replay on); `phases.json` `engram.wait` **mean < 15 ms** (read-ahead hits; was 249) |
+| P4 A / B | the same server, one 32K cell each with `TF_DSV41_PREFETCH_AHEAD=0`, then `TF_DSV41_GM_V2=0`, then `TF_DSV41_PF_DENSE=off` | ~30 min | each knob's share of P3 (expected: ahead 3-8 %, GM_V2 5-8 %, PF_DENSE 3-5 %) |
+| P5 restore | prod back on perf1 (`scripts/v2-rollback.sh perf1`) if the window ends here | 2 min | as every window |
+
 ### Speed against prod after the night (`dsq-zig-speed-2`, offline)
 
 Every number below is from the night's logs (quant repo `results/zig-night-20261007/r0/`: `*/server.log`,
