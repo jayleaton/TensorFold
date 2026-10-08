@@ -124,6 +124,8 @@ pub const Served = struct {
         s.host = api.LaneHost.init(gpa, io, &s.core, .{ .name = "dsv41-cuda", .lanes = m.slots, .context_window = window, .prefill_step = m.gt.prefill_rows });
         // the lanes run on LaneHost's thread: the model's CUDA context must be current there
         s.host.on_thread = .{ .ctx = m, .run = bindContext };
+        // /metrics' device memory: the bytes this rank holds in cuda.DeviceBuffers (weights, KV pool, staging), its peak
+        s.host.memory = .{ .read = readMemory };
         try s.host.start();
         if (s.gengine) |ge| ge.inner = s.host.engine();
         s.rec = Recorder.init(gpa, io, if (s.gengine) |ge| ge.engine() else s.host.engine());
@@ -135,6 +137,11 @@ pub const Served = struct {
     fn syncStream(ctx: *anyopaque) anyerror!void {
         const m: *model.Model = @ptrCast(@alignCast(ctx));
         try m.stream.synchronize();
+    }
+
+    fn readMemory(_: ?*anyopaque, reset_peak: bool) ?api.Memory {
+        const u = @import("cuda").usage(reset_peak);
+        return .{ .active = u.device, .cache = 0, .peak = u.peak };
     }
 
     fn bindContext(ctx: *anyopaque) anyerror!void {
