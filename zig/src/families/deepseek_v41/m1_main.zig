@@ -88,6 +88,15 @@ pub fn main(init: std.process.Init) !u8 {
             std.debug.print("FAIL tf-dsv41-m1 slots: {t}\n", .{e});
             return 1;
         };
+    if (args.len >= 6 and std.mem.eql(u8, args[1], "sess4")) {
+        // OUT REF...: sessions over several live slots (dsq-zig-sess4-1, tools/zig/dsv41_sess4/job.sh)
+        const refs = try init.arena.allocator().alloc([]const u8, args.len - 5);
+        for (refs, args[5..]) |*t, x| t.* = x;
+        return @import("sess4_cli.zig").main(init.gpa, init.io, args[2], args[3], args[4], refs) catch |e| {
+            std.debug.print("FAIL tf-dsv41-m1 sess4: {t}\n", .{e});
+            return 1;
+        };
+    }
     if (args.len >= 5 and std.mem.eql(u8, args[1], "mdraft")) {
         // TRACE...: the several-slot drafting gate (dsq-zig-mdraft-1)
         const traces = try init.arena.allocator().alloc([]const u8, args.len - 4);
