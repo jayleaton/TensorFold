@@ -1646,6 +1646,83 @@ recorded and the window moves on.
 | S5 GM_V2 | M2c-2 kit `PREFILL=1 GM_V2=1 ./run_host.sh` (both hosts; `prefill.log`'s `prod knobs:` line must say `x3gm v2 one`), then S2's 32K cell with `TF_DSV41_GM_V2=1` | ~35 min | **prefill gate PASS** (95/95 roles, first token, 512/512); 32K **+5-10 %**. PASS: `TF_DSV41_GM_V2=1` into prod-zig.env |
 | S6 restore | prod back on perf1 (`scripts/v2-rollback.sh perf1`) | ~2 min | as every window |
 
+### The DSpark pass on the device (`dsq-zig-dspark-1`, offline; engine `fc43fecd`, `2ab5e2e0`; zig-serve `7fa11c9`)
+
+**What Python does** (8474f31 `drafter.py`, `draft_graphs.py`, `dspark.py`): the whole pass is one CUDA graph a key
+(slots padded to 1 / 2 / 4, rows, head variant; `TF_DSV41_DRAFT_GRAPHS`, default `TF_DSV41_GRAPHS`): static inputs
+in two device arenas staged from pinned mirrors by two non-blocking copies; the blocks; the head; `candidates`
+(`_keys` + `torch.topk`, a rank's best 64 by (value desc, id asc)); `gather_cols`; the `_chain` Triton kernel; one
+D2H copy of drafts + confidences. A 4-slot pass is one 20-row graph (row mode over the stacked rings).
+
+**What Zig did** (the night's 7.0 ms against 3.66): eager launches, a stream sync before the statics' pageable
+uploads, then the host step: a sync, the block's whole logits ([5 x 64,640] fp32, 1.3 MB pageable) and head hidden
+downloaded, the host top-k of every row, an upload, the gather, a second sync, the download. Every sync drains the GPU,
+and the host's launches and top-k then run with the GPU idle.
+
+**Now (`fc43fecd`, `TF_DSV41_DRAFT_GRAPHS`, default off):**
+- `glue.cu` `ds_cands`: each rank's best k columns a row on the device, the host rule exactly (unique 64-bit keys
+  (mono(value + 0.0) << 32 | ~column): -0.0 == +0.0, ties by column; radix select with early exit, bitonic sort).
+  Then the ranks' gather and one async copy of the gathered [W][rows][2 k] (+ the head hidden) into pinned memory, all
+  on the stream. The host keeps the chain (`draft/dspark.zig`), so **draft ids are the host path's bit for bit** (the
+  same candidate lists, the same chain); against Python's `_chain` kernel they agree up to fp32 summation order, as
+  before (acceptance, not tokens: verification is exact).
+- The statics come from pinned staging with no sync; nothing in the pass reads the device on the host, so the pass is
+  captured once a key (`graph_cache`, `TF_DSV41_DRAFT_GRAPHS_MAX` 32, the graphs' memory floor): one key for the
+  one-slot pass, (slots, the group's first row) for slot passes.
+- **Self-check on the hardware:** the first 8 passes run eagerly and also compare the device candidates with the host's
+  on the same logits (every rank). Then the ranks agree, with one all-gather at the same pass on every rank and before
+  any capture. All equal -> graphs (log `draft graphs: 8 passes' device candidates equal the host's on every rank:
+  graphs`); any difference -> the host step for the rest of the run on every rank (log `draft graphs: device candidates
+  differ ...`). A glue fatbin built before `ds_cands` loads as before and keeps the host step (a warning). So the knob
+  can be switched on in a window without risking a reply or a hang.
+- **The speculative pass over several slots:** `SlotPass` implements `Pass.begin` / `collect` on the device path
+  (every group of the round launched back to back, one wait at `collect`), so `TF_DSV41_SPEC_DRAFT` overlaps the pass
+  with the host's commit for 4 slots as for one. If the checks turned the device path off, `begin` defers the exact
+  pass to `collect`. The device path's op 41 carries the group's first row of the round.
+- Phases inside `draft.pass`: `draft.wait` (the host waiting for the device pass), `draft.chain` (the host chain),
+  `draft.host` (the old host step; DRAFT_GRAPHS off), so S4's per-cell phases split the pass.
+- `TF_DSV41_DRAFT_GRAPHS=device`: device candidates without graphs (the A / B of the two halves).
+- **Kit:** the glue fatbin must hold `ds_cands`. Either build with `-Dnvcc`, or use `dsv41-zig-ref/fatbin-kit-dsg`:
+  `fatbin-kit` with `dsv41_glue.fatbin` rebuilt from `fc43fecd` with the build's flags (torch's flags, -O3,
+  --fmad=false, sm_121). Every other kernel's SASS there equals `fatbin-kit`'s.
+
+**Checks (dev box, no GPU):** `check` cap15 / cap18 / cap22 / cap24-1 / cap24-12 / cap24-16 and `dcheck cap16` 0
+mismatches; `test-dsv41`, `test-dsv41-knobs`, `test-dsv41-draft`, `test-dsv41-rows`, `test-dsv41-mdraft` PASS. The
+kernel's selection steps, mirrored on the host, equal the host rule on 400 tie-heavy rows (integer ties, +-0.0, -inf).
+Not proven offline: the kernel on a GPU (the self-check proves it at boot), the graphed pass's capture, the speed.
+
+**Expected** (estimates; the night's B2 numbers):
+
+| | night | expected | why |
+|---|---:|---:|---|
+| DSpark pass (one slot) | 7.0 ms | ~3.5-4 ms | no 1.3 MB pageable download, no host top-k of 5 x 64,640, no 3 syncs, ~90 launches as one graph |
+| code T0, 1 stream | 60.4 | ~63-64 (+ the Engram fix's ~3-4) | ~3 ms off a ~65 ms round |
+| code T0, 4 streams | 82.2 | ~88-92 (+ Engram) | two passes a drafted round, ~6 ms off, and the speculative pass now overlaps with several slots |
+
+**Not reached: the one 20-row pass for 4 slots.** It needs Python's above-16-row decode path in the pass's emitter:
+`_site` for the first site (SPLIT, COLLAPSE 1) and for the final (MIX off) with `_finish_k` (COEF off) instead of
+`mhc_cuda`; the router's above-16-row configuration (`router_gemv.py`: `rows > 16`); and the MoE's grouped path at 20
+rows. No capture of a 20-row pass exists (the night's set P holds 5-row passes only), so `dcheck` could not gate such
+an emission, and it was not written blind. Its gate: a set P capture at 4 slots (`dsv41_m1_capture.py` with the
+drafter in row mode, `pad_slots(4)`), then the emitter, `aot-needs` / `triton_fill.py` for its variants, and `dcheck`.
+**The same limit costs more in the verify windows:** Zig's row windows stop at 16 rows (`batch.zig`, mhc_cuda's MAXR),
+so a 4-slot drafted round of 4 x 6 = 24 rows runs as two forwards, where Python runs one 24-row window. That is
+probably a larger share of the 4-stream gap than the second DSpark pass (owner: the decode runtime, `dsq-zig-rtparity-1`).
+
+#### NEXT SPARK WINDOW: the DSpark pass (not run; after S1-S2)
+
+Kit from `fc43fecd` or later with a glue fatbin holding `ds_cands` (`FATBINS=dsv41-zig-ref/fatbin-kit-dsg`, or
+`-Dnvcc`). Check the lease first.
+
+| step | what | time | PASS |
+|---|---|---|---|
+| D1 boot | B2's shape (4 slots, slot drafts, prod-zig.env, S2's phases knobs) plus `TF_DSV41_DRAFT_GRAPHS=1` on both ranks | ~10 min | both ranks log **`draft graphs: 8 passes' device candidates equal the host's on every rank: graphs`**; no `differ` line |
+| D2 tokens | `bench_http.py --work code --temps 0 --streams 1 --reps 2` and `--streams 4`, against the same cells with `TF_DSV41_DRAFT_GRAPHS=0` | ~20 min | **T0 replies equal** (`--compare`); `dsv41 spec:` launches > 0 at 4 streams; shutdown's `draft graphs:` line: graphed ~= passes - 8 |
+| D3 speed | the two runs' `phases.json` | - | `draft.pass` ms_avg **< 4.5** at 1 stream (was 7.0); code 1-stream **> 62**, 4-stream **> 88** |
+| D4 on failure | a `differ` line or a capture failure: record it, rerun with `TF_DSV41_DRAFT_GRAPHS=device` (eager), then 0 | ~10 min | the line and the first differing row in the report |
+
+PASS of D1-D3: `TF_DSV41_DRAFT_GRAPHS=1` into prod-zig.env (zig-serve, today commented as pending this gate).
+
 ### 4 slots x 1M and the AOT fill (`dsq-zig-rows1m-1`, offline)
 
 **4 slots x 1M (`9bb3227`).** The night's rank 1 `UnknownRowsCall` came from the row programs (`Batch.plan`, every bucket
