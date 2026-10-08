@@ -23,6 +23,7 @@ const batch = @import("batch.zig");
 const iface = @import("draft/iface.zig");
 const dspark = @import("draft/dspark.zig");
 const dsd = @import("dspark_dev.zig");
+const ph = @import("phases.zig");
 
 pub const Error = error{ Slots, NotAPrefix, CandidateWidth, Unbound };
 
@@ -332,7 +333,11 @@ pub const SlotPass = struct {
         const d = x.dev.?;
         const b = x.begun.?;
         x.begun = null;
-        try d.wait();
+        {
+            const tw = ph.start(x.f.phases, .@"draft.wait");
+            defer tw.stop();
+            try d.wait();
+        }
         const n: usize = x.f.cfg.dspark_block;
         const c: usize = x.f.comm.world() * x.one.k;
         const D: usize = x.f.cfg.hidden;
@@ -343,6 +348,8 @@ pub const SlotPass = struct {
         }
         var scratch = std.heap.ArenaAllocator.init(x.gpa);
         defer scratch.deinit();
+        const tc = ph.start(x.f.phases, .@"draft.chain");
+        defer tc.stop();
         // rows of the round are in sorted-slot order: the j-th sorted ask's rows at j x n
         for (x.order[0..b.n], 0..) |i, j| {
             const a = asks[i];
@@ -505,6 +512,8 @@ pub const SlotPass = struct {
     /// dspark_gpu.zig's host step over the pass's rows: each rank's best k a row, the ranks' lists gathered, the head
     /// hidden for the confidences.
     fn hostStep(x: *SlotPass, r: *run.Runner, logits_t: calls.Tensor, hid_t: calls.Tensor) !void {
+        const th = ph.start(x.f.phases, .@"draft.host");
+        defer th.stop();
         const comm = x.f.comm;
         const R: usize = @intCast(logits_t.shape[0]);
         const V: usize = @intCast(logits_t.shape[1]);

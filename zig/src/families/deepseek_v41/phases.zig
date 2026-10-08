@@ -33,6 +33,12 @@ pub const Name = enum {
     spec,
     /// host time between top-level phases (not a phase of Python's: its report has no name for it)
     host,
+    /// inside `draft.pass` (dspark_dev.zig, TF_DSV41_DRAFT_GRAPHS): the host waiting for the device pass and its copy
+    @"draft.wait",
+    /// inside `draft.pass`: the host's chain (Markov bias, choice, confidences) over the gathered candidates
+    @"draft.chain",
+    /// inside `draft.pass`, the host step (DRAFT_GRAPHS off): the logits' download, the host candidates, their gather
+    @"draft.host",
 };
 
 /// A gap between top-level phases this long or longer is idle (no live stream), not a round's host time.
