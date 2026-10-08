@@ -26,6 +26,10 @@ pub fn runtimeFor(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
     const cuda = b.createModule(.{ .root_source_file = b.path("zig/src/cuda/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
     cuda.addImport("gpu_memory", @import("gpu_memory.zig").module(b, target));
     cuda.addOptions("kernel_options", options);
+    // MiaAI-Lab's one-shot RoCE all-gather proxy (cuda/roce_mia.zig): C over libibverbs' header, else a refusing stub
+    const verbs = if (std.Io.Dir.accessAbsolute(b.graph.io, "/usr/include/infiniband/verbs.h", .{})) |_| true else |_| false;
+    const proxy = if (verbs) "zig/src/cuda/roce_proxy.c" else "zig/src/cuda/roce_proxy_stub.c";
+    cuda.addCSourceFile(.{ .file = b.path(proxy), .flags = &.{ "-std=gnu11", "-O2", "-idirafter", "/usr/include" } });
     cuda.addImport("stagger", stagger(b, target, optimize));
     if (with) for (@import("cuda_kernels.zig").kernels, images) |k, image| cuda.addAnonymousImport(b.fmt("fatbin_{s}", .{k.name}), .{ .root_source_file = image.? });
     return cuda;

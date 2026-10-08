@@ -16,6 +16,8 @@ const lanes_cli = @import("cuda_lanes.zig");
 const segments_cli = @import("cuda_segments.zig");
 const train_check = @import("cuda_train_check.zig");
 const dory_cli = @import("cuda_dory.zig");
+const flashnext_mia = @import("flashnext_mia");
+const flashnext_cli = @import("flashnext_cuda.zig");
 const decode = nemotron.decode;
 
 const usage =
@@ -81,6 +83,8 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("{s}", .{usage});
         return 2;
     }
+    // MiaAI-Lab's Flash Next engine takes its own commands for qwen4_exp checkpoints when TF_FLASHNEXT_ENGINE=mia
+    if (flashnext_mia.selected() and flashnext_cli.wants(gpa, init.io, args[2])) return flashnext_cli.main(init, args);
     var opts = Options{ .model = args[2] };
     var positional: std.ArrayList([]const u8) = .empty;
     defer positional.deinit(gpa);

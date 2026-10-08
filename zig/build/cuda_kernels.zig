@@ -166,6 +166,25 @@ pub const kernels = [_]Kernel{
     .{ .name = "drama3", .flags = &.{"-O3"} },
     .{ .name = "drama3_fp8", .flags = &.{"-O3"} },
     .{ .name = "drama3_codec", .flags = &.{"-O3"} },
+    // MiaAI-Lab's Flash Next engine (families/flashnext_mia): her qwen4_exp extension copies and kernels
+    .{ .name = "fn_gdn", .flags = &.{ "-O3", "--fmad=false" } }, // qwen4_exp/cuda/gdn.py
+    .{ .name = "fn_gdn_io", .flags = &.{ "-O3", "--fmad=false" } }, // qwen4_exp/cuda/gdn_io.py
+    .{ .name = "fn_gdn_prefill", .flags = &.{ "-O3", "--fmad=false" } }, // cuda/kernels/gdn.py, tensorfold_gdn_v2
+    .{ .name = "fn_gdn_tree", .flags = &.{ "-O3", "--fmad=false" } }, // cuda/kernels/gdn.py, tensorfold_gdn_v2
+    .{ .name = "fn_nvfp4_experts", .flags = &.{"-O3"} }, // cuda/nvfp4/linear.py, tensorfold_nvfp4_v3
+    .{ .name = "fn_qmm", .flags = &.{"-O3"} }, // cuda/kernels/qmm.py, tensorfold_qmm_v5
+    .{ .name = "fn_qmm_prefill", .flags = &.{"-O3"} }, // cuda/kernels/qmm.py, tensorfold_qmm_v5
+    .{ .name = "fn_pack", .flags = &.{"-O3"} }, // the n-gram table's GPU gather
+    .{ .name = "torch_fn_ops", .src = "torch_ops/fn_ops", .flags = torch_ops }, // SwiGLU, sampler packing
+    .{ .name = "torch_fn_logsumexp", .src = "torch_ops/fn_logsumexp", .flags = torch_ops }, // ATen's logsumexp order
+    .{ .name = "fn_experts_prompt", .flags = &.{"-O3"} }, // routed NVFP4 experts reading weights once a prompt call
+    .{ .name = "fn_qmmf", .flags = &.{"-O3"} }, // cuda/nvfp4/qmmf.cu (FP8G lane matmul), tensorfold_nvfp4_v3
+    .{ .name = "fn_int4", .flags = &.{"-O3"} }, // GPTQ int4 g128 routed experts and lm_head (W4A16, fp32 sums)
+    .{ .name = "fn_qmmf_ld", .flags = &.{"-O3"} }, // fn_qmmf.cu with an output row stride
+    .{ .name = "fn_nvfp4_shape", .flags = &.{"-O3"} }, // fn_nvfp4_experts' unit arithmetic in other launch shapes
+    .{ .name = "fn_qmm_cluster", .flags = &.{"-O3"} }, // qmm_kernel's K-slice cluster forms for the 4-bit MTP head
+    .{ .name = "fn_roce", .flags = &.{"-O3"} }, // the one-shot RoCE all-gather's GPU half (cuda/roce_mia.zig)
+    .{ .name = "fn_qsa_scores", .flags = &.{"-O3"} }, // attention._scores' bits from row tiles (the prompt indexer)
 };
 
 /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.

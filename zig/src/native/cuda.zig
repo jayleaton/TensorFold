@@ -23,6 +23,7 @@ const vision_offer = @import("cuda_vision_offer.zig");
 const drafted = @import("cuda_drafted.zig");
 const kv_pages = @import("cuda_kv_pool.zig");
 const cuda_families = @import("cuda_families.zig");
+const flashnext_mia = @import("cuda_flashnext_mia.zig");
 /// CUDA families provide metadata, open their lane backend and explain their refusals.
 pub const registry = cuda_families.registry;
 /// --record opens here (engines.zig refuses it for a backend without this).
@@ -163,6 +164,8 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     }
     if (std.mem.eql(u8, o.model_type, "fish_omni")) return openDrama(a, gpa, io, o, problem);
     if (std.mem.eql(u8, o.model_type, "qwen4") or std.mem.eql(u8, o.model_type, "qwen4_text")) return @import("qwen4_cuda.zig").open(a, gpa, io, o, problem);
+    // MiaAI-Lab's Flash Next engine also reads qwen4_exp: TF_FLASHNEXT_ENGINE=mia picks it over upstream's flashnext
+    if (flashnext_mia.wanted(o)) return flashnext_mia.open(a, gpa, io, o, problem);
     inline for (registry) |F| if (std.mem.eql(u8, o.model_type, F.model_type)) return openWith(F, a, gpa, io, o, problem);
     if (std.mem.eql(u8, o.model_type, lfm2.family.model_type)) {
         if (refusals.lfm2(o)) |why| {

@@ -82,7 +82,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const mods = family(b, target, optimize, cuda, draft_ids);
     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip });
     const native = engines(b, target, optimize, cuda, mods.core, mods.lanes, mods.nemotron, mods.heat, mods.qwen35, mods.qwen_vision);
-    for ([_]struct { []const u8, *std.Build.Module }{ .{ "cuda", cuda }, .{ "core", mods.core }, .{ "lanes", mods.lanes }, .{ "nemotron", mods.nemotron }, .{ "dory", native.engines.import_table.get("dory").? }, .{ "cluster", @import("cluster_cuda.zig").module(b, target, optimize, mods.lanes, mods.core, native.canon, native.verbs) } }) |m| cli.addImport(m[0], m[1]);
+    for ([_]struct { []const u8, *std.Build.Module }{ .{ "cuda", cuda }, .{ "core", mods.core }, .{ "lanes", mods.lanes }, .{ "nemotron", mods.nemotron }, .{ "dory", native.engines.import_table.get("dory").? }, .{ "flashnext_mia", native.engines.import_table.get("flashnext_mia").? }, .{ "cluster", @import("cluster_cuda.zig").module(b, target, optimize, mods.lanes, mods.core, native.canon, native.verbs) } }) |m| cli.addImport(m[0], m[1]);
     cli.addOptions("build_options", build_options);
     cli.addImport("checkpoint_cli", checkpointCli(b, target, optimize, strip, native.engines, mods.core));
     b.installArtifact(b.addExecutable(.{ .name = "tensorfold", .root_module = cli }));
@@ -120,6 +120,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     b.installArtifact(b.addExecutable(.{ .name = "tf-tp-watch-check", .root_module = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/tp_watch_check.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip, .imports = &.{.{ .name = "cuda", .module = cuda }} }) }));
     @import("living_dense.zig").target(b, target, optimize, cuda, mods.qwen35);
     flashnextChecks(b, target, optimize, cuda, mods.core, mods.lanes, mods.qwen_vision, mods.api, opts);
+    @import("flashnext_mia.zig").steps(b, target, optimize, cuda, native.engines.import_table.get("flashnext_mia").?);
     b.step("compile-cuda-tests", "Compile CUDA runner without executing a GPU").dependOn(&runner_exe.step);
     const startup = b.addObject(.{ .name = "modelopt-startup", .root_module = b.createModule(.{ .root_source_file = b.path("zig/modelopt_startup_compile.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "native", .module = native.engines }} }) });
     _ = startup.getEmittedBin();
@@ -346,7 +347,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     b.step("test-trainer-close-host", "Actual native close and real Flash Next trainer ownership sentinels").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = native, .filters = &.{"Save recovery:"} })).step);
     const template, const server_tests = @import("cuda_server_host.zig").steps(b, host, cuda, mods, native_modules, build_options, windows_port, step, server_steps);
     // the tokenizer's own tests (memo, steps, regex, unicode) run here: no other test binary reaches them
-    for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, mods.qwen35, mods.qwen_vision, flashnextModule(b, host, .debug, cuda, mods.core, mods.lanes, mods.qwen_vision, mods.api), lfm2Module(b, host, .debug, cuda, mods.core), mods.radio, mods.heat, mods.tokenizer, native_modules.api, native, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
+    for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, mods.qwen35, mods.qwen_vision, flashnextModule(b, host, .debug, cuda, mods.core, mods.lanes, mods.qwen_vision, mods.api), lfm2Module(b, host, .debug, cuda, mods.core), native_modules.engines.import_table.get("flashnext_mia").?, mods.radio, mods.heat, mods.tokenizer, native_modules.api, native, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
     const selected = b.option([]const u8, "modelopt-host-filter", "One portable ModelOpt regression") orelse "modelopt host:";
     const run = b.addRunArtifact(b.addTest(.{ .root_module = mods.nemotron, .filters = &.{selected} }));
     run.has_side_effects = true;
@@ -387,6 +388,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     cli.addImport("core", mods.core);
     cli.addImport("lanes", mods.lanes);
     cli.addImport("nemotron", mods.nemotron);
+    cli.addImport("flashnext_mia", native_modules.engines.import_table.get("flashnext_mia").?);
     cli.addOptions("build_options", build_options);
     cli.addImport("checkpoint_cli", checkpointCli(b, host, .debug, false, native_modules.engines, mods.core));
     const memory_cli = checkpointCli(b, host, .debug, false, native_modules.engines, mods.core);
