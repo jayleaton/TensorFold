@@ -21,6 +21,15 @@ Pod (2x PRO 6000, the backbone prefix, TP=2, Python R1 against Zig):
   row count for each side; then GPU ms a window by kernel family (mHC, attention, indexer, dense linears, experts,
   router, exchanges, small ops, Engram, head), so the host's share is wall - GPU on each side.
 
+Spark or pod (the full prefill, Python against Zig on the same prompt: the M2c-2 kit's PREFILL=1 PROF_PREFILL=1):
+
+    python3 gap.py prefill --py ref/prof-rank0.json --zig-profile zig-prefill/prof-rank0.json [--top 20]
+
+  ``--py``: dsv41_m2b_ref.py --profile-prefill's ``prefill`` (wall, torch.profiler kernel time by name over one
+  prefill); ``--zig-profile``: TF_DSV41_PROFILE's ``prefill`` (profile.zig: the prefill segments' calls, event-timed,
+  the glue included: an Engram read the GPU waits for shows as glue.engram_rows' time). Rows: wall and GPU a prompt on
+  each side, then GPU ms a prompt by family, then each side's largest kernels.
+
     python3 gap.py selftest
 """
 
@@ -165,6 +174,34 @@ def windows_table(py: dict, zig_paths: list[str], zig_prof: dict | None) -> list
     return lines
 
 
+def prefill_table(py: dict, zig: dict, top: int = 20) -> list[str]:
+    """``py`` / ``zig``: the two profiles' ``prefill`` objects (one prompt each)."""
+
+    lines = ["| | Python | Zig | Zig - Python |", "|---|---:|---:|---:|"]
+    for label, pk, zk in (("prompt rows", "rows", None), ("segments", "segments", "segments"),
+                          ("wall ms", "wall_ms", "wall_ms"), ("GPU ms (kernels / calls)", "gpu_ms", "gpu_ms")):
+        pv, zv = py.get(pk), zig.get(zk) if zk else None
+        f = lambda x: "" if x is None else (f"{x:.1f}" if isinstance(x, float) else str(x))  # noqa: E731
+        d = f"{zv - pv:+.1f}" if isinstance(pv, (int, float)) and isinstance(zv, (int, float)) else ""
+        lines.append(f"| {label} | {f(pv)} | {f(zv)} | {d} |")
+    fam_py: dict[str, float] = {}
+    for name, v in py.get("kernels", {}).items():
+        fam_py[family(name)] = fam_py.get(family(name), 0.0) + v["ms"]
+    fam_zig: dict[str, float] = {}
+    for name, v in zig.get("calls", {}).items():
+        fam_zig[family(name)] = fam_zig.get(family(name), 0.0) + v["ms"]
+    lines += ["", "GPU ms a prompt by family", "| family | Python | Zig | Zig - Python |", "|---|---:|---:|---:|"]
+    for fam in [f for f, _ in FAMILIES] + ["other"]:
+        if fam in fam_py or fam in fam_zig:
+            a, b = fam_py.get(fam, 0.0), fam_zig.get(fam, 0.0)
+            lines.append(f"| {fam} | {a:.1f} | {b:.1f} | {b - a:+.1f} |")
+    for side, ks in (("Python", py.get("kernels", {})), ("Zig", zig.get("calls", {}))):
+        lines += ["", f"{side}'s largest {top} (ms a prompt, calls)", "| name | family | ms | calls |", "|---|---|---:|---:|"]
+        for name, v in sorted(ks.items(), key=lambda kv: -kv[1]["ms"])[:top]:
+            lines.append(f"| {name[:90]} | {family(name)} | {v['ms']:.1f} | {v['calls']} |")
+    return lines
+
+
 def selftest() -> int:
     py = {"mode": "1", "wall_ms": 1000.0, "window": {"ms": 600.0, "n": 20, "ms_avg": 30.0},
           "draft.pass": {"ms": 80.0, "n": 20, "ms_avg": 4.0}, "commit": {"ms": 20.0, "n": 20, "ms_avg": 1.0}}
@@ -191,6 +228,11 @@ def selftest() -> int:
                                   "calls": {"tf_dsv41_mhc.run": {"calls": 162, "ms": 5.0}}})
         assert any(l.startswith("| 1 | 26.000 | 2.300 | 30.000 | 24.000 | -2.000") for l in w), w
         assert any(l.startswith("| mHC | 2.300 | 2.500") for l in w), w
+    pt = prefill_table({"rows": 4096, "segments": 2, "wall_ms": 3000.0, "gpu_ms": 2900.0,
+                        "kernels": {"gatherTopK": {"calls": 40, "ms": 50.0}, "_fused_kernel": {"calls": 40, "ms": 900.0}}},
+                       {"segments": 2, "wall_ms": 6000.0, "gpu_ms": 5000.0,
+                        "calls": {"glue.topk": {"calls": 40, "ms": 400.0}, "_fused": {"calls": 40, "ms": 900.0}}})
+    assert "| wall ms | 3000.0 | 6000.0 | +3000.0 |" in pt and "| indexer | 50.0 | 400.0 | +350.0 |" in pt, pt
     print("gap.py selftest: OK")
     return 0
 
@@ -206,6 +248,10 @@ def main() -> int:
     b.add_argument("--py", required=True)
     b.add_argument("--zig", action="append", default=[])
     b.add_argument("--zig-profile", default=None)
+    c = sub.add_parser("prefill")
+    c.add_argument("--py", required=True)
+    c.add_argument("--zig-profile", required=True)
+    c.add_argument("--top", type=int, default=20)
     sub.add_parser("selftest")
     x = ap.parse_args()
     if x.cmd == "selftest":
@@ -220,6 +266,13 @@ def main() -> int:
             print(f"### Python {label} vs Zig {next(iter(zigs))}")
             print("\n".join(phases_table(rep, zigs[next(iter(zigs))])))
             print()
+        return 0
+    if x.cmd == "prefill":
+        py, zig = json.load(open(x.py)).get("prefill"), json.load(open(x.zig_profile)).get("prefill")
+        if not py or not zig:
+            print(f"no \"prefill\" in {x.py if not py else x.zig_profile}", file=sys.stderr)
+            return 1
+        print("\n".join(prefill_table(py, zig, x.top)))
         return 0
     prof = json.load(open(x.zig_profile)) if x.zig_profile else None
     print("\n".join(windows_table(json.load(open(x.py)), x.zig, prof)))

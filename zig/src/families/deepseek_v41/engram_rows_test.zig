@@ -44,15 +44,20 @@ fn parseFx(a: std.mem.Allocator, lut_sha: *[32]u8) !Fx {
 
 /// Writes the fixture's shard (Python write_shard's layout) as engram-l1-r0of2.bin under `dir`.
 fn writeShard(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, fx: Fx) !void {
+    return writeShardAs(a, io, dir, fx, 1);
+}
+
+fn writeShardAs(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, fx: Fx, layer: u64) !void {
     const n: usize = @intCast(er.header_bytes + fx.rows * er.row_bytes);
     const b = try a.alloc(u8, n);
     defer a.free(b);
     @memset(b, 0);
-    for ([_]u64{ er.magic, 1, fx.lo, fx.lo + fx.rows, fx.total, er.row_bytes }, 0..) |v, i| std.mem.writeInt(u64, b[8 * i ..][0..8], v, .little);
+    for ([_]u64{ er.magic, layer, fx.lo, fx.lo + fx.rows, fx.total, er.row_bytes }, 0..) |v, i| std.mem.writeInt(u64, b[8 * i ..][0..8], v, .little);
     for (0..fx.rows) |k| for (0..er.row_bytes) |j| {
         b[er.header_bytes + k * er.row_bytes + j] = recordByte(fx.lo + k, j);
     };
-    try dir.writeFile(io, .{ .sub_path = "engram-l1-r0of2.bin", .data = b });
+    var nb: [32]u8 = undefined;
+    try dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&nb, "engram-l{d}-r0of2.bin", .{layer}), .data = b });
 }
 
 fn sha(out: []const u16) [32]u8 {
@@ -211,6 +216,58 @@ test "engram rows: a prompt segment's bulk reads issued ahead wait through one u
         const misses = r.stats.misses;
         try r.rows(0, all, 256, big);
         try testing.expect(r.stats.misses > misses);
+        for (r.batches.items) |b| try testing.expect(!b.in_use);
+    }
+}
+
+test "engram rows: a prompt segment ahead on two tables survives the segment's layer-1 then layer-14 reads" {
+    // forward_prefill.prompt: segment k + 1's batches of both Engram layers are issued, then segment k reads layer 1,
+    // then layer 14; segment k + 1 then reads layer 1 (a settle on the other table), then layer 14: no miss on either
+    const a = testing.allocator;
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var lut_sha: [32]u8 = undefined;
+    const fx = try parseFx(arena.allocator(), &lut_sha);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeShardAs(a, io, tmp.dir, fx, 1);
+    try writeShardAs(a, io, tmp.dir, fx, 14);
+    const all = try a.alloc(i64, fx.rows);
+    defer a.free(all);
+    for (all, 0..) |*x, k| x.* = @intCast(fx.lo + k);
+    const big = try a.alloc(u16, all.len * 256);
+    defer a.free(big);
+    const s = fx.sets[0];
+    const o = try a.alloc(u16, s.idx.len * 256);
+    defer a.free(o);
+    for (modes) |mode| {
+        const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(root);
+        const r = try er.Rows.open(a, root, 0, 2, &.{ 1, 14 }, 4096);
+        defer r.close();
+        if (mode != .uring) if (r.ring) |*g| {
+            g.deinit();
+            r.ring = null;
+        };
+        if (mode == .pool and r.pool == null) try r.startPool(8);
+        if (mode == .sync) r.stopPool();
+        try r.issue(0, all);
+        try r.issue(1, all);
+        for (0..2) |li| {
+            try r.rows(li, s.idx, 256, o); // segment k: a few shared rows of each table (waits for the batch)
+            try testing.expectEqual(s.sha, sha(o));
+        }
+        const reads = r.stats.reads;
+        for (0..2) |li| {
+            try r.rows(li, all, 256, big); // segment k + 1: layer 1, then layer 14, all from the batches issued ahead
+            try testing.expectEqual(@as(u64, 0), r.stats.misses);
+            try testing.expectEqual(reads, r.stats.reads);
+            for (all, 0..) |x, k| for (0..256) |j| {
+                const row: u64 = @intCast(x);
+                try testing.expectEqual(r.lut[@as(usize, recordByte(row, 256 + j / 32)) << 8 | recordByte(row, j)], big[k * 256 + j]);
+            };
+        }
         for (r.batches.items) |b| try testing.expect(!b.in_use);
     }
 }

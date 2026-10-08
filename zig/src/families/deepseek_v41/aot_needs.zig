@@ -17,7 +17,10 @@
 //! - row mode (slots > 1): every row bucket up to the cap at every context bucket (row programs are keyed by both);
 //! - prefill segments of 1 .. TF_DSV41_PREFILL_ROWS rows at each start (a multiple of the rows, as a prompt's
 //!   segments start) whose full segment's variant set is new: every row count there;
-//! - DSpark: the pass, the slots' passes (1 .. group slots), ingests of 1 .. 16 rows.
+//! - DSpark: the pass, the slots' passes (1 .. group slots), ingests of 1 .. 128 rows (a prompt's tail in one call);
+//! - CED replay (TF_DSV41_PREFILL=replay, ced.zig): the decoder pass over a prompt's tail, 127 rows from any R0 (the
+//!   scan) and every shorter tail from 0 (a prompt of at most 128 tokens); its encoder segments are the prefill
+//!   segments' launches.
 //! The scan: a window's launches change only where a threshold crosses (the index budget, attn_cuda.plan, the stream
 //! threshold, ...), and between them an int's class repeats every 256 positions (keys = end / ratio, ratio <= 2;
 //! blocks = keys / 8; % 16). So every position of the first 512 is emitted, then every 256th; where two samples'
@@ -34,6 +37,7 @@ const rowtab = @import("rowtab.zig");
 const rowmode = @import("rowmode.zig");
 const triton_call = @import("triton_call.zig");
 const Config = @import("config.zig").Config;
+const ced = @import("ced.zig");
 
 pub const Param = struct { name: []const u8, constexpr: bool, nospec: bool, noalign: bool };
 pub const Fn = struct { function: []const u8, params: []Param };
@@ -189,6 +193,8 @@ pub const Served = struct {
     slot_drafts: bool,
     group: u32,
     graphs: graphs.Settings,
+    /// TF_DSV41_PREFILL=replay: the decoder pass's programs too
+    replay: bool = false,
 
     /// The engine's knobs as model.zig / prod_knobs.zig read them (the dense prefill's table and image paths aside:
     /// PF_DENSE's fused kernel is CUDA, so the `_gemm` variants it replaces are listed too).
@@ -216,6 +222,7 @@ pub const Served = struct {
             .slot_drafts = drafts and slots > 1 and rows_mod.enabled(),
             .group = try rows_mod.groupFromEnv((Config{}).dspark_block),
             .graphs = try graphs.Settings.fromEnvOr(true),
+            .replay = try knobs.prefillMode(&knobs.env) == .replay,
         };
     }
 };
@@ -267,6 +274,11 @@ const Ctx = struct {
 fn decodeAt(ctx: *const anyopaque, a: std.mem.Allocator, end: i64) anyerror![]const calls.Call {
     const c: *const Ctx = @ptrCast(@alignCast(ctx));
     return block.emit(a, c.cfg, c.w, c.o, c.layers, c.rows, end - c.rows, true);
+}
+
+fn decoderAt(ctx: *const anyopaque, a: std.mem.Allocator, end: i64) anyerror![]const calls.Call {
+    const c: *const Ctx = @ptrCast(@alignCast(ctx));
+    return block_prefill.emitReplay(a, c.cfg, c.w, c.o, c.layers, c.rows, end - c.rows, .decoder);
 }
 
 fn prefillAt(ctx: *const anyopaque, a: std.mem.Allocator, end: i64) anyerror![]const calls.Call {
@@ -356,14 +368,30 @@ pub fn enumerate(gpa: std.mem.Allocator, n: *Needs, cfg: *const Config, w: *cons
             try log.flush();
         }
     }
+    // CED replay's decoder pass (ced.tailOf): a prompt of n > 128 tokens replays 127 rows ending at n - 1 (the scan),
+    // a shorter one its n - 1 rows from 0
+    if (sv.replay) {
+        const dec = layers[try ced.decoderStart(cfg)..];
+        const c: Ctx = .{ .cfg = cfg, .w = w, .o = sv.o, .layers = dec, .rows = ced.keep };
+        try scan(n, .{ .ctx = &c, .emit = decoderAt }, ced.keep, limit - 1);
+        var m: i64 = 1;
+        while (m < ced.keep) : (m += 1) {
+            var pa = std.heap.ArenaAllocator.init(gpa);
+            defer pa.deinit();
+            _ = try n.program(try block_prefill.emitReplay(pa.allocator(), cfg, w, sv.o, dec, m, 0, .decoder));
+        }
+        try log.print("aot-needs: CED decoder, {d} programs, {d} variants\n", .{ n.programs, n.keys.count() });
+        try log.flush();
+    }
     // DSpark
     if (sv.drafts) {
         var pa = std.heap.ArenaAllocator.init(gpa);
         defer pa.deinit();
         const pb = pa.allocator();
         _ = try n.program(try dspark_emit.emitPass(pb, cfg, w, sv.o, cfg.dspark_block));
+        // ingests: a window's rows, and a prompt's prefilled tail in one call (target.handTaps: up to the window)
         var rows: i64 = 1;
-        while (rows <= max_rows) : (rows += 1) {
+        while (rows <= @max(max_rows, cfg.window)) : (rows += 1) {
             _ = try n.program(try dspark_emit.emitIngest(pb, cfg, w, sv.o, rows, 0));
             _ = try n.program(try dspark_emit.emitIngest(pb, cfg, w, sv.o, rows, 1));
         }

@@ -9,7 +9,10 @@
 //! - `TF_DSV41_PREFILL_CHUNK` / `TF_DSV41_PREFILL_ROWS`: a prompt segment's rows (the smaller of the two; the boot
 //!   buffer plan's prefill program is sized for it). Prefill is segmentation-invariant (memory.py, G19).
 //! - `TF_DSV41_PREFETCH_AHEAD`: a prompt segment's Engram reads issued before the previous segment runs (prefetch.py).
-//! - `TF_DSV41_PREFILL`: full (Zig's prefill) | replay (Python's CED replay, not ported: warned at boot).
+//! - `TF_DSV41_PREFILL`: full (every layer over every prompt row) | replay (Python's CED bounded replay, ced.zig: the
+//!   encoder pass over every row, the decoder over the prompt's last 127 rows). Replay needs the served shape
+//!   (TF_DSV41_OWN_PREFILL=1, TF_DSV41_PROMPT_TAIL=verify: model.zig refuses the others, as Python's server is the only
+//!   place it runs).
 const std = @import("std");
 const dk = @import("dsv41_kernels");
 const Config = @import("config.zig").Config;
@@ -200,7 +203,9 @@ pub fn streamScratch(cfg: *const Config, limit: i64, rows: i64) u64 {
 
 pub const PrefillMode = enum { full, replay };
 
-/// TF_DSV41_PREFILL (Python's default: full). Zig runs full prefill whatever it says; `replay` is logged at boot.
+/// TF_DSV41_PREFILL: the prompt's prefill mode (forward_prefill.State.mode, ced.zig). Unset is `full` here (new
+/// behaviour defaults off until its gate passes); Python's server defaults to `replay` (stack.py DEFAULT_PREFILL) and
+/// prod sets it, so Zig-as-prod sets it too (prod-zig.env).
 pub fn prefillMode(get: Get) !PrefillMode {
     const raw = get("TF_DSV41_PREFILL") orelse return .full;
     return std.meta.stringToEnum(PrefillMode, std.mem.trim(u8, raw, " ")) orelse {
@@ -233,19 +238,29 @@ pub fn promptSplit(n: usize, tail: PromptTail) struct { prefill: usize, window: 
 }
 
 /// The knobs onto a forward before its buffer plan, on every rank (model.zig serving, m2b.zig's gates): the fused
-/// dense prefill GEMM, the segment rows, the indexer's budget, the Engram read-ahead of the next segment, x3gm v2;
-/// `TF_DSV41_PREFILL=replay` is logged. R1 is read where the forward is made (`r1`).
+/// dense prefill GEMM, the segment rows, the indexer's budget, the Engram read-ahead of the next segment, x3gm v2, the
+/// prefill mode (CED replay: the model's decoder layer checked). R1 is read where the forward is made (`r1`).
 pub fn apply(f: *@import("forward.zig").Forward, a: std.mem.Allocator, io: std.Io, rank: u32) !void {
     f.opts.pfd = try pfDense(a, io, &env);
     if (try prefillRows(&env)) |r| f.opts.prefill_rows = r;
     if (try indexBudget(&env)) |b| f.opts.index_budget = b;
     f.prefill_state.ahead = prefetchAhead(&env);
     f.opts.gm_v2 = try @import("gm2pf.zig").mode(&env);
+    f.prefill_state.mode = try prefillMode(&env);
+    if (f.prefill_state.mode == .replay) {
+        const ced = @import("ced.zig");
+        const d = ced.decoderStart(f.cfg) catch |e| {
+            std.log.scoped(.dsv41).err("TF_DSV41_PREFILL=replay: no decoder layer in this model ({t}: the first ratio-1 layer must be a kv source and no later layer Engram's)", .{e});
+            return e;
+        };
+        if (std.mem.indexOfScalar(u32, try f.backbone(a), d) == null) {
+            std.log.scoped(.dsv41).err("TF_DSV41_PREFILL=replay: the forward's layers do not reach the decoder's first ({d})", .{d});
+            return error.BadKnob;
+        }
+    }
     if (rank != 0) return;
     const log = std.log.scoped(.dsv41);
-    if (try prefillMode(&env) == .replay)
-        log.warn("TF_DSV41_PREFILL=replay: the Zig engine runs full prefill (CED replay is not ported); prompts over 128 tokens leave other state than Python prod's", .{});
-    log.info("prod knobs: pf_dense {s}, prefill rows {d}, index budget {d} MiB, R1 {s}, prefetch ahead {s}, x3gm v2 {t}", .{ if (f.opts.pfd != null) "fused" else "off", f.opts.prefill_rows, f.opts.index_budget >> 20, if (f.opts.r1) "on" else "off", if (f.prefill_state.ahead) "on" else "off", f.opts.gm_v2 });
+    log.info("prod knobs: pf_dense {s}, prefill rows {d}, index budget {d} MiB, R1 {s}, prefetch ahead {s}, x3gm v2 {t}, prefill {t}", .{ if (f.opts.pfd != null) "fused" else "off", f.opts.prefill_rows, f.opts.index_budget >> 20, if (f.opts.r1) "on" else "off", if (f.prefill_state.ahead) "on" else "off", f.opts.gm_v2, f.prefill_state.mode });
 }
 
 pub fn env(name: []const u8) ?[]const u8 {

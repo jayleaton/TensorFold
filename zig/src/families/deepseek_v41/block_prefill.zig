@@ -48,6 +48,7 @@ const config = @import("config.zig");
 const moe = @import("block_moe.zig");
 const longpf = @import("longpf.zig");
 const gm2pf = @import("gm2pf.zig");
+const ced = @import("ced.zig");
 const Config = config.Config;
 const E = block.Emitter;
 const Arg = calls.Arg;
@@ -101,6 +102,8 @@ const Seg = struct {
     cand: bool = false,
     /// at most 16 rows: Python's short segment (the module doc)
     short: bool = false,
+    /// CED replay's passes (`emitReplay`, ced.zig); `.whole`: a full segment
+    part: Part = .whole,
 
     // -----------------------------------------------------------------------------------------------------------
     // dense EXL3 projections (prefill_mm.matmul)
@@ -229,7 +232,8 @@ const Seg = struct {
     /// segment: mhc_cuda alone).
     fn site(s: *Seg, L: u32, which: []const u8, mode: moe.Mode) !void {
         const e = s.e;
-        if (s.short) return moe.mhc(e, L, which, mode);
+        // the decoder replay's boundaries write the streams in place (replay.finish's Streams has no `alt`)
+        if (s.short) return moe.mhcInto(e, L, which, mode, s.part == .decoder);
         const n = e.n;
         const D: i64 = e.cfg.hidden;
         const post = mode == .boundary;
@@ -243,7 +247,7 @@ const Seg = struct {
         const c = try e.buf("L.mhc.c", .{}, .bf16, &.{ n, D });
         const tap = try tapOf(e, L, which, mode);
         // the forward's second streams buffer (mhc.out_of_place): a boundary of at most 32 rows writes it
-        const spare = post and n <= split_rows;
+        const spare = post and n <= split_rows and s.part != .decoder;
         const xout = if (spare) try e.spare() else x;
         if (n >= pf_rows) {
             try e.ext("tf_dsv41_mhc_pf_v1.run", &.{
@@ -641,6 +645,38 @@ const Seg = struct {
         return p;
     }
 
+    /// blocks._projection: a kv source's compressor projection of "w.out" as fp32 rows (ratio 2: [kv | gate], kept for
+    /// the commit's carry).
+    fn compProj(s: *Seg, L: u32) !Arg {
+        const e = s.e;
+        const n = e.n;
+        const D: i64 = e.cfg.hidden;
+        const hd: i64 = e.cfg.head_dim;
+        const x = try e.buf("w.out", .{}, .bf16, &.{ n, D });
+        const cw = try e.buf("L.comp", .{}, .bf16, &.{ n, hd });
+        try s.proj(try e.fmt("L{d}.attn.comp_wkv", .{L}), .lanes, x, D, hd, cw);
+        if (e.cfg.compressRatio(L) == 2) {
+            const cg = try e.buf("L.comp_gate", .{}, .bf16, &.{ n, hd });
+            try s.proj(try e.fmt("L{d}.attn.comp_wgate", .{L}), .lanes, x, D, hd, cg);
+            const p = try e.buf("w.L{d}.proj", .{L}, .f32, &.{ n, 2 * hd });
+            try e.glue("proj", &.{ cw, cg, p });
+            return p;
+        }
+        const p = try e.buf("L.proj", .{}, .f32, &.{ n, hd });
+        try e.glue("proj", &.{ cw, p });
+        return p;
+    }
+
+    /// CED's encoder pass at the decoder's first layer, after its attention site (blocks.compress_rows): the kv
+    /// source's compressor alone (its compressed rows and index keys for every row), then the stash: the rows entering
+    /// the layer (the streams, the normed input, the site's coefficients) into the slot's ring (replay.encode).
+    fn encoderEnd(s: *Seg, L: u32) !void {
+        const e = s.e;
+        if (e.cfg.mode(L) != .full) return error.Unsupported;
+        try s.compress(L, try s.compProj(L));
+        try e.glue("ced_stash", &try stashArgs(e));
+    }
+
     fn attention(s: *Seg, L: u32) !void {
         const e = s.e;
         const n = e.n;
@@ -653,27 +689,14 @@ const Seg = struct {
         const ID: i64 = e.cfg.index_dim;
         const x = try e.buf("w.out", .{}, .bf16, &.{ n, D });
         const indexer = md == .full or md == .reindex;
-        const own_kv = md == .full;
+        // the decoder replay skips the kv source's compressor (blocks.Context.comp_done: the encoder pass stored it)
+        const own_kv = md == .full and s.part != .decoder;
         // the x projections (wq_a, wkv, a KV source's compressor), each its own matmul
         const qa = try e.buf("L.qa", .{}, .bf16, &.{ n, e.cfg.q_lora });
         const kva = try e.buf("L.kva", .{}, .bf16, &.{ n, hd });
         try s.proj(try e.fmt("L{d}.attn.wq_a", .{L}), .lanes, x, D, e.cfg.q_lora, qa);
         try s.proj(try e.fmt("L{d}.attn.wkv", .{L}), .lanes, x, D, hd, kva);
-        var projection: Arg = undefined;
-        if (own_kv) {
-            // blocks._projection: fp32 rows (ratio 2: [kv | gate], kept for the commit's carry)
-            const cw = try e.buf("L.comp", .{}, .bf16, &.{ n, hd });
-            try s.proj(try e.fmt("L{d}.attn.comp_wkv", .{L}), .lanes, x, D, hd, cw);
-            if (ratio == 2) {
-                const cg = try e.buf("L.comp_gate", .{}, .bf16, &.{ n, hd });
-                try s.proj(try e.fmt("L{d}.attn.comp_wgate", .{L}), .lanes, x, D, hd, cg);
-                projection = try e.buf("w.L{d}.proj", .{L}, .f32, &.{ n, 2 * hd });
-                try e.glue("proj", &.{ cw, cg, projection });
-            } else {
-                projection = try e.buf("L.proj", .{}, .f32, &.{ n, hd });
-                try e.glue("proj", &.{ cw, projection });
-            }
-        }
+        const cproj: Arg = if (own_kv) try s.compProj(L) else undefined;
         const qn = try e.buf("L.qn", .{}, .bf16, &.{ n, e.cfg.q_lora });
         const kv = try e.buf("L.kv", .{}, .bf16, &.{ n, hd });
         try e.triton("_rms2", .{ n, 2, 1 }, &.{
@@ -713,7 +736,7 @@ const Seg = struct {
         const ring0 = 2 * W;
         if (s.staged) try e.glue("stage_in", &.{ rows[0], rows[1], .{ .i = s.ring }, slot[0], slot[1], .{ .i = ring0 }, .{ .i = @max(0, e.start - W + 1) }, .{ .i = e.start } });
         try s.kvStore(kv, rows, 0);
-        if (own_kv) try s.compress(L, projection);
+        if (own_kv) try s.compress(L, cproj);
         if (indexer) try s.select(L);
         // the fused prefill core over the SWA ring and (a compressed layer) the source's pool at the latest selection
         const groups: i64 = e.cfg.o_groups / e.o.world;
@@ -982,18 +1005,30 @@ const Seg = struct {
         const e = s.e;
         const n = e.n;
         const D: i64 = e.cfg.hidden;
-        try e.glue("positions", &.{ try pos(e), try e.buf("w.pos64", .{}, .i64, &.{n}), try e.buf("w.lo", .{}, .i32, &.{n}) });
-        try e.glue("embed", &.{ try e.streams(), try e.buf("w.recv.moe", .{}, .bf16, &.{ e.o.world, n, D }) });
+        if (s.part == .decoder) {
+            // replay.finish: every row's window starts at the pass's first row R0 (ctx.lo), and the rows entering the
+            // decoder come from the stash (its Streams: the streams, the normed input, coefficient set 0)
+            try e.glue("positions", &.{ try pos(e), try e.buf("w.pos64", .{}, .i64, &.{n}), try e.buf("w.lo", .{}, .i32, &.{n}), .{ .i = e.start } });
+            const st = try stashArgs(e);
+            try e.glue("ced_load", &st);
+        } else {
+            try e.glue("positions", &.{ try pos(e), try e.buf("w.pos64", .{}, .i64, &.{n}), try e.buf("w.lo", .{}, .i32, &.{n}) });
+            try e.glue("embed", &.{ try e.streams(), try e.buf("w.recv.moe", .{}, .bf16, &.{ e.o.world, n, D }) });
+        }
         for (layers, 0..) |L, i| {
             if (i > 0) e.begin = .layer;
             e.layer_ratio = e.cfg.compressRatio(L);
-            if (i == 0 or e.cfg.isEngram(L)) {
+            if (s.part == .decoder and i == 0) {
+                // entered (forward._layers): the first block's attention site is the stash's
+            } else if (i == 0 or e.cfg.isEngram(L)) {
                 // the run's first block, or an Engram block: the last exchange's post alone, Engram, then a site that
                 // collapses with the previous coefficients' pre
                 if (i > 0) try s.postOnly(try e.streams());
                 if (e.cfg.isEngram(L)) try s.engram(L);
                 try s.site(L, "hc_attn", if (i == 0) .site1 else .site2);
             } else try s.site(L, "hc_attn", .boundary);
+            // CED's encoder pass stops at the decoder's first layer once its site and compressor ran (`upto`)
+            if (s.part == .encoder and i + 1 == layers.len) return s.encoderEnd(L);
             try s.attention(L);
             if (s.short) try e.prefetchF(L);
             try e.glue("exchange", &.{ try e.buf("L.part", .{}, .bf16, &.{ n, D }), try s.recv("attn") });
@@ -1011,9 +1046,41 @@ const Seg = struct {
     }
 };
 
+/// The CED stash glue's tensors (ced_stash / ced_load): the run's streams, normed input and current coefficient set,
+/// then the ring's roles (ced.roles, `ced.ring` rows; position p at row p % ring).
+fn stashArgs(e: *E) ![10]Arg {
+    const D: i64 = e.cfg.hidden;
+    const R: i64 = ced.ring;
+    const c = try Seg.coefs(e, e.coef);
+    return .{
+        try e.streams(),                                      try e.buf("w.out", .{}, .bf16, &.{ e.n, D }),
+        c[0],                                                 c[1],
+        c[2],                                                 try e.buf(ced.roles[0], .{}, .bf16, &.{ R, 4 * D }),
+        try e.buf(ced.roles[1], .{}, .bf16, &.{ R, D }),      try e.buf(ced.roles[2], .{}, .f32, &.{ R, 4 }),
+        try e.buf(ced.roles[3], .{}, .f32, &.{ R, 4 }),       try e.buf(ced.roles[4], .{}, .f32, &.{ R, 16 }),
+    };
+}
+
+/// A prefill program's part: a whole segment, or one of CED replay's passes (ced.zig).
+pub const Part = enum { whole, encoder, decoder };
+
+/// CED replay's programs (TF_DSV41_PREFILL=replay, ced.zig), `n` rows from `start`:
+/// - `.encoder`: a prompt segment over `layers` (0 .. D, D last: the decoder's first layer), D only to its attention
+///   site and compressor, then the stash glue; no head (replay.encode: run(upto=D), logits off);
+/// - `.decoder`: layers D .. from D's attention (`layers[0]` = D), its compressor skipped, every window from `start`
+///   (= R0), the rows entering D from the stash, the boundaries in place, no final norm or head (replay.finish).
+pub fn emitReplay(a: std.mem.Allocator, cfg: *const Config, w: *const block.Widths, o: block.Options, layers: []const u32, n: i64, start: i64, part: Part) ![]calls.Call {
+    if (layers.len == 0) return error.Unsupported;
+    return emitPart(a, cfg, w, o, layers, n, start, part == .whole, part);
+}
+
 /// The calls of a prefill segment of `n` rows from position `start` over `layers` (ascending, consecutive), and the
 /// final norm + head when `head` (arena-owned by `a`).
 pub fn emitPrefill(a: std.mem.Allocator, cfg: *const Config, w: *const block.Widths, o: block.Options, layers: []const u32, n: i64, start: i64, head: bool) ![]calls.Call {
+    return emitPart(a, cfg, w, o, layers, n, start, head, .whole);
+}
+
+fn emitPart(a: std.mem.Allocator, cfg: *const Config, w: *const block.Widths, o: block.Options, layers: []const u32, n: i64, start: i64, head: bool, part: Part) ![]calls.Call {
     if (n < 1 or n > o.prefill_rows or n > router_chunk) return error.Unsupported;
     var e: E = .{ .a = a, .cfg = cfg, .w = w, .o = o, .n = n, .start = start };
     const W: i64 = cfg.window;
@@ -1022,7 +1089,7 @@ pub fn emitPrefill(a: std.mem.Allocator, cfg: *const Config, w: *const block.Wid
     const stage: i64 = @intCast(std.math.ceilPowerOfTwo(u64, @intCast(o.prefill_rows + W - 1)) catch return error.Unsupported);
     const ring = if (staged) stage else 2 * W;
     if (ring < n + W - 1) return error.Unsupported; // attn_pf: the ring must hold the rows and their windows
-    var s: Seg = .{ .e = &e, .staged = staged, .ring = ring, .short = n <= 16 };
+    var s: Seg = .{ .e = &e, .staged = staged, .ring = ring, .short = n <= 16, .part = part };
     try s.run(layers, head);
     return e.out.items;
 }

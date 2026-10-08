@@ -5,6 +5,9 @@
 //!   ("s.L<i>.swa.v" / ".s"), the ratio-2 carries ("s.L<i>.carry"), the position and the Engram tail. A RAM entry keeps
 //!   a host copy; a park writes the same pieces as named blobs next to the entry's pages;
 //! - `save`: an entry for the slot's committed ids (its pages shared, not copied), then the slot lets go of its pages;
+//! - CED replay (TF_DSV41_PREFILL=replay, ced.zig): no turn entries; `savePrompt` keeps an entry at the prompt's
+//!   replay point while the slot goes on prefilling, its bounded state with the stash ring ("s.ced.*") and the stash's
+//!   positions and ids; replay entries carry their own tag (ced.tag), so full and replay entries never resume each other;
 //! - `resume`: the longest saved entry that strictly prefixes a prompt, from RAM (full pages adopted, the partial last one
 //!   copied) or NVMe (streamed into fresh pages through the staging set), its bounded state uploaded: the slot continues at
 //!   the entry's position, and the caller prefills the rest of the prompt;
@@ -24,6 +27,7 @@ const fwd = @import("forward.zig");
 const eh = @import("engram_host.zig");
 const kvs = @import("kv_state.zig");
 const buffers = @import("buffers.zig");
+const ced = @import("ced.zig");
 
 const sessions = kv.sessions;
 const Store = sessions.Store;
@@ -97,6 +101,11 @@ pub const Sessions = struct {
                 s.bounded_bytes += len;
             }
         }
+        // CED replay: the stash ring (planned in replay mode only)
+        for (ced.roles) |role| if (plan.sizes.get(role)) |len| {
+            try list.append(s.names.allocator(), .{ .role = role, .addr = f.runner.addressOf(role) orelse return error.Unbound, .len = len });
+            s.bounded_bytes += len;
+        };
         s.pieces = list.items;
         if (o.disk) |root| {
             // the tier's compat ident: the families' layout, the split and this rank (a file is one rank's rows)
@@ -110,7 +119,7 @@ pub const Sessions = struct {
         }
         errdefer if (s.disk) |d| d.close();
         s.store = try Store.init(gpa, io, &kx.pool, kx.dev.store(), s.disk, .{ .ram_bytes = o.ram_bytes, .chats = o.resident, .resident_bytes = o.resident_bytes });
-        f.sess = .{ .ptr = s, .commit = commitFn, .save = saveFn, .restore = restoreFn, .reset = resetFn };
+        f.sess = .{ .ptr = s, .commit = commitFn, .save = saveFn, .restore = restoreFn, .reset = resetFn, .prompt = promptFn };
         return s;
     }
 
@@ -122,6 +131,11 @@ pub const Sessions = struct {
     fn saveFn(ptr: *anyopaque) anyerror!void {
         const s: *Sessions = @ptrCast(@alignCast(ptr));
         _ = try s.save();
+    }
+
+    fn promptFn(ptr: *anyopaque) anyerror!void {
+        const s: *Sessions = @ptrCast(@alignCast(ptr));
+        _ = try s.savePrompt();
     }
 
     fn resetFn(ptr: *anyopaque) anyerror!void {
@@ -152,6 +166,7 @@ pub const Sessions = struct {
         pos: u64,
         tail: [eh.max_ngram]u32,
         tail_len: usize,
+        stash: ced.Stash,
 
         fn bounded(p: *Snap) sessions.store.Bounded {
             return .{ .ptr = p, .vtable = &.{ .nbytes = nbytes, .blobs = blobs, .release = release } };
@@ -172,11 +187,16 @@ pub const Sessions = struct {
                 b.* = .{ .name = try gpa.dupe(u8, pc.role), .bytes = try gpa.dupe(u8, p.bytes[at..][0..pc.len]) };
                 at += pc.len;
             }
-            var slot: [8 + 4 * eh.max_ngram + 8]u8 = undefined;
+            var slot: [slot_bytes]u8 = undefined;
             std.mem.writeInt(u64, slot[0..8], p.pos, .little);
             std.mem.writeInt(u64, slot[8..16], p.tail_len, .little);
             for (0..eh.max_ngram) |i| std.mem.writeInt(u32, slot[16 + 4 * i ..][0..4], if (i < p.tail_len) p.tail[i] else 0, .little);
-            out[ps.len] = .{ .name = try gpa.dupe(u8, "slot"), .bytes = try gpa.dupe(u8, slot[0 .. 16 + 4 * eh.max_ngram]) };
+            // CED: the stash's positions and ids (a full-mode entry's are zeros)
+            const c = slot[ced_at..];
+            std.mem.writeInt(u64, c[0..8], p.stash.from, .little);
+            std.mem.writeInt(u64, c[8..16], p.stash.hi, .little);
+            for (p.stash.ids, 0..) |t, i| std.mem.writeInt(u32, c[16 + 4 * i ..][0..4], t, .little);
+            out[ps.len] = .{ .name = try gpa.dupe(u8, "slot"), .bytes = try gpa.dupe(u8, &slot) };
             return out;
         }
 
@@ -188,13 +208,18 @@ pub const Sessions = struct {
         }
     };
 
+    /// The "slot" blob: position, tail length, the tail; then (CED) the stash's from / hi and its ids. Entries parked
+    /// before the stash fields have the short form (their stash is empty).
+    const ced_at: usize = 16 + 4 * eh.max_ngram;
+    const slot_bytes: usize = ced_at + 16 + 4 * ced.ring;
+
     /// The slot's bounded state now (device to host, after the stream's work).
     fn snapshot(s: *Sessions) !*Snap {
         const r = s.f.runner;
         try r.stream.synchronize();
         const p = try s.gpa.create(Snap);
         errdefer s.gpa.destroy(p);
-        p.* = .{ .owner = s, .bytes = try s.gpa.alloc(u8, s.bounded_bytes), .pos = s.f.slot.pos, .tail = s.f.slot.tail, .tail_len = s.f.slot.tail_len };
+        p.* = .{ .owner = s, .bytes = try s.gpa.alloc(u8, s.bounded_bytes), .pos = s.f.slot.pos, .tail = s.f.slot.tail, .tail_len = s.f.slot.tail_len, .stash = s.f.slot.ced };
         var at: usize = 0;
         for (s.pieces) |pc| {
             try cuda.DeviceBuffer.download(.{ .d = r.d, .ptr = pc.addr, .len = pc.len }, 0, p.bytes[at..][0..pc.len]);
@@ -213,6 +238,7 @@ pub const Sessions = struct {
         s.f.slot.pos = p.pos;
         s.f.slot.tail = p.tail;
         s.f.slot.tail_len = p.tail_len;
+        s.f.slot.ced = p.stash;
     }
 
     fn uploadBlobs(s: *Sessions, bs: []const Blob) !void {
@@ -223,6 +249,13 @@ pub const Sessions = struct {
                 s.f.slot.pos = std.mem.readInt(u64, b.bytes[0..8], .little);
                 s.f.slot.tail_len = @intCast(std.mem.readInt(u64, b.bytes[8..16], .little));
                 for (0..eh.max_ngram) |i| s.f.slot.tail[i] = std.mem.readInt(u32, b.bytes[16 + 4 * i ..][0..4], .little);
+                s.f.slot.ced = .{};
+                if (b.bytes.len >= slot_bytes) {
+                    const c = b.bytes[ced_at..];
+                    s.f.slot.ced.from = std.mem.readInt(u64, c[0..8], .little);
+                    s.f.slot.ced.hi = std.mem.readInt(u64, c[8..16], .little);
+                    for (&s.f.slot.ced.ids, 0..) |*t, i| t.* = std.mem.readInt(u32, c[16 + 4 * i ..][0..4], .little);
+                }
                 continue;
             }
             const pc = for (s.pieces) |pc| {
@@ -242,7 +275,7 @@ pub const Sessions = struct {
         try s.f.sendSess(.save, 0);
         if (s.history.items.len == 0) return null;
         const snap = try s.snapshot();
-        const id = s.store.save(s.kx.slot, snap.bounded(), s.history.items, 0, 0) catch |e| {
+        const id = s.store.save(s.kx.slot, snap.bounded(), s.history.items, s.tag(), 0) catch |e| {
             Snap.release(snap);
             return e;
         };
@@ -250,6 +283,30 @@ pub const Sessions = struct {
         // the residency budget past the save: the least recently used chats parked (streamed) or dropped
         try s.store.settleAll();
         return id;
+    }
+
+    /// CED replay's prompt snapshot (batch.py `save_at`, rounds.py `_save(slot, "prompt")`): an entry for the committed
+    /// ids at the slot's position (the prompt's replay point), its bounded state with the stash; the slot keeps its
+    /// pages and goes on prefilling (it only writes positions past the entry's, which a resume rewrites before reading).
+    pub fn savePrompt(s: *Sessions) !?u32 {
+        if (s.history.items.len != s.f.slot.pos or s.f.slot.pending != null or s.f.slot.ced.hi != s.f.slot.pos) return error.BadWindow;
+        try s.f.sendSess(.prompt, 0);
+        if (s.history.items.len == 0) return null;
+        const snap = try s.snapshot();
+        const id = s.store.save(s.kx.slot, snap.bounded(), s.history.items, s.tag(), prompt_kind) catch |e| {
+            Snap.release(snap);
+            return e;
+        };
+        try s.store.settleAll();
+        return id;
+    }
+
+    /// sessions.Entry.kind: a prompt's replay point (a turn's end is 0)
+    const prompt_kind: u32 = 1;
+
+    /// The entries' tag (sessions.Tag's CED field): replay entries never resume full ones, nor full ones replay's.
+    fn tag(s: *const Sessions) u32 {
+        return if (s.f.prefill_state.mode == .replay) ced.tag else 0;
     }
 
     /// The slot empty, its pages back (a session entry may hold them).
@@ -266,7 +323,7 @@ pub const Sessions = struct {
         const ids = try s.gpa.alloc(i32, prompt.len);
         defer s.gpa.free(ids);
         for (ids, prompt) |*d, t| d.* = @intCast(t);
-        const hit = (try s.store.find(0, ids)) orelse return 0;
+        const hit = (try s.store.find(s.tag(), ids)) orelse return 0;
         if (hit.pos >= prompt.len) return 0; // a row must remain to prefill (strict prefixes only)
         try s.f.sendSess(.restore, hit.id);
         try s.restore(hit.id);

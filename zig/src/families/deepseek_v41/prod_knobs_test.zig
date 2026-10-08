@@ -11,6 +11,11 @@ const check = @import("m1_check.zig");
 const pk = @import("prod_knobs.zig");
 const Config = @import("config.zig").Config;
 
+// CED replay's programs on the same emitter (TF_DSV41_PREFILL=replay)
+test {
+    _ = @import("ced_test.zig");
+}
+
 const Fake = struct {
     var pairs: []const [2][]const u8 = &.{};
     fn get(name: []const u8) ?[]const u8 {

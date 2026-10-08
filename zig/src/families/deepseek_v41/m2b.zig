@@ -375,7 +375,16 @@ fn ownPrefill(gpa: std.mem.Allocator, io: std.Io, a: std.mem.Allocator, f: *fwd.
     // verify = Python's server, the last token as a one-row decode window kept after its choice
     const shape: pk.PromptTail = if (meta.object.get("prompt_tail")) |v| std.meta.stringToEnum(pk.PromptTail, v.string) orelse return error.BadPromptTail else .prefill;
     const sp = pk.promptSplit(prompt.len, shape);
+    // the reference's prefill mode (ref.json "prefill", dsv41_m2b_ref.py --prefill; older references: full): CED replay
+    // needs TF_DSV41_PREFILL=replay on these ranks too (their buffer plan holds its programs) and the served shape
+    const mode: pk.PrefillMode = if (meta.object.get("prefill")) |v| std.meta.stringToEnum(pk.PrefillMode, v.string) orelse return error.BadPrefillMode else .full;
+    if (mode != f.prefill_state.mode or (mode == .replay and shape != .verify)) {
+        std.log.err("M2B_PREFILL: the reference prefilled in {t} mode (prompt tail {t}), these ranks run TF_DSV41_PREFILL={t}; replay needs both and the verify tail", .{ mode, shape, f.prefill_state.mode });
+        return error.PrefillMode;
+    }
     try f.prefill(prompt[0..sp.prefill]);
+    // CED: the decoder replay over the prompt's tail before the verify row (full mode: nothing)
+    try f.finishPrompt();
     if (sp.window > 0) try f.window(prompt[sp.prefill..]);
     // the prompt's choice: the window's row, or the last chunk's last row
     const seg: usize = @intCast(f.opts.prefill_rows);

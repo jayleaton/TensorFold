@@ -9,6 +9,11 @@ this host's rope tables.
     python dsv41_m2b_ref.py --pack PACK --out DIR [--layers 0-27] [--prompt 1536] [--steps 64] [--port 29611]
 Writes DIR/ref.json, DIR/rank<r>/state/*, DIR/rope.bin, DIR/aot/.
 
+``--prefill replay`` (with ``--prompt-tail verify``): the prompt as prod prefills it under ``TF_DSV41_PREFILL=replay``
+(CED bounded replay, ``replay.py``): the encoder pass over [0, n - 1), the decoder over the prefilled tail from the
+stash, the last token a verify row; ``--aot-prompts`` then run that way too (the decoder pass's Triton variants).
+ref.json records ``"prefill"``; the Zig gate (``M2B_PREFILL``) needs ``TF_DSV41_PREFILL=replay`` on its ranks.
+
 ``--prompts 2060,2049,...`` (both ranks on this host): one load, each prompt from a fresh slot (Forward.new_slot, the
 stores zeroed as a new Forward's) into DIR/p<N>/, a whole reference dir each (the AOT set and rope tables of every
 prompt's kernels in each).
@@ -176,6 +181,44 @@ def rank_main(rank: int, a) -> None:
                 print(f"profile: {n}-row windows {prof['rows'][str(n)]['ms_mean']:.3f} ms mean, "
                       f"kernels {sum(v['ms'] for v in ks.values()):.3f} ms a window", flush=True)
         (Path(a.out) / f"prof-rank{rank}.json").write_text(json.dumps(prof, indent=1) + "\n")
+    # --profile-prefill N: after the run, the gate's prompt shape (N ids from --seed, as ``one``; served_prompt with
+    # --prompt-tail / --prefill) from a fresh slot: once to warm (Triton JIT), once timed (wall, the stream synced),
+    # once under torch.profiler (CUDA kernel time by name), into DIR/prof-rank<r>.json's "prefill": the full
+    # prefill's Python side of TF_DSV41_PROFILE's "prefill" (tf-dsv41-m1 m2b with M2B_PREFILL=1; gap.py prefill)
+    if a.profile_prefill:
+        if kv is not None:
+            raise SystemExit("--profile-prefill: the contiguous slot only (no --pool / --split / --park)")
+        from torch.profiler import ProfilerActivity, profile as tprofile
+
+        g = torch.Generator().manual_seed(a.seed)
+        ids = torch.randint(3, cfg.vocab_size, (a.profile_prefill,), generator=g).tolist()
+
+        def prefill_once():
+            fw.slots[0] = fw.new_slot(contiguous=True)
+            torch.cuda.synchronize()
+            t1 = time.perf_counter()
+            served_prompt(fw, Seg, ids, a.prompt_tail, a.prefill)
+            torch.cuda.synchronize()
+            return (time.perf_counter() - t1) * 1e3
+
+        prefill_once()
+        wall = prefill_once()
+        with tprofile(activities=[ProfilerActivity.CUDA]) as pr:
+            prefill_once()
+        ks = {}
+        for ev in pr.key_averages():
+            t = getattr(ev, "device_time_total", None) or getattr(ev, "cuda_time_total", 0)
+            if t:
+                ks[ev.key] = {"calls": ev.count, "ms": t / 1e3}
+        f = Path(a.out) / f"prof-rank{rank}.json"
+        doc = json.loads(f.read_text()) if f.exists() else {}
+        doc["prefill"] = {"rows": len(ids), "segments": -(-len(ids) // fw.pchunk), "wall_ms": wall,
+                          "gpu_ms": sum(v["ms"] for v in ks.values()), "prompt_tail": a.prompt_tail,
+                          "prefill": a.prefill, "kernels": ks}
+        f.write_text(json.dumps(doc, indent=1) + "\n")
+        if rank == 0:
+            print(f"profile: prefill of {len(ids)} ({a.prefill}, tail {a.prompt_tail}) {wall:.1f} ms wall, "
+                  f"kernels {doc['prefill']['gpu_ms']:.1f} ms", flush=True)
     # --sampled (dsq-zig-samp-1): the keyed sampling gate's reference on this load (dsv41_samp_ref.run_cases: its prompts
     # from fresh slots, serial sampled decoding, DIR/samp/trace.jsonl for tf-dsv41-m1 generate); before the AOT dump, so
     # its prompt lengths' Triton variants are in the set
@@ -211,6 +254,11 @@ def rank_main(rank: int, a) -> None:
         tok = int(greedy(fw, fw.prompt(ids)[-1:])[0])
         fw.run([Seg(0, fw.slot.pos, (tok,))])
         fw.keep(0, 0)
+        if a.prefill == "replay":       # the replay's passes at this length too (encoder segments, the decoder's tail)
+            fw.slots[0] = fw.new_slot(contiguous=True)
+            tok = int(greedy(fw, replay_prompt(fw, Seg, ids))[0])
+            fw.run([Seg(0, fw.slot.pos, (tok,))])
+            fw.keep(0, 0)
         torch.cuda.synchronize()
         if rank == 0:
             print(f"aot prompt of {n}: done", flush=True)
@@ -282,16 +330,44 @@ def decode(fw, greedy, Seg, digest, tok, steps, kv, trace) -> tuple[list, list, 
     return tokens, digests, layers_d
 
 
-def served_prompt(fw, Seg, ids, tail: str = "prefill"):
+def served_prompt(fw, Seg, ids, tail: str = "prefill", prefill: str = "full"):
     """The prompt's choice logits [1, V / W] in ``tail``'s shape (the Zig side: prod_knobs.PromptTail). ``verify``:
     prod's server (batch.py ``_pieces`` / ``finals``, rounds.py) prefills [0, n - 1) and runs the last token as the
     pending row of the reply's first verify window, a decode row (decode kernels, the decode expert top-p, R1), kept
-    whole; ``prefill``: Forward.prompt, every row prefilled (every reference before this option)."""
+    whole; ``prefill``: Forward.prompt, every row prefilled (every reference before this option). ``prefill`` =
+    ``replay``: the verify shape with CED's bounded replay (``replay_prompt``)."""
 
+    if prefill == "replay":
+        if tail != "verify":
+            raise ValueError("--prefill replay: prod's server shape only (--prompt-tail verify)")
+        return replay_prompt(fw, Seg, ids)
     if tail == "prefill":
         return fw.prompt(ids)[-1:]
     if len(ids) > 1:
         fw.prompt(ids[:-1])
+    lg = fw.run([Seg(0, fw.slot.pos, (ids[-1],))])
+    fw.keep(0, 0)
+    return lg[-1:]
+
+
+def replay_prompt(fw, Seg, ids):
+    """``TF_DSV41_PREFILL=replay`` as prod's server runs it (``slots.SlotsForward.prefill(mode="replay")`` then
+    ``finish_prompt``, rounds.py): ``replay.encode`` over the pieces [0, n - 1) in ``pchunk`` segments (layers 0-19 and
+    layer 20's site and compressor, the stash), ``replay.finish`` over the prefilled tail [max(0, n - 128), n - 1)
+    (layers 20-39 from the stash, windows from R0), then the last token as the reply's first verify row, kept whole.
+    The Zig side: ced.zig (Forward.prefill in replay mode, then Forward.finishPrompt)."""
+
+    from tensorfold.families.deepseek_v41.cuda import replay as RP
+    from tensorfold.families.deepseek_v41.cuda.protocol import REPLAY, Piece
+    from tensorfold.families.deepseek_v41.cuda.slots import prefill_runs
+
+    if not isinstance(getattr(fw, "stash", None), dict):    # a plain Forward: SlotsForward's stash dict
+        fw.stash = {}
+    fw.stash.pop(0, None)
+    n, pos = len(ids), fw.slot.pos
+    if n > 1:
+        RP.encode(fw, prefill_runs([Piece(0, pos, tuple(ids[:-1]))], fw.pchunk))
+        RP.finish(fw, 0, pos + n - 1, tuple(ids[max(0, n - REPLAY):n - 1]))
     lg = fw.run([Seg(0, fw.slot.pos, (ids[-1],))])
     fw.keep(0, 0)
     return lg[-1:]
@@ -308,11 +384,11 @@ def one(rank, a, fw, cfg, greedy, Seg, digest, prompt, out, lo, hi, t0, load_s, 
     g = torch.Generator().manual_seed(a.seed)
     ids = torch.randint(3, cfg.vocab_size, (prompt,), generator=g).tolist()
     t1 = time.time()
-    logits = served_prompt(fw, Seg, ids, a.prompt_tail)
+    logits = served_prompt(fw, Seg, ids, a.prompt_tail, a.prefill)
     tok = int(greedy(fw, logits[-1:])[0])
     torch.cuda.synchronize()
     if rank == 0:
-        print(f"prompt of {prompt} at {time.time() - t0:.0f} s, first token {tok} (tail {a.prompt_tail})", flush=True)
+        print(f"prompt of {prompt} at {time.time() - t0:.0f} s, first token {tok} (tail {a.prompt_tail}, prefill {a.prefill})", flush=True)
     # the slot after the prompt, by our forward's role names (block.zig: s.L<i>.swa / comp .v .s, .ik, .carry)
     sd = out / f"rank{rank}" / "state"
     sd.mkdir(parents=True, exist_ok=True)
@@ -354,7 +430,8 @@ def one(rank, a, fw, cfg, greedy, Seg, digest, prompt, out, lo, hi, t0, load_s, 
             fw.keep(0, n - 1)
     torch.cuda.synchronize()
     mine = {"rank": rank, "load_s": round(load_s, 1), "run_s": round(time.time() - t1, 1), "tokens": tokens,
-            "logits_sha256": digests, "layers_first_window": layers_d, "prompt_ids": ids, "prompt_tail": a.prompt_tail}
+            "logits_sha256": digests, "layers_first_window": layers_d, "prompt_ids": ids, "prompt_tail": a.prompt_tail,
+            "prefill": a.prefill}
     (out / f"rank{rank}.json").write_text(json.dumps(mine) + "\n")
 
 
@@ -436,6 +513,9 @@ def main() -> int:
                     "not the index function")
     ap.add_argument("--engram-make", action="store_true", help="write --engram-dir first: sparse shards, records under the prompts' rows")
     ap.add_argument("--profile", default="", help="row counts (\"1 4 8\"): time windows of each after the run")
+    ap.add_argument("--profile-prefill", type=int, default=0,
+                    help="after the run: an N-id prompt (the gate's ids at N = --prompt) prefilled from a fresh slot, timed "
+                         "and under torch.profiler, into DIR/prof-rank<r>.json's \"prefill\" (gap.py prefill)")
     ap.add_argument("--aot-prompts", type=lambda v: [int(x) for x in v.split(",") if x], default=[],
                     help="more prompt lengths after the run, for their Triton variants only (e.g. 1,9,17,45,64,65,173,300,1025,2049,2600)")
     ap.add_argument("--aot-taps", action="store_true",
@@ -446,6 +526,9 @@ def main() -> int:
     ap.add_argument("--prompt-tail", choices=("prefill", "verify"), default="prefill",
                     help="verify: the prompt as prod's server runs it ([0, n - 1) prefilled, the last token a decode row; "
                          "the Zig side's TF_DSV41_PROMPT_TAIL default); prefill: Forward.prompt (contiguous slot only)")
+    ap.add_argument("--prefill", choices=("full", "replay"), default="full",
+                    help="replay: prod's TF_DSV41_PREFILL=replay (CED bounded replay; needs --prompt-tail verify); the Zig "
+                         "prefill gate's ranks then need TF_DSV41_PREFILL=replay")
     ap.add_argument("--grammar", action="store_true",
                     help="also the structured-output gate's replies (dsv41_grammar/grammar_ref.py) into DIR/grammar/trace.jsonl")
     ap.add_argument("--sampled", action="store_true",
@@ -466,6 +549,8 @@ def main() -> int:
     a.kv = "split" if a.split else ("pool" if a.pool or a.park else "contig")
     if a.prompt_tail == "verify" and a.kv != "contig":
         ap.error("--prompt-tail verify: the contiguous slot only (one_kv prefills with Forward.prompt)")
+    if a.prefill == "replay" and a.prompt_tail != "verify":
+        ap.error("--prefill replay: prod's server shape only (--prompt-tail verify)")
     if a.compact is not None:
         if not a.split:
             ap.error("--compact needs --split")
@@ -484,7 +569,7 @@ def main() -> int:
             ranks[a.rank] = {k: mine[k] for k in ("load_s", "run_s", "logits_sha256", "layers_first_window")}
             meta = {"layers": a.layers, "prompt": prompt, "steps": a.steps, "seed": a.seed, "limit": a.limit,
                     "tokens": mine["tokens"], "prompt_ids": mine["prompt_ids"], "host_rank": a.rank,
-                    "prompt_tail": mine.get("prompt_tail", "prefill"),
+                    "prompt_tail": mine.get("prompt_tail", "prefill"), "prefill": mine.get("prefill", "full"),
                     "env": {k: v for k, v in os.environ.items() if k.startswith("TF_DSV41")}, "ranks": ranks}
             if a.kv != "contig":
                 meta["kv"] = a.kv
@@ -507,6 +592,7 @@ def main() -> int:
             continue
         meta = {"layers": a.layers, "prompt": prompt, "steps": a.steps, "seed": a.seed, "limit": a.limit,
                 "tokens": r0["tokens"], "prompt_ids": r0["prompt_ids"], "prompt_tail": r0.get("prompt_tail", "prefill"),
+                "prefill": r0.get("prefill", "full"),
                 "env": {k: v for k, v in os.environ.items() if k.startswith("TF_DSV41")},
                 "ranks": [{k: r[k] for k in ("load_s", "run_s", "logits_sha256", "layers_first_window")} for r in (r0, r1)]}
         if a.kv != "contig":            # M5: the pool mode, the exchange's counts, the park round trip a rank

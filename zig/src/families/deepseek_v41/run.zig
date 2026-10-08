@@ -29,6 +29,23 @@ pub const Runner = struct {
     glue: ?Glue = null,
     /// TF_DSV41_PROFILE: the eager decode windows' calls timed (profile.zig)
     prof: ?*profile.Profile = null,
+    /// TF_DSV41_L2PF (l2pf.zig): the L2 prefetch launches on a side stream forked at their site and joined at the
+    /// window's end, as l2pf.py; null: skipped (their tables unfilled)
+    l2pf: ?*Side = null,
+    /// rows of the window being issued (0: unknown): a window wider than `Side.rows` skips every prefetch site
+    rows: u32 = 0,
+
+    /// l2pf.py's Prefetcher on the device: the side stream, the fork / join events, whether a fork is open.
+    pub const Side = struct {
+        stream: cuda.Stream,
+        fork: cuda.Event,
+        join: cuda.Event,
+        /// TF_DSV41_L2PF_ROWS (16): wider windows skip every site
+        rows: u32 = 16,
+        open: bool = false,
+        launches: u64 = 0,
+        skipped_rows: u64 = 0,
+    };
 
     pub const Glue = struct {
         ctx: *anyopaque,
@@ -112,10 +129,36 @@ pub const Runner = struct {
         };
     }
 
-    /// Issues one call on the runner's stream. The L2 prefetchers are skipped until their address tables are built
-    /// (they change no bits; R-perf work).
+    /// Issues one call on the runner's stream. The L2 prefetchers (they read weights into L2 and write nothing) go to
+    /// the side stream, forked here so they start after every launch before them (l2pf.py `mark`); without
+    /// TF_DSV41_L2PF they are skipped.
     pub fn issue(r: *Runner, c: *const calls.Call) !void {
-        if (std.mem.startsWith(u8, c.name, "tf_dsv41_l2p")) return;
+        if (std.mem.startsWith(u8, c.name, "tf_dsv41_l2p")) {
+            const p = r.l2pf orelse return;
+            if (r.rows > p.rows) {
+                p.skipped_rows += 1;
+                return;
+            }
+            try p.fork.record(r.stream);
+            try p.stream.wait(p.fork);
+            p.open = true;
+            p.launches += 1;
+            return r.issueOn(p.stream, c);
+        }
+        return r.issueOn(r.stream, c);
+    }
+
+    /// The main stream waits for the side stream's prefetches (l2pf.py `join`): every window joins before it returns,
+    /// so a captured graph holds no open fork.
+    pub fn join(r: *Runner) !void {
+        const p = r.l2pf orelse return;
+        if (!p.open) return;
+        p.open = false;
+        try p.join.record(p.stream);
+        try r.stream.wait(p.join);
+    }
+
+    fn issueOn(r: *Runner, stream: cuda.Stream, c: *const calls.Call) !void {
         if (c.glue) {
             const g = r.glue orelse return error.NoGlue;
             return g.run(g.ctx, r, c);
@@ -128,20 +171,24 @@ pub const Runner = struct {
             for (r.triton.variants) |v| if (std.mem.eql(u8, v.spec.@"fn", c.name)) try mine.append(a, v.spec);
             const sp = try tc.split(a, c, mine.items, .{ .ctx = @constCast(r), .of = addrOf });
             const g = c.grid;
-            return r.triton.run(r.stream, c.name, .{ @intCast(g[0]), @intCast(g[1]), @intCast(g[2]) }, sp.args, sp.consts);
+            return r.triton.run(stream, c.name, .{ @intCast(g[0]), @intCast(g[1]), @intCast(g[2]) }, sp.args, sp.consts);
         }
         const dot = std.mem.lastIndexOfScalar(u8, c.name, '.') orelse return error.BadName;
         const args = try a.alloc(rp.Arg, c.args.len);
         for (c.args, args) |x, *y| y.* = try r.extArg(a, x.arg);
         var scratch: rp.Scratch = .{ .ptr = r.scratch.?.ptr, .len = r.scratch.?.len };
-        if (!try rp.call(r.kernels, r.stream, c.name[0..dot], c.name[dot + 1 ..], args, &.{}, &scratch)) return error.NoBinding;
+        if (!try rp.call(r.kernels, stream, c.name[0..dot], c.name[dot + 1 ..], args, &.{}, &scratch)) return error.NoBinding;
     }
 
     /// Issues a window's calls in order. TF_DSV41_SYNC_EACH=1 (diagnosis): the stream synced after every call, and a
     /// failing call named with its index and row count (an asynchronous fault otherwise surfaces windows later).
     pub fn window(r: *Runner, cs: []const calls.Call) !void {
         if (syncEach()) return r.windowChecked(cs);
+        errdefer if (r.l2pf) |p| {
+            p.open = false; // a failed window (or capture) leaves no fork for the next one to join
+        };
         for (cs) |*c| try r.issue(c);
+        try r.join();
     }
 
     fn windowChecked(r: *Runner, cs: []const calls.Call) !void {
@@ -155,6 +202,7 @@ pub const Runner = struct {
                 return e;
             };
         }
+        try r.join();
     }
 
     /// An eager decode window, each call timed when TF_DSV41_PROFILE is set (never inside a graph capture).
@@ -162,11 +210,15 @@ pub const Runner = struct {
         const p = r.prof orelse return r.window(cs);
         if (syncEach()) return r.windowChecked(cs);
         p.begin();
+        errdefer if (r.l2pf) |x| {
+            x.open = false;
+        };
         for (cs) |*c| {
             try p.before(r.stream, c);
             try r.issue(c);
             try p.after(r.stream);
         }
+        try r.join();
         try p.end(r.stream);
     }
 };

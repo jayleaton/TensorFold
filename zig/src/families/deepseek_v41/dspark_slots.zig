@@ -22,6 +22,7 @@ const gpu = @import("dspark_gpu.zig");
 const batch = @import("batch.zig");
 const iface = @import("draft/iface.zig");
 const dspark = @import("draft/dspark.zig");
+const dsd = @import("dspark_dev.zig");
 
 pub const Error = error{ Slots, NotAPrefix, CandidateWidth, Unbound };
 
@@ -54,6 +55,21 @@ pub const SlotPass = struct {
     /// batch.zig's taps stash (base, bytes; 0, 0: none)
     stash: [2]u64,
     stats: struct { passes: u64 = 0, slots: u64 = 0 } = .{},
+    /// TF_DSV41_DRAFT_GRAPHS (dspark_dev.zig): candidates on the device, each pass size graphed; null: the host step
+    dev: ?*dsd.Dev = null,
+    /// the group being issued: its first row in the round (the device step's region)
+    cur_at: usize = 0,
+    /// the group being issued: its slot count (its program)
+    cur_k: usize = 1,
+    last_logits: u64 = 0,
+    last_v: usize = 0,
+    /// the speculative pass's asks (sorted by slot) and its groups, between `begin` and `collect`
+    begun: ?Begun = null,
+    begun_host: bool = false,
+    order: [16]usize = undefined,
+    begun_asks: [16]iface.Ask = undefined,
+
+    const Begun = struct { n: usize, groups: [16][2]usize, ng: usize };
 
     /// The roles several-slot passes add to the forward's plan (before Runner.bind): the stacked rings, each pass
     /// size's statics and rows, the ingests' slot views.
@@ -98,6 +114,16 @@ pub const SlotPass = struct {
         x.programs = try a.alloc([]const calls.Call, group);
         for (x.programs, 1..) |*pg, k| pg.* = try emit.emitPassSlots(a, f.cfg, f.widths, f.opts, @intCast(n), @intCast(k), nslots);
         f.ext = .{ .ptr = x, .run = followFn };
+        const mode = try dsd.modeFromEnv();
+        if (mode != .host) {
+            const r = f.runner;
+            if (r.kernels.others(r.stream).f.ds_cands == null) {
+                std.log.scoped(.dsv41).warn("draft graphs: TF_DSV41_DRAFT_GRAPHS set, but the glue fatbin has no ds_cands kernel: the host step", .{});
+            } else {
+                _ = try x.device(&x.send, 2 * R * f.cfg.hidden); // the embedding's and exchanges' send, at its largest
+                x.dev = try dsd.Dev.init(gpa, r.d, f.comm, r.stream, mode, one.k, f.cfg.hidden, n * nslots, one.conf != null, @intCast(8 * lay.len64 + 4 * lay.len32), nslots);
+            }
+        }
         std.log.scoped(.dsv41).info("slot drafts: {d} slots, DSpark passes of up to {d} slots ({d} rows)", .{ nslots, group, R });
         return x;
     }
@@ -105,6 +131,7 @@ pub const SlotPass = struct {
     pub fn deinit(x: *SlotPass) void {
         const gpa = x.gpa;
         x.f.ext = x.prev_ext;
+        if (x.dev) |d| d.deinit();
         if (x.send) |*b| b.free();
         if (x.gathered) |*b| b.free();
         inline for (.{ "valid", "h64", "h32", "cand", "cval", "hid", "logits", "hid16", "packed_", "all", "ids" }) |name| gpa.free(@field(x, name));
@@ -113,10 +140,12 @@ pub const SlotPass = struct {
     }
 
     pub fn pass(x: *SlotPass) iface.Pass {
-        return .{ .ptr = x, .vtable = &vtable };
+        return .{ .ptr = x, .vtable = if (x.dev != null) &vtable_begin else &vtable };
     }
 
     const vtable: iface.Pass.VTable = .{ .ingest = ingest, .propose = propose, .reset = reset, .markov = heads };
+    /// with the device path: the speculative pass too (draft/spec.zig), the whole round launched by `begin`
+    const vtable_begin: iface.Pass.VTable = .{ .ingest = ingest, .propose = propose, .reset = reset, .markov = heads, .begin = begin, .collect = collect };
 
     fn self(p: *anyopaque) *SlotPass {
         return @ptrCast(@alignCast(p));
@@ -185,6 +214,11 @@ pub const SlotPass = struct {
         const x = self(p);
         if (asks.len == 0) return;
         if (asks.len > x.nslots) return error.Slots;
+        if (x.begun != null) return error.PassBegun;
+        if (x.devOn()) {
+            try x.devLaunchRound(asks);
+            return x.devFinishRound(asks, out);
+        }
         var order: [16]usize = undefined;
         for (order[0..asks.len], 0..) |*o, i| o.* = i;
         std.sort.insertion(usize, order[0..asks.len], asks, bySlot);
@@ -225,6 +259,135 @@ pub const SlotPass = struct {
         }
     }
 
+    fn devOn(x: *const SlotPass) bool {
+        const d = x.dev orelse return false;
+        return d.on();
+    }
+
+    /// The speculative pass over several slots: every group launched (device path), collected by `collect`.
+    fn begin(p: *anyopaque, asks: []const iface.Ask) anyerror!void {
+        const x = self(p);
+        if (asks.len == 0 or asks.len > x.nslots) return error.Slots;
+        if (x.begun != null) return error.PassBegun;
+        @memcpy(x.begun_asks[0..asks.len], asks);
+        if (!x.devOn()) {
+            // the checks turned the device path off: the pass runs at `collect` (exact; only the overlap is lost:
+            // between the two only work without collectives runs, and the rings are as `begin` saw them)
+            x.begun = .{ .n = asks.len, .groups = undefined, .ng = 0 };
+            x.begun_host = true;
+            return;
+        }
+        try x.devLaunchRound(x.begun_asks[0..asks.len]);
+    }
+
+    fn collect(p: *anyopaque, out: []iface.Proposal) anyerror!void {
+        const x = self(p);
+        const b = x.begun orelse return error.NoPassBegun;
+        if (out.len != b.n) return error.Slots;
+        if (x.begun_host) {
+            x.begun_host = false;
+            x.begun = null;
+            return propose(p, x.begun_asks[0..b.n], out);
+        }
+        return x.devFinishRound(x.begun_asks[0..b.n], out);
+    }
+
+    /// Every group of the round on the device (the leader's op first, each), in Python's slot order; during the check
+    /// passes each group is waited for and checked at once, as a follower does (the ranks' verdict pairs up).
+    fn devLaunchRound(x: *SlotPass, asks: []const iface.Ask) !void {
+        const d = x.dev.?;
+        for (x.order[0..asks.len], 0..) |*o, i| o.* = i;
+        std.sort.insertion(usize, x.order[0..asks.len], asks, bySlot);
+        var b: Begun = .{ .n = asks.len, .groups = undefined, .ng = 0 };
+        b.ng = rows.groups(asks.len, x.group, &b.groups);
+        const n: usize = x.f.cfg.dspark_block;
+        for (b.groups[0..b.ng], 0..) |g, gi| {
+            var ms: [16]rows.Member = undefined;
+            const idx = x.order[g[0]..g[1]];
+            for (idx, ms[0..idx.len]) |i, *m| {
+                const a = asks[i];
+                if (a.slot >= x.nslots) return error.Slots;
+                m.* = .{ .slot = a.slot, .anchor = a.anchor, .start = a.start, .valid = x.valid[a.slot] };
+            }
+            // the device path's op carries the group's first row of the round (its region and graph key), last
+            var buf: [3 + 3 * 16]i64 = undefined;
+            const msg = try rows.proposeMsg(ms[0..idx.len], buf[0 .. 2 + 3 * 16]);
+            buf[msg.len] = @intCast(g[0] * n);
+            try x.sendOp(buf[0 .. msg.len + 1]);
+            _ = gi;
+            try x.devGroup(ms[0..idx.len], g[0] * n);
+            if (d.stats.passes < dsd.check_passes) {
+                try d.mark();
+                try d.wait();
+                try d.check(x.last_logits, x.last_v, idx.len * n, g[0] * n);
+            }
+            try d.settle();
+        }
+        try d.mark();
+        x.begun = b;
+    }
+
+    /// The round's results: the event waited for, each group's candidates unpacked, each slot's chain.
+    fn devFinishRound(x: *SlotPass, asks: []const iface.Ask, out: []iface.Proposal) !void {
+        const d = x.dev.?;
+        const b = x.begun.?;
+        x.begun = null;
+        try d.wait();
+        const n: usize = x.f.cfg.dspark_block;
+        const c: usize = x.f.comm.world() * x.one.k;
+        const D: usize = x.f.cfg.hidden;
+        for (b.groups[0..b.ng]) |g| {
+            const at = g[0] * n;
+            const R = (g[1] - g[0]) * n;
+            try d.unpack(R, at, x.f.cfg.vocab, x.cand[at * c ..], x.cval[at * c ..], if (x.one.conf != null) x.hid[at * D ..] else null);
+        }
+        var scratch = std.heap.ArenaAllocator.init(x.gpa);
+        defer scratch.deinit();
+        // rows of the round are in sorted-slot order: the j-th sorted ask's rows at j x n
+        for (x.order[0..b.n], 0..) |i, j| {
+            const a = asks[i];
+            const o = out[i];
+            const cd = x.cand[j * n * c ..][0 .. n * c];
+            const cv = x.cval[j * n * c ..][0 .. n * c];
+            try dspark.chain(scratch.allocator(), x.one.markov, cd, cv, c, a.anchor, a.params, if (x.one.conf != null) x.hid[j * n * D ..][0 .. n * D] else null, o.drafts, o.conf);
+            if (o.cand) |t| {
+                if (t.len != cd.len) return error.CandidateWidth;
+                @memcpy(t, cd);
+            }
+            if (o.base) |t| {
+                if (t.len != cv.len) return error.CandidateWidth;
+                @memcpy(t, cv);
+            }
+        }
+    }
+
+    /// One group on the device: statics from its pinned staging region (no sync), the pass (its (size, row) graph once
+    /// the checks passed); its candidates land at round row `at`.
+    fn devGroup(x: *SlotPass, ms: []const rows.Member, at: usize) !void {
+        const d = x.dev.?;
+        const f = x.f;
+        const n: u32 = f.cfg.dspark_block;
+        const lay = emit.Layout.of(@intCast(ms.len), n, f.cfg.window);
+        const sv = try d.statics(at / @as(usize, n), @intCast(lay.len64), @intCast(lay.len32));
+        rows.stage(lay, n, f.cfg.window, @intCast(emit.ringRows(f.cfg)), x.one.shape.noise, ms, sv[0], sv[1]);
+        const r = f.runner;
+        try cuda.DeviceBuffer.uploadAsync(.{ .d = r.d, .ptr = r.addressOf("w.ds.i64") orelse return error.Unbound, .len = 8 * @as(usize, @intCast(lay.len64)) }, 0, std.mem.sliceAsBytes(sv[0]), r.stream.handle);
+        try cuda.DeviceBuffer.uploadAsync(.{ .d = r.d, .ptr = r.addressOf("w.ds.i32") orelse return error.Unbound, .len = 4 * @as(usize, @intCast(lay.end32)) }, 0, std.mem.sliceAsBytes(sv[1][0..@intCast(lay.end32)]), r.stream.handle);
+        x.stats.passes += 1;
+        x.stats.slots += ms.len;
+        x.cur_at = at;
+        r.glue = .{ .ctx = x, .run = glueFn };
+        const extra = [_]u64{ if (x.send) |b| b.ptr else 0, if (x.send) |b| b.len else 0 };
+        x.cur_k = ms.len;
+        try d.issue(@intCast(ms.len << 16 | at), dsd.fingerprint(r, d, &extra), .{ .ctx = x, .run = groupBody });
+    }
+
+    fn groupBody(ctx: *anyopaque, stream: cuda.Stream) anyerror!void {
+        const x: *SlotPass = @ptrCast(@alignCast(ctx));
+        _ = stream;
+        try x.f.runner.window(x.programs[x.cur_k - 1]);
+    }
+
     /// One pass over `ms` on this rank: the statics staged, the launches, the host's candidates (every rank).
     fn runGroup(x: *SlotPass, ms: []const rows.Member) !void {
         const f = x.f;
@@ -258,8 +421,23 @@ pub const SlotPass = struct {
             },
             rows.op_propose => {
                 var ms: [16]rows.Member = undefined;
-                const got = try rows.proposeOf(msg, x.valid, ms[0..x.group]);
-                try x.runGroup(got);
+                if (x.devOn()) {
+                    // the leader's group, run here alike at its row of the round (the op's last word): the same
+                    // graph keys in the same order on every rank; a follower reads no results
+                    if (msg.len < 3) return error.BadPlan;
+                    const at: usize = @intCast(msg[msg.len - 1]);
+                    const got = try rows.proposeOf(msg[0 .. msg.len - 1], x.valid, ms[0..x.group]);
+                    const d = x.dev.?;
+                    try x.devGroup(got, at);
+                    if (d.stats.passes < dsd.check_passes) {
+                        try d.mark();
+                        try d.wait();
+                        try d.check(x.last_logits, x.last_v, got.len * x.f.cfg.dspark_block, at);
+                    }
+                    try d.settle();
+                    return;
+                }
+                try x.runGroup(try rows.proposeOf(msg, x.valid, ms[0..x.group]));
             },
             else => {
                 const e = x.prev_ext orelse return error.BadPlan;
@@ -313,7 +491,14 @@ pub const SlotPass = struct {
         }
         if (std.mem.eql(u8, step, "widen"))
             return k.widenF32(try r.tensorAddr(c.args[0].arg.t), try r.tensorAddr(c.args[1].arg.t), numel(c.args[0].arg.t));
-        if (std.mem.eql(u8, step, "ds_out")) return x.hostStep(r, c.args[0].arg.t, c.args[1].arg.t);
+        if (std.mem.eql(u8, step, "ds_out")) {
+            if (x.dev) |dv| if (dv.on()) {
+                x.last_logits = try r.tensorAddr(c.args[0].arg.t);
+                x.last_v = @intCast(c.args[0].arg.t.shape[1]);
+                return dv.launch(r, c.args[0].arg.t, c.args[1].arg.t, @intCast(c.args[0].arg.t.shape[0]), x.cur_at);
+            };
+            return x.hostStep(r, c.args[0].arg.t, c.args[1].arg.t);
+        }
         return error.GlueNotBuilt;
     }
 

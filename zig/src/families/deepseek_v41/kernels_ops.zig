@@ -441,6 +441,8 @@ pub const Functions = struct {
     kv_pack: ?cuda.Function = null,
     kv_gather: cuda.Function,
     glue: [10]cuda.Function, // glue.syms order
+    /// glue.cu's DSpark candidates (TF_DSV41_DRAFT_GRAPHS); null in a fatbin built before it (the host's candidates)
+    ds_cands: ?cuda.Function = null,
     pfglue: [pfglue.syms.len]cuda.Function, // pfglue.syms order
 
     /// `pf`: the four pfdense modules (K2 8, 10, 12, 16).
@@ -491,6 +493,7 @@ pub const Functions = struct {
         f.kv_gather = try m_kv.function("_ZN13dsv41_kvsplit13gather_kernelEPKhjPKjjPh");
         f.kv_pack = m_kv.function("_ZN13dsv41_kvsplit11pack_kernelENS_8PackArgsE") catch null;
         inline for (glue.syms, 0..) |name, i| f.glue[i] = try m_glue.function(name);
+        f.ds_cands = m_glue.function(glue.ds_cands_sym) catch null;
         inline for (pfglue.syms, 0..) |name, i| f.pfglue[i] = try m_pfglue.function(name);
         return f;
     }
@@ -556,6 +559,10 @@ pub const glue = struct {
         "_ZN10dsv41_glue16widen_f32_kernelEPKtPfx",
     };
     pub const Kind = enum(u4) { embed_send, embed_sum, cast_bf16, kit_weights, kit_logits, positions, gather_cols, carry, positions_dev, widen_f32 };
+    /// DSpark's candidates (optional: resolved apart, so an older fatbin still loads)
+    pub const ds_cands_sym: [:0]const u8 = "_ZN10dsv41_glue15ds_cands_kernelEPKfxiiiPf";
+    /// the most candidates a rank (the kernel's shared sort)
+    pub const ds_cands_max = 128;
 
     fn grid(n: u64) usize {
         return @intCast(@max(1, @min((n + 255) / 256, 4096)));
@@ -880,6 +887,23 @@ pub const Ops = struct {
         a.add(pos64);
         a.add(lo);
         try o.go(o.f.glue[@intFromEnum(glue.Kind.positions)], .{ (@max(n, 1) + 255) / 256, 1, 1 }, 256, 0, null, &a);
+    }
+
+    /// DSpark's candidates (glue.cu ds_cands): each of `rows` fp32 logits rows [rows, V] (row stride ld) -> its best
+    /// k by (value desc, column asc) as packed [rows][2 k] fp32 (values, then id0 + column as int bits; -inf / -1
+    /// past V), dspark.candidates' result. One CTA a row.
+    pub fn dsCandidates(o: Ops, lg: u64, ld: usize, rows: usize, V: usize, k: usize, id0: u32, out: u64) !void {
+        const f = o.f.ds_cands orelse return error.Unsupported;
+        if (k < 1 or k > glue.ds_cands_max or V < 1) return error.Shape;
+        if (rows == 0) return;
+        var a: cuda.Args = .{};
+        a.add(lg);
+        a.add(@as(i64, @intCast(ld)));
+        a.add(@as(i32, @intCast(V)));
+        a.add(@as(i32, @intCast(k)));
+        a.add(@as(i32, @intCast(id0)));
+        a.add(out);
+        try o.go(f, .{ rows, 1, 1 }, 1024, 0, null, &a);
     }
 
     /// bf16 [n] -> fp32 [n], exact (the DSpark pass's q.float() before _rope).

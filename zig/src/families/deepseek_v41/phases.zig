@@ -9,6 +9,9 @@
 //! Phases nest: `window` > `forward` > `graph.stage` (> `engram.wait`) / `graph.replay` / `graph.capture`, and
 //! `window` > `candidates` (the choices' reads). Top level: `prefill`, `draft` (ingest), `draft.pass`, `window`,
 //! `commit`. `rounds` counts verify windows and `tokens` the committed tokens, for per-round and per-token figures.
+//! `host`: the time between one top-level phase's end and the next one's start (the lanes' own work, the token events,
+//! the plan link, everything no phase covers), so the top-level phases plus `host` add up to the decode rounds; a gap
+//! of `idle_ns` or more is the engine waiting for a request and is not counted.
 //! TF_DSV41_PHASES_OUT=<file>: the report as JSON (Python's shape), rewritten every 64 rounds and at close.
 
 const std = @import("std");
@@ -28,7 +31,12 @@ pub const Name = enum {
     commit,
     /// the speculative pass's launch after a window (TF_DSV41_SPEC_DRAFT; its collect is `draft.pass`)
     spec,
+    /// host time between top-level phases (not a phase of Python's: its report has no name for it)
+    host,
 };
+
+/// A gap between top-level phases this long or longer is idle (no live stream), not a round's host time.
+pub const idle_ns: u64 = 50 * std.time.ns_per_ms;
 
 const count = std.enums.values(Name).len;
 
@@ -47,6 +55,9 @@ pub const Phases = struct {
     t0: u64,
     path: ?[]const u8 = null,
     reported: u64 = 0,
+    /// phases open now (a top-level phase starts at depth 0), and when the last top-level phase ended (0: none yet)
+    depth: u32 = 0,
+    last_end: u64 = 0,
 
     pub fn parseMode(v: []const u8) !Mode {
         if (std.mem.eql(u8, v, "0") or v.len == 0) return .off;
@@ -70,6 +81,8 @@ pub const Phases = struct {
         p.rounds = 0;
         p.tokens = 0;
         p.t0 = nowNs();
+        p.depth = 0;
+        p.last_end = 0;
     }
 
     fn settle(p: *Phases) void {
@@ -122,12 +135,20 @@ pub const Timer = struct {
     pub fn stop(t: Timer) void {
         const p = t.p orelse return;
         p.settle();
-        p.add(t.name, nowNs() -| t.t0);
+        const now = nowNs();
+        p.add(t.name, now -| t.t0);
+        p.depth -|= 1;
+        if (p.depth == 0) p.last_end = now;
     }
 };
 
 pub fn start(p: ?*Phases, name: Name) Timer {
     const x = p orelse return .{ .p = null, .name = name, .t0 = 0 };
+    if (x.depth == 0 and x.last_end != 0) {
+        const gap = nowNs() -| x.last_end;
+        if (gap < idle_ns) x.add(.host, gap);
+    }
+    x.depth += 1;
     x.settle();
     return .{ .p = x, .name = name, .t0 = nowNs() };
 }
@@ -155,6 +176,17 @@ test "phases: Python's names and report shape; sync mode syncs at both ends" {
     const off = start(null, .window);
     off.stop();
     try std.testing.expectEqual(@as(u32, 2), c.n);
+    {
+        // a second top-level phase: one `host` gap before it; the nested phase opens none
+        const t = start(&p, .window);
+        defer t.stop();
+        const n = start(&p, .forward);
+        n.stop();
+    }
+    try std.testing.expectEqual(@as(u64, 1), p.n[@intFromEnum(Name.host)]);
+    p.last_end = nowNs() - idle_ns; // an idle gap: not counted
+    start(&p, .commit).stop();
+    try std.testing.expectEqual(@as(u64, 1), p.n[@intFromEnum(Name.host)]);
     p.add(.@"engram.wait", 1_500_000);
     p.add(.@"engram.wait", 500_000);
     p.rounds = 2;
@@ -170,7 +202,8 @@ test "phases: Python's names and report shape; sync mode syncs at both ends" {
     const ew = o.get("engram.wait").?.object;
     try std.testing.expectEqual(@as(i64, 2), ew.get("n").?.integer);
     try std.testing.expectEqual(@as(f64, 2.0), ew.get("ms").?.float);
-    try std.testing.expect(o.get("draft.pass") != null and o.get("window") == null);
+    try std.testing.expect(o.get("draft.pass") != null and o.get("window") != null);
+    try std.testing.expect(o.get("host") != null); // the gap between the two top-level phases above
     try std.testing.expectEqual(Mode.off, try Phases.parseMode("0"));
     try std.testing.expectError(error.BadPhasesMode, Phases.parseMode("nvtx"));
 }

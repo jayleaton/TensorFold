@@ -556,7 +556,9 @@ pub const Rows = struct {
             if (!b.in_use or b.left > 0) continue;
             const t = &r.tables[b.table];
             const keep = !b.failed and b.rows.len <= r.cap / 4;
-            if (!keep and !b.failed and !b.read and b.unread < 1) {
+            // a settle on another table never drops it: a segment reads layer 1, then 14, so the next segment's layer
+            // 14 batch sees this segment's layer-14 read and the next one's layer-1 read before its own
+            if (!keep and !b.failed and !b.read and (b.unread < 1 or li != b.table)) {
                 if (li == b.table) b.unread += 1;
                 continue;
             }

@@ -216,6 +216,7 @@ pub const Batch = struct {
         b.stats.windows += 1;
         b.stats.rows += n;
         b.stats.padded += R - n;
+        r.rows = R; // l2pf: the window's rows (with its padding, the graph's key) past 16 skip the prefetch sites
         if (b.g) |*g| {
             const out = try g.cache.run(key, r.stream, b.fingerprint(), .{ .ctx = b, .run = body });
             if (outcomeLog(out, g)) std.log.scoped(.dsv41).info("row graphs: capture {d} ({d} rows, context bucket {d}), {d} replayed", .{ g.cache.stats.captured, key.rows, key.ctx, g.cache.stats.replayed });

@@ -40,6 +40,7 @@ const samp = @import("sampling_gpu.zig");
 const grammar_gpu = @import("grammar_gpu.zig");
 const dspark_rows = @import("dspark_rows.zig");
 const dspark_slots = @import("dspark_slots.zig");
+const l2pf_mod = @import("l2pf.zig");
 const iface = @import("draft/iface.zig");
 
 pub const Options = struct {
@@ -109,6 +110,8 @@ pub const Model = struct {
     slot_pass: ?*dspark_slots.SlotPass = null,
     /// the keyed sampler, every rank with TF_DSV41_SAMPLING=1 (requests with T > 0; followers run its gathers in follow)
     sampler: ?*samp.GpuSampler = null,
+    /// TF_DSV41_L2PF (l2pf.zig): the filled prefetch tables and the runner's side stream
+    l2pf: ?*l2pf_mod.L2pf = null,
     /// structured output, every rank with TF_DSV41_GRAMMAR=1 (grammar_gpu.zig: the masks and the followers' matchers)
     grammar: ?*grammar_gpu.Masks = null,
 
@@ -130,6 +133,7 @@ pub const Model = struct {
         // gpa.create applies no field defaults: the parts made only with drafts, KV, several slots or sampling start
         // null here, or close() frees garbage when they are off (TF_DSV41_DRAFTS=0 and the rest)
         m.pass = null;
+        m.l2pf = null;
         m.sessions = null;
         m.slots = 1;
         m.slot_set = null;
@@ -241,7 +245,9 @@ pub const Model = struct {
         const nb = @max(o.prefill_rows, m.cfg.dspark_block + 1);
         for (buckets[0..nb], 0..) |*b, i| b.* = @intCast(i + 1);
         var bp = try m.f.plan(buckets[0..nb]);
-        if (o.drafts) try dspark_gpu.GpuPass.plan(m.f.arena.allocator(), &m.f, &bp, nb);
+        // the pass ingests a prompt's prefilled tail in one call (the drafter's window, target.handTaps) with the own prefill
+        const ingest_rows: u32 = if (o.own_prefill) @max(nb, m.cfg.window) else nb;
+        if (o.drafts) try dspark_gpu.GpuPass.plan(m.f.arena.allocator(), &m.f, &bp, ingest_rows);
         if (o.own_prefill) try m.f.planPrefill(&bp, @intCast(m.f.opts.prefill_rows));
         const rows_cap = try batch.capFromEnv();
         if (m.slots > 1) try batch.Batch.plan(&m.f, &bp, m.slots, rows_cap);
@@ -259,6 +265,8 @@ pub const Model = struct {
             const bytes = (try forms.build(ra.allocator(), &src, role)) orelse continue;
             try cuda.DeviceBuffer.upload(.{ .d = &m.driver, .ptr = m.runner.addressOf(role).?, .len = bytes.len }, 0, bytes);
         }
+        // TF_DSV41_L2PF: the prefetch tables from the bound weights and forms (the expert tables above), every rank
+        m.l2pf = try l2pf_mod.install(gpa, &m.f, &m.weights);
         // no size cap: prod's 1M limit + 2,048 rows is 538 MB (a 256 MiB cap failed every rank's load with StreamTooLong)
         const rope = try cwd.readFileAlloc(io, try std.fs.path.join(a, &.{ assets, "rope.bin" }), a, .unlimited);
         const half = (rope.len - 16) / 2;
@@ -279,9 +287,18 @@ pub const Model = struct {
         m.gt = .{ .f = &m.f, .prefill_rows = o.prefill_rows, .max_rows = nb, .own_prefill = o.own_prefill, .sessions = m.sessions };
         // TF_DSV41_PROMPT_TAIL (prod_knobs.promptTail): the prompt's last token as the first decode row, as Python's server
         m.gt.prompt_tail = try @import("prod_knobs.zig").promptTail(&@import("prod_knobs.zig").env);
-        if (o.drafts) m.pass = try dspark_gpu.GpuPass.init(gpa, &m.f, nb);
+        // TF_DSV41_PREFILL=replay (ced.zig) runs where Python's server runs it: the own prefill over [0, n - 1), the
+        // decoder replay, the last token as the first verify row (Forward.prompt never replays)
+        if (m.f.prefill_state.mode == .replay and (!o.own_prefill or m.gt.prompt_tail != .verify)) {
+            std.log.scoped(.dsv41).err("TF_DSV41_PREFILL=replay needs TF_DSV41_OWN_PREFILL=1 and TF_DSV41_PROMPT_TAIL=verify, as Python's server (own prefill {}, prompt tail {t})", .{ o.own_prefill, m.gt.prompt_tail });
+            return error.BadKnob;
+        }
+        if (o.drafts) m.pass = try dspark_gpu.GpuPass.init(gpa, &m.f, ingest_rows);
         if (m.slots > 1) try m.openRows(rows_cap, &bp);
         if (slot_drafts) m.slot_pass = try dspark_slots.SlotPass.init(gpa, &m.f, m.pass.?, m.rows.?, m.slots, group);
+        // the prompt's prefilled tail's taps (CED's decoder replay, or the last segment) to the pass the lanes drive
+        m.gt.pass = m.draftPass();
+        m.gt.ingest_window = m.cfg.window;
         // TF_DSV41_SAMPLING=1: keyed sampling (T > 0) on every rank; off: such requests are refused (error.Sampling)
         m.sampler = if (samp.enabled()) try samp.GpuSampler.init(gpa, &m.f) else null;
         m.gt.sampler = m.sampler;
@@ -324,6 +341,11 @@ pub const Model = struct {
         if (m.sessions) |x| x.deinit();
         if (m.f.kv) |k| k.deinit();
         m.f.deinit();
+        if (m.l2pf) |p| {
+            m.runner.l2pf = null;
+            p.deinit();
+            gpa.destroy(p);
+        }
         m.runner.deinit();
         m.aot.deinit();
         m.weights.deinit();

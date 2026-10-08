@@ -21,6 +21,12 @@ fn coefs(e: *E, set: u1) ![3]Arg {
 
 /// One mHC site of layer L (`which`: hc_attn / hc_ffn), or the final norm (L null).
 pub fn mhc(e: *E, layer: ?u32, which: []const u8, mode: Mode) !void {
+    return mhcInto(e, layer, which, mode, false);
+}
+
+/// `mhc`, a boundary writing the streams in place when `in_place` (a run without the second streams buffer: CED's
+/// decoder replay, replay.finish's Streams has no `alt`).
+pub fn mhcInto(e: *E, layer: ?u32, which: []const u8, mode: Mode, in_place: bool) !void {
     const n = e.n;
     const D: i64 = e.cfg.hidden;
     const post = mode == .boundary or mode == .final;
@@ -53,7 +59,7 @@ pub fn mhc(e: *E, layer: ?u32, which: []const u8, mode: Mode) !void {
     const xout: Arg = switch (mode) {
         .site1, .site2 => b0,
         .final => x,
-        .boundary => try e.spare(),
+        .boundary => if (in_place) x else try e.spare(),
     };
     try e.ext("tf_dsv41_mhc_cuda_v1.run", &.{
         x,                                                               xout,
@@ -89,7 +95,7 @@ pub fn mhc(e: *E, layer: ?u32, which: []const u8, mode: Mode) !void {
         });
     } else if (e.o.r1_sig) try e.appendLast(&.{ .{ .i = -1 }, .{ .i = 0 } }); // the twin's binding, R1 off: no tail
     if (mix) e.coef = 1 - e.coef;
-    if (mode == .boundary) e.cur = 1 - e.cur;
+    if (mode == .boundary and !in_place) e.cur = 1 - e.cur;
 }
 
 /// mhc.post_only (Triton `_site`, POST_ON, no collapse or mix): the last exchange's post applied to the streams in
