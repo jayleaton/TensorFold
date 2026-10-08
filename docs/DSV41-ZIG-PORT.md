@@ -1317,8 +1317,14 @@ prefill. Commits `557dc713` (engine), `22044785` (aot-needs hook), `d4216b61` (r
 - **Refused** (boot error, by name): replay without `TF_DSV41_OWN_PREFILL=1` or with `TF_DSV41_PROMPT_TAIL=prefill`
   (`Forward.prompt` never replays: Python runs replay only in the server's piece / finals shape); a forward whose
   layers do not reach layer 20; a config without a decoder layer.
-- Not copied: Python feeds the replayed rows' DSpark taps to the drafter (`replayed`). Zig's drafter starts from the
-  verify window's row, as after `a390113`; this changes draft acceptance, not bits.
+- The drafter's context (`65e2028c`): Python's encoder segments keep no taps (layers 37-39 never run there), and
+  `finish_prompt` hands the decoder pass's taps to `drafter.ingest(slot, R0, taps)` (`decode.DecodeForward.replayed`);
+  the verify row follows at its commit. Zig: `forward_prefill` records what "w.taps" holds after the prompt (the
+  decoder pass's [R0, n - 1), or in full mode the last segment), `GpuTarget.handTaps` ingests their last 128 rows
+  (`ced.handoff`, drafter.ingest's skip) in one call before the verify window, through the lanes' pass (one slot or
+  the slots' pass, planned for 128-row ingests), and `lanes.prefill` then ingests only the verify row. Before this,
+  every verify-tail prompt restarted the drafter's context after the prompt (a390113's note). Full mode: Python
+  ingests each piece overlapping the last 128 rows (one or two calls); Zig one call over the last segment's rows.
 - `rounds.zig` already encodes `Mode.replay` in the plan; the served path does not use rounds plans, the knob is
   read on every rank (the follower checks op 44 against its own mode and position).
 
@@ -1337,10 +1343,11 @@ prefill. Commits `557dc713` (engine), `22044785` (aot-needs hook), `d4216b61` (r
 
 **Found on the way.**
 - Python's server defaults to replay; any "Python full" comparison must set `TF_DSV41_PREFILL=full` explicitly.
-- Python prod's fast prefill tag already forbids turn snapshots in full mode too (`rounds._finish`: `not tag >> 8`).
-  Zig's one-slot sessions save turn ends in full mode, so a resumed multi-turn chat in Zig full mode reads
-  decode-written rows where Python re-prefills them. Irrelevant for prod's row mode (no sessions) and for replay
-  mode (now prompt snapshots only); a full-mode follow-up if one-slot Zig serves sessions with full prefill.
+- Python prod's fast prefill tag forbids turn snapshots in full mode too (`rounds._finish`: `not tag >> 8`). Zig's
+  one-slot sessions saved turn ends in full mode, so a resumed chat read decode-written rows Python re-prefills.
+  Fixed in `9b363f5d`: the served shape (own prefill, verify tail) takes prompt snapshots at the replay point in both
+  modes and none at release, under the fast tag (`ced.tag_fast`; replay `ced.tag`), so old exact-tag turn entries never
+  resume. Prod's row mode opens no sessions, so this is the one-slot server's.
 - The 4 x 1M window's step 5 (long T0 replies Zig vs prod) compares against prod's replay: it needs
   `TF_DSV41_PREFILL=replay` on the Zig server to be equal past 128 tokens.
 
@@ -1355,6 +1362,7 @@ Check the lease on dgx-01 first. Kit and image from `df3e30ee` or later. `K` = t
 | C2 gate, two segments | the same with `PROMPT=2600 AOT_PROMPTS=""` (R0 = 2472 in the second segment, the ring across segments) | ~30 min | as C1 |
 | C3 bits vs prod | Zig-as-prod (`prod-zig.env` with `TF_DSV41_PREFILL=replay` uncommented, the image from C0): `$D ask --url http://127.0.0.1:8000 --prompts $K/prompts.txt --bench --out $OUT/zig-ced.jsonl`, `$D compare $OUT/py.jsonl $OUT/zig-ced.jsonl --tokenizer $TOK` (`py.jsonl` from the prompt-tail step 0) | ~15 min incl. boot | **16/16** (the night: bench prompts 0/8); boot log `prod knobs: ... prefill replay` |
 | C4 prefill speed | the same server: `python3 $K/bench_http.py --url http://127.0.0.1:8000 --label zig-ced --long 32768,131072 --out $K/out/zig-ced-long.json`; A / B one cell with the line commented again | ~25 min | 32K **> 1,200 tok/s** (full: 571 at the night, ~690 expected after the Engram fix; prod 2,430); the 32K T0 reply equal to prod's |
+| C4b drafts | the same server, drafts on: `python3 $K/bench_http.py --url http://127.0.0.1:8000 --label zig-ced --work code --temps 0 --streams 1 --reps 2 --long 32768 --out $K/out/zig-ced-drafts.json`, with `TF_DSV41_PHASES=1`; prod's same cells from the window's earlier runs | ~15 min | accepted tokens a round after the 32K prompt within 5 % of prod's (before `65e2028c` the context restarted after every prompt); replies equal to the drafts-off run |
 | C5 restore | prod back on perf1 if the window ends here | 2 min | as every window |
 
 If C1 fails, `first_differing_role` names the part: `s.L2x/3x.swa.*` = the decoder pass (lo, in-place boundaries,
