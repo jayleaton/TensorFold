@@ -1317,8 +1317,14 @@ prefill. Commits `557dc713` (engine), `22044785` (aot-needs hook), `d4216b61` (r
 - **Refused** (boot error, by name): replay without `TF_DSV41_OWN_PREFILL=1` or with `TF_DSV41_PROMPT_TAIL=prefill`
   (`Forward.prompt` never replays: Python runs replay only in the server's piece / finals shape); a forward whose
   layers do not reach layer 20; a config without a decoder layer.
-- Not copied: Python feeds the replayed rows' DSpark taps to the drafter (`replayed`). Zig's drafter starts from the
-  verify window's row, as after `a390113`; this changes draft acceptance, not bits.
+- The drafter's context (`65e2028c`): Python's encoder segments keep no taps (layers 37-39 never run there), and
+  `finish_prompt` hands the decoder pass's taps to `drafter.ingest(slot, R0, taps)` (`decode.DecodeForward.replayed`);
+  the verify row follows at its commit. Zig: `forward_prefill` records what "w.taps" holds after the prompt (the
+  decoder pass's [R0, n - 1), or in full mode the last segment), `GpuTarget.handTaps` ingests their last 128 rows
+  (`ced.handoff`, drafter.ingest's skip) in one call before the verify window, through the lanes' pass (one slot or
+  the slots' pass, planned for 128-row ingests), and `lanes.prefill` then ingests only the verify row. Before this,
+  every verify-tail prompt restarted the drafter's context after the prompt (a390113's note). Full mode: Python
+  ingests each piece overlapping the last 128 rows (one or two calls); Zig one call over the last segment's rows.
 - `rounds.zig` already encodes `Mode.replay` in the plan; the served path does not use rounds plans, the knob is
   read on every rank (the follower checks op 44 against its own mode and position).
 
@@ -1337,10 +1343,11 @@ prefill. Commits `557dc713` (engine), `22044785` (aot-needs hook), `d4216b61` (r
 
 **Found on the way.**
 - Python's server defaults to replay; any "Python full" comparison must set `TF_DSV41_PREFILL=full` explicitly.
-- Python prod's fast prefill tag already forbids turn snapshots in full mode too (`rounds._finish`: `not tag >> 8`).
-  Zig's one-slot sessions save turn ends in full mode, so a resumed multi-turn chat in Zig full mode reads
-  decode-written rows where Python re-prefills them. Irrelevant for prod's row mode (no sessions) and for replay
-  mode (now prompt snapshots only); a full-mode follow-up if one-slot Zig serves sessions with full prefill.
+- Python prod's fast prefill tag forbids turn snapshots in full mode too (`rounds._finish`: `not tag >> 8`). Zig's
+  one-slot sessions saved turn ends in full mode, so a resumed chat read decode-written rows Python re-prefills.
+  Fixed in `9b363f5d`: the served shape (own prefill, verify tail) takes prompt snapshots at the replay point in both
+  modes and none at release, under the fast tag (`ced.tag_fast`; replay `ced.tag`), so old exact-tag turn entries never
+  resume. Prod's row mode opens no sessions, so this is the one-slot server's.
 - The 4 x 1M window's step 5 (long T0 replies Zig vs prod) compares against prod's replay: it needs
   `TF_DSV41_PREFILL=replay` on the Zig server to be equal past 128 tokens.
 
@@ -1355,6 +1362,7 @@ Check the lease on dgx-01 first. Kit and image from `df3e30ee` or later. `K` = t
 | C2 gate, two segments | the same with `PROMPT=2600 AOT_PROMPTS=""` (R0 = 2472 in the second segment, the ring across segments) | ~30 min | as C1 |
 | C3 bits vs prod | Zig-as-prod (`prod-zig.env` with `TF_DSV41_PREFILL=replay` uncommented, the image from C0): `$D ask --url http://127.0.0.1:8000 --prompts $K/prompts.txt --bench --out $OUT/zig-ced.jsonl`, `$D compare $OUT/py.jsonl $OUT/zig-ced.jsonl --tokenizer $TOK` (`py.jsonl` from the prompt-tail step 0) | ~15 min incl. boot | **16/16** (the night: bench prompts 0/8); boot log `prod knobs: ... prefill replay` |
 | C4 prefill speed | the same server: `python3 $K/bench_http.py --url http://127.0.0.1:8000 --label zig-ced --long 32768,131072 --out $K/out/zig-ced-long.json`; A / B one cell with the line commented again | ~25 min | 32K **> 1,200 tok/s** (full: 571 at the night, ~690 expected after the Engram fix; prod 2,430); the 32K T0 reply equal to prod's |
+| C4b drafts | the same server, drafts on: `python3 $K/bench_http.py --url http://127.0.0.1:8000 --label zig-ced --work code --temps 0 --streams 1 --reps 2 --long 32768 --out $K/out/zig-ced-drafts.json`, with `TF_DSV41_PHASES=1`; prod's same cells from the window's earlier runs | ~15 min | accepted tokens a round after the 32K prompt within 5 % of prod's (before `65e2028c` the context restarted after every prompt); replies equal to the drafts-off run |
 | C5 restore | prod back on perf1 if the window ends here | 2 min | as every window |
 
 If C1 fails, `first_differing_role` names the part: `s.L2x/3x.swa.*` = the decoder pass (lo, in-place boundaries,
@@ -1450,6 +1458,110 @@ Check the lease on dgx-01 first. Kit (M2c-2) and zig-serve image from the engine
 | P4 A / B | the same server, one 32K cell each with `TF_DSV41_PREFETCH_AHEAD=0`, then `TF_DSV41_GM_V2=0`, then `TF_DSV41_PF_DENSE=off` | ~30 min | each knob's share of P3 (expected: ahead 3-8 %, GM_V2 5-8 %, PF_DENSE 3-5 %) |
 | P5 restore | prod back on perf1 (`scripts/v2-rollback.sh perf1`) if the window ends here | 2 min | as every window |
 
+### Prod parity: decode runtime (`dsq-zig-rt-1`, offline)
+
+Every decode-round knob of prod-perf1 (`config/prod.env`, engine 8474f31), checked against Python's source at 8474f31
+and the Zig tree, plus the round loop itself (Python `rounds.py` / `batch.py` / `decode.py` against Zig `lanes` /
+`draft/lanes.zig` / `target.zig` / `forward.zig`). The M1 captures were taken under `tools/zig/dsv41_m1/prod-knobs.env`
+(+ `r1c-knobs.env`): every R1 word, `L2PF=1` / `_MB=12` / `_PACE_GBPS=150`, `BRANCHES=1` / `_PRIO=side`; not
+`ENGRAM_GATE`, `GRAPH_MODE`, `PLAN_*`, `GLM53_TF_ROCE_FAST`. So *built in* below means the emitter's launch, checked
+launch by launch against those captures; it says nothing about streams, overlap or host work, which the captures do not
+record.
+
+**The "~20 ms a round outside every phase" (run A) is not in the data.** It came from dividing code T0's round (94.9 ms:
+384 tokens at 40.47 tok/s in 100 rounds, `server.log`) by phase averages taken over *all* cells (`window` 43.7, `draft.pass`
+31.5 ms), and prose rounds have about half code's rows (prose 1.2 drafted a round, code 3.5). Over the whole run
+(`r0/a/phases.json`): 648.1 s wall, 585.6 s in top-level phases, so at most **8.4 ms a round** is untimed, and that
+includes the server's idle time from `t0` (model open) to the first request and between bench cells. `a6080cf`
+adds a `host` phase (the gaps between top-level phases inside a round; gaps of 50 ms or more are idle) so the next
+window measures it per cell instead of inferring it. Where else the round's time goes, found in the code:
+- **Engram reads serialised per layer and per slot.** The graphed window staged layer 1's rows (read and wait), then
+  layer 14's (read and wait); row mode did that per slot as well: 2 layers x 4 slots = 8 read latencies a window.
+  Python's gate worker reads every row of the round, all slots and all layers, in one batch. Fixed (`Forward.issueEngram`,
+  below): every layer's and slot's reads in flight before the first wait, so one read latency a window.
+- **Greedy picks on the host.** `Forward.greedy` downloads the window's whole logits ([n, 64,640] fp32, ~1.3 MB at 5 rows),
+  argmaxes on the CPU, uploads the pairs, all-gathers, downloads, and syncs twice. Python's `cand_gather` takes the top
+  candidates on the GPU and copies [R, C] back once. Estimated 0.2-0.5 ms a round; not changed here (it needs a GPU
+  argmax kernel and a GPU to prove it).
+- **The speculative pass starts after the host's pick** (DSpark area, `dsq-zig-dspark-1`). Python's `decode.window`
+  queues the candidates' copy, launches the next pass on the GPU (`spec.launch`), and only then waits. Zig's
+  `Lanes.verify` runs `target.window` (greedy's two syncs included) and then `speculate`, so the GPU idles for the
+  host's pick and the lanes' bookkeeping. Run A's speculative pass ran in only 800 of 7,493 passes; prod hits 99 %.
+- **`candidates` 40.9 ms a call** in run A is the pass's logits download (before `9bc88af`), not the window.
+
+**Knobs** (status: *built in* = the emitter's constant at prod's value, checked by the captures; *ported* = a Zig knob,
+on in `prod-zig.env` unless said; *missing* = not in the Zig engine):
+
+| knob (prod) | Python at 8474f31 | Zig | evidence | commit |
+|---|---|---|---|---|
+| `L2PF=1`, `_MB=12`, `_PACE_GBPS=150` | `l2pf.py`: the next dense group's first 12 MiB prefetched into L2 on a side stream at sites o / x / f (x, f paced at 150 GB/s on 2 CTAs; windows <= 16 rows), joined at the window's end. `l2pace.cu`: off costs 1.7 ms a 1-row window | **ported, on.** Before: the launches were emitted with empty tables and **skipped at issue** (`run.zig` `issue`: `tf_dsv41_l2p*` returned) | `l2pf.zig` (`install`: tables from `Emitter.l2pfSources`, l2pf.site_tensors' order and `take`'s budget, every span inside a live allocation; knobs), `run.zig` (`Side`: fork at the site, join at the window's end, `rows` > 16 skip), `block.zig` (the sizes now come from the sources: `check` 0 mismatches) | engine `1f5e75c`, zig-serve `1ba798c` |
+| `GLM53_TF_ROCE_MAX_KB=1024` | the RoCE mailbox's message cap (4-slot x 16-row windows fit) | **ported** (`tp/config.zig` alias), but **it never reached the Zig ranks**: serve.sh passed only `TF_DSV41_*` into the Zig containers, so the cap stayed 256 KiB and 4-slot windows' exchanges went to NCCL (21 vs 8.9 us an exchange) | `scripts/serve.sh` `run_args_zig` now passes `GLM53_TF_*` (checked: the generated `docker run` holds `-e GLM53_TF_ROCE_MAX_KB=1024`) | zig-serve `a45d79f` |
+| `PLAN_LINK=rdma`, `PLAN_PIN=auto` | `planlink.py`: rank 1 spins 5 ms on a RoCE mailbox flag, then naps; plan threads pinned (G14: rank 1's window-entry lag +130 -> -9 us) | **ported (equivalent), on**: TCP link, rank 1 spins on the socket 5 ms (`TF_DSV41_PLAN_SPIN_US`), then blocks; pin as Python's `pin_cpu`. Zig sends 3-5 plan messages a round (window, greedy, keep, DSpark ops), Python one | `tp/planlink.zig` `spin` / `pinOnce`, `tp/config.zig` | zig-serve `a45d79f` |
+| `DEPTH_JOINT=0` | `joint.py`: the branch default is 1; prod 0 (G9: joint failed its gate) | **ported, on**: Zig read it but defaulted to 1 and prod-zig.env did not set it | `draft/calib_env.zig` `depthSettings`, `draft/depth.zig` `joint: u2 = 1` | zig-serve `1ba798c` |
+| `ENGRAM_GATE=1` | `engram_gate.py`: the graph launches at once and a kernel before layers 1 / 14 spins on a host-mapped flag, then copies the rows a worker read (all slots and layers in one batch); C2 / C4 +3.5 / +2.6 % | **missing** (the kernel and launcher exist: `kernels_ops.engramGate`; no emitter call, no host-mapped staging, no worker). **Partly covered:** `Forward.issueEngram` puts every layer's and slot's reads in flight before the first wait (the batch half of the gate; the host still waits before the launch) | `forward.zig` `issueEngram`, `graphedWindow`, `window`; `batch.zig` `stageEngram` | engine `8774969` |
+| `BRANCHES=1`, `BRANCHES_PRIO=side` | `branches.py`: the indexer / compressor chains on a high-priority side stream under wq_b's weight stream, joined before the attention core (1-row window -0.53 ms over 3 boots); e4's folded copies | **e4 built in** (the launch set: `_plain` bf16, `index` before wq_b, split q group; `block.zig`), **the side stream missing** (one stream). A port needs per-call stream tags + fork / join at `plan()`'s points, a second ext scratch (the runner's 64 MiB `scratch` is shared by every ext launch), and a GPU bits gate | `block.zig` attention, `run.zig` | - |
+| `MHC_DEFER=1` (R1) | `mhc_cuda.py`: the coefficient kernel on a side stream, awaited by the next reader | bits built in (`block_moe.zig` `mhc_cuda_v1.coef`), **serial** (no side stream); ~0.2 ms a window | `block_moe.zig` | - |
+| `RMS_FOLD=1` (R1) | `rmsnorm.py`: q norm folded into rot_in; kv_norm on the side stream | q fold built in; kv_norm **on the main stream** (~0.1 ms a window) | `block.zig` `fusedNorm`, `rms` | - |
+| `GLM53_TF_ROCE_FAST=1` | `roce.py` `gather_fast_kernel`: seven critical-path changes (1-row -0.16, 16-row -0.51 ms) | **1 of 7** (`tp/mailbox.cu`: local copy while the peer's travels); `dsq-zig-tp-1`'s kernel work | `fabric/tp/mailbox.cu` | - |
+| `COMM_BACKEND=roce` | `engine.py` | ported (`TF_COMM_BACKEND`, serve.sh) | `tp/config.zig` | - |
+| `GRAPH_MODE=rows` | `rowgraphs.py`: slot-agnostic row graphs | equivalent: `TF_DSV41_GRAPHS=1` + row mode graphs (`graphs.zig`, `batch.zig`) | - | - |
+| `EXPERT_LOADS=1` | `expert_loads.py`: x3ld `ld_kernel` (nt 8, pd 1) | built in | `block_moe.zig` `x3ld_v1.grouped` | - |
+| `EXPERT_TOPP=0.85`, `MIN_K=3`, `RENORM=kept` | `prune.py` | TOPP ported (same name, prod-zig.env; **off when unset** on the served model); MIN_K / RENORM built in at prod's values (their env vars are not read) | `model.zig`, `block_moe.zig` | - |
+| `MHC_CUDA`, `MHC_DEC`, `MHC_FIN2`, `MHC_FN=bf16`, `MHC_TAIL` | `mhc_cuda.py`, `mhc_dec.py`, `mhc.py` | built in (`MHC_TAIL` under `r1`) | `block_moe.zig` | - |
+| `RMS_PAIR`, `RG_NARROW=2`, `RG_TAIL`, `RG_PRUNE`, `PRUNE_KIT` | `rmsnorm.py`, `router_gemv.py`, `prune.py` | built in (`RG_PRUNE` / `PRUNE_KIT` under `r1`) | `block.zig` `_rms2`, `block_moe.zig` `route` | - |
+| `PARTIAL_BF16`, `MOE_BF16`, `DENSE_V3`, `ATTN_CUDA`, `ATTN_ROPE`, `ATTN_SPLIT=4` | `forward.py`, `moe.py`, `dense3.py`, `attn_cuda.py` | built in (`MOE_BF16`, `ATTN_*` under `r1`) | `block.zig`, `block_moe.zig` | - |
+| `ROUTER=gemv`, `INDEX_DTOPK`, `INDEX_KV=fp8`, `PDL=0`, `ENGRAM_FUSE_DEC` | `router.py`, `dtopk.py`, `backend.py`, `pdl.py`, `engram_dec.py` | built in | `block_moe.zig`, `block.zig` | - |
+| `CALIB=real` | `calib.py`: the engine's own window / pass costs measured at boot, stored | read only: Zig prices drafts from Python's last stored table, i.e. Python's costs, not Zig's (Zig's 1-row round 24.7 ms against the table's 21.5; pass 7.0 against 3.4-3.7), so the depth policy optimises for the wrong engine. `TF_DSV41_DRAFT_TIMED=1` prices from Zig's own measured rounds (off in prod-zig.env: HTTP == CLI replay); no boot measurer | `draft/calib_env.zig`, `serve_engine.zig` `cfg.timed` | - |
+
+Open item for verification (not settled offline): Python's `MHC_CUDA` / `MHC_DEC` have `MAX_ROWS = 16` and fall back to
+Triton above; Zig's row graphs reach 64 rows and the emitter has no row-count branch there. The captures' windows are
+all <= 16 rows, so `check` does not cover a > 16-row decode window.
+
+**Gates on the engine commits** (each on a clean `git archive` of HEAD plus the commit's files): `tf-dsv41-m1 check`
+cap15 / cap18 / cap22 / cap24-1 / cap24-12 / cap24-16 and `dcheck cap16` **0 mismatches**; `zig build test-dsv41`
+(incl. `l2pf.take` against l2pf.py's span rules), `test-dsv41-knobs`, `test-dsv41-rows`, `test-dsv41-draft`, `test-tp`
+pass. No GPU: the prefetch launches themselves were replayed bit-exact in the M1 pods (they write nothing), but the
+side stream, the tables and the batched Engram issue are proven only on the Sparks (below).
+
+**BRANCHES port: the design, from the code (not built; no GPU to gate it).** The emitter already issues the
+sublayer in `branches.plan`'s order (the captures were taken with `BRANCHES=1`: `_plain` before the x group, the
+compressor chain and `index` before wq_b, the split q group, the SWA store after RoPE on index layers), so the work is
+streams, not order:
+1. `calls.Call` gets a stream tag and fork / join marks, set in `Emitter.attention` at `plan()`'s points: fork before
+   `_plain` and again after the x group (R1: there is no `_rms2`; `index` reads `L.qa` with q_norm folded), side =
+   `_plain`, the compressor chain (`_pool_norm`, `kvStore`, `ix_wk` upstream, `_index_k`), `index` (`ix_wq_b`,
+   `_scores`, top-k) and on non-index layers `swaStore` (with R1's kv_norm `rms`, as `RMS_FOLD` puts it beside the
+   store); join before the attention core. `check` ignores the new fields (it compares launches), so the captures stay
+   the gate for the bits.
+2. `run.zig`: a second `Side` (not L2PF's stream: Python's branches and prefetch streams are distinct) at
+   `BRANCHES_PRIO=side`'s high priority (`cuStreamCreateWithPriority`, not in `cuda/abi.zig` yet), and a **second ext
+   scratch**: every ext launch gets the runner's one 64 MiB `scratch` today, so two streams would share it.
+3. **Glue on the side**: the indexer's `topk`, `counts`, `block_pos` steps and `kvStore`'s paths are glue run by
+   `forward.zig` / `batch.zig` on `r.stream`; the glue interface needs the stream it runs on (and row mode's
+   transformed glue the same).
+4. A host hazard check like Python's `branches.check`: for every window program, each value a stream reads is written
+   on the same stream or before a join/fork that orders it (the roles' names give reads / writes), over every layer
+   kind, R1 on and off, row mode.
+5. GPU gate on the Sparks or a pod: `M2B` decode gate with `TF_DSV41_BRANCHES=1` (tokens and logits == off), graphs on
+   and off, then R4's A / B. Python's gain: -0.53 ms a 1-row window (serving rounds 30.4 -> 29.9 ms).
+MHC_DEFER's side coefficient kernel (`block_moe.zig` `mhc_cuda_v1.coef`, ~0.2 ms a window) uses the same machinery.
+
+#### NEXT SPARK WINDOW: decode runtime (not run; before S4)
+
+Check the lease on dgx-01 first. Image from engine **8774969 or later** and zig-serve
+**1ba798c or later**. `K` = the kit dir. Zig-as-prod: `scripts/v2-rollback.sh zig` (prod-zig.env as committed) with
+`TF_DSV41_PHASES=1 TF_DSV41_PHASES_OUT=/state/phases.json` added for the window. Copy `phases.json` after every cell
+(it is cumulative): `ssh dgx01 cp ~/ai/dsv41-tf/phases.json $K/out/rt-<cell>-phases.json`.
+
+| step | what | time | PASS / record |
+|---|---|---|---|
+| R0 boot | `scripts/serve.sh start` (config/prod-zig.env); `docker logs dsv41-tf-r0 2>&1 \| grep -E 'l2pf\|plan link\|tp:\|engram:'` and the same on dgx-02's `dsv41-tf-r1` | ~10 min (fast boot) | **`l2pf: bulk, 12 MiB a site, N tables (o / f / x ... MiB)`** on both ranks (N: about three a backbone layer, o / f / x), **no `l2pf: OFF`**; `plan link rank 1 pinned to CPU n`; `docker inspect dsv41-tf-r1 \| grep ROCE_MAX_KB` shows 1024 |
+| R1 bits | `python3 $K/bench_http.py --url http://127.0.0.1:8000 --label zig-rt --work code,prose --temps 0 --streams 1 --reps 1 --out $K/out/rt-bits-on.json`; then `TF_DSV41_L2PF=0` in prod-zig.env, `serve.sh stop && serve.sh start`, the same command `--out $K/out/rt-bits-off.json`; restore `TF_DSV41_L2PF=1` | ~25 min | **every reply's `sha` equal on == off** (the prefetch writes nothing); FAIL: `TF_DSV41_L2PF=0` in prod-zig.env, record the first differing cell |
+| R2 1-stream | L2PF on: `python3 $K/bench_http.py --url http://127.0.0.1:8000 --label zig-rt --work code,prose --temps 0 --streams 1 --reps 2 --out $K/out/rt-s1.json`, save `phases.json`; then `python3 $K/bench_http.py --compare $K/out/prod.json $K/out/rt-s1.json` (prod.json: the night's Python prod run, quant repo `results/zig-night-20261007/r0/prod.json`, copied to `$K/out/`) | ~20 min | code T0 1-stream **> 65 tok/s** (night 60.4; prod 84.7); `host` ms a round **< 2** (if larger: the host time is the lanes / token events, record it for `dsq-zig-dspark-1`); `engram.wait` a window **< 1 ms** (one batched read) |
+| R3 4-stream | the same with `--streams 4` (`--out $K/out/rt-s4.json`), save `phases.json` | ~15 min | code T0 4-stream **> 95** (night 82.2; prod 143.6); `engram.wait` a window **< 1.5 ms** (was 8 serial reads) |
+| R4 A / B | one `--work code --temps 0 --streams 1 --reps 2` cell each with, in turn: `TF_DSV41_L2PF=0`; `TF_DSV41_PLAN_LINK=tcp`; `TF_DSV41_ENGRAM_PREFETCH=0` (the old per-layer reads); `TF_DSV41_DRAFT_TIMED=1` (drafts priced from Zig's own rounds, not Python's table); restart between | ~45 min | each knob's ms a round (expected: L2PF 1-1.7 ms at 1-2 rows, less at 5 rows; plan link 0.1-0.4 ms; Engram batch 0.3-1 ms at 1 stream, more at 4; DRAFT_TIMED: tokens a round and tok/s, either way); a knob that measures slower: off in prod-zig.env, recorded here |
+| R5 restore | `scripts/v2-rollback.sh perf1` if the window ends here | 2 min | as every window |
+
 ### Speed against prod after the night (`dsq-zig-speed-2`, offline)
 
 Every number below is from the night's logs (quant repo `results/zig-night-20261007/r0/`: `*/server.log`,
@@ -1533,6 +1645,85 @@ recorded and the window moves on.
 | S4 short decode, per cell | B2's shape (4 slots, slot drafts, prod-zig.env, S2's phases knobs), one `bench_http.py --work code --temps 0 --streams 1 --reps 2` run, save `phases.json`; then `--streams 4`; then `--work prose --streams 1` (copy `phases.json` between runs: it is cumulative) | ~30 min | code 1-stream **> 62** (was 60.4), 4-stream **> 88** (82.2); per-cell phases name the ~20 ms a round outside every phase |
 | S5 GM_V2 | M2c-2 kit `PREFILL=1 GM_V2=1 ./run_host.sh` (both hosts; `prefill.log`'s `prod knobs:` line must say `x3gm v2 one`), then S2's 32K cell with `TF_DSV41_GM_V2=1` | ~35 min | **prefill gate PASS** (95/95 roles, first token, 512/512); 32K **+5-10 %**. PASS: `TF_DSV41_GM_V2=1` into prod-zig.env |
 | S6 restore | prod back on perf1 (`scripts/v2-rollback.sh perf1`) | ~2 min | as every window |
+
+### The DSpark pass on the device (`dsq-zig-dspark-1`, offline; engine `fc43fecd`, `2ab5e2e0`; zig-serve `7fa11c9`)
+
+**What Python does** (8474f31 `drafter.py`, `draft_graphs.py`, `dspark.py`): the whole pass is one CUDA graph a key
+(slots padded to 1 / 2 / 4, rows, head variant; `TF_DSV41_DRAFT_GRAPHS`, default `TF_DSV41_GRAPHS`): static inputs
+in two device arenas staged from pinned mirrors by two non-blocking copies; the blocks; the head; `candidates`
+(`_keys` + `torch.topk`, a rank's best 64 by (value desc, id asc)); `gather_cols`; the `_chain` Triton kernel; one
+D2H copy of drafts + confidences. A 4-slot pass is one 20-row graph (row mode over the stacked rings).
+
+**What Zig did** (the night's 7.0 ms against 3.66): eager launches, a stream sync before the statics' pageable
+uploads, then the host step: a sync, the block's whole logits ([5 x 64,640] fp32, 1.3 MB pageable) and head hidden
+downloaded, the host top-k of every row, an upload, the gather, a second sync, the download. Every sync drains the GPU,
+and the host's launches and top-k then run with the GPU idle.
+
+**Now (`fc43fecd`, `TF_DSV41_DRAFT_GRAPHS`, default off):**
+- `glue.cu` `ds_cands`: each rank's best k columns a row on the device, the host rule exactly (unique 64-bit keys
+  (mono(value + 0.0) << 32 | ~column): -0.0 == +0.0, ties by column; radix select with early exit, bitonic sort).
+  Then the ranks' gather and one async copy of the gathered [W][rows][2 k] (+ the head hidden) into pinned memory, all
+  on the stream. The host keeps the chain (`draft/dspark.zig`), so **draft ids are the host path's bit for bit** (the
+  same candidate lists, the same chain); against Python's `_chain` kernel they agree up to fp32 summation order, as
+  before (acceptance, not tokens: verification is exact).
+- The statics come from pinned staging with no sync; nothing in the pass reads the device on the host, so the pass is
+  captured once a key (`graph_cache`, `TF_DSV41_DRAFT_GRAPHS_MAX` 32, the graphs' memory floor): one key for the
+  one-slot pass, (slots, the group's first row) for slot passes.
+- **Self-check on the hardware:** the first 8 passes run eagerly and also compare the device candidates with the host's
+  on the same logits (every rank). Then the ranks agree, with one all-gather at the same pass on every rank and before
+  any capture. All equal -> graphs (log `draft graphs: 8 passes' device candidates equal the host's on every rank:
+  graphs`); any difference -> the host step for the rest of the run on every rank (log `draft graphs: device candidates
+  differ ...`). A glue fatbin built before `ds_cands` loads as before and keeps the host step (a warning). So the knob
+  can be switched on in a window without risking a reply or a hang.
+- **The speculative pass over several slots:** `SlotPass` implements `Pass.begin` / `collect` on the device path
+  (every group of the round launched back to back, one wait at `collect`), so `TF_DSV41_SPEC_DRAFT` overlaps the pass
+  with the host's commit for 4 slots as for one. If the checks turned the device path off, `begin` defers the exact
+  pass to `collect`. The device path's op 41 carries the group's first row of the round.
+- Phases inside `draft.pass`: `draft.wait` (the host waiting for the device pass), `draft.chain` (the host chain),
+  `draft.host` (the old host step; DRAFT_GRAPHS off), so S4's per-cell phases split the pass.
+- `TF_DSV41_DRAFT_GRAPHS=device`: device candidates without graphs (the A / B of the two halves).
+- **Kit:** the glue fatbin must hold `ds_cands`. Either build with `-Dnvcc`, or use `dsv41-zig-ref/fatbin-kit-dsg`:
+  `fatbin-kit` with `dsv41_glue.fatbin` rebuilt from `fc43fecd` with the build's flags (torch's flags, -O3,
+  --fmad=false, sm_121). Every other kernel's SASS there equals `fatbin-kit`'s.
+
+**Checks (dev box, no GPU):** `check` cap15 / cap18 / cap22 / cap24-1 / cap24-12 / cap24-16 and `dcheck cap16` 0
+mismatches; `test-dsv41`, `test-dsv41-knobs`, `test-dsv41-draft`, `test-dsv41-rows`, `test-dsv41-mdraft` PASS. The
+kernel's selection steps, mirrored on the host, equal the host rule on 400 tie-heavy rows (integer ties, +-0.0, -inf).
+Not proven offline: the kernel on a GPU (the self-check proves it at boot), the graphed pass's capture, the speed.
+
+**Expected** (estimates; the night's B2 numbers):
+
+| | night | expected | why |
+|---|---:|---:|---|
+| DSpark pass (one slot) | 7.0 ms | ~3.5-4 ms | no 1.3 MB pageable download, no host top-k of 5 x 64,640, no 3 syncs, ~90 launches as one graph |
+| code T0, 1 stream | 60.4 | ~63-64 (+ the Engram fix's ~3-4) | ~3 ms off a ~65 ms round |
+| code T0, 4 streams | 82.2 | ~88-92 (+ Engram) | two passes a drafted round, ~6 ms off, and the speculative pass now overlaps with several slots |
+
+**Not reached: the one 20-row pass for 4 slots.** It needs Python's above-16-row decode path in the pass's emitter:
+`_site` for the first site (SPLIT, COLLAPSE 1) and for the final (MIX off) with `_finish_k` (COEF off) instead of
+`mhc_cuda`; the router's above-16-row configuration (`router_gemv.py`: `rows > 16`); and the MoE's grouped path at 20
+rows. No capture of a 20-row pass exists (the night's set P holds 5-row passes only), so `dcheck` could not gate such
+an emission, and it was not written blind. Its gate: a set P capture at 4 slots (`dsv41_m1_capture.py` `M1_DRAFT_SLOTS=4`,
+`64b65d3d`: phase `q4`, which `dcheck` compares with `emitPassSlots(4)`; step D5 below), then the emitter, `aot-needs` /
+`triton_fill.py` for its variants, and `dcheck capture-p4` at 0. Use k = 4 (a power of two): Python pads 3 slots to 4.
+**The same limit costs more in the verify windows:** Zig's row windows stop at 16 rows (`batch.zig`, mhc_cuda's MAXR),
+so a 4-slot drafted round of 4 x 6 = 24 rows runs as two forwards, where Python runs one 24-row window. That is
+probably a larger share of the 4-stream gap than the second DSpark pass (owner: the decode runtime, `dsq-zig-rtparity-1`).
+
+#### NEXT SPARK WINDOW: the DSpark pass (not run: no window on 2026-10-08, prod in use; run when the user schedules one, after S1-S2)
+
+Kit from `fc43fecd` or later with a glue fatbin holding `ds_cands` (`FATBINS=dsv41-zig-ref/fatbin-kit-dsg`, or
+`-Dnvcc`). Check the lease first.
+
+| step | what | time | PASS |
+|---|---|---|---|
+| D1 boot | B2's shape (4 slots, slot drafts, prod-zig.env, S2's phases knobs) plus `TF_DSV41_DRAFT_GRAPHS=1` on both ranks | ~10 min | both ranks log **`draft graphs: 8 passes' device candidates equal the host's on every rank: graphs`**; no `differ` line |
+| D2 tokens | `bench_http.py --work code --temps 0 --streams 1 --reps 2` and `--streams 4`, against the same cells with `TF_DSV41_DRAFT_GRAPHS=0` | ~20 min | **T0 replies equal** (`--compare`); `dsv41 spec:` launches > 0 at 4 streams; shutdown's `draft graphs:` line: graphed ~= passes - 8 |
+| D3 speed | the two runs' `phases.json` | - | `draft.pass` ms_avg **< 4.5** at 1 stream (was 7.0); code 1-stream **> 62**, 4-stream **> 88** |
+| D4 on failure | a `differ` line or a capture failure: record it, rerun with `TF_DSV41_DRAFT_GRAPHS=device` (eager), then 0 | ~10 min | the line and the first differing row in the report |
+| D5 the 20-row pass's capture (one GPU, ~3 min; prod may stay up only if a GPU is free, else in the downtime) | the night's set P capture (`run_m4.sh`'s `capture-p` step: prod's knobs + R1, 8474f31's tree) with `-e M1_DRAFT_SLOTS=4 --out /out/capture-p4`. Back on the dev box: `tf-dsv41-m1 dcheck capture-p4` | ~10 min | capture log `{"ops": ...}` with a `q4` phase in `ops.jsonl`. `dcheck` prints `P q4 (n 20): x/y calls equal`: today's `emitPassSlots(4)` against Python's 20-row pass. Its mismatches (expected: the first site and the final on `_site` / `_finish_k` instead of `mhc_cuda`, the router's above-16-row config, the experts at 20 rows) are the emitter's work list, and the gate it must then pass at 0. Keep `capture-p4/aot` (the 20-row pass's Triton variants for the served set) |
+
+PASS of D1-D3: `TF_DSV41_DRAFT_GRAPHS=1` into prod-zig.env (zig-serve, today commented as pending this gate).
 
 ### 4 slots x 1M and the AOT fill (`dsq-zig-rows1m-1`, offline)
 

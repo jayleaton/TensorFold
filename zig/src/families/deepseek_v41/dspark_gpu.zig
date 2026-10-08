@@ -22,6 +22,7 @@ const emit = @import("dspark_emit.zig");
 const iface = @import("draft/iface.zig");
 const dspark = @import("draft/dspark.zig");
 const dsd = @import("dspark_dev.zig");
+const ph = @import("phases.zig");
 
 pub const Error = error{ Slots, NotAPrefix, NoWeight, CandidateWidth, BadCandidates };
 
@@ -267,6 +268,8 @@ pub const GpuPass = struct {
         const c: usize = x.f.comm.world() * x.k;
         var scratch = std.heap.ArenaAllocator.init(x.gpa);
         defer scratch.deinit();
+        const tc = ph.start(x.f.phases, .@"draft.chain");
+        defer tc.stop();
         try dspark.chain(scratch.allocator(), x.markov, x.cand, x.cval, c, a.anchor, a.params, if (x.conf != null) x.hid else null, out[0].drafts, out[0].conf);
         // trees (lanes' siblings): the gathered candidates and base logits [block][world x k], Python's last_tree
         if (out[0].cand) |cd| {
@@ -324,7 +327,11 @@ pub const GpuPass = struct {
     /// the ranks' verdict after the checks.
     fn devCollect(x: *GpuPass, unpack: bool) !void {
         const d = x.dev.?;
-        try d.wait();
+        {
+            const tw = ph.start(x.f.phases, .@"draft.wait");
+            defer tw.stop();
+            try d.wait();
+        }
         if (d.checked < dsd.check_passes) try d.check(x.last_logits, x.last_v, @intCast(x.st.n), 0);
         if (unpack) try d.unpack(@intCast(x.st.n), 0, x.f.cfg.vocab, x.cand, x.cval, if (x.conf != null) x.hid else null);
         try d.settle();
@@ -423,6 +430,8 @@ pub const GpuPass = struct {
     /// The host's step after the head: this rank's best k columns a row (as token ids), every rank's lists gathered in
     /// rank order (value bits then ids, gather_cols' layout), and the head hidden for the confidences.
     fn hostStep(x: *GpuPass, r: *run.Runner, logits_t: calls.Tensor, hid_t: calls.Tensor) !void {
+        const th = ph.start(x.f.phases, .@"draft.host");
+        defer th.stop();
         const comm = x.f.comm;
         const n: usize = @intCast(x.st.n);
         const V: usize = @intCast(logits_t.shape[1]);

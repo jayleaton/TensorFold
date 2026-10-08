@@ -407,6 +407,17 @@ def run_draft(cap, rec, s, loader, cfg, tree, layers, tmap, dev, a, g, vh, Forwa
     fw.keep(0, 0)
     rec_phase("i1", lambda: dr.ingest(0, fw.slot.pos - 1, fw.slot.taps))
     rec_phase("d1", lambda: dr.propose([0], [nxt], [fw.slot.pos]))
+    # M1_DRAFT_SLOTS=k (k > 1): a pass over k slots as prod's batcher runs it (row mode over the stacked rings, the
+    # slots padded to a power of two: 4 slots x block = 20 rows), phase "q<k>"; slots 1.. have empty contexts (their
+    # drafts are dropped: only the launches matter). dcheck compares it with dspark_emit.emitPassSlots.
+    k = int(os.environ.get("M1_DRAFT_SLOTS", "") or 1)
+    if k > 1:
+        if not dr.rowmode:
+            raise ValueError("M1_DRAFT_SLOTS: the drafter is not in row mode (csa2 'triton')")
+        for sl in range(1, k):
+            dr.reset(sl)
+        pos = fw.slot.pos
+        rec_phase(f"q{k}", lambda: dr.propose(list(range(k)), [nxt] * k, [pos] * k))
     torch.cuda.synchronize()
     cap.draft_w = None
     del fw, dr, dw, tree, layers
