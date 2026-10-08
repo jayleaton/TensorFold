@@ -364,11 +364,9 @@ fn ready(f: *Forward) !void {
     if (f.engram) |h| {
         const cols = h.headShard(f.comm.rank(), f.comm.world())[1] * @as(usize, f.cfg.engram_head_dim);
         _ = try grow(&f.gathered, r.d, W * 2 * rows * cols);
-        if (f.rows_host == null or f.rows_host.?.bytes.len < 2 * rows * cols) {
-            if (f.rows_host) |*hb| hb.free();
-            f.rows_host = try cuda.HostBuffer.alloc(r.d, @max(2 * rows * cols, 4096));
-        }
+        for (0..h.layer_ids.len) |li| _ = try f.rows_stage[li].take(r.d, 2 * rows * cols);
     }
+    _ = try f.ids_stage.take(r.d, 8 * rows);
     try r.stream.synchronize();
     st.ready = true;
 }

@@ -21,6 +21,7 @@ const kvs = @import("kv_state.zig");
 const er = @import("engram_rows.zig");
 const greedy_host = @import("greedy.zig");
 const ph = @import("phases.zig");
+const hs = @import("host_stage.zig");
 const ced = @import("ced.zig");
 
 pub const Error = error{ GlueNotBuilt, BadWindow };
@@ -49,13 +50,14 @@ pub const Forward = struct {
     programs: std.AutoHashMapUnmanaged(u32, []const calls.Call) = .empty,
     slot: Slot = .{},
     /// pinned staging of the window's token ids, and their device copy (int64, the embedding step reads them)
-    host: ?cuda.HostBuffer = null,
+    ids_stage: hs.Stage = .{},
     dev_ids: ?cuda.DeviceBuffer = null,
     /// Engram's hasher (tools/zig/dsv41_engram_host.py's tables) and the rows' source; M2a: the synthetic rows
     engram: ?*const eh.Host = null,
     gathered: ?cuda.DeviceBuffer = null,
-    /// Engram's own pinned staging (the ids' staging may still be in flight: one buffer a producer)
-    rows_host: ?cuda.HostBuffer = null,
+    /// Engram's own pinned staging, one a layer of the table (the ids' staging may still be in flight: one buffer a
+    /// producer; a prompt segment's layer-14 rows are written while its layer-1 copy may still be queued)
+    rows_stage: [eh.max_layers]hs.Stage = @splat(.{}),
     /// a bf16 [rows, hidden] send buffer for the exchanges whose partial is not bf16 already (embedding, MoE)
     send: ?cuda.DeviceBuffer = null,
     /// the window's token ids (the embedding step reads them; window() copies them into ids_own)
@@ -119,11 +121,11 @@ pub const Forward = struct {
             g.deinit();
             f.gpa.destroy(g);
         }
-        if (f.host) |*h| h.free();
+        f.ids_stage.deinit();
         if (f.dev_ids) |*b| b.free();
         if (f.send) |*b| b.free();
         if (f.gathered) |*b| b.free();
-        if (f.rows_host) |*b| b.free();
+        for (&f.rows_stage) |*x| x.deinit();
         f.prefill_state.deinit(f.gpa);
         if (f.engram_rows) |x| x.close();
         if (f.pick_host) |*b| b.free();
@@ -608,18 +610,17 @@ pub const Forward = struct {
         if (std.mem.eql(u8, step, "embed")) {
             // this rank's vocabulary rows (others +0), their all-sum (the window's first exchange), x4 into the streams
             const n: usize = p.n;
-            if (f.host == null or f.host.?.bytes.len < 8 * n) {
-                if (f.host) |*h| h.free();
-                f.host = try cuda.HostBuffer.alloc(r.d, @max(8 * n, 4096));
-            }
             if (f.dev_ids == null or f.dev_ids.?.len < 8 * n) {
                 if (f.dev_ids) |*b| b.free();
                 f.dev_ids = try cuda.DeviceBuffer.alloc(r.d, @max(8 * n, 256));
             }
-            const h = f.host.?.bytes;
-            try r.stream.synchronize(); // the previous window's copy out of this staging has finished
+            // the previous window's copy out of this staging has finished: a prompt segment waits for that copy
+            // alone (Python's ids_of: to_device past CHUNK rows), a smaller window for the stream (a pageable copy)
+            if (n <= hs.chunk) try r.stream.synchronize();
+            const h = try f.ids_stage.take(r.d, 8 * n);
             for (f.ids, 0..) |id, i| std.mem.writeInt(i64, h[8 * i ..][0..8], id, .little);
             try r.d.check(r.d.api.cuMemcpyHtoDAsync_v2(f.dev_ids.?.ptr, h.ptr, 8 * n, s), "cuMemcpyHtoDAsync");
+            try f.ids_stage.issued(r.d, r.stream);
             const embed = r.weights.get("embed") orelse return error.MissingWeight;
             const V: usize = f.cfg.vocab / W;
             const rows = try f.sendBuffer(r, 2 * n * D);
@@ -672,16 +673,18 @@ pub const Forward = struct {
         const W = f.comm.world();
         const cols = f.engramCols(h); // this rank's columns of a row
         const bytes = 2 * n * cols;
-        // an earlier copy out of this staging (the previous Engram layer's) must have left it before it is rewritten
-        try r.stream.synchronize();
-        if (f.rows_host == null or f.rows_host.?.bytes.len < bytes) {
-            if (f.rows_host) |*hb| hb.free();
-            f.rows_host = try cuda.HostBuffer.alloc(r.d, @max(bytes, 4096));
-        }
-        try f.fillEngramRows(h, L, @alignCast(std.mem.bytesAsSlice(u16, f.rows_host.?.bytes[0..bytes])));
+        // an earlier copy out of this layer's staging must have left it before it is rewritten: a prompt segment waits
+        // for that copy alone (decode.LazyEngram: to_device past CHUNK rows, no stream sync), a smaller window for the
+        // stream (Python's pageable copy)
+        const li = std.mem.indexOfScalar(u32, h.layer_ids, L) orelse return error.NotEngram;
+        if (n <= hs.chunk) try r.stream.synchronize();
+        const stage = &f.rows_stage[li];
+        const host = try stage.take(r.d, bytes);
+        try f.fillEngramRows(h, L, @alignCast(std.mem.bytesAsSlice(u16, host)));
         const send = try f.sendBuffer(r, bytes);
         const s = r.stream.handle;
-        try r.d.check(r.d.api.cuMemcpyHtoDAsync_v2(send, f.rows_host.?.bytes.ptr, bytes, s), "cuMemcpyHtoDAsync");
+        try r.d.check(r.d.api.cuMemcpyHtoDAsync_v2(send, host.ptr, bytes, s), "cuMemcpyHtoDAsync");
+        try stage.issued(r.d, r.stream);
         if (f.gathered == null or f.gathered.?.len < W * bytes) {
             if (f.gathered) |*g| g.free();
             f.gathered = try cuda.DeviceBuffer.alloc(r.d, W * bytes);
