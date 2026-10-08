@@ -145,6 +145,42 @@ pub fn stageMirror(st: emit.Statics, ring: u64, noise: u32, valid: u64, pick: []
     h32[@intCast(st.anchor())] = @intCast(A);
 }
 
+/// glue.cu ds_accept_rows on the host (its mirror): each slot's (accepted, bonus, next position) of a row window.
+pub fn acceptMirror(picks: []const i64, ids: []const i64, segs: []const [3]i64, acc: [][3]i64) void {
+    for (segs, acc) |sg, *o| {
+        const a: usize = @intCast(sg[0]);
+        const n: usize = @intCast(sg[1]);
+        var c: usize = 0;
+        while (c + 1 < n and ids[a + c + 1] == picks[a + c]) c += 1;
+        o.* = .{ @intCast(c), picks[a + c], sg[2] + @as(i64, @intCast(c)) + 1 };
+    }
+}
+
+/// glue.cu ds_stage_rows on the host (its mirror): a pass's members' position-dependent statics from acc.
+pub fn stageRowsMirror(lay: emit.Layout, n: u32, window: u32, ring: u32, noise: u32, acc: []const [3]i64, mem: []const [3]i64, h64: []i64, h32: []i32) void {
+    const W: i64 = window;
+    for (mem, 0..) |m, mi| {
+        const A = acc[@intCast(m[0])][1];
+        const P = acc[@intCast(m[0])][2];
+        const lo_w: i64 = if (P > W) P - W else 0;
+        const first: i64 = @max(lo_w, m[2]);
+        const count: i64 = if (P > first) P - first else 0;
+        const a: i64 = @as(i64, @intCast(mi)) * n;
+        for (0..n) |i| {
+            const ii: i64 = @intCast(i);
+            h64[@intCast(lay.ids + a + ii)] = if (i == 0) A else noise;
+            h64[@intCast(lay.positions + a + ii)] = P + ii;
+            h32[@intCast(lay.counts + a + ii)] = @intCast(count);
+            h32[@intCast(lay.lo + a + ii)] = @intCast(P);
+            h32[@intCast(lay.hi + a + ii)] = @intCast(P + n - 1);
+        }
+        for (0..@as(usize, n) * @as(usize, window)) |e| {
+            const j: i64 = @intCast(e % window);
+            h32[@intCast(lay.tokens + a * W + @as(i64, @intCast(e)))] = if (j < count) @intCast(m[1] * ring + @mod(first + j, ring)) else -1;
+        }
+    }
+}
+
 /// The leader's op_propose message for `ms` into `buf` (2 + 3 x 16 words).
 pub fn proposeMsg(ms: []const Member, buf: []i64) ![]const i64 {
     if (ms.len == 0 or 2 + 3 * ms.len > buf.len) return error.BadPlan;

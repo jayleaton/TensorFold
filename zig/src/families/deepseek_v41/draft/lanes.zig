@@ -282,6 +282,8 @@ pub const Lanes = struct {
         for (windows, segs) |w, g| {
             const st = x.get(w.stream) catch continue;
             if (!dsparkRound(st, w) or !sp.wouldWant(st.slot)) continue;
+            // the device pick is greedy: a keyed (T > 0) window's next pass starts from the host's choices
+            if (w.stream.sampling) |smp| if (smp.temperature > 0) continue;
             arm(x.pass.ptr, st.slot, g.start, @intCast(g.tokens.len));
         }
     }

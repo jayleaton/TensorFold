@@ -19,6 +19,11 @@
 //   ds_stage     DSpark's one-slot pass statics from the device pick (spec.py stage_device): anchor = pick[nw + 1] (the
 //                bonus), P = pick[nw + 2]; dspark_gpu.fillStatics' values (ids, positions, P, the context list, counts,
 //                lo, hi, anchor), integers only
+//   ds_accept_rows  a row window's slots (segs [k][3]: first row, rows, start): each one's accepted drafts (rows whose
+//                pick is the next row's id), bonus = its pick at that row, next position = start + accepted + 1
+//                (pick_merge's chain walk, per slot) into acc [k][3]
+//   ds_stage_rows   a several-slot pass's statics (dspark_rows.stage's position-dependent values) for its members
+//                (mem [g][3]: the slot's index in acc, its slot, its valid) from acc's (bonus, next position)
 //   pick_pack    pairs[r] = (f64 vals[r], f64 (cols[r] + id0))     (forward.greedy's pair: a rank's best, topk_keys k 1)
 //   pick_merge   out[r] = the id of the best pair over the ranks [W][n][2] (higher value; on a tie or NaN the lower
 //                rank: forward.greedy's merge, strict >); out[n] = accepted (rows 0.. whose pick is the next row's id:
@@ -268,6 +273,46 @@ __global__ void __launch_bounds__(256) ds_stage_kernel(const long long* __restri
     if (t == 0) {
         s32[0] = (int)P;                                            // start (offset 0)
         s32[o_anchor] = (int)A;
+    }
+}
+
+// one thread a slot of a row window: pick_merge's chain walk over the slot's own rows
+__global__ void __launch_bounds__(32) ds_accept_rows_kernel(const long long* __restrict__ picks, const long long* __restrict__ ids,
+                                                           const long long* __restrict__ segs, int k, long long* __restrict__ acc) {
+    const int s = threadIdx.x;
+    if (s >= k) return;
+    const long long a = segs[3 * s], n = segs[3 * s + 1], start = segs[3 * s + 2];
+    long long c = 0;
+    while (c + 1 < n && ids[a + c + 1] == picks[a + c]) c++;
+    acc[3 * s] = c;
+    acc[3 * s + 1] = picks[a + c];
+    acc[3 * s + 2] = start + c + 1;
+}
+
+// one block: a pass's members (dspark_rows.stage over its Layout), each member's n rows from its (bonus, next position)
+__global__ void __launch_bounds__(256) ds_stage_rows_kernel(const long long* __restrict__ acc, const long long* __restrict__ mem,
+                                                           int g, long long* __restrict__ s64, int* __restrict__ s32, int n,
+                                                           int W, int ring, int noise, int o_ids, int o_pos, int o_tok,
+                                                           int o_cnt, int o_lo, int o_hi) {
+    const int t = threadIdx.x;
+    for (int m = 0; m < g; m++) {
+        const long long j = mem[3 * m], slot = mem[3 * m + 1], valid = mem[3 * m + 2];
+        const long long A = acc[3 * j + 1], P = acc[3 * j + 2];
+        const long long lo_w = P > W ? P - W : 0;
+        const long long first = lo_w > valid ? lo_w : valid;
+        const int count = P > first ? (int)(P - first) : 0;
+        const int a = m * n;
+        for (int i = t; i < n; i += blockDim.x) {
+            s64[o_ids + a + i] = i == 0 ? A : (long long)noise;
+            s64[o_pos + a + i] = P + i;
+            s32[o_cnt + a + i] = count;
+            s32[o_lo + a + i] = (int)P;
+            s32[o_hi + a + i] = (int)(P + n - 1);
+        }
+        for (int e = t; e < n * W; e += blockDim.x) {
+            const int jj = e % W;
+            s32[o_tok + a * W + e] = jj < count ? (int)(slot * ring + (first + jj) % ring) : -1;
+        }
     }
 }
 

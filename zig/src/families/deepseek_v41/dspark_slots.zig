@@ -70,7 +70,29 @@ pub const SlotPass = struct {
     order: [16]usize = undefined,
     begun_asks: [16]iface.Ask = undefined,
 
+    /// the speculative round from the row window's device pick (spec.py's order; Pass.arm, forward.after_pick):
+    /// `bat` the row windows' state (each slot's rows in the window), the armed windows by slot until the pick, then
+    /// the round launched from it until `begin` takes it (rank 0); `dscr` / `hscr` the accept's inputs and outputs
+    bat: ?*const batch.Batch = null,
+    armed: [16]?Arm = @splat(null),
+    dl: ?Dl = null,
+    begun_dev: bool = false,
+    dscr: ?cuda.DeviceBuffer = null,
+    hscr: ?cuda.HostBuffer = null,
+    staged: ?cuda.Event = null,
+    prev_pick: ?fwd.Forward.AfterPick = null,
+    dstats: struct { device_starts: u64 = 0, device_dropped: u64 = 0 } = .{},
+
     const Begun = struct { n: usize, groups: [16][2]usize, ng: usize };
+
+    const Arm = struct { start: u64, n: u32 };
+    const Dl = struct { k: usize, slots: [16]u32 };
+    /// dscr / hscr layout (int64 elements): ids [64], segs [16][3], acc [16][3], mem [16][16][3] (a group each)
+    const scr_ids = 0;
+    const scr_segs = 64;
+    const scr_acc = scr_segs + 48;
+    const scr_mem = scr_acc + 48;
+    const scr_len = scr_mem + 16 * 48;
 
     /// The roles several-slot passes add to the forward's plan (before Runner.bind): the stacked rings, each pass
     /// size's statics and rows, the ingests' slot views.
@@ -123,6 +145,17 @@ pub const SlotPass = struct {
             } else {
                 _ = try x.device(&x.send, 2 * R * f.cfg.hidden); // the embedding's and exchanges' send, at its largest
                 x.dev = try dsd.Dev.init(gpa, r.d, f.comm, r.stream, mode, one.k, f.cfg.hidden, n * nslots, one.conf != null, @intCast(8 * lay.len64 + 4 * lay.len32), nslots);
+                // the speculative round from the row window's device pick (TF_DSV41_GREEDY_GPU, ds_accept_rows /
+                // ds_stage_rows): this pass takes the forward's hook over from the one-slot pass
+                const ko = r.kernels.others(r.stream).f;
+                if (ko.ds_accept_rows != null and ko.ds_stage_rows != null and nslots <= 16) {
+                    x.bat = b;
+                    x.dscr = try cuda.DeviceBuffer.alloc(r.d, 8 * scr_len);
+                    x.hscr = try cuda.HostBuffer.alloc(r.d, 8 * scr_len);
+                    x.staged = try cuda.Event.init(r.d, false);
+                    x.prev_pick = f.after_pick;
+                    f.after_pick = .{ .ctx = x, .run = afterPick };
+                }
             }
         }
         std.log.scoped(.dsv41).info("slot drafts: {d} slots, DSpark passes of up to {d} slots ({d} rows)", .{ nslots, group, R });
@@ -132,7 +165,14 @@ pub const SlotPass = struct {
     pub fn deinit(x: *SlotPass) void {
         const gpa = x.gpa;
         x.f.ext = x.prev_ext;
-        if (x.dev) |d| d.deinit();
+        if (x.bat != null) x.f.after_pick = x.prev_pick;
+        if (x.dscr) |*b| b.free();
+        if (x.hscr) |*b| b.free();
+        if (x.staged) |*e| e.deinit();
+        if (x.dev) |d| {
+            if (x.dstats.device_starts + x.dstats.device_dropped > 0) std.log.scoped(.dsv41).info("slot drafts: {d} speculative rounds started from the device pick, {d} unused", .{ x.dstats.device_starts, x.dstats.device_dropped });
+            d.deinit();
+        }
         if (x.send) |*b| b.free();
         if (x.gathered) |*b| b.free();
         inline for (.{ "valid", "h64", "h32", "cand", "cval", "hid", "logits", "hid16", "packed_", "all", "ids" }) |name| gpa.free(@field(x, name));
@@ -146,7 +186,126 @@ pub const SlotPass = struct {
 
     const vtable: iface.Pass.VTable = .{ .ingest = ingest, .propose = propose, .reset = reset, .markov = heads };
     /// with the device path: the speculative pass too (draft/spec.zig), the whole round launched by `begin`
-    const vtable_begin: iface.Pass.VTable = .{ .ingest = ingest, .propose = propose, .reset = reset, .markov = heads, .begin = begin, .collect = collect };
+    const vtable_begin: iface.Pass.VTable = .{ .ingest = ingest, .propose = propose, .reset = reset, .markov = heads, .begin = begin, .collect = collect, .arm = arm };
+
+    /// The device path is on and past its checks.
+    fn devReady(x: *const SlotPass) bool {
+        const d = x.dev orelse return false;
+        return d.on() and d.stats.passes >= dsd.check_passes;
+    }
+
+    /// Pass.arm (rank 0): the slot's coming row window, for the speculative round from its device pick; the followers
+    /// get op 43 [op, slot, start, rows] (the one-slot pass's arm has no slot) before the window.
+    fn arm(p: *anyopaque, slot: u32, start: u64, n_rows: u32) void {
+        const x = self(p);
+        if (x.dl != null) x.dropDevice();
+        if (x.bat == null or slot >= x.nslots or !x.devReady()) return;
+        x.sendOp(&.{ gpu.GpuPass.op_arm, slot, @intCast(start), n_rows }) catch |e| {
+            std.log.err("slot drafts: the arm did not reach the followers ({t})", .{e});
+            return;
+        };
+        x.armed[slot] = .{ .start = start, .n = n_rows };
+    }
+
+    fn dropDevice(x: *SlotPass) void {
+        if (x.dl != null) x.dstats.device_dropped += 1;
+        x.dl = null;
+        x.armed = @splat(null);
+    }
+
+    /// forward.after_pick, every rank, after a row window's device pick: for the armed slots whose rows are all in
+    /// this forward, each one's window taps into its rings (no stream drain), the slots' (accepted, bonus, next
+    /// position) from the picks (ds_accept_rows, copied back for `begin`), then each group's statics (dspark_rows.stage
+    /// with placeholders, ds_stage_rows from the pick) and pass (its graph if captured, never a capture here).
+    fn afterPick(ctx: *anyopaque, pick: fwd.Forward.PickDevice) anyerror!void {
+        const x: *SlotPass = @ptrCast(@alignCast(ctx));
+        const armed = x.armed;
+        x.armed = @splat(null);
+        const b = x.bat orelse return;
+        if (pick.chain or x.begun != null or !x.devReady() or pick.n != b.n) return;
+        var slots: [16]u32 = undefined;
+        var k: usize = 0;
+        for (armed[0..x.nslots], 0..) |am, sl| if (am) |a| {
+            const pd = b.pend[sl] orelse continue;
+            if (pd.stashed or pd.start != a.start or pd.n != a.n or pd.a + pd.n > pick.n or a.n > x.one.ingest_rows) continue;
+            slots[k] = @intCast(sl);
+            k += 1;
+        };
+        if (k == 0) return;
+        const d = x.dev.?;
+        const f = x.f;
+        const r = f.runner;
+        const n: u32 = f.cfg.dspark_block;
+        // the accept's inputs: the armed slots' window ids at their rows, their (first row, rows, start)
+        const h: []i64 = @alignCast(std.mem.bytesAsSlice(i64, x.hscr.?.bytes[0 .. 8 * scr_len]));
+        for (slots[0..k], 0..) |sl, j| {
+            const pd = b.pend[sl].?;
+            for (pd.ids[0..pd.n], 0..) |t, i| h[scr_ids + pd.a + i] = t;
+            h[scr_segs + 3 * j ..][0..3].* = .{ pd.a, pd.n, @intCast(pd.start) };
+        }
+        const dev = x.dscr.?.ptr;
+        try cuda.DeviceBuffer.uploadAsync(.{ .d = r.d, .ptr = dev, .len = 8 * scr_acc }, 0, std.mem.sliceAsBytes(h[0..scr_acc]), r.stream.handle);
+        const ops = r.kernels.others(r.stream);
+        try ops.dsAcceptRows(pick.out, dev + 8 * scr_ids, dev + 8 * scr_segs, k, dev + 8 * scr_acc);
+        try r.d.check(r.d.api.cuMemcpyDtoHAsync_v2(x.hscr.?.bytes.ptr + 8 * scr_acc, dev + 8 * scr_acc, 8 * 3 * k, r.stream.handle), "cuMemcpyDtoHAsync");
+        try x.staged.?.record(r.stream);
+        // each slot's whole window into its rings (spec.py: rows past the commit lie past every later pass's context)
+        for (slots[0..k]) |sl| {
+            const pd = b.pend[sl].?;
+            try x.ingestAsync(sl, pd.start, .{ .src = 0, .skip = pd.a }, pd.n);
+        }
+        // the groups as devLaunchRound forms them (slots sorted, rows.groups), each staged on the device and launched
+        var gs: [16][2]usize = undefined;
+        const ng = rows.groups(k, x.group, &gs);
+        const W: u32 = f.cfg.window;
+        const ring: u32 = @intCast(emit.ringRows(f.cfg));
+        const s64 = r.addressOf("w.ds.i64") orelse return error.Unbound;
+        const s32 = r.addressOf("w.ds.i32") orelse return error.Unbound;
+        for (gs[0..ng]) |g| {
+            var ms: [16]rows.Member = undefined;
+            const gk = g[1] - g[0];
+            const mem = h[scr_mem + 48 * (g[0] % 16) ..][0 .. 3 * gk];
+            for (slots[g[0]..g[1]], ms[0..gk], 0..) |sl, *m, i| {
+                m.* = .{ .slot = sl, .anchor = 0, .start = b.pend[sl].?.start, .valid = x.valid[sl] };
+                mem[3 * i ..][0..3].* = .{ @intCast(g[0] + i), sl, @intCast(x.valid[sl]) };
+            }
+            const lay = emit.Layout.of(@intCast(gk), n, W);
+            const at = g[0] * n;
+            const sv = try d.statics(at / n, @intCast(lay.len64), @intCast(lay.len32));
+            rows.stage(lay, n, W, ring, x.one.shape.noise, ms[0..gk], sv[0], sv[1]);
+            try cuda.DeviceBuffer.uploadAsync(.{ .d = r.d, .ptr = s64, .len = 8 * @as(usize, @intCast(lay.len64)) }, 0, std.mem.sliceAsBytes(sv[0]), r.stream.handle);
+            try cuda.DeviceBuffer.uploadAsync(.{ .d = r.d, .ptr = s32, .len = 4 * @as(usize, @intCast(lay.end32)) }, 0, std.mem.sliceAsBytes(sv[1][0..@intCast(lay.end32)]), r.stream.handle);
+            const moff = 8 * (scr_mem + 48 * (g[0] % 16));
+            try cuda.DeviceBuffer.uploadAsync(.{ .d = r.d, .ptr = dev + moff, .len = 8 * 3 * gk }, 0, std.mem.sliceAsBytes(mem), r.stream.handle);
+            try ops.dsStageRows(dev + 8 * scr_acc, dev + moff, gk, s64, s32, n, W, ring, x.one.shape.noise, .{ lay.ids, lay.positions, lay.tokens, lay.counts, lay.lo, lay.hi });
+            x.stats.passes += 1;
+            x.stats.slots += gk;
+            x.cur_at = at;
+            x.cur_k = gk;
+            r.glue = .{ .ctx = x, .run = glueFn };
+            const extra = [_]u64{ if (x.send) |sb| sb.ptr else 0, if (x.send) |sb| sb.len else 0 };
+            try d.issueReplay(@intCast(gk << 16 | at), dsd.fingerprint(r, d, &extra), .{ .ctx = x, .run = groupBody });
+            try d.settle(); // counted here on every rank (rank 0's collect does not count it again)
+        }
+        try d.mark();
+        if (x.f.comm.rank() == 0 or x.f.link == null) {
+            x.dl = .{ .k = k, .slots = undefined };
+            @memcpy(x.dl.?.slots[0..k], slots[0..k]);
+        }
+    }
+
+    /// An ingest of a slot's rows on the device without draining the stream first (dspark_gpu.ingestAsync's form).
+    fn ingestAsync(x: *SlotPass, slot: u32, start: u64, at: rows.TapsAt, n: u32) !void {
+        const r = x.f.runner;
+        const pos: i32 = @intCast(start);
+        try cuda.DeviceBuffer.uploadAsync(.{ .d = r.d, .ptr = r.addressOf("w.ds.pos") orelse return error.Unbound, .len = 4 }, 0, std.mem.asBytes(&pos), r.stream.handle);
+        var la = std.heap.ArenaAllocator.init(x.gpa);
+        defer la.deinit();
+        const sl: emit.Slots = .{ .ring_slots = x.nslots, .slot = slot, .taps_role = if (at.src == 1) batch.taps_stash_role else "w.taps" };
+        const cs = try emit.emitIngestAt(la.allocator(), x.f.cfg, x.f.widths, x.f.opts, n, at.skip, sl);
+        r.glue = .{ .ctx = x, .run = glueFn };
+        try r.window(cs);
+    }
 
     fn self(p: *anyopaque) *SlotPass {
         return @ptrCast(@alignCast(p));
@@ -166,6 +325,7 @@ pub const SlotPass = struct {
 
     fn reset(p: *anyopaque, slot: u32) void {
         const x = self(p);
+        x.dropDevice();
         x.sendOp(&.{ rows.op_reset, slot }) catch |e| std.log.err("slot drafts: the draft reset did not reach the followers ({t})", .{e});
         if (slot < x.nslots) x.valid[slot] = 0;
     }
@@ -179,6 +339,8 @@ pub const SlotPass = struct {
         if (rws.len == 0) return;
         for (rws, 0..) |r, i| if (r != rws[0] + i) return error.NotAPrefix;
         if (taps.map != null) return error.NotAPrefix; // trees are refused with several slots (batch.zig)
+        // a device-launched round already ingested this slot's window rows (afterPick): the same rows, positions
+        if (x.dl) |dl| if (rws[0] == 0 and std.mem.indexOfScalar(u32, dl.slots[0..dl.k], slot) != null) if (x.bat.?.pend[slot]) |pd| if (pd.start == start and rws.len <= pd.n) return;
         const n: u32 = @intCast(rws.len);
         const r = x.f.runner;
         const at = try rows.locate(taps.address, taps.rows, 2 * @as(u64, taps.stride), rws[0], n, x.one.ingest_rows, r.addressOf("w.taps") orelse return error.Unbound, x.stash);
@@ -216,6 +378,7 @@ pub const SlotPass = struct {
         if (asks.len == 0) return;
         if (asks.len > x.nslots) return error.Slots;
         if (x.begun != null) return error.PassBegun;
+        x.dropDevice();
         if (x.devOn()) {
             try x.devLaunchRound(asks);
             return x.devFinishRound(asks, out);
@@ -271,6 +434,7 @@ pub const SlotPass = struct {
         if (asks.len == 0 or asks.len > x.nslots) return error.Slots;
         if (x.begun != null) return error.PassBegun;
         @memcpy(x.begun_asks[0..asks.len], asks);
+        if (x.dl != null and try x.takeDevice(x.begun_asks[0..asks.len])) return;
         if (!x.devOn()) {
             // the checks turned the device path off: the pass runs at `collect` (exact; only the overlap is lost:
             // between the two only work without collectives runs, and the rings are as `begin` saw them)
@@ -281,10 +445,39 @@ pub const SlotPass = struct {
         try x.devLaunchRound(x.begun_asks[0..asks.len]);
     }
 
+    /// `begin` over the device-launched round when its slots are the asks' and every slot's (bonus, next position)
+    /// on the device is the ask's (anchor, start) - the same picks the host merged; else it is dropped (false).
+    fn takeDevice(x: *SlotPass, asks: []const iface.Ask) !bool {
+        const dl = x.dl.?;
+        x.dl = null;
+        for (x.order[0..asks.len], 0..) |*o, i| o.* = i;
+        std.sort.insertion(usize, x.order[0..asks.len], asks, bySlot);
+        var ok = asks.len == dl.k;
+        if (ok) {
+            try x.staged.?.synchronize(); // the accept's copy back (not the passes)
+            const h: []const i64 = @alignCast(std.mem.bytesAsSlice(i64, x.hscr.?.bytes[0 .. 8 * scr_len]));
+            for (x.order[0..asks.len], 0..) |i, j| {
+                const a = asks[i];
+                if (a.slot != dl.slots[j] or h[scr_acc + 3 * j + 1] != a.anchor or h[scr_acc + 3 * j + 2] != @as(i64, @intCast(a.start))) ok = false;
+            }
+        }
+        if (!ok) {
+            x.dstats.device_dropped += 1;
+            return false;
+        }
+        var bg: Begun = .{ .n = asks.len, .groups = undefined, .ng = 0 };
+        bg.ng = rows.groups(asks.len, x.group, &bg.groups);
+        x.begun = bg;
+        x.begun_dev = true;
+        x.dstats.device_starts += 1;
+        return true;
+    }
+
     fn collect(p: *anyopaque, out: []iface.Proposal) anyerror!void {
         const x = self(p);
         const b = x.begun orelse return error.NoPassBegun;
         if (out.len != b.n) return error.Slots;
+        x.begun_dev = false; // a device-launched round collects as a begun one (devFinishRound: wait, unpack, chains)
         if (x.begun_host) {
             x.begun_host = false;
             x.begun = null;
@@ -425,6 +618,17 @@ pub const SlotPass = struct {
             rows.op_ingest => {
                 if (msg.len != 6 or msg[1] < 0 or msg[1] >= x.nslots) return error.BadPlan;
                 try x.doIngest(@intCast(msg[1]), @intCast(msg[2]), .{ .src = msg[3], .skip = msg[4] }, @intCast(msg[5]));
+            },
+            gpu.GpuPass.op_arm => {
+                // [op, slot, start, rows]: this pass's arm; [op, start, rows]: the one-slot pass's
+                if (msg.len == 4) {
+                    const sl: usize = @intCast(msg[1]);
+                    if (sl >= x.nslots) return error.BadPlan;
+                    x.armed[sl] = .{ .start = @intCast(msg[2]), .n = @intCast(msg[3]) };
+                    return;
+                }
+                const e = x.prev_ext orelse return error.BadPlan;
+                try e.run(e.ptr, msg);
             },
             rows.op_propose => {
                 var ms: [16]rows.Member = undefined;

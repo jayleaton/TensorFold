@@ -304,3 +304,58 @@ test "the speculative pass's device start: ds_stage's arithmetic over the placeh
         }
     }
 }
+
+test "the slot passes' device start: ds_accept_rows / ds_stage_rows over the placeholder staging == the host's statics" {
+    // dspark_slots.afterPick: each armed slot's (accepted, bonus, next position) from the row window's picks (lanes'
+    // accept, a slot's own rows), then a group's statics staged as stage(anchor 0, the window's start) and rewritten
+    // from those values: the result must be stage() at (bonus, next position), the round's `begin` statics.
+    const cfg: Config = .{};
+    const n: u32 = cfg.dspark_block;
+    const W: u32 = cfg.window;
+    const ring: u32 = @intCast(emit.ringRows(&cfg));
+    const noise: u32 = cfg.dspark_noise_token;
+    // a 4-slot row window: slot 2 (rows 0-5), slot 0 (6-8), slot 3 (9-14), slot 1 (15)
+    const segs = [_][3]i64{ .{ 0, 6, 300 }, .{ 6, 3, 129 }, .{ 9, 6, 5000 }, .{ 15, 1, 40 } };
+    const seg_slot = [_]u32{ 2, 0, 3, 1 };
+    var ids: [16]i64 = undefined;
+    var picks: [16]i64 = undefined;
+    for (&ids, &picks, 0..) |*t, *q, i| {
+        t.* = @intCast(1000 + i);
+        q.* = @intCast(5000 + i);
+    }
+    // accepted 3 for slot 2 (picks 0..2 equal the next rows' ids), 0 for slot 0, 5 (all) for slot 3, 0 for slot 1
+    for (0..3) |i| picks[i] = ids[i + 1];
+    for (9..14) |i| picks[i] = ids[i + 1];
+    var acc: [4][3]i64 = undefined;
+    rows.acceptMirror(&picks, &ids, &segs, &acc);
+    try testing.expectEqual([3]i64{ 3, picks[3], 304 }, acc[0]);
+    try testing.expectEqual([3]i64{ 0, picks[6], 130 }, acc[1]);
+    try testing.expectEqual([3]i64{ 5, picks[14], 5006 }, acc[2]);
+    try testing.expectEqual([3]i64{ 0, picks[15], 41 }, acc[3]);
+    const valids = [4]u64{ 0, 100, 4990, 0 };
+    // groups of 1-4 members in sorted-slot order, as afterPick forms them
+    for ([_][2]usize{ .{ 0, 4 }, .{ 0, 2 }, .{ 2, 4 }, .{ 1, 2 } }) |g| {
+        const gk = g[1] - g[0];
+        const lay = emit.Layout.of(@intCast(gk), n, W);
+        var want64: [256]i64 = undefined;
+        var want32: [8192]i32 = undefined;
+        var got64: [256]i64 = undefined;
+        var got32: [8192]i32 = undefined;
+        var ms_want: [4]rows.Member = undefined;
+        var ms_ph: [4]rows.Member = undefined;
+        var mem: [4][3]i64 = undefined;
+        for (g[0]..g[1], 0..) |j, i| {
+            const sl = seg_slot[j];
+            ms_want[i] = .{ .slot = sl, .anchor = @intCast(acc[j][1]), .start = @intCast(acc[j][2]), .valid = valids[j] };
+            ms_ph[i] = .{ .slot = sl, .anchor = 0, .start = @intCast(segs[j][2]), .valid = valids[j] };
+            mem[i] = .{ @intCast(j), sl, @intCast(valids[j]) };
+        }
+        const l64: usize = @intCast(lay.len64);
+        const l32: usize = @intCast(lay.len32);
+        rows.stage(lay, n, W, ring, noise, ms_want[0..gk], want64[0..l64], want32[0..l32]);
+        rows.stage(lay, n, W, ring, noise, ms_ph[0..gk], got64[0..l64], got32[0..l32]);
+        rows.stageRowsMirror(lay, n, W, ring, noise, &acc, mem[0..gk], got64[0..l64], got32[0..l32]);
+        try testing.expectEqualSlices(i64, want64[0..l64], got64[0..l64]);
+        try testing.expectEqualSlices(i32, want32[0..l32], got32[0..l32]);
+    }
+}

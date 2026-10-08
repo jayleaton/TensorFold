@@ -448,6 +448,9 @@ pub const Functions = struct {
     pick_merge: ?cuda.Function = null,
     /// glue.cu's DSpark statics from the device pick (the speculative pass's device start); optional, as ds_cands
     ds_stage: ?cuda.Function = null,
+    /// glue.cu's row-window accept and several-slot statics (the slot passes' device start); optional
+    ds_accept_rows: ?cuda.Function = null,
+    ds_stage_rows: ?cuda.Function = null,
     pfglue: [pfglue.syms.len]cuda.Function, // pfglue.syms order
 
     /// `pf`: the four pfdense modules (K2 8, 10, 12, 16).
@@ -502,6 +505,8 @@ pub const Functions = struct {
         f.pick_pack = m_glue.function(glue.pick_pack_sym) catch null;
         f.pick_merge = m_glue.function(glue.pick_merge_sym) catch null;
         f.ds_stage = m_glue.function(glue.ds_stage_sym) catch null;
+        f.ds_accept_rows = m_glue.function(glue.ds_accept_rows_sym) catch null;
+        f.ds_stage_rows = m_glue.function(glue.ds_stage_rows_sym) catch null;
         inline for (pfglue.syms, 0..) |name, i| f.pfglue[i] = try m_pfglue.function(name);
         return f;
     }
@@ -573,6 +578,8 @@ pub const glue = struct {
     pub const ds_cands_max = 128;
     /// DSpark's statics from the device pick (optional, as ds_cands)
     pub const ds_stage_sym: [:0]const u8 = "_ZN10dsv41_glue15ds_stage_kernelEPKxiPxPiiiixiiiiiii";
+    pub const ds_accept_rows_sym: [:0]const u8 = "_ZN10dsv41_glue21ds_accept_rows_kernelEPKxS1_S1_iPx";
+    pub const ds_stage_rows_sym: [:0]const u8 = "_ZN10dsv41_glue20ds_stage_rows_kernelEPKxS1_iPxPiiiiiiiiiii";
     /// the device pick (optional, as ds_cands)
     pub const pick_pack_sym: [:0]const u8 = "_ZN10dsv41_glue16pick_pack_kernelEPKfPKxixPd";
     pub const pick_merge_sym: [:0]const u8 = "_ZN10dsv41_glue17pick_merge_kernelEPKdiiPKxxPx";
@@ -935,6 +942,39 @@ pub const Ops = struct {
         a.add(@as(i32, @intCast(W)));
         a.add(@as(i32, @intCast(ring)));
         a.add(@as(i64, @intCast(valid)));
+        a.add(@as(i32, @intCast(noise)));
+        for (off) |x| a.add(@as(i32, @intCast(x)));
+        try o.go(f, .{ 1, 1, 1 }, 256, 0, null, &a);
+    }
+
+    /// A row window's slots' (accepted, bonus, next position) into `acc` [k][3] from the device picks `picks` and the
+    /// window's ids `ids` (int64 a row), `segs` [k][3] = (first row, rows, start) int64 (pick_merge's walk a slot).
+    pub fn dsAcceptRows(o: Ops, picks: u64, ids: u64, segs: u64, k: usize, acc: u64) !void {
+        const f = o.f.ds_accept_rows orelse return error.Unsupported;
+        if (k < 1 or k > 32) return error.Shape;
+        var a: cuda.Args = .{};
+        a.add(picks);
+        a.add(ids);
+        a.add(segs);
+        a.add(@as(i32, @intCast(k)));
+        a.add(acc);
+        try o.go(f, .{ 1, 1, 1 }, 32, 0, null, &a);
+    }
+
+    /// A several-slot pass's statics (dspark_rows.stage's position-dependent values) for `g` members, `mem` [g][3] =
+    /// (index in `acc`, slot, valid) int64, from acc's (bonus, next position); `off`: Layout's ids, positions,
+    /// tokens, counts, lo, hi.
+    pub fn dsStageRows(o: Ops, acc: u64, mem: u64, g: usize, s64: u64, s32: u64, n: usize, W: usize, ring: usize, noise: u32, off: [6]i64) !void {
+        const f = o.f.ds_stage_rows orelse return error.Unsupported;
+        var a: cuda.Args = .{};
+        a.add(acc);
+        a.add(mem);
+        a.add(@as(i32, @intCast(g)));
+        a.add(s64);
+        a.add(s32);
+        a.add(@as(i32, @intCast(n)));
+        a.add(@as(i32, @intCast(W)));
+        a.add(@as(i32, @intCast(ring)));
         a.add(@as(i32, @intCast(noise)));
         for (off) |x| a.add(@as(i32, @intCast(x)));
         try o.go(f, .{ 1, 1, 1 }, 256, 0, null, &a);
