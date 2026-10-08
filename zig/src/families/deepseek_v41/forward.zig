@@ -214,6 +214,7 @@ pub const Forward = struct {
         }
         const tf = ph.start(f.phases, .forward);
         defer tf.stop();
+        f.runner.rows = @intCast(ids.len); // l2pf: wider windows skip the prefetch sites
         if (try f.graphedWindow(ids)) return;
         // the window's calls at its position (the indexer's scores and top-k grow with the cache: NK = end / ratio)
         var wa = std.heap.ArenaAllocator.init(f.gpa);

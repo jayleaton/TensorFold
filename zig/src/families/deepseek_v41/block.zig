@@ -323,7 +323,71 @@ pub const Emitter = struct {
     }
 
     // -----------------------------------------------------------------------------------------------------------
-    // L2 prefetch (l2pf.py): the table rows only (the addresses are the device's; the replay skips these launches)
+    // L2 prefetch (l2pf.py): the table rows; l2pf.zig fills the tables with the addresses of `l2pfSources` at boot
+    // (TF_DSV41_L2PF) and the runner issues these launches on its side stream, else skips them
+
+    /// What a site prefetches, in the order the launches after it read it (l2pf.site_tensors): a weight, a projection's
+    /// trellis words as its linear reads them ("s.<w>.lanes", else the stored "<w>.trellis"), or the trellis an
+    /// expert table's entry `index` points at (the shared expert's, the last).
+    pub const L2Src = struct { kind: enum { weight, words, expert }, name: []const u8, index: u32 = 0, bytes: u64 };
+    pub const L2Site = enum { o, f, x };
+
+    /// l2pf._lin_tensors: every projection's suh and svh, then their trellis words.
+    fn linSrcs(e: *Emitter, out: *std.ArrayList(L2Src), ws: []const []const u8, ks: []const i64, ns: []const i64) !void {
+        for (ws, ks, ns) |w, k, n| try out.appendSlice(e.a, &.{
+            .{ .kind = .weight, .name = try e.fmt("{s}.suh", .{w}), .bytes = @intCast(2 * k) },
+            .{ .kind = .weight, .name = try e.fmt("{s}.svh", .{w}), .bytes = @intCast(2 * n) },
+        });
+        for (ws, ks, ns) |w, k, n| try out.append(e.a, .{ .kind = .words, .name = w, .bytes = try e.trellisBytes(w, k, n) });
+    }
+
+    /// Site `site`'s sources: "o" and "f" of block `L`, "x" of the block before `L` (its table is "s.L<L>.pf.x").
+    pub fn l2pfSources(e: *Emitter, L: u32, site: L2Site) ![]const L2Src {
+        var out: std.ArrayList(L2Src) = .empty;
+        switch (site) {
+            .o => {
+                const D: i64 = e.cfg.hidden;
+                const g = e.cfg.o_groups / e.o.world;
+                const ki: i64 = @divExact(@as(i64, e.cfg.heads) * e.cfg.head_dim, @as(i64, e.cfg.o_groups));
+                const ws = try e.a.alloc([]const u8, g);
+                const ks = try e.a.alloc(i64, g);
+                const ns = try e.a.alloc(i64, g);
+                for (ws, ks, ns, 0..) |*w, *k, *n, i| {
+                    w.* = try e.fmt("L{d}.attn.wo_a.{d}", .{ L, i });
+                    k.* = ki;
+                    n.* = e.cfg.o_lora;
+                }
+                try e.linSrcs(&out, ws, ks, ns);
+                try e.linSrcs(&out, &.{try e.fmt("L{d}.attn.wo_b", .{L})}, &.{@as(i64, g) * e.cfg.o_lora}, &.{D});
+            },
+            .f => {
+                const D: i64 = e.cfg.hidden;
+                const I: i64 = e.cfg.expert_width / e.o.world;
+                const ex = e.cfg.expertsOf(L);
+                const sh = try e.fmt("L{d}.moe.shared.0.w1", .{L});
+                const k2: u64 = try e.w.k2(sh);
+                const shared: u64 = @as(u64, @intCast(@divExact(D, 16) * @divExact(I, 16))) * 8 * k2 * 2;
+                try out.appendSlice(e.a, &.{
+                    .{ .kind = .weight, .name = try e.fmt("L{d}.moe.gate", .{L}), .bytes = @as(u64, ex.count) * @as(u64, @intCast(D)) * 2 },
+                    .{ .kind = .expert, .name = try e.fmt("s.L{d}.ex.tp_g", .{L}), .index = ex.count, .bytes = shared },
+                    .{ .kind = .expert, .name = try e.fmt("s.L{d}.ex.tp_u", .{L}), .index = ex.count, .bytes = shared },
+                });
+            },
+            .x => {
+                const xg = try e.xGroup(L);
+                try e.linSrcs(&out, xg.ws, xg.ks, xg.ns);
+                const qg = try e.qGroup(L);
+                try e.linSrcs(&out, qg.ws, qg.ks, qg.ns);
+            },
+        }
+        return out.items;
+    }
+
+    fn srcSizes(e: *Emitter, srcs: []const L2Src) ![]const u64 {
+        const out = try e.a.alloc(u64, srcs.len);
+        for (srcs, out) |x, *y| y.* = x.bytes;
+        return out;
+    }
 
     /// l2pf.take: spans of `sizes` in order within the budget, the last one's head.
     fn take(e: *const Emitter, sizes: []const u64) i64 {
@@ -339,30 +403,13 @@ pub const Emitter = struct {
         return rows;
     }
 
-    fn linSizes(e: *Emitter, out: *std.ArrayList(u64), ws: []const []const u8, ks: []const i64, ns: []const i64) !void {
-        for (ks, ns) |k, n| try out.appendSlice(e.a, &.{ @intCast(2 * k), @intCast(2 * n) });
-        for (ws, ks, ns) |w, k, n| try out.append(e.a, try e.trellisBytes(w, k, n));
-    }
 
     /// Site "o" (after wq_b): wo_a's groups, then wo_b; l2pf segments.
     pub fn prefetchO(e: *Emitter, L: u32) !void {
-        const D: i64 = e.cfg.hidden;
-        const g = e.cfg.o_groups / e.o.world;
-        const ki: i64 = @divExact(@as(i64, e.cfg.heads) * e.cfg.head_dim, @as(i64, e.cfg.o_groups));
-        var sizes: std.ArrayList(u64) = .empty;
-        const ws = try e.a.alloc([]const u8, g);
-        const ks = try e.a.alloc(i64, g);
-        const ns = try e.a.alloc(i64, g);
-        for (ws, ks, ns, 0..) |*w, *k, *n, i| {
-            w.* = try e.fmt("L{d}.attn.wo_a.{d}", .{ L, i });
-            k.* = ki;
-            n.* = e.cfg.o_lora;
-        }
-        try e.linSizes(&sizes, ws, ks, ns);
-        try e.linSizes(&sizes, &.{try e.fmt("L{d}.attn.wo_b", .{L})}, &.{@as(i64, g) * e.cfg.o_lora}, &.{D});
+        const sizes = try e.srcSizes(try e.l2pfSources(L, .o));
         var total: u64 = 0;
         var left = e.o.l2pf_budget;
-        for (sizes.items) |s| {
+        for (sizes) |s| {
             if (left < 16) break;
             const n = @min(left, s) / 16 * 16;
             total += n;
@@ -370,7 +417,7 @@ pub const Emitter = struct {
         }
         const pieces = std.math.divCeil(u64, total, @intCast(e.o.l2pf_chunk)) catch 1;
         const grid: i64 = @max(1, @min(e.o.sms, @as(i64, @intCast(std.math.divCeil(u64, pieces, 128) catch 1))));
-        const rows = e.take(sizes.items);
+        const rows = e.take(sizes);
         try e.ext("tf_dsv41_l2pf_v1.segments", &.{ .{ .opaque_table = (try e.buf("s.L{d}.pf.o", .{L}, .i64, &.{ rows, 2 })).t }, .{ .i = grid }, .{ .i = 128 }, .{ .i = e.o.l2pf_chunk }, .{ .b = true } });
     }
 
@@ -381,24 +428,12 @@ pub const Emitter = struct {
 
     /// Site "f" (after the attention sublayer): the router's gate, then the shared expert's gate and up trellises.
     pub fn prefetchF(e: *Emitter, L: u32) !void {
-        const D: i64 = e.cfg.hidden;
-        const I: i64 = e.cfg.expert_width / e.o.world;
-        const ex = e.cfg.expertsOf(L);
-        const sh = try e.fmt("L{d}.moe.shared.0.w1", .{L});
-        const k2: u64 = try e.w.k2(sh);
-        const shared: u64 = @as(u64, @intCast(@divExact(D, 16) * @divExact(I, 16))) * 8 * k2 * 2;
-        const sizes = [_]u64{ @as(u64, ex.count) * @as(u64, @intCast(D)) * 2, shared, shared };
-        try e.paced(try e.fmt("s.L{d}.pf.f", .{L}), e.take(&sizes));
+        try e.paced(try e.fmt("s.L{d}.pf.f", .{L}), e.take(try e.srcSizes(try e.l2pfSources(L, .f))));
     }
 
     /// Site "x" of the block before `nxt` (after its MoE): `nxt`'s x group, then its q group.
     pub fn prefetchX(e: *Emitter, nxt: u32) !void {
-        var sizes: std.ArrayList(u64) = .empty;
-        const xg = try e.xGroup(nxt);
-        try e.linSizes(&sizes, xg.ws, xg.ks, xg.ns);
-        const qg = try e.qGroup(nxt);
-        try e.linSizes(&sizes, qg.ws, qg.ks, qg.ns);
-        try e.paced(try e.fmt("s.L{d}.pf.x", .{nxt}), e.take(sizes.items));
+        try e.paced(try e.fmt("s.L{d}.pf.x", .{nxt}), e.take(try e.srcSizes(try e.l2pfSources(nxt, .x))));
     }
 
     const Group = struct { ws: []const []const u8, ks: []const i64, ns: []const i64 };

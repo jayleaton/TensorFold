@@ -40,6 +40,7 @@ const samp = @import("sampling_gpu.zig");
 const grammar_gpu = @import("grammar_gpu.zig");
 const dspark_rows = @import("dspark_rows.zig");
 const dspark_slots = @import("dspark_slots.zig");
+const l2pf_mod = @import("l2pf.zig");
 const iface = @import("draft/iface.zig");
 
 pub const Options = struct {
@@ -109,6 +110,8 @@ pub const Model = struct {
     slot_pass: ?*dspark_slots.SlotPass = null,
     /// the keyed sampler, every rank with TF_DSV41_SAMPLING=1 (requests with T > 0; followers run its gathers in follow)
     sampler: ?*samp.GpuSampler = null,
+    /// TF_DSV41_L2PF (l2pf.zig): the filled prefetch tables and the runner's side stream
+    l2pf: ?*l2pf_mod.L2pf = null,
     /// structured output, every rank with TF_DSV41_GRAMMAR=1 (grammar_gpu.zig: the masks and the followers' matchers)
     grammar: ?*grammar_gpu.Masks = null,
 
@@ -130,6 +133,7 @@ pub const Model = struct {
         // gpa.create applies no field defaults: the parts made only with drafts, KV, several slots or sampling start
         // null here, or close() frees garbage when they are off (TF_DSV41_DRAFTS=0 and the rest)
         m.pass = null;
+        m.l2pf = null;
         m.sessions = null;
         m.slots = 1;
         m.slot_set = null;
@@ -259,6 +263,8 @@ pub const Model = struct {
             const bytes = (try forms.build(ra.allocator(), &src, role)) orelse continue;
             try cuda.DeviceBuffer.upload(.{ .d = &m.driver, .ptr = m.runner.addressOf(role).?, .len = bytes.len }, 0, bytes);
         }
+        // TF_DSV41_L2PF: the prefetch tables from the bound weights and forms (the expert tables above), every rank
+        m.l2pf = try l2pf_mod.install(gpa, &m.f, &m.weights);
         // no size cap: prod's 1M limit + 2,048 rows is 538 MB (a 256 MiB cap failed every rank's load with StreamTooLong)
         const rope = try cwd.readFileAlloc(io, try std.fs.path.join(a, &.{ assets, "rope.bin" }), a, .unlimited);
         const half = (rope.len - 16) / 2;
@@ -330,6 +336,11 @@ pub const Model = struct {
         if (m.sessions) |x| x.deinit();
         if (m.f.kv) |k| k.deinit();
         m.f.deinit();
+        if (m.l2pf) |p| {
+            m.runner.l2pf = null;
+            p.deinit();
+            gpa.destroy(p);
+        }
         m.runner.deinit();
         m.aot.deinit();
         m.weights.deinit();
