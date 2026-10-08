@@ -406,11 +406,12 @@ pub const Rows = struct {
         };
         if (m == 0) return;
         r.stats.issued += m;
-        _ = try r.start(@intCast(li), r.uniq.items[0..m]);
+        _ = try r.start(@intCast(li), r.uniq.items[0..m], false);
     }
 
-    /// A batch for sorted unique `rows` of table `ti` (none cached or in flight): its extents submitted.
-    fn start(r: *Rows, ti: u32, rows_in: []const u64) !u32 {
+    /// A batch for sorted unique `rows` of table `ti` (none cached or in flight): its extents submitted. `urgent`: a read
+    /// the caller waits for now (the pool runs it before queued read-ahead).
+    fn start(r: *Rows, ti: u32, rows_in: []const u64, urgent: bool) !u32 {
         const t = &r.tables[ti];
         const gpa = r.gpa;
         var ext: std.ArrayList(Extent) = .empty;
@@ -444,7 +445,7 @@ pub const Rows = struct {
             // the batch's slot and its extents queued under the pool's lock (a worker settles batches.items[bi])
             try t.map.ensureUnusedCapacity(gpa, @intCast(owned.len));
             p.lock();
-            const queued = r.queue(p, t, b);
+            const queued = r.queue(p, t, b, urgent);
             p.unlock();
             const bi = try queued;
             _ = std.c.pthread_cond_broadcast(&p.work);
@@ -483,15 +484,24 @@ pub const Rows = struct {
         return @intCast(r.batches.items.len - 1);
     }
 
-    /// A batch `b` in a free slot, its extents on the pool's queue (`p` locked by the caller).
-    fn queue(r: *Rows, p: *Pool, t: *const Table, b: Batch) !u32 {
+    /// A batch `b` in a free slot, its extents on the pool's queue (`p` locked by the caller): at its end, or `urgent` at
+    /// its head (a window's misses go before a prompt segment's read-ahead).
+    fn queue(r: *Rows, p: *Pool, t: *const Table, b: Batch, urgent: bool) !u32 {
         try p.jobs.ensureUnusedCapacity(r.gpa, b.ext.len);
         const bi = try r.slotFor(b);
         const bp = &r.batches.items[bi];
         r.stats.reads += bp.ext.len;
-        for (bp.ext) |e| {
+        const n = bp.ext.len;
+        const at = if (urgent) p.head else p.jobs.items.len;
+        if (urgent) {
+            // one shift of the queued jobs past the head, then this batch's in their place
+            const old = p.jobs.items.len;
+            p.jobs.items.len += n;
+            std.mem.copyBackwards(Job, p.jobs.items[at + n ..], p.jobs.items[at..old]);
+        } else p.jobs.items.len += n;
+        for (bp.ext, p.jobs.items[at..][0..n]) |e, *j| {
             r.stats.bytes += e.len;
-            p.jobs.appendAssumeCapacity(.{ .bi = bi, .fd = t.fd, .size = t.size, .direct = t.direct, .buf = bp.buf[e.at..][0..@intCast(e.len)], .off = e.off });
+            j.* = .{ .bi = bi, .fd = t.fd, .size = t.size, .direct = t.direct, .buf = bp.buf[e.at..][0..@intCast(e.len)], .off = e.off };
         }
         bp.left = @intCast(bp.ext.len);
         return bi;
@@ -597,7 +607,7 @@ pub const Rows = struct {
         }
         if (miss.items.len > 0) {
             r.stats.misses += miss.items.len;
-            const bi = try r.start(@intCast(li), miss.items);
+            const bi = try r.start(@intCast(li), miss.items, true);
             r.batches.items[bi].read = true;
             try r.want.append(r.gpa, bi);
         }
