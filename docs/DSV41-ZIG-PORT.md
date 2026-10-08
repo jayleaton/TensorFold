@@ -102,6 +102,7 @@ Five agents work on `dsv41-zig` at once toward one combined pod gate and one Spa
   - 28–31: `dsq-zig-grammar-1` (28 `op_grammar`: bind / step / release, `grammar_gpu.zig`);
   - 40–43: `dsq-zig-mdraft-1` (40 `op_ingest`, 41 `op_propose`, 42 `op_reset`: `dspark_rows.zig`; 28–31 are `dsq-zig-grammar-1`'s `op_grammar`).
   - 44–47: `dsq-zig-ced-1` (44 `op_ced_finish` `[op, end]`: `Forward.finishPrompt`; 45 `op_sess_prompt`: a replay-mode prompt snapshot, `sessions_gpu.savePrompt`).
+  - 48–51: `dsq-zig-sess4-1` (48 `op_sess_admit` `[op, need, n, spilled entry ids...]`: a request's pool admission, `sessions_gpu.admit`).
 - **Defaults.** Every new behaviour is behind a knob or a new code path, and defaults to today's. With every new knob off, the gates `check cap24-*/cap15/cap18/cap22` and `dcheck cap16` still give 0 mismatches. Run `tf-dsv41-m1 m5-emit cap18` before committing a change to an emitter.
 - **Pool vs contiguous.** A slot's KV is either the contiguous roles (`s.L<i>.comp.*`, `s.L<i>.ik`) or the pool (`block.Options.pool`, the `s.kv.*` roles). New code must work with both, or refuse the other by name.
 - **Collectives.** Leader and followers make the same collective calls in the same order. Anything rank 0 decides (sampling draws, tree shapes, slot admission) travels on the plan link before the work that depends on it.
@@ -568,7 +569,7 @@ Pod 30 failed the vision tower (1 bf16 ulp off from block 0, 0/3 images). The fi
   - `slots_cli.zig`: `tf-dsv41-m1 slots PACK ASSETS TRACE`, the gate (below). `rows_test.zig`: `zig build test-dsv41-rows`.
 - **Knobs:** `TF_DSV41_SLOTS` (1–16, every rank the same), `TF_DSV41_ROWS_CAP` (16: a bucket, the rows a forward takes; `block.emit`'s decode path is gated up to 16 rows, `mhc_cuda`'s MAXR), `TF_DSV41_GRAPHS` (row graphs, with the forward's default: on in M4; one-slot graphs stay off with several slots).
 - **Hooks** (one commit each): `kv_state.zig` (`Options.slots`, `Kv.slots`, `select`); `forward.zig` (`Forward.ext`: a follower hands op numbers it does not know to the workstream); `target.zig` (`rows`: window / keep / taps / release go to `Batch`, prefill activates the slot); `model.zig` (`slots`, `openRows`, the row programs in the buffer plan); `serve_engine.zig` (lanes slots and LaneHost admission = `m.slots`); `m1_main.zig` (`slots`); `zig/build/cuda.zig` (`test-dsv41-rows`).
-- **Not yet with several slots** (each refused by name): sessions (`sessions_gpu.zig` snapshots one slot's roles: not opened), draft trees and keyed sampling in row windows (`TreeWindow` / `Sampling`), DSpark drafting unless `TF_DSV41_SLOT_DRAFTS=1` (section 0c; else `dspark_gpu.zig` is one slot: run `TF_DSV41_DRAFTS=0`). Engram rows come through the forward's source (`Host.windowRows`: R3's table or M2a's index rows), per segment with its slot's tail. Mixes over 16 rows run as several forwards; 24–64-row forwards need `block.emit`'s >16-row decode path (Triton mHC above `mhc_cuda`'s 16 rows).
+- **Not yet with several slots** (each refused by name): sessions unless `TF_DSV41_SESSION_SLOTS=1` (section "Sessions over several slots"; off, they are not opened and the boot log says so), draft trees and keyed sampling in row windows (`TreeWindow` / `Sampling`), DSpark drafting unless `TF_DSV41_SLOT_DRAFTS=1` (section 0c; else `dspark_gpu.zig` is one slot: run `TF_DSV41_DRAFTS=0`). Engram rows come through the forward's source (`Host.windowRows`: R3's table or M2a's index rows), per segment with its slot's tail. Mixes over 16 rows run as several forwards; 24–64-row forwards need `block.emit`'s >16-row decode path (Triton mHC above `mhc_cuda`'s 16 rows).
 - **Host gate:** `zig build test-dsv41-rows`, 13/13. It covers the table against Python's `plan_rows` example; checks, packing and layout; and the whole backbone window (paged and split pool, R1 on and off, R 1 / 4 / 12 / 16) through the real `block.emit` + `transform`. In that window every CSA2 step reads the table's columns, NK is the context bucket's, the attention / top-k get pos / rslot / pts, and the plan's stacked roles are S x one slot's while every other role is unchanged.
 - **Pod step** (TWO GPUs, inside `M1_JOB=m2b` after the pack copy; `source tools/zig/dsv41_slots/job.sh; slots_gate`, with `SLOTS_PYSRC` = a Python tree with `rowgraphs` / `slots`, e.g. the decode1 twin's src with its `TORCH_EXTENSIONS_DIR`). About 14 min for the reference (one TP=2 load of layers 0–`$hi`, 4 prompts x 64 tokens, the row buckets warmed), then about 4 x 5 min:
   1. `slots-ref`: `ref.py` writes `trace.jsonl`, `ref.json`, `rope.bin` and `aot/`, including the row-mode Triton variants (`ROWS`, int64 POS, SL / PTS) for every bucket up to 16. `slots-engram-host` writes `engram-host.bin`.
@@ -1312,7 +1313,8 @@ prefill. Commits `557dc713` (engine), `22044785` (aot-needs hook), `d4216b61` (r
 - Split KV: the decoder's index layers exchange their selections as any segment does (`kx_*` glue); host test covers
   pooled and split programs.
 - 4-slot row mode: a prompt's encoder segments and its decoder run inside one `target.prefill` on the activated slot,
-  so one ring a forward suffices. Row mode opens no sessions (as before).
+  so one ring a forward suffices. Sessions in row mode: section "Sessions over several slots" (the ring is read only
+  inside one slot's `target.prefill`, so it stays one ring).
 - Images: the decoder's tail ids come from the ring, so image rows route with `bias_vl` (`replay._image`).
 - **Refused** (boot error, by name): replay without `TF_DSV41_OWN_PREFILL=1` or with `TF_DSV41_PROMPT_TAIL=prefill`
   (`Forward.prompt` never replays: Python runs replay only in the server's piece / finals shape); a forward whose
@@ -2134,6 +2136,72 @@ problems the sections did not cover; all are fixed offline (engine: this commit;
   `config/prod.env` (an edit of prod-zig.env plus `serve.sh stop` / `start` restarts the old settings), and
   `scripts/windows/zig-window.sh` holds a window whose deadman restores **perf1** (the GLM-era harness restores whatever
   `config/prod.env` holds, Zig's during the window); `docs/ZIG-SERVE.md` section 3.
+
+### Sessions over several slots (`dsq-zig-sess4-1`, offline)
+
+Python prod (perf1 8474f31) serves `PARALLEL=4` with sessions on (`TF_DSV41_SESSIONS=1`, a 256 MiB RAM tier, the NVMe
+tier at `/sessions`, 128 GiB). Zig's served config runs `TF_DSV41_SLOTS=4`, and until this change it opened no session
+store with more than one slot (`model.zig`), so a resumed chat re-prefilled its whole history where prod restores it.
+Now the store runs over every slot, behind `TF_DSV41_SESSION_SLOTS=1` until the hardware steps below pass (without
+it, `SESSIONS=1` + `SLOTS>1` boots with sessions off and a warning naming the knob; one slot is unchanged).
+
+**Python's semantics (8474f31) and where each lives in Zig.**
+
+| Python | Zig |
+|---|---|
+| Admission: `need = pool.need_pages(n, max_tokens, capacity)` (`kvpool.need_tokens`: prompt + reply + 64 slack, at most the slot's capacity), a RAM hit's full pages shared (`want = need - cached // PAGE`), `plan_spill(want, keep=[hit])` when `available() < want`, a wait when even every entry is not enough, a refusal past the whole pool (batch.py:383-441) | `kv/sess.zig` `admit` (the same arithmetic over `sessions.Store.planSpill`); `sessions_gpu.Sessions.admit` before the restore: the leader's spills and quota to the followers (op 48 `op_sess_admit`), every rank evicts them and `Slot.reserve(need)`; the reply budget comes from the lanes (`iface.Target.admit`, `lanes.prefill`), forwarded by the grammar and timing wrappers |
+| `spills` evicted, then `_admit`: `sl.reserve(quota)`, `fwd.reset`, `store.restore` (RAM: full pages adopted, partial page copied; NVMe: read into fresh pages), `fwd.restore` (rounds.py:88, 192-215) | `Sessions.resume_`: admission, then `restore` on the activated slot (slots.zig `activate`: the slot's ring / carry views, its `Forward.Slot`, the pool's current slot); the stacked roles' per-slot bytes (plan / S) are the pieces |
+| Prompt snapshot at `snapshot_point(n)` when `> cached` and `>= 64` (batch.py:442-443, 494-495; rounds.py:118, `_save` 184); no turn snapshot in replay mode or under the fast tag (rounds.py:173-178) | unchanged from `9b363f5d` / `557dc713` (`ced.savePoint`, `target.prefill`), now on any slot; outside the served shape a released row-mode slot saves its turn as the one-slot path does (`Batch.saveTurn`) |
+| One store over every slot; LRU RAM tier trimmed past `ram_bytes` of `Bounded.nbytes` (sessions.py:187-230), park when `disk.accepts(pos)` (`>= DISK_MIN`), else drop; parks and NVMe reads synchronous inside the round | one `Store` over the pool's slots; `Snap.nbytes` is prod's measure (`kv/sess.zig` `Measure`: SWA rows below the decoder in replay mode, the float32 carries, the lookback, the stash's rows, the drafter's rows; slots.py:249-272, replay.py:98, drafter.py:296-317), so the 256 MiB tier trims at prod's saves; parks / restores synchronous (the store's sync policy) |
+| No covered-entry or delta rule; RAM default 256 MiB (stack.py:74, 87) | `TF_DSV41_SESSION_SKIP_COVERED` and `TF_DSV41_SESSION_DELTA` now default off (were on), `TF_DSV41_SESSION_RAM_MIB` default 256 (was 512); one slot gets the same policy |
+| Each slot's history: prefilled pieces and committed windows (rounds.py `_commit`) | `Sessions.hist[slot]`: prefill segments (`commit`) and row windows' keeps (`Batch.keep` -> `commitAt`) |
+| The drafter's rows ride in the snapshot; a restore sets `valid = pos - n` (drafter.py:306-317) | Zig keeps no DSpark rows in a snapshot. In replay mode the decoder replay's taps `[R0, n-1)` refill every row the drafter reads after a resume, as after a fresh prompt (`ced.handoff`), so the context is equal. In full mode a resume with fewer than 128 rows left restarts the context (acceptance only, not bits). The measure counts prod's rows (`ds_valid` a slot) |
+
+Other slots during a park or restore: prod runs a round's spills and admissions (parks, NVMe reads) before its
+windows, so every slot waits for them. Zig runs them inside the admitted slot's `target.prefill` (`beginPrefill`
+keeps the pending windows first), so the others wait the same way, no longer. Zig still prefills a whole prompt in
+that call where prod interleaves 2,048-row pieces with decode rounds; that is the prefill scheduler's difference
+(not this change), and sessions shorten it.
+
+**Proven offline** (HEAD + these files in a clean tree):
+- `test-kv`: `kv/sess4_test.zig` replays `kv/sess4_golden.json`, prod's own `sessions.Store`, `pool.Pool` and
+  `sessdisk.DiskTier` (8474f31) driven on the CPU the way batch.py / rounds.py drive them
+  (`tools/zig/dsv41_sess4/golden.py`), on the Zig store, pool and tier with `kv/sess.zig`'s rules: 4 slots, 5 chats,
+  27 interleaved steps (admissions with 3 spills, 2 RAM and 5 NVMe resumes, a resend sharing a live slot's RAM pages, a
+  regenerated message resuming below its branch, a request that would wait, 5 parks, 3 drops under DISK_MIN). Every
+  step decides as prod did: pages, spills, tier, resume point, the snapshot's measure (bytes and drafter rows), the RAM
+  entries, the NVMe files, the pool's free and unreserved pages. Every resume is checked row for row.
+- `kv/sess.zig`'s measure equals prod's `Bounded.nbytes` at 96 and >= 128 positions (6,227,136 / 8,247,384 bytes).
+- `check` cap15 / cap18 / cap22 / cap24-1 / cap24-12 / cap24-16, `dcheck cap16`: 0 mismatches; `test-dsv41`,
+  `test-kv`, `test-dsv41-rows`, `test-dsv41-knobs` pass (the sessions module's tests are in `test-kv`).
+- Not offline: the device side (the pieces' per-slot views, the uploads, follower order). The gates below prove it.
+
+**Pod step** (TWO GPUs, `M1_JOB=m2b M2B_SESS4=1`, layers 0-24: `tools/zig/dsv41_sess4/job.sh` `sess4_gate`): a
+served-shape replay reference of 4 chats' first prompts (160 / 1,100 / 1,700 / 2,300 tokens), the AOT fill for the
+gate's config, then our ranks serving 3 turns of every chat at once, fresh (`TF_DSV41_SESSIONS=0`) and with
+sessions on 4 slots (RAM tier one entry wide, NVMe tier taking 128+ tokens). PASS = in `$RES/sess4-gate/summary.log`:
+`PASS sess4 turn 1 == Python: 4/4` (both runs), `PASS sess4 resumed == fresh: 12/12`, `PASS sess4 tiers: n RAM and m
+NVMe resumes` with n, m > 0. `SESS4_RUNS="s4 s1"` adds one slot with sessions against the same fresh run.
+
+#### NEXT SPARK WINDOW: sessions over 4 slots (not run; after the CED gate C1 and C3 pass)
+
+Prod's chats resume in replay mode, so Zig must serve `TF_DSV41_PREFILL=replay` for these replies to be equal. Check
+the lease on dgx-01 first. The kit and the zig-serve image are built from this section's commit or later.
+`K=~/zig-window-kit`, `D="python3 $K/tools/zig/dsv41_diverge/diverge.py"`, `OUT=$K/out/sess4`,
+`TOK=/home/dgx01/ai/models/dsv41-q28-v2/tokenizer.json` on dgx-01.
+
+| step | what | time | PASS |
+|---|---|---|---|
+| S4-0 no downtime | Python prod's chats: `$D chat --url http://127.0.0.1:8000 --turns 3 --out $OUT/py-chat.jsonl` (the bench's 8 prompts, 4 at a time, thinking off, 192 tokens a turn), then the same with `--no-draft --out $OUT/py-chat-nd.jsonl` and `$D compare $OUT/py-chat.jsonl $OUT/py-chat-nd.jsonl` | ~6 min | 24/24 (prod drafted == serial over resumed turns) |
+| S4-1 Zig sessions, prod down | Zig-as-prod (`prod-zig.env` with `TF_DSV41_PREFILL=replay` and `TF_DSV41_SESSION_SLOTS=1` added, the usual switch; fast boot ~375 s): `$D chat --url http://127.0.0.1:8000 --turns 3 --out $OUT/zig-chat.jsonl`; `$D compare $OUT/py-chat.jsonl $OUT/zig-chat.jsonl --tokenizer $TOK` | ~15 min incl. boot | **24/24**; rank 0's log has `slots: 4 live, ... sessions on (every slot)` and 16 lines `sessions: slot s resumed N of M prompt tokens from RAM` (turns 2 and 3) |
+| S4-2 resumed == fresh | restart with `TF_DSV41_SESSIONS=0` added (remove afterwards): `$D chat ... --out $OUT/zig-fresh.jsonl`; `$D compare $OUT/zig-chat.jsonl $OUT/zig-fresh.jsonl` | ~12 min | 24/24 (the full model's resumes equal fresh prefills of the same history) |
+| S4-3 NVMe resumes | restart with `TF_DSV41_SESSION_RAM_MIB=16 TF_DSV41_SESSION_DISK_MIN=128` added (prod's measure: about two entries stay in RAM, the others park to `/sessions`; the chats stay under prod's 1,024-token floor, which would drop them): `$D chat ... --out $OUT/zig-nvme.jsonl`; `$D compare $OUT/py-chat.jsonl $OUT/zig-nvme.jsonl --tokenizer $TOK`; `grep -c "from NVMe" <rank 0 log>` | ~12 min | 24/24 and NVMe resumes > 0; `ls /sessions` holds the parked files |
+| S4-4 | prod back on perf1 (`scripts/v2-rollback.sh perf1`); keep `$OUT` and both ranks' logs in the quant repo's results | 2 min | as every window |
+
+If S4-1 fails while S4-2 passes, the difference is not the sessions (replay or the prompt tail: C1 / C3). If S4-2
+fails, the first differing chat's turn names it: turn 2 only = the restore (RAM), turn 3 with S4-3 only = the NVMe
+blobs. After S4-1 to S4-3 pass, add `TF_DSV41_SESSION_SLOTS=1` to zig-serve's `prod-zig.env` and make it the default
+(`sessions_gpu.Options.several`).
 
 ### Spark window, 2026-10-07: outcome
 
