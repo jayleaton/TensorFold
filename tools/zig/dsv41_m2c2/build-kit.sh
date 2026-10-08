@@ -8,7 +8,9 @@
 # kit-fatbins.sh first makes KITDIR/fatbins: FATBINS' files + tp_mailbox.fatbin built from this tree's mailbox.cu (nvcc
 # 13.3, tp.zig's flags; TP_FATBIN only when it passes the same checks), the glue fatbin checked against glue.cu. The
 # binaries embed that dir, and it is the prod image's: ZIG_FATBINS=KITDIR/fatbins scripts/zig-image.sh stage (zig-serve).
-# TRITON_FILL_WIDE=<a kept fill dir (its aot/, compile.json)>: copied to KITDIR/triton-fill-wide (W2's merge source).
+# TRITON_FILL_FROM=<a kept fill dir (its aot/, compile.json, needs.json, the env)>: copied to KITDIR/triton-fill instead of
+# compiling one (TRITON_FILL=1): the fill of the same served env (tools/zig/dsv41_m4/fill-prod.env) and emitter.
+# The single-pass window's scripts (tools/zig/dsv41_window: zig-gate.sh, zig-bench.sh) go to the kit's root.
 set -euo pipefail
 # the dev box's shared build lock (spark-work/heavy.sh: one heavy job at a time, 8 GiB, -j4), when it exists
 H=$HOME/Documents/Projects/spark-work/heavy.sh
@@ -65,13 +67,15 @@ if [[ "${TRITON_FILL:-0}" == 1 ]]; then
         ${TRITON_FILL_HAVE:+--have $TRITON_FILL_HAVE} ${TRITON_FILL_STAMPS:+--stamps "$TRITON_FILL_STAMPS"} | tee "$FILL/compile.json"
     cp tools/zig/triton_fill.py tools/zig/dsv41_triton_options.json "$KIT/tools/zig/"
 fi
-if [[ -n "${TRITON_FILL_WIDE:-}" ]]; then
-    [[ -d "$TRITON_FILL_WIDE/aot" ]] || { echo "TRITON_FILL_WIDE=$TRITON_FILL_WIDE has no aot/" >&2; exit 2; }
-    mkdir -p "$KIT/triton-fill-wide" && cp -R "$TRITON_FILL_WIDE/aot" "$KIT/triton-fill-wide/"
-    cp "$TRITON_FILL_WIDE"/*.json "$TRITON_FILL_WIDE"/*.env "$KIT/triton-fill-wide/" 2>/dev/null || true
+if [[ -n "${TRITON_FILL_FROM:-}" ]]; then
+    [[ "${TRITON_FILL:-0}" != 1 ]] || { echo "TRITON_FILL=1 and TRITON_FILL_FROM: one of them" >&2; exit 2; }
+    grep -q '"failed": \[\]' "$TRITON_FILL_FROM/compile.json" || { echo "$TRITON_FILL_FROM/compile.json: not failed: []" >&2; exit 2; }
+    mkdir -p "$KIT/triton-fill" && cp -R "$TRITON_FILL_FROM/aot" "$KIT/triton-fill/"
+    cp "$TRITON_FILL_FROM"/*.json "$TRITON_FILL_FROM"/*.env "$TRITON_FILL_FROM"/*.log "$KIT/triton-fill/" 2>/dev/null || true
     cp tools/zig/triton_fill.py tools/zig/dsv41_triton_options.json "$KIT/tools/zig/"
 fi
-chmod +x "$KIT/run_host.sh" "$KIT/run_m4.sh" "$KIT/requests.sh" "$KIT/restore.sh" "$KIT/tf-dsv41-m1" "$KIT/tensorfold-dsv41"
+cp tools/zig/dsv41_window/zig-gate.sh tools/zig/dsv41_window/zig-bench.sh "$KIT/"
+chmod +x "$KIT/zig-gate.sh" "$KIT/zig-bench.sh" "$KIT/run_host.sh" "$KIT/run_m4.sh" "$KIT/requests.sh" "$KIT/restore.sh" "$KIT/tf-dsv41-m1" "$KIT/tensorfold-dsv41"
 git rev-parse HEAD > "$KIT/COMMIT" 2>/dev/null || echo "${KIT_COMMIT:?KIT_COMMIT: the commit of an archived tree (no .git)}" > "$KIT/COMMIT"
 (cd "$KIT" && find . -type f ! -name SHA256SUMS | sort | xargs sha256sum > SHA256SUMS)
 file "$KIT/tf-dsv41-m1"; du -sh "$KIT"; echo "kit at $KIT (tree $(head -c 12 "$KIT/COMMIT"))"

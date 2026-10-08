@@ -7,8 +7,12 @@
 #   dgx-01:  ./run_host.sh 0 OUTDIR
 #   dgx-02:  ./run_host.sh 1 OUTDIR
 # Prod must be stopped first (RUNBOOK.md). Knobs: STEPS (512), SEEDS ("4101"), PROMPT (1536), BACKEND (roce | nccl), LANES (1: also M3's lanes gate, about +12 min), PREFILL (1: Zig's own prefill gate, about +10 min), AOT_PROMPTS (the reference's extra prompt lengths for M4's Triton variants: every prefill path; "" for none), PROF_ROWS ("1 2 4": after the gate, windows of each row count timed on both sides: the R1 timing table; Zig's in seed*/zig.log, Python's in seed*/ref.log), PROMPT_TAIL (verify: the reference runs the prompt as prod's server does, [0, n - 1) prefilled and the last token a decode row; ref.json records it and the Zig side follows it; unset: Forward.prompt), GM_V2 (with PREFILL=1: the Zig prefill gate's ranks run TF_DSV41_GM_V2=$GM_V2, x3gm v2 on the Zig prefill; the reference is prod's, which runs it), LIMIT (the reference's slot limit, 4096; a long PROMPT needs PROMPT + 2048 or more: the Zig side takes it from ref.json), PROF_PREFILL (1, with PREFILL=1: the prefill timed call by call on both sides, the reference's --profile-prefill $PROMPT into ref/prof-rank<r>.json and the Zig prefill gate's TF_DSV41_PROFILE into zig-prefill/prof-rank<r>.json; compare with tools/zig/dsv41_perf/gap.py prefill), RT (1: the decode gate's Zig ranks run prod's decode-runtime knobs: TF_DSV41_L2PF, _ENGRAM_GATE, _BRANCHES + _PRIO=side, _MHC_DEFER, GLM53_TF_ROCE_FAST, TF_DSV41_GREEDY_GPU; the bits must not move), PREFILL_MODE (replay: prod's TF_DSV41_PREFILL=replay, CED bounded replay: the reference prefills that way (--prefill replay; PROMPT_TAIL is then verify) and the Zig prefill gate's ranks run TF_DSV41_PREFILL=replay; unset: full).
+# Single-pass window knobs: RT_KNOBS (RT=1's decode knobs, KEY=value separated by spaces or commas; default the prod set below),
+# SKIP_REF (1: reuse OUTDIR's reference of the same seed, for a rerun), DECODE (0: skip the decode gate, e.g. a rerun
+# of the prefill gate alone). LEASE_FILE=/nonexistent when the caller holds the lease itself (zig-gate.sh).
 set -u
 RANK=${1:?rank}; OUT=${2:?outdir}
+RT_KNOBS=${RT_KNOBS-TF_DSV41_L2PF=1 TF_DSV41_ENGRAM_GATE=1 TF_DSV41_BRANCHES=1 TF_DSV41_BRANCHES_PRIO=side TF_DSV41_MHC_DEFER=1 GLM53_TF_ROCE_FAST=1 TF_DSV41_GREEDY_GPU=1}
 KIT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # dgx-01's test-window lease (Spark-tool-kit's campaign.sh windows): held = the Sparks are not ours, nothing starts
 LEASE=${LEASE_FILE:-/home/dgx01/ai/.test-window-lease}
@@ -49,6 +53,9 @@ for seed in $SEEDS; do
     R=/out/seed$seed
     mkdir -p "$OUT/seed$seed"
     # 1. the reference: Python at TP=2 (this host's rank), state + tokens + digests + the AOT set + rope tables
+    if [[ "${SKIP_REF:-0}" == 1 && -f "$OUT/seed$seed/ref/engram-host.bin" ]]; then
+        log "seed $seed: reusing the reference in $OUT/seed$seed/ref (SKIP_REF=1)"
+    else
     drop_caches
     log "seed $seed: Python reference (layers 0-39, prompt $PROMPT, $STEPS greedy steps, top-p 0.85)"
     t0=$(date +%s)
@@ -62,18 +69,21 @@ for seed in $SEEDS; do
     docker run "${ARGS[@]}" --entrypoint python "$IMAGE" -B /kit/tools/zig/dsv41_engram_host.py --py-src /dsv41-tf/src \
         --config /model/config.json --tokenizer /model/tokenizer.json --out "$R/ref/engram-host.bin" > "$OUT/seed$seed/engram-host.log" 2>&1 \
         || { log "engram host tables failed"; exit 1; }
+    fi
     # 2. ours: the same rank from the reference's state, over the hybrid collective
+    if [[ "${DECODE:-1}" == 1 ]]; then
     drop_caches
-    log "seed $seed: our forward (backend $BACKEND)"
+    log "seed $seed: our forward (backend $BACKEND${RT:+, RT=$RT: $RT_KNOBS})"
     t0=$(date +%s)
     docker run "${ARGS[@]}" -e TF_TP_WORLD=2 -e TF_TP_RANK="$RANK" -e TF_TP_DEVICE=0 -e TF_TP_MASTER="$MASTER" \
         -e TF_TP_PORT=$((port + 10)) -e TF_DSV41_PLAN_TIMEOUT=1800 -e TF_COMM_BACKEND="$BACKEND" -e TF_TP_ROCE_FALLBACK=error \
         -e TF_TP_KERNEL_IMAGE=/kit/tp_mailbox.fatbin -e M2B_TOPP=0.85 -e TF_DSV41_FAILFAST=0 -e M2B_PROF_ROWS="${PROF_ROWS:-}" \
-        $( [[ "${RT:-0}" == 1 ]] && printf -- '-e %s ' TF_DSV41_L2PF=1 TF_DSV41_ENGRAM_GATE=1 TF_DSV41_BRANCHES=1 TF_DSV41_BRANCHES_PRIO=side TF_DSV41_MHC_DEFER=1 GLM53_TF_ROCE_FAST=1 TF_DSV41_GREEDY_GPU=1 ) \
+        $( [[ "${RT:-0}" == 1 && -n "$RT_KNOBS" ]] && printf -- '-e %s ' ${RT_KNOBS//,/ } ) \
         --name "dsv41-zig-m2c2-r$RANK" \
         --entrypoint bash "$IMAGE" -c 'export TF_NCCL_LIB=$(python -c "import nvidia.nccl, os; print(os.path.join(os.path.dirname(nvidia.nccl.__file__), \"lib\", \"libnccl.so.2\"))" 2>/dev/null || echo libnccl.so.2); exec /kit/tf-dsv41-m1 m2b /model '"$R/ref"' '"$R/zig" \
         > "$OUT/seed$seed/zig.log" 2>&1
     rc=$?; log "seed $seed: ours rc $rc in $(( $(date +%s) - t0 )) s: $(grep -h '^PASS\|^FAIL' "$OUT/seed$seed/zig.log" | tail -1)"
+    fi
     # 2b. optional (PREFILL=1): Zig's own prefill from an empty slot (M2B_PREFILL=1): every state role == the
     #     reference's dump and its first token, then the same decode gate; about +10 min (one more load)
     if [[ "${PREFILL:-0}" == 1 ]]; then
