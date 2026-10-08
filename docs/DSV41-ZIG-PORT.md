@@ -1799,6 +1799,7 @@ Kit from `fc43fecd` or later with a glue fatbin holding `ds_cands` (`FATBINS=dsv
 | D1 boot | B2's shape (4 slots, slot drafts, prod-zig.env, S2's phases knobs) plus `TF_DSV41_DRAFT_GRAPHS=1` on both ranks | ~10 min | both ranks log **`draft graphs: 8 passes' device candidates equal the host's on every rank: graphs`**; no `differ` line |
 | D2 tokens | `bench_http.py --work code --temps 0 --streams 1 --reps 2` and `--streams 4`, against the same cells with `TF_DSV41_DRAFT_GRAPHS=0` | ~20 min | **T0 replies equal** (`--compare`); `dsv41 spec:` launched **> 80 % of `draft.pass` n** at 1 stream (the night: 800 of 7,493; `6237ee39`) and > 0 at 4 streams; shutdown's `draft graphs:` line: graphed ~= passes - 8 |
 | D3 speed | the two runs' `phases.json` | - | `draft.pass` ms_avg **< 4.5** at 1 stream (was 7.0); code 1-stream **> 62**, 4-stream **> 88** |
+| D2b device start | D2's 1-stream cell with `TF_DSV41_GREEDY_GPU=1` added (both ranks), against D2's | ~10 min | **T0 replies equal**; shutdown's `draft graphs: N speculative passes started from the device pick, M unused`, N > 80 % of `dsv41 spec:`'s launches; `draft.wait` ms_avg below D2's |
 | D4 on failure | a `differ` line or a capture failure: record it, rerun with `TF_DSV41_DRAFT_GRAPHS=device` (eager), then 0 | ~10 min | the line and the first differing row in the report |
 | D5 the 20-row pass's capture (one GPU, ~3 min; prod may stay up only if a GPU is free, else in the downtime) | the night's set P capture (`run_m4.sh`'s `capture-p` step: prod's knobs + R1, 8474f31's tree) with `-e M1_DRAFT_SLOTS=4 --out /out/capture-p4`. Back on the dev box: `tf-dsv41-m1 dcheck capture-p4` | ~10 min | capture log `{"ops": ...}` with a `q4` phase in `ops.jsonl`. `dcheck` prints `P q4 (n 20): x/y calls equal`: today's `emitPassSlots(4)` against Python's 20-row pass. Its mismatches (expected: the first site and the final on `_site` / `_finish_k` instead of `mhc_cuda`, the router's above-16-row config, the experts at 20 rows) are the emitter's work list, and the gate it must then pass at 0. Keep `capture-p4/aot` (the 20-row pass's Triton variants for the served set) |
 
@@ -1847,17 +1848,26 @@ Not with split KV (`rowmode.transform` refuses a union past 16 rows; prod-perf1 
 
 Not proven offline: Python's launch list at 20 / 24 rows (no capture yet: step W1 records it), the bits, the speed.
 
-**The speculative pass's launch order (with `dsq-zig-rtparity-1`).** rtparity's GPU pick (`TF_DSV41_GREEDY_GPU`,
-`Forward.pickDevice()`, pending) leaves on the device each row's pick and, for a chain window, the accepted count, the
-bonus token and the next position: Python's `vsample`. The rest of Python's order is the pass's side:
-- a statics kernel that writes the pass's position-dependent statics from (start, bonus) on the device (`spec.py`
-  `stage_device`): ids[0], positions, the context list, counts, lo / hi, start, anchor. Everything else is staged
-  from the host as today (`dspark_dev.zig`'s pinned staging);
-- the window's whole-taps ingest with the device start;
-- `Pass.beginDevice(pick)`, enqueued between the pick's kernels and its copy-back wait.
-The hook is inside rtparity's `greedy` / `target.window` (uncommitted), so it waits for that commit. Until then the
-speculative pass launches after the host's pick (with `6237ee39` on nearly every round). rtparity's one copy back
-already shortens the gap to the launch.
+**The speculative pass's launch order (`61806079`, on rtparity's `1bd39606` device pick).** As Python's spec.py: the
+pass starts from the window's device pick, before either host waits. With `TF_DSV41_SPEC_DRAFT`, `TF_DSV41_DRAFT_GRAPHS`
+(past its 8 check passes) and `TF_DSV41_GREEDY_GPU`, one slot:
+- `lanes.verify` arms the slots whose next pass `speculate()` would launch (its rules without the window's choices:
+  `dsparkRound`, `roundAllowed`, `Spec.wouldWant`): `Pass.arm`, op 43 [start, rows] to the followers;
+- `forward.greedy` records the pick's copy back with an event, runs `after_pick`, and waits for that copy alone;
+- `GpuPass.afterPick`, every rank:
+  - the window's taps into the rings, without draining the stream;
+  - the statics as `fillStatics` stages them, with placeholders;
+  - `glue.cu ds_stage`, which writes every position-dependent static from the pick's (bonus, next position);
+  - the pass: its graph if already captured, else eagerly, never a capture.
+- rank 0's `begin` takes the pass when the pick's (bonus, next position) are the ask's, and `collect` waits and
+  unpacks; otherwise the device pass is dropped and the pass runs as before.
+
+Draft ids are the host-ordered pass's: the same rings and the same statics. `mdraft_test` checks that `ds_stage` over
+the placeholder staging equals `fillStatics(bonus, P)`; `dspark_rows.stageMirror` mirrors the kernel's arithmetic.
+Sampled rounds and row mode keep the host order: the device pick is greedy and one slot; Python's `vsample` keyed
+choice and the 4-slot device start are follow-ups. The kit's glue fatbin must hold `ds_cands`, `ds_stage`,
+`pick_pack` and `pick_merge`: `dsv41-zig-ref/fatbin-kit-dsg` (rebuilt from `61806079`'s glue.cu; every older kernel's
+SASS equals `fatbin-kit`'s).
 
 #### NEXT SPARK WINDOW: decode windows past 16 rows (not run; after D1-D2)
 
