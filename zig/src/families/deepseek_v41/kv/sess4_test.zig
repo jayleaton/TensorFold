@@ -210,7 +210,8 @@ const World = struct {
         const hit = try w.store.find(w.g.tag, ids);
         var spills: std.ArrayList(u32) = .empty;
         defer spills.deinit(w.gpa);
-        const plan = try sess.admit(&w.store, hit, st.n, st.max_new, w.g.capacity, &spills);
+        const keep: []const u32 = if (hit) |h| &.{h.id} else &.{};
+        const plan = try sess.admit(&w.store, hit, st.n, st.max_new, w.g.capacity, keep, 0, &spills);
         if (std.mem.eql(u8, st.op, "probe")) {
             try testing.expectEqual(st.wait.?, plan.wait);
             try testing.expectEqual(st.need, plan.need);

@@ -71,7 +71,22 @@ pub const Backend = struct {
         alternatives: ?*const fn (ptr: *anyopaque, s: *Stream, out: []Alternative) anyerror!usize = null,
         /// The stream left the rounds: free its caches and held drafts.
         release: *const fn (ptr: *anyopaque, s: *Stream) void,
+        /// A prompt in pieces between rounds (a family's round planner, lane_host.zig `Rounds`) in place of `prefill`:
+        /// `begin` takes the stream (its caches; a saved prefix restored), `piece` runs prompt rows [start, end)
+        /// (`save`: the prompt's snapshot right after them), `finish` the prompt's last row (then `first`). null: the
+        /// backend runs whole prompts only.
+        begin: ?*const fn (ptr: *anyopaque, s: *Stream) anyerror!Begun = null,
+        piece: ?*const fn (ptr: *anyopaque, s: *Stream, start: u64, end: u64, save: bool) anyerror!void = null,
+        finish: ?*const fn (ptr: *anyopaque, s: *Stream) anyerror!void = null,
     };
+
+    /// `begin`'s outcome: prompt tokens the stream's state holds (a restored prefix), and whether a damaged saved
+    /// entry was dropped instead (the prompt then runs from 0).
+    pub const Begun = struct { cached: u64 = 0, damaged: bool = false };
+
+    pub fn pieces(b: Backend) bool {
+        return b.vtable.begin != null and b.vtable.piece != null and b.vtable.finish != null;
+    }
 
     pub fn prefill(b: Backend, s: *Stream) !void {
         return b.vtable.prefill(b.ptr, s);

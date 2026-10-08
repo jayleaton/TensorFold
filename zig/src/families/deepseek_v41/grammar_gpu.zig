@@ -427,10 +427,54 @@ pub const GrammarTarget = struct {
         return .{ .ptr = t, .vtable = &vtable };
     }
 
-    const vtable: iface.Target.VTable = .{ .prefill = prefill, .window = window, .keep = keep, .taps = taps, .release = release, .admit = admit };
+    const vtable: iface.Target.VTable = .{ .prefill = prefill, .window = window, .keep = keep, .taps = taps, .release = release, .admit = admit, .begin = begin, .piece = piece, .finish = finish };
 
     fn admit(p: *anyopaque, slot: u32, max_new: u64) void {
         self(p).inner.admit(slot, max_new);
+    }
+
+    /// A prompt in pieces: the slot's grammar state starts over at `begin`; the grammar binds at `finish`, before the
+    /// prompt's last token's window (its mask: the grammar's start), as `prefill` binds it before the whole prompt.
+    fn begin(p: *anyopaque, slot: u32, ids: []const u32) anyerror!iface.Target.Begun {
+        const t = self(p);
+        if (slot < t.slots.len) {
+            t.slots[slot].last.clearRetainingCapacity();
+            t.slots[slot].kept = null;
+            t.slots[slot].windows = 0;
+            t.failed[slot] = null;
+        }
+        return t.inner.begin(slot, ids);
+    }
+
+    fn piece(p: *anyopaque, slot: u32, ids: []const u32, start: u64, end: u64, save: bool) anyerror!void {
+        return self(p).inner.piece(slot, ids, start, end, save);
+    }
+
+    fn finish(p: *anyopaque, slot: u32, ids: []const u32, sampling: ?lanes.Sampling, draw: u64) anyerror!u32 {
+        const t = self(p);
+        if (slot >= t.slots.len) return t.inner.finish(slot, ids, sampling, draw);
+        try t.bindPrompt(slot, ids);
+        const first = try t.inner.finish(slot, ids, sampling, draw);
+        if (t.masks.failed) |e| {
+            t.masks.failed = null;
+            return e;
+        }
+        return first;
+    }
+
+    /// The request's grammar bound to the slot (none: the slot's masks released), the prompt's last row's mask staged.
+    fn bindPrompt(t: *GrammarTarget, slot: u32, ids: []const u32) !void {
+        const reg = t.requests.claim(ids);
+        if (reg == null or reg.?.compiled == null) return t.masks.release(slot);
+        const r = reg.?;
+        const active = grammar.constraint.thinkActive(ids, t.masks.g.think_open, t.masks.g.think_end);
+        try t.masks.bind(slot, r.spec, r.compiled.?, active);
+        var cuts: [1]grammar.Cut = undefined;
+        var bad: [1]?anyerror = undefined;
+        const ask = [_]Masks.Ask{.{ .slot = slot, .row0 = null, .advance = &.{}, .tokens = ids[ids.len - 1 ..] }};
+        t.masks.prepare(&ask, &cuts, &bad);
+        if (bad[0]) |e| return e;
+        try t.masks.commit(&ask, &cuts, &bad);
     }
 
     fn self(p: *anyopaque) *GrammarTarget {

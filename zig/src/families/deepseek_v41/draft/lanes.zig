@@ -123,8 +123,19 @@ pub const Lanes = struct {
     }
 
     pub fn backend(x: *Lanes) be.Backend {
-        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .probabilities = probabilities, .tree = heldTree, .release = release } };
+        const pieces = x.target.pieces();
+        return .{ .ptr = x, .vtable = if (pieces) &vtable_pieces else &vtable };
     }
+
+    const vtable: be.Backend.VTable = .{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .probabilities = probabilities, .tree = heldTree, .release = release };
+    /// a target that runs prompts in pieces (iface.Target begin / piece / finish): the round planner may use them
+    const vtable_pieces: be.Backend.VTable = blk: {
+        var v = vtable;
+        v.begin = begin;
+        v.piece = piece;
+        v.finish = finish;
+        break :blk v;
+    };
 
     /// The speculative pass's counts (Python's describe()) on stderr, when it is on: the gates' and the server's line.
     pub fn reportSpec(x: *const Lanes) void {
@@ -207,6 +218,49 @@ pub const Lanes = struct {
         try x.ingest(st, ids.len - tr, rows);
         try x.streams.put(x.gpa, s, st);
         x.by_slot[slot] = st;
+    }
+
+    /// A prompt in pieces (the round planner, lane_host.zig `Rounds`): the stream takes a slot, its drafter context and
+    /// depth start over (prod's admission `fwd.reset`), the target admits it and restores a saved prefix.
+    fn begin(ptr: *anyopaque, s: *Stream) anyerror!be.Backend.Begun {
+        const x = self(ptr);
+        if (x.streams.get(s) != null) return error.StreamLive;
+        const slot = x.free.pop() orelse return error.NoSlot;
+        errdefer x.free.append(x.gpa, slot) catch {};
+        const st = try x.gpa.create(St);
+        errdefer x.gpa.destroy(st);
+        st.* = .{ .slot = slot };
+        try x.settle();
+        if (x.spec) |*sp| sp.forget(slot);
+        x.pass.reset(slot);
+        x.policy.depth.reset(slot);
+        x.target.admit(slot, s.max_new);
+        const b = try x.target.begin(slot, s.prompt());
+        try x.streams.put(x.gpa, s, st);
+        x.by_slot[slot] = st;
+        return .{ .cached = b.at, .damaged = b.damaged };
+    }
+
+    fn piece(ptr: *anyopaque, s: *Stream, start: u64, end: u64, save: bool) anyerror!void {
+        const x = self(ptr);
+        const st = try x.get(s);
+        try x.settle();
+        return x.target.piece(st.slot, s.prompt(), start, end, save);
+    }
+
+    /// The prompt's rows are in: its last token's window (the first choice), its taps to the drafter as `prefill`'s.
+    fn finish(ptr: *anyopaque, s: *Stream) anyerror!void {
+        const x = self(ptr);
+        const st = try x.get(s);
+        try x.settle();
+        const ids = s.prompt();
+        st.first = try x.target.finish(st.slot, ids, s.sampling, ids.len);
+        st.len = ids.len;
+        _ = x.scratch.reset(.retain_capacity);
+        const tr: usize = @min(x.target.taps(st.slot).rows, ids.len);
+        const rows = try x.scratch.allocator().alloc(u32, tr);
+        for (rows, 0..) |*r, i| r.* = @intCast(i);
+        try x.ingest(st, ids.len - tr, rows);
     }
 
     fn first(ptr: *anyopaque, s: *Stream, position: u64) anyerror!u64 {

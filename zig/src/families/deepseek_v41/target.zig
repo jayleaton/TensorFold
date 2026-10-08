@@ -9,6 +9,13 @@
 //! and prefills only the rest; a released slot is saved as an entry (its pages shared, its bounded state kept), the
 //! residency budget parking or dropping the least recently used chats. With several slots (`rows`) the same runs on
 //! the activated slot while the other slots' windows wait, as prod's round runs its admissions before its windows.
+//! Prompts in pieces (`begin` / `piece` / `finish`, the served shape only: own prefill, the verify tail; TF_DSV41_
+//! PREFILL_PIECES, serve_engine.zig's rounds over kv/sched.zig): the request admitted as the round planner decided
+//! (`admission`: its pages, the entry it resumes, the round's spills), each piece of rows run between other slots'
+//! decode rounds (its snapshot right after it at the replay point; full mode: its taps to the drafter, decode.py
+//! `prefill`), then the decoder replay and the prompt's last token's window. A released slot's pages wait for the
+//! next round's admissions to be decided (`defer_release`, `settleReleases`: prod's `_finish` at the next round's
+//! start, after its plan).
 
 const std = @import("std");
 const iface = @import("draft/iface.zig");
@@ -55,12 +62,20 @@ pub const GpuTarget = struct {
     ingest_window: u32 = 0,
     /// each slot's next request's reply budget (`admit`, before its prefill): its pool admission's price
     max_new: [16]?u64 = @splat(null),
+    /// the next `begin`'s admission as the round planner decided it (kv/sched.zig); null: priced at `begin`
+    admission: ?Planned = null,
+    /// releases wait for `settleReleases` (the rounds: after the next round's admissions are decided)
+    defer_release: bool = false,
+    releasing: [16]bool = @splat(false),
+
+    /// A request's admission (kv/sched.zig Admission + the round's spills, with its first admission).
+    pub const Planned = struct { need: u32, hit: ?@import("kv").sessions.store.Hit, spills: []const u32 = &.{} };
 
     pub fn target(t: *GpuTarget) iface.Target {
         return .{ .ptr = t, .vtable = &vtable };
     }
 
-    const vtable: iface.Target.VTable = .{ .prefill = prefill, .window = window, .keep = keep, .taps = taps, .release = release, .admit = admit };
+    const vtable: iface.Target.VTable = .{ .prefill = prefill, .window = window, .keep = keep, .taps = taps, .release = release, .admit = admit, .begin = begin, .piece = piece, .finish = finish };
 
     fn admit(p: *anyopaque, slot: u32, max_new: u64) void {
         const t = self_(p);
@@ -99,6 +114,9 @@ pub const GpuTarget = struct {
             if (save_at) |s_at| {
                 const cut: usize = @intCast(s_at);
                 try t.f.prefill(ids[at..cut]);
+                // full mode: the piece's last rows to the drafter first (decode.py `prefill`), so the snapshot's
+                // drafter rings hold them (drafter.py `snapshot`)
+                if (t.f.prefill_state.mode == .full) try t.handTaps(slot);
                 _ = try t.sessions.?.savePrompt();
                 try t.f.prefill(ids[cut .. at + sp.prefill]);
             } else try t.f.prefill(rest[0..sp.prefill]);
@@ -138,6 +156,69 @@ pub const GpuTarget = struct {
             at_ += n;
         }
         return choice[0];
+    }
+
+    /// The pieces path's slot for an operation: activated (row mode), or the one slot.
+    fn onSlot(t: *GpuTarget, slot: u32) !void {
+        if (t.rows) |b| try b.beginPrefill(slot) else if (slot != 0) return error.Slots;
+    }
+
+    fn begin(p: *anyopaque, slot: u32, ids: []const u32) anyerror!iface.Target.Begun {
+        const t = self_(p);
+        if (!(t.own_prefill and t.prompt_tail == .verify)) return error.NoPieces;
+        const planned = t.admission;
+        t.admission = null;
+        try t.onSlot(slot);
+        t.tree.clear();
+        const max_new: ?u64 = if (slot < t.max_new.len) t.max_new[slot] else null;
+        if (slot < t.max_new.len) t.max_new[slot] = null;
+        errdefer if (t.sessions != null) t.abandon(slot);
+        t.f.prefill_state.taps_rows = 0;
+        const ss = t.sessions orelse return .{};
+        if (planned) |a| {
+            const r = try ss.resumePlanned(ids.len, a.need, a.hit, a.spills);
+            return .{ .at = r.at, .damaged = r.damaged };
+        }
+        const before = ss.stats.damaged;
+        const at = try ss.resume_(ids, max_new);
+        return .{ .at = at, .damaged = ss.stats.damaged != before };
+    }
+
+    fn piece(p: *anyopaque, slot: u32, ids: []const u32, start: u64, end: u64, save: bool) anyerror!void {
+        const t = self_(p);
+        try t.onSlot(slot);
+        if (t.f.slot.pos != start or start >= end or end + 1 > ids.len) return error.NotAChain;
+        try t.f.prefill(ids[start..end]);
+        // rounds.py `_save`: a history under session_min is not snapshotted (a damaged entry's restart cuts there)
+        if (save and end >= ced.session_min) if (t.sessions) |ss| {
+            _ = try ss.savePrompt();
+        };
+        // full mode: the drafter reads each piece's last rows (decode.py `prefill`'s ingest of a piece's tail)
+        if (t.f.prefill_state.mode == .full) try t.handTaps(slot);
+    }
+
+    fn finish(p: *anyopaque, slot: u32, ids: []const u32, sampling: ?lanes.Sampling, draw: u64) anyerror!u32 {
+        const t = self_(p);
+        try t.onSlot(slot);
+        if (ids.len == 0 or t.f.slot.pos != ids.len - 1) return error.NotAChain;
+        if (t.f.prefill_state.mode == .replay) {
+            // the decoder replay over the prompt's tail (rounds.py `finish_prompt`), its taps the drafter's context
+            t.f.prefill_state.taps_rows = 0;
+            try t.f.finishPrompt();
+            try t.handTaps(slot);
+        }
+        var one: [1]u32 = undefined;
+        var out = [_][]u32{&one};
+        try window(p, &.{.{ .slot = slot, .start = ids.len - 1, .tokens = ids[ids.len - 1 ..], .parents = null, .draws = &.{draw}, .sampling = sampling }}, &out);
+        return one[0];
+    }
+
+    /// The releases held since the last round (`defer_release`) run now, slot by slot.
+    pub fn settleReleases(t: *GpuTarget) void {
+        for (&t.releasing, 0..) |*x, s| if (x.*) {
+            x.* = false;
+            t.releaseNow(@intCast(s));
+        };
     }
 
     fn window(p: *anyopaque, segments: []const iface.Segment, choices: [][]u32) anyerror!void {
@@ -231,6 +312,14 @@ pub const GpuTarget = struct {
 
     fn release(p: *anyopaque, slot: u32) void {
         const t = self_(p);
+        if (t.defer_release and slot < t.releasing.len) {
+            t.releasing[slot] = true;
+            return;
+        }
+        t.releaseNow(slot);
+    }
+
+    fn releaseNow(t: *GpuTarget, slot: u32) void {
         if (t.rows) |b| {
             // outside the served shape the turn is kept for the next one, as the one-slot path below (prod's exact
             // prefill tag in full mode, rounds.py `_finish`); the served shape saved its prompt at its replay point

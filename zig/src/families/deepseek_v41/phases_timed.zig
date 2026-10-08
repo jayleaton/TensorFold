@@ -21,10 +21,31 @@ pub const TimedTarget = struct {
         return .{ .ptr = t, .vtable = &vtable };
     }
 
-    const vtable: iface.Target.VTable = .{ .prefill = prefill, .window = window, .keep = keep, .taps = taps, .release = release, .admit = admit };
+    const vtable: iface.Target.VTable = .{ .prefill = prefill, .window = window, .keep = keep, .taps = taps, .release = release, .admit = admit, .begin = begin, .piece = piece, .finish = finish };
 
     fn admit(p: *anyopaque, slot: u32, max_new: u64) void {
         self(p).inner.admit(slot, max_new);
+    }
+
+    fn begin(p: *anyopaque, slot: u32, ids: []const u32) anyerror!iface.Target.Begun {
+        const t = self(p);
+        const tm = ph.start(t.p, .prefill);
+        defer tm.stop();
+        return t.inner.begin(slot, ids);
+    }
+
+    fn piece(p: *anyopaque, slot: u32, ids: []const u32, start: u64, end: u64, save: bool) anyerror!void {
+        const t = self(p);
+        const tm = ph.start(t.p, .prefill);
+        defer tm.stop();
+        return t.inner.piece(slot, ids, start, end, save);
+    }
+
+    fn finish(p: *anyopaque, slot: u32, ids: []const u32, sampling: ?lanes.Sampling, draw: u64) anyerror!u32 {
+        const t = self(p);
+        const tm = ph.start(t.p, .prefill);
+        defer tm.stop();
+        return t.inner.finish(slot, ids, sampling, draw);
     }
 
     fn self(p: *anyopaque) *TimedTarget {

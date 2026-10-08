@@ -39,6 +39,7 @@ pub const Fake = struct {
     prefill_hook: ?*const fn (ctx: *anyopaque, s: *Stream, chunk: usize) void = null,
     prefill_hook_ctx: ?*anyopaque = null,
     refuse_sampled: bool = false, // prefill refuses a sampled stream with error.SamplingRefused
+    pieces_run: usize = 0, // prompt pieces run (`pieceBackend`)
 
     pub fn deinit(x: *Fake) void {
         var it = x.lanes.valueIterator();
@@ -55,6 +56,35 @@ pub const Fake = struct {
 
     pub fn backend(x: *Fake) be.Backend {
         return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release } };
+    }
+
+    /// The backend with prompts in pieces (begin / piece / finish) beside whole prompts.
+    pub fn pieceBackend(x: *Fake) be.Backend {
+        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release, .begin = begin, .piece = piece, .finish = finish } };
+    }
+
+    fn begin(ptr: *anyopaque, s: *Stream) anyerror!be.Backend.Begun {
+        const x = self(ptr);
+        const got = try x.lanes.getOrPut(x.gpa, s);
+        if (got.found_existing) freeLane(x.gpa, got.value_ptr);
+        got.value_ptr.* = .{};
+        return .{};
+    }
+
+    fn piece(ptr: *anyopaque, s: *Stream, start: u64, end: u64, snapshot: bool) anyerror!void {
+        _ = snapshot;
+        const x = self(ptr);
+        const h = &x.lane(s).history;
+        if (h.items.len != start or end + 1 > s.prompt_len) return error.PositionMismatch;
+        try h.appendSlice(x.gpa, s.prompt()[start..end]);
+        x.pieces_run += 1;
+    }
+
+    fn finish(ptr: *anyopaque, s: *Stream) anyerror!void {
+        const x = self(ptr);
+        const h = &x.lane(s).history;
+        if (h.items.len + 1 != s.prompt_len) return error.PositionMismatch;
+        try h.append(x.gpa, s.prompt()[s.prompt_len - 1]);
     }
 
     fn self(ptr: *anyopaque) *Fake {

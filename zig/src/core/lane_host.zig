@@ -16,6 +16,40 @@ const Reason = api.Reason;
 const Stats = api.Stats;
 const SubmitError = api.SubmitError;
 
+/// A family's round planner (DeepSeek-V4.1: prod's batcher, families/deepseek_v41/kv/sched.zig): which queued request
+/// starts each round, and which prompt rows run between the decode rounds; the backend runs prompts in pieces
+/// (lanes.Backend begin / piece / finish). A round: the admissions decided in queue order, then what must run before
+/// them (`admitted`: the slots released last round), the admitted streams begun, this round's pieces, a decode round of
+/// the streams decoding, the prompts whose rows are in (finals: their first token), then `after`. Keys are the host's
+/// handles for its requests.
+pub const Rounds = struct {
+    ctx: *anyopaque,
+    vtable: *const VTable,
+
+    pub const Verdict = enum { admit, wait, skip, refuse };
+    pub const Piece = struct { key: usize, start: u64, end: u64, save: bool, run: bool = true };
+    pub const Ask = struct { key: usize, prompt: []const u32, max_tokens: u32, submitted_s: f64 };
+
+    pub const VTable = struct {
+        /// An admission pass starts (a lane is free and requests wait).
+        begin_admit: *const fn (ctx: *anyopaque) void,
+        /// The next queued request: start it, keep it and those behind it queued this round (wait), look past it
+        /// (skip), or refuse it (`words`: why).
+        admit: *const fn (ctx: *anyopaque, ask: Ask, words: *[]const u8) Verdict,
+        /// The pass is decided: what runs before the admitted streams begin.
+        admitted: *const fn (ctx: *anyopaque) anyerror!void,
+        /// Around an admitted request's stream begin (`damaged`: its saved prefix could not be restored).
+        arm: *const fn (ctx: *anyopaque, key: usize) void,
+        began: *const fn (ctx: *anyopaque, key: usize, damaged: bool) void,
+        /// This round's pieces, in order, and the requests whose prompts are in.
+        plan: *const fn (ctx: *anyopaque, pieces: *std.ArrayList(Piece), finals: *std.ArrayList(usize)) anyerror!void,
+        /// A request left: finished, cancelled, failed or refused, started or not.
+        left: *const fn (ctx: *anyopaque, key: usize) void,
+        /// After the round: the pieces' seconds and the decode round's (finals included).
+        after: *const fn (ctx: *anyopaque, piece_s: f64, decode_s: f64) void,
+    };
+};
+
 pub const LaneHost = struct {
     gpa: Allocator,
     io: std.Io,
@@ -43,6 +77,10 @@ pub const LaneHost = struct {
     explain: ?api.Explain = null, // the backend's words for a request it refuses; null: the error's name
     /// Runs first on the engine thread: a backend whose API state is per thread (a CUDA context) binds it there.
     on_thread: ?ThreadInit = null,
+    /// a family's round planner (prompts in pieces between decode rounds); null: whole prompts at admission
+    rounds: ?Rounds = null,
+    pieces: std.ArrayList(Rounds.Piece) = .empty,
+    finals: std.ArrayList(usize) = .empty,
 
     pub const ThreadInit = struct { ctx: *anyopaque, run: *const fn (ctx: *anyopaque) anyerror!void };
 
@@ -59,6 +97,7 @@ pub const LaneHost = struct {
         delivered: usize = 0,
         started: bool = false,
         prefill_sent: bool = false, // a lone driver's prefilled event went out
+        submitted: i96 = 0,
         began: i96 = 0,
         prefilled: ?i96 = null,
         entry: ?*pc.Entry = null, // the kept state the backend restores, until its prompt pass reports
@@ -106,6 +145,8 @@ pub const LaneHost = struct {
         h.cancels.deinit(h.gpa);
         h.decoded.deinit(h.gpa);
         h.live_tokens.deinit(h.gpa);
+        h.pieces.deinit(h.gpa);
+        h.finals.deinit(h.gpa);
     }
 
     pub fn engine(h: *LaneHost) Engine {
@@ -128,7 +169,7 @@ pub const LaneHost = struct {
     fn submitFn(ctx: *anyopaque, id: Id, request: *const Request, sink: Sink) SubmitError!void {
         const h = self(ctx);
         const job = h.gpa.create(Job) catch return error.Busy;
-        job.* = .{ .host = h, .id = id, .request = request, .sink = sink };
+        job.* = .{ .host = h, .id = id, .request = request, .sink = sink, .submitted = std.Io.Clock.awake.now(h.io).toNanoseconds() };
         h.mutex.lockUncancelable(h.io);
         defer h.mutex.unlock(h.io);
         if (h.closing) {
@@ -219,6 +260,7 @@ pub const LaneHost = struct {
     }
 
     fn finish(h: *LaneHost, job: *Job, reason: Reason, message: []const u8) void {
+        if (h.rounds) |rd| rd.vtable.left(rd.ctx, @intFromPtr(job));
         job.reported();
         h.gpa.free(job.marks);
         const s = &job.stream;
@@ -295,6 +337,17 @@ pub const LaneHost = struct {
             return true;
         };
         h.unlock();
+        if (!h.openStream(job)) return true;
+        const began = job.began;
+        if (h.loneFits(job)) return h.runLone(job, began);
+        h.core.addStream(&job.stream) catch |e| return if (e == error.Cancelled) h.cancel(job) else h.drop(job, h.words(e));
+        h.prefilled(job, began);
+        if (h.deliver(job)) h.remove(job);
+        return true;
+    }
+
+    /// An admitted job's stream (its kept prefix looked up, its drafter): false when it failed (the job is finished).
+    fn openStream(h: *LaneHost, job: *Job) bool {
         const r = job.request;
         var reuse: lanes.stream.Reuse = .{};
         // the entry stays alive until the backend restores it: nothing keeps between here and this stream's own pass
@@ -304,7 +357,7 @@ pub const LaneHost = struct {
             job.marks = l.marks;
             reuse = .{ .saved = if (l.entry) |e| e.saved else null, .at = if (l.entry) |e| e.at else 0, .marks = l.marks, .hook = .{ .ptr = job, .at = Job.kept } };
         } else |_| {};
-        job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch return h.drop(job, "the drafter could not start");
+        job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch return !h.drop(job, "the drafter could not start");
         job.stream = lanes.Stream.init(h.gpa, .{
             .id = "request",
             .prompt = r.prompt,
@@ -323,16 +376,118 @@ pub const LaneHost = struct {
             .reuse = reuse,
         }) catch {
             job.proposer.deinit();
-            return h.drop(job, "out of memory");
+            return !h.drop(job, "out of memory");
         };
         job.started = true;
-        const began = std.Io.Clock.awake.now(h.io).toNanoseconds();
-        job.began = began;
-        if (h.loneFits(job)) return h.runLone(job, began);
-        h.core.addStream(&job.stream) catch |e| return if (e == error.Cancelled) h.cancel(job) else h.drop(job, h.words(e));
-        h.prefilled(job, began);
-        if (h.deliver(job)) h.remove(job);
+        job.began = std.Io.Clock.awake.now(h.io).toNanoseconds();
         return true;
+    }
+
+    fn seconds(ns: i96) f64 {
+        return @as(f64, @floatFromInt(ns)) / 1e9;
+    }
+
+    /// One round under the family's planner; false when it did nothing (nothing to admit, prefill or decode).
+    fn round(h: *LaneHost, rd: Rounds) bool {
+        var did = false;
+        // the admission pass, decided whole before any of it runs
+        var admits: std.ArrayList(*Job) = .empty;
+        defer admits.deinit(h.gpa);
+        var refused: std.ArrayList(struct { job: *Job, why: []const u8 }) = .empty;
+        defer refused.deinit(h.gpa);
+        h.lock();
+        if (h.queued.items.len > 0 and h.admitted.items.len < h.info_.lanes) {
+            rd.vtable.begin_admit(rd.ctx);
+            var free = h.info_.lanes - h.admitted.items.len;
+            var i: usize = 0;
+            while (i < h.queued.items.len and free > 0) {
+                const job = h.queued.items[i];
+                var why: []const u8 = "";
+                const v = rd.vtable.admit(rd.ctx, .{ .key = @intFromPtr(job), .prompt = job.request.prompt, .max_tokens = job.request.max_tokens, .submitted_s = seconds(job.submitted) }, &why);
+                switch (v) {
+                    .admit => {
+                        if (h.admitted.append(h.gpa, job)) |_| {} else |_| break;
+                        if (admits.append(h.gpa, job)) |_| {} else |_| {
+                            _ = h.admitted.pop();
+                            break;
+                        }
+                        _ = h.queued.orderedRemove(i);
+                        free -= 1;
+                    },
+                    .wait => break,
+                    .skip => i += 1,
+                    .refuse => {
+                        if (refused.append(h.gpa, .{ .job = job, .why = why })) |_| {} else |_| break;
+                        _ = h.queued.orderedRemove(i);
+                    },
+                }
+            }
+        }
+        h.unlock();
+        for (refused.items) |x| h.finish(x.job, .failed, x.why);
+        rd.vtable.admitted(rd.ctx) catch |e| {
+            h.failAll(h.words(e));
+            return true;
+        };
+        for (admits.items) |job| {
+            did = true;
+            if (!h.openStream(job)) continue;
+            rd.vtable.arm(rd.ctx, @intFromPtr(job));
+            const b = h.core.beginStream(&job.stream) catch |e| {
+                _ = h.drop(job, h.words(e));
+                continue;
+            };
+            rd.vtable.began(rd.ctx, @intFromPtr(job), b.damaged);
+        }
+        // this round's pieces, a decode round of the streams decoding, then the prompts whose rows are in
+        rd.vtable.plan(rd.ctx, &h.pieces, &h.finals) catch |e| {
+            h.failAll(h.words(e));
+            return true;
+        };
+        const t0 = std.Io.Clock.awake.now(h.io).toNanoseconds();
+        for (h.pieces.items) |piece| {
+            if (!piece.run) continue;
+            did = true;
+            const job: *Job = @ptrFromInt(piece.key);
+            if (job.stream.finished) continue;
+            h.core.piece(&job.stream, piece.start, piece.end, piece.save) catch |e| {
+                _ = h.drop(job, h.words(e));
+            };
+        }
+        const t1 = std.Io.Clock.awake.now(h.io).toNanoseconds();
+        if (h.core.activeCount() > 0) {
+            did = true;
+            h.core.step() catch |e| {
+                h.failAll(@errorName(e));
+                return true;
+            };
+        }
+        for (h.finals.items) |key| {
+            did = true;
+            const job: *Job = @ptrFromInt(key);
+            if (job.stream.finished) continue;
+            h.core.finishStream(&job.stream) catch |e| {
+                if (e == error.Cancelled) {
+                    h.core.discard(&job.stream);
+                    h.remove(job);
+                    h.finish(job, .cancelled, "");
+                } else _ = h.drop(job, h.words(e));
+                continue;
+            };
+            h.prefilled(job, job.began);
+        }
+        const t2 = std.Io.Clock.awake.now(h.io).toNanoseconds();
+        var i: usize = 0;
+        while (i < h.admitted.items.len) {
+            const job = h.admitted.items[i];
+            if (job.started and h.deliver(job)) {
+                h.lock();
+                _ = h.admitted.orderedRemove(i);
+                h.unlock();
+            } else i += 1;
+        }
+        rd.vtable.after(rd.ctx, seconds(t1 - t0), seconds(t2 - t1));
+        return did;
     }
 
     fn prefilled(h: *LaneHost, job: *Job, began: i96) void {
@@ -440,6 +595,7 @@ pub const LaneHost = struct {
 
     fn run(h: *LaneHost) void {
         if (h.on_thread) |t| t.run(t.ctx) catch |e| std.log.err("lane host: the engine thread's init failed ({t})", .{e});
+        if (h.rounds) |rd| return h.runRounds(rd);
         while (true) {
             h.takeCancels();
             while (h.admitOne()) {}
@@ -471,6 +627,36 @@ pub const LaneHost = struct {
                     _ = h.admitted.orderedRemove(i);
                     h.unlock();
                 } else i += 1;
+            }
+        }
+    }
+
+    /// The engine thread under a round planner: rounds while requests wait or run; an idle round (requests held back
+    /// by the planner, nothing running) waits for an arrival, a cancel or a short time before asking again.
+    fn runRounds(h: *LaneHost, rd: Rounds) void {
+        while (true) {
+            h.takeCancels();
+            h.lock();
+            if (h.closing) {
+                const left = h.queued.items.len + h.admitted.items.len;
+                h.unlock();
+                if (left == 0) return;
+                h.closeAll();
+                continue;
+            }
+            const work = h.admitted.items.len > 0 or (h.queued.items.len > 0 and h.admitted.items.len < h.info_.lanes);
+            if (!work) {
+                if (h.cancels.items.len == 0) h.wake.waitTimeout(h.io, &h.mutex, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }) catch {};
+                h.unlock();
+                continue;
+            }
+            h.unlock();
+            const did = h.round(rd);
+            h.noteLive();
+            if (!did) {
+                h.lock();
+                if (h.cancels.items.len == 0) h.wake.waitTimeout(h.io, &h.mutex, .{ .duration = .{ .raw = .fromMilliseconds(20), .clock = .awake } }) catch {};
+                h.unlock();
             }
         }
     }

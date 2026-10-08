@@ -362,7 +362,8 @@ pub const Store = struct {
             },
             .restore => {
                 if (j.err) |err| {
-                    _ = try s.pool.slots.items[j.slot].releaseAll();
+                    // the slot as before the restore (empty, its reservation kept: prod's `sl.truncate(0)`)
+                    _ = try s.pool.slots.items[j.slot].truncate(0);
                     return err;
                 }
                 const e = s.index.get(j.entry);
@@ -408,6 +409,20 @@ pub const Store = struct {
         s.ram_count -= 1;
         try s.index.setRam(id, false, null);
         if (!e.extra.file) s.index.remove(id);
+    }
+
+    /// An entry whose file could not be read back (a damaged NVMe file: prod's sessdisk `read` deletes it): its file
+    /// deleted and the entry gone unless RAM holds it. Every rank forgets the same entry, so the indexes stay alike.
+    pub fn forget(s: *Store, id: u32) !void {
+        const e = s.index.get(id);
+        if (e.extra.job != null) return error.Busy;
+        if (e.extra.file) if (s.disk) |d| {
+            d.stats.bad += 1;
+            // a delta's base stays while a newer file stacks on it (TF_DSV41_SESSION_DELTA; off by default)
+            d.remove(e.key) catch |err| return if (err == error.HasDependents) {} else err;
+            e.extra.file = false;
+        };
+        if (!e.ram) s.index.remove(id);
     }
 
     /// Drops an entry from RAM without writing it.

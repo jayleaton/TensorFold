@@ -41,10 +41,33 @@ pub const Target = struct {
         /// Before `prefill`: the request's reply budget (its max new tokens), for a target that admits requests by the
         /// pages they may write (the GPU target's pool admission, prod's batch.py `_admit`). null: nothing to do.
         admit: ?*const fn (ptr: *anyopaque, slot: u32, max_new: u64) void = null,
+        /// A prompt in pieces between decode rounds (prod's batcher: kv/sched.zig), in place of `prefill`: `begin`
+        /// takes the request into the slot (its pool pages, a saved prefix restored): the tokens its state holds and
+        /// whether a damaged saved entry was dropped; `piece` runs prompt rows [start, end) (`save`: the prompt's
+        /// snapshot right after them); `finish` runs the prompt's last token as the reply's first window: the keyed
+        /// choice after it. null: the target runs whole prompts only.
+        begin: ?*const fn (ptr: *anyopaque, slot: u32, ids: []const u32) anyerror!Begun = null,
+        piece: ?*const fn (ptr: *anyopaque, slot: u32, ids: []const u32, start: u64, end: u64, save: bool) anyerror!void = null,
+        finish: ?*const fn (ptr: *anyopaque, slot: u32, ids: []const u32, sampling: ?lanes.Sampling, draw: u64) anyerror!u32 = null,
     };
+
+    pub const Begun = struct { at: u64 = 0, damaged: bool = false };
 
     pub fn admit(t: Target, slot: u32, max_new: u64) void {
         if (t.vtable.admit) |f| f(t.ptr, slot, max_new);
+    }
+
+    pub fn pieces(t: Target) bool {
+        return t.vtable.begin != null and t.vtable.piece != null and t.vtable.finish != null;
+    }
+    pub fn begin(t: Target, slot: u32, ids: []const u32) !Begun {
+        return (t.vtable.begin orelse return error.NoPieces)(t.ptr, slot, ids);
+    }
+    pub fn piece(t: Target, slot: u32, ids: []const u32, start: u64, end: u64, save: bool) !void {
+        return (t.vtable.piece orelse return error.NoPieces)(t.ptr, slot, ids, start, end, save);
+    }
+    pub fn finish(t: Target, slot: u32, ids: []const u32, sampling: ?lanes.Sampling, draw: u64) !u32 {
+        return (t.vtable.finish orelse return error.NoPieces)(t.ptr, slot, ids, sampling, draw);
     }
 
     pub fn prefill(t: Target, slot: u32, ids: []const u32, sampling: ?lanes.Sampling, draw: u64) !u32 {

@@ -305,6 +305,9 @@ pub const Model = struct {
         }
         if (o.drafts) m.pass = try dspark_gpu.GpuPass.init(gpa, &m.f, ingest_rows);
         if (m.slots > 1) try m.openRows(rows_cap, &bp);
+        // prompts in pieces between decode rounds (TF_DSV41_PREFILL_PIECES, every rank alike): two slots' CED prompts
+        // interleave, so the stash ring becomes a slot's own (swapped on activate)
+        if (piecesEnv() and m.slot_set != null and m.f.prefill_state.mode == .replay) try m.slot_set.?.swap(&bp, &@import("ced.zig").roles);
         // sessions over several slots: the operations on the activated slot, the row windows' kept ids committed
         if (m.sessions) |x| if (m.rows) |b| {
             x.slot_set = m.slot_set;
@@ -313,6 +316,8 @@ pub const Model = struct {
         if (slot_drafts) m.slot_pass = try dspark_slots.SlotPass.init(gpa, &m.f, m.pass.?, m.rows.?, m.slots, group);
         // the prompt's prefilled tail's taps (CED's decoder replay, or the last segment) to the pass the lanes drive
         m.gt.pass = m.draftPass();
+        // full mode: a restored entry's drafter rings start the pass's context where prod's restore does
+        if (m.sessions) |x| x.ds_set = .{ .ctx = m, .set = setDsValid };
         m.gt.ingest_window = m.cfg.window;
         // TF_DSV41_SAMPLING=1: keyed sampling (T > 0) on every rank; off: such requests are refused (error.Sampling)
         m.sampler = if (samp.enabled()) try samp.GpuSampler.init(gpa, &m.f) else null;
@@ -342,6 +347,23 @@ pub const Model = struct {
         m.f.ext = m.rows.?.ext();
         m.f.graphs_read = true;
         m.gt.rows = m.rows;
+    }
+
+    fn setDsValid(ctx: *anyopaque, slot: u32, valid: u64) void {
+        const m: *Model = @ptrCast(@alignCast(ctx));
+        if (m.slot_pass) |x| {
+            if (slot < x.valid.len) x.valid[slot] = valid;
+        } else if (m.pass) |p| if (slot == 0) {
+            p.valid = valid;
+        };
+    }
+
+    /// TF_DSV41_PREFILL_PIECES=1: prompts prefilled in pieces between decode rounds, as prod's batcher plans them
+    /// (serve_engine.zig's round planner, kv/sched.zig). Default off until its Spark step (the port doc's NEXT SPARK
+    /// WINDOW P-1..P-4) passes; every rank must set the same.
+    pub fn piecesEnv() bool {
+        const v = std.c.getenv("TF_DSV41_PREFILL_PIECES") orelse return false;
+        return std.mem.eql(u8, std.mem.trim(u8, std.mem.span(v), " "), "1");
     }
 
     pub fn close(m: *Model) void {

@@ -22,17 +22,19 @@ pub const Plan = struct { need: u32, want: u32, wait: bool = false };
 
 /// batch.py `_admit` for one request of `prompt` tokens and `max_new` reply tokens on a slot of `capacity` positions,
 /// `hit` the store's find for its prompt: its pages, and in `spills` the entries to evict first (both ranks evict the
-/// leader's list, in its order). Refuses a request larger than the whole pool (prod: a ValueError to the request).
-pub fn admit(store: *sessions.Store, hit: ?sessions.store.Hit, prompt: u64, max_new: u64, capacity: u64, spills: *std.ArrayList(u32)) !Plan {
+/// leader's list, in its order). `held`: entries never spilled (prod's `used + [key]`: the hit and the entries the
+/// round's earlier admissions resume); `extra`: pages the round's earlier admissions take (prod's `new_pages`: a round's
+/// admissions are decided before any of them runs), so `want` counts them too. Refuses a request larger than the whole
+/// pool (prod: a ValueError to the request).
+pub fn admit(store: *sessions.Store, hit: ?sessions.store.Hit, prompt: u64, max_new: u64, capacity: u64, held: []const u32, extra: u32, spills: *std.ArrayList(u32)) !Plan {
     spills.clearRetainingCapacity();
     const pool = store.pool;
     const need = pool.needPages(prompt, max_new, capacity, slack);
     if (need > pool.npages) return error.RequestTooLarge;
     // a RAM hit's full pages are shared, not new (`cached // PAGE if tier == "ram"`)
     const shared: u32 = if (hit) |h| (if (h.ram) @intCast(h.pos / pool.page) else 0) else 0;
-    const want = need - @min(need, shared);
+    const want = need - @min(need, shared) + extra;
     if (pool.available() >= want) return .{ .need = need, .want = want };
-    const held: []const u32 = if (hit) |h| &.{h.id} else &.{};
     if (!try store.planSpill(want, held, spills)) {
         spills.clearRetainingCapacity();
         return .{ .need = need, .want = want, .wait = true };

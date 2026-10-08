@@ -89,6 +89,36 @@ pub const Engine = struct {
             e.backend.release(s);
             return error.Cancelled;
         }
+        return e.opened(s);
+    }
+
+    /// A stream whose prompt runs in pieces between rounds (the host's round planner): the backend takes it; its
+    /// pieces follow (`piece`), then `finishStream`. A failed begin leaves nothing to release.
+    pub fn beginStream(e: *Engine, s: *Stream) !be.Backend.Begun {
+        try trail.event(e, &.{ f("ev", str("add")), f("stream", str(s.id)) });
+        const begin = e.backend.vtable.begin orelse return error.NoPieces;
+        const b = try begin(e.backend.ptr, s);
+        s.cached = @intCast(b.cached);
+        return b;
+    }
+
+    /// Prompt rows [start, end) of a begun stream (`save`: the prompt's snapshot right after them).
+    pub fn piece(e: *Engine, s: *Stream, start: u64, end: u64, save: bool) !void {
+        const run = e.backend.vtable.piece orelse return error.NoPieces;
+        return run(e.backend.ptr, s, start, end, save);
+    }
+
+    /// A begun stream's prompt is in: its last row, its first token and first drafts; it takes part from the next
+    /// round. A failure leaves the stream with the backend (the host discards it).
+    pub fn finishStream(e: *Engine, s: *Stream) !void {
+        _ = e.arena.reset(.retain_capacity);
+        const fin = e.backend.vtable.finish orelse return error.NoPieces;
+        try fin(e.backend.ptr, s);
+        return e.opened(s);
+    }
+
+    /// After the prompt: the first token, the first drafts; the stream joins the rounds (or ends at once).
+    fn opened(e: *Engine, s: *Stream) !void {
         s.context.shrinkRetainingCapacity(s.prompt_len);
         s.pending = null;
         s.cache_len = s.prompt_len;

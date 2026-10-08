@@ -23,6 +23,7 @@ const timed = @import("phases_timed.zig");
 const grammar_gpu = @import("grammar_gpu.zig");
 const Allocator = std.mem.Allocator;
 const vision_rows = @import("vision_rows.zig");
+const sched_host = @import("sched_host.zig");
 
 pub const backends: []const []const u8 = &.{"cuda"};
 pub const families: []const api.Family = &.{.{ .model_type = "deepseek_v41", .formats = &.{"exl3"} }};
@@ -68,6 +69,8 @@ pub const Served = struct {
     /// TF_DSV41_GRAMMAR=1 (grammar_gpu.zig): the request grammars and the target that enforces them
     gengine: ?*grammar_gpu.GrammarEngine = null,
     gtarget: ?*grammar_gpu.GrammarTarget = null,
+    /// TF_DSV41_PREFILL_PIECES=1 (sched_host.zig): prod's batcher plans the host's rounds
+    sched: ?*sched_host.SchedHost = null,
 
     /// Rank 0's engine over a loaded model (`drafts`: DSpark's pass, else serial windows through the same lanes).
     pub fn open(gpa: Allocator, io: std.Io, dir: []const u8, assets: []const u8, drafts: bool, context: ?i64) !*Served {
@@ -126,6 +129,22 @@ pub const Served = struct {
         s.host.on_thread = .{ .ctx = m, .run = bindContext };
         // /metrics' device memory: the bytes this rank holds in cuda.DeviceBuffers (weights, KV pool, staging), its peak
         s.host.memory = .{ .read = readMemory };
+        // TF_DSV41_PREFILL_PIECES=1: prod's batcher plans the rounds (queued admissions, prompts in pieces between
+        // decode rounds); the served shape only (own prefill, the verify tail), every rank with the same setting
+        s.sched = null;
+        if (model.Model.piecesEnv()) {
+            if (!(m.gt.own_prefill and m.gt.prompt_tail == .verify)) {
+                std.log.warn("TF_DSV41_PREFILL_PIECES=1 needs TF_DSV41_OWN_PREFILL=1 and TF_DSV41_PROMPT_TAIL=verify (the served shape); prompts run whole", .{});
+            } else {
+                const sh = try gpa.create(sched_host.SchedHost);
+                sh.* = sched_host.SchedHost.init(gpa, io, &m.gt, try sched_host.SchedHost.settings(&m.gt));
+                s.sched = sh;
+                s.host.rounds = sh.rounds();
+                m.gt.defer_release = true;
+                var buf: [256]u8 = undefined;
+                std.log.info("dsv41 rounds: {s}", .{sh.describe(&buf)});
+            }
+        } else std.log.info("dsv41 rounds: whole prompts at admission (TF_DSV41_PREFILL_PIECES=1: prod's pieces between decode rounds)", .{});
         try s.host.start();
         if (s.gengine) |ge| ge.inner = s.host.engine();
         s.rec = Recorder.init(gpa, io, if (s.gengine) |ge| ge.engine() else s.host.engine());
@@ -157,6 +176,11 @@ pub const Served = struct {
         const s: *Served = @ptrCast(@alignCast(ctx));
         const gpa = s.gpa;
         s.host.stop();
+        if (s.sched) |sh| {
+            s.m.gt.settleReleases();
+            sh.deinit();
+            gpa.destroy(sh);
+        }
         s.m.f.stop() catch {}; // the followers' loops end
         if (s.phases) |x| {
             x.flush(gpa, s.io);

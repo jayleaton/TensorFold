@@ -9,6 +9,7 @@ pub const budget = @import("budget.zig");
 pub const device = @import("device.zig");
 pub const DevicePool = device.DevicePool;
 pub const sess = @import("sess.zig");
+pub const sched = @import("sched.zig");
 
 test {
     _ = layout;
@@ -18,4 +19,5 @@ test {
     _ = @import("split_test.zig");
     _ = sess;
     _ = @import("sess4_test.zig");
+    _ = sched;
 }

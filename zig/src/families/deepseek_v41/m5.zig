@@ -166,7 +166,7 @@ fn onePrompt(gpa: std.mem.Allocator, io: std.Io, a: std.mem.Allocator, m: *model
                     try log.print("{{\"park\": \"skipped: {d} positions, under the tier's 1,024\"}}\n", .{f.slot.pos});
                 } else _ = try ss.parkAll();
             }
-            try ss.restore(id);
+            if (!try ss.restore(id)) return error.RestoreFailed;
             round_trips[@intFromBool(disk)] = secs(io, tr);
         }
         const ids = [_]u32{tok};

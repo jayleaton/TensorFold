@@ -94,3 +94,125 @@ test "a request the backend refuses fails alone, in the backend's words" {
     try std.testing.expectEqual(Reason.length, plain.wait());
     try std.testing.expectEqual(@as(usize, 64), plain.tokens);
 }
+
+test "a round planner: prompts in pieces between the other streams' decode rounds, queued admissions, the same tokens" {
+    const gpa = std.testing.allocator;
+    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+    defer cfg.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.pieceBackend(), clock.clock());
+    defer core.deinit();
+    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
+    // one prompt prefilling at a time (the next waits queued), 3 rows a round, a final when its rows are in
+    const Plan = struct {
+        const Seq = struct { key: usize, n: u64, done: u64 = 0, decoding: bool = false };
+        seqs: std.ArrayList(Seq) = .empty,
+        waits: u32 = 0,
+        rounds: u32 = 0,
+        mixed: u32 = 0, // rounds that ran a piece while another stream decoded
+        fn self(ctx: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(ctx));
+        }
+        fn beginAdmit(_: *anyopaque) void {}
+        fn admit(ctx: *anyopaque, ask: api.Rounds.Ask, _: *[]const u8) api.Rounds.Verdict {
+            const p = self(ctx);
+            for (p.seqs.items) |x| if (!x.decoding) {
+                p.waits += 1;
+                return .wait;
+            };
+            p.seqs.append(gpa, .{ .key = ask.key, .n = ask.prompt.len }) catch return .refuse;
+            return .admit;
+        }
+        fn admitted(_: *anyopaque) anyerror!void {}
+        fn arm(_: *anyopaque, _: usize) void {}
+        fn began(_: *anyopaque, _: usize, _: bool) void {}
+        fn plan(ctx: *anyopaque, pieces: *std.ArrayList(api.Rounds.Piece), finals: *std.ArrayList(usize)) anyerror!void {
+            const p = self(ctx);
+            pieces.clearRetainingCapacity();
+            finals.clearRetainingCapacity();
+            var decoding = false;
+            for (p.seqs.items) |x| decoding = decoding or x.decoding;
+            for (p.seqs.items) |*x| if (!x.decoding) {
+                if (x.done < x.n - 1) {
+                    const end = @min(x.done + 3, x.n - 1);
+                    try pieces.append(gpa, .{ .key = x.key, .start = x.done, .end = end, .save = false });
+                    x.done = end;
+                    if (decoding) p.mixed += 1;
+                }
+                if (x.done == x.n - 1) {
+                    try finals.append(gpa, x.key);
+                    x.decoding = true;
+                }
+            };
+            p.rounds += 1;
+        }
+        fn left(ctx: *anyopaque, key: usize) void {
+            const p = self(ctx);
+            for (p.seqs.items, 0..) |x, i| if (x.key == key) {
+                _ = p.seqs.orderedRemove(i);
+                return;
+            };
+        }
+        fn after(_: *anyopaque, _: f64, _: f64) void {}
+    };
+    var pl: Plan = .{};
+    defer pl.seqs.deinit(gpa);
+    host.rounds = .{ .ctx = &pl, .vtable = &.{ .begin_admit = Plan.beginAdmit, .admit = Plan.admit, .admitted = Plan.admitted, .arm = Plan.arm, .began = Plan.began, .plan = Plan.plan, .left = Plan.left, .after = Plan.after } };
+    const Box = struct {
+        mutex: std.Io.Mutex = .init,
+        tokens: std.ArrayList(u32) = .empty,
+        done: ?Reason = null,
+        fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
+            const b: *@This() = @ptrCast(@alignCast(ctx));
+            b.mutex.lockUncancelable(std.testing.io);
+            defer b.mutex.unlock(std.testing.io);
+            switch (e.*) {
+                .tokens => |t| b.tokens.appendSlice(gpa, t) catch {},
+                .finished => |f| b.done = f.reason,
+                else => {},
+            }
+        }
+        fn wait(b: *@This()) Reason {
+            while (true) {
+                b.mutex.lockUncancelable(std.testing.io);
+                const d = b.done;
+                b.mutex.unlock(std.testing.io);
+                if (d) |r| return r;
+                std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+            }
+        }
+    };
+    const p1 = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6, 5, 3 };
+    const p2 = [_]u32{ 2, 7, 1, 8, 2, 8, 1, 8, 2, 8, 4, 5, 9 };
+    var b1: Box = .{};
+    var b2: Box = .{};
+    defer b1.tokens.deinit(gpa);
+    defer b2.tokens.deinit(gpa);
+    const r1: Request = .{ .prompt = &p1, .max_tokens = 40 };
+    const r2: Request = .{ .prompt = &p2, .max_tokens = 12 };
+    const e = host.engine();
+    try host.start();
+    try e.submit(1, &r1, .{ .ctx = &b1, .event = Box.event });
+    try e.submit(2, &r2, .{ .ctx = &b2, .event = Box.event });
+    try std.testing.expectEqual(Reason.length, b1.wait());
+    try std.testing.expectEqual(Reason.length, b2.wait());
+    host.stop();
+    // the replies are the whole-prompt path's tokens
+    for ([_]struct { p: []const u32, b: *Box }{ .{ .p = &p1, .b = &b1 }, .{ .p = &p2, .b = &b2 } }) |c| {
+        var history: std.ArrayList(u32) = .empty;
+        defer history.deinit(gpa);
+        try history.appendSlice(gpa, c.p);
+        for (c.b.tokens.items) |t| {
+            try std.testing.expectEqual(lanes.fake.next(history.items, null, history.items.len), t);
+            try history.append(gpa, t);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 40), b1.tokens.items.len);
+    try std.testing.expectEqual(@as(usize, 12), b2.tokens.items.len);
+    // the second prompt waited queued, then ran its pieces while the first decoded
+    try std.testing.expect(pl.waits > 0 and pl.mixed >= 3);
+    try std.testing.expectEqual(@as(usize, 3 + 4), target.pieces_run);
+    try std.testing.expectEqual(@as(usize, 0), pl.seqs.items.len);
+}

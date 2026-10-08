@@ -9,11 +9,16 @@
 //!   release) then runs on slot s unchanged. The leader sends `op_select` first, so every rank activates the same slot
 //!   before the same operation.
 //! - `deactivate()`: the roles back at the stacked bases (row mode's view), the active slot's state stored.
+//! - Swapped roles (`swap`: CED's stash ring "s.ced.*", one buffer the active slot's prompt uses): each slot's bytes kept
+//!   aside while another slot's prompt runs, swapped in by `activate` on every rank alike (Python keeps a stash a slot,
+//!   replay.py `encode`). Only prompts prefilled in pieces between decode rounds (TF_DSV41_PREFILL_PIECES) interleave
+//!   two slots' prompts; a whole prompt in one call never needed it.
 //! Row mode needs the pool (Python: rowmode.ready); the contiguous slot is refused by name (error.RowsNeedPool).
 //! The session store (sessions_gpu.zig) runs on the activated slot: its views of the stacked roles (a slot's bytes),
 //! its `Forward.Slot`, the pool's current slot.
 
 const std = @import("std");
+const cuda = @import("cuda");
 const fwd = @import("forward.zig");
 const buffers = @import("buffers.zig");
 const rowmode = @import("rowmode.zig");
@@ -44,6 +49,11 @@ pub const SlotSet = struct {
     /// the slot whose views are bound (its state lives in f.slot meanwhile); null: the stacked bases
     active: ?u32 = null,
     roles: std.StringArrayHashMapUnmanaged(Stacked) = .empty,
+    /// roles one buffer holds for one slot at a time, each slot's copy aside (`swap`); `owner`: whose bytes are in
+    swapped: std.ArrayList(Swapped) = .empty,
+    owner: ?u32 = null,
+
+    const Swapped = struct { addr: u64, len: u64, aside: cuda.DeviceBuffer };
 
     pub fn init(gpa: std.mem.Allocator, f: *fwd.Forward, n: u32) !*SlotSet {
         if (f.kv == null) return error.RowsNeedPool;
@@ -57,6 +67,8 @@ pub const SlotSet = struct {
     }
 
     pub fn deinit(ss: *SlotSet) void {
+        for (ss.swapped.items) |*x| x.aside.free();
+        ss.swapped.deinit(ss.gpa);
         ss.roles.deinit(ss.gpa);
         ss.gpa.free(ss.states);
         ss.gpa.destroy(ss);
@@ -74,6 +86,28 @@ pub const SlotSet = struct {
         const tb: u64 = 4 * @as(u64, k.dev.pts);
         try ss.roles.put(ss.gpa, "s.kv.pt", .{ .base = k.dev.table.ptr, .bytes = tb });
         try ss.roles.put(ss.gpa, "s.kv.ct", .{ .base = k.dev.local.ptr, .bytes = tb });
+    }
+
+    /// After Runner.bind: `roles` (planned ones; others skipped) become per-slot by swapping (CED's stash ring with
+    /// prompts in pieces). Each slot's copy is set aside in its own buffer (S x the role's bytes).
+    pub fn swap(ss: *SlotSet, plan: *const buffers.Plan, roles: []const []const u8) !void {
+        const r = ss.f.runner;
+        for (roles) |role| {
+            const len = plan.sizes.get(role) orelse continue;
+            const addr = r.addressOf(role) orelse return error.NotBound;
+            try ss.swapped.append(ss.gpa, .{ .addr = addr, .len = len, .aside = try cuda.DeviceBuffer.alloc(r.d, len * ss.n) });
+        }
+    }
+
+    /// The swapped roles hold slot s's bytes (the owner's set aside first), on the runner's stream.
+    fn swapIn(ss: *SlotSet, s: u32) !void {
+        if (ss.swapped.items.len == 0 or ss.owner == s) return;
+        const r = ss.f.runner;
+        for (ss.swapped.items) |x| {
+            if (ss.owner) |o| try r.d.check(r.d.api.cuMemcpyDtoDAsync_v2(x.aside.ptr + o * x.len, x.addr, x.len, r.stream.handle), "cuMemcpyDtoDAsync");
+            try r.d.check(r.d.api.cuMemcpyDtoDAsync_v2(x.addr, x.aside.ptr + s * x.len, x.len, r.stream.handle), "cuMemcpyDtoDAsync");
+        }
+        ss.owner = s;
     }
 
     /// "s.L<i>.…" of a backbone layer (DSpark's blocks keep their own one-slot rings).
@@ -98,6 +132,7 @@ pub const SlotSet = struct {
     pub fn activate(ss: *SlotSet, s: u32) !void {
         if (s >= ss.n) return error.SlotRange;
         if (ss.leads()) try ss.f.link.?.send(&.{ op_select, s });
+        try ss.swapIn(s);
         if (ss.active == s) return;
         ss.store();
         ss.f.slot = ss.states[s];
