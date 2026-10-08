@@ -1282,6 +1282,90 @@ The kit is built from the fix's commit or later. It also carries `tools/zig/dsv4
 5. Prod back on perf1 (`scripts/v2-rollback.sh perf1`), as in every window. Keep `py*.jsonl`, `zig*.jsonl` and the
    compare output in the quant repo's results.
 
+### Speed against prod after the night (`dsq-zig-speed-2`, offline)
+
+Every number below is from the night's logs (quant repo `results/zig-night-20261007/r0/`: `*/server.log`,
+`*/phases.json`, `*/bench.log`, `r1prof/`), prod's own cost table (`calib-*.json`, the one the served Zig read) or a
+dev-box measurement where named. No Spark or pod was used.
+
+**What each run actually had** (each server's `prod knobs:` / `engram:` / `graphs:` boot lines):
+
+| run | graphs | Engram rows | io_uring | PF_DENSE | GM_V2 | PREFETCH_AHEAD | prefill rows | drafts | speculative pass |
+|---|---|---|---|---|---|---|---|---|---|
+| A (1 slot) | on | `/engram` (R3) | **off** (PermissionDenied) | off | off | off | 2,048 | on | 800 of 7,493 passes |
+| B (4 slots) | row graphs | `/engram` | **off** | off | off | off | 2,048 | off | - |
+| B2 (4 slots) | row graphs | `/engram` | **off** | off | off | off | 2,048 | slot drafts, passes of <= 3 slots | 189 of 3,530 passes |
+| C (1M) | **off** (eager) | `/engram` | **off** | off | off | off | 2,048 | on | 6 |
+| part 4 (Zig prod) | row graphs | `/engram` | **off** | fused | off | off | 2,048 | slot drafts | - |
+
+So every run had the real Engram shards (bc55ef4's `TF_DSV41_ENGRAM_DIR`), but none had GM_V2 or read-ahead, only
+part 4 had PF_DENSE, run C was eager, and **every run read Engram rows one `pread` at a time on the engine thread**:
+Docker's default seccomp profile refuses `io_uring_setup`, and R3's fallback was serial. Python's reader says the same
+in its docstring (`engram_native.py`: "Docker's default seccomp profile refuses io_uring") and reads with a pthread
+pool (32 threads for prefill, a persistent pool of 64 for decode).
+
+**Gap -> cause -> fix:**
+
+| gap (Zig vs prod) | cause, with the evidence | kind | fix |
+|---|---|---|---|
+| all: Engram reads | io_uring refused in every run; serial 264-byte reads: run C 1,022 `engram.wait`, 249 ms mean (~0.64 s of each ~3.6 s 2,048-row segment, 12 lookups a row a layer a rank); run A 3.8 ms `engram.wait` + 2.6 ms `prefetch` a window; row mode (B / B2) has no read-ahead, so every row is read at its window | code | **dd33a75 + d6c5e02**: a persistent pool of reader threads (`TF_DSV41_ENGRAM_QD`, Python's name and default 64); a window's misses go ahead of queued read-ahead. Dev box O_DIRECT, a segment's 24,576 rows: 174-271 ms serial -> 71-74 ms. Same bits (engram_rows_test: serial / pool / io_uring) |
+| prefill: read-ahead | `prefetch ahead off` in every run; with serial reads it could not overlap anyway | config | prod-zig.env `TF_DSV41_PREFETCH_AHEAD=1` (zig-serve **a62b7a1**) |
+| decode 1 stream (code 60.4 vs 84.7, prose 34.3 vs 51.6) | not the forward: Zig's eager R1 windows 30.4 / 31.3 / 32.3 ms (1 / 2 / 4 rows) vs Python's eager reference 33.3 / 37.5 / 38.3 on the same windows (`r1prof/.../prof-rank0.json`); run B's 1-stream round 24.7 ms vs prod's served 1-row verify 21.5-22.1 ms. With drafts the round is ~65 ms (B2 code: 384 tokens, 98 rounds) against prod's ~43 (its 2026-10-06 table: verify 4 / 5 rows 36.4 / 41.1 ms, pass 3.66 ms) | code | Engram above (~4-6 ms a round); the rest needs hardware, below |
+| decode: the DSpark pass | 7.0 ms (B2) vs prod's 3.66: eager launches, a synchronous download of the block's whole logits ([5 x 64,640] fp32, pageable), the candidates on the host, two stream syncs | code | Spark: graph the pass and keep the candidates on the GPU (not done offline: needs the GPU to prove) |
+| decode: unattributed host time | run A code T0: 94.9 ms a round = window 43.7 + pass 31.5 (before 9bc88af) + ~20 ms outside every phase (phases time the target / pass calls only, summed over all cells) | unknown | Spark step S4: phases per cell |
+| decode 4 streams (82-94 vs 143.6) | 4 live slots need two DSpark passes a round (passes <= 3 slots: `mhc_cuda` site1 / final take <= 16 rows, the AOT set has no 20-row pass; prod: one 20-row pass); the speculative pass ran 189 of 3,530 passes (prod: 99 % hits); serial Engram reads of 16-row windows (~380 a window) | code | Engram above; 20-row slot pass and the speculative pass over slot passes need kernels + AOT on hardware |
+| long prefill (32K 571, 131K 585 vs 2,430 / 2,263 tok/s) | (1) prod runs **CED replay** (`TF_DSV41_PREFILL=replay`): layers 20-39 only over a prompt's last 127 rows, ~2x by Python's own numbers (DEPLOY.md 950 vs 480; ENGINE-PLAN 2,200 vs 1,500); Zig runs `full` (not ported, section 0e). So Zig's full prefill is ~2.1x behind Python's full, not 4.2x. (2) Engram serial reads ~18 % of a segment. (3) GM_V2, PF_DENSE off. Not host emission: `emitPrefill` of a 40-layer 2,048-row segment is 1.9-3.8 ms (dev box, ReleaseFast) | code + config | Engram fix + read-ahead; GM_V2 after its gate (S5); CED replay is the largest item and a port of its own (below) |
+| long-context decode (35.6-38.9 vs 50.5-54.0) | run C was eager (graphs on the paged pool need `_scores paged NK 2048`, never recorded): `forward` 31.3 ms of host launches a window (graphed run A: 3.55); `prefetch` 7.08 ms a window (serial Engram) | config + AOT | Engram fix; graphs once the AOT fill covers the context buckets (`dsq-zig-rows1m-1`'s aot-needs / fill), S3 |
+| fast boot 375 s (prod 33-48 s), first boot 810 s | 261 s of the 367 s weights load is "upload + digest": a SHA-256 of every tensor on the way up (95 GiB a rank, one thread). The image is built for generic `aarch64-linux-gnu`, where std's SHA-256 has no `sha2` instructions (checked: `builtin.cpu.has(.aarch64, .sha2)` is false there, true with `-mcpu=baseline+sha2+aes`); only M1's weights check reads the digests. Prepared reads ~106 s (~0.9 GB/s, one thread) | code + build | **a5ce61a**: the served model takes no digests; the next prepared file is read ahead (`POSIX_FADV_WILLNEED`) while a layer uploads. zig-serve **a62b7a1**: `ZIG_CPU=baseline+sha2+aes` (the first boot's file digests and `PREPARED_VERIFY` in hardware). The kit's `build-kit.sh` (owner `dsq-zig-rows1m-1`) can take the same `-Dcpu` |
+
+Checks on d6c5e02 (these commits on a390113, other agents' uncommitted work left out): `check` cap15 / cap18 / cap22 / cap24-1 /
+cap24-12 / cap24-16 and `dcheck cap16` 0 mismatches, `test-dsv41-knobs` PASS, engram_rows_test 8/8 (Debug, and
+ReleaseSafe five times). No kernel, emitter or value changed.
+
+**Expected after these fixes** (estimates; the basis is the measured share each fix removes):
+
+| workload | night | expected | basis |
+|---|---:|---:|---|
+| code T0, 1 stream | 60.4 | ~63-65 | Engram ~4-6 ms of a ~65 ms round |
+| prose T0, 1 stream | 34.3 | ~36-37 | the same on a ~48 ms round |
+| code T0, 4 streams | 82.2 | ~90-95 | ~380 serial Engram reads a 16-row window (run A: 3.8 ms a window of ~4.6 rows) |
+| 32K prefill | 571 tok/s | ~690; ~730 with GM_V2 | 0.64 s of 3.58 s a segment; GM_V2 +7 % on q28-v2 in Python |
+| 32K decode | 36.4 | ~40 eager; up to ~50 graphed | `prefetch` 7.08 ms of a ~72 ms round; graphs: the launch share, unknown until S3 |
+| fast boot | 375 s | ~120-160 s | the digest out of 261 s, read-ahead of the 106 s read |
+| first boot | 810 s | ~400-500 s | the upload digest out, the file digests in hardware |
+
+**Beyond these (code, needs hardware to prove; ranked by expected gain):**
+1. **CED replay prefill** (`TF_DSV41_PREFILL=replay`): ~2x long prefill and the bits prod serves for prompts over 128
+   tokens (section 0e). Python `replay.py` at 8474f31: encoder pass (layers 0-19 + layer 20's site and compressor:
+   the decoder's global KV for every position), a stash of the rows entering layer 20 for the last 127 positions,
+   then layers 20-39 over [R0, n - 1) with every SWA window starting at R0; the last token is the reply's first
+   verify row (Zig's `PROMPT_TAIL=verify` already does that part). Gate: a `dsv41_m2b_ref.py` reference with
+   `TF_DSV41_PREFILL=replay` (M2c-2 kit, `PREFILL=1`). A workstream of its own.
+2. **The DSpark pass**: graph its launches and keep its candidates on the GPU (pinned staging at least): 7.0 -> ~3.7
+   ms a round, ~+5 % at 1 stream.
+3. **One pass over 4 slots** (20 rows: `mhc_cuda` site1 / final past 16 rows and the AOT variants) and the
+   speculative pass over slot passes: the 4-stream drafted rounds.
+4. **Row-mode Engram read-ahead** (batch.zig, owner `dsq-zig-rows1m-1`): the one-slot path reads the next window's
+   row 0 during the pass; row mode reads everything at the window (now in parallel, still on the round's path).
+5. Engram GPU gate (Python `ENGRAM_GATE`, +2.6-3.5 % at C2 / C4), `BRANCHES` side stream (-0.53 ms a 1-row
+   window), `ROCE_FAST` (-0.16 to -0.51 ms), `PLAN_LINK=rdma`.
+
+#### NEXT SPARK WINDOW: speed (not run; after the prompt-tail steps, ordered by expected gain)
+
+Kit and image from engine **d6c5e02 or later** (plus `dsq-zig-rows1m-1`'s AOT fill when it lands); the image from
+zig-serve **a62b7a1** (`ZIG_CPU`). Check the lease on dgx-01 first. Both nodes' `dsv41-zig-prepared` were deleted
+after the night, so the first Zig boot rebuilds them. Each step's PASS criterion is in bold; a step that fails is
+recorded and the window moves on.
+
+| step | what | time | expect |
+|---|---|---|---|
+| S1 boot | Zig-as-prod switch (`v2-rollback.sh zig`, prod-zig.env), then `serve.sh stop` / `start` again. If 4 slots x 1M still refuses at boot (9bb3227 is not proven on the Sparks), run S1-S2 with `PARALLEL=1 TF_DSV41_SLOTS=1` as run C did | ~25 min | rank 0's `dsv41 load:` line: first boot **< 600 s** ready (was 810), then fast boot **< 200 s** (was 375); `upload + digest` far below 261 s |
+| S2 Engram | the same server with `TF_DSV41_PHASES=1 TF_DSV41_PHASES_OUT=/state/phases.json` added to prod-zig.env for the window (removed after): boot log **`engram: no io_uring (...); rows read by 64 threads`**; `bench_http.py --long 32768`: **`engram.wait` mean < 30 ms** (was 249), TTFT **< 58 s** (was 66.5). A / B one cell with `TF_DSV41_ENGRAM_QD=0` (the serial path) | ~20 min | 32K ~690 tok/s |
+| S3 long decode | after the AOT fill: run C's shape (`CONTEXT=1048576`, one slot) with `GRAPHS=1`, `--long 32768,131072` | ~25 min | **no MissingTritonVariant**; decode **> 45 tok/s** at 32K (was 36.4); else record the variant, `GRAPHS=0` |
+| S4 short decode, per cell | B2's shape (4 slots, slot drafts, prod-zig.env, S2's phases knobs), one `bench_http.py --work code --temps 0 --streams 1 --reps 2` run, save `phases.json`; then `--streams 4`; then `--work prose --streams 1` (copy `phases.json` between runs: it is cumulative) | ~30 min | code 1-stream **> 62** (was 60.4), 4-stream **> 88** (82.2); per-cell phases name the ~20 ms a round outside every phase |
+| S5 GM_V2 | M2c-2 kit `PREFILL=1 GM_V2=1 ./run_host.sh` (both hosts; `prefill.log`'s `prod knobs:` line must say `x3gm v2 one`), then S2's 32K cell with `TF_DSV41_GM_V2=1` | ~35 min | **prefill gate PASS** (95/95 roles, first token, 512/512); 32K **+5-10 %**. PASS: `TF_DSV41_GM_V2=1` into prod-zig.env |
+| S6 restore | prod back on perf1 (`scripts/v2-rollback.sh perf1`) | ~2 min | as every window |
+
 ### Spark window, 2026-10-07: outcome
 
 Prod was down 12:34-14:07 (93 min) and was restored on perf1 (`scripts/v2-rollback.sh perf1`: 17 x 23 -> 391,

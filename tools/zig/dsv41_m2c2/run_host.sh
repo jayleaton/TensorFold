@@ -6,7 +6,7 @@
 # Start it on both hosts within about a minute (each phase's rendezvous waits up to 30 min for the other host):
 #   dgx-01:  ./run_host.sh 0 OUTDIR
 #   dgx-02:  ./run_host.sh 1 OUTDIR
-# Prod must be stopped first (RUNBOOK.md). Knobs: STEPS (512), SEEDS ("4101"), PROMPT (1536), BACKEND (roce | nccl), LANES (1: also M3's lanes gate, about +12 min), PREFILL (1: Zig's own prefill gate, about +10 min), AOT_PROMPTS (the reference's extra prompt lengths for M4's Triton variants: every prefill path; "" for none), PROF_ROWS ("1 2 4": after the gate, windows of each row count timed on both sides: the R1 timing table; Zig's in seed*/zig.log, Python's in seed*/ref.log), PROMPT_TAIL (verify: the reference runs the prompt as prod's server does, [0, n - 1) prefilled and the last token a decode row; ref.json records it and the Zig side follows it; unset: Forward.prompt).
+# Prod must be stopped first (RUNBOOK.md). Knobs: STEPS (512), SEEDS ("4101"), PROMPT (1536), BACKEND (roce | nccl), LANES (1: also M3's lanes gate, about +12 min), PREFILL (1: Zig's own prefill gate, about +10 min), AOT_PROMPTS (the reference's extra prompt lengths for M4's Triton variants: every prefill path; "" for none), PROF_ROWS ("1 2 4": after the gate, windows of each row count timed on both sides: the R1 timing table; Zig's in seed*/zig.log, Python's in seed*/ref.log), PROMPT_TAIL (verify: the reference runs the prompt as prod's server does, [0, n - 1) prefilled and the last token a decode row; ref.json records it and the Zig side follows it; unset: Forward.prompt), GM_V2 (with PREFILL=1: the Zig prefill gate's ranks run TF_DSV41_GM_V2=$GM_V2, x3gm v2 on the Zig prefill; the reference is prod's, which runs it).
 set -u
 RANK=${1:?rank}; OUT=${2:?outdir}
 KIT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -78,7 +78,7 @@ for seed in $SEEDS; do
         t0=$(date +%s)
         docker run "${ARGS[@]}" -e TF_TP_WORLD=2 -e TF_TP_RANK="$RANK" -e TF_TP_DEVICE=0 -e TF_TP_MASTER="$MASTER" \
             -e TF_TP_PORT=$((port + 13)) -e TF_DSV41_PLAN_TIMEOUT=1800 -e TF_COMM_BACKEND="$BACKEND" -e TF_TP_ROCE_FALLBACK=error \
-            -e TF_TP_KERNEL_IMAGE=/kit/tp_mailbox.fatbin -e M2B_TOPP=0.85 -e M2B_PREFILL=1 -e TF_DSV41_FAILFAST=0 --name "dsv41-zig-pf-r$RANK" \
+            -e TF_TP_KERNEL_IMAGE=/kit/tp_mailbox.fatbin -e M2B_TOPP=0.85 -e M2B_PREFILL=1 -e TF_DSV41_FAILFAST=0 -e TF_DSV41_GM_V2="${GM_V2:-}" --name "dsv41-zig-pf-r$RANK" \
             --entrypoint bash "$IMAGE" -c 'export TF_NCCL_LIB=$(python -c "import nvidia.nccl, os; print(os.path.join(os.path.dirname(nvidia.nccl.__file__), \"lib\", \"libnccl.so.2\"))" 2>/dev/null || echo libnccl.so.2); mkdir -p '"$R/zig-prefill"'; exec /kit/tf-dsv41-m1 m2b /model '"$R/ref"' '"$R/zig-prefill" \
             > "$OUT/seed$seed/prefill.log" 2>&1
         rc=$?; log "seed $seed: prefill gate rc $rc in $(( $(date +%s) - t0 )) s: $(grep -h '^PASS Zig\|^FAIL Zig' "$OUT/seed$seed/prefill.log" | tail -1) / $(grep -h '^PASS M2b\|^FAIL M2b' "$OUT/seed$seed/prefill.log" | tail -1)"
