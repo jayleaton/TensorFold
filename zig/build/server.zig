@@ -76,6 +76,23 @@ pub fn tests(b: *std.Build, build_options: *std.Build.Step.Options, test_step: *
         server_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = s.json })).step);
         server_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = s.api })).step);
         test_step.dependOn(server_step);
+        // test-golden: the frozen server parity goldens, checked by Zig driving fake_serve (macOS: nativeServer)
+        const fake_serve = b.addExecutable(.{ .name = "fake_serve", .root_module = b.createModule(.{
+            .root_source_file = b.path("zig/tests/server/fake_serve.zig"),
+            .target = host,
+            .optimize = .Debug,
+            .link_libc = true,
+            .imports = &.{ .{ .name = "server", .module = s.server }, .{ .name = "engine_api", .module = s.api }, .{ .name = "tokenizer", .module = s.server.import_table.get("tokenizer").? }, .{ .name = "template", .module = s.server.import_table.get("template").? } },
+        }) });
+        const golden_check = b.addExecutable(.{ .name = "golden_check", .root_module = b.createModule(.{ .root_source_file = b.path("zig/tests/server/golden_check.zig"), .target = host, .optimize = .Debug, .link_libc = true }) });
+        const golden_run = b.addRunArtifact(golden_check);
+        golden_run.addArtifactArg(fake_serve);
+        golden_run.addFileArg(b.path("zig/tests/server/golden/cases.json"));
+        golden_run.addDirectoryArg(b.path("zig/tests/server/golden"));
+        golden_run.addDirectoryArg(b.path("zig/tests/server/fixtures"));
+        golden_run.setCwd(b.path("."));
+        b.step("test-golden", "The frozen server parity goldens checked by a Zig step driving fake_serve").dependOn(&golden_run.step);
+        test_step.dependOn(&golden_run.step);
         const none = b.createModule(.{ .root_source_file = b.path("zig/src/native/none.zig"), .target = host, .optimize = .ReleaseSafe, .link_libc = true });
         const exe = b.addExecutable(.{ .name = "tensorfold-native", .root_module = server(b, host, .ReleaseSafe, "zig/src/server/main.zig", none, build_options).server });
         b.step("server-none", "tensorfold-native without an engine (the server's own checks) into zig-out/server").dependOn(&b.addInstallArtifact(exe, .{ .dest_dir = .{ .override = .{ .custom = "server" } } }).step);

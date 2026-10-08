@@ -324,13 +324,13 @@ fn check(h: *Harness, a: Allocator) !void {
         const want = try tok.encodeAlloc(a, try serve_mod.template.render(a, (try json.parseText(a, "[{\"role\":\"user\",\"content\":\"hi @think\"}]")).ok, .{}, &p));
         try testing.expectEqual(@as(i64, @intCast(want.len)), v.get("count").?.int64().?);
     }
-    // 8. past the context window: 400 with OpenAI's code, before any stream opens
+    // 8. past the context window: OpenAI's code inside the stream on this (tensorfold) wire, as TensorFold 0.6.6; the
+    // Spark wire answers 400 before the stream opens, as its Python server
     {
         const body = "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":true,\"max_tokens\":100000}";
         const r = try h.post(a, "/v1/chat/completions", body);
-        try testing.expectEqual(@as(u16, 400), r.status);
-        const v = (try json.parseText(a, r.body)).ok;
-        try testing.expectEqualStrings("context_length_exceeded", v.get("error").?.get("code").?.string);
+        try testing.expectEqual(@as(u16, 200), r.status);
+        try testing.expect(std.mem.indexOf(u8, r.body, "context_length_exceeded") != null);
     }
 }
 

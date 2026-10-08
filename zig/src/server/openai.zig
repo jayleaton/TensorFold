@@ -521,13 +521,15 @@ const Run = struct {
         const tools = r.plan.input.tools.len > 0 and r.srv.family == null;
         var cx: Cx = .{ .a = a };
         // a context-window refusal is reported inside the stream; every other refusal is still a 400 before it opens
+        // (the Spark wire, as its Python server: a 400 before the stream for that one too)
+        const in_stream = r.srv.config.wire != .spark;
         var compaction: ?compact.Stamp = null;
         const prepared = if (r.srv.config.compact_at == null) chat.prepare(r.srv, &cx, r.plan.input, gone) catch |e| {
-            if (e == error.Refused and cx.kind == .context_length) return r.streamedContext(&cx, tools, field);
+            if (e == error.Refused and cx.kind == .context_length and in_stream) return r.streamedContext(&cx, tools, field);
             return r.unsent(&cx, e, field);
         } else blk: {
             const ready = compact.prepare(r.srv, &cx, r.plan.input, gone) catch |e| {
-                if (e == error.Refused and cx.kind == .context_length) return r.streamedContext(&cx, tools, field);
+                if (e == error.Refused and cx.kind == .context_length and in_stream) return r.streamedContext(&cx, tools, field);
                 return r.unsent(&cx, e, field);
             };
             compaction = ready.stamp;
