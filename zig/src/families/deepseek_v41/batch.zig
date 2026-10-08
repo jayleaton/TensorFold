@@ -429,6 +429,16 @@ pub const Batch = struct {
         const src: ?eh.Source = if (f.engram_rows) |x| x.source() else null;
         const n = rowtab.totalRows(mix);
         const dim: usize = f.cfg.engram_head_dim;
+        // every slot's rows on every Engram layer in flight first (Python's round job: one batched read), so the
+        // per-slot, per-layer waits below cost one read latency, not one a slot and layer
+        if (src != null) {
+            var a: usize = 0;
+            for (mix) |m| {
+                const st = &b.ss.states[m.slot];
+                f.issueEngram(ids[a .. a + m.rows], st.tail[0..st.tail_len]);
+                a += m.rows;
+            }
+        }
         for (b.stages.items) |*stg| {
             const cols = stg.cols;
             const out = try stg.begin(R);

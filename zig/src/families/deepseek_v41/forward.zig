@@ -216,6 +216,7 @@ pub const Forward = struct {
         defer tf.stop();
         f.runner.rows = @intCast(ids.len); // l2pf: wider windows skip the prefetch sites
         if (try f.graphedWindow(ids)) return;
+        f.issueEngram(ids, f.slot.tail[0..f.slot.tail_len]); // read while the window's calls are emitted and issued
         // the window's calls at its position (the indexer's scores and top-k grow with the cache: NK = end / ratio)
         var wa = std.heap.ArenaAllocator.init(f.gpa);
         defer wa.deinit();
@@ -716,6 +717,16 @@ pub const Forward = struct {
         return if (f.engram_rows) |x| x.source() else null;
     }
 
+    /// Every Engram layer's reads of a window's rows `ids` (after `tail`) in flight at once, before the first layer
+    /// waits for its own (Python's round job: all layers' rows in one batched read); the waits then find them read or
+    /// pending (engram_rows), so a window pays one read latency, not one a layer. Off with TF_DSV41_ENGRAM_PREFETCH=0.
+    pub fn issueEngram(f: *Forward, ids: []const u32, tail: []const u32) void {
+        const h = f.engram orelse return;
+        const src = (f.engramSource(h) catch return) orelse return;
+        if (!f.engram_prefetch or h.layer_ids.len < 2) return;
+        h.prefetch(f.gpa, src, ids, tail, f.comm.rank(), f.comm.world());
+    }
+
     /// R3: the coming window's rows `ids` at `start` (row 0: the pending token) read ahead on this rank; its lookback
     /// is the slot's tail plus the rows of the window in flight that `start` implies are kept. A wrong guess costs a
     /// read at the window, never a bit.
@@ -781,6 +792,7 @@ pub const Forward = struct {
         {
             const ts = ph.start(f.phases, .@"graph.stage");
             defer ts.stop();
+            f.issueEngram(ids, f.slot.tail[0..f.slot.tail_len]);
             try g.statics.stage(r.stream, ids, f.slot.pos);
             if (f.engram) |h| for (g.stages.items) |*st| {
                 try f.fillEngramRows(h, st.layer, try st.begin(n));
