@@ -480,16 +480,25 @@ pub fn phases(a: std.mem.Allocator, io: std.Io, dir: []const u8, cfg: *const Con
     }
     const out = try a.alloc(Phase, by.count());
     for (out, by.keys(), by.values()) |*p, ph, ops| {
-        // an ingest's rows: the prompt's last `window` (i0) or the decode row (i1); a pass: the block
-        const n: i64 = if (ph[0] == 'i') (if (std.mem.eql(u8, ph, "i0")) cfg.window else 1) else cfg.dspark_block;
+        // an ingest's rows: the prompt's last `window` (i0) or the decode row (i1); a pass: the block; a pass over k
+        // slots (M1_DRAFT_SLOTS, phase "q<k>"): k blocks
+        const n: i64 = if (ph[0] == 'i') (if (std.mem.eql(u8, ph, "i0")) cfg.window else 1) else if (ph[0] == 'q') try slotsOf(ph) * cfg.dspark_block else cfg.dspark_block;
         p.* = .{ .name = ph, .n = n, .skip = if (std.mem.eql(u8, ph, "i0")) prompt - cfg.window else 0, .ops = ops.items };
     }
     return out;
 }
 
+/// "q<k>": a capture's pass over k slots (M1_DRAFT_SLOTS=k, Python's row-mode pass, slots padded to a power of two).
+fn slotsOf(name: []const u8) !i64 {
+    return std.fmt.parseInt(i64, name[1..], 10);
+}
+
 /// A phase's launches (glue left out).
 pub fn phaseCalls(a: std.mem.Allocator, cfg: *const Config, w: *const block.Widths, o: block.Options, p: Phase) ![]const calls.Call {
-    const all = if (p.name[0] == 'i') try emitIngest(a, cfg, w, o, p.n, p.skip) else try emitPass(a, cfg, w, o, p.n);
+    const all = if (p.name[0] == 'i') try emitIngest(a, cfg, w, o, p.n, p.skip) else if (p.name[0] == 'q') blk: {
+        const k = try slotsOf(p.name);
+        break :blk try emitPassSlots(a, cfg, w, o, cfg.dspark_block, k, k);
+    } else try emitPass(a, cfg, w, o, p.n);
     return calls.launches(a, all);
 }
 
