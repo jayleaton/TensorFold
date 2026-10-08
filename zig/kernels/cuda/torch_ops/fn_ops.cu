@@ -1,7 +1,7 @@
 // Flash Next (qwen4_exp) torch ops on the CUDA engine's hot path, with torch's rounding points kept one for one.
 // TensorFold 0.6.5 sources: nvfp4_moe.MoE4.shared_act, decode.Engine.sample_draft and forward.candidates; the fills
 // replace Tensor.fill_ on 64-bit device scalars (gdn_io's conv pointer). Compile with -O3 --fmad=false --ftz=false
-// (torch_ops/README.md); tools/zig/check_flashnext_ops.py compares raw bytes with torch.
+// (torch_ops/README.md); tools/zig/flashnext_mia/check_flashnext_ops.py compares raw bytes with torch.
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -182,7 +182,7 @@ extern "C" __global__ void __launch_bounds__(128) tf_fn_fp4_serial_kernel(
     }
 }
 
-// C launchers for the development parity checks (tools/zig/check_flashnext_ops.py); Zig loads the fatbin.
+// C launchers for the development parity checks (tools/zig/flashnext_mia/check_flashnext_ops.py); Zig loads the fatbin.
 extern "C" cudaError_t tf_fn_shared_swiglu(const void* g, void* out, uint64_t rows, uint64_t ni, uint64_t out_stride,
                                            cudaStream_t stream) {
     const uint64_t count = rows * ni;

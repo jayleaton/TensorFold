@@ -1,5 +1,5 @@
 //! tf-flashnext-weights: Flash Next's weights loaded by flashnext.weights (on the GPU, or hashed on the host) and every
-//! buffer's sha256 against the Python oracle's weights.json (zig/tests/cuda/flashnext/capture.py weight_digests).
+//! buffer's sha256 against the Python oracle's weights.json (zig/tests/cuda/flashnext_mia/capture.py weight_digests).
 //!
 //!   tf-flashnext-weights SNAPSHOT [WEIGHTS.json] [--mode device|hash|count] [--rank R --world W] [--threads N]
 //!                        [--yarn FACTOR] [--gather TOKENS] [--out DIGESTS.json]

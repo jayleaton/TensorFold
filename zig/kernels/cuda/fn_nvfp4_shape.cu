@@ -6,7 +6,7 @@
 // cross-warp exchange: the unit loop below is the original's, and it runs the original's load_stage, compute_stage
 // (the k-groups in increasing order, each mma and fmaf as there), the fp32 scale and the epilogue. WARPS moves only
 // which block a unit runs in; D moves only how far ahead load_stage issues, never the order of compute_stage calls.
-// So every output element keeps its bits (checked byte for byte by zig/tests/cuda/flashnext/experts_shape_test.cu
+// So every output element keeps its bits (checked byte for byte by zig/tests/cuda/flashnext_mia/experts_shape_test.cu
 // against the original on every row count and epilogue, and by the engine's gates).
 
 #include "fn_nvfp4_experts.cu"
@@ -199,7 +199,7 @@ __global__ void __launch_bounds__(WARPS * 32)
 }  // namespace tf_fn_nvfp4_shape
 
 // The shape cuda_kernels.zig launches for small gate/up calls (at most 230 units: one row at TP=1, one or two at TP=2):
-// one warp a block, two stages, one n8 tile a warp (zig/tests/cuda/flashnext/experts_shape_test.cu: TP=2 one row
+// one warp a block, two stages, one n8 tile a warp (zig/tests/cuda/flashnext_mia/experts_shape_test.cu: TP=2 one row
 // 80.8 -> 66.3 us, two rows 100.8 -> 93.4; TP=1 one row 103.1 -> 92.0). The test instantiates every other shape itself.
 template __global__ void tf_fn_nvfp4_shape::expert_nt_kernel<2, 2, 1, 2, 1>(const __nv_bfloat16*, int, int,
     const uint4*, const float*, int, int, const int*, const int*, const int*, void*, int, float, int);

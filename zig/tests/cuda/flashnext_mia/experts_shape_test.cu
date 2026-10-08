@@ -8,7 +8,7 @@
 // cuda_kernels.zig sizes it (ceil(max units / warps) capped at the resident blocks).
 //
 // Build (PyTorch image): nvcc -O3 -std=c++20 -arch=sm_121 -I zig/kernels/cuda -o experts_shape_test
-//   zig/tests/cuda/flashnext/experts_shape_test.cu      Run: ./experts_shape_test [iters=200]
+//   zig/tests/cuda/flashnext_mia/experts_shape_test.cu      Run: ./experts_shape_test [iters=200]
 // Lines: PASS / FAIL / RESULT; exit 1 on any byte difference.
 
 #include <cuda_runtime.h>
