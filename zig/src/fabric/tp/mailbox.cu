@@ -90,6 +90,12 @@ __device__ __forceinline__ uint32_t atom_add_acq_rel_gpu(uint32_t *p, uint32_t v
     return old;
 }
 
+__device__ __forceinline__ uint32_t atom_add_acq_rel_sys(uint32_t *p, uint32_t v) {
+    uint32_t old;
+    asm volatile("atom.acq_rel.sys.global.add.u32 %0, [%1], %2;" : "=r"(old) : "l"(p), "r"(v) : "memory");
+    return old;
+}
+
 __device__ __forceinline__ uint32_t atom_cas_gpu(uint32_t *p, uint32_t cmp, uint32_t v) {
     uint32_t old;
     asm volatile("atom.relaxed.gpu.global.cas.b32 %0, [%1], %2, %3;" : "=r"(old) : "l"(p), "r"(cmp), "r"(v) : "memory");
@@ -120,6 +126,43 @@ __device__ __forceinline__ void copy_bytes(uint8_t *dst, const uint8_t *src, uin
         for (uint64_t i = index; i < n; i += stride) {
             dst[i] = static_cast<uint8_t>(SysSrc ? ld_relaxed_sys_u8(src + i) : src[i]);
         }
+    }
+}
+
+// GLM53_TF_ROCE_FAST (roce.cu copy_bytes2): copy_bytes with a thread's loads of two grid strides issued before their
+// stores (16-byte case; else copy_bytes), so a thread's share costs one load round trip, not two in a row. The bytes
+// and their places are copy_bytes'.
+template <bool SysSrc>
+__device__ __forceinline__ void copy_bytes2(uint8_t *dst, const uint8_t *src, uint64_t n, uint64_t index,
+                                            uint64_t stride) {
+    const uint64_t a = reinterpret_cast<uint64_t>(dst) | reinterpret_cast<uint64_t>(src) | n;
+    if ((a & 15u) != 0u) {
+        copy_bytes<SysSrc>(dst, src, n, index, stride);
+        return;
+    }
+    const uint64_t packs = n >> 4;
+    for (uint64_t i = index; i < packs; i += 2u * stride) {
+        const uint64_t j = i + stride;
+        uint4 v0, v1 = make_uint4(0u, 0u, 0u, 0u);
+        if (SysSrc) {
+            v0 = ld_relaxed_sys_v4(src + (i << 4));
+            if (j < packs) v1 = ld_relaxed_sys_v4(src + (j << 4));
+        } else {
+            v0 = reinterpret_cast<const uint4 *>(src)[i];
+            if (j < packs) v1 = reinterpret_cast<const uint4 *>(src)[j];
+        }
+        reinterpret_cast<uint4 *>(dst)[i] = v0;
+        if (j < packs) reinterpret_cast<uint4 *>(dst)[j] = v1;
+    }
+}
+
+template <bool SysSrc>
+__device__ __forceinline__ void copy_any(bool fast, uint8_t *dst, const uint8_t *src, uint64_t n, uint64_t index,
+                                         uint64_t stride) {
+    if (fast) {
+        copy_bytes2<SysSrc>(dst, src, n, index, stride);
+    } else {
+        copy_bytes<SysSrc>(dst, src, n, index, stride);
     }
 }
 
@@ -205,6 +248,42 @@ __device__ __noinline__ bool wait_flag(const uint32_t *flag, uint32_t seq, const
                 *why = aborted ? 1u : 2u;
                 *waited_us = now > t0 ? static_cast<uint32_t>((now - t0) / 1000u) : 0u;
                 return *seen == seq;
+            }
+        }
+    }
+}
+
+// GLM53_TF_ROCE_FAST (roce.cu wait_flag_shared): wait_flag for one of several pollers of a flag; `done` (shared) ends
+// the others as soon as one saw it (the barrier after the wait orders the block's payload reads after that acquire).
+__device__ __noinline__ bool wait_flag_shared(const uint32_t *flag, uint32_t seq, const uint32_t *ctrl,
+                                              uint64_t timeout_ns, uint32_t *seen, uint32_t *why, uint32_t *waited_us,
+                                              volatile uint32_t *done) {
+    const uint64_t t0 = globaltimer();
+    uint32_t polls = 0;
+    while (true) {
+        const uint32_t v = ld_acquire_sys(flag);
+        if (v == seq) {
+            *done = 1u;
+            *seen = v;
+            return true;
+        }
+        if (*done != 0u) {
+            *seen = seq;
+            return true;
+        }
+        if ((++polls & 63u) == 0u) {
+            const uint64_t now = globaltimer();
+            const bool aborted = ld_relaxed_sys(ctrl + kCtrlAbort) != 0u;
+            const bool late = now > t0 && now - t0 > timeout_ns;
+            if (aborted || late) {
+                *seen = ld_acquire_sys(flag);
+                *why = aborted ? 1u : 2u;
+                *waited_us = now > t0 ? static_cast<uint32_t>((now - t0) / 1000u) : 0u;
+                if (*seen == seq) {
+                    *done = 1u;
+                    return true;
+                }
+                return *done != 0u;
             }
         }
     }
@@ -335,7 +414,9 @@ struct RoceArgs {
     uint32_t rank;
     uint32_t mode;
     uint32_t n_hca;
-    uint32_t pad;
+    // GLM53_TF_ROCE_FAST (roce.cu gather_fast_kernel; local, the wire is unchanged): bit 0 fast, bits 8-15 pollers a
+    // flag (_POLLERS, 1-8), bits 16-31 their start stagger in ns (_STAGGER_NS); 0: the classic path
+    uint32_t opts;
     // Variable lengths (gather only; nullptr: every shard is ``nbytes``): lens[r] = rank r's bytes (<= nbytes), read on the
     // device, the same array on both ranks. Rank r stages and posts lens[r] (padded to 16, at least 16: the proxy posts no
     // empty op) and the peer copies lens[r] bytes of it to out + r x nbytes (cf28d37's contract; the wire is unchanged).
@@ -366,6 +447,8 @@ __device__ __forceinline__ uint64_t roce_span(const RoceArgs &a, uint64_t n) {
 extern "C" __global__ void __launch_bounds__(512) tp_roce(RoceArgs a) {
     __shared__ uint32_t s_head[2];  // poison, seq
     __shared__ uint32_t s_bad;
+    __shared__ uint32_t s_done[kRoceHcas];  // fast: some poller of HCA h saw its flag
+    const bool fast = (a.opts & 1u) != 0u;
     const uint32_t tid = threadIdx.x;
     const uint32_t gdim = gridDim.x;
     const uint64_t index = static_cast<uint64_t>(blockIdx.x) * blockDim.x + tid;
@@ -375,6 +458,9 @@ extern "C" __global__ void __launch_bounds__(512) tp_roce(RoceArgs a) {
         s_head[0] = ld_relaxed_gpu(a.state + 2);
         s_head[1] = ld_relaxed_gpu(a.state) + 1u;
         s_bad = 0u;
+    }
+    if (tid < static_cast<uint32_t>(kRoceHcas)) {
+        s_done[tid] = 0u;
     }
     __syncthreads();
     if (s_head[0] != 0u) {
@@ -388,9 +474,21 @@ extern "C" __global__ void __launch_bounds__(512) tp_roce(RoceArgs a) {
     const uint64_t padded = var ? (mine < 16u ? 16u : (mine + 15u) & ~uint64_t(15u)) : (a.nbytes + 15u) & ~uint64_t(15u);
 
     // 1. stage this block's share into the send slot; the last block to finish rings the doorbell
-    copy_bytes<false>(a.send_slots + slot * a.slot_bytes, a.in, var ? roce_span(a, mine) : a.nbytes, index, stride);
+    copy_any<false>(fast, a.send_slots + slot * a.slot_bytes, a.in, var ? roce_span(a, mine) : a.nbytes, index, stride);
     __syncthreads();
-    if (tid == 0) {
+    if (tid == 0 && fast) {
+        // roce.cu's lean doorbell: a block's arrival is a release RMW at system scope (the barrier made the block's
+        // staging precede it), the last arrival acquires the others', the doorbell is a release store: the same
+        // happens-before edges without the two sequentially consistent system fences
+        const bool last = gdim == 1u || atom_add_acq_rel_sys(a.state + 3, 1u) == gdim - 1u;
+        if (last) {
+            if (gdim > 1u) {
+                st_release_gpu(a.state + 3, 0u);
+            }
+            st_relaxed_sys(a.ctrl + kRoceSlotBytes + slot, static_cast<uint32_t>(padded));
+            st_release_sys(a.ctrl + kRoceSeq, seq);
+        }
+    } else if (tid == 0) {
         fence_sc_sys();
         const bool last = gdim == 1u || atom_add_acq_rel_gpu(a.state + 3, 1u) == gdim - 1u;
         if (last) {
@@ -403,12 +501,38 @@ extern "C" __global__ void __launch_bounds__(512) tp_roce(RoceArgs a) {
         }
     }
     if (a.mode == kGather) {
-        copy_bytes<false>(a.out + static_cast<uint64_t>(a.rank) * a.nbytes, a.in, var ? roce_span(a, mine) : a.nbytes,
-                          index, stride);
+        copy_any<false>(fast, a.out + static_cast<uint64_t>(a.rank) * a.nbytes, a.in,
+                        var ? roce_span(a, mine) : a.nbytes, index, stride);
     }
 
-    // 2. every HCA's flag for this slot (the stripes do not follow the blocks: each block needs all of them)
-    if (tid == 0) {
+    // 2. every HCA's flag for this slot (the stripes do not follow the blocks: each block needs all of them). Fast:
+    //    poller k of HCA h is thread 32 k + h (its own warp), started k x stagger ns late; the HCAs' flags in parallel
+    const uint32_t pollers = (a.opts >> 8) & 0xffu;
+    const uint32_t stagger_ns = a.opts >> 16;
+    if (fast) {
+        const uint32_t lane = tid & 31u;
+        const uint32_t k = tid >> 5;
+        if (lane < a.n_hca && k < (pollers == 0u ? 1u : pollers)) {
+            if (k > 0u && stagger_ns != 0u) {
+                __nanosleep(k * stagger_ns);
+            }
+            uint32_t seen = 0u, why = 0u, waited = 0u;
+            if (!wait_flag_shared(a.flags + (slot * kRoceHcas + lane) * kFlagStride, seq, a.ctrl + kRoceAbort,
+                                  a.timeout_ns, &seen, &why, &waited, &s_done[lane])) {
+                s_bad = 1u;
+                if (atom_cas_gpu(a.state + 2, 0u, 1u) == 0u) {
+                    st_relaxed_sys(a.ctrl + kRoceFailed + 1, seq);
+                    st_relaxed_sys(a.ctrl + kRoceFailed + 2, seen);
+                    st_relaxed_sys(a.ctrl + kRoceFailed + 3, lane);
+                    st_relaxed_sys(a.ctrl + kRoceFailed + 4, why);
+                    st_relaxed_sys(a.ctrl + kRoceFailed + 5, waited);
+                    fence_sc_sys();
+                    st_relaxed_sys(a.ctrl + kRoceFailed, 1u);
+                    fence_sc_sys();
+                }
+            }
+        }
+    } else if (tid == 0) {
         for (uint32_t h = 0; h < a.n_hca; h++) {
             uint32_t seen = 0u, why = 0u, waited = 0u;
             if (!wait_flag(a.flags + (slot * kRoceHcas + h) * kFlagStride, seq, a.ctrl + kRoceAbort, a.timeout_ns, &seen,
@@ -435,11 +559,11 @@ extern "C" __global__ void __launch_bounds__(512) tp_roce(RoceArgs a) {
         const uint8_t *inbox = a.recv_slots + slot * a.slot_bytes;
         switch (a.mode) {
             case kGather:
-                copy_bytes<true>(a.out + static_cast<uint64_t>(1u - a.rank) * a.nbytes, inbox,
-                                 var ? roce_span(a, theirs) : a.nbytes, index, stride);
+                copy_any<true>(fast, a.out + static_cast<uint64_t>(1u - a.rank) * a.nbytes, inbox,
+                               var ? roce_span(a, theirs) : a.nbytes, index, stride);
                 break;
             case kExchange:
-                copy_bytes<true>(a.out, inbox, a.nbytes, index, stride);
+                copy_any<true>(fast, a.out, inbox, a.nbytes, index, stride);
                 break;
             case kSumF32:
                 sum_bytes<false>(a.out, a.in, inbox, a.nbytes, a.rank, index, stride);

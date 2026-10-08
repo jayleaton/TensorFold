@@ -46,6 +46,9 @@ pub const Config = struct {
     /// Stripe over at most this many HCAs (auto detection only).
     roce_hcas: u8 = 2,
     roce_tc: u8 = 0,
+    /// GLM53_TF_ROCE_FAST (roce.cu gather_fast_kernel) as tp_roce's `opts` word: bit 0 on, bits 8-15 pollers a flag
+    /// (GLM53_TF_ROCE_POLLERS, 1-8), bits 16-31 their stagger (GLM53_TF_ROCE_STAGGER_NS, 150); local, not agreed
+    roce_fast: u32 = 0,
     /// Pin the proxy thread (it busy-spins one core between exchanges).
     roce_cpu: ?u32 = null,
     /// `shm` runs the RoCE protocol on one host without RDMA (tests); `verbs` is the real wire.
@@ -81,6 +84,11 @@ pub const Config = struct {
         c.roce_hca = get("TF_TP_ROCE_HCA");
         c.roce_hcas = try int(u8, get, "TF_TP_ROCE_HCAS", 2, 1, 2);
         c.roce_tc = try int(u8, get, "TF_TP_ROCE_TC", try int(u8, get, "NCCL_IB_TC", 0, 0, 255), 0, 255);
+        if (try int(u8, get, alias(get, "TF_TP_ROCE_FAST", "GLM53_TF_ROCE_FAST"), 0, 0, 1) == 1) {
+            const pollers = try int(u32, get, alias(get, "TF_TP_ROCE_POLLERS", "GLM53_TF_ROCE_POLLERS"), 1, 1, 8);
+            const stagger = try int(u32, get, alias(get, "TF_TP_ROCE_STAGGER_NS", "GLM53_TF_ROCE_STAGGER_NS"), 150, 0, 65535);
+            c.roce_fast = 1 | (pollers << 8) | (stagger << 16);
+        }
         if (get("TF_TP_ROCE_CPU")) |_| c.roce_cpu = try int(u32, get, "TF_TP_ROCE_CPU", 0, 0, 4095);
         if (get("TF_TP_ROCE_WIRE")) |w| c.roce_wire = std.meta.stringToEnum(@TypeOf(c.roce_wire), w) orelse {
             std.log.warn("TF_TP_ROCE_WIRE={s}: expected verbs or shm", .{w});

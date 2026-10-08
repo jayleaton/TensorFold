@@ -72,7 +72,7 @@ pub const Session = struct {
             s.fate.?.onFail(.{ .ctx = s, .call = abortHook });
             try s.fate.?.start();
         }
-        std.log.info("[tensorfold] tp: rank {d} of {d} up ({t}, NCCL {d}, fail-fast {s})", .{ cfg.rank, cfg.world, s.comm().kind(), v, if (cfg.failfast) "on" else "off" });
+        std.log.info("[tensorfold] tp: rank {d} of {d} up ({t}, NCCL {d}, fail-fast {s}, roce fast {s}: {d} poller(s), stagger {d} ns)", .{ cfg.rank, cfg.world, s.comm().kind(), v, if (cfg.failfast) "on" else "off", if (cfg.roce_fast & 1 != 0) "on" else "off", (cfg.roce_fast >> 8) & 0xff, cfg.roce_fast >> 16 });
     }
 
     /// RoCE for the small exchanges: a collective setup, then a load-time probe against NCCL's bytes; a failure on
@@ -90,7 +90,7 @@ pub const Session = struct {
                 n_specs = roce_verbs.autoSpecs(&v, &specs, cfg.roce_hcas);
             } else |_| {}
         }
-        const opts: roce.Options = .{ .wire = if (cfg.roce_wire == .shm) .shm else .verbs, .hcas = specs[0..n_specs], .traffic_class = cfg.roce_tc, .cpu = cfg.roce_cpu, .max_bytes = cfg.mailbox_max_bytes, .timeout_ns = cfg.mailbox_timeout_ns };
+        const opts: roce.Options = .{ .wire = if (cfg.roce_wire == .shm) .shm else .verbs, .hcas = specs[0..n_specs], .traffic_class = cfg.roce_tc, .cpu = cfg.roce_cpu, .max_bytes = cfg.mailbox_max_bytes, .timeout_ns = cfg.mailbox_timeout_ns, .fast = cfg.roce_fast };
         const r = roce.Roce.init(d, b, image, opts) catch |e| return s.roceFallback(e);
         s.roce = r;
         s.route = .{ .small = .{ .roce = r }, .nccl = &s.nccl, .max_bytes = cfg.mailbox_max_bytes };

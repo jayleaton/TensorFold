@@ -46,7 +46,8 @@ const RoceArgs = extern struct {
     rank: u32,
     mode: u32,
     n_hca: u32,
-    pad: u32 = 0,
+    /// GLM53_TF_ROCE_FAST (config.roce_fast; 0: the classic path)
+    opts: u32 = 0,
     /// gather only: device int32 [2] of each rank's bytes (0: every shard is `nbytes`)
     lens: DevicePtr = 0,
 };
@@ -66,6 +67,8 @@ pub const Options = struct {
     cpu: ?u32 = null,
     max_bytes: usize = 256 * 1024,
     timeout_ns: u64 = 120 * std.time.ns_per_s,
+    /// GLM53_TF_ROCE_FAST: tp_roce's `opts` word (config.roce_fast)
+    fast: u32 = 0,
 };
 
 /// The shm wire: the peer's region is mapped here; a post copies the slot, then stores the flag (x86 / Arm stores
@@ -113,6 +116,8 @@ pub const Roce = struct {
     me: u32,
     slot_bytes: usize,
     timeout_ns: u64,
+    /// GLM53_TF_ROCE_FAST: the kernel's `opts` word
+    fast: u32 = 0,
     /// This rank's region (for shm: half of the mapping in `mapping`).
     region: []align(page) u8,
     mapping: []align(page) u8,
@@ -147,7 +152,7 @@ pub const Roce = struct {
         const len = regionBytes(slot);
         const r = try std.heap.page_allocator.create(Roce);
         errdefer std.heap.page_allocator.destroy(r);
-        r.* = .{ .me = b.rank, .slot_bytes = slot, .timeout_ns = o.timeout_ns, .region = undefined, .mapping = undefined, .wire = undefined, .cpu = o.cpu };
+        r.* = .{ .me = b.rank, .slot_bytes = slot, .timeout_ns = o.timeout_ns, .fast = o.fast, .region = undefined, .mapping = undefined, .wire = undefined, .cpu = o.cpu };
         // 1. the regions and the wire, each rank alone; every rank learns whether all did
         const ok = r.openWire(b, o, len) catch |e| blk: {
             std.log.warn("[tensorfold] tp roce: rank {d} setup failed: {t}", .{ b.rank, e });
@@ -329,6 +334,7 @@ pub const Roce = struct {
             .rank = r.me,
             .mode = @intFromEnum(mode),
             .n_hca = r.wire.hcas(),
+            .opts = r.fast,
             .lens = lens,
         };
         var params = [1]?*anyopaque{@ptrCast(&a)};
