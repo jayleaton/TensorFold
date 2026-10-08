@@ -17,6 +17,9 @@
 //! - Long prompts (longpf.zig): past TF_DSV41_INDEX_STREAM_MIN visible keys the full-mode layers select with the
 //!   stream top-k (glue "stream_merge"); under split KV a union past the cap runs its attentions in row blocks
 //!   (longpf.window).
+//! - CED replay (TF_DSV41_PREFILL=replay, ced.zig): each segment is the encoder pass (block_prefill.emitReplay
+//!   `.encoder`, no head) whose glue "ced_stash" keeps its last rows entering the decoder in the ring; `finish` then
+//!   runs the decoder over the prompt's tail from the ring (glue "ced_load", windows from R0) and commits nothing.
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -28,11 +31,13 @@ const longpf = @import("longpf.zig");
 const vision_rows = @import("vision_rows.zig");
 const fwd = @import("forward.zig");
 const eh = @import("engram_host.zig");
+const ced = @import("ced.zig");
+const prod_knobs = @import("prod_knobs.zig");
 const Forward = fwd.Forward;
 
 const log = std.log.scoped(.dsv41);
 
-pub const Error = error{ NoExpertTable, NoK2Table, BadGlue };
+pub const Error = error{ NoExpertTable, NoK2Table, BadGlue, StashGap };
 
 /// The prefill's own state on the forward (forward.zig: `prefill_state`).
 pub const State = struct {
@@ -50,6 +55,11 @@ pub const State = struct {
     ahead: bool = false,
     /// long prompts' buffers (longpf.zig)
     long: longpf.State = .{},
+    /// TF_DSV41_PREFILL (prod_knobs.apply): `.replay` = CED (ced.zig), segments are encoder passes and `finish` runs
+    /// the decoder; `.full`: every layer over every row
+    mode: prod_knobs.PrefillMode = .full,
+    /// the decoder replay's ids (the glue reads them through Forward.ids while it runs)
+    tail_ids: [ced.keep]u32 = undefined,
 
     pub fn deinit(s: *State, gpa: std.mem.Allocator) void {
         s.long.deinit(gpa);
@@ -68,39 +78,75 @@ pub fn plan(f: *Forward, p: *buffers.Plan, rows: u32) !void {
     const layers = try f.backbone(la.allocator());
     const sizes = [_]u32{ rows, 17, 16 };
     for (sizes[if (rows > 17) 0 else 1..]) |n| {
-        const top = try lastStart(f, layers, n);
+        const top = try lastStart(f, layers, n, .whole);
         for ([_]i64{ 0, top }) |start| {
             var ea = std.heap.ArenaAllocator.init(f.gpa);
             defer ea.deinit();
             try p.add(try block_prefill.emitPrefill(ea.allocator(), f.cfg, f.widths, vision_rows.planOptions(f), layers, n, start, true));
         }
     }
+    if (f.prefill_state.mode == .replay) try planReplay(f, p, rows, layers);
 }
 
-/// Whether an `n`-row segment at `start` is on the prefill path (block_prefill's emitter takes it).
-fn emits(f: *Forward, layers: []const u32, n: u32, start: i64) !bool {
+/// CED replay's programs (ced.zig): an encoder segment (the whole segment's roles up to the decoder's first layer, and
+/// the stash ring), and the decoder pass at the row counts where its paths change (a short segment up to 16 rows, the
+/// selection's attn_cuda top-k up to 64, the materialised selection past it, the replay's 127), at 0 and its last start.
+fn planReplay(f: *Forward, p: *buffers.Plan, rows: u32, layers: []const u32) !void {
+    const enc = try encoderLayers(f, layers);
+    const dec = try decoderLayers(f, layers);
     var ea = std.heap.ArenaAllocator.init(f.gpa);
     defer ea.deinit();
-    _ = block_prefill.emitPrefill(ea.allocator(), f.cfg, f.widths, f.opts, layers, n, start, true) catch |e| switch (e) {
+    try p.add(try block_prefill.emitReplay(ea.allocator(), f.cfg, f.widths, vision_rows.planOptions(f), enc, rows, 0, .encoder));
+    for ([_]u32{ 16, 17, 32, 33, 64, 65, ced.keep }) |m| {
+        if (m > rows) continue;
+        const top = try lastStart(f, dec, m, .decoder);
+        for ([_]i64{ 0, top }) |start| {
+            var da = std.heap.ArenaAllocator.init(f.gpa);
+            defer da.deinit();
+            try p.add(try block_prefill.emitReplay(da.allocator(), f.cfg, f.widths, vision_rows.planOptions(f), dec, m, start, .decoder));
+        }
+    }
+}
+
+/// The encoder pass's layers: the forward's up to the decoder's first (ced.decoderStart), inclusive.
+fn encoderLayers(f: *Forward, layers: []const u32) ![]const u32 {
+    const d = try ced.decoderStart(f.cfg);
+    const i = std.mem.indexOfScalar(u32, layers, d) orelse return error.NoDecoder;
+    return layers[0 .. i + 1];
+}
+
+/// The decoder pass's layers: the forward's from the decoder's first on.
+fn decoderLayers(f: *Forward, layers: []const u32) ![]const u32 {
+    const d = try ced.decoderStart(f.cfg);
+    const i = std.mem.indexOfScalar(u32, layers, d) orelse return error.NoDecoder;
+    return layers[i..];
+}
+
+/// Whether an `n`-row segment (`part` of it) at `start` is on the prefill path (block_prefill's emitter takes it).
+fn emits(f: *Forward, layers: []const u32, n: u32, start: i64, part: block_prefill.Part) !bool {
+    var ea = std.heap.ArenaAllocator.init(f.gpa);
+    defer ea.deinit();
+    _ = block_prefill.emitReplay(ea.allocator(), f.cfg, f.widths, f.opts, layers, n, start, part) catch |e| switch (e) {
         error.Unsupported => return false,
         else => return e,
     };
     return true;
 }
 
-/// The last start an `n`-row segment emits at (the stream top-k's threshold moves with the segment's end).
-fn lastStart(f: *Forward, layers: []const u32, n: u32) !i64 {
-    var hi: i64 = f.opts.limit - n;
+/// The last start an `n`-row segment emits at (the stream top-k's threshold moves with the segment's end). The decoder
+/// pass ends a row before the prompt's last token: its last start is one lower.
+fn lastStart(f: *Forward, layers: []const u32, n: u32, part: block_prefill.Part) !i64 {
+    var hi: i64 = f.opts.limit - n - @intFromBool(part == .decoder);
     if (hi < 0) return error.BadWindow;
-    if (try emits(f, layers, n, hi)) return hi;
-    if (!try emits(f, layers, n, 0)) {
+    if (try emits(f, layers, n, hi, part)) return hi;
+    if (!try emits(f, layers, n, 0, part)) {
         log.warn("prefill: a {d}-row segment is not on the prefill path at any position (block_prefill: Unsupported)", .{n});
         return error.Unsupported;
     }
     var lo: i64 = 0;
     while (hi - lo > 1) {
         const mid = lo + @divFloor(hi - lo, 2);
-        if (try emits(f, layers, n, mid)) lo = mid else hi = mid;
+        if (try emits(f, layers, n, mid, part)) lo = mid else hi = mid;
     }
     log.info("prefill: {d}-row segments emit up to start {d}", .{ n, lo });
     return lo;
@@ -123,7 +169,7 @@ pub fn prompt(f: *Forward, ids_in: []const u32) !void {
     while (at < ids.len) {
         const n = @min(seg, ids.len - at);
         if (st.ahead and at + n < ids.len) readAhead(f, ids, at, n, @min(seg, ids.len - at - n));
-        try segment(f, ids[at .. at + n], at + n == ids.len);
+        try segment(f, ids[at .. at + n], at + n == ids.len and st.mode == .full);
         at += n;
     }
 }
@@ -155,10 +201,14 @@ fn segment(f: *Forward, ids: []const u32, head: bool) !void {
     var sa = std.heap.ArenaAllocator.init(f.gpa);
     defer sa.deinit();
     const a = sa.allocator();
-    const layers = try f.backbone(a);
+    // CED replay: the encoder pass (layers up to the decoder's first, its site and compressor, the stash; no head)
+    const replay = st.mode == .replay;
+    const layers = if (replay) try encoderLayers(f, try f.backbone(a)) else try f.backbone(a);
     const start = f.slot.pos;
     if (f.kv) |kx| try kx.reserve(start + n);
-    const cs = block_prefill.emitPrefill(a, f.cfg, f.widths, vision_rows.segmentOptions(f, ids), layers, n, @intCast(start), head) catch |e| {
+    const o = vision_rows.segmentOptions(f, ids);
+    const emitted = if (replay) block_prefill.emitReplay(a, f.cfg, f.widths, o, layers, n, @intCast(start), .encoder) else block_prefill.emitPrefill(a, f.cfg, f.widths, o, layers, n, @intCast(start), head);
+    const cs = emitted catch |e| {
         if (e == error.Unsupported) log.warn("prefill: the {d}-row segment at {d} is not on the prefill path (block_prefill: Unsupported)", .{ n, start });
         return e;
     };
@@ -171,7 +221,67 @@ fn segment(f: *Forward, ids: []const u32, head: bool) !void {
     f.runner.glue = .{ .ctx = f, .run = glueFn };
     try longpf.window(&st.long, f.gpa, f.runner, f.kv, start, cs);
     try commit(f, n);
-    f.last_rows = n;
+    // replay.encode: the stash's ids follow its rows (a segment that does not continue it starts it over)
+    if (replay) f.slot.ced.extend(start, ids);
+    f.last_rows = if (replay) 0 else n;
+}
+
+/// CED's decoder replay (replay.finish; Forward.finishPrompt on every rank): layers D .. over the prompt's prefilled
+/// tail [R0, end) from the stash, end = the slot's position, every window from R0. Nothing is committed: the slot
+/// stays at `end`, the decoder's SWA rings hold [R0, end), and the prompt's last token is the next window's row.
+pub fn finish(f: *Forward) !void {
+    const st = &f.prefill_state;
+    if (st.mode != .replay) return;
+    if (f.slot.pending != null) return error.BadWindow;
+    const end = f.slot.pos;
+    const t = ced.tailOf(end);
+    if (t.m == 0) return;
+    if (!f.slot.ced.covers(t.r0, end)) {
+        log.err("CED replay of [{d}, {d}), but the stash holds [{d}, {d})", .{ t.r0, end, f.slot.ced.lo(), f.slot.ced.hi });
+        return error.StashGap;
+    }
+    try ready(f);
+    var sa = std.heap.ArenaAllocator.init(f.gpa);
+    defer sa.deinit();
+    const a = sa.allocator();
+    const layers = try decoderLayers(f, try f.backbone(a));
+    const ids = st.tail_ids[0..t.m];
+    f.slot.ced.tail(t.r0, end, ids);
+    // the tail's image positions route with gate.bias_vl (replay._image); no decoder layer reads Engram
+    const cs = try block_prefill.emitReplay(a, f.cfg, f.widths, vision_rows.segmentOptions(f, ids), layers, t.m, @intCast(t.r0), .decoder);
+    f.ids = ids;
+    f.slot.pending = .{ .start = t.r0, .n = t.m };
+    defer f.slot.pending = null;
+    st.layers = layers;
+    st.moe = 0;
+    f.runner.glue = .{ .ctx = f, .run = glueFn };
+    try longpf.window(&st.long, f.gpa, f.runner, f.kv, t.r0, cs);
+    f.last_rows = 0;
+}
+
+/// ced_stash (`store`): the segment's last min(n, ring) rows of each tensor (the streams, the normed input, the
+/// coefficients) into the ring, position p at row p % ring; ced_load: the ring's rows of the pass's positions into the
+/// tensors' rows 0 .. n.
+fn stashCopy(f: *Forward, r: *run.Runner, c: *const calls.Call, store: bool) !void {
+    const p = f.slot.pending orelse return error.BadGlue;
+    const x = c.args;
+    if (x.len != 2 * ced.roles.len) return error.BadGlue;
+    const k: u64 = @min(p.n, ced.ring);
+    const a0: u64 = p.start + p.n - k;
+    var sp: [2]ced.Span = undefined;
+    for (0..ced.roles.len) |j| {
+        const t = x[j].arg.t;
+        const rg = x[ced.roles.len + j].arg.t;
+        const row = dim(t, 1) * buffers.dtSize(t.dt);
+        if (dim(rg, 1) * buffers.dtSize(rg.dt) != row or ld(t) != dim(t, 1) or dim(rg, 0) != ced.ring) return error.BadGlue;
+        const ta = try r.tensorAddr(t);
+        const ra = try r.tensorAddr(rg);
+        for (ced.spans(a0, a0 + k, &sp)) |s| {
+            const tr = ta + (a0 - p.start + s.at) * row;
+            const rr = ra + @as(u64, s.row) * row;
+            if (store) try copy(r, rr, tr, s.n * row) else try copy(r, tr, rr, s.n * row);
+        }
+    }
 }
 
 /// Keep of all the pending segment's rows: the ratio-2 carries, the Engram tail, the position.
@@ -308,6 +418,7 @@ fn glueFn(ctx: *anyopaque, r: *run.Runner, c: *const calls.Call) anyerror!void {
         return copy(r, buf + bytesOf(carry), try r.tensorAddr(x[1].arg.t), bytesOf(x[1].arg.t));
     }
     if (eql(u8, step, "stream_merge")) return longpf.merge(&st.long, f.gpa, r, c);
+    if (eql(u8, step, "ced_stash") or eql(u8, step, "ced_load")) return stashCopy(f, r, c, eql(u8, step, "ced_stash"));
     if (eql(u8, step, "zeros")) return zero(r, try r.tensorAddr(x[0].arg.t), bytesOf(x[0].arg.t));
     if (eql(u8, step, "image_keep")) return vision_rows.keep(f, r, c);
     if (eql(u8, step, "image_split") or eql(u8, step, "image_merge")) return vision_rows.splitRows(f, r, c, eql(u8, step, "image_merge"));

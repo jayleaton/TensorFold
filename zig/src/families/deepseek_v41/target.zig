@@ -17,6 +17,7 @@ const batch = @import("batch.zig");
 const samp = @import("sampling_gpu.zig");
 const branches = @import("draft/branches.zig");
 const pk = @import("prod_knobs.zig");
+const ced = @import("ced.zig");
 
 pub const Error = error{ TreeWindow, Sampling, Slots, NotAChain, WindowRows };
 
@@ -71,7 +72,17 @@ pub const GpuTarget = struct {
             // (one slot or row mode), its choice greedy or keyed at `draw`, left pending for the next window to keep
             // (a chain window never kept keeps every row; release keeps it before a session save)
             const sp = pk.promptSplit(rest.len, .verify);
-            try t.f.prefill(rest[0..sp.prefill]);
+            // CED replay with sessions: the prompt's snapshot at its replay point (batch.py `save_at`, rounds.py
+            // `_save(slot, "prompt")`): its rows prefilled, an entry with the stash, then the rest
+            const save_at: ?u64 = if (t.sessions != null and t.f.prefill_state.mode == .replay) ced.savePoint(ids.len, at) else null;
+            if (save_at) |s_at| {
+                const cut: usize = @intCast(s_at);
+                try t.f.prefill(ids[at..cut]);
+                _ = try t.sessions.?.savePrompt();
+                try t.f.prefill(ids[cut .. at + sp.prefill]);
+            } else try t.f.prefill(rest[0..sp.prefill]);
+            // the decoder replay over the prompt's tail (rounds.py `finish_prompt`; full mode: nothing)
+            try t.f.finishPrompt();
             var one: [1]u32 = undefined;
             var out = [_][]u32{&one};
             try window(p, &.{.{ .slot = slot, .start = ids.len - sp.window, .tokens = ids[ids.len - sp.window ..], .parents = null, .draws = &.{draw}, .sampling = sampling }}, &out);
@@ -182,6 +193,12 @@ pub const GpuTarget = struct {
         if (slot != 0) return;
         t.tree.clear();
         if (t.sessions) |ss| {
+            // CED replay keeps no turn snapshots (rounds.py `_finish`: a turn's end holds decoder rows a fresh prompt
+            // replays differently); the prompt was saved at its replay point
+            if (t.f.prefill_state.mode == .replay) {
+                t.f.release() catch |e| std.log.err("dsv41 target: releasing the slot on the other ranks failed ({t})", .{e});
+                return;
+            }
             // the turn kept for the next one (a pending window is the reply's last token: committed first)
             if (t.f.slot.pending) |w| t.f.keep(w.n - 1) catch |e| std.log.err("sessions: keep before save failed ({t})", .{e});
             _ = ss.save() catch |e| {

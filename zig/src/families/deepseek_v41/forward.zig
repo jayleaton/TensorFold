@@ -21,6 +21,7 @@ const kvs = @import("kv_state.zig");
 const er = @import("engram_rows.zig");
 const greedy_host = @import("greedy.zig");
 const ph = @import("phases.zig");
+const ced = @import("ced.zig");
 
 pub const Error = error{ GlueNotBuilt, BadWindow };
 
@@ -32,6 +33,8 @@ pub const Slot = struct {
     tail_len: usize = 0,
     /// the window in flight: its first position, its rows
     pending: ?struct { start: u64, n: u32 } = null,
+    /// CED replay (TF_DSV41_PREFILL=replay): the positions and ids of the stash ring "s.ced.*" (ced.zig)
+    ced: ced.Stash = .{},
 };
 
 pub const Forward = struct {
@@ -335,6 +338,17 @@ pub const Forward = struct {
         if (f.leads()) try f.link.?.send(ints);
     }
     const op_tree_drop: i64 = 20;
+    /// 44-47: dsq-zig-ced-1 (CED replay); 44: [op, end] the decoder replay (finishPrompt); 45: a prompt snapshot
+    const op_ced_finish: i64 = 44;
+    const op_sess_prompt: i64 = 45;
+
+    /// CED (TF_DSV41_PREFILL=replay, ced.zig): the decoder replay over the prompt's prefilled tail, after its last
+    /// prefill segment and before its first verify window (rounds.py `finish_prompt`), on every rank; full mode: nothing.
+    pub fn finishPrompt(f: *Forward) !void {
+        if (f.prefill_state.mode != .replay) return;
+        if (f.leads()) try f.link.?.send(&.{ op_ced_finish, @intCast(f.slot.pos) });
+        return pf.finish(f);
+    }
     /// 28-31: dsq-zig-grammar-1; 28: [op, sub (bind / step / release), ...] (grammar_gpu.zig)
     pub const op_grammar: i64 = 28;
 
@@ -356,6 +370,8 @@ pub const Forward = struct {
         commit: *const fn (ptr: *anyopaque, ids: []const u32) anyerror!void,
         save: *const fn (ptr: *anyopaque) anyerror!void,
         restore: *const fn (ptr: *anyopaque, id: u32) anyerror!void,
+        /// CED replay's prompt snapshot: an entry at the slot's position, the slot keeps going (sessions_gpu.zig)
+        prompt: *const fn (ptr: *anyopaque) anyerror!void,
         /// the slot empty: its pages back, the committed ids cleared
         reset: *const fn (ptr: *anyopaque) anyerror!void,
     };
@@ -378,8 +394,12 @@ pub const Forward = struct {
     }
 
     /// Rank 0: a session operation to the followers (before running it).
-    pub fn sendSess(f: *Forward, op: enum { save, restore }, id: u32) !void {
-        if (f.leads()) try f.link.?.send(&.{ if (op == .save) op_sess_save else op_sess_restore, id });
+    pub fn sendSess(f: *Forward, op: enum { save, restore, prompt }, id: u32) !void {
+        if (f.leads()) try f.link.?.send(&.{ switch (op) {
+            .save => op_sess_save,
+            .restore => op_sess_restore,
+            .prompt => op_sess_prompt,
+        }, id });
     }
 
     /// The drafter's operations a follower runs (dspark_gpu.zig): its collectives pair up with the leader's.
@@ -466,6 +486,15 @@ pub const Forward = struct {
                 op_sess_restore => {
                     const x = f.sess orelse return error.BadPlan;
                     try x.restore(x.ptr, @intCast(msg[1]));
+                },
+                op_sess_prompt => {
+                    const x = f.sess orelse return error.BadPlan;
+                    try x.prompt(x.ptr);
+                },
+                op_ced_finish => {
+                    // the leader's slot ends where this one does, and both run replay (the same TF_DSV41_PREFILL)
+                    if (f.prefill_state.mode != .replay or msg.len < 2 or msg[1] != f.slot.pos) return error.BadPlan;
+                    try pf.finish(f);
                 },
                 op_ds_ingest => {
                     const d = f.drafter orelse return error.BadPlan;
@@ -558,7 +587,10 @@ pub const Forward = struct {
             const t = [_]calls.Tensor{ c.args[0].arg.t, c.args[1].arg.t, c.args[2].arg.t };
             // graphed: the start staged in the statics (one graph serves every window of its key)
             if (g) |gr| return k.positionsDev(gr.statics.startDev(), p.n, try r.tensorAddr(t[0]), try r.tensorAddr(t[1]), try r.tensorAddr(t[2]));
-            return k.positions(@intCast(p.start), p.n, try r.tensorAddr(t[0]), try r.tensorAddr(t[1]), try r.tensorAddr(t[2]));
+            try k.positions(@intCast(p.start), p.n, try r.tensorAddr(t[0]), try r.tensorAddr(t[1]), try r.tensorAddr(t[2]));
+            // CED's decoder replay: every row's window starts at the pass's first row (replay.finish's ctx.lo)
+            if (c.args.len == 4) try r.d.check(r.d.api.cuMemsetD32Async(try r.tensorAddr(t[2]), @bitCast(@as(i32, @intCast(c.args[3].arg.i))), p.n, s), "cuMemsetD32Async");
+            return;
         }
         if (g != null and std.mem.eql(u8, step, "embed")) {
             // graphed: the ids staged before the launch; no host step inside the window
