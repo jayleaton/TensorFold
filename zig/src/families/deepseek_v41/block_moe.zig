@@ -162,6 +162,9 @@ pub fn moe(e: *E, L: u32) !void {
     const members = try e.buf("{s}.members", .{sc}, .i32, &.{ P, n });
     // router_gemv.config / row_tile: the narrow kernel's (2, 0) to 16 rows, then the prefill config (block_wide.zig)
     const rc = wide.routerCfg(n);
+    // router_gemv.route groups in its tail only on the narrow kernel (rc[2] == 0: at most 16 rows) and GE <= 512; past
+    // that it returns grouped=False and moe.py runs upstream's group after it (kit and prune stay folded either way)
+    const grouped = fold and rc[2] == 0 and Et <= 512;
     const scale: f64 = E.dec(e.cfg.routed_scale);
     try e.ext("tf_dsv41_router_gemv_v2.route", &.{
         x,                                                        try e.weight("L{d}.moe.gate", .{L}, .bf16, &.{ ex.count, D }),
@@ -171,9 +174,9 @@ pub fn moe(e: *E, L: u32) !void {
         .{ .i = slots },                                          .{ .f = scale },
         .{ .i = rc[0] },                                          .{ .i = rc[1] },
         .{ .i = rc[2] },                                          .{ .b = true },
-        .{ .b = fold },                                           if (!fold) try e.empty(.i32) else uids,
-        if (!fold) try e.empty(.i32) else ucount,                 if (!fold) try e.t(.empty, .i32, &.{ 0, 1 }) else members,
-        .{ .i = if (!fold) 0 else Et },                           .{ .b = fold },
+        .{ .b = fold },                                           if (!grouped) try e.empty(.i32) else uids,
+        if (!grouped) try e.empty(.i32) else ucount,              if (!grouped) try e.t(.empty, .i32, &.{ 0, 1 }) else members,
+        .{ .i = if (!grouped) 0 else Et },                        .{ .b = grouped },
     });
     if (e.o.r1) {
         // prune.fold_args: [min_w, topp, scale, min_k, orig, drop, dup] (empty: no rule, a DSpark block's); drop is
@@ -205,8 +208,8 @@ pub fn moe(e: *E, L: u32) !void {
             last.args = more;
         }
         try e.glue("kit_weights", &.{ wts, try e.buf("L.wts16", .{}, .f32, &.{ n, slots }) });
-        try e.ext("tensorfold_exl3_experts_v1.group", &.{ pick, uids, ucount, members, .{ .i = n }, .{ .i = slots }, .{ .i = Et } });
     }
+    if (!grouped) try e.ext("tensorfold_exl3_experts_v1.group", &.{ pick, uids, ucount, members, .{ .i = n }, .{ .i = slots }, .{ .i = Et } });
     const pre = try e.fmt("s.L{d}.ex", .{L});
     const xg = try e.buf("{s}.xg", .{sc}, .f16, &.{ rows * slots, D });
     const xu = try e.buf("{s}.xu", .{sc}, .f16, &.{ rows * slots, D });

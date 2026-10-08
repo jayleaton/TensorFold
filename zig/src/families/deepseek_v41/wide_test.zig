@@ -119,8 +119,15 @@ fn expectRouters(cs: []const calls.Call) !usize {
         try testing.expectEqual(@as(i64, 16), c.args[10].arg.i);
         try testing.expectEqual(@as(i64, 8), c.args[11].arg.i);
         try testing.expectEqual(@as(i64, 2), c.args[12].arg.i);
+        // router_gemv.route groups only on the narrow kernel (<= 16 rows): here `group` is off, so the router's check
+        // passes (kernels_ops.Router.check: a group needs the narrow kernel) and upstream's group runs after it
+        try testing.expect(!c.args[19].arg.b);
+        try testing.expectEqual(@as(i64, 0), c.args[18].arg.i);
         m += 1;
     };
+    var g: usize = 0;
+    for (cs) |c| g += @intFromBool(std.mem.eql(u8, c.name, "tensorfold_exl3_experts_v1.group"));
+    try testing.expectEqual(m, g);
     return m;
 }
 
@@ -166,7 +173,9 @@ test "wide rows: 16-row windows keep mhc_cuda and the narrow router" {
             try testing.expectEqual(@as(i64, 16), c.args[10].arg.i);
             try testing.expectEqual(@as(i64, 2), c.args[11].arg.i);
             try testing.expectEqual(@as(i64, 0), c.args[12].arg.i);
+            try testing.expect(c.args[19].arg.b); // grouped in the narrow kernel's tail (R1's fold)
         }
+        try testing.expect(!std.mem.eql(u8, c.name, "tensorfold_exl3_experts_v1.group"));
     }
     try testing.expect(cuda > 0);
 }
