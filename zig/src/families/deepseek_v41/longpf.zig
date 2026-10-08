@@ -145,14 +145,21 @@ fn dtSize(dt: calls.Dt) i64 {
 /// A prefill segment's calls (forward_prefill.segment): as Runner.window, but an attention over a union kept in
 /// several row blocks runs block by block (each block's exchange first).
 /// `k`: the forward's ?*kv_state.Kv (its `blocks` and `fetchBlock`).
+/// TF_DSV41_PROFILE (profile.zig): each call timed on the GPU, the segment into the profile's prefill totals.
 pub fn window(s: *State, gpa: std.mem.Allocator, r: *run.Runner, k: anytype, start: u64, cs: []const calls.Call) !void {
+    const p = r.prof;
+    if (p) |x| x.beginPrefill();
     for (cs) |*c| {
+        if (p) |x| try x.before(r.stream, c);
         if (k) |kx| if (kx.blocks.items.len > 0 and readsExchange(c)) {
             try attendBlocks(s, gpa, r, kx, start, c);
+            if (p) |x| try x.after(r.stream);
             continue;
         };
         try r.issue(c);
+        if (p) |x| try x.after(r.stream);
     }
+    if (p) |x| try x.end(r.stream);
 }
 
 fn attendBlocks(s: *State, gpa: std.mem.Allocator, r: *run.Runner, k: anytype, start: u64, c: *const calls.Call) !void {

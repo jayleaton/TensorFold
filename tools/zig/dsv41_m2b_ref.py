@@ -181,6 +181,44 @@ def rank_main(rank: int, a) -> None:
                 print(f"profile: {n}-row windows {prof['rows'][str(n)]['ms_mean']:.3f} ms mean, "
                       f"kernels {sum(v['ms'] for v in ks.values()):.3f} ms a window", flush=True)
         (Path(a.out) / f"prof-rank{rank}.json").write_text(json.dumps(prof, indent=1) + "\n")
+    # --profile-prefill N: after the run, the gate's prompt shape (N ids from --seed, as ``one``; served_prompt with
+    # --prompt-tail / --prefill) from a fresh slot: once to warm (Triton JIT), once timed (wall, the stream synced),
+    # once under torch.profiler (CUDA kernel time by name), into DIR/prof-rank<r>.json's "prefill": the full
+    # prefill's Python side of TF_DSV41_PROFILE's "prefill" (tf-dsv41-m1 m2b with M2B_PREFILL=1; gap.py prefill)
+    if a.profile_prefill:
+        if kv is not None:
+            raise SystemExit("--profile-prefill: the contiguous slot only (no --pool / --split / --park)")
+        from torch.profiler import ProfilerActivity, profile as tprofile
+
+        g = torch.Generator().manual_seed(a.seed)
+        ids = torch.randint(3, cfg.vocab_size, (a.profile_prefill,), generator=g).tolist()
+
+        def prefill_once():
+            fw.slots[0] = fw.new_slot(contiguous=True)
+            torch.cuda.synchronize()
+            t1 = time.perf_counter()
+            served_prompt(fw, Seg, ids, a.prompt_tail, a.prefill)
+            torch.cuda.synchronize()
+            return (time.perf_counter() - t1) * 1e3
+
+        prefill_once()
+        wall = prefill_once()
+        with tprofile(activities=[ProfilerActivity.CUDA]) as pr:
+            prefill_once()
+        ks = {}
+        for ev in pr.key_averages():
+            t = getattr(ev, "device_time_total", None) or getattr(ev, "cuda_time_total", 0)
+            if t:
+                ks[ev.key] = {"calls": ev.count, "ms": t / 1e3}
+        f = Path(a.out) / f"prof-rank{rank}.json"
+        doc = json.loads(f.read_text()) if f.exists() else {}
+        doc["prefill"] = {"rows": len(ids), "segments": -(-len(ids) // fw.pchunk), "wall_ms": wall,
+                          "gpu_ms": sum(v["ms"] for v in ks.values()), "prompt_tail": a.prompt_tail,
+                          "prefill": a.prefill, "kernels": ks}
+        f.write_text(json.dumps(doc, indent=1) + "\n")
+        if rank == 0:
+            print(f"profile: prefill of {len(ids)} ({a.prefill}, tail {a.prompt_tail}) {wall:.1f} ms wall, "
+                  f"kernels {doc['prefill']['gpu_ms']:.1f} ms", flush=True)
     # --sampled (dsq-zig-samp-1): the keyed sampling gate's reference on this load (dsv41_samp_ref.run_cases: its prompts
     # from fresh slots, serial sampled decoding, DIR/samp/trace.jsonl for tf-dsv41-m1 generate); before the AOT dump, so
     # its prompt lengths' Triton variants are in the set
@@ -475,6 +513,9 @@ def main() -> int:
                     "not the index function")
     ap.add_argument("--engram-make", action="store_true", help="write --engram-dir first: sparse shards, records under the prompts' rows")
     ap.add_argument("--profile", default="", help="row counts (\"1 4 8\"): time windows of each after the run")
+    ap.add_argument("--profile-prefill", type=int, default=0,
+                    help="after the run: an N-id prompt (the gate's ids at N = --prompt) prefilled from a fresh slot, timed "
+                         "and under torch.profiler, into DIR/prof-rank<r>.json's \"prefill\" (gap.py prefill)")
     ap.add_argument("--aot-prompts", type=lambda v: [int(x) for x in v.split(",") if x], default=[],
                     help="more prompt lengths after the run, for their Triton variants only (e.g. 1,9,17,45,64,65,173,300,1025,2049,2600)")
     ap.add_argument("--aot-taps", action="store_true",
