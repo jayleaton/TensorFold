@@ -1703,13 +1703,14 @@ Not proven offline: the kernel on a GPU (the self-check proves it at boot), the 
 `_site` for the first site (SPLIT, COLLAPSE 1) and for the final (MIX off) with `_finish_k` (COEF off) instead of
 `mhc_cuda`; the router's above-16-row configuration (`router_gemv.py`: `rows > 16`); and the MoE's grouped path at 20
 rows. No capture of a 20-row pass exists (the night's set P holds 5-row passes only), so `dcheck` could not gate such
-an emission, and it was not written blind. Its gate: a set P capture at 4 slots (`dsv41_m1_capture.py` with the
-drafter in row mode, `pad_slots(4)`), then the emitter, `aot-needs` / `triton_fill.py` for its variants, and `dcheck`.
+an emission, and it was not written blind. Its gate: a set P capture at 4 slots (`dsv41_m1_capture.py` `M1_DRAFT_SLOTS=4`,
+`64b65d3d`: phase `q4`, which `dcheck` compares with `emitPassSlots(4)`; step D5 below), then the emitter, `aot-needs` /
+`triton_fill.py` for its variants, and `dcheck capture-p4` at 0. Use k = 4 (a power of two): Python pads 3 slots to 4.
 **The same limit costs more in the verify windows:** Zig's row windows stop at 16 rows (`batch.zig`, mhc_cuda's MAXR),
 so a 4-slot drafted round of 4 x 6 = 24 rows runs as two forwards, where Python runs one 24-row window. That is
 probably a larger share of the 4-stream gap than the second DSpark pass (owner: the decode runtime, `dsq-zig-rtparity-1`).
 
-#### NEXT SPARK WINDOW: the DSpark pass (not run; after S1-S2)
+#### NEXT SPARK WINDOW: the DSpark pass (not run: no window on 2026-10-08, prod in use; run when the user schedules one, after S1-S2)
 
 Kit from `fc43fecd` or later with a glue fatbin holding `ds_cands` (`FATBINS=dsv41-zig-ref/fatbin-kit-dsg`, or
 `-Dnvcc`). Check the lease first.
@@ -1720,6 +1721,7 @@ Kit from `fc43fecd` or later with a glue fatbin holding `ds_cands` (`FATBINS=dsv
 | D2 tokens | `bench_http.py --work code --temps 0 --streams 1 --reps 2` and `--streams 4`, against the same cells with `TF_DSV41_DRAFT_GRAPHS=0` | ~20 min | **T0 replies equal** (`--compare`); `dsv41 spec:` launches > 0 at 4 streams; shutdown's `draft graphs:` line: graphed ~= passes - 8 |
 | D3 speed | the two runs' `phases.json` | - | `draft.pass` ms_avg **< 4.5** at 1 stream (was 7.0); code 1-stream **> 62**, 4-stream **> 88** |
 | D4 on failure | a `differ` line or a capture failure: record it, rerun with `TF_DSV41_DRAFT_GRAPHS=device` (eager), then 0 | ~10 min | the line and the first differing row in the report |
+| D5 the 20-row pass's capture (one GPU, ~3 min; prod may stay up only if a GPU is free, else in the downtime) | the night's set P capture (`run_m4.sh`'s `capture-p` step: prod's knobs + R1, 8474f31's tree) with `-e M1_DRAFT_SLOTS=4 --out /out/capture-p4`. Back on the dev box: `tf-dsv41-m1 dcheck capture-p4` | ~10 min | capture log `{"ops": ...}` with a `q4` phase in `ops.jsonl`. `dcheck` prints `P q4 (n 20): x/y calls equal`: today's `emitPassSlots(4)` against Python's 20-row pass. Its mismatches (expected: the first site and the final on `_site` / `_finish_k` instead of `mhc_cuda`, the router's above-16-row config, the experts at 20 rows) are the emitter's work list, and the gate it must then pass at 0. Keep `capture-p4/aot` (the 20-row pass's Triton variants for the served set) |
 
 PASS of D1-D3: `TF_DSV41_DRAFT_GRAPHS=1` into prod-zig.env (zig-serve, today commented as pending this gate).
 
