@@ -1,6 +1,6 @@
 //! engram_rows.zig against the Python engine's own Engram host code (fixtures/engram-rows-ref.txt, written by
 //! tools/zig/dsv41_perf/engram_fixture.py with torch on the CPU): the bf16 table, then a packed shard read back
-//! through the synchronous path and through io_uring, prefetched, cached and evicted.
+//! through the synchronous path, the reader threads and io_uring, prefetched, cached and evicted.
 
 const std = @import("std");
 const testing = std.testing;
@@ -77,18 +77,24 @@ test "engram rows: the bf16 table equals torch's dequant(...).to(bfloat16)" {
     try testing.expectEqual(@as(u16, 0x0000), t[0 << 8 | 0x38]);
 }
 
-fn openRows(a: std.mem.Allocator, io: std.Io, tmp: *testing.TmpDir, uring: bool) !*er.Rows {
+/// How a test reads: serially on the calling thread, by the reader threads (no io_uring), or by io_uring.
+const Mode = enum { sync, pool, uring };
+const modes = [_]Mode{ .sync, .pool, .uring };
+
+fn openRows(a: std.mem.Allocator, io: std.Io, tmp: *testing.TmpDir, mode: Mode) !*er.Rows {
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
     const r = try er.Rows.open(a, root, 0, 2, &.{1}, 4096);
-    if (!uring) if (r.ring) |*g| {
+    if (mode != .uring) if (r.ring) |*g| {
         g.deinit();
         r.ring = null;
     };
+    if (mode == .pool and r.pool == null) try r.startPool(8);
+    if (mode == .sync) r.stopPool(); // no io_uring here: open started the pool
     return r;
 }
 
-test "engram rows: a packed shard read as Python's ShardRows.rows(...).to(bfloat16), synchronously and by io_uring" {
+test "engram rows: a packed shard read as Python's ShardRows.rows(...).to(bfloat16), synchronously, by the reader threads and by io_uring" {
     const a = testing.allocator;
     const io = testing.io;
     var arena = std.heap.ArenaAllocator.init(a);
@@ -98,8 +104,8 @@ test "engram rows: a packed shard read as Python's ShardRows.rows(...).to(bfloat
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     try writeShard(a, io, tmp.dir, fx);
-    for ([_]bool{ false, true }) |uring| {
-        const r = try openRows(a, io, &tmp, uring);
+    for (modes) |mode| {
+        const r = try openRows(a, io, &tmp, mode);
         defer r.close();
         try testing.expectEqual(fx.lo, r.tables[0].h.lo);
         for (fx.sets) |s| {
@@ -127,8 +133,8 @@ test "engram rows: issued ahead, then waited for; bulk reads past the cache; evi
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     try writeShard(a, io, tmp.dir, fx);
-    for ([_]bool{ false, true }) |uring| {
-        const r = try openRows(a, io, &tmp, uring);
+    for (modes) |mode| {
+        const r = try openRows(a, io, &tmp, mode);
         defer r.close();
         const s = fx.sets[1];
         try r.issue(0, s.idx);
@@ -181,8 +187,8 @@ test "engram rows: a prompt segment's bulk reads issued ahead wait through one u
     try testing.expect(all.len > 4096 / 4); // a bulk batch: read through, not cached
     const big = try a.alloc(u16, all.len * 256);
     defer a.free(big);
-    for ([_]bool{ false, true }) |uring| {
-        const r = try openRows(a, io, &tmp, uring);
+    for (modes) |mode| {
+        const r = try openRows(a, io, &tmp, mode);
         defer r.close();
         try r.issue(0, all);
         const s = fx.sets[0];
@@ -207,6 +213,46 @@ test "engram rows: a prompt segment's bulk reads issued ahead wait through one u
         try testing.expect(r.stats.misses > misses);
         for (r.batches.items) |b| try testing.expect(!b.in_use);
     }
+}
+
+test "engram rows: the reader threads with many batches in flight (issued, missed, waited for out of order)" {
+    const a = testing.allocator;
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var lut_sha: [32]u8 = undefined;
+    const fx = try parseFx(arena.allocator(), &lut_sha);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeShard(a, io, tmp.dir, fx);
+    const r = try openRows(a, io, &tmp, .pool);
+    defer r.close();
+    var rng = std.Random.DefaultPrng.init(4101);
+    const rand = rng.random();
+    const sets = try a.alloc([]i64, 48);
+    defer {
+        for (sets) |q| a.free(q);
+        a.free(sets);
+    }
+    for (sets) |*q| {
+        q.* = try a.alloc(i64, 1 + rand.uintLessThan(usize, 300));
+        for (q.*) |*x| x.* = @intCast(fx.lo + rand.uintLessThan(u64, fx.rows));
+    }
+    // every set issued ahead, then read in reverse (later batches waited for first), each read checked value by value
+    for (sets) |q| try r.issue(0, q);
+    var k = sets.len;
+    while (k > 0) {
+        k -= 1;
+        const q = sets[k];
+        const out = try a.alloc(u16, q.len * 256);
+        defer a.free(out);
+        try r.rows(0, q, 256, out);
+        for (q, 0..) |x, i| for (0..256) |j| {
+            const row: u64 = @intCast(x);
+            try testing.expectEqual(r.lut[@as(usize, recordByte(row, 256 + j / 32)) << 8 | recordByte(row, j)], out[i * 256 + j]);
+        };
+    }
+    try testing.expect(r.stats.issued > 0);
 }
 
 test "engram rows: shard headers" {
