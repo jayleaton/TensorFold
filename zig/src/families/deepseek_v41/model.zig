@@ -245,7 +245,9 @@ pub const Model = struct {
         const nb = @max(o.prefill_rows, m.cfg.dspark_block + 1);
         for (buckets[0..nb], 0..) |*b, i| b.* = @intCast(i + 1);
         var bp = try m.f.plan(buckets[0..nb]);
-        if (o.drafts) try dspark_gpu.GpuPass.plan(m.f.arena.allocator(), &m.f, &bp, nb);
+        // the pass ingests a prompt's prefilled tail in one call (the drafter's window, target.handTaps) with the own prefill
+        const ingest_rows: u32 = if (o.own_prefill) @max(nb, m.cfg.window) else nb;
+        if (o.drafts) try dspark_gpu.GpuPass.plan(m.f.arena.allocator(), &m.f, &bp, ingest_rows);
         if (o.own_prefill) try m.f.planPrefill(&bp, @intCast(m.f.opts.prefill_rows));
         const rows_cap = try batch.capFromEnv();
         if (m.slots > 1) try batch.Batch.plan(&m.f, &bp, m.slots, rows_cap);
@@ -291,9 +293,12 @@ pub const Model = struct {
             std.log.scoped(.dsv41).err("TF_DSV41_PREFILL=replay needs TF_DSV41_OWN_PREFILL=1 and TF_DSV41_PROMPT_TAIL=verify, as Python's server (own prefill {}, prompt tail {t})", .{ o.own_prefill, m.gt.prompt_tail });
             return error.BadKnob;
         }
-        if (o.drafts) m.pass = try dspark_gpu.GpuPass.init(gpa, &m.f, nb);
+        if (o.drafts) m.pass = try dspark_gpu.GpuPass.init(gpa, &m.f, ingest_rows);
         if (m.slots > 1) try m.openRows(rows_cap, &bp);
         if (slot_drafts) m.slot_pass = try dspark_slots.SlotPass.init(gpa, &m.f, m.pass.?, m.rows.?, m.slots, group);
+        // the prompt's prefilled tail's taps (CED's decoder replay, or the last segment) to the pass the lanes drive
+        m.gt.pass = m.draftPass();
+        m.gt.ingest_window = m.cfg.window;
         // TF_DSV41_SAMPLING=1: keyed sampling (T > 0) on every rank; off: such requests are refused (error.Sampling)
         m.sampler = if (samp.enabled()) try samp.GpuSampler.init(gpa, &m.f) else null;
         m.gt.sampler = m.sampler;

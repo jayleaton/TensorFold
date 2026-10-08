@@ -198,9 +198,12 @@ pub const Lanes = struct {
         st.first = try x.target.prefill(slot, ids, s.sampling, ids.len);
         st.len = ids.len;
         _ = x.scratch.reset(.retain_capacity);
-        const rows = try x.scratch.allocator().alloc(u32, ids.len);
+        // the taps hold the prompt's last rows (its last window or segment; after a verify-tail prompt only that row,
+        // the target handed the prefilled tail to the pass itself): those rows, at their positions
+        const tr: usize = @min(x.target.taps(slot).rows, ids.len);
+        const rows = try x.scratch.allocator().alloc(u32, tr);
         for (rows, 0..) |*r, i| r.* = @intCast(i);
-        try x.ingest(st, 0, rows);
+        try x.ingest(st, ids.len - tr, rows);
         try x.streams.put(x.gpa, s, st);
         x.by_slot[slot] = st;
     }

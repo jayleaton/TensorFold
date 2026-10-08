@@ -104,6 +104,18 @@ pub const Stash = struct {
     }
 };
 
+/// The DSpark hand-off after a served prompt's prefill, before its first verify row: "w.taps" rows [0, rows) hold
+/// the taps of positions [at, at + rows) (replay: the decoder pass over the tail, `replayed(slot, R0, taps)`; full: the
+/// last segment, the last piece's keep). One ingest of their last `window` rows (drafter.ingest's skip): `n` rows from
+/// taps row `row0`, landing at `start`. Null: no rows.
+pub const Handoff = struct { start: u64, row0: u32, n: u32 };
+
+pub fn handoff(at: u64, rows: u32, window: u32) ?Handoff {
+    if (rows == 0 or window == 0) return null;
+    const skip = rows -| window;
+    return .{ .start = at + skip, .row0 = skip, .n = rows - skip };
+}
+
 /// One contiguous run of positions in the ring: rows [row, row + n) hold positions [at, at + n) of a range.
 pub const Span = struct { row: u32, n: u32, at: u32 };
 
@@ -145,6 +157,16 @@ test "replay rules as replay.py / sessions.py / batch.py" {
     var bad = cfg;
     bad.engram_layers = @TypeOf(cfg.engram_layers).of(&.{ 1, 24 });
     try std.testing.expectError(error.EngramInDecoder, decoderStart(&bad));
+}
+
+test "the DSpark hand-off: the decoder pass's rows whole, a longer run's last window" {
+    // replay, n = 1,536: the tail [1408, 1535), 127 rows, one ingest at R0 (replay.finish -> replayed)
+    try std.testing.expectEqual(Handoff{ .start = 1408, .row0 = 0, .n = 127 }, handoff(tailOf(1535).r0, tailOf(1535).m, 128).?);
+    // a prompt of 45 tokens: its 44 prefilled rows from 0
+    try std.testing.expectEqual(Handoff{ .start = 0, .row0 = 0, .n = 44 }, handoff(tailOf(44).r0, tailOf(44).m, 128).?);
+    // full mode, a last segment of 2,048 rows at 4,096: its last 128
+    try std.testing.expectEqual(Handoff{ .start = 4096 + 1920, .row0 = 1920, .n = 128 }, handoff(4096, 2048, 128).?);
+    try std.testing.expectEqual(@as(?Handoff, null), handoff(0, 0, 128));
 }
 
 test "the stash: the last rows of every segment, a gap restarts it, two ring runs at most" {

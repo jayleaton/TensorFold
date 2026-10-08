@@ -17,7 +17,7 @@
 //! - row mode (slots > 1): every row bucket up to the cap at every context bucket (row programs are keyed by both);
 //! - prefill segments of 1 .. TF_DSV41_PREFILL_ROWS rows at each start (a multiple of the rows, as a prompt's
 //!   segments start) whose full segment's variant set is new: every row count there;
-//! - DSpark: the pass, the slots' passes (1 .. group slots), ingests of 1 .. 16 rows;
+//! - DSpark: the pass, the slots' passes (1 .. group slots), ingests of 1 .. 128 rows (a prompt's tail in one call);
 //! - CED replay (TF_DSV41_PREFILL=replay, ced.zig): the decoder pass over a prompt's tail, 127 rows from any R0 (the
 //!   scan) and every shorter tail from 0 (a prompt of at most 128 tokens); its encoder segments are the prefill
 //!   segments' launches.
@@ -389,8 +389,9 @@ pub fn enumerate(gpa: std.mem.Allocator, n: *Needs, cfg: *const Config, w: *cons
         defer pa.deinit();
         const pb = pa.allocator();
         _ = try n.program(try dspark_emit.emitPass(pb, cfg, w, sv.o, cfg.dspark_block));
+        // ingests: a window's rows, and a prompt's prefilled tail in one call (target.handTaps: up to the window)
         var rows: i64 = 1;
-        while (rows <= max_rows) : (rows += 1) {
+        while (rows <= @max(max_rows, cfg.window)) : (rows += 1) {
             _ = try n.program(try dspark_emit.emitIngest(pb, cfg, w, sv.o, rows, 0));
             _ = try n.program(try dspark_emit.emitIngest(pb, cfg, w, sv.o, rows, 1));
         }

@@ -46,6 +46,11 @@ pub const GpuTarget = struct {
     sampler: ?*samp.GpuSampler = null,
     /// draft trees (`parents`): resolved as chain windows on the slot (draft/branches.zig), the last one kept by path
     tree: branches.Resolver = .{},
+    /// the DSpark pass the lanes drive (model.zig): with `.verify`, the prompt's prefilled tail's taps go to it before
+    /// the reply's first verify window overwrites them (Python: the decoder replay's `replayed`, the last piece's keep);
+    /// `ingest_window`: the drafter's context rows (DSpark's shape window)
+    pass: ?iface.Pass = null,
+    ingest_window: u32 = 0,
 
     pub fn target(t: *GpuTarget) iface.Target {
         return .{ .ptr = t, .vtable = &vtable };
@@ -72,6 +77,7 @@ pub const GpuTarget = struct {
             // (one slot or row mode), its choice greedy or keyed at `draw`, left pending for the next window to keep
             // (a chain window never kept keeps every row; release keeps it before a session save)
             const sp = pk.promptSplit(rest.len, .verify);
+            t.f.prefill_state.taps_rows = 0; // a one-token prompt prefills nothing: no stale taps handed over
             // CED replay with sessions: the prompt's snapshot at its replay point (batch.py `save_at`, rounds.py
             // `_save(slot, "prompt")`): its rows prefilled, an entry with the stash, then the rest
             const save_at: ?u64 = if (t.sessions != null and t.f.prefill_state.mode == .replay) ced.savePoint(ids.len, at) else null;
@@ -83,6 +89,7 @@ pub const GpuTarget = struct {
             } else try t.f.prefill(rest[0..sp.prefill]);
             // the decoder replay over the prompt's tail (rounds.py `finish_prompt`; full mode: nothing)
             try t.f.finishPrompt();
+            try t.handTaps(slot);
             var one: [1]u32 = undefined;
             var out = [_][]u32{&one};
             try window(p, &.{.{ .slot = slot, .start = ids.len - sp.window, .tokens = ids[ids.len - sp.window ..], .parents = null, .draws = &.{draw}, .sampling = sampling }}, &out);
@@ -138,6 +145,19 @@ pub const GpuTarget = struct {
         try t.f.window(s.tokens);
         if (keyed) |smp| return t.sampler.?.choose(0, @intCast(s.tokens.len), smp, s.draws, choices[0][0..s.tokens.len]);
         try t.f.greedy(choices[0][0..s.tokens.len]);
+    }
+
+    /// The prompt's prefilled tail's taps into the DSpark pass (ced.handoff): its last `ingest_window` rows, one ingest.
+    fn handTaps(t: *GpuTarget, slot: u32) !void {
+        const ps = t.pass orelse return;
+        const st = &t.f.prefill_state;
+        const h = ced.handoff(st.taps_at, st.taps_rows, t.ingest_window) orelse return;
+        var rows: [256]u32 = undefined;
+        if (h.n > rows.len) return error.WindowRows;
+        for (rows[0..h.n], 0..) |*r, i| r.* = h.row0 + @as(u32, @intCast(i));
+        const k: u32 = @intCast(t.f.cfg.dspark_targets.items().len);
+        const tp: iface.Taps = .{ .address = t.f.runner.addressOf("w.taps") orelse return error.Unbound, .rows = st.taps_rows, .stride = k * t.f.cfg.hidden };
+        try ps.ingest(slot, h.start, tp, rows[0..h.n]);
     }
 
     /// T > 0: the sampling the sampler keys (null: greedy); refused without a sampler.

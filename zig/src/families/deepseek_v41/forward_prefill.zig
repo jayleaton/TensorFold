@@ -60,6 +60,10 @@ pub const State = struct {
     mode: prod_knobs.PrefillMode = .full,
     /// the decoder replay's ids (the glue reads them through Forward.ids while it runs)
     tail_ids: [ced.keep]u32 = undefined,
+    /// what "w.taps" holds after the prompt: positions [taps_at, taps_at + taps_rows) at rows 0 .. (the last full
+    /// segment's, or the decoder replay's; an encoder segment writes none): the DSpark hand-off (ced.handoff)
+    taps_at: u64 = 0,
+    taps_rows: u32 = 0,
 
     pub fn deinit(s: *State, gpa: std.mem.Allocator) void {
         s.long.deinit(gpa);
@@ -163,6 +167,7 @@ pub fn prompt(f: *Forward, ids_in: []const u32) !void {
         try st.ids.appendSlice(f.gpa, ids_in);
     }
     const ids = st.ids.items;
+    st.taps_rows = 0;
     try ready(f);
     const seg: usize = @intCast(f.opts.prefill_rows);
     var at: usize = 0;
@@ -224,6 +229,8 @@ fn segment(f: *Forward, ids: []const u32, head: bool) !void {
     // replay.encode: the stash's ids follow its rows (a segment that does not continue it starts it over)
     if (replay) f.slot.ced.extend(start, ids);
     f.last_rows = if (replay) 0 else n;
+    st.taps_at = start;
+    st.taps_rows = if (replay) 0 else n;
 }
 
 /// CED's decoder replay (replay.finish; Forward.finishPrompt on every rank): layers D .. over the prompt's prefilled
@@ -257,6 +264,9 @@ pub fn finish(f: *Forward) !void {
     f.runner.glue = .{ .ctx = f, .run = glueFn };
     try longpf.window(&st.long, f.gpa, f.runner, f.kv, t.r0, cs);
     f.last_rows = 0;
+    // the drafter's context rows: the tail's taps (replay.finish's, which slots.finish_prompt hands to `replayed`)
+    st.taps_at = t.r0;
+    st.taps_rows = t.m;
 }
 
 /// ced_stash (`store`): the segment's last min(n, ring) rows of each tensor (the streams, the normed input, the

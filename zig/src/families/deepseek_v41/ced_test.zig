@@ -11,6 +11,7 @@ const bp = @import("block_prefill.zig");
 const check = @import("m1_check.zig");
 const ced = @import("ced.zig");
 const Config = @import("config.zig").Config;
+const dspark_emit = @import("dspark_emit.zig");
 
 test {
     _ = ced;
@@ -183,5 +184,49 @@ test "CED: the decoder pass emits for every tail shape up to prod's 1M limit (po
             defer pa.deinit();
             _ = try bp.emitReplay(pa.allocator(), &cfg, &w, o, dec, ced.keep, r0, .decoder);
         }
+    }
+}
+
+test "CED: the decoder pass writes the tail's DSpark taps (layers 37-39, rows 0 .. m), the encoder none; one ingest takes them" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cfg: Config = .{};
+    var w = try widths(a);
+    var layers: [40]u32 = undefined;
+    for (&layers, 0..) |*l, i| l.* = @intCast(i);
+    const d = try ced.decoderStart(&cfg);
+    const targets = cfg.dspark_targets.items();
+    const D: i64 = cfg.hidden;
+    const T: i64 = @as(i64, @intCast(targets.len)) * D;
+    for ([_]i64{ 12, 44, ced.keep }) |m| {
+        const o: block.Options = .{ .limit = limit, .rope_rows = limit + 2048, .taps = true };
+        const dec = try bp.emitReplay(a, &cfg, &w, o, layers[d..], m, 1000, .decoder);
+        const enc = try bp.emitReplay(a, &cfg, &w, o, layers[0 .. d + 1], 2048, 0, .encoder);
+        // each target layer's column block of "w.taps", the pass's m rows, written once
+        var seen: [8]usize = @splat(0);
+        for (dec) |c| for (c.args) |x| if (x.arg == .t and std.mem.eql(u8, roleOf(x.arg), "w.taps")) {
+            try testing.expectEqual(m, x.arg.t.shape[0]);
+            try testing.expectEqual(T, x.arg.t.stride[0]);
+            const j: usize = @intCast(@divExact(x.arg.t.offset, 2 * D));
+            try testing.expect(j < targets.len);
+            seen[j] += 1;
+        };
+        for (seen[0..targets.len]) |k| try testing.expectEqual(@as(usize, 1), k);
+        for (enc) |c| for (c.args) |x| try testing.expect(!std.mem.eql(u8, roleOf(x.arg), "w.taps"));
+        // the hand-off: all m rows from taps row 0, at R0; the pass's ingest reads exactly them
+        const h = ced.handoff(1000, @intCast(m), cfg.window).?;
+        // the ingest's main_proj (not in the backbone fixture): a width of the DSpark blocks' own, as mdraft_test
+        if (w.dense.get("dspark.main_proj") == null) try w.dense.put(a, "dspark.main_proj", try w.k2("L40.attn.wkv"));
+        try testing.expectEqual(ced.Handoff{ .start = 1000, .row0 = 0, .n = @intCast(m) }, h);
+        const ing = try dspark_emit.emitIngest(a, &cfg, &w, o, h.n, h.row0);
+        var reads: usize = 0;
+        for (ing) |c| for (c.args) |x| if (x.arg == .t and std.mem.eql(u8, roleOf(x.arg), "w.taps")) {
+            try testing.expectEqual(m, x.arg.t.shape[0]);
+            try testing.expectEqual(T, x.arg.t.shape[1]);
+            try testing.expectEqual(@as(i64, 0), x.arg.t.offset);
+            reads += 1;
+        };
+        try testing.expect(reads >= 1);
     }
 }
