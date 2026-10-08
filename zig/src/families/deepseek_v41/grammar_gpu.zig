@@ -427,7 +427,11 @@ pub const GrammarTarget = struct {
         return .{ .ptr = t, .vtable = &vtable };
     }
 
-    const vtable: iface.Target.VTable = .{ .prefill = prefill, .window = window, .keep = keep, .taps = taps, .release = release };
+    const vtable: iface.Target.VTable = .{ .prefill = prefill, .window = window, .keep = keep, .taps = taps, .release = release, .admit = admit };
+
+    fn admit(p: *anyopaque, slot: u32, max_new: u64) void {
+        self(p).inner.admit(slot, max_new);
+    }
 
     fn self(p: *anyopaque) *GrammarTarget {
         return @ptrCast(@alignCast(p));

@@ -195,6 +195,7 @@ pub const Lanes = struct {
         x.pass.reset(slot);
         x.policy.depth.reset(slot);
         const ids = s.prompt();
+        x.target.admit(slot, s.max_new);
         st.first = try x.target.prefill(slot, ids, s.sampling, ids.len);
         st.len = ids.len;
         _ = x.scratch.reset(.retain_capacity);

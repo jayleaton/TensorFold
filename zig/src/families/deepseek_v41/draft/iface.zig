@@ -38,7 +38,14 @@ pub const Target = struct {
         /// The taps of the slot's last window (or its prompt, after prefill).
         taps: *const fn (ptr: *anyopaque, slot: u32) Taps,
         release: *const fn (ptr: *anyopaque, slot: u32) void,
+        /// Before `prefill`: the request's reply budget (its max new tokens), for a target that admits requests by the
+        /// pages they may write (the GPU target's pool admission, prod's batch.py `_admit`). null: nothing to do.
+        admit: ?*const fn (ptr: *anyopaque, slot: u32, max_new: u64) void = null,
     };
+
+    pub fn admit(t: Target, slot: u32, max_new: u64) void {
+        if (t.vtable.admit) |f| f(t.ptr, slot, max_new);
+    }
 
     pub fn prefill(t: Target, slot: u32, ids: []const u32, sampling: ?lanes.Sampling, draw: u64) !u32 {
         return t.vtable.prefill(t.ptr, slot, ids, sampling, draw);
