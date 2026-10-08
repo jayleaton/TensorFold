@@ -455,6 +455,8 @@ pub const Forward = struct {
     /// 44-47: dsq-zig-ced-1 (CED replay); 44: [op, end] the decoder replay (finishPrompt); 45: a prompt snapshot
     const op_ced_finish: i64 = 44;
     const op_sess_prompt: i64 = 45;
+    /// 48-51: dsq-zig-sess4-1 (sessions over several slots); 48: [op, need, n, spilled entry ids...] a request's admission
+    const op_sess_admit: i64 = 48;
 
     /// CED (TF_DSV41_PREFILL=replay, ced.zig): the decoder replay over the prompt's prefilled tail, after its last
     /// prefill segment and before its first verify window (rounds.py `finish_prompt`), on every rank; full mode: nothing.
@@ -488,6 +490,8 @@ pub const Forward = struct {
         prompt: *const fn (ptr: *anyopaque) anyerror!void,
         /// the slot empty: its pages back, the committed ids cleared
         reset: *const fn (ptr: *anyopaque) anyerror!void,
+        /// a request's pool admission (op_sess_admit's message): the leader's spills evicted, its pages reserved
+        admit: ?*const fn (ptr: *anyopaque, msg: []const i64) anyerror!void = null,
     };
 
     /// Drops the pending window on every rank without committing a row (draft/branches.zig: a tree's chain whose branch
@@ -514,6 +518,16 @@ pub const Forward = struct {
             .restore => op_sess_restore,
             .prompt => op_sess_prompt,
         }, id });
+    }
+
+    /// Rank 0: a request's admission to the followers (before running it): its pages and the entries to evict first.
+    pub fn sendSessAdmit(f: *Forward, need: u32, spills: []const u32) !void {
+        if (!f.leads()) return;
+        var msg: std.ArrayList(i64) = .empty;
+        defer msg.deinit(f.gpa);
+        try msg.appendSlice(f.gpa, &.{ op_sess_admit, need, @intCast(spills.len) });
+        for (spills) |id| try msg.append(f.gpa, id);
+        try f.link.?.send(msg.items);
     }
 
     /// The drafter's operations a follower runs (dspark_gpu.zig): its collectives pair up with the leader's.
@@ -604,6 +618,11 @@ pub const Forward = struct {
                 op_sess_prompt => {
                     const x = f.sess orelse return error.BadPlan;
                     try x.prompt(x.ptr);
+                },
+                op_sess_admit => {
+                    const x = f.sess orelse return error.BadPlan;
+                    const run_ = x.admit orelse return error.BadPlan;
+                    try run_(x.ptr, msg);
                 },
                 op_ced_finish => {
                     // the leader's slot ends where this one does, and both run replay (the same TF_DSV41_PREFILL)
