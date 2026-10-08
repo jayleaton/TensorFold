@@ -1804,6 +1804,71 @@ Kit from `fc43fecd` or later with a glue fatbin holding `ds_cands` (`FATBINS=dsv
 
 PASS of D1-D3: `TF_DSV41_DRAFT_GRAPHS=1` into prod-zig.env (zig-serve, today commented as pending this gate).
 
+### Decode windows past 16 rows (`dsq-zig-dspark-1`, offline; engine `8db18b59`, `0596d5c4`)
+
+**The gap.** Python's row mode serves a round's slots in one window padded to a row bucket of up to 64 rows
+(`rowtab.BUCKETS`, attn_cuda / dtopk `MAX_ROWS` 64), and its drafter runs every live slot in one pass (`pad_slots`: 20
+rows at 4 slots). Zig's decode emitter stopped at mhc_cuda's 16 rows, so `batch.zig` ran a 4-slot drafted round
+(4 x 6 = 24 rows) as two forwards (16 + 8) and the slot drafts as two passes (`<= 3` slots). From prod's own cost
+table (G15, `lanes_test.prodCosts`): one 24-row window is 101.0 ms; 16 + 8 rows are 72.4 + 51.1 = 123.5 ms. About
+22 ms of every such round, plus a second DSpark pass (~3.5-7 ms): roughly +20 % at 4 streams (an estimate).
+
+**What Python runs past 16 rows** (8474f31; everything else in a decode window is row-agnostic to 64 rows: attention
+and the indexer's top-k (attn_cuda 64), dtopk (64), the dense / fused linears (128 a launch), the experts' grouped path
+(EXPERT_BLOCK 1,024), the selection budget (block.zig already follows it)):
+- **mHC**: `mhc_cuda.run` and `mhc_dec` take <= 16 rows, so every site is `mhc._launch`'s Triton `_site`, then
+  `_finish_k`. BM 16 (`tile`: MHC_BM / MHC_WARPS only from MHC_ROWS 256). SPLIT (grid z 4) for a mixing launch of <= 32
+  rows (`TF_DSV41_MHC_SPLIT_ROWS`) that does not post in place. The second streams buffer (`out_of_place`) exists for
+  <= 32 rows, so boundaries are out of place there and in place above. `final` and `post_only` never mix; `_finish_k`
+  has COEF at mixing sites, not at the final.
+- **router**: `router_gemv.config` past 16 rows = the prefill config (8 warps, 2 experts a warp), `row_tile` 16
+  (`RG_NARROW` is a <= 16-row kernel).
+
+**Ported** (`block_wide.zig`; hooks in `block_moe.mhcInto` / `moe` and `dspark_emit.final`): the decode windows'
+sites / boundaries / final and the DSpark pass's first site and final past 16 rows, and the router's configuration.
+Windows of <= 16 rows emit exactly as before. **Knob: the existing `TF_DSV41_ROWS_CAP`** (rows a forward; 16 by
+default). With 64, `batch.zig` serves every round as one forward up to Python's largest bucket (its row graphs too),
+and DSpark's slot passes take every live slot (`TF_DSV41_SLOTS`) within the cap (`dspark_rows.groupFromEnv`: 4 slots, one 20-row pass).
+Not with split KV (`rowmode.transform` refuses a union past 16 rows; prod-perf1 runs without split KV).
+
+**Checks (dev box, no GPU):**
+- `test-dsv41-wide` (new). The real emitter at 17 / 20 / 24 / 32 / 33 / 48 / 64 rows, 40 layers, prod's knobs, a 1M
+  pool, three context buckets. Every `_site` / `_finish_k` launch's POST_ON, COLLAPSE, MIX, SPLIT, TAP_ON, BM, R, grid
+  and in-place / out-of-place streams, against a table derived from `forward._layers`, `mhc._launch` / `out_of_place`
+  and `router_gemv.config` independently of the emitter. No mhc_cuda launch; `rowmode.transform` takes every window.
+  The 4-slot DSpark pass (20 rows) against `Drafter._device_pass`; 16-row windows keep mhc_cuda and the narrow router.
+  Mutations (split rows 24; the router's experts a warp 1) fail it.
+- `check` cap15 / cap18 / cap22 / cap24-1 / cap24-12 / cap24-16 / cap30-gm2v2, `dcheck` cap16 and the night's sm_121
+  capture-p: 0 mismatches. `test-dsv41-rows`, `-mdraft`, `-knobs` PASS.
+- AOT fill at prod's 4 x 1M with `TF_DSV41_ROWS_CAP=64` (`fill-4x1m.env` with the cap; `aot-needs` + `triton_fill.py
+  compile`, `--have` the night's local sets): 137 variants, 119 held, 18 compiled (the cap-16 fill: 15), 0 failed. Kept in
+  `dsv41-zig-ref/triton-fill-wide/aot` (with `needs.json`, `compile.json`, the env); a kit built with
+  `TRITON_FILL_ENV=<that env>` produces the same.
+
+Not proven offline: Python's launch list at 20 / 24 rows (no capture yet: step W1 records it), the bits, the speed.
+
+**The speculative pass's launch order (with `dsq-zig-rtparity-1`).** rtparity's GPU pick (`TF_DSV41_GREEDY_GPU`,
+`Forward.pickDevice()`, pending) leaves on the device each row's pick and, for a chain window, the accepted count, the
+bonus token and the next position: Python's `vsample`. The rest of Python's order is the pass's side:
+- a statics kernel that writes the pass's position-dependent statics from (start, bonus) on the device (`spec.py`
+  `stage_device`): ids[0], positions, the context list, counts, lo / hi, start, anchor. Everything else is staged
+  from the host as today (`dspark_dev.zig`'s pinned staging);
+- the window's whole-taps ingest with the device start;
+- `Pass.beginDevice(pick)`, enqueued between the pick's kernels and its copy-back wait.
+The hook is inside rtparity's `greedy` / `target.window` (uncommitted), so it waits for that commit. Until then the
+speculative pass launches after the host's pick (with `6237ee39` on nearly every round). rtparity's one copy back
+already shortens the gap to the launch.
+
+#### NEXT SPARK WINDOW: decode windows past 16 rows (not run; after D1-D2)
+
+| step | what | time | PASS |
+|---|---|---|---|
+| W1 capture (one GPU, ~10 min) | the set capture (`run_m4.sh`'s capture step, prod's knobs + R1, 8474f31's tree) with `--sets A,B,C,P -e M1_WINDOWS=1,3,16,20,24 -e M1_DRAFT_SLOTS=4 -e M1_PREFILL_ROWS=0 --out /out/capture-wide`. Dev box: `tf-dsv41-m1 check capture-wide` and `dcheck capture-wide` | ~20 min | **0 mismatches** on the w20 / w24 windows and the q4 pass (the emitter's gate); keep `capture-wide/aot` (merged into the served set like the fill) |
+| W2 boot | B2's shape plus `TF_DSV41_ROWS_CAP=64` on both ranks, the fill (`triton-fill-wide/aot`, or the kit's `TRITON_FILL=1` with ROWS_CAP=64) merged into ASSETS/aot (`triton_fill.py merge`) | ~10 min | `row graphs: on, buckets up to 64 rows`; `slot drafts: 4 slots, DSpark passes of up to 4 slots (20 rows)`; no `MissingTritonVariant` |
+| W3 tokens and speed | `bench_http.py --work code --temps 0 --streams 4 --reps 2`, against `ROWS_CAP=16` and prod | ~20 min | **T0 replies equal** prod's; 4-stream code **> 100 tok/s** (was 82.2); `phases.json` window ms_avg at 4 streams below the 16-cap run's |
+
+PASS of W1-W3: `TF_DSV41_ROWS_CAP=64` into prod-zig.env (zig-serve, today commented as pending this gate).
+
 ### 4 slots x 1M and the AOT fill (`dsq-zig-rows1m-1`, offline)
 
 **4 slots x 1M (`9bb3227`).** The night's rank 1 `UnknownRowsCall` came from the row programs (`Batch.plan`, every bucket
