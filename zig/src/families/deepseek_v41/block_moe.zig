@@ -6,6 +6,7 @@ const calls = @import("calls.zig");
 const block = @import("block.zig");
 const E = block.Emitter;
 const Arg = calls.Arg;
+const wide = @import("block_wide.zig");
 
 /// mhc_cuda.run modes: a sublayer's site without post-processing (the window's first), a boundary between sublayers
 /// (post of the last, collapse 2, mix), the final norm (post, collapse 2, no mix).
@@ -27,6 +28,8 @@ pub fn mhc(e: *E, layer: ?u32, which: []const u8, mode: Mode) !void {
 /// `mhc`, a boundary writing the streams in place when `in_place` (a run without the second streams buffer: CED's
 /// decoder replay, replay.finish's Streams has no `alt`).
 pub fn mhcInto(e: *E, layer: ?u32, which: []const u8, mode: Mode, in_place: bool) !void {
+    // past mhc_cuda's 16 rows (TF_DSV41_WIDE_ROWS): Python's Triton `_site` + `_finish_k` (block_wide.zig)
+    if (e.n > wide.cuda_rows) return wide.decode(e, layer, which, mode, in_place);
     const n = e.n;
     const D: i64 = e.cfg.hidden;
     const post = mode == .boundary or mode == .final;
@@ -144,7 +147,8 @@ pub fn moe(e: *E, L: u32) !void {
     const uids = try e.buf("{s}.ids", .{sc}, .i32, &.{P});
     const ucount = try e.buf("{s}.count", .{sc}, .i32, &.{1});
     const members = try e.buf("{s}.members", .{sc}, .i32, &.{ P, n });
-    const rows_pad = std.math.ceilPowerOfTwo(u64, @intCast(n)) catch unreachable;
+    // router_gemv.config / row_tile: the narrow kernel's (2, 0) to 16 rows, then the prefill config (block_wide.zig)
+    const rc = wide.routerCfg(n);
     const scale: f64 = E.dec(e.cfg.routed_scale);
     try e.ext("tf_dsv41_router_gemv_v2.route", &.{
         x,                                                        try e.weight("L{d}.moe.gate", .{L}, .bf16, &.{ ex.count, D }),
@@ -152,8 +156,8 @@ pub fn moe(e: *E, L: u32) !void {
         wts,                                                      try e.buf("L.logits", .{}, .f32, &.{ n, ex.count }),
         try e.buf("s.router.cnt", .{}, .i32, &.{128}),           .{ .i = ex.topk },
         .{ .i = slots },                                          .{ .f = scale },
-        .{ .i = @intCast(rows_pad) },                             .{ .i = 2 },
-        .{ .i = 0 },                                              .{ .b = true },
+        .{ .i = rc[0] },                                          .{ .i = rc[1] },
+        .{ .i = rc[2] },                                          .{ .b = true },
         .{ .b = fold },                                           if (!fold) try e.empty(.i32) else uids,
         if (!fold) try e.empty(.i32) else ucount,                 if (!fold) try e.t(.empty, .i32, &.{ 0, 1 }) else members,
         .{ .i = if (!fold) 0 else Et },                           .{ .b = fold },

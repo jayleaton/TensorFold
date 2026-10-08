@@ -25,6 +25,7 @@ const Config = @import("config.zig").Config;
 const E = block.Emitter;
 const Arg = calls.Arg;
 const dense = dk.dense;
+const wide = @import("block_wide.zig");
 
 /// The rows of one ring (a power of two holding the window and a block).
 pub fn ringRows(cfg: *const Config) i64 {
@@ -370,6 +371,8 @@ const Ds = struct {
     fn final(d: *Ds) !void {
         const e = d.e;
         const n = e.n;
+        // a pass of more than 16 rows (4 slots: 20, TF_DSV41_WIDE_ROWS): mhc.final on Triton (block_wide.zig)
+        if (n > wide.cuda_rows) return wide.mhc(e, null, "", .final, false, "dspark.norm", null);
         const D: i64 = d.cfg().hidden;
         const f0 = try e.empty(.f32);
         const b0 = try e.empty(.bf16);
