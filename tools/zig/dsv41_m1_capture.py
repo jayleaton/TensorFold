@@ -58,7 +58,11 @@ SETS = {"A": (1, 2, 3), "B": (20, 21, 22, 23, 24), "C": (40,), "D": (8, 13, 14, 
         "P": (20, 36, 37, 38, 39)}
 # D: Engram mid-stack (post, Engram, site2); 8 is 13-15's KV source (pod 20: KeyError 8 at a 2,048-row prompt). P: DSpark's drafting pass (taps entering 37-39, then the drafter's ingest /
 # propose); 20 is 36-39's KV and candidate source (pod 15 failed with KeyError 20 without it)
-WINDOWS = (1, 3, 16)
+# M1_WINDOWS (default 1,3,16): the decode windows' rows, in order (past 16: the > 16-row decode path, block_wide.zig;
+# up to attn_cuda's 64). meta.json "windows" carries them to `tf-dsv41-m1 check`.
+WINDOWS = tuple(int(x) for x in (os.environ.get("M1_WINDOWS", "") or "1,3,16").split(","))
+if not WINDOWS or any(not 1 <= n <= 64 for n in WINDOWS):
+    raise ValueError(f"M1_WINDOWS={os.environ.get('M1_WINDOWS')!r}: rows 1..64, comma separated")
 PREFILL = int(os.environ.get("M1_PREFILL_ROWS", "256"))   # rows of the recorded prefill segment after the windows
 #   (the fast prefill kernels; 2048 = prod's PREFILL_CHUNK, the Zig prefill's launch list)
 KV_MODE = "split" if os.environ.get("M1_SPLIT", "0") == "1" else ("pool" if os.environ.get("M1_PAGED", "0") == "1" else "")

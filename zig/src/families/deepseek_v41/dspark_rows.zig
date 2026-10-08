@@ -28,10 +28,14 @@ pub fn enabled() bool {
     return std.mem.eql(u8, std.mem.span(v), "1");
 }
 
-/// The most slots a pass takes: the most whose rows stay below 16 (TF_DSV41_SLOT_DRAFT_GROUP lowers it; 1: a pass a
-/// slot, the one-slot pass's shapes).
+/// The most slots a pass takes: the most whose rows stay below 16, or with TF_DSV41_ROWS_CAP past 16 (block_wide.zig:
+/// the > 16-row decode path) the most within the cap, so 4 slots run one 20-row pass as Python's drafter does
+/// (TF_DSV41_SLOT_DRAFT_GROUP lowers it; 1: a pass a slot, the one-slot pass's shapes).
 pub fn groupFromEnv(block: u32) !u32 {
-    const most = maxGroup(block);
+    const cap: u32 = if (std.c.getenv("TF_DSV41_ROWS_CAP")) |v| try std.fmt.parseInt(u32, std.mem.span(v), 10) else 16;
+    // past 16 rows: every live slot (TF_DSV41_SLOTS) within the cap, as Python's drafter runs them in one pass
+    const live: u32 = if (std.c.getenv("TF_DSV41_SLOTS")) |v| try std.fmt.parseInt(u32, std.mem.span(v), 10) else 1;
+    const most = if (cap > 16) @max(1, @min(live, cap / block)) else maxGroup(block);
     const v = std.c.getenv("TF_DSV41_SLOT_DRAFT_GROUP") orelse return most;
     const g = try std.fmt.parseInt(u32, std.mem.span(v), 10);
     if (g == 0 or g > most) return error.Group;
