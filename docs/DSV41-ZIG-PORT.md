@@ -1801,6 +1801,7 @@ Kit from `fc43fecd` or later with a glue fatbin holding `ds_cands` (`FATBINS=dsv
 | D3 speed | the two runs' `phases.json` | - | `draft.pass` ms_avg **< 4.5** at 1 stream (was 7.0); code 1-stream **> 62**, 4-stream **> 88** |
 | D2b device start | D2's 1-stream cell with `TF_DSV41_GREEDY_GPU=1` added (both ranks), against D2's | ~10 min | **T0 replies equal**; shutdown's `draft graphs: N speculative passes started from the device pick, M unused`, N > 80 % of `dsv41 spec:`'s launches; `draft.wait` ms_avg below D2's |
 | D2c device start, 4 slots | D2's 4-stream cell (B2's shape) with `TF_DSV41_GREEDY_GPU=1`, against D2's 4-stream cell | ~10 min | **T0 replies equal**; shutdown's `slot drafts: N speculative rounds started from the device pick, M unused`, N > 80 % of `dsv41 spec:`'s launches; `draft.wait` ms_avg below D2's |
+| D2d device start, keyed | D2c's shape with `bench_http.py --work code,prose --temps 0.7 --streams 1,4` (top_k as served), against the same cells with `TF_DSV41_DRAFT_GRAPHS=0` | ~20 min | **replies equal** (seeded keyed draws are op 12's either way); the shutdown lines' device starts > 80 % of the keyed cells' `dsv41 spec:` launches; `unused` (device / host near-ties) < 1 % |
 | D4 on failure | a `differ` line or a capture failure: record it, rerun with `TF_DSV41_DRAFT_GRAPHS=device` (eager), then 0 | ~10 min | the line and the first differing row in the report |
 | D5 the 20-row pass's capture (one GPU, ~3 min; prod may stay up only if a GPU is free, else in the downtime) | the night's set P capture (`run_m4.sh`'s `capture-p` step: prod's knobs + R1, 8474f31's tree) with `-e M1_DRAFT_SLOTS=4 --out /out/capture-p4`. Back on the dev box: `tf-dsv41-m1 dcheck capture-p4` | ~10 min | capture log `{"ops": ...}` with a `q4` phase in `ops.jsonl`. `dcheck` prints `P q4 (n 20): x/y calls equal`: today's `emitPassSlots(4)` against Python's 20-row pass. Its mismatches (expected: the first site and the final on `_site` / `_finish_k` instead of `mhc_cuda`, the router's above-16-row config, the experts at 20 rows) are the emitter's work list, and the gate it must then pass at 0. Keep `capture-p4/aot` (the 20-row pass's Triton variants for the served set) |
 
@@ -1881,9 +1882,37 @@ the placeholder staging equals `fillStatics(bonus, P)`; `dspark_rows.stageMirror
 Keyed (T > 0) rounds keep the host order: Python's `vsample` keyed choice on the device is the follow-up. A round
 split over several forwards (`ROWS_CAP` 16) starts only the slots of the forward that runs the pick.
 
-The kit's glue fatbin must hold `ds_cands`, `ds_stage`, `ds_accept_rows`, `ds_stage_rows`, `pick_pack` and
-`pick_merge`: `dsv41-zig-ref/fatbin-kit-dsg`, rebuilt from `ec7855e6`'s glue.cu (on 1bd3960's); every older kernel's
-SASS equals `fatbin-kit`'s.
+**Keyed rounds (`54058b82`, `e0929dd9`; Python's `vsample` + spec.py).** T > 0 rounds get a device choice too:
+- `glue.cu vs_choose` is `vsample.choose` a row, speculation only: the gathered candidates merged by (value desc, id
+  asc) and cut to the call's count, then the host Picker's `chooseRow` in float64:
+  - top_k;
+  - top_p over numpy's pairwise sum;
+  - min_p;
+  - the keyed Gumbel draw of splitmix64(seed, position, id).
+  It uses libdevice's exp / log. Nucleus rows (top_k 0) give -1: their statistics stay on the host, and prod does not
+  speculate them (`TF_DSV41_SPEC_NUCLEUS` unset, as Python's).
+- The sampler hands the candidates' download to `sampling_gpu.afterGather`:
+  - an async copy and an event;
+  - `vs_choose`;
+  - the pass's start, through `Forward.after_sample`;
+  - then the host waits for the copy alone and picks as before.
+  The draws stay op 12's, unchanged. op 12 then carries the seed and the first draw position (9 words), so every rank
+  chooses alike.
+- `Pass.arm` says greedy or keyed. One slot: `ds_accept_rows` over the window's segment, then `ds_stage`. Row mode:
+  the GPU pick and each keyed slot's `vs_choose` fill one picks array, and the round starts when every armed slot of
+  the forward has its choice.
+- A device choice that differs from the host's (a libdevice / glibc near-tie) only drops that speculation: `begin`
+  compares (bonus, next position) as for greedy.
+
+Gate (`test-dsv41-sampling`): `vs_choose`'s host mirror (`sampling_pipe.chooseMirror`, step for step, with libc's
+exp / log) equals the pipeline's picks:
+- on all 112 non-nucleus keyed golden rows;
+- on 576 synthetic rows: top_k 20 / 40 / 100 x top_p 0.5-1 x min_p x T, one and two ranks, flat, peaked and tied rows.
+A mutated top-p keep count fails it, and the pipeline itself stays 207/207 on Python's goldens.
+
+The kit's glue fatbin must hold `ds_cands`, `ds_stage`, `ds_accept_rows`, `ds_stage_rows`, `vs_choose`, `pick_pack`
+and `pick_merge`: `dsv41-zig-ref/fatbin-kit-dsg`, rebuilt from `e0929dd9`'s glue.cu. Every older kernel's SASS, both
+instructions and encodings, equals `fatbin-kit`'s.
 
 #### NEXT SPARK WINDOW: decode windows past 16 rows (not run; after D1-D2)
 
@@ -1894,6 +1923,43 @@ SASS equals `fatbin-kit`'s.
 | W3 tokens and speed | `bench_http.py --work code --temps 0 --streams 4 --reps 2`, against `ROWS_CAP=16` and prod | ~20 min | **T0 replies equal** prod's; 4-stream code **> 100 tok/s** (was 82.2); `phases.json` window ms_avg at 4 streams below the 16-cap run's |
 
 PASS of W1-W3: `TF_DSV41_ROWS_CAP=64` into prod-zig.env (zig-serve, today commented as pending this gate).
+
+### The drafter's end state (`dsq-zig-dspark-1`, offline)
+
+Everything below is committed and default off until its Spark step passes. Nothing in it has run on a GPU yet.
+
+**Knobs, in the order the steps turn them on** (prod-zig.env lines commented until then):
+
+| knob | what | gate (port doc) |
+|---|---|---|
+| `TF_DSV41_DRAFT_GRAPHS=1` | DSpark candidates on the GPU, the pass graphed, the boot self-check (8 passes against the host's) | D1-D3 |
+| (with `TF_DSV41_SPEC_DRAFT`, `TF_DSV41_GREEDY_GPU`, both already in prod-zig.env) | the speculative pass starts from the window's device choice: greedy D2b / D2c, keyed D2d | D2b-D2d |
+| `TF_DSV41_ROWS_CAP=64` + the fill (`triton-fill-wide`) | 4-slot rounds as one forward up to 64 rows, slot drafts as one 20-row pass | W1-W3 |
+
+**Paths that stay in host order** (the pass starts at `begin` from the host's choices), each with the reason and
+where it is measured:
+
+| path | why | Python | measured / proven in |
+|---|---|---|---|
+| nucleus rows (top_k 0, 0 < top_p < 1) | the keep count needs the ranks' statistics (`nucleus.Pre`); `vs_choose` returns -1 | not speculated either (`SPEC_NUCLEUS` unset in prod) | - (needed only if prod turns `SPEC_NUCLEUS` on: port `nucleus.device_z`) |
+| tree rounds (`TF_DSV41_TREE`) | spec.py never speculates trees | the same; prod runs no trees | - |
+| rows taken whole (top_k past the device bound: W k > 2,048) | no gathered candidates to choose from | the same fallback, host | D2d's `unused` count |
+| a round split over several forwards (`ROWS_CAP` 16) | the earlier forwards' slots are stashed before the pick | one forward up to 64 rows | gone with `ROWS_CAP=64` (W2) |
+| a device choice that differs from the host's (libdevice exp / log near-tie) | the host decides; the speculation is dropped | the same rule (spec.py: "a wrong guess is only a dropped speculation") | D2d: `unused` < 1 % |
+| before the 8 check passes, after a failed check, an older glue fatbin | the device path is not trusted / not there | - | D1 (the check line), the boot warning |
+
+**Open items, each with its step:**
+- the device candidates kernel and the graphed pass on hardware: D1 (self-check line), D2 (equal T0 replies), D3
+  (`draft.pass` < 4.5 ms);
+- Python's launch lists at 20 / 24 rows and the 4-slot pass: W1's capture, then `check` / `dcheck` at 0 (the
+  emitter's gate; today it is checked against a table derived from Python's rules, `test-dsv41-wide`);
+- 64-row windows' memory at 4 x 1M (the plan's per-window buffers at 64 rows): W2's boot, free memory recorded;
+- the 20-row DSpark pass's graph keys (one per (slots, first row)): W2 / W3, `graph.capture` count and no
+  `MissingTritonVariant`;
+- acceptance against Python's (0.67 at T0): D2's drafted / accepted counts per stream; the host chain sums in a
+  different fp32 order than `_chain`, so close, not equal;
+- trees with several slots (`batch.zig` refuses them) and Python's nucleus device normalizer: not needed by prod's
+  knobs; ported only if prod adopts `TF_DSV41_TREE` or `TF_DSV41_SPEC_NUCLEUS`.
 
 ### 4 slots x 1M and the AOT fill (`dsq-zig-rows1m-1`, offline)
 
