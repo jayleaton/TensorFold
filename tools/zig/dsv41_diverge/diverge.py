@@ -21,6 +21,10 @@ with ``supported=False``; Zig refuses them): a margin at the first differing tok
     # Python's replies as a trace for `tf-dsv41-m1 generate` (prompt ids from a Zig server's TF_DSV41_TRACE_TOKENS
     # file of the same requests): its "first_differing" is then the Zig engine's first token off Python's reply
     python3 diverge.py trace py.jsonl zig-trace.jsonl --tokenizer /model/tokenizer.json --out py-trace.jsonl
+    # multi-turn chats (sessions): every bench prompt a chat of --turns turns (its replies fed back, a follow-up message
+    # each turn), --concurrency chats at once, so later turns resume their chat's session while other chats decode;
+    # the records compare as `ask`'s do ("prompt" names the chat and turn)
+    python3 diverge.py chat --url http://127.0.0.1:8000 --turns 3 --out py-chat.jsonl
 
 Standard library only for ``ask``; ``compare`` / ``trace`` need ``tokenizers`` (for the context they print, and for
 replies without ids). A reply's text is
@@ -83,6 +87,56 @@ def ask(a) -> int:
                    "content": msg.get("content") or "", "ids": stats.get("token_ids"), "draft": not a.no_draft}
             out.write(json.dumps(rec, ensure_ascii=False) + "\n")
             print(json.dumps({k: rec[k] for k in ("n", "kind", "usage", "finish")}), flush=True)
+    return 0
+
+
+FOLLOW = ("Now explain the trickiest part of your answer in more detail.",
+          "Give one concrete example, then list two pitfalls.",
+          "Summarize everything above in three sentences.")
+
+
+def chat(a) -> int:
+    """Multi-turn chats: each first message (``--prompts`` lines, else the bench's 8 prompts) starts a chat; turn t
+    sends the whole conversation (the server's own earlier replies as assistant messages) plus FOLLOW[t - 2]. Thinking
+    off, greedy, ``--concurrency`` chats in flight. The server's stats block (``tensorfold``: its session hit, if it
+    reports one) is kept beside each reply."""
+
+    import concurrent.futures as cf
+
+    firsts = [l.rstrip("\n") for l in open(a.prompts, encoding="utf-8") if l.strip()] if a.prompts else list(BENCH)
+    off = {"reasoning_effort": "none", "chat_template_kwargs": {"enable_thinking": False}}
+
+    def one(c: int) -> list[dict]:
+        msgs, recs = [{"role": "user", "content": firsts[c]}], []
+        for t in range(1, a.turns + 1):
+            body = {"model": a.model, "messages": msgs, "temperature": 0, "max_tokens": a.max_tokens,
+                    "return_token_ids": True, **off}
+            if a.no_draft:
+                body["draft"] = False
+            req = urllib.request.Request(f"{a.url}/v1/chat/completions", data=json.dumps(body).encode(),
+                                         headers={"content-type": "application/json"})
+            t0 = time.time()
+            with urllib.request.urlopen(req, timeout=900) as r:
+                d = json.loads(r.read())
+            msg = (d.get("choices") or [{}])[0].get("message") or {}
+            stats = d.get("tensorfold") or (d.get("choices") or [{}])[0].get("tensorfold") or {}
+            content = msg.get("content") or ""
+            recs.append({"chat": c, "turn": t, "kind": "chat", "thinking": False,
+                         "prompt": f"chat {c} turn {t}: {firsts[c][:60]}", "usage": d.get("usage"),
+                         "finish": (d.get("choices") or [{}])[0].get("finish_reason"),
+                         "seconds": round(time.time() - t0, 2), "reasoning": "", "content": content,
+                         "ids": stats.get("token_ids"), "stats": {k: v for k, v in stats.items() if k != "token_ids"},
+                         "draft": not a.no_draft})
+            msgs += [{"role": "assistant", "content": content}, {"role": "user", "content": FOLLOW[(t - 1) % len(FOLLOW)]}]
+        return recs
+
+    with cf.ThreadPoolExecutor(a.concurrency) as ex:
+        recs = [r for rs in ex.map(one, range(len(firsts))) for r in rs]
+    with open(a.out, "w", encoding="utf-8") as out:
+        for n, rec in enumerate(sorted(recs, key=lambda r: (r["chat"], r["turn"])), 1):
+            rec["n"] = n
+            out.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            print(json.dumps({k: rec[k] for k in ("n", "chat", "turn", "usage", "finish", "seconds")}), flush=True)
     return 0
 
 
@@ -191,6 +245,15 @@ def main() -> int:
     p.add_argument("--bench-tokens", type=int, default=384)
     p.add_argument("--no-draft", action="store_true", help='every request with "draft": false')
     p.add_argument("--out", required=True)
+    p = sub.add_parser("chat")
+    p.add_argument("--url", default="http://127.0.0.1:8000")
+    p.add_argument("--model", default="DeepSeek-V4.1-Flash-TF")
+    p.add_argument("--prompts", default="", help="first messages, one a line (default: the bench's 8 prompts)")
+    p.add_argument("--turns", type=int, default=3)
+    p.add_argument("--max-tokens", type=int, default=192)
+    p.add_argument("--concurrency", type=int, default=4)
+    p.add_argument("--no-draft", action="store_true")
+    p.add_argument("--out", required=True)
     p = sub.add_parser("compare")
     p.add_argument("a")
     p.add_argument("b")
@@ -206,7 +269,7 @@ def main() -> int:
     p.add_argument("--prompts", required=True)
     p.add_argument("--out", required=True)
     a = ap.parse_args()
-    return {"ask": ask, "compare": compare, "trace": trace, "fromtrace": fromtrace}[a.cmd](a)
+    return {"ask": ask, "chat": chat, "compare": compare, "trace": trace, "fromtrace": fromtrace}[a.cmd](a)
 
 
 if __name__ == "__main__":
