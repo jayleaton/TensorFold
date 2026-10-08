@@ -101,6 +101,7 @@ Five agents work on `dsv41-zig` at once toward one combined pod gate and one Spa
   - 24–27: `dsq-zig-speed-1` (none used: its hooks ride on `op_ds_propose`).
   - 28–31: `dsq-zig-grammar-1` (28 `op_grammar`: bind / step / release, `grammar_gpu.zig`);
   - 40–43: `dsq-zig-mdraft-1` (40 `op_ingest`, 41 `op_propose`, 42 `op_reset`: `dspark_rows.zig`; 28–31 are `dsq-zig-grammar-1`'s `op_grammar`).
+  - 44–47: `dsq-zig-ced-1` (44 `op_ced_finish` `[op, end]`: `Forward.finishPrompt`; 45 `op_sess_prompt`: a replay-mode prompt snapshot, `sessions_gpu.savePrompt`).
 - **Defaults.** Every new behaviour is behind a knob or a new code path, and defaults to today's. With every new knob off, the gates `check cap24-*/cap15/cap18/cap22` and `dcheck cap16` still give 0 mismatches. Run `tf-dsv41-m1 m5-emit cap18` before committing a change to an emitter.
 - **Pool vs contiguous.** A slot's KV is either the contiguous roles (`s.L<i>.comp.*`, `s.L<i>.ik`) or the pool (`block.Options.pool`, the `s.kv.*` roles). New code must work with both, or refuse the other by name.
 - **Collectives.** Leader and followers make the same collective calls in the same order. Anything rank 0 decides (sampling draws, tree shapes, slot admission) travels on the plan link before the work that depends on it.
@@ -707,7 +708,7 @@ Every key of `dsv41-tensorfold-spark/config/prod.env` (PERF1, engine 8474f31), c
 
 | Knob | State |
 |---|---|
-| `TF_DSV41_PREFILL=replay` | **Not ported.** Prod prefills with CED bounded replay (`replay.py`): the encoder pass (layers 0–19 and layer 20's attention site and compressor) over every prompt row, a stash of the rows entering layer 20, then layers 20–39 over the prompt's last ≤ 127 rows with every SWA window starting at R0, and the last token as a full 40-layer verify row. It is approximate by design and carries its own session tag. Zig runs full prefill (every layer over every row), which equals replay only for prompts of 128 tokens or fewer. Longer prompts leave a different decoder state and can change replies. The served model now logs a warning at boot when `TF_DSV41_PREFILL=replay` is set. What a port needs: `block_prefill` with an `upto` layer and layer 20's partial site; the stash roles (`[KEEP, 4D]` streams, `[KEEP, D]` normed input, coefficients); a decoder pass from the stash with `lo` = R0 on the fused attention and its Triton variant; the plan's `Mode.replay` (already encoded in `rounds.zig`) driving it; and session snapshots carrying the stash. The gate is a replay capture (`M1_PREFILL_MODE=replay` in `dsv41_m1_capture.py`: the encoder segment, the stash, the finish pass) plus `M2B_PREFILL` with the reference in replay mode. It is the largest open parity item; until it lands, Zig's replies equal Python's with `TF_DSV41_PREFILL=full`, not prod's. |
+| `TF_DSV41_PREFILL=replay` | **Ported, default off, Spark gate pending** (`dsq-zig-ced-1`, `ced.zig`; section "CED replay prefill" below): the encoder pass, the stash ring, the decoder replay over the prompt's tail with windows from R0, replay-mode prompt snapshots. Host-gated; the GPU proof is the M2c-2 kit with `PREFILL_MODE=replay`. Until that passes, Zig's replies equal Python's with `TF_DSV41_PREFILL=full` only (prompts over 128 tokens). |
 
 **(c) Speed only.**
 
@@ -749,7 +750,8 @@ Every key of `dsv41-tensorfold-spark/config/prod.env` (PERF1, engine 8474f31), c
 - add after the knobs pod step passes: `TF_DSV41_PF_DENSE=fused`, `TF_DSV41_PF_DENSE_TABLE=/cache/pfdense-table.json`, `TF_DSV41_PREFETCH_AHEAD=1`;
 - add after the Spark window measures them: `TF_DSV41_PLAN_LINK=rdma`, `TF_DSV41_PLAN_PIN=auto`;
 - add after the `M2B_GM2PF` pod step passes: `TF_DSV41_GM_V2=1` (prod's value; the same bits);
-- leave out, since Zig has no effect for them: `GLM53_TF_ROCE_FAST`, `TF_DSV41_ENGRAM_GATE`, `TF_DSV41_BRANCHES*`, `TF_DSV41_FULL_CONE`, `TF_DSV41_PREFILL_ADAPT*`, `TF_DSV41_PREFILL` (Zig runs full; `replay` only adds the boot warning);
+- leave out, since Zig has no effect for them: `GLM53_TF_ROCE_FAST`, `TF_DSV41_ENGRAM_GATE`, `TF_DSV41_BRANCHES*`, `TF_DSV41_FULL_CONE`, `TF_DSV41_PREFILL_ADAPT*`;
+- add after the CED replay gate passes (section "CED replay prefill"): `TF_DSV41_PREFILL=replay` (prod's value; Python's server default);
 - `TF_TP_ROCE_FALLBACK` / `GLM53_TF_ROCE_FALLBACK`: unset (`nccl`), as prod.
 
 **(f) Python-only:** `TF_DSV41_NATIVE_DIR` (the C reader's build dir), `PYLIB`, `MIMALLOC_ALLOW_THP`.
@@ -1281,6 +1283,83 @@ The kit is built from the fix's commit or later. It also carries `tools/zig/dsv4
    the served shape.
 5. Prod back on perf1 (`scripts/v2-rollback.sh perf1`), as in every window. Keep `py*.jsonl`, `zig*.jsonl` and the
    compare output in the quant repo's results.
+
+### CED replay prefill (`dsq-zig-ced-1`, offline)
+
+Prod serves with `TF_DSV41_PREFILL=replay` (prod.env; it is also Python's server default, `stack.py`
+`DEFAULT_PREFILL = "replay"`). Zig ran full prefill, so for any prompt over 128 tokens Zig-as-prod left another
+decoder state than prod (the night's 384-token bench prompts: 0/8 equal) and spent about twice prod's time on long
+prefill. Commits `557dc713` (engine), `22044785` (aot-needs hook), `d4216b61` (reference + kit knob), `df3e30ee`
+(fill env). Default off; `prod-zig.env` on zig-serve carries the line commented until the gate below passes.
+
+**Python's semantics, and where each lives in Zig** (`replay.py`, `slots.py`, `rounds.py`, `batch.py`, `sessions.py` at 8474f31):
+
+| Python | Zig |
+|---|---|
+| `decoder_start`: the first ratio-1 layer, a kv source (20) | `ced.decoderStart` (also refuses an Engram layer at or past it: `replay.finish` runs the decoder without Engram rows) |
+| `encode`: each segment `run(upto=20)`: layers 0-19, layer 20's attention site, `compress_rows` (its comp rows and index keys for every row); `keep(n - 1)` as a full segment | `block_prefill.emitReplay(.encoder)`: the whole segment's calls through layer 20's site, then `compProj` + `compress`, then glue `ced_stash`; `forward_prefill.segment` commits as before (carries 2 / 8 / 14, Engram tail, position); no head |
+| `Stash`: streams [m, 4D], normed input [m, D], layer 20's site pre / post / comb of the last 127 positions; a gap restarts it | a 128-row ring `s.ced.x / .out / .pre / .post / .comb` (row = position % 128) + `Slot.ced` (`ced.Stash`: from, hi, ids) |
+| `finish(slot, n - 1, tail = prompt[max(0, n-128) : n-1])` before the first verify window; decoder from the stash, `ctx.lo = R0`, `comp_done`, Streams without `alt`, `_finish(logits=False)` | `Forward.finishPrompt` (op 44, every rank) -> `forward_prefill.finish`: `emitReplay(.decoder)` over layers 20-39, glue `ced_load` (ring -> `w.x0`, `w.out`, `w.c0.*`), `positions` with `w.lo` = R0, layer 20's compressor skipped, every boundary in place (`block_moe.mhcInto`, `_site` without SPLIT), no final norm or head; nothing committed |
+| the last token: the first verify row, a full 40-layer decode row | unchanged: `TF_DSV41_PROMPT_TAIL=verify` (`a390113`) |
+| n <= 128: R0 = 0, replay == full bit for bit | the same rule (`ced.tailOf`); the host test checks the call-level identity |
+| sessions: no turn snapshots in replay mode; a prompt snapshot at S = (n-1)//16*16 when S > cached and S >= 64, with the stash; own tag | `target.prefill` splits the prefill at S and calls `Sessions.savePrompt` (op 45: an entry, the slot keeps its pages); `release` saves nothing in replay mode; the "slot" blob carries the stash's from / hi / ids, the ring rides as pieces; entries tagged `ced.tag` (16) |
+
+**Interactions.**
+- Chunked segments and 1M prompts: the encoder segments are the full segments' launches up to layer 20 (any segment
+  size, the stream top-k, split-KV row blocks: `longpf.window` runs them); the decoder pass is 127 rows (or n - 1)
+  once a prompt, never staged. The ring keeps rows across segments; the decoder pass emits at every tail shape to
+  the 1M limit (host test).
+- Split KV: the decoder's index layers exchange their selections as any segment does (`kx_*` glue); host test covers
+  pooled and split programs.
+- 4-slot row mode: a prompt's encoder segments and its decoder run inside one `target.prefill` on the activated slot,
+  so one ring a forward suffices. Row mode opens no sessions (as before).
+- Images: the decoder's tail ids come from the ring, so image rows route with `bias_vl` (`replay._image`).
+- **Refused** (boot error, by name): replay without `TF_DSV41_OWN_PREFILL=1` or with `TF_DSV41_PROMPT_TAIL=prefill`
+  (`Forward.prompt` never replays: Python runs replay only in the server's piece / finals shape); a forward whose
+  layers do not reach layer 20; a config without a decoder layer.
+- Not copied: Python feeds the replayed rows' DSpark taps to the drafter (`replayed`). Zig's drafter starts from the
+  verify window's row, as after `a390113`; this changes draft acceptance, not bits.
+- `rounds.zig` already encodes `Mode.replay` in the plan; the served path does not use rounds plans, the knob is
+  read on every rank (the follower checks op 44 against its own mode and position).
+
+**Proven offline** (HEAD + these files in a clean tree; other agents' WIP left out):
+- `test-dsv41-knobs` 12/12, with `ced_test.zig`: encoder pass ++ decoder pass == the whole segment's calls with layer
+  20's compressor moved to the encoder's end, at 12 / 30 / 64 / 100 / 127 rows, contiguous / pooled / split KV,
+  R0 = 0 and 1000; the decoder's windows from R0, its boundaries in place, the stash roles; the decoder pass emits at
+  every tail length from 0 and 127 rows up to the 1M limit; `ced.zig`'s rules against replay.py / sessions.py /
+  batch.py.
+- `check` cap15 / cap18 / cap22 / cap24-1 / cap24-12 / cap24-16 and `dcheck cap16`: 0 mismatches; `m5-emit cap18`:
+  0 problems; `test-dsv41` 32/33 (1 skipped as before), `-longpf` 7/7, `-rows` 18/18, `-mdraft` 7/7, `-gm2pf` 5/5,
+  `-draft` 32/32.
+- Not offline: the values. No Python replay capture exists (it needs a GPU), so the bits are proven only by the
+  M2c-2 gate below. `aot-needs` with replay was not run end to end (the dev box's Triton is 3.8; the fill needs
+  3.7.1): the hook's programs are the ones the host test emits.
+
+**Found on the way.**
+- Python's server defaults to replay; any "Python full" comparison must set `TF_DSV41_PREFILL=full` explicitly.
+- Python prod's fast prefill tag already forbids turn snapshots in full mode too (`rounds._finish`: `not tag >> 8`).
+  Zig's one-slot sessions save turn ends in full mode, so a resumed multi-turn chat in Zig full mode reads
+  decode-written rows where Python re-prefills them. Irrelevant for prod's row mode (no sessions) and for replay
+  mode (now prompt snapshots only); a full-mode follow-up if one-slot Zig serves sessions with full prefill.
+- The 4 x 1M window's step 5 (long T0 replies Zig vs prod) compares against prod's replay: it needs
+  `TF_DSV41_PREFILL=replay` on the Zig server to be equal past 128 tokens.
+
+#### NEXT SPARK WINDOW: CED replay (not run; right after the prompt-tail proof)
+
+Check the lease on dgx-01 first. Kit and image from `df3e30ee` or later. `K` = the kit dir on both hosts.
+
+| step | what | time | PASS |
+|---|---|---|---|
+| C0 dev box | the kit as in "4 slots x 1M" step 0 (`TRITON_FILL=1`, `TRITON_FILL_ENV=tools/zig/dsv41_m4/fill-4x1m.env`, which now has `TF_DSV41_PREFILL=replay`), `KIT_COMMIT=<df3e30ee or later>`; the zig-serve image from the same commit | before | `needs.log` has `aot-needs: CED decoder, ...`; `compile.json` `failed: []` |
+| C1 gate, prod down | both hosts within a minute: dgx-01 `cd $K && PREFILL=1 PREFILL_MODE=replay PROMPT=1536 ./run_host.sh 0 $K/out/ced-1536`, dgx-02 the same with rank `1` (`PREFILL_MODE=replay` sets `PROMPT_TAIL=verify`) | ~40 min | `run.log`: `ours ... PASS` (decode from Python's replay state), `prefill gate ... PASS Zig prefill rank r: ... state roles N/N equal ..., first token a vs a` and `PASS M2b rank r: tokens 512/512, logits 512/512` on both ranks |
+| C2 gate, two segments | the same with `PROMPT=2600 AOT_PROMPTS=""` (R0 = 2472 in the second segment, the ring across segments) | ~30 min | as C1 |
+| C3 bits vs prod | Zig-as-prod (`prod-zig.env` with `TF_DSV41_PREFILL=replay` uncommented, the image from C0): `$D ask --url http://127.0.0.1:8000 --prompts $K/prompts.txt --bench --out $OUT/zig-ced.jsonl`, `$D compare $OUT/py.jsonl $OUT/zig-ced.jsonl --tokenizer $TOK` (`py.jsonl` from the prompt-tail step 0) | ~15 min incl. boot | **16/16** (the night: bench prompts 0/8); boot log `prod knobs: ... prefill replay` |
+| C4 prefill speed | the same server: `python3 $K/bench_http.py --url http://127.0.0.1:8000 --label zig-ced --long 32768,131072 --out $K/out/zig-ced-long.json`; A / B one cell with the line commented again | ~25 min | 32K **> 1,200 tok/s** (full: 571 at the night, ~690 expected after the Engram fix; prod 2,430); the 32K T0 reply equal to prod's |
+| C5 restore | prod back on perf1 if the window ends here | 2 min | as every window |
+
+If C1 fails, `first_differing_role` names the part: `s.L2x/3x.swa.*` = the decoder pass (lo, in-place boundaries,
+the ring), `s.L20.comp.* / .ik` = the encoder's compressor, `s.L<20.*` = the encoder pass. Keep `TF_DSV41_PREFILL`
+commented in prod-zig.env until C1 and C3 pass.
 
 ### Speed against prod after the night (`dsq-zig-speed-2`, offline)
 
