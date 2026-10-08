@@ -164,7 +164,7 @@ pub const Model = struct {
         var ds: [8]u32 = undefined;
         const blocks = if (o.drafts) try std.mem.concat(a, u32, &.{ backbone, dspark_emit.blocks(&m.cfg, &ds) }) else backbone;
         m.pl = try plan.build(gpa, &m.cfg, &m.pack, .{ .rank = m.tcfg.rank, .world = world, .blocks = blocks, .top = true, .dspark = o.drafts });
-        m.weights = .{ .gpa = gpa };
+        m.weights = .{ .gpa = gpa, .digest = false }; // no weights check reads the digests here (load.zig)
         // TF_DSV41_PREPARED (prepared.zig): each layer's host images read back instead of rebuilt from the pack
         var cache = try prepared.Cache.fromEnv(gpa, io, &m.pack, .{ .rank = m.tcfg.rank, .world = world, .o_groups = m.cfg.o_groups, .blocks = blocks, .dspark = o.drafts });
         defer if (cache) |*c| c.deinit();
@@ -182,6 +182,11 @@ pub const Model = struct {
                 if (cache) |*c| c.put(&b, tag) catch |e| std.log.warn("dsv41 prepared: {s} not written ({t})", .{ tag, e });
             }
             const t1 = std.Io.Clock.awake.now(io).toNanoseconds();
+            // the next prepared file read ahead by the kernel while this layer uploads
+            if (cache) |*c| {
+                var next_buf: [16]u8 = undefined;
+                c.willNeed(if (i + 1 < m.pl.layers.len) std.fmt.bufPrint(&next_buf, "L{d}", .{i + 1}) catch "" else "top");
+            }
             try m.weights.upload(&m.driver, &b);
             t_build += t1 - t0;
             t_upload += std.Io.Clock.awake.now(io).toNanoseconds() - t1;

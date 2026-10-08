@@ -83,6 +83,20 @@ pub const Cache = struct {
         return std.fmt.bufPrint(buf, "{s}/{s}.bin{s}", .{ c.root, tag, suffix });
     }
 
+    /// The kernel asked to read ``<tag>.bin`` ahead (POSIX_FADV_WILLNEED), so the next `get` of it finds its pages while
+    /// the caller uploads the layer before it; a missing file is ignored, nothing waits.
+    pub fn willNeed(c: *const Cache, tag: []const u8) void {
+        var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+        const p = c.path(pbuf[0 .. pbuf.len - 1], tag, "") catch return;
+        pbuf[p.len] = 0;
+        const linux = std.os.linux;
+        const rc = linux.openat(linux.AT.FDCWD, pbuf[0..p.len :0], .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(rc) != .SUCCESS) return;
+        const fd: linux.fd_t = @intCast(rc);
+        defer _ = linux.close(fd);
+        _ = linux.fadvise(fd, 0, 0, linux.POSIX_FADV.WILLNEED);
+    }
+
     /// Fills `b` from ``<tag>.bin``: true when read, false when there is no usable file (`b` is then untouched).
     pub fn get(c: *Cache, b: *named.Builder, tag: []const u8) !bool {
         var pbuf: [std.fs.max_path_bytes]u8 = undefined;

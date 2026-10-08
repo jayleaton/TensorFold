@@ -22,6 +22,10 @@ pub const Weights = struct {
     bufs: std.ArrayList(cuda.DeviceBuffer) = .empty,
     map: std.StringHashMapUnmanaged(Tensor) = .empty,
     bytes: usize = 0,
+    /// each tensor's SHA-256 taken on the way up (M1's weights check reads it); off, `sha256` is zeros: the served
+    /// model's boot, where nothing reads it (95 GiB a rank through one thread's SHA-256, in software on the generic
+    /// aarch64 build: the likely bulk of the Spark night's 261 s "upload + digest")
+    digest: bool = true,
 
     pub fn deinit(w: *Weights) void {
         for (w.bufs.items) |*b| b.free();
@@ -36,8 +40,8 @@ pub const Weights = struct {
     pub fn upload(w: *Weights, d: *const cuda.Driver, b: *const named.Builder) !void {
         for (b.out.items) |n| {
             if (w.map.contains(n.name)) return error.DuplicateWeight;
-            var sha: [32]u8 = undefined;
-            std.crypto.hash.sha2.Sha256.hash(n.bytes, &sha, .{});
+            var sha: [32]u8 = @splat(0);
+            if (w.digest) std.crypto.hash.sha2.Sha256.hash(n.bytes, &sha, .{});
             var buf = try cuda.DeviceBuffer.fromHost(d, n.bytes);
             errdefer buf.free();
             try w.bufs.append(w.gpa, buf);
