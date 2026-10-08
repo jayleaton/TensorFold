@@ -1427,23 +1427,72 @@ Nothing on the list is MISSING. Two were OFF in every night run (GM_V2, PREFETCH
    takes `PROF_PREFILL=1` and `LIMIT` (prompts past 4,096). Off unless set: nothing changes in the served engine.
 3. zig-serve `prod-zig.env` (`8bc8318`): `TF_DSV41_GM_V2=1`; the "left out" note now names the knobs built into the emitter.
 
+#### Every non-Python launch of a segment, and the segment's syncs (second pass, offline)
+
+**Census** (`block_prefill.emitPrefill`, the 40-layer program at 2,048 rows, prod's options: 1M limit, 64 MiB index
+budget; contiguous and paged pool give the same calls): 2,759 calls at start 0, 2,793 at 16,384, 2,829 at 30,720, of
+which 613 / 632 / 650 are glue (Zig's own steps for torch ops). The rest are launches of Python's own Triton or CUDA
+kernels, checked call by call by the captures. No launch is sized by the 1M limit or the pool (only the rope table's
+tensor is that large; every grid is per row). Per segment at 16K, with the shapes the emitter gives and a GB10 roofline
+(273 GB/s DRAM; estimates, not measurements):
+
+| Zig step (count) | shapes | Python 8474f31 | Zig, how | est. ms a segment |
+|---|---|---|---|---:|
+| `topk` = `top_positions` (46) | 32 x [256 x 16,384] int64 -> 512 (the reindex layers' candidates), 7 x [303 x ~17K] -> 512 and 7 x [303 x ~2.1K] -> 2,048 (layer 20's blocks under the 64 MiB budget) | `index.top_positions`: `torch.topk(sorted=False)` = mbtopk (2 x 256-thread blocks a slice at 48 SMs, `RADIX_BITS` 8: 8 passes x 2 launches + gather, every pass re-reads the slice: 9 reads), then 3 `where`, `torch.sort` [R, 512], `cat`, `to(int32)` | one kernel: one 1,024-thread CTA a row, the same 8-bit radix select (9 reads of the row, L2-resident: 128 KiB a row), winners, bitonic sort in shared memory | ~10-15 (both: the same bytes; Zig's is one launch and one CTA a row, torch's is ~22 launches) |
+| `stream_merge` (3) | [2048, 1 x 1,024] -> 512 | `stream_topk` merge: topk + sort | `kvGather` + `top_positions` | ~1 |
+| `exchange` (80), `embed` (1), `engram_rows` all-gather (2) | [2, 2048, 5120] bf16, 21 MB a rank | `fast_gather` (> `ROCE_MAX_KB`: NCCL) | `comm.allGather` (> 1 MiB: NCCL) | ~80 (both) |
+| `gm_plan` (160) | 12,288 picks, 577 passes | `x3gm.plan`: `argsort(stable)` (CUB radix sort), `bincount`, 2 `cumsum`, `searchsorted`, ~8 elementwise: ~15 launches | `dsv41_x3gm_plan`: one 512-thread CTA, counting sort (`match_any` stable scatter), same integers | ~10 (both) |
+| `moe_sum` (40), `swiglu` (40), `gm_picks` (40), `gm_ticket` (40) | [2048, 5120] f32 x 2 -> bf16; [2048, 1152] f32 | `out += shared` then `.to(bf16)` (2 kernels), `clamp_` / `clamp_` / `silu` / `mul_` (4), slicing copies, `zero_` | one fused kernel each | ~20 (Python ~30) |
+| `cand_keys` (32), `counts` (8), `block_pos` (39), `stage_in` / `stage_out` (80), `proj` (4), `proj_carry` (3), `zeros` (4), `ix_w` (8), `positions` (1) | 16 MB writes each for `cand_keys`; the rest KB | the matching torch ops (`arange` arithmetic, `sum`, `cat`, index copies) | grid-stride elementwise kernels, `cuMemcpyDtoDAsync`, `cuMemsetD8Async` | ~4 |
+
+So Zig's glue is ~45-50 ms a segment beside ~80 ms of exchanges both engines pay, against Python's torch ops of about
+the same; no non-Python kernel explains a ~1 s segment gap, and none is rewritten (a GPU kernel changed without a GPU
+to prove its bits is not shipped; `top_positions` at 512 threads would gain ~3 ms: noted, not done).
+
+**Syncs a segment** (host stream syncs, D2H copies, allocations; `forward_prefill`, `forward`, `longpf`, `kv_state`):
+
+| point | Python (8474f31) | Zig before | Zig now |
+|---|---|---|---|
+| a segment's ids (`embed`) | `ids_of`: past `CHUNK` (128) rows `to_device` (pinned, `non_blocking`): no sync | `r.stream.synchronize()` before rewriting the pinned ids: the GPU drained at every segment start | waits for that buffer's last copy alone (an event); <= 128 rows keep the sync |
+| Engram rows, layers 1 and 14 | `decode.LazyEngram`: a layer's rows when the forward reaches it; past `CHUNK` rows `to_device`, "no stream sync for the copy" | `r.stream.synchronize()` before each fill: two drains a segment, the GPU idle through each fill | one pinned buffer a Engram layer, each waiting for its own last copy; <= 128 rows keep the sync |
+| page-table entries (`kv.reserve`) | the pool's table rows (a small copy) | pageable `cuMemcpyHtoDAsync`, staged at once (no device sync) | unchanged |
+| D2H | the last segment's logits | the last segment's logits (greedy) | unchanged |
+| allocations | the caching allocator | none past `ready()` (send, gathered, the stagings pre-grown to a segment) | unchanged |
+
+With the three drains gone a non-final segment never stops the host: segment k + 1's emission, its ids and both of its
+Engram fills run while the GPU is still on segment k's later layers, as in Python. Same bits: the same bytes reach the
+same device buffers in the same stream order; only the host's wait moved from the stream to the buffer's own copy.
+
+**The gap is in the served shape, not in the kernels.** The night's M2c-2 prefill gate (contiguous slot, 4,096 limit,
+synthetic Engram rows, no host reads) ran 1,536 rows in 1.44 s (rank 0, `seed4101/prefill.log`): ~1.9 s a 2,048-row
+equivalent, Python's full speed (~1.85 s at 32K). Served run C took 3.58 s a segment, flat from 32K to 131K (571 /
+585 tok/s), with 0.64 s of it `engram.wait`. So the ~1 s a segment beyond the Engram reads is something the served
+run has and the gate has not: host drains while the host was the bottleneck (three a segment, the two Engram ones each
+waiting through a serial read: removed now), the long-context selections past 4,096 keys (the same Python kernels in
+both engines: their GPU time is in P2), and rank 1. P2 profiles a 32K prompt in the gate's harness, so it separates
+GPU time from idle directly.
+
 **Expected at 32K** (one stream, `bench_http.py --long 32768`; each row multiplies the one above; the basis column is
 the measured share or Python's own number):
 
 | step | tok/s | basis |
 |---|---:|---|
 | night (full, serial Engram, no read-ahead, PF_DENSE / GM_V2 off) | 571 | run C |
-| + reader pool (d6c5e02) and read-ahead that hits on both layers (this pass) | ~690 | 0.64 s of a 3.58 s segment were `engram.wait` |
-| + PF_DENSE fused with prod's table | ~720 | Python dense-t +4.1 % at 32K full |
-| + GM_V2 | ~770 | Python q28-v2 +6.7 % at 32K |
-| + CED replay (`dsq-zig-ced-1`, its gate first) | ~1,600 | Python replay / full 2.06x at 32K (2,285 / 1,109) |
+| + reader pool (d6c5e02) and read-ahead that hits on both layers (51acf4ea) | ~690 | 0.64 s of a 3.58 s segment were `engram.wait` |
+| + no host drains in a segment (`9492042d`) | ~700-1,000 | lower bound: the drains' own fills (~30-60 ms a segment); upper bound: the gate's 1.9 s a segment, if the rest of the ~1 s was GPU idle behind them |
+| + PF_DENSE fused with prod's table | x 1.04 | Python dense-t +4.1 % at 32K full |
+| + GM_V2 | x 1.067 | Python q28-v2 +6.7 % at 32K |
+| + CED replay (`dsq-zig-ced-1`, its gate first) | x 2.06 | Python replay / full at 32K (2,285 / 1,109) |
+| = Zig with everything | ~1,600-2,250 | |
 | prod | 2,430 | prod-long-bench.log |
 
-The last ~1.5x (Zig full ~770 against Python full ~1,180 with the same knobs) is not attributed offline: the launches
-are Python's (the captures), the exchanges take the same NCCL path, the host emits a segment in 2-4 ms, and the
-sessions commit per segment only appends ids. The P2 profile below names it by kernel family; the candidates are the
-Zig glue kernels that replace torch ops (`top_positions`, one CTA a row with shared-memory atomics against
-torch.topk's radix select; `ring_copy`, `widen_cat`, `cand_keys`) and GPU idle at the two Engram syncs.
+What would close the rest is named by P2: if the Zig prefill's GPU sum equals Python's and its wall is larger, the
+remainder is idle (host or rank 1); if a family's GPU time is larger, it is that family's launches.
+
+**dsq-zig-rtparity-1 (ENGRAM_GATE, decode):** prefill keeps `f.gated = false` (their WIP), so prompt segments take
+`engramRows`' staged path changed here; the gated path and decode windows of <= 128 rows are untouched. The staging
+moved from `f.host` / `f.rows_host` to `f.ids_stage` / `f.rows_stage[li]` (`host_stage.zig`); a decode change that
+wants the same no-sync copy calls `Stage.take` / `issued` on them.
 
 #### NEXT SPARK WINDOW: prefill parity (not run; after the CED gate C1, before C4)
 
@@ -1453,9 +1502,9 @@ Check the lease on dgx-01 first. Kit (M2c-2) and zig-serve image from the engine
 | step | what | time | PASS / record |
 |---|---|---|---|
 | P1 GM_V2 gate | dgx-01 `cd $K && PREFILL=1 GM_V2=1 PROMPT=2600 AOT_PROMPTS="" ./run_host.sh 0 $K/out/pf-gm2`, dgx-02 the same with rank `1` (two segments: the read-ahead's path) | ~35 min | `prefill.log`: `prod knobs: ... x3gm v2 one`, **`PASS Zig prefill rank r: ... state roles N/N equal`, first token equal, `PASS M2b ... 512/512`** on both ranks. FAIL: comment `TF_DSV41_GM_V2=1` out of prod-zig.env |
-| P2 prefill profile at 32K | `PREFILL=1 GM_V2=1 PROF_PREFILL=1 PROMPT=32768 LIMIT=36864 STEPS=16 AOT_PROMPTS="" ./run_host.sh 0 $K/out/pf-prof` (rank 1 likewise); then on dgx-01 `python3 $K/tools/zig/dsv41_perf/gap.py prefill --py $K/out/pf-prof/seed4101/ref/prof-rank0.json --zig-profile $K/out/pf-prof/seed4101/zig-prefill/prof-rank0.json --top 25 > $K/out/pf-prof/gap-prefill.md` (add `PREFILL_MODE=replay` for the replay shape once C1 passes) | ~40 min | the prefill gate PASS as P1; **record** `gap-prefill.md`: wall and GPU a prompt on both sides, the family with the largest `Zig - Python`, `glue.engram_rows`' ms (the GPU waiting on Engram) |
-| P3 served 32K | Zig-as-prod (prod-zig.env as committed, `TF_DSV41_PHASES=1 TF_DSV41_PHASES_OUT=/state/phases.json` added for the window): `python3 $K/bench_http.py --url http://127.0.0.1:8000 --label zig-pf --long 32768,131072 --out $K/out/zig-pf-long.json` | ~25 min | 32K **> 700 tok/s full** (> 1,500 with replay on); `phases.json` `engram.wait` **mean < 15 ms** (read-ahead hits; was 249) |
-| P4 A / B | the same server, one 32K cell each with `TF_DSV41_PREFETCH_AHEAD=0`, then `TF_DSV41_GM_V2=0`, then `TF_DSV41_PF_DENSE=off` | ~30 min | each knob's share of P3 (expected: ahead 3-8 %, GM_V2 5-8 %, PF_DENSE 3-5 %) |
+| P2 prefill profile at 32K | `PREFILL=1 GM_V2=1 PROF_PREFILL=1 PROMPT=32768 LIMIT=36864 STEPS=16 AOT_PROMPTS="" ./run_host.sh 0 $K/out/pf-prof` (rank 1 likewise); then on dgx-01 `python3 $K/tools/zig/dsv41_perf/gap.py prefill --py $K/out/pf-prof/seed4101/ref/prof-rank0.json --zig-profile $K/out/pf-prof/seed4101/zig-prefill/prof-rank0.json --top 25 > $K/out/pf-prof/gap-prefill.md` (add `PREFILL_MODE=replay` for the replay shape once C1 passes) | ~40 min | the prefill gate PASS as P1; **record** `gap-prefill.md`: wall and GPU a prompt on both sides, the family with the largest `Zig - Python`, `glue.engram_rows`' ms (the GPU waiting on Engram); the Zig profile's `wall_ms - gpu_ms` (idle: host or rank 1). Then the same with `PROMPT=2048` (one segment at 0): the 32K run's ms a segment minus this one is what the long-context selections and the served shape add |
+| P3 served 32K | Zig-as-prod (prod-zig.env as committed, `TF_DSV41_PHASES=1 TF_DSV41_PHASES_OUT=/state/phases.json` added for the window): `python3 $K/bench_http.py --url http://127.0.0.1:8000 --label zig-pf --long 32768,131072 --out $K/out/zig-pf-long.json` | ~25 min | 32K **> 750 tok/s full** (> 1,600 with replay on); rank 0's segments back to back (`phases.json` `prefill` ms / segments against P2's GPU ms a segment); `phases.json` `engram.wait` **mean < 15 ms** (read-ahead hits; was 249) |
+| P4 A / B | the same server, one 32K cell each with `TF_DSV41_PREFETCH_AHEAD=0`, then `TF_DSV41_GM_V2=0`, then `TF_DSV41_PF_DENSE=off`, then an engine without `host_stage` (the commit before it: the three drains back) | ~40 min | each one's share of P3 (expected: ahead 3-8 %, GM_V2 5-8 %, PF_DENSE 3-5 %, the drains 1-30 %) |
 | P5 restore | prod back on perf1 (`scripts/v2-rollback.sh perf1`) if the window ends here | 2 min | as every window |
 
 ### Prod parity: decode runtime (`dsq-zig-rt-1`, offline)
