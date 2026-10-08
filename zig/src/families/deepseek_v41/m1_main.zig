@@ -31,6 +31,8 @@ const usage =
     \\       tf-dsv41-m1 check CAPTURE   (host only: block.zig's calls against the capture's launches)
     \\       tf-dsv41-m1 plan            (host only: the whole model emitted from the q28-v2 listings, M2's buffer plan)
     \\       tf-dsv41-m1 m5-emit CAPTURE (host only: the pool / split programs' invariants for every captured window)
+    \\       tf-dsv41-m1 aot-needs SIGS OUT (host only: every Triton variant the served config (env) can launch, for
+    \\                   tools/zig/triton_fill.py compile; SIGS from its `sigs`)
     \\       tf-dsv41-m1 m5 paged|split|compact|park PACK REF OUT (M5: a rank of TP=2 on the paged pool vs the pool reference)
     \\       tf-dsv41-m1 m2a PACK REF OUT (M2a: our forward vs tools/zig/dsv41_m2a_digests.py's run, one GPU)
     \\       tf-dsv41-m1 m2b PACK REF OUT (M2b: a rank of TP=2 over NCCL vs tools/zig/dsv41_m2b_ref.py; TF_TP_RANK ...)
@@ -135,6 +137,15 @@ pub fn main(init: std.process.Init) !u8 {
         };
         out.interface.flush() catch {};
         return if (bad == 0) 0 else 1;
+    }
+    if (args.len == 4 and std.mem.eql(u8, args[1], "aot-needs")) {
+        var buf: [4096]u8 = undefined;
+        var out = std.Io.File.stderr().writer(init.io, &buf);
+        @import("aot_needs.zig").main(init.gpa, init.io, args[2], args[3], &out.interface) catch |e| {
+            std.debug.print("FAIL tf-dsv41-m1 aot-needs: {t}\n", .{e});
+            return 1;
+        };
+        return 0;
     }
     if (args.len == 3 and std.mem.eql(u8, args[1], "check")) {
         var buf: [4096]u8 = undefined;

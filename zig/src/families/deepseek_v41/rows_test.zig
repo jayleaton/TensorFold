@@ -17,6 +17,7 @@ const Config = @import("config.zig").Config;
 test {
     _ = rowtab;
     _ = rowmode;
+    _ = @import("aot_needs.zig");
 }
 
 const S: u32 = 4;

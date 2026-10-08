@@ -1178,13 +1178,13 @@ Run A predates `9bc88af` (the DSpark pass 31.5 -> 7.0 ms a round); B2 has it. **
 
 **Open, from the window:**
 - **Zig prod != Python prod on 3/8 short greedy requests** (and the bench's T0 cells 0/20, thinking off, streamed) while Zig's served path == its own CLI replay (49/49) and the M2c-2 / prefill gates are bit-exact. Prompts render alike (same head hashes and counts). **Cause found offline: the prompt's last token** (next section): fixed by `TF_DSV41_PROMPT_TAIL=verify` (the default), proof steps under NEXT SPARK WINDOW.
-- **4 slots x 1M on Zig:** row mode needs the long-context selections (`_dtopk` / `_stream` with `ROWS=1`) before prod can switch; one slot at 1M works (run C).
+- **4 slots x 1M on Zig:** row mode needs the long-context selections (`_dtopk` / `_stream` with `ROWS=1`) before prod can switch; one slot at 1M works (run C). **Ported offline (`9bb3227`):** dtopk with `ROWS` and `backend._blocked` under the index budget (Python never streams a `RowWin`); proof steps under NEXT SPARK WINDOW: 4 slots x 1M and the AOT fill.
 - **Fast boot is upload-bound:** 261 s of the 367 s is "upload + digest" with the prepared images already read.
 - **`/cache/roce-failed`** exists in prod's cache volume (preflight: "both ranks start on NCCL"); delete it to retry RoCE, if that is intended.
 - **Long prefill ~4x slower than prod** (563-585 tok/s vs 2,263-2,430): the stream top-k path and 2,048-row segments; profile with `TF_DSV41_PHASES`.
 - **Graphs with one slot on the paged pool** pad NK to the 2,048 context bucket: no reference decodes through Python's graph buckets (`_scores` paged NK 2048 missing); run C ran eager.
 - **Speed at short prompts:** B2 code T0 1-stream 60.4 vs 84.7; 4 streams 82-91 vs 142-144. The window's choice reads wait on the GPU forward; next is the per-round phase split (`out/b2/phases.json`).
-- **The AOT set is sampled, not complete:** a served shape no reference launched fails `MissingTritonVariant`. A fill step that compiles the emitter's specs straight from Python's Triton source (the same cubins its JIT builds) would close the class.
+- **The AOT set is sampled, not complete:** a served shape no reference launched fails `MissingTritonVariant`. A fill step that compiles the emitter's specs straight from Python's Triton source (the same cubins its JIT builds) would close the class. **Built offline:** `tf-dsv41-m1 aot-needs` + `tools/zig/triton_fill.py` (build-kit `TRITON_FILL=1`); same section.
 - Images: V2 still 1 ulp at b0.attn (owner `dsq-zig-vision-1`).
 
 ### Zig prod vs Python prod: the prompt's last token (`dsq-zig-diverge-1`, offline)
@@ -1365,6 +1365,124 @@ recorded and the window moves on.
 | S4 short decode, per cell | B2's shape (4 slots, slot drafts, prod-zig.env, S2's phases knobs), one `bench_http.py --work code --temps 0 --streams 1 --reps 2` run, save `phases.json`; then `--streams 4`; then `--work prose --streams 1` (copy `phases.json` between runs: it is cumulative) | ~30 min | code 1-stream **> 62** (was 60.4), 4-stream **> 88** (82.2); per-cell phases name the ~20 ms a round outside every phase |
 | S5 GM_V2 | M2c-2 kit `PREFILL=1 GM_V2=1 ./run_host.sh` (both hosts; `prefill.log`'s `prod knobs:` line must say `x3gm v2 one`), then S2's 32K cell with `TF_DSV41_GM_V2=1` | ~35 min | **prefill gate PASS** (95/95 roles, first token, 512/512); 32K **+5-10 %**. PASS: `TF_DSV41_GM_V2=1` into prod-zig.env |
 | S6 restore | prod back on perf1 (`scripts/v2-rollback.sh perf1`) | ~2 min | as every window |
+
+### 4 slots x 1M and the AOT fill (`dsq-zig-rows1m-1`, offline)
+
+**4 slots x 1M (`9bb3227`).** The night's rank 1 `UnknownRowsCall` came from the row programs (`Batch.plan`, every bucket
+at the 1M limit's end): `115b46e` / `acae981` added `_dtopk` for one slot and the row rewriter did not know it. Python's
+row path (`backend.select` / `select_cand` with a `RowWin`, 8474f31) has two long-context selections, and Zig had one:
+- past attn_cuda's plan (more than 126,976 keys): `dtopk.select` / `dtopk.blocks` with `rows=True` (`_dtopk` reads
+  `POS[r]`). Row mode now rewrites `_dtopk` and `_block_keys` onto the table's `pos` with `ROWS` on.
+- past the index budget (prod's `TF_DSV41_INDEX_BUDGET_MIB=64`: 6+ rows at 1M keys, 11+ at ratio 2, and one slot's
+  16-row verify windows past about 350K positions): `backend._blocked` (`_row_blocks`, each block `_scores` + `_keys` +
+  `index.top_positions`, the candidate source's `_block_keys` + `top_positions`, then `visible_counts`). The decode
+  emitter had no budget rule, so these windows took the whole-window dtopk / CUDA path and were not Python's bits, in
+  row mode and for one slot. `block.zig` now applies `backend.select`'s rule. A `RowWin.sub` block keeps the bucket's
+  cap (`block.Options.rows`), and row mode never streams (`not win.rows`). A row block reads rows [a, a + n) of the
+  table (`block_pos` carries a and n). The glue `topk` / `counts` / `block_pos` moved to the shared decode glue.
+- Host checks (`test-dsv41-rows`, 17/17): the real emitter at `CONTEXT=1048576`, 4 slots, prod's knobs, every bucket
+  up to the cap at six context buckets and `Batch.plan`'s windows. Every selection launch is counted against an
+  independent table of `backend.py` / `attn_cuda.py`'s rules, and every row-mode argument is checked on its rows of the
+  table. Buckets 24-64 run as 16-row blocks. One slot runs at 1M (1-16 rows at the limit and at 400K). The row table
+  of a 4-slot mix sits at the limit. The plan at 16 rows adds `L.ix.keys` 128 MiB, `L.scores` 64 MiB and
+  `L.ix.bkeys` 16 MiB a rank, the bytes Python allocates per window. `check`: cap8 / 15 / 18 / 22 / 24-1 / 24-12 /
+  24-16 / 30-gm2v2 0 mismatches; cap6 22, the same at 9c7e415 (its 256-row prefill head).
+
+**The AOT fill (`tools/zig/triton_fill.py`, `tf-dsv41-m1 aot-needs`).** The served set held only what reference runs
+happened to launch; the night patched five phases in. The fill compiles every variant the served config can launch,
+from Python's own Triton source, ahead of time:
+1. `triton_fill.py sigs --py <8474f31 src>`: each kernel's parameters, constexprs, `do_not_specialize` and
+   `do_not_specialize_on_alignment`, from the JITFunctions of the family's and `tensorfold/cuda`'s modules.
+2. `tf-dsv41-m1 aot-needs SIGS OUT`, with the served env (`tools/zig/dsv41_m4/fill-4x1m.env`): the engine's own
+   programs, each Triton launch reduced to Triton's specialization (constexpr values; per runtime argument the dtype
+   and 16-byte alignment, the int width, == 1 folded, % 16, fp32). The programs:
+   - one-slot decode windows of 1-16 rows, eager at every end position and graphed at every context bucket;
+   - row mode, every bucket up to the cap at every context bucket;
+   - prefill segments of 1-2,048 rows at each regime's first start;
+   - DSpark's pass, the slots' passes and ingests.
+   The position scan relies on two facts: a window's launches change only where a threshold crosses, and between
+   thresholds every int's class repeats every 256 positions. So it emits every position of the first 512, then every
+   256th, then the 512 around any sample whose variant set changed, then the last 256.
+3. `triton_fill.py compile --needs ... --options tools/zig/dsv41_triton_options.json --arch 121`: each variant through
+   the JIT's own steps without a GPU. Those steps are the function's binder (`create_function_from_signature` for the
+   target) over stand-ins of the specialization, `_pack_args`, `ASTSource` and `triton.compile`. So the signature,
+   constexprs, attrs and options are the ones Python's launch makes. The output is aot.json in `pack_aot`'s form
+   (`"filled": true`). Variants an existing set holds (`--have`, by specialization) are not compiled.
+   - Options are a call site's, so `options` derives one rule per function from the Sparks' 18 night manifests. All
+     agree. `mhc_dec`'s maxnreg rule is mirrored, and `_dtopk` / `_prune`, which no capture launched, come from their
+     8474f31 call sites. `compile` refuses a function without a rule.
+4. Byte identity needs the image's toolchain and files: Triton 3.7.1, ptxas V13.3.73 (PyPI `nvidia-cuda-nvcc==13.3.73`,
+   the image's `/usr/local/cuda/bin/ptxas`), and the line info's paths (`/dsv41-tf/src`, the image's Triton dir;
+   `get_jit_fn_file_line` is mapped). ptxas also writes each source file's mtime and size into the DWARF line table,
+   from the file at that path. `--stamps` (`stamps --cubins <a set of the image>`) compiles in a bubblewrap root where
+   those paths hold the image's stamps. Without stamps, the SASS is the same and only those DWARF bytes differ.
+5. `build-kit.sh` with `TRITON_FILL=1` runs 1-3 into `$KIT/triton-fill/aot` and ships `triton_fill.py` + the options.
+   `triton_fill.py merge` adds the fill to a served set by specialization (the fill's hashes are another host's
+   Triton key). `sass` compares the fill against a served set's captured cubins.
+
+**Checks (dev box, no GPU):**
+
+| check | result |
+|---|---|
+| pod 24 sm_120 captures (cap24-16 / 24-1 / 24-12, tree 67f3850^): specialization from the binder == captured | 103/103 |
+| the same, SASS (`nvdisasm -c`) == captured cubin | 103/103 |
+| the same with stamps read from the capture's own cubins: cubin bytes == captured (sha256 == the manifest's) | 29/29 (cap24-16) |
+| the Sparks' sm_121 night manifests (long / rows / taps-aot, capture-p, seed4101 ref; 8474f31): specialization == captured | 313/313 (cubins stay on the Sparks: SASS is window step 2) |
+| options rules vs every Spark variant | 17 functions, 0 disagree (+ 2 from call sites) |
+| `aot-needs` at 4 x 1M (fill-4x1m.env) | 149,317 programs, 134 variants (decode 39, + row mode 18, + prefill 73, + DSpark 4; 14 prefill regimes); 10.5 min (5.9 min CPU, ReleaseFast) |
+| `compile` of those needs, `--have` the night's 7 local sets | **119 already held** (the Zig reduction and Python's specialization name the same variant), **15 compiled**, 0 failed: `_dtopk` / `_block_keys` with `ROWS` (row mode, never captured), `_dtopk` mode 2 in 4 classes (one slot past 1,015,808 positions, `acae981`), `_stream` with `nsplit % 16 == 0` (the night's gap 5 class), `_site` with `R % 16 == 0` x 4, one `_scores`; 1.5 MB |
+| `merge` twice into a copy of a set, then `sass` against it | 15 added then 0; 15/15 SASS and bytes |
+
+**Limits.** Prefill coverage is every row count at each regime's first start: starts that are not multiples of 2,048
+(a resumed session's prompt) are sampled, not proven. The images path (`IMAGES` off) and `TF_DSV41_PF_DENSE=fused`'s
+replacement of `_gemm` are not modelled; `_gemm`'s variants are listed anyway (a superset).
+
+#### NEXT SPARK WINDOW: 4 slots x 1M and the AOT fill (not run)
+
+The kit is built from this section's commit or later, with the fill. Check the lease on dgx-01 before any step.
+`K=~/zig-window-kit-rows1m`, `ASSETS=~/ai/dsv41-zig-assets` on both hosts, `IMAGE=tensorfold-dsv41:e1e2-8474f31`.
+
+0. **Dev box, before the window:** the kit with the fill (`TRITON_FILL_HAVE` empty, so step 2 can compare every
+   variant the served set also holds):
+   ```
+   git -C ~/Documents/Projects/spark-work/tensorfold-decode1 archive 8474f31 src | tar -x -C /tmp/py8474
+   TRITON_FILL=1 TRITON_FILL_PY=/tmp/py8474/src TRITON_FILL_PYTHON=~/.cache/dsq-triton-fill/venv/bin/python \
+   TRITON_FILL_PTXAS=~/.cache/dsq-triton-fill/cuda133/nvidia/cu13/bin/ptxas \
+   TRITON_FILL_ENV=tools/zig/dsv41_m4/fill-4x1m.env FATBINS=<fatbin-kit> TP_FATBIN=<tp_mailbox.fatbin> \
+   KIT_COMMIT=<commit> bash tools/zig/dsv41_m2c2/build-kit.sh $K
+   ```
+   Expect `compile.json` `failed: []`. Copy `$K` to both Sparks and check `SHA256SUMS`.
+1. **No downtime (prod up):** Python prod's long T0 replies, for step 5:
+   `python3 $K/bench_http.py --url http://127.0.0.1:8000 --label prod --long 400000,900000 --out $K/out/prod-long2.json`
+   (one stream each; 900K takes about 10 min of prefill).
+2. **The fill's SASS against the served set's captured sm_121 cubins** (both hosts, no GPU work):
+   ```
+   docker run --rm -v $K:/kit -v $ASSETS:/assets -e TRITON_NVDISASM_PATH=/usr/local/cuda/bin/nvdisasm $IMAGE \
+     python3 /kit/tools/zig/triton_fill.py sass --fill /kit/triton-fill/aot --served /assets/aot
+   ```
+   PASS = `differ: []`, with `both` > 0 (every variant both sets hold has the same SASS). Then the image's stamps,
+   for byte-identical fills from the next kit on:
+   `docker run --rm -v $K:/kit $IMAGE python3 /kit/tools/zig/triton_fill.py stamps --root /dsv41-tf/src
+   /usr/local/lib/python3.12/dist-packages/triton --out /kit/triton-fill/stamps.json`. Copy it back to the dev box
+   (`TRITON_FILL_STAMPS`). With stamps, a later `sass` must show `bytes_equal == both`.
+3. **Merge** (both hosts): `cp -r $ASSETS/aot $ASSETS/aot.pre-fill && python3 $K/tools/zig/triton_fill.py merge
+   $ASSETS/aot $K/triton-fill/aot`. Keep `aot.pre-fill` for the rollback.
+4. **Boot 4 x 1M** (prod down; part 4's Zig-as-prod shape with `CONTEXT=1048576`, `SLOTS=4`, `SLOT_DRAFTS=1`,
+   `POOL_TOKENS=1400000`, prod's knobs and the merged `ASSETS`; `run_m4.sh 0 OUT server` / `run_m4.sh 1 OUT follow`,
+   `GRAPHS=1`). PASS = rank 0 logs `serving: 4 slot(s)` and `row graphs: on`, no `UnknownRowsCall`, no
+   `MissingTritonVariant`, the canaries answer. Record both ranks' free memory after boot (the plan's new `L.ix.keys`
+   / `L.scores` / `L.ix.bkeys`: about 208 MiB a rank).
+5. **Long context on 4 slots** (the row path's blocked selections and dtopk at 400K / 900K):
+   `python3 $K/bench_http.py --url http://127.0.0.1:8091 --label zig --long 400000,900000 --out $K/out/zig-long2.json`
+   while a second shell runs `python3 $K/bench_http.py --url http://127.0.0.1:8091 --streams 4 --reps 1 --out
+   $K/out/zig-mix.json` (short slots beside the long one). PASS = no error on either rank, and
+   `bench_http.py --compare $K/out/prod-long2.json $K/out/zig-long2.json` equal T0 replies (with the prompt-tail fix,
+   `a390113`, in the kit). If they differ, report the first differing token per length; that is a new divergence,
+   not this change.
+6. **No missing variant across the night's workloads:** rerun run B2's bench (`--streams 1,4`) and run C's 32K / 131K
+   cells on the 4 x 1M server, with no new AOT phase. PASS = 0 `MissingTritonVariant` in both ranks' logs.
+7. Prod back on perf1 (`scripts/v2-rollback.sh perf1`). Keep `out/`, `triton-fill/`, the `sass` / `merge` output and
+   both ranks' logs in the quant repo's results.
 
 ### Spark window, 2026-10-07: outcome
 

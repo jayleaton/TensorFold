@@ -33,6 +33,29 @@ mkdir -p "$KIT/tools/zig/dsv41_vision" && cp tools/zig/dsv41_vision/vision_ref.p
 # long context (the long-aot phase's rope tables) and the serving / ops steps (RUNBOOK.md part 4)
 cp tools/zig/dsv41_rope_tables.py "$KIT/tools/zig/"
 mkdir -p "$KIT/tools/zig/dsv41_ops" && cp tools/zig/dsv41_ops/WINDOW-STEPS.md tools/zig/dsv41_ops/wire_probe.py "$KIT/tools/zig/dsv41_ops/"
+# the AOT fill (port doc "AOT fill"): every Triton variant the served config can launch (tf-dsv41-m1 aot-needs, a host
+# build), compiled from the served Python tree's Triton source for sm_121 (tools/zig/triton_fill.py) into
+# $KIT/triton-fill/aot, minus the variants the sets in TRITON_FILL_HAVE already hold. TRITON_FILL=1 with:
+#   TRITON_FILL_PY      the served tree's src/ (prod's TF_COMMIT: git archive 8474f31 of tensorfold-decode1)
+#   TRITON_FILL_PYTHON  a python with triton==3.7.1 and torch (CPU) - the image's Triton
+#   TRITON_FILL_PTXAS   ptxas V13.3.73 (the image's /usr/local/cuda/bin/ptxas; PyPI nvidia-cuda-nvcc==13.3.73)
+#   TRITON_FILL_ENV     the served engine's env file (TF_DSV41_CONTEXT, _SLOTS, _ROWS_CAP, R1's knobs, ...)
+#   TRITON_FILL_HAVE    aot dirs already served (space separated; optional)
+#   TRITON_FILL_STAMPS  stamps.json of the image's files (optional: byte-identical cubins; without, the same SASS)
+if [[ "${TRITON_FILL:-0}" == 1 ]]; then
+    PYF=${TRITON_FILL_PYTHON:?python with triton 3.7.1}; FILL=$KIT/triton-fill; mkdir -p "$FILL"
+    export TRITON_PTXAS_PATH=${TRITON_FILL_PTXAS:?ptxas 13.3.73} TRITON_PTXAS_BLACKWELL_PATH=$TRITON_FILL_PTXAS
+    zig build -Doptimize=ReleaseFast -j4 --prefix "$KIT/.host" install
+    "$PYF" tools/zig/triton_fill.py sigs --py "${TRITON_FILL_PY:?served src}" --out "$FILL/sigs.json"
+    (set -a; source "${TRITON_FILL_ENV:?served env}"; set +a
+     "$KIT/.host/bin/tf-dsv41-m1" aot-needs "$FILL/sigs.json" "$FILL/needs.json") 2>&1 | tee "$FILL/needs.log"
+    rm -rf "$KIT/.host"
+    # shellcheck disable=SC2086
+    "$PYF" tools/zig/triton_fill.py compile --py "$TRITON_FILL_PY" --needs "$FILL/needs.json" \
+        --options tools/zig/dsv41_triton_options.json --arch 121 --out "$FILL/aot" \
+        ${TRITON_FILL_HAVE:+--have $TRITON_FILL_HAVE} ${TRITON_FILL_STAMPS:+--stamps "$TRITON_FILL_STAMPS"} | tee "$FILL/compile.json"
+    cp tools/zig/triton_fill.py tools/zig/dsv41_triton_options.json "$KIT/tools/zig/"
+fi
 chmod +x "$KIT/run_host.sh" "$KIT/run_m4.sh" "$KIT/requests.sh" "$KIT/restore.sh" "$KIT/tf-dsv41-m1" "$KIT/tensorfold-dsv41"
 git rev-parse HEAD > "$KIT/COMMIT" 2>/dev/null || echo "${KIT_COMMIT:?KIT_COMMIT: the commit of an archived tree (no .git)}" > "$KIT/COMMIT"
 (cd "$KIT" && find . -type f ! -name SHA256SUMS | sort | xargs sha256sum > SHA256SUMS)
