@@ -31,6 +31,8 @@ pub const graph = @import("graph.zig");
 pub const cublaslt = @import("cublaslt.zig");
 pub const nccl = @import("nccl.zig");
 pub const roce = @import("roce.zig");
+/// MiaAI-Lab's one-shot RoCE all-gather for her Flash Next engine (families/flashnext_mia), beside upstream's roce.zig.
+pub const roce_mia = @import("roce_mia.zig");
 pub const triton = @import("triton.zig");
 pub const aot = @import("aot.zig");
 pub const kernels = @import("kernels.zig");
@@ -115,6 +117,7 @@ test {
     _ = @import("experts_waves.zig");
     _ = @import("sample.zig");
     _ = @import("roce.zig");
+    _ = @import("roce_mia.zig");
     _ = @import("roce_nap.zig");
     _ = @import("rank_scatter.zig");
     _ = @import("relay_plan.zig");

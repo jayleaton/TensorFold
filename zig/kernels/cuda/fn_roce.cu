@@ -1,7 +1,7 @@
 // The GPU half of the one-shot RoCE all-gather between two DGX Sparks (decode plan D1, work/research/R1-decode.md 3.1):
 // b12x's "RoCEnante" protocol (https://github.com/local-inference-lab/b12x, b12x/comm/roce, by the b12x contributors
 // at Local Inference Lab, Apache License 2.0), written anew in CUDA C++ for TensorFold's Zig runtime (the host half is
-// zig/src/cuda/roce_proxy.c, the driver zig/src/cuda/roce.zig; the region layout is described there).
+// zig/src/cuda/roce_proxy.c, the driver zig/src/cuda/roce_mia.zig; the region layout is described there).
 //
 // One launch is one all-gather of `n` units (16 or 4 bytes) a rank into out[world][n], rank 0's first, as
 // ncclAllGather lays it out: stage this rank's shard into the pinned send slot, ring the proxy (the last block, after
@@ -101,7 +101,7 @@ __global__ void __launch_bounds__(512) gather(const T* in, T* out, int n, unsign
     while (ld_acquire_sys(f) != seq) {
       if (globaltimer() - t0 > timeout_ns) {
         // the peer is gone or its proxy failed: say which, then trap rather than read a stale slot (a fatal error for
-        // the context: the process restarts; roce.zig timedOut reads the sequence and the peer)
+        // the context: the process restarts; roce_mia.zig timedOut reads the sequence and the peer)
         st_relaxed_sys(ctrl + 3, (unsigned)peer);
         st_relaxed_sys(ctrl + 2, seq);
         __threadfence_system();
