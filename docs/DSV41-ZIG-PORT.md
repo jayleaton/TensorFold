@@ -1800,6 +1800,7 @@ Kit from `fc43fecd` or later with a glue fatbin holding `ds_cands` (`FATBINS=dsv
 | D2 tokens | `bench_http.py --work code --temps 0 --streams 1 --reps 2` and `--streams 4`, against the same cells with `TF_DSV41_DRAFT_GRAPHS=0` | ~20 min | **T0 replies equal** (`--compare`); `dsv41 spec:` launched **> 80 % of `draft.pass` n** at 1 stream (the night: 800 of 7,493; `6237ee39`) and > 0 at 4 streams; shutdown's `draft graphs:` line: graphed ~= passes - 8 |
 | D3 speed | the two runs' `phases.json` | - | `draft.pass` ms_avg **< 4.5** at 1 stream (was 7.0); code 1-stream **> 62**, 4-stream **> 88** |
 | D2b device start | D2's 1-stream cell with `TF_DSV41_GREEDY_GPU=1` added (both ranks), against D2's | ~10 min | **T0 replies equal**; shutdown's `draft graphs: N speculative passes started from the device pick, M unused`, N > 80 % of `dsv41 spec:`'s launches; `draft.wait` ms_avg below D2's |
+| D2c device start, 4 slots | D2's 4-stream cell (B2's shape) with `TF_DSV41_GREEDY_GPU=1`, against D2's 4-stream cell | ~10 min | **T0 replies equal**; shutdown's `slot drafts: N speculative rounds started from the device pick, M unused`, N > 80 % of `dsv41 spec:`'s launches; `draft.wait` ms_avg below D2's |
 | D4 on failure | a `differ` line or a capture failure: record it, rerun with `TF_DSV41_DRAFT_GRAPHS=device` (eager), then 0 | ~10 min | the line and the first differing row in the report |
 | D5 the 20-row pass's capture (one GPU, ~3 min; prod may stay up only if a GPU is free, else in the downtime) | the night's set P capture (`run_m4.sh`'s `capture-p` step: prod's knobs + R1, 8474f31's tree) with `-e M1_DRAFT_SLOTS=4 --out /out/capture-p4`. Back on the dev box: `tf-dsv41-m1 dcheck capture-p4` | ~10 min | capture log `{"ops": ...}` with a `q4` phase in `ops.jsonl`. `dcheck` prints `P q4 (n 20): x/y calls equal`: today's `emitPassSlots(4)` against Python's 20-row pass. Its mismatches (expected: the first site and the final on `_site` / `_finish_k` instead of `mhc_cuda`, the router's above-16-row config, the experts at 20 rows) are the emitter's work list, and the gate it must then pass at 0. Keep `capture-p4/aot` (the 20-row pass's Triton variants for the served set) |
 
@@ -1864,10 +1865,25 @@ pass starts from the window's device pick, before either host waits. With `TF_DS
 
 Draft ids are the host-ordered pass's: the same rings and the same statics. `mdraft_test` checks that `ds_stage` over
 the placeholder staging equals `fillStatics(bonus, P)`; `dspark_rows.stageMirror` mirrors the kernel's arithmetic.
-Sampled rounds and row mode keep the host order: the device pick is greedy and one slot; Python's `vsample` keyed
-choice and the 4-slot device start are follow-ups. The kit's glue fatbin must hold `ds_cands`, `ds_stage`,
-`pick_pack` and `pick_merge`: `dsv41-zig-ref/fatbin-kit-dsg` (rebuilt from `61806079`'s glue.cu; every older kernel's
-SASS equals `fatbin-kit`'s).
+**Row mode (`ec7855e6`; prod's shape, 4 slots).** Row windows report `chain` false, so the slots' values come from
+`glue.cu`:
+- lanes arms each greedy slot (op 43 [slot, start, rows]);
+- `SlotPass` takes `after_pick` over. For the armed slots whose rows are all in this forward (`batch.pend`):
+  - `ds_accept_rows`: each slot's (accepted, bonus, next position), `pick_merge`'s walk over the slot's own rows,
+    copied back;
+  - each slot's window taps into its rings;
+  - then each group (`devLaunchRound`'s grouping) is staged as `dspark_rows.stage` with placeholders, rewritten by
+    `ds_stage_rows`, and launched.
+- `begin` takes the round when its slots and every slot's (bonus, next position) are the asks'. It waits for the
+  accept's copy alone.
+
+`mdraft_test` covers both kernels' arithmetic against lanes' accept and `stage()`, for groups of 1-4 slots.
+Keyed (T > 0) rounds keep the host order: Python's `vsample` keyed choice on the device is the follow-up. A round
+split over several forwards (`ROWS_CAP` 16) starts only the slots of the forward that runs the pick.
+
+The kit's glue fatbin must hold `ds_cands`, `ds_stage`, `ds_accept_rows`, `ds_stage_rows`, `pick_pack` and
+`pick_merge`: `dsv41-zig-ref/fatbin-kit-dsg`, rebuilt from `ec7855e6`'s glue.cu (on 1bd3960's); every older kernel's
+SASS equals `fatbin-kit`'s.
 
 #### NEXT SPARK WINDOW: decode windows past 16 rows (not run; after D1-D2)
 
