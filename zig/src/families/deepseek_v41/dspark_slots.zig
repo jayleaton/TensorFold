@@ -81,15 +81,18 @@ pub const SlotPass = struct {
     hscr: ?cuda.HostBuffer = null,
     staged: ?cuda.Event = null,
     prev_pick: ?fwd.Forward.AfterPick = null,
+    prev_sample: ?fwd.Forward.AfterSample = null,
     dstats: struct { device_starts: u64 = 0, device_dropped: u64 = 0 } = .{},
 
     const Begun = struct { n: usize, groups: [16][2]usize, ng: usize };
 
-    const Arm = struct { start: u64, n: u32 };
+    const Arm = struct { start: u64, n: u32, sampled: bool, chosen: bool = false };
     const Dl = struct { k: usize, slots: [16]u32 };
-    /// dscr / hscr layout (int64 elements): ids [64], segs [16][3], acc [16][3], mem [16][16][3] (a group each)
+    /// dscr / hscr layout (int64 elements): ids [64], picks [64] (the window's device choices: the GPU pick's, each
+    /// sampled slot's over its rows), segs [16][3], acc [16][3], mem [16][16][3] (a group each)
     const scr_ids = 0;
-    const scr_segs = 64;
+    const scr_picks = 64;
+    const scr_segs = 128;
     const scr_acc = scr_segs + 48;
     const scr_mem = scr_acc + 48;
     const scr_len = scr_mem + 16 * 48;
@@ -155,6 +158,8 @@ pub const SlotPass = struct {
                     x.staged = try cuda.Event.init(r.d, false);
                     x.prev_pick = f.after_pick;
                     f.after_pick = .{ .ctx = x, .run = afterPick };
+                    x.prev_sample = f.after_sample;
+                    if (ko.vs_choose != null) f.after_sample = .{ .ctx = x, .run = afterSample };
                 }
             }
         }
@@ -165,7 +170,10 @@ pub const SlotPass = struct {
     pub fn deinit(x: *SlotPass) void {
         const gpa = x.gpa;
         x.f.ext = x.prev_ext;
-        if (x.bat != null) x.f.after_pick = x.prev_pick;
+        if (x.bat != null) {
+            x.f.after_pick = x.prev_pick;
+            x.f.after_sample = x.prev_sample;
+        }
         if (x.dscr) |*b| b.free();
         if (x.hscr) |*b| b.free();
         if (x.staged) |*e| e.deinit();
@@ -194,17 +202,18 @@ pub const SlotPass = struct {
         return d.on() and d.stats.passes >= dsd.check_passes;
     }
 
-    /// Pass.arm (rank 0): the slot's coming row window, for the speculative round from its device pick; the followers
-    /// get op 43 [op, slot, start, rows] (the one-slot pass's arm has no slot) before the window.
-    fn arm(p: *anyopaque, slot: u32, start: u64, n_rows: u32) void {
+    /// Pass.arm (rank 0): the slot's coming row window, for the speculative round from its device choices; the
+    /// followers get op 43 [op, slot, start, rows, sampled] (the one-slot pass's arm has no slot) before the window.
+    fn arm(p: *anyopaque, slot: u32, start: u64, n_rows: u32, sampled: bool) void {
         const x = self(p);
         if (x.dl != null) x.dropDevice();
         if (x.bat == null or slot >= x.nslots or !x.devReady()) return;
-        x.sendOp(&.{ gpu.GpuPass.op_arm, slot, @intCast(start), n_rows }) catch |e| {
+        if (sampled and x.f.after_sample == null) return;
+        x.sendOp(&.{ gpu.GpuPass.op_arm, slot, @intCast(start), n_rows, @intFromBool(sampled) }) catch |e| {
             std.log.err("slot drafts: the arm did not reach the followers ({t})", .{e});
             return;
         };
-        x.armed[slot] = .{ .start = start, .n = n_rows };
+        x.armed[slot] = .{ .start = start, .n = n_rows, .sampled = sampled };
     }
 
     fn dropDevice(x: *SlotPass) void {
@@ -213,25 +222,53 @@ pub const SlotPass = struct {
         x.armed = @splat(null);
     }
 
-    /// forward.after_pick, every rank, after a row window's device pick: for the armed slots whose rows are all in
-    /// this forward, each one's window taps into its rings (no stream drain), the slots' (accepted, bonus, next
-    /// position) from the picks (ds_accept_rows, copied back for `begin`), then each group's statics (dspark_rows.stage
-    /// with placeholders, ds_stage_rows from the pick) and pass (its graph if captured, never a capture here).
+    /// forward.after_pick, every rank, after a row window's GPU pick: its picks into the window's device choices, the
+    /// greedy armed slots chosen; then the round starts if every armed slot of this forward has its choice.
     fn afterPick(ctx: *anyopaque, pick: fwd.Forward.PickDevice) anyerror!void {
         const x: *SlotPass = @ptrCast(@alignCast(ctx));
-        const armed = x.armed;
-        x.armed = @splat(null);
         const b = x.bat orelse return;
-        if (pick.chain or x.begun != null or !x.devReady() or pick.n != b.n) return;
+        if (pick.chain or pick.n != b.n or pick.n > 64) return;
+        const r = x.f.runner;
+        try r.d.check(r.d.api.cuMemcpyDtoDAsync_v2(x.dscr.?.ptr + 8 * scr_picks, pick.out, 8 * @as(usize, pick.n), r.stream.handle), "cuMemcpyDtoDAsync");
+        for (&x.armed) |*am| if (am.*) |*a| if (!a.sampled) {
+            a.chosen = true;
+        };
+        return x.tryLaunch();
+    }
+
+    /// forward.after_sample, every rank, after a sampled call's device choice (vsample.choose): a sampled armed
+    /// slot whose rows these are gets them in the window's device choices; then the round starts if it can.
+    fn afterSample(ctx: *anyopaque, row0: u32, n: u32, chosen: u64) anyerror!void {
+        const x: *SlotPass = @ptrCast(@alignCast(ctx));
+        const b = x.bat orelse return;
+        for (&x.armed, 0..) |*am, sl| if (am.*) |*a| if (a.sampled) {
+            const pd = b.pend[sl] orelse continue;
+            if (pd.stashed or pd.a != row0 or pd.n != n or pd.a + pd.n > 64) continue;
+            const r = x.f.runner;
+            try r.d.check(r.d.api.cuMemcpyDtoDAsync_v2(x.dscr.?.ptr + 8 * (scr_picks + pd.a), chosen, 8 * @as(usize, n), r.stream.handle), "cuMemcpyDtoDAsync");
+            a.chosen = true;
+        };
+        return x.tryLaunch();
+    }
+
+    /// The round from the window's device choices, every rank alike, once every armed slot whose rows are all in
+    /// this forward (batch.pend) has its choice: each slot's (accepted, bonus, next position) (ds_accept_rows, copied
+    /// back for `begin`), its window taps into its rings (no stream drain), then each group's statics
+    /// (dspark_rows.stage with placeholders, ds_stage_rows) and pass (its graph if captured, never a capture here).
+    fn tryLaunch(x: *SlotPass) !void {
+        const b = x.bat orelse return;
+        if (x.begun != null or !x.devReady()) return;
         var slots: [16]u32 = undefined;
         var k: usize = 0;
-        for (armed[0..x.nslots], 0..) |am, sl| if (am) |a| {
+        for (x.armed[0..x.nslots], 0..) |am, sl| if (am) |a| {
             const pd = b.pend[sl] orelse continue;
-            if (pd.stashed or pd.start != a.start or pd.n != a.n or pd.a + pd.n > pick.n or a.n > x.one.ingest_rows) continue;
+            if (pd.stashed or pd.start != a.start or pd.n != a.n or pd.a + pd.n > b.n or a.n > x.one.ingest_rows) continue;
+            if (!a.chosen) return; // a slot of this forward still waits for its choice
             slots[k] = @intCast(sl);
             k += 1;
         };
         if (k == 0) return;
+        x.armed = @splat(null);
         const d = x.dev.?;
         const f = x.f;
         const r = f.runner;
@@ -244,9 +281,11 @@ pub const SlotPass = struct {
             h[scr_segs + 3 * j ..][0..3].* = .{ pd.a, pd.n, @intCast(pd.start) };
         }
         const dev = x.dscr.?.ptr;
-        try cuda.DeviceBuffer.uploadAsync(.{ .d = r.d, .ptr = dev, .len = 8 * scr_acc }, 0, std.mem.sliceAsBytes(h[0..scr_acc]), r.stream.handle);
+        // ids, then segs (the picks between them are the device's, written above)
+        try cuda.DeviceBuffer.uploadAsync(.{ .d = r.d, .ptr = dev, .len = 8 * scr_picks }, 0, std.mem.sliceAsBytes(h[0..scr_picks]), r.stream.handle);
+        try cuda.DeviceBuffer.uploadAsync(.{ .d = r.d, .ptr = dev + 8 * scr_segs, .len = 8 * (scr_acc - scr_segs) }, 0, std.mem.sliceAsBytes(h[scr_segs..scr_acc]), r.stream.handle);
         const ops = r.kernels.others(r.stream);
-        try ops.dsAcceptRows(pick.out, dev + 8 * scr_ids, dev + 8 * scr_segs, k, dev + 8 * scr_acc);
+        try ops.dsAcceptRows(dev + 8 * scr_picks, dev + 8 * scr_ids, dev + 8 * scr_segs, k, dev + 8 * scr_acc);
         try r.d.check(r.d.api.cuMemcpyDtoHAsync_v2(x.hscr.?.bytes.ptr + 8 * scr_acc, dev + 8 * scr_acc, 8 * 3 * k, r.stream.handle), "cuMemcpyDtoHAsync");
         try x.staged.?.record(r.stream);
         // each slot's whole window into its rings (spec.py: rows past the commit lie past every later pass's context)
@@ -620,11 +659,11 @@ pub const SlotPass = struct {
                 try x.doIngest(@intCast(msg[1]), @intCast(msg[2]), .{ .src = msg[3], .skip = msg[4] }, @intCast(msg[5]));
             },
             gpu.GpuPass.op_arm => {
-                // [op, slot, start, rows]: this pass's arm; [op, start, rows]: the one-slot pass's
-                if (msg.len == 4) {
+                // [op, slot, start, rows, sampled]: this pass's arm; [op, start, rows, sampled]: the one-slot pass's
+                if (msg.len == 5) {
                     const sl: usize = @intCast(msg[1]);
                     if (sl >= x.nslots) return error.BadPlan;
-                    x.armed[sl] = .{ .start = @intCast(msg[2]), .n = @intCast(msg[3]) };
+                    x.armed[sl] = .{ .start = @intCast(msg[2]), .n = @intCast(msg[3]), .sampled = msg[4] != 0 };
                     return;
                 }
                 const e = x.prev_ext orelse return error.BadPlan;

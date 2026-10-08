@@ -19,6 +19,27 @@ const Case = struct {
     nucleus: u32 = serve.sampling.nucleus_count,
     got: []u32,
     whole: []usize,
+    /// rank 0: vs_choose's mirror over the gathered candidates (sampling_pipe.chooseMirror), per row; null: not run
+    mirror: ?[]i64 = null,
+};
+
+/// The download hook on rank 0 (sampling_gpu.zig's place): the mirror over the gathered candidates, then the pipe's
+/// own download (false).
+const Mirror = struct {
+    c: *Case,
+    fn run(ctx: *anyopaque, gathered: u64, n: usize, k: usize, count: usize, host: []u8) anyerror!bool {
+        _ = host;
+        const m: *Mirror = @ptrCast(@alignCast(ctx));
+        const W: usize = m.c.world;
+        const g: [*]const f32 = @ptrFromInt(gathered);
+        const a = testing.allocator;
+        const keys = try a.alloc(u64, W * k);
+        defer a.free(keys);
+        const work = try a.alloc(f64, 1024);
+        defer a.free(work);
+        pipe.chooseMirror(keys, work, g[0 .. W * n * 2 * k], W, n, k, count, m.c.sampling, m.c.positions[0], m.c.mirror.?);
+        return false;
+    }
 };
 
 /// Rank `me` of a window: its vocabulary slice of each row (contiguous [rows, V]), the pipeline's tokens on rank 0.
@@ -33,6 +54,8 @@ fn rankBody(comm: tp.collective.Collective, me: u32, c: *Case) anyerror!void {
     defer dev.deinit();
     var p = try pipe.Pipe.init(a, comm, @intCast(V), c.nucleus);
     defer p.deinit();
+    var mh: Mirror = .{ .c = c };
+    if (me == 0 and c.mirror != null) p.after_gather = .{ .ctx = &mh, .run = Mirror.run };
     const out = try a.alloc(u32, c.rows);
     defer a.free(out);
     try p.choose(dev.device(), @intFromPtr(mine.ptr), c.rows, c.sampling, if (me == 0) c.positions else null, out);
@@ -142,4 +165,70 @@ test "a window's rows pick as each row does alone (one call, several positions, 
             try testing.expectEqual(@as(u32, @intCast(want)), all[r]);
         }
     };
+}
+
+test "vs_choose's arithmetic (its host mirror) picks the pipeline's tokens on the serving goldens' keyed rows" {
+    // the device choice (glue.cu vs_choose) only decides where the speculative pass starts; its mirror, with libc's
+    // exp / log, must equal the host pick on every non-nucleus keyed row, so only libdevice's last bits can differ
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var it = std.mem.splitScalar(u8, serve.fixtures.sampling, '\n');
+    var rows: usize = 0;
+    var bad: usize = 0;
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        _ = arena.reset(.retain_capacity);
+        const g = try parse(arena.allocator(), line);
+        const s = g.s orelse continue;
+        if (!pipe.sampled(s) or g.logits.len % g.world != 0) continue;
+        if (s.top_k == 0 and s.top_p > 0 and s.top_p < 1) continue; // nucleus rows: the host's statistics
+        var got: [1]u32 = .{0};
+        var w: [1]usize = .{0};
+        var mirror: [1]i64 = .{-2};
+        var c: Case = .{ .logits = g.logits, .world = g.world, .rows = 1, .sampling = s, .positions = &.{g.position}, .got = &got, .whole = &w, .mirror = &mirror };
+        try run(&c);
+        if (mirror[0] == -2) continue; // taken whole (k past the device bound): no gathered candidates
+        rows += 1;
+        if (mirror[0] != got[0]) {
+            bad += 1;
+            if (bad <= 5) std.debug.print("row {d}: mirror {d}, pipeline {d} (sampling {any})\n", .{ rows, mirror[0], got[0], s });
+        }
+    }
+    std.debug.print("vs_choose mirror: {d}/{d} keyed rows as the pipeline picks them\n", .{ rows - bad, rows });
+    try testing.expect(rows > 20);
+    try testing.expectEqual(@as(usize, 0), bad);
+}
+
+test "vs_choose's mirror == the pipeline's picks over top_k x top_p x min_p x temperature, one and two ranks" {
+    const a = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(4101);
+    const rnd = prng.random();
+    const vocab = 4096;
+    const n = 6;
+    const logits = try a.alloc(f32, n * vocab);
+    defer a.free(logits);
+    const positions = [_]u64{ 300, 301, 302, 303, 304, 305 };
+    var rows: usize = 0;
+    for (0..3) |round| {
+        // flat-ish rows (the top-p cut lands inside the top k), peaked rows, and ties (bf16-valued)
+        for (logits, 0..) |*v, i| {
+            const spread: f64 = if (round == 0) 0.6 else 2.5;
+            const x: f32 = @floatCast(rnd.floatNorm(f64) * spread + @as(f64, if (i % vocab < 3) 4 else 0));
+            v.* = if (round == 2) @bitCast(@as(u32, @bitCast(x)) & 0xFFFF_0000) else x;
+        }
+        for ([_]u32{ 20, 40, 100 }) |top_k| for ([_]f64{ 0.5, 0.8, 0.95, 1.0 }) |top_p| for ([_]f64{ 0, 0.05 }) |min_p| for ([_]f64{ 0.6, 1.3 }) |t| for ([_]u32{ 1, 2 }) |world| {
+            const s: pipe.Sampling = .{ .seed = rnd.int(u64) >> 1, .temperature = t, .top_k = top_k, .top_p = top_p, .min_p = min_p };
+            var got: [n]u32 = undefined;
+            var w: [1]usize = .{0};
+            var mirror: [n]i64 = @splat(-2);
+            var c: Case = .{ .logits = logits, .world = world, .rows = n, .sampling = s, .positions = &positions, .got = &got, .whole = &w, .mirror = &mirror };
+            try run(&c);
+            for (got, mirror) |g, m| {
+                try testing.expectEqual(@as(i64, g), m);
+                rows += 1;
+            }
+        };
+    }
+    try testing.expectEqual(@as(usize, 3 * 3 * 4 * 2 * 2 * 2 * n), rows);
 }

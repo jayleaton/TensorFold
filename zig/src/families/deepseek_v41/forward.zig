@@ -111,6 +111,7 @@ pub const Forward = struct {
     /// TF_DSV41_DRAFT_GRAPHS with TF_DSV41_SPEC_DRAFT (dspark_gpu.zig): enqueued after the device pick; `pick_done`
     /// the copy back's event the host waits on then
     after_pick: ?AfterPick = null,
+    after_sample: ?AfterSample = null,
     pick_done: ?cuda.Event = null,
     /// the prefill's state (forward_prefill.zig)
     prefill_state: pf.State = .{},
@@ -377,6 +378,10 @@ pub const Forward = struct {
     /// Work enqueued from the device pick (dspark_gpu.zig's speculative pass), on every rank, after the pick's copy back
     /// and before the host waits for it.
     pub const AfterPick = struct { ctx: *anyopaque, run: *const fn (ctx: *anyopaque, pick: PickDevice) anyerror!void };
+
+    /// Work enqueued from a sampled call's device choices (sampling_gpu.zig: vsample.choose, every rank), rows
+    /// [row0, row0 + n) of "w.logits" chosen into `chosen` int64 [n], before the host waits for the candidates.
+    pub const AfterSample = struct { ctx: *anyopaque, run: *const fn (ctx: *anyopaque, row0: u32, n: u32, chosen: u64) anyerror!void };
 
     pub fn pickDevice(f: *const Forward) ?PickDevice {
         return f.pick_last;

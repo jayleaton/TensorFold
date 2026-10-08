@@ -63,8 +63,13 @@ pub const GpuPass = struct {
     last_v: usize = 0,
     /// the speculative pass from the device pick (spec.py's order; Pass.arm, forward.after_pick): the armed window
     /// (start, rows) until its pick, then the pass launched from it until `begin` takes it (rank 0)
-    armed: ?struct { start: u64, n: u32 } = null,
-    dl: ?struct { start: u64, n: u32, host: [*]const i64 } = null,
+    armed: ?struct { start: u64, n: u32, sampled: bool } = null,
+    /// `wait`: the host values come from the accept's copy (a sampled window): `begin` waits for `staged` first
+    dl: ?struct { start: u64, n: u32, host: [*]const i64, rows: u32, wait: bool = false } = null,
+    /// a sampled window's accept: device ids / segment / result, its pinned copy and event
+    sscr: ?cuda.DeviceBuffer = null,
+    shost: ?cuda.HostBuffer = null,
+    staged: ?cuda.Event = null,
     /// `begin` took a device-launched pass: `collect` waits and unpacks without counting a pass again
     begun_dev: bool = false,
     prev_ext: ?fwd.Forward.Ext = null,
@@ -132,6 +137,12 @@ pub const GpuPass = struct {
                 // the speculative pass from the device pick (needs TF_DSV41_GREEDY_GPU's pick and ds_stage)
                 if (r.kernels.others(r.stream).f.ds_stage != null) {
                     f.after_pick = .{ .ctx = x, .run = afterPick };
+                    if (r.kernels.others(r.stream).f.ds_accept_rows != null) {
+                        x.sscr = try cuda.DeviceBuffer.alloc(r.d, 8 * 128);
+                        x.shost = try cuda.HostBuffer.alloc(r.d, 8 * 128);
+                        x.staged = try cuda.Event.init(r.d, false);
+                        f.after_sample = .{ .ctx = x, .run = afterSample };
+                    }
                     x.prev_ext = f.ext;
                     f.ext = .{ .ptr = x, .run = followExt };
                 }
@@ -147,6 +158,10 @@ pub const GpuPass = struct {
             x.f.after_pick = null;
             x.f.ext = x.prev_ext;
         }
+        if (x.f.after_sample != null and x.f.after_sample.?.ctx == @as(*anyopaque, x)) x.f.after_sample = null;
+        if (x.sscr) |*b| b.free();
+        if (x.shost) |*b| b.free();
+        if (x.staged) |*e| e.deinit();
         if (x.dev) |d| {
             if (x.stats.device_starts + x.stats.device_dropped > 0) std.log.scoped(.dsv41).info("draft graphs: {d} speculative passes started from the device pick, {d} unused", .{ x.stats.device_starts, x.stats.device_dropped });
             d.deinit();
@@ -177,27 +192,29 @@ pub const GpuPass = struct {
 
     const vtable: iface.Pass.VTable = .{ .ingest = ingest, .propose = propose, .reset = reset, .markov = heads, .begin = begin, .collect = collect, .arm = arm };
 
-    /// 43 (dspark_rows' range 40-43): [op, start, rows] the armed window (every rank: the pass starts from its pick)
+    /// 43 (dspark_rows' range 40-43): [op, start, rows, sampled] the armed window (every rank: the pass starts from
+    /// its pick); SlotPass's has the slot first (5 words)
     pub const op_arm: i64 = 43;
 
     /// Pass.arm (rank 0): the slot's coming window of `rows` rows at `start`, for the speculative pass from its device
     /// pick; the followers get it before the window. Only once the checks passed and with the device path on.
-    fn arm(p: *anyopaque, slot: u32, start: u64, rows: u32) void {
+    fn arm(p: *anyopaque, slot: u32, start: u64, n_rows: u32, sampled: bool) void {
         const x = self(p);
         x.dropDevice();
         if (slot != 0 or x.f.after_pick == null or !x.devReady()) return;
-        x.f.sendDrafter(&.{ op_arm, @intCast(start), rows }) catch |e| {
+        if (sampled and x.f.after_sample == null) return;
+        x.f.sendDrafter(&.{ op_arm, @intCast(start), n_rows, @intFromBool(sampled) }) catch |e| {
             std.log.err("dspark: the arm did not reach the followers ({t})", .{e});
             return;
         };
-        x.armed = .{ .start = start, .n = rows };
+        x.armed = .{ .start = start, .n = n_rows, .sampled = sampled };
     }
 
     fn followExt(ptr: *anyopaque, msg: []const i64) anyerror!void {
         const x: *GpuPass = @ptrCast(@alignCast(ptr));
         if (msg[0] == op_arm) {
-            if (msg.len != 3) return error.BadPlan;
-            x.armed = .{ .start = @intCast(msg[1]), .n = @intCast(msg[2]) };
+            if (msg.len != 4) return error.BadPlan;
+            x.armed = .{ .start = @intCast(msg[1]), .n = @intCast(msg[2]), .sampled = msg[3] != 0 };
             return;
         }
         const e = x.prev_ext orelse return error.BadPlan;
@@ -217,9 +234,44 @@ pub const GpuPass = struct {
     fn afterPick(ctx: *anyopaque, pick: fwd.Forward.PickDevice) anyerror!void {
         const x: *GpuPass = @ptrCast(@alignCast(ctx));
         const a = x.armed orelse return;
+        if (a.sampled) return; // the sampler's choice starts it (afterSample)
         x.armed = null;
         if (!pick.chain or pick.n != a.n or pick.start != a.start or pick.host == null or x.begun != null) return;
         if (!x.devReady() or a.n > x.ingest_rows) return;
+        try x.launchFrom(a.start, a.n, pick.out, pick.n);
+        if (x.f.comm.rank() == 0 or x.f.link == null) x.dl = .{ .start = a.start, .n = a.n, .host = pick.host.?, .rows = a.n };
+    }
+
+    /// forward.after_sample, every rank, after a sampled window's device choice (sampling_gpu.zig, vsample.choose):
+    /// the window's accept on the device (ds_accept_rows over its one segment, copied back for `begin`), then the
+    /// pass as afterPick starts it.
+    fn afterSample(ctx: *anyopaque, row0: u32, n: u32, chosen: u64) anyerror!void {
+        const x: *GpuPass = @ptrCast(@alignCast(ctx));
+        const a = x.armed orelse return;
+        if (!a.sampled) return;
+        x.armed = null;
+        const p = x.f.slot.pending orelse return;
+        if (row0 != 0 or n != a.n or p.start != a.start or p.n != a.n or x.begun != null) return;
+        if (!x.devReady() or a.n > x.ingest_rows or x.f.ids.len < n) return;
+        const r = x.f.runner;
+        // [ids n | segment 3 | acc 3] int64
+        const h: []i64 = @alignCast(std.mem.bytesAsSlice(i64, x.shost.?.bytes[0 .. 8 * 128]));
+        for (x.f.ids[0..n], 0..) |t, i| h[i] = t;
+        h[64..67].* = .{ 0, n, @intCast(a.start) };
+        const dev = x.sscr.?.ptr;
+        try cuda.DeviceBuffer.uploadAsync(.{ .d = r.d, .ptr = dev, .len = 8 * 67 }, 0, std.mem.sliceAsBytes(h[0..67]), r.stream.handle);
+        try r.kernels.others(r.stream).dsAcceptRows(chosen, dev, dev + 8 * 64, 1, dev + 8 * 68);
+        try r.d.check(r.d.api.cuMemcpyDtoHAsync_v2(x.shost.?.bytes.ptr + 8 * 68, dev + 8 * 68, 8 * 3, r.stream.handle), "cuMemcpyDtoHAsync");
+        try x.staged.?.record(r.stream);
+        // acc [accepted, bonus, next position] reads as a pick of 0 rows: ds_stage takes pick[1], pick[2]
+        try x.launchFrom(a.start, a.n, dev + 8 * 68, 0);
+        if (x.f.comm.rank() == 0 or x.f.link == null) x.dl = .{ .start = a.start, .n = 0, .host = @ptrCast(h[68..].ptr), .rows = a.n, .wait = true };
+    }
+
+    /// The device start's launches, every rank: the window's taps, the statics (placeholders, then ds_stage from
+    /// `pick` [nw + 3]'s bonus and next position), the pass (its graph if captured), the event; counted here.
+    fn launchFrom(x: *GpuPass, start: u64, n: u32, pick: u64, nw: u32) !void {
+        const a = .{ .start = start, .n = n };
         const d = x.dev.?;
         const r = x.f.runner;
         // every row of the window (Python ingests the whole window: rows past the commit lie past every later pass's
@@ -233,13 +285,12 @@ pub const GpuPass = struct {
         const s32 = r.addressOf("w.ds.i32") orelse return error.Unbound;
         try cuda.DeviceBuffer.uploadAsync(.{ .d = r.d, .ptr = s64, .len = 8 * sv[0].len }, 0, std.mem.sliceAsBytes(sv[0]), r.stream.handle);
         try cuda.DeviceBuffer.uploadAsync(.{ .d = r.d, .ptr = s32, .len = 4 * sv[1].len }, 0, std.mem.sliceAsBytes(sv[1]), r.stream.handle);
-        try r.kernels.others(r.stream).dsStage(pick.out, pick.n, s64, s32, @intCast(st.n), @intCast(st.window), @intCast(emit.ringRows(x.f.cfg)), x.valid, x.shape.noise, stageOffsets(st));
+        try r.kernels.others(r.stream).dsStage(pick, nw, s64, s32, @intCast(st.n), @intCast(st.window), @intCast(emit.ringRows(x.f.cfg)), x.valid, x.shape.noise, stageOffsets(st));
         r.glue = .{ .ctx = x, .run = glueFn };
         const extra = [_]u64{ if (x.send) |b| b.ptr else 0, if (x.send) |b| b.len else 0 };
         try d.issueReplay(0, dsd.fingerprint(r, d, &extra), .{ .ctx = x, .run = passBody });
         try d.mark();
         try d.settle(); // counted here on every rank (rank 0's collect does not count it again)
-        if (x.f.comm.rank() == 0 or x.f.link == null) x.dl = .{ .start = a.start, .n = a.n, .host = pick.host.? };
     }
 
     /// ds_stage's offsets: positions, tokens, counts, lo, hi, anchor (ids and start at 0).
@@ -289,7 +340,7 @@ pub const GpuPass = struct {
         if (rows.len == 0) return;
         for (rows, 0..) |r, i| if (r != rows[0] + i) return error.NotAPrefix;
         // the device-launched pass already ingested its window's rows (afterPick): the same rows at the same positions
-        if (x.dl) |dl| if (start == dl.start and rows[0] == 0 and rows.len <= dl.n) return;
+        if (x.dl) |dl| if (start == dl.start and rows[0] == 0 and rows.len <= dl.rows) return;
         const n: u32 = @intCast(rows.len);
         const ops = fwd.Forward.dsIngestOp(start, rows[0], n, taps.rows);
         try x.f.sendDrafter(&ops);
@@ -357,6 +408,7 @@ pub const GpuPass = struct {
             // position) are the host's (the same merged picks), else it is dropped and the pass runs as below
             const h = dl.host;
             x.dl = null;
+            if (dl.wait) try x.staged.?.synchronize(); // the accept's copy (not the pass)
             if (h[dl.n + 1] == a.anchor and h[dl.n + 2] == @as(i64, @intCast(a.start))) {
                 x.stats.device_starts += 1;
                 x.begun = a;

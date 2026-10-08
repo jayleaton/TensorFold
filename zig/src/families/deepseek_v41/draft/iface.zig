@@ -85,8 +85,9 @@ pub const Pass = struct {
         collect: ?*const fn (ptr: *anyopaque, out: []Proposal) anyerror!void = null,
         /// Before a verify window whose next pass would be speculated (spec.zig): the slot's window of `rows` rows at
         /// `start`, so the pass may start from the window's device pick, before the host has the tokens (Python
-        /// spec.py's order); `begin` then takes it over. Null: the pass starts at `begin`.
-        arm: ?*const fn (ptr: *anyopaque, slot: u32, start: u64, rows: u32) void = null,
+        /// spec.py's order); `begin` then takes it over. `sampled`: its rows are keyed (T > 0, the sampler's device
+        /// choice), else greedy (the GPU pick). Null: the pass starts at `begin`.
+        arm: ?*const fn (ptr: *anyopaque, slot: u32, start: u64, rows: u32, sampled: bool) void = null,
     };
 
     pub fn ingest(p: Pass, slot: u32, start: u64, taps: Taps, rows: []const u32) !void {

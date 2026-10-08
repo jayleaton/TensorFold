@@ -451,6 +451,8 @@ pub const Functions = struct {
     /// glue.cu's row-window accept and several-slot statics (the slot passes' device start); optional
     ds_accept_rows: ?cuda.Function = null,
     ds_stage_rows: ?cuda.Function = null,
+    /// glue.cu's device keyed choice (vsample.choose; the sampled rounds' device start); optional
+    vs_choose: ?cuda.Function = null,
     pfglue: [pfglue.syms.len]cuda.Function, // pfglue.syms order
 
     /// `pf`: the four pfdense modules (K2 8, 10, 12, 16).
@@ -507,6 +509,7 @@ pub const Functions = struct {
         f.ds_stage = m_glue.function(glue.ds_stage_sym) catch null;
         f.ds_accept_rows = m_glue.function(glue.ds_accept_rows_sym) catch null;
         f.ds_stage_rows = m_glue.function(glue.ds_stage_rows_sym) catch null;
+        f.vs_choose = m_glue.function(glue.vs_choose_sym) catch null;
         inline for (pfglue.syms, 0..) |name, i| f.pfglue[i] = try m_pfglue.function(name);
         return f;
     }
@@ -580,6 +583,9 @@ pub const glue = struct {
     pub const ds_stage_sym: [:0]const u8 = "_ZN10dsv41_glue15ds_stage_kernelEPKxiPxPiiiixiiiiiii";
     pub const ds_accept_rows_sym: [:0]const u8 = "_ZN10dsv41_glue21ds_accept_rows_kernelEPKxS1_S1_iPx";
     pub const ds_stage_rows_sym: [:0]const u8 = "_ZN10dsv41_glue20ds_stage_rows_kernelEPKxS1_iPxPiiiiiiiiiii";
+    pub const vs_choose_sym: [:0]const u8 = "_ZN10dsv41_glue16vs_choose_kernelEPKfiiiiyxidddPx";
+    /// the candidates vs_choose merges at most (W k)
+    pub const vs_max = 2048;
     /// the device pick (optional, as ds_cands)
     pub const pick_pack_sym: [:0]const u8 = "_ZN10dsv41_glue16pick_pack_kernelEPKfPKxixPd";
     pub const pick_merge_sym: [:0]const u8 = "_ZN10dsv41_glue17pick_merge_kernelEPKdiiPKxxPx";
@@ -978,6 +984,27 @@ pub const Ops = struct {
         a.add(@as(i32, @intCast(noise)));
         for (off) |x| a.add(@as(i32, @intCast(x)));
         try o.go(f, .{ 1, 1, 1 }, 256, 0, null, &a);
+    }
+
+    /// vsample.choose over the gathered candidates `g` [W][n][2 k] (count 0: all) for `n` rows drawn at pos0 + r under
+    /// one sampling: each row's token into `out` int64 [n] (-1: a nucleus row; speculation only, the host decides).
+    pub fn vsChoose(o: Ops, g: u64, W: usize, n: usize, k: usize, count: usize, seed: u64, pos0: u64, top_k: u32, temp: f64, top_p: f64, min_p: f64, out: u64) !void {
+        const f = o.f.vs_choose orelse return error.Unsupported;
+        if (W * k > glue.vs_max or n == 0) return error.Shape;
+        var a: cuda.Args = .{};
+        a.add(g);
+        a.add(@as(i32, @intCast(W)));
+        a.add(@as(i32, @intCast(n)));
+        a.add(@as(i32, @intCast(k)));
+        a.add(@as(i32, @intCast(count)));
+        a.add(seed);
+        a.add(@as(i64, @intCast(pos0)));
+        a.add(@as(i32, @intCast(top_k)));
+        a.add(temp);
+        a.add(top_p);
+        a.add(min_p);
+        a.add(out);
+        try o.go(f, .{ n, 1, 1 }, 256, 0, null, &a);
     }
 
     /// bf16 [n] -> fp32 [n], exact (the DSpark pass's q.float() before _rope).

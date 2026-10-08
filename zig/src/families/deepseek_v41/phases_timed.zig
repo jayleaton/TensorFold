@@ -119,9 +119,9 @@ pub const TimedPass = struct {
         self(p).inner.reset(slot);
     }
 
-    fn arm(p: *anyopaque, slot: u32, start: u64, rows: u32) void {
+    fn arm(p: *anyopaque, slot: u32, start: u64, rows: u32, sampled: bool) void {
         const t = self(p);
-        if (t.inner.vtable.arm) |f| f(t.inner.ptr, slot, start, rows);
+        if (t.inner.vtable.arm) |f| f(t.inner.ptr, slot, start, rows, sampled);
     }
 
     fn markov(p: *anyopaque) ?@import("draft/dspark.zig").Markov {

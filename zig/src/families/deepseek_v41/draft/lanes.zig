@@ -282,9 +282,10 @@ pub const Lanes = struct {
         for (windows, segs) |w, g| {
             const st = x.get(w.stream) catch continue;
             if (!dsparkRound(st, w) or !sp.wouldWant(st.slot)) continue;
-            // the device pick is greedy: a keyed (T > 0) window's next pass starts from the host's choices
-            if (w.stream.sampling) |smp| if (smp.temperature > 0) continue;
-            arm(x.pass.ptr, st.slot, g.start, @intCast(g.tokens.len));
+            // keyed rows: the sampler's device choice (vsample.choose); a nucleus row's statistics stay on the host
+            const sampled = if (w.stream.sampling) |smp| smp.temperature > 0 else false;
+            if (sampled and spec_mod.isNucleus(w.stream.sampling)) continue;
+            arm(x.pass.ptr, st.slot, g.start, @intCast(g.tokens.len), sampled);
         }
     }
 

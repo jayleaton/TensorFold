@@ -22,6 +22,11 @@
 //   ds_accept_rows  a row window's slots (segs [k][3]: first row, rows, start): each one's accepted drafts (rows whose
 //                pick is the next row's id), bonus = its pick at that row, next position = start + accepted + 1
 //                (pick_merge's chain walk, per slot) into acc [k][3]
+//   vs_choose    vsample.choose a row (speculation only: the host's keyed pick stays the authority): the gathered
+//                [W][n][2k] candidates merged by (value desc, id asc) and cut to `count`, then the host Picker's
+//                chooseRow - top_k, top_p over numpy's pairwise sum, min_p, the keyed Gumbel draw of splitmix64(seed,
+//                position, id) in float64 (libdevice exp / log: a near-tie may differ from glibc's, which only drops a
+//                speculation); greedy (T <= 0) the first merged candidate; a nucleus row (top_k 0, 0 < top_p < 1) -1
 //   ds_stage_rows   a several-slot pass's statics (dspark_rows.stage's position-dependent values) for its members
 //                (mem [g][3]: the slot's index in acc, its slot, its valid) from acc's (bonus, next position)
 //   pick_pack    pairs[r] = (f64 vals[r], f64 (cols[r] + id0))     (forward.greedy's pair: a rank's best, topk_keys k 1)
@@ -314,6 +319,118 @@ __global__ void __launch_bounds__(256) ds_stage_rows_kernel(const long long* __r
             s32[o_tok + a * W + e] = jj < count ? (int)(slot * ring + (first + jj) % ring) : -1;
         }
     }
+}
+
+__device__ __forceinline__ unsigned long long vs_mix(unsigned long long x) {
+    x ^= x >> 30;
+    x *= 0xBF58476D1CE4E5B9ull;
+    x ^= x >> 27;
+    x *= 0x94D049BB133111EBull;
+    return x ^ (x >> 31);
+}
+
+__device__ __forceinline__ double vs_uniform(unsigned long long seed, unsigned long long pos, unsigned long long id) {
+    unsigned long long x = vs_mix(seed + 0x9E3779B97F4A7C15ull);
+    x = vs_mix(x ^ (pos * 0xD1B54A32D192ED03ull));
+    x = vs_mix(x ^ id);
+    return (double)(x >> 11) * 0x1p-53 + 0x1p-54;
+}
+
+__device__ __forceinline__ float vs_value(unsigned long long k) {
+    const unsigned int mono = (unsigned int)(k >> 32);
+    return __uint_as_float((mono & 0x80000000u) ? (mono & 0x7FFFFFFFu) : ~mono);
+}
+
+// numpy's float64 pairwise sum of a[0..n) (np.add.reduce on a contiguous row; lanes.sampling.pairwiseSum)
+__device__ double vs_pairwise(const double* a, int n) {
+    if (n < 8) {
+        double r = -0.0;
+        for (int i = 0; i < n; i++) r += a[i];
+        return r;
+    }
+    if (n <= 128) {
+        double r[8];
+        for (int j = 0; j < 8; j++) r[j] = a[j];
+        int i = 8;
+        for (; i < n - (n % 8); i += 8)
+            for (int j = 0; j < 8; j++) r[j] += a[i + j];
+        double res = ((r[0] + r[1]) + (r[2] + r[3])) + ((r[4] + r[5]) + (r[6] + r[7]));
+        for (; i < n; i++) res += a[i];
+        return res;
+    }
+    int n2 = n / 2;
+    n2 -= n2 % 8;
+    return vs_pairwise(a, n2) + vs_pairwise(a + n2, n - n2);
+}
+
+constexpr int VS_NT = 256, VS_MAX = 2048;
+
+// one block a row: g [W][n][2 k] (values, then ids as int32 bits), count (0: all W k) -> out[row0 + r]
+__global__ void __launch_bounds__(VS_NT) vs_choose_kernel(const float* __restrict__ g, int W, int n, int k, int count,
+                                                         unsigned long long seed, long long pos0, int top_k, double temp,
+                                                         double top_p, double min_p, long long* __restrict__ out) {
+    __shared__ unsigned long long keys[VS_MAX];
+    __shared__ double work[1024];
+    const int r = blockIdx.x, t = threadIdx.x, C = W * k;
+    if (C > VS_MAX) { if (t == 0) out[r] = -1; return; }
+    for (int i = t; i < C; i += VS_NT) {
+        const int w = i / k, j = i - w * k;
+        const float* row = g + ((long long)w * n + r) * 2 * k;
+        const unsigned int bits = __float_as_uint(row[j] + 0.0f);
+        const unsigned int mono = (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+        const unsigned int id = __float_as_uint(row[k + j]);
+        keys[i] = ((unsigned long long)mono << 32) | (0xFFFFFFFFull - id);
+    }
+    int m = 1;
+    while (m < C) m <<= 1;
+    for (int i = C + t; i < m; i += VS_NT) keys[i] = 0;
+    __syncthreads();
+    for (int size = 2; size <= m; size <<= 1)
+        for (int stride = size >> 1; stride > 0; stride >>= 1) {
+            for (int i = t; i < m; i += VS_NT) {
+                const int j = i ^ stride;
+                if (j > i) {
+                    const bool desc = (i & size) == 0;
+                    const unsigned long long a = keys[i], b = keys[j];
+                    if (desc ? a < b : a > b) { keys[i] = b; keys[j] = a; }
+                }
+            }
+            __syncthreads();
+        }
+    if (t != 0) return;
+    const long long id0 = (long long)(0xFFFFFFFFull - (keys[0] & 0xFFFFFFFFull));
+    if (!(temp > 0.0)) { out[r] = id0; return; }                            // greedy: the first merged candidate
+    if (top_k == 0 && top_p > 0.0 && top_p < 1.0) { out[r] = -1; return; }  // a nucleus row: the host's statistics
+    const int width = (count > 0 && count < C) ? count : C;
+    int kk = top_k != 0 ? (top_k < width ? top_k : width) : width;
+    if (kk < 1) kk = 1;
+    if (kk > 1024) kk = 1024;
+    const double tt = temp > 1e-6 ? temp : 1e-6;
+    const double s0 = (double)vs_value(keys[0]) / tt;
+    int keep = kk;
+    if (top_p > 0.0 && top_p < 1.0) {
+        for (int j = 0; j < kk; j++) work[j] = exp((double)vs_value(keys[j]) / tt - s0);
+        const double total = vs_pairwise(work, kk);
+        double cum = 0.0;
+        int below = 0;
+        for (int j = 0; j < kk; j++) {
+            cum += work[j] / total;
+            if (cum < top_p) below++;
+        }
+        keep = below + 1;
+    }
+    const double floor_ = s0 + (min_p > 0.0 ? log(min_p) : -INFINITY);
+    const int lim = keep < kk ? keep : kk;
+    int best = 0;
+    double best_score = -INFINITY;
+    for (int j = 0; j < lim; j++) {
+        const double x = (double)vs_value(keys[j]) / tt;
+        if (min_p > 0.0 && x < floor_) continue;
+        const unsigned long long id = 0xFFFFFFFFull - (keys[j] & 0xFFFFFFFFull);
+        const double score = x - log(-log(vs_uniform(seed, (unsigned long long)(pos0 + r), id)));
+        if (j == 0 || score > best_score) { best = j; best_score = score; }
+    }
+    out[r] = (long long)(0xFFFFFFFFull - (keys[best] & 0xFFFFFFFFull));
 }
 
 }  // namespace dsv41_glue

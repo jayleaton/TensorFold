@@ -44,6 +44,84 @@ pub const Device = struct {
 };
 
 /// The candidates' count of a sampling (``Batcher._decode``) at `nucleus` (TF_DSV41_NUCLEUS, 0: off).
+extern "c" fn exp(x: f64) f64;
+extern "c" fn log(x: f64) f64;
+
+/// glue.cu vs_choose on the host (its mirror, step for step; libc's exp / log where the kernel has libdevice's): each
+/// row's token from the gathered candidates `g` [W][n][2 k] (count 0: all W k) under `s`, row r drawn at pos0 + r;
+/// -1 for a nucleus row. The test holds it to the pipeline's own picks.
+pub fn chooseMirror(scratch: []u64, work: []f64, g: []const f32, W: usize, n: usize, k: usize, count: usize, s: Sampling, pos0: u64, out: []i64) void {
+    const C = W * k;
+    for (0..n) |r| {
+        const keys = scratch[0..C];
+        for (0..C) |i| {
+            const w = i / k;
+            const j = i - w * k;
+            const row = g[(w * n + r) * 2 * k ..][0 .. 2 * k];
+            const bits: u32 = @bitCast(row[j] + 0.0);
+            const mono: u32 = if (bits & 0x8000_0000 != 0) ~bits else bits | 0x8000_0000;
+            const id: u32 = @bitCast(row[k + j]);
+            keys[i] = @as(u64, mono) << 32 | (0xFFFF_FFFF - id);
+        }
+        std.sort.pdq(u64, keys, {}, std.sort.desc(u64));
+        const idOf = struct {
+            fn f(x: u64) i64 {
+                return @intCast(0xFFFF_FFFF - (x & 0xFFFF_FFFF));
+            }
+        }.f;
+        const valueOf = struct {
+            fn f(x: u64) f64 {
+                const mono: u32 = @truncate(x >> 32);
+                const v: f32 = @bitCast(if (mono & 0x8000_0000 != 0) mono & 0x7FFF_FFFF else ~mono);
+                return v;
+            }
+        }.f;
+        if (!(s.temperature > 0)) {
+            out[r] = idOf(keys[0]);
+            continue;
+        }
+        if (s.top_k == 0 and s.top_p > 0 and s.top_p < 1) {
+            out[r] = -1;
+            continue;
+        }
+        const width = if (count > 0 and count < C) count else C;
+        var kk: usize = if (s.top_k != 0) @min(s.top_k, width) else width;
+        kk = @min(@max(kk, 1), 1024);
+        const tt = @max(s.temperature, 1e-6);
+        const s0 = valueOf(keys[0]) / tt;
+        var keep = kk;
+        if (s.top_p > 0 and s.top_p < 1) {
+            for (0..kk) |j| work[j] = exp(valueOf(keys[j]) / tt - s0);
+            const total = @import("lanes").sampling.pairwiseSum(work[0..kk]);
+            var cum: f64 = 0;
+            var below: usize = 0;
+            for (0..kk) |j| {
+                cum += work[j] / total;
+                if (cum < s.top_p) below += 1;
+            }
+            keep = below + 1;
+        }
+        const floor_ = s0 + (if (s.min_p > 0) log(s.min_p) else -std.math.inf(f64));
+        const lim = @min(keep, kk);
+        var best: usize = 0;
+        var best_score = -std.math.inf(f64);
+        for (0..lim) |j| {
+            const x = valueOf(keys[j]) / tt;
+            if (s.min_p > 0 and x < floor_) continue;
+            const id: u64 = @intCast(idOf(keys[j]));
+            const score = x - log(-log(@import("lanes").sampling.uniform(s.seed, pos0 + r, id)));
+            if (j == 0 or score > best_score) {
+                best = j;
+                best_score = score;
+            }
+        }
+        out[r] = idOf(keys[best]);
+    }
+}
+
+/// sampling_gpu.zig's hook over a call's gathered candidates [W][n][2 k] (`count` merged), before their download.
+pub const AfterGather = struct { ctx: *anyopaque, run: *const fn (ctx: *anyopaque, gathered: u64, n: usize, k: usize, count: usize, host: []u8) anyerror!bool };
+
 pub fn countOf(s: Sampling, vocab: u32, nucleus: u32) u32 {
     return smp.candidateCount(s, vocab, nucleus);
 }
@@ -74,6 +152,9 @@ pub const Pipe = struct {
     host: std.array_list.Aligned(u8, .@"16") = .empty,
     full: std.ArrayList(u32) = .empty,
     picks: std.ArrayList(smp.Pick) = .empty,
+    /// the candidates' download taken over (sampling_gpu.zig: an async copy, the device start enqueued behind it, then
+    /// the wait): true when it downloaded `host`; null or false: the device's own download
+    after_gather: ?AfterGather = null,
     /// rows taken whole in the last call (the nucleus fallback or k > max_k): the tests' and logs' count
     whole_rows: usize = 0,
 
@@ -134,7 +215,8 @@ pub const Pipe = struct {
         const cand_bytes = 4 * W * n * row_f32;
         const stat_bytes: usize = if (nuc) 16 * W * n else 0;
         const host = try p.hostBytes(cand_bytes + stat_bytes);
-        try vt.download(dev.ptr, gathered, host[0..cand_bytes]);
+        const taken = if (p.after_gather) |h| try h.run(h.ctx, gathered, n, k, count, host[0..cand_bytes]) else false;
+        if (!taken) try vt.download(dev.ptr, gathered, host[0..cand_bytes]);
         if (nuc) try vt.download(dev.ptr, stats_dev, host[cand_bytes..][0..stat_bytes]);
         const cand: smp.Candidates = .{ .data = @alignCast(std.mem.bytesAsSlice(f32, host[0..cand_bytes])), .world = @intCast(W), .rows = @intCast(n), .k = @intCast(k) };
         const all_stats: []const f64 = if (nuc) @alignCast(std.mem.bytesAsSlice(f64, host[cand_bytes..][0..stat_bytes])) else &.{};
