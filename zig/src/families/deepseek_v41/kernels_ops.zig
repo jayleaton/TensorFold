@@ -446,6 +446,8 @@ pub const Functions = struct {
     /// glue.cu's device pick (TF_DSV41_GREEDY_GPU); null in a fatbin built before it (the pairs merged on the host)
     pick_pack: ?cuda.Function = null,
     pick_merge: ?cuda.Function = null,
+    /// glue.cu's DSpark statics from the device pick (the speculative pass's device start); optional, as ds_cands
+    ds_stage: ?cuda.Function = null,
     pfglue: [pfglue.syms.len]cuda.Function, // pfglue.syms order
 
     /// `pf`: the four pfdense modules (K2 8, 10, 12, 16).
@@ -499,6 +501,7 @@ pub const Functions = struct {
         f.ds_cands = m_glue.function(glue.ds_cands_sym) catch null;
         f.pick_pack = m_glue.function(glue.pick_pack_sym) catch null;
         f.pick_merge = m_glue.function(glue.pick_merge_sym) catch null;
+        f.ds_stage = m_glue.function(glue.ds_stage_sym) catch null;
         inline for (pfglue.syms, 0..) |name, i| f.pfglue[i] = try m_pfglue.function(name);
         return f;
     }
@@ -568,6 +571,8 @@ pub const glue = struct {
     pub const ds_cands_sym: [:0]const u8 = "_ZN10dsv41_glue15ds_cands_kernelEPKfxiiiPf";
     /// the most candidates a rank (the kernel's shared sort)
     pub const ds_cands_max = 128;
+    /// DSpark's statics from the device pick (optional, as ds_cands)
+    pub const ds_stage_sym: [:0]const u8 = "_ZN10dsv41_glue15ds_stage_kernelEPKxiPxPiiiixiiiiiii";
     /// the device pick (optional, as ds_cands)
     pub const pick_pack_sym: [:0]const u8 = "_ZN10dsv41_glue16pick_pack_kernelEPKfPKxixPd";
     pub const pick_merge_sym: [:0]const u8 = "_ZN10dsv41_glue17pick_merge_kernelEPKdiiPKxxPx";
@@ -914,6 +919,25 @@ pub const Ops = struct {
         a.add(@as(i32, @intCast(id0)));
         a.add(out);
         try o.go(f, .{ rows, 1, 1 }, 1024, 0, null, &a);
+    }
+
+    /// DSpark's one-slot statics from the device pick `pick` ([nw + 3]: picks, accepted, bonus, next position) into
+    /// "w.ds.i64" / "w.ds.i32" (`s64` / `s32`): dspark_gpu.fillStatics' values for (bonus, next position); `o`: the
+    /// offsets of positions, tokens, counts, lo, hi, anchor (ids and start at 0).
+    pub fn dsStage(o: Ops, pick: u64, nw: usize, s64: u64, s32: u64, n: usize, W: usize, ring: usize, valid: u64, noise: u32, off: [6]i64) !void {
+        const f = o.f.ds_stage orelse return error.Unsupported;
+        var a: cuda.Args = .{};
+        a.add(pick);
+        a.add(@as(i32, @intCast(nw)));
+        a.add(s64);
+        a.add(s32);
+        a.add(@as(i32, @intCast(n)));
+        a.add(@as(i32, @intCast(W)));
+        a.add(@as(i32, @intCast(ring)));
+        a.add(@as(i64, @intCast(valid)));
+        a.add(@as(i32, @intCast(noise)));
+        for (off) |x| a.add(@as(i32, @intCast(x)));
+        try o.go(f, .{ 1, 1, 1 }, 256, 0, null, &a);
     }
 
     /// bf16 [n] -> fp32 [n], exact (the DSpark pass's q.float() before _rope).

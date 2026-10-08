@@ -22,6 +22,7 @@ const emit = @import("dspark_emit.zig");
 const iface = @import("draft/iface.zig");
 const dspark = @import("draft/dspark.zig");
 const dsd = @import("dspark_dev.zig");
+const rows_mod = @import("dspark_rows.zig");
 const ph = @import("phases.zig");
 
 pub const Error = error{ Slots, NotAPrefix, NoWeight, CandidateWidth, BadCandidates };
@@ -60,6 +61,14 @@ pub const GpuPass = struct {
     /// the last eager pass's logits (a check pass compares the device candidates with the host's on them)
     last_logits: u64 = 0,
     last_v: usize = 0,
+    /// the speculative pass from the device pick (spec.py's order; Pass.arm, forward.after_pick): the armed window
+    /// (start, rows) until its pick, then the pass launched from it until `begin` takes it (rank 0)
+    armed: ?struct { start: u64, n: u32 } = null,
+    dl: ?struct { start: u64, n: u32, host: [*]const i64 } = null,
+    /// `begin` took a device-launched pass: `collect` waits and unpacks without counting a pass again
+    begun_dev: bool = false,
+    prev_ext: ?fwd.Forward.Ext = null,
+    stats: struct { device_starts: u64 = 0, device_dropped: u64 = 0 } = .{},
 
     /// The buffer roles DSpark adds to the forward's plan (call before Runner.bind).
     pub fn plan(a: std.mem.Allocator, f: *const fwd.Forward, p: *buffers.Plan, ingest_rows: u32) !void {
@@ -120,6 +129,12 @@ pub const GpuPass = struct {
                 // every buffer a graphed pass bakes in, at its largest: the embedding's and exchanges' send
                 _ = try x.device(&x.send, 2 * @as(usize, @intCast(n)) * cfg.hidden);
                 x.dev = try dsd.Dev.init(gpa, r.d, f.comm, r.stream, mode, k, cfg.hidden, @intCast(n), conf != null, @intCast(8 * st.len64() + 4 * st.len32()), 1);
+                // the speculative pass from the device pick (needs TF_DSV41_GREEDY_GPU's pick and ds_stage)
+                if (r.kernels.others(r.stream).f.ds_stage != null) {
+                    f.after_pick = .{ .ctx = x, .run = afterPick };
+                    x.prev_ext = f.ext;
+                    f.ext = .{ .ptr = x, .run = followExt };
+                }
             }
         }
         return x;
@@ -128,7 +143,14 @@ pub const GpuPass = struct {
     pub fn deinit(x: *GpuPass) void {
         const gpa = x.gpa;
         x.f.drafter = null;
-        if (x.dev) |d| d.deinit();
+        if (x.f.after_pick != null and x.f.after_pick.?.ctx == @as(*anyopaque, x)) {
+            x.f.after_pick = null;
+            x.f.ext = x.prev_ext;
+        }
+        if (x.dev) |d| {
+            if (x.stats.device_starts + x.stats.device_dropped > 0) std.log.scoped(.dsv41).info("draft graphs: {d} speculative passes started from the device pick, {d} unused", .{ x.stats.device_starts, x.stats.device_dropped });
+            d.deinit();
+        }
         if (x.send) |*b| b.free();
         if (x.gathered) |*b| b.free();
         gpa.free(x.w1);
@@ -153,7 +175,85 @@ pub const GpuPass = struct {
         return .{ .ptr = x, .vtable = &vtable };
     }
 
-    const vtable: iface.Pass.VTable = .{ .ingest = ingest, .propose = propose, .reset = reset, .markov = heads, .begin = begin, .collect = collect };
+    const vtable: iface.Pass.VTable = .{ .ingest = ingest, .propose = propose, .reset = reset, .markov = heads, .begin = begin, .collect = collect, .arm = arm };
+
+    /// 43 (dspark_rows' range 40-43): [op, start, rows] the armed window (every rank: the pass starts from its pick)
+    pub const op_arm: i64 = 43;
+
+    /// Pass.arm (rank 0): the slot's coming window of `rows` rows at `start`, for the speculative pass from its device
+    /// pick; the followers get it before the window. Only once the checks passed and with the device path on.
+    fn arm(p: *anyopaque, slot: u32, start: u64, rows: u32) void {
+        const x = self(p);
+        x.dropDevice();
+        if (slot != 0 or x.f.after_pick == null or !x.devReady()) return;
+        x.f.sendDrafter(&.{ op_arm, @intCast(start), rows }) catch |e| {
+            std.log.err("dspark: the arm did not reach the followers ({t})", .{e});
+            return;
+        };
+        x.armed = .{ .start = start, .n = rows };
+    }
+
+    fn followExt(ptr: *anyopaque, msg: []const i64) anyerror!void {
+        const x: *GpuPass = @ptrCast(@alignCast(ptr));
+        if (msg[0] == op_arm) {
+            if (msg.len != 3) return error.BadPlan;
+            x.armed = .{ .start = @intCast(msg[1]), .n = @intCast(msg[2]) };
+            return;
+        }
+        const e = x.prev_ext orelse return error.BadPlan;
+        return e.run(e.ptr, msg);
+    }
+
+    /// The device path is on and past its checks (a pass launched outside `propose` / `begin` then counts no check).
+    fn devReady(x: *const GpuPass) bool {
+        const d = x.dev orelse return false;
+        return d.on() and d.stats.passes >= dsd.check_passes;
+    }
+
+    /// forward.after_pick, every rank, after the armed window's device pick (its copy back recorded): the window's
+    /// taps into the rings, the pass's statics from (bonus, next position) on the device (ds_stage), the pass (its
+    /// graph if captured, never a capture here), the event `collect` waits on. Python's spec.py order: the GPU drafts
+    /// while the hosts sample, plan and commit.
+    fn afterPick(ctx: *anyopaque, pick: fwd.Forward.PickDevice) anyerror!void {
+        const x: *GpuPass = @ptrCast(@alignCast(ctx));
+        const a = x.armed orelse return;
+        x.armed = null;
+        if (!pick.chain or pick.n != a.n or pick.start != a.start or pick.host == null or x.begun != null) return;
+        if (!x.devReady() or a.n > x.ingest_rows) return;
+        const d = x.dev.?;
+        const r = x.f.runner;
+        // every row of the window (Python ingests the whole window: rows past the commit lie past every later pass's
+        // context and the pass's own block rows overwrite them; the commit's ingest of the kept rows is the same bytes)
+        try x.ingestAsync(a.start, 0, a.n);
+        // the statics as fillStatics stages them (placeholders), then every position-dependent one from the pick
+        const st = x.st;
+        const sv = try d.statics(0, @intCast(st.len64()), @intCast(st.len32()));
+        x.fillStatics(0, a.start, sv[0], sv[1]);
+        const s64 = r.addressOf("w.ds.i64") orelse return error.Unbound;
+        const s32 = r.addressOf("w.ds.i32") orelse return error.Unbound;
+        try cuda.DeviceBuffer.uploadAsync(.{ .d = r.d, .ptr = s64, .len = 8 * sv[0].len }, 0, std.mem.sliceAsBytes(sv[0]), r.stream.handle);
+        try cuda.DeviceBuffer.uploadAsync(.{ .d = r.d, .ptr = s32, .len = 4 * sv[1].len }, 0, std.mem.sliceAsBytes(sv[1]), r.stream.handle);
+        try r.kernels.others(r.stream).dsStage(pick.out, pick.n, s64, s32, @intCast(st.n), @intCast(st.window), @intCast(emit.ringRows(x.f.cfg)), x.valid, x.shape.noise, stageOffsets(st));
+        r.glue = .{ .ctx = x, .run = glueFn };
+        const extra = [_]u64{ if (x.send) |b| b.ptr else 0, if (x.send) |b| b.len else 0 };
+        try d.issueReplay(0, dsd.fingerprint(r, d, &extra), .{ .ctx = x, .run = passBody });
+        try d.mark();
+        try d.settle(); // counted here on every rank (rank 0's collect does not count it again)
+        if (x.f.comm.rank() == 0 or x.f.link == null) x.dl = .{ .start = a.start, .n = a.n, .host = pick.host.? };
+    }
+
+    /// ds_stage's offsets: positions, tokens, counts, lo, hi, anchor (ids and start at 0).
+    fn stageOffsets(st: emit.Statics) [6]i64 {
+        return .{ st.positions(), st.tokens(), st.counts(), st.lo(), st.hi(), st.anchor() };
+    }
+
+    /// A device-launched pass nobody took (the round did not speculate after all): its results are dropped; the next
+    /// pass follows it on the stream.
+    fn dropDevice(x: *GpuPass) void {
+        if (x.dl != null) x.stats.device_dropped += 1;
+        x.dl = null;
+        x.armed = null;
+    }
 
     fn self(p: *anyopaque) *GpuPass {
         return @ptrCast(@alignCast(p));
@@ -164,6 +264,7 @@ pub const GpuPass = struct {
     fn reset(p: *anyopaque, slot: u32) void {
         _ = slot;
         const x = self(p);
+        x.dropDevice();
         if (x.begun != null) std.log.err("dspark: a reset while a speculative pass is begun", .{});
         const op = fwd.Forward.dsResetOp();
         x.f.sendDrafter(&op) catch |e| std.log.err("dspark: the draft reset did not reach the followers ({t})", .{e});
@@ -172,6 +273,7 @@ pub const GpuPass = struct {
 
     fn followReset(p: *anyopaque) void {
         self(p).valid = 0;
+        self(p).armed = null;
     }
 
     fn heads(p: *anyopaque) ?dspark.Markov {
@@ -186,6 +288,8 @@ pub const GpuPass = struct {
         if (x.begun != null) return error.PassBegun;
         if (rows.len == 0) return;
         for (rows, 0..) |r, i| if (r != rows[0] + i) return error.NotAPrefix;
+        // the device-launched pass already ingested its window's rows (afterPick): the same rows at the same positions
+        if (x.dl) |dl| if (start == dl.start and rows[0] == 0 and rows.len <= dl.n) return;
         const n: u32 = @intCast(rows.len);
         const ops = fwd.Forward.dsIngestOp(start, rows[0], n, taps.rows);
         try x.f.sendDrafter(&ops);
@@ -194,6 +298,19 @@ pub const GpuPass = struct {
 
     fn followIngest(p: *anyopaque, start: u64, row0: u32, n: u32, avail: u32) anyerror!void {
         return self(p).doIngest(start, row0, n, avail);
+    }
+
+    /// An ingest of rows on the device (row0 + n <= the taps' rows) without draining the stream first: the position from
+    /// pageable memory (copied out before the call returns), then the launches in stream order.
+    fn ingestAsync(x: *GpuPass, start: u64, row0: u32, n: u32) !void {
+        const r = x.f.runner;
+        const pos: i32 = @intCast(start);
+        try cuda.DeviceBuffer.uploadAsync(.{ .d = r.d, .ptr = r.addressOf("w.ds.pos") orelse return error.Unbound, .len = 4 }, 0, std.mem.asBytes(&pos), r.stream.handle);
+        var la = std.heap.ArenaAllocator.init(x.gpa);
+        defer la.deinit();
+        const cs = try emit.emitIngest(la.allocator(), x.f.cfg, x.f.widths, x.f.opts, n, row0);
+        r.glue = .{ .ctx = x, .run = glueFn };
+        try r.window(cs);
     }
 
     fn doIngest(x: *GpuPass, start: u64, row0: u32, n: u32, avail: u32) !void {
@@ -218,6 +335,7 @@ pub const GpuPass = struct {
         const x = self(p);
         if (asks.len != 1) return error.Slots;
         if (x.begun != null) return error.PassBegun;
+        x.dropDevice();
         const a = asks[0];
         const ops = fwd.Forward.dsProposeOp(a.anchor, a.start);
         try x.f.sendDrafter(&ops);
@@ -234,6 +352,20 @@ pub const GpuPass = struct {
         if (asks.len != 1) return error.Slots;
         if (x.begun != null) return error.PassBegun;
         const a = asks[0];
+        if (x.dl) |dl| {
+            // the pass already ran from the window's device pick: it is this ask's when the device's (bonus, next
+            // position) are the host's (the same merged picks), else it is dropped and the pass runs as below
+            const h = dl.host;
+            x.dl = null;
+            if (h[dl.n + 1] == a.anchor and h[dl.n + 2] == @as(i64, @intCast(a.start))) {
+                x.stats.device_starts += 1;
+                x.begun = a;
+                x.begun_dev = true;
+                return;
+            }
+            x.stats.device_dropped += 1;
+            std.log.warn("dspark: the device pick's pass ({d} at {d}) is not the ask ({d} at {d}); run again", .{ h[dl.n + 1], h[dl.n + 2], a.anchor, a.start });
+        }
         const ops = fwd.Forward.dsProposeOp(a.anchor, a.start);
         try x.f.sendDrafter(&ops);
         if (x.devOn()) {
@@ -252,6 +384,11 @@ pub const GpuPass = struct {
         const a = x.begun orelse return error.NoPassBegun;
         x.begun = null;
         if (out.len != 1) return error.Slots;
+        if (x.begun_dev) {
+            x.begun_dev = false;
+            try x.devResults();
+            return x.finish(a, out);
+        }
         if (x.devOn()) {
             try x.devCollect(true);
             return x.finish(a, out);
@@ -337,6 +474,17 @@ pub const GpuPass = struct {
         try d.settle();
     }
 
+    /// A device-launched pass's results (rank 0): waited for and unpacked; it was counted at its launch.
+    fn devResults(x: *GpuPass) !void {
+        const d = x.dev.?;
+        {
+            const tw = ph.start(x.f.phases, .@"draft.wait");
+            defer tw.stop();
+            try d.wait();
+        }
+        try d.unpack(@intCast(x.st.n), 0, x.f.cfg.vocab, x.cand, x.cval, if (x.conf != null) x.hid else null);
+    }
+
     /// The pass's statics (Python's DraftInputs) on the device, and its glue in place.
     fn stagePass(x: *GpuPass, anchor: u32, start: u64) !void {
         x.fillStatics(anchor, start, x.h64, x.h32);
@@ -349,29 +497,7 @@ pub const GpuPass = struct {
 
     /// The statics (Python's DraftInputs, one slot) into `h64` / `h32`.
     fn fillStatics(x: *GpuPass, anchor: u32, start: u64, h64: []i64, h32: []i32) void {
-        const st = x.st;
-        const n: usize = @intCast(st.n);
-        const W: usize = @intCast(st.window);
-        @memset(h64, 0);
-        @memset(h32, 0);
-        const ring: u64 = @intCast(emit.ringRows(x.f.cfg));
-        for (0..n) |i| {
-            h64[@intCast(st.ids() + @as(i64, @intCast(i)))] = if (i == 0) anchor else x.shape.noise;
-            h64[@intCast(st.positions() + @as(i64, @intCast(i)))] = @intCast(start + i);
-            h64[@intCast(st.readRows() + @as(i64, @intCast(i)))] = 0; // slot 0's ring
-            h64[@intCast(st.writeRows() + @as(i64, @intCast(i)))] = 0;
-        }
-        const ctx = dspark.Context.of(x.shape, start, x.valid);
-        h32[@intCast(st.start())] = @intCast(start);
-        const tok = h32[@intCast(st.tokens())..][0 .. n * W];
-        @memset(tok, -1);
-        for (0..n) |i| for (0..ctx.count) |j| {
-            tok[i * W + j] = @intCast((ctx.first + j) % ring);
-        };
-        @memset(h32[@intCast(st.counts())..][0..n], @intCast(ctx.count));
-        @memset(h32[@intCast(st.lo())..][0..n], @intCast(start));
-        @memset(h32[@intCast(st.hi())..][0..n], @intCast(start + n - 1));
-        h32[@intCast(st.anchor())] = @intCast(anchor);
+        return rows_mod.stageOne(x.st, @intCast(emit.ringRows(x.f.cfg)), x.shape.noise, x.valid, anchor, start, h64, h32);
     }
 
     fn device(x: *GpuPass, slot: *?cuda.DeviceBuffer, bytes: usize) !u64 {

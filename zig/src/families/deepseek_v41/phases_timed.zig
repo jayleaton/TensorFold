@@ -77,7 +77,7 @@ pub const TimedPass = struct {
     }
 
     const vtable: iface.Pass.VTable = .{ .ingest = ingest, .propose = propose, .reset = reset, .markov = markov };
-    const vtable_begin: iface.Pass.VTable = .{ .ingest = ingest, .propose = propose, .reset = reset, .markov = markov, .begin = begin, .collect = collect };
+    const vtable_begin: iface.Pass.VTable = .{ .ingest = ingest, .propose = propose, .reset = reset, .markov = markov, .begin = begin, .collect = collect, .arm = arm };
 
     fn self(p: *anyopaque) *TimedPass {
         return @ptrCast(@alignCast(p));
@@ -117,6 +117,11 @@ pub const TimedPass = struct {
 
     fn reset(p: *anyopaque, slot: u32) void {
         self(p).inner.reset(slot);
+    }
+
+    fn arm(p: *anyopaque, slot: u32, start: u64, rows: u32) void {
+        const t = self(p);
+        if (t.inner.vtable.arm) |f| f(t.inner.ptr, slot, start, rows);
     }
 
     fn markov(p: *anyopaque) ?@import("draft/dspark.zig").Markov {

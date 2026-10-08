@@ -83,6 +83,10 @@ pub const Pass = struct {
         begin: ?*const fn (ptr: *anyopaque, asks: []const Ask) anyerror!void = null,
         /// The begun pass's results, in its asks' order (as `propose` gives them).
         collect: ?*const fn (ptr: *anyopaque, out: []Proposal) anyerror!void = null,
+        /// Before a verify window whose next pass would be speculated (spec.zig): the slot's window of `rows` rows at
+        /// `start`, so the pass may start from the window's device pick, before the host has the tokens (Python
+        /// spec.py's order); `begin` then takes it over. Null: the pass starts at `begin`.
+        arm: ?*const fn (ptr: *anyopaque, slot: u32, start: u64, rows: u32) void = null,
     };
 
     pub fn ingest(p: Pass, slot: u32, start: u64, taps: Taps, rows: []const u32) !void {

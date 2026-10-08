@@ -108,6 +108,10 @@ pub const Forward = struct {
     greedy_dev: ?cuda.DeviceBuffer = null,
     /// the last GPU pick on the device (`pickDevice`), null when it was merged on the host
     pick_last: ?PickDevice = null,
+    /// TF_DSV41_DRAFT_GRAPHS with TF_DSV41_SPEC_DRAFT (dspark_gpu.zig): enqueued after the device pick; `pick_done`
+    /// the copy back's event the host waits on then
+    after_pick: ?AfterPick = null,
+    pick_done: ?cuda.Event = null,
     /// the prefill's state (forward_prefill.zig)
     prefill_state: pf.State = .{},
     /// rows of "w.logits" the last prefill left (its last segment's, or its tail's): greedy takes out[0..last_rows]
@@ -152,6 +156,7 @@ pub const Forward = struct {
         if (f.pick_host) |*b| b.free();
         if (f.pick_dev) |*b| b.free();
         if (f.greedy_dev) |*b| b.free();
+        if (f.pick_done) |*e| e.deinit();
         f.programs.deinit(f.gpa);
         f.ids_own.deinit(f.gpa);
         f.arena.deinit();
@@ -306,9 +311,16 @@ pub const Forward = struct {
                 try k.pickMerge(dev.ptr + 16 * n, W, n, if (chain) ids_dev else 0, start, out_dev);
                 const oh: []i64 = @alignCast(std.mem.bytesAsSlice(i64, hb[std.mem.alignForward(usize, 8 * n, 16)..][0 .. 8 * (n + 3)]));
                 try r.d.check(r.d.api.cuMemcpyDtoHAsync_v2(oh.ptr, out_dev, 8 * (n + 3), r.stream.handle), "cuMemcpyDtoHAsync");
-                try r.stream.synchronize();
+                f.pick_last = .{ .out = out_dev, .n = @intCast(n), .chain = chain, .start = @intCast(start), .host = oh.ptr };
+                if (f.after_pick) |h| {
+                    // work that starts from the device pick (the speculative DSpark pass, spec.py's order) goes on the
+                    // stream after the copy back; the host waits for the copy alone
+                    if (f.pick_done == null) f.pick_done = try cuda.Event.init(r.d, false);
+                    try f.pick_done.?.record(r.stream);
+                    try h.run(h.ctx, f.pick_last.?);
+                    try f.pick_done.?.synchronize();
+                } else try r.stream.synchronize();
                 for (out, oh[0..n]) |*o, x| o.* = @intCast(x);
-                f.pick_last = .{ .out = out_dev, .n = @intCast(n), .chain = chain };
                 return;
             }
             const vh: []f32 = @alignCast(std.mem.bytesAsSlice(f32, hb[0 .. 4 * n]));
@@ -359,7 +371,12 @@ pub const Forward = struct {
     /// on the GPU before the host has the tokens (the DSpark pass's device start): `out` int64 [n + 3] = each row's
     /// pick, then (a chain window, `chain`) the accepted drafts, the bonus token (= out[accepted]) and the next
     /// position (window start + accepted + 1), valid in stream order after `greedy` returns until the next pick.
-    pub const PickDevice = struct { out: u64, n: u32, chain: bool };
+    /// `start`: the window's first position; `host`: the pinned copy of `out`, valid once `greedy` returned
+    pub const PickDevice = struct { out: u64, n: u32, chain: bool, start: u64 = 0, host: ?[*]const i64 = null };
+
+    /// Work enqueued from the device pick (dspark_gpu.zig's speculative pass), on every rank, after the pick's copy back
+    /// and before the host waits for it.
+    pub const AfterPick = struct { ctx: *anyopaque, run: *const fn (ctx: *anyopaque, pick: PickDevice) anyerror!void };
 
     pub fn pickDevice(f: *const Forward) ?PickDevice {
         return f.pick_last;

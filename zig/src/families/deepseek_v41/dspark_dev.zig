@@ -232,6 +232,18 @@ pub const Dev = struct {
         if (out != .eager) x.stats.graphed += 1;
     }
 
+    /// A speculative pass's launch (dspark_gpu.afterPick): the key's graph when it is already captured, else eagerly -
+    /// never a capture (spec.py: "only keys already captured: a speculation never captures"), so no agreement
+    /// collective runs between the pick and its copy back.
+    pub fn issueReplay(x: *Dev, key: u32, fp: u64, body: graphs.gc.Body) !void {
+        if (x.active == .graphs and !x.cache.failed and x.cache.has(key) and x.cache.fingerprint == fp) {
+            _ = try x.cache.run(key, x.stream, fp, body);
+            x.stats.graphed += 1;
+            return;
+        }
+        return body.run(body.ctx, x.stream);
+    }
+
     /// The device buffers a graphed pass bakes in besides the runner's roles.
     pub fn words(x: *const Dev, out: []u64) usize {
         const w = [_]u64{ x.send.ptr, x.gathered.ptr, @intFromPtr(x.host.bytes.ptr), @intFromPtr(x.stage.bytes.ptr) };

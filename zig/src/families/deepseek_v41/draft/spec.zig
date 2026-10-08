@@ -176,6 +176,11 @@ pub const Spec = struct {
         return false;
     }
 
+    /// `wanted` without counting a skip: whether a launch after this slot's coming window would take it (the arm).
+    pub fn wouldWant(s: *const Spec, slot: u32) bool {
+        return s.rate[slot] >= min_rate or s.skipped[slot] + 1 >= probe;
+    }
+
     fn score(s: *Spec, hit: bool) void {
         for (s.asks[0..s.n]) |a| s.rate[a.slot] = decay * s.rate[a.slot] + (1.0 - decay) * @as(f64, if (hit) 1.0 else 0.0);
     }

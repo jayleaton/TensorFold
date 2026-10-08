@@ -93,6 +93,58 @@ pub fn stage(lay: emit.Layout, n: u32, window: u32, ring: u32, noise: u32, ms: [
     }
 }
 
+/// The one-slot pass's statics (dspark_gpu.zig, Python's DraftInputs for slot 0): ids [anchor, noise ...],
+/// positions start .., the context list max(start -| window, valid) .. start - 1 as ring rows, counts, lo, hi, start,
+/// anchor; every other element 0.
+pub fn stageOne(st: emit.Statics, ring: u64, noise: u32, valid: u64, anchor: u32, start: u64, h64: []i64, h32: []i32) void {
+    const n: usize = @intCast(st.n);
+    const W: usize = @intCast(st.window);
+    @memset(h64, 0);
+    @memset(h32, 0);
+    for (0..n) |i| {
+        h64[@intCast(st.ids() + @as(i64, @intCast(i)))] = if (i == 0) anchor else noise;
+        h64[@intCast(st.positions() + @as(i64, @intCast(i)))] = @intCast(start + i);
+    }
+    const first = @max(start -| @as(u64, W), valid);
+    const count: usize = @intCast(if (start > first) start - first else 0);
+    h32[@intCast(st.start())] = @intCast(start);
+    const tok = h32[@intCast(st.tokens())..][0 .. n * W];
+    @memset(tok, -1);
+    for (0..n) |i| for (0..count) |j| {
+        tok[i * W + j] = @intCast((first + j) % ring);
+    };
+    @memset(h32[@intCast(st.counts())..][0..n], @intCast(count));
+    @memset(h32[@intCast(st.lo())..][0..n], @intCast(start));
+    @memset(h32[@intCast(st.hi())..][0..n], @intCast(start + n - 1));
+    h32[@intCast(st.anchor())] = @intCast(anchor);
+}
+
+/// glue.cu ds_stage's arithmetic on the host (its mirror, for the test against `stageOne`): the position-dependent
+/// statics from a device pick `pick` ([nw + 3]: picks, accepted, bonus, next position) over already staged ones.
+pub fn stageMirror(st: emit.Statics, ring: u64, noise: u32, valid: u64, pick: []const i64, nw: usize, h64: []i64, h32: []i32) void {
+    const n: usize = @intCast(st.n);
+    const W: i64 = st.window;
+    const A = pick[nw + 1];
+    const P = pick[nw + 2];
+    const lo_w: i64 = if (P > W) P - W else 0;
+    const first: i64 = @max(lo_w, @as(i64, @intCast(valid)));
+    const count: i64 = if (P > first) P - first else 0;
+    for (0..n) |i| {
+        const ii: i64 = @intCast(i);
+        h64[@intCast(ii)] = if (i == 0) A else noise;
+        h64[@intCast(st.positions() + ii)] = P + ii;
+        h32[@intCast(st.counts() + ii)] = @intCast(count);
+        h32[@intCast(st.lo() + ii)] = @intCast(P);
+        h32[@intCast(st.hi() + ii)] = @intCast(P + @as(i64, @intCast(n)) - 1);
+    }
+    for (0..n * @as(usize, @intCast(W))) |e| {
+        const j: i64 = @intCast(e % @as(usize, @intCast(W)));
+        h32[@intCast(st.tokens() + @as(i64, @intCast(e)))] = if (j < count) @intCast(@mod(first + j, @as(i64, @intCast(ring)))) else -1;
+    }
+    h32[0] = @intCast(P);
+    h32[@intCast(st.anchor())] = @intCast(A);
+}
+
 /// The leader's op_propose message for `ms` into `buf` (2 + 3 x 16 words).
 pub fn proposeMsg(ms: []const Member, buf: []i64) ![]const i64 {
     if (ms.len == 0 or 2 + 3 * ms.len > buf.len) return error.BadPlan;

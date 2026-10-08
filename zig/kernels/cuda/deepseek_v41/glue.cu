@@ -16,6 +16,9 @@
 //   carry        carry[j] = f32(src[row][j]), row = *accepted (device) or the host's   (the ratio-2 compressor carry)
 //   ds_cands     DSpark's candidates (dspark.candidates / draft/dspark.zig): each row's best k fp32 logits by (value
 //                desc, column asc), -0.0 == +0.0, as [vals k | ids k as int bits] (an exact selection: integers only)
+//   ds_stage     DSpark's one-slot pass statics from the device pick (spec.py stage_device): anchor = pick[nw + 1] (the
+//                bonus), P = pick[nw + 2]; dspark_gpu.fillStatics' values (ids, positions, P, the context list, counts,
+//                lo, hi, anchor), integers only
 //   pick_pack    pairs[r] = (f64 vals[r], f64 (cols[r] + id0))     (forward.greedy's pair: a rank's best, topk_keys k 1)
 //   pick_merge   out[r] = the id of the best pair over the ranks [W][n][2] (higher value; on a tie or NaN the lower
 //                rank: forward.greedy's merge, strict >); out[n] = accepted (rows 0.. whose pick is the next row's id:
@@ -237,6 +240,34 @@ __global__ void __launch_bounds__(1024) pick_merge_kernel(const double* __restri
         out[n] = acc;
         out[n + 1] = out[acc];
         out[n + 2] = start + acc + 1;
+    }
+}
+
+// one block: DSpark's one-slot statics from the device pick ([nw + 3]: picks, accepted, bonus, next position), as
+// dspark_gpu.fillStatics writes them for (anchor, start) = (bonus, next position); the fields it leaves 0 stay as staged
+__global__ void __launch_bounds__(256) ds_stage_kernel(const long long* __restrict__ pick, int nw, long long* __restrict__ s64,
+                                                      int* __restrict__ s32, int n, int W, int ring, long long valid,
+                                                      int noise, int o_pos, int o_tok, int o_cnt, int o_lo, int o_hi,
+                                                      int o_anchor) {
+    const long long A = pick[nw + 1], P = pick[nw + 2];
+    const long long lo_w = P > W ? P - W : 0;                       // p -| window
+    const long long first = lo_w > valid ? lo_w : valid;
+    const int count = P > first ? (int)(P - first) : 0;
+    const int t = threadIdx.x;
+    for (int i = t; i < n; i += blockDim.x) {
+        s64[i] = i == 0 ? A : (long long)noise;                     // ids (offset 0)
+        s64[o_pos + i] = P + i;
+        s32[o_cnt + i] = count;
+        s32[o_lo + i] = (int)P;
+        s32[o_hi + i] = (int)(P + n - 1);
+    }
+    for (int e = t; e < n * W; e += blockDim.x) {
+        const int j = e % W;
+        s32[o_tok + e] = j < count ? (int)((first + j) % ring) : -1;
+    }
+    if (t == 0) {
+        s32[0] = (int)P;                                            // start (offset 0)
+        s32[o_anchor] = (int)A;
     }
 }
 

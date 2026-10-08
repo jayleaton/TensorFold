@@ -266,3 +266,41 @@ test "groups, messages, taps placement, the gather's order" {
     try testing.expectEqualSlices(i32, &.{ 10, 11, 20, 21, 12, 13, 22, 23 }, &cand);
     try testing.expectEqualSlices(f32, &.{ 1, 2, 5, 6, 3, 4, 7, 8 }, &cval);
 }
+
+test "the speculative pass's device start: ds_stage's arithmetic over the placeholder staging == the host's statics" {
+    // dspark_gpu.afterPick stages stageOne(anchor 0, the window's start), then glue.cu ds_stage (mirrored by
+    // stageMirror) writes every position-dependent element from the pick: the result must be stageOne(bonus, next
+    // position), the statics `begin` would stage on the host. stageOne itself against Context.of (draft/dspark.zig).
+    const dspark = @import("draft/dspark.zig");
+    const cfg: Config = .{};
+    const st: emit.Statics = .{ .n = cfg.dspark_block, .window = cfg.window };
+    const ring: u64 = @intCast(emit.ringRows(&cfg));
+    const shape: dspark.Shape = .{ .block = cfg.dspark_block, .window = cfg.window };
+    var want64: [64]i64 = undefined;
+    var want32: [1024]i32 = undefined;
+    var got64: [64]i64 = undefined;
+    var got32: [1024]i32 = undefined;
+    const l64: usize = @intCast(st.len64());
+    const l32: usize = @intCast(st.len32());
+    for ([_]u64{ 1, 2, 5, 127, 128, 129, 200, 255, 256, 257, 4000, 1 << 20 }) |P| {
+        for ([_]u64{ 0, 1, 64, 150, 3999 }) |valid| {
+            if (valid > P) continue;
+            for ([_]u32{ 1, 3, 6 }) |nw| {
+                const window_start = P - @min(P, nw); // the window the pick came from (any start below P)
+                var pick: [16]i64 = @splat(0);
+                pick[nw] = 2; // accepted (unused by the statics)
+                pick[nw + 1] = 77_123; // bonus
+                pick[nw + 2] = @intCast(P);
+                rows.stageOne(st, ring, cfg.dspark_noise_token, valid, 77_123, P, want64[0..l64], want32[0..l32]);
+                rows.stageOne(st, ring, cfg.dspark_noise_token, valid, 0, window_start, got64[0..l64], got32[0..l32]);
+                rows.stageMirror(st, ring, cfg.dspark_noise_token, valid, &pick, nw, got64[0..l64], got32[0..l32]);
+                try testing.expectEqualSlices(i64, want64[0..l64], got64[0..l64]);
+                try testing.expectEqualSlices(i32, want32[0..l32], got32[0..l32]);
+                // stageOne's context == Context.of's (the old fillStatics' rule)
+                const c = dspark.Context.of(shape, P, valid);
+                try testing.expectEqual(@as(i32, @intCast(c.count)), want32[@intCast(st.counts())]);
+                if (c.count > 0) try testing.expectEqual(@as(i32, @intCast(c.first % ring)), want32[@intCast(st.tokens())]);
+            }
+        }
+    }
+}

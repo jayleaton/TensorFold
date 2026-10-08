@@ -257,6 +257,7 @@ pub const Lanes = struct {
             c.* = o.sampled;
             @memcpy(o.drafts, tokens[1..]);
         }
+        if (x.spec != null) x.armSpec(windows, segs);
         try x.target.window(segs, choices);
         for (windows) |w| {
             const st = try x.get(w.stream);
@@ -264,6 +265,34 @@ pub const Lanes = struct {
             st.len += w.rows();
         }
         if (x.spec != null) try x.speculate(a, windows, segs, choices);
+    }
+
+    /// Before the window: the slots whose next pass `speculate` would launch (its rules, without the window's choices)
+    /// are armed, so the pass may start from the window's device pick (Pass.arm; spec.py's order).
+    fn armSpec(x: *Lanes, windows: []const be.Window, segs: []const iface.Segment) void {
+        const arm = x.pass.vtable.arm orelse return;
+        const sp = &x.spec.?;
+        var tree_round = false;
+        var nucleus = false;
+        for (windows) |w| {
+            tree_round = tree_round or w.parents != null;
+            nucleus = nucleus or spec_mod.isNucleus(w.stream.sampling);
+        }
+        if (!sp.roundAllowed(tree_round, nucleus)) return;
+        for (windows, segs) |w, g| {
+            const st = x.get(w.stream) catch continue;
+            if (!dsparkRound(st, w) or !sp.wouldWant(st.slot)) continue;
+            arm(x.pass.ptr, st.slot, g.start, @intCast(g.tokens.len));
+        }
+    }
+
+    /// A DSpark round: the window verifies the pass's drafts (none when the depth chose 0), no host drafts. The lane
+    /// core reads a chain's held drafts back as host tokens (Backend.tree after every draft), so a window of `w.tokens`
+    /// that are a prefix of the slot's held chain is one too.
+    fn dsparkRound(st: *const St, w: be.Window) bool {
+        if (st.n == 0) return false;
+        if (w.tokens.len == 0) return true;
+        return w.held == 0 and w.parents == null and w.tokens.len <= st.n and std.mem.eql(u32, w.tokens, st.held[0..w.tokens.len]);
     }
 
     /// Collects a speculative pass still running (before any other pass, target or ingest work).
@@ -285,12 +314,9 @@ pub const Lanes = struct {
         var n: usize = 0;
         for (windows, segs, choices) |w, g, c| {
             const st = try x.get(w.stream);
-            // a DSpark round: the window verifies the pass's drafts (none when the depth chose 0), no host drafts.
-            // The lane core reads a chain's held drafts back as host tokens (Backend.tree after every draft), so a
-            // window of `w.tokens` that are a prefix of the slot's held chain is a DSpark round too (it was skipped:
-            // the night's run A speculated 800 of 7,493 passes)
-            if (st.n == 0) continue;
-            if (w.tokens.len != 0 and !(w.held == 0 and w.parents == null and w.tokens.len <= st.n and std.mem.eql(u32, w.tokens, st.held[0..w.tokens.len]))) continue;
+            // a DSpark round (dsparkRound; before 6237ee39 chain rounds read back as host tokens were skipped: the
+            // night's run A speculated 800 of 7,493 passes)
+            if (!dsparkRound(st, w)) continue;
             var acc: u32 = 0;
             while (acc + 1 < g.tokens.len and g.tokens[acc + 1] == c[acc]) acc += 1;
             cands[n] = .{ .slot = st.slot, .start = g.start, .accepted = acc, .bonus = c[acc], .sampling = g.sampling };
