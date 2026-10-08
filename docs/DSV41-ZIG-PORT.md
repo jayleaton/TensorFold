@@ -1380,7 +1380,7 @@ were taken with prod's knobs; *ported* = read under prod's name):
 | `MHC_PF=1`, `MHC_BM=64`, `MHC_WARPS=8` | `mhc_pf.py`, `mhc.py` | built in | `block_prefill.zig:62-63` (`pf_rows` 256, `mhc_bm` 64), `:253` (`tf_dsv41_mhc_pf_v1.run`); warps are the AOT variant's | M1 caps |
 | `FULL_CONE=1` | `rounds.py:217`: only when `mode == "full"`; prod runs replay | inert in prod | - (would only matter if Zig served `full`) | - |
 | `PREFILL_KERNELS=fast` | `prefill_mm.py` | built in | `block_prefill.zig:1-8` (rot_in, unpack, `_gemm` column blocks under `ws_limit` `:60`) | M1 caps |
-| `FAST_EXPERTS=gm` + `GM_V2=1` | `x3gm.py` `_run_ragged` / `_run_v2` | built in (v1); **v2 ported, now ON in prod-zig.env** | `block_prefill.zig:899-939` (x3gm rot / gateup / down), `:907` + `gm2pf.zig:37` (`TF_DSV41_GM_V2`) | `550a371..46b15c6`; zig-serve this pass |
+| `FAST_EXPERTS=gm` + `GM_V2=1` | `x3gm.py` `_run_ragged` / `_run_v2` | built in (v1); **v2 ported, now ON in prod-zig.env** | `block_prefill.zig:899-939` (x3gm rot / gateup / down), `:907` + `gm2pf.zig:37` (`TF_DSV41_GM_V2`) | `550a371..46b15c6`; zig-serve `8bc8318` |
 | `PF_DENSE=fused` + `PF_DENSE_TABLE` | `pfdense.py` | ported, ON in prod-zig.env | `prod_knobs.zig:102`, `block_prefill.zig:118`, `:166-168` (`Seg.fused`) | 0e; zig-serve ed716a5 |
 | `ENGRAM_NATIVE=1`, `NATIVE_DIR` | `engram_native.py` (pthread pool: 32 threads prefill, 64 decode) | equivalent | `engram_rows.zig:16` (`TF_DSV41_ENGRAM_QD`, 64 threads without io_uring), dd33a75 / d6c5e02; `NATIVE_DIR` is Python's C build dir | dd33a75, d6c5e02 |
 | `PREFETCH_AHEAD=1` | `prefetch.py` (one segment ahead; the next round keeps a bulk read in flight) | ported, ON; **its layer-14 batch was dropped before use: fixed** | `forward_prefill.zig:171`, `:181` (`readAhead`); `engram_rows.zig` `settle` | 19be37a7; **this pass** |
@@ -1405,7 +1405,7 @@ Nothing on the list is MISSING. Two were OFF in every night run (GM_V2, PREFETCH
 | Engram read-ahead | the round issues this segment's reads and the next one's (`ahead`); a bulk read in flight is kept | `readAhead` issues segment k + 1's reads before segment k runs; **before this pass `settle` dropped the k + 1 layer-14 batch at k + 1's layer-1 read**, so every layer-14 read was a synchronous miss with the GPU drained (~70-75 ms a segment with the reader pool, ~250 ms serial at the night). Fixed: an unread bulk batch is only aged by reads of its own table |
 | rank-1 exchange | the plan (RDMA mailbox) each round, then the forward's all-gathers | the segment's all-gathers only (> 1 MiB: NCCL, as Python above `ROCE_MAX_KB`) |
 
-**Changes in this pass** (engine `dsv41-zig`, HEAD + these files in a clean `git archive` tree):
+**Changes in this pass** (engine `dsv41-zig` `51acf4ea`, `144a97a5`; HEAD + these files in a clean `git archive` tree):
 1. `engram_rows.zig` `settle`: a settle on another table never drops an unread bulk batch; it is still dropped at the
    second read of its own table (a wrong guess costs one read, never a bit). `engram_rows_test.zig`: segment k + 1's
    batches on two tables survive segment k's layer-1 then layer-14 reads and segment k + 1's layer-1 read, 0 misses on
@@ -1417,7 +1417,7 @@ Nothing on the list is MISSING. Two were OFF in every night run (GM_V2, PREFETCH
    as `glue.engram_rows` time; `dsv41_m2b_ref.py --profile-prefill N` times Python's prefill of the gate's prompt
    shape (warm, timed, torch.profiler); `gap.py prefill` puts them side by side by family and by kernel; the M2c-2 kit
    takes `PROF_PREFILL=1` and `LIMIT` (prompts past 4,096). Off unless set: nothing changes in the served engine.
-3. zig-serve `prod-zig.env`: `TF_DSV41_GM_V2=1`; the "left out" note now names the knobs built into the emitter.
+3. zig-serve `prod-zig.env` (`8bc8318`): `TF_DSV41_GM_V2=1`; the "left out" note now names the knobs built into the emitter.
 
 **Expected at 32K** (one stream, `bench_http.py --long 32768`; each row multiplies the one above; the basis column is
 the measured share or Python's own number):
