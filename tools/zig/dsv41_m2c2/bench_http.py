@@ -10,6 +10,10 @@ N are live (m2bench ``steady``). Standard library only (runs on the Spark hosts 
     python3 bench_http.py --url ... --out long.json --long 32768,131072,524288   # long context, one stream a length:
         an N-token document (about N tokens: the reply's usage.prompt_tokens is the exact count) and a question; the
         prompt's tok/s (prompt tokens / time to the first token) and the decode tok/s of a 128-token answer
+
+Every cell also keeps each reply's tokens a decode round (``tpr``: drafting's acceptance, from the ``tensorfold`` block
+of the stream's last chunk): Python's ``drafting.tokens_per_round`` ((windows + drafts kept) / windows), the Zig
+server's ``(rounds + accepted) / rounds``; ``--compare`` prints both sides' mean a cell.
 """
 from __future__ import annotations
 
@@ -41,15 +45,20 @@ them. Plain prose, no lists or headings.""")
 PROMPTS = {"code": (CODE, *CODE_MORE), "prose": (PROSE, *PROSE_MORE)}
 
 
+NO_DRAFT = False     # --no-draft: every request with "draft": false (both servers: the reply without DSpark)
+
+
 def one(url: str, model: str, msg: str, temp: float, max_tokens: int, out: dict) -> None:
     body = {"model": model, "messages": [{"role": "user", "content": msg}], "max_tokens": max_tokens,
             "temperature": temp, "stream": True, "stream_options": {"include_usage": True},
             "reasoning_effort": "none", "chat_template_kwargs": {"enable_thinking": False}}
     if temp > 0:
         body.update(top_p=0.95, seed=1234)
+    if NO_DRAFT:
+        body["draft"] = False
     req = urllib.request.Request(f"{url}/v1/chat/completions", data=json.dumps(body).encode(),
                                  headers={"content-type": "application/json"})
-    times, usage, t0, text = [], None, time.perf_counter(), []
+    times, usage, t0, text, tf = [], None, time.perf_counter(), [], None
     with urllib.request.urlopen(req, timeout=900) as r:
         for raw in r:
             line = raw.decode().strip()
@@ -58,6 +67,8 @@ def one(url: str, model: str, msg: str, temp: float, max_tokens: int, out: dict)
             d = json.loads(line[5:])
             if d.get("usage"):
                 usage = d["usage"]
+            if d.get("tensorfold"):
+                tf = d["tensorfold"]
             for c in d.get("choices") or []:
                 delta = c.get("delta") or {}
                 if delta.get("content") or delta.get("reasoning_content"):
@@ -68,7 +79,23 @@ def one(url: str, model: str, msg: str, temp: float, max_tokens: int, out: dict)
                prompt_tokens=(usage or {}).get("prompt_tokens"),
                sha=hashlib.sha256("".join(text).encode()).hexdigest()[:16],
                decode_tok_s=round((n - 1) / (times[-1] - times[0]), 2) if len(times) > 1 and times[-1] > times[0] else None,
-               ttft_s=round(times[0] - t0, 3) if times else None)
+               ttft_s=round(times[0] - t0, 3) if times else None, tpr=tokens_per_round(tf))
+
+
+def tokens_per_round(tf: dict | None) -> float | None:
+    """Tokens a decode round of one reply (1 = no draft kept): Python's drafting report, else the Zig server's counts."""
+    tf = tf or {}
+    dr = tf.get("drafting") or {}
+    if dr.get("tokens_per_round") is not None:
+        return dr["tokens_per_round"]
+    if not dr and tf.get("rounds") and "accepted" in tf:     # Python's top-level "rounds" is the server's total
+        return round((tf["rounds"] + tf["accepted"]) / tf["rounds"], 3)
+    return None
+
+
+def mean(xs: list) -> float | None:
+    xs = [x for x in xs if x is not None]
+    return round(sum(xs) / len(xs), 3) if xs else None
 
 
 def cell(url: str, model: str, work: str, temp: float, streams: int, max_tokens: int) -> dict:
@@ -88,7 +115,8 @@ def cell(url: str, model: str, work: str, temp: float, streams: int, max_tokens:
     return {"work": work, "temp": temp, "streams": streams, "per_stream": rates,
             "mean_tok_s": round(sum(rates) / len(rates), 2) if rates else None, "aggregate_tok_s": agg,
             "ttft_s": [r.get("ttft_s") for r in res], "tokens": [r.get("tokens") for r in res],
-            "sha": [r.get("sha") for r in res]}
+            "sha": [r.get("sha") for r in res], "tpr": [r.get("tpr") for r in res],
+            "mean_tpr": mean([r.get("tpr") for r in res])}
 
 
 def document(n: int) -> str:
@@ -110,7 +138,7 @@ def long_cell(url: str, model: str, n: int, max_tokens: int) -> dict:
     return {"work": f"long-{n}", "temp": 0.0, "streams": 1, "prompt_tokens": pt, "ttft_s": r.get("ttft_s"),
             "prompt_tok_s": round(pt / r["ttft_s"], 1) if pt and r.get("ttft_s") else None,
             "mean_tok_s": r.get("decode_tok_s"), "aggregate_tok_s": None, "per_stream": [r.get("decode_tok_s")],
-            "tokens": [r.get("tokens")]}
+            "tokens": [r.get("tokens")], "sha": [r.get("sha")], "tpr": [r.get("tpr")], "mean_tpr": r.get("tpr")}
 
 
 def compare(a_path: str, b_path: str) -> None:
@@ -146,6 +174,21 @@ def compare(a_path: str, b_path: str) -> None:
             if w in lb:
                 print(f"| {w} | {la[w]['prompt_tokens']} | {la[w]['prompt_tok_s']} | {lb[w]['prompt_tok_s']} | "
                       f"{la[w]['ttft_s']} | {lb[w]['ttft_s']} |")
+    # drafting's acceptance: mean tokens a round a cell (all reps), where both sides report it
+    ta, tb = _tprs(a["cells"], key), _tprs(b["cells"], key)
+    rows = [k for k in sorted(ta) if k in tb and ta[k] and tb[k]]
+    if rows:
+        print(f"\n| workload | T | streams | {a['label']} tokens/round | {b['label']} tokens/round | {b['label']} vs {a['label']} |")
+        print("|---|---|---|---:|---:|---:|")
+        for k in rows:
+            print(f"| {k[0]} | {k[1]} | {k[2]} | {ta[k]:.3f} | {tb[k]:.3f} | {100 * (tb[k] / ta[k] - 1):+.1f} % |")
+
+
+def _tprs(cs, key):
+    out = {}
+    for c in cs:
+        out.setdefault(key(c), []).extend(x for x in c.get("tpr") or [] if x is not None)
+    return {k: sum(v) / len(v) if v else None for k, v in out.items()}
 
 
 def _group(cs, key):
@@ -169,7 +212,10 @@ def main() -> int:
     ap.add_argument("--out", default="")
     ap.add_argument("--compare", nargs=2, metavar=("A", "B"))
     ap.add_argument("--long", default="", help="long-context lengths (tokens, comma separated): one stream each, T0")
+    ap.add_argument("--no-draft", action="store_true", help='every request with "draft": false (drafts-off replies)')
     a = ap.parse_args()
+    global NO_DRAFT
+    NO_DRAFT = a.no_draft
     if a.compare:
         compare(*a.compare)
         return 0

@@ -24,7 +24,11 @@
 #   IMAGES=native), GM_V2 (1: x3gm v2 prefill), PF_DENSE (fused: prod's fused dense prefill + its table),
 #   PREFETCH_AHEAD (1: the next segment's Engram reads early; needs ENGRAM=1); each on only once its pod gate passed.
 #   SPEC (1: the speculative DSpark pass, prod's TF_DSV41_SPEC_DRAFT=1; 0: off), CONTEXT (the served slot limit, prod
-#   1048576; unset: 4,096; needs the long-aot phase's rope.bin and _stream variants).
+#   1048576; unset: 4,096; needs the long-aot phase's rope.bin and _stream variants), PREFILL_MODE (replay: CED replay
+#   prefill, prod's TF_DSV41_PREFILL=replay, needs PROMPT_TAIL=verify; unset: full).
+# dspark-aot's capture: CAPTURE_SETS (P), CAPTURE_ENV (more capture settings, space separated KEY=value, e.g.
+#   "M1_WINDOWS=1,3,16,20,24 M1_DRAFT_SLOTS=4": windows past 16 rows and the 4-slot pass), CAPTURE_OUT (capture-p: the
+#   dir under OUTDIR), CAPTURE_MERGE (1: its aot/ merged into ASSETS/aot; 0: kept apart, e.g. until `dcheck` passed).
 # long-aot (both hosts, once, before CONTEXT past 4,096): Python's prefill of one 8,448-token prompt on layers 0-24 at TP=2
 # over the two hosts (the stream top-k's _stream variants past 4,096 visible keys) merged into ASSETS/aot, and ASSETS'
 # rope.bin rebuilt with LONG_ROWS rows (1,050,624 = 1M + 2,048) (about 10 min).
@@ -75,6 +79,7 @@ if [[ "${CALIB-real}" == real || "${BIAS_VL:-0}" == 1 || -n "${PF_DENSE:-}" ]]; 
 [[ "${SPEC:-1}" == 1 ]] && ARGS+=(-e TF_DSV41_SPEC_DRAFT=1)    # prod's SPEC_DRAFT=1: the next round's pass early
 [[ -n "${CONTEXT:-}" ]] && ARGS+=(-e TF_DSV41_CONTEXT="$CONTEXT")  # the served slot limit (rope.bin: CONTEXT + 2,048 rows)
 [[ "${PHASES:-0}" == 1 ]] && ARGS+=(-e TF_DSV41_PHASES=1 -e TF_DSV41_PHASES_OUT=/out/phases.json)
+[[ -n "${PREFILL_MODE:-}" ]] && ARGS+=(-e TF_DSV41_PREFILL="$PREFILL_MODE")
 NCCL='export TF_NCCL_LIB=$(python -c "import nvidia.nccl, os; print(os.path.join(os.path.dirname(nvidia.nccl.__file__), \"lib\", \"libnccl.so.2\"))" 2>/dev/null || echo libnccl.so.2)'
 case "$PHASE" in
     server)
@@ -88,18 +93,20 @@ case "$PHASE" in
     dspark-aot)
         # DSpark's Triton variants on this GPU (the M2c-2 reference never drafts): a set P capture (one GPU, ~3 min) on
         # prod's tree and knobs (+ R1), its AOT set merged into ASSETS/aot
-        CAP=$OUT/capture-p; rm -rf "$CAP"
+        CO=${CAPTURE_OUT:-capture-p}; CAP=$OUT/$CO; rm -rf "$CAP"
+        CE=(); for kv in ${CAPTURE_ENV:-}; do CE+=(-e "$kv"); done
         KN=(); for f in prod-knobs.env r1c-knobs.env; do while read -r kv; do [[ "$kv" =~ ^TF_ ]] && KN+=(-e "$kv"); done < "$KIT/tools/zig/dsv41_m1/$f"; done
         C=8474f3164ea60cb9c9f8e9bd5a4493fdf13eaa47
         if [[ "$RANK" == 0 ]]; then TF=/home/dgx01/ai/src/dsv41-prod/$C; else TF=/home/root/ai/src/dsv41-prod/$C; fi
         docker run --rm --gpus all --ipc=host -v "$TF:/dsv41-tf:ro" -v "$MODEL:/model:ro" -v "$KIT:/kit:ro" -v "$OUT:/out" \
-            -v "${CACHE_VOL:-dsv41-perf1-cache}:/cache" "${KN[@]}" -e TF_DSV41_GM_V2=1 -e M1_PREFILL_ROWS=0 \
+            -v "${CACHE_VOL:-dsv41-perf1-cache}:/cache" "${KN[@]}" -e TF_DSV41_GM_V2=1 -e M1_PREFILL_ROWS=0 "${CE[@]}" \
             -e PYTHONPATH=/dsv41-tf/src:/cache/pylib -e TORCH_EXTENSIONS_DIR=/cache/torch_extensions -e TRITON_CACHE_DIR=/cache/triton \
-            --name "dsv41-zig-capp-r$RANK" --entrypoint python "$IMAGE" -u -B /kit/tools/zig/dsv41_m1_capture.py --pack /model --out /out/capture-p --sets P \
-            > "$OUT/capture-p.log" 2>&1 || { echo "capture P failed: $OUT/capture-p.log"; exit 1; }
+            --name "dsv41-zig-capp-r$RANK" --entrypoint python "$IMAGE" -u -B /kit/tools/zig/dsv41_m1_capture.py --pack /model --out "/out/$CO" --sets "${CAPTURE_SETS:-P}" \
+            > "$OUT/$CO.log" 2>&1 || { echo "capture ${CAPTURE_SETS:-P} failed: $OUT/$CO.log"; exit 1; }
         # the blobs are the container's (root-owned): removed as root in the image; the merge does not depend on it
-        docker run --rm -v "$OUT:/out" --entrypoint rm "$IMAGE" -rf /out/capture-p/blobs || echo "warning: $CAP/blobs left"
-        python3 "$KIT/tools/zig/dsv41_aot_merge.py" "$ASSETS/aot" "$CAP/aot" | tee -a "$OUT/capture-p.log" ;;
+        docker run --rm -v "$OUT:/out" --entrypoint rm "$IMAGE" -rf "/out/$CO/blobs" || echo "warning: $CAP/blobs left"
+        if [[ "${CAPTURE_MERGE:-1}" == 1 ]]; then python3 "$KIT/tools/zig/dsv41_aot_merge.py" "$ASSETS/aot" "$CAP/aot" | tee -a "$OUT/$CO.log"
+        else echo "$CAP/aot kept apart (CAPTURE_MERGE=0)" | tee -a "$OUT/$CO.log"; fi ;;
     rows-aot)
         # the row-mode Triton variants (ROWS, int64 POS, SL / PTS) of every bucket up to 16 on this GPU: Python's slots
         # engine (prod's tree: rowtab / rowmode / rowgraphs) at TP=2 over the two hosts, 4 slots, layers 0-24 (every

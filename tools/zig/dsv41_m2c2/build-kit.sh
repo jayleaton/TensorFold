@@ -1,22 +1,27 @@
 #!/usr/bin/env bash
 # Builds the Spark kit (dev box, no Spark): tf-dsv41-m1 and tensorfold-dsv41 for aarch64 with the sm_121 fatbins
 # embedded, the TP mailbox / RoCE fatbin, the Python tools, run_host.sh (M2c-2), run_m4.sh + requests.sh + prompts.txt
-# (M4), bench_http.py, restore.sh, the slots reference, RUNBOOK.md (the overnight window: tools/zig/dsv41_m4/
-# RUNBOOK-OVERNIGHT.md), SHA256SUMS. Run it from a clean archive of the tree
-# (KIT_COMMIT=<hash>): the shared worktree may hold other agents' uncommitted files.
-#   FATBINS=<dir of sm_121 dsv41_*.fatbin> TP_FATBIN=<tp_mailbox.fatbin (sm_121)> bash build-kit.sh KITDIR
+# (M4), bench_http.py, restore.sh, the slots reference, diverge.py (Zig vs Python replies) and gap.py (phases /
+# prefill profiles), RUNBOOK.md (the overnight window: tools/zig/dsv41_m4/RUNBOOK-OVERNIGHT.md), SHA256SUMS. Run it
+# from a clean archive of the tree (KIT_COMMIT=<hash>): the shared worktree may hold other agents' uncommitted files.
+#   FATBINS=<dir of sm_121 dsv41_*.fatbin> [TP_FATBIN=<prebuilt tp_mailbox.fatbin>] bash build-kit.sh KITDIR
+# kit-fatbins.sh first makes KITDIR/fatbins: FATBINS' files + tp_mailbox.fatbin built from this tree's mailbox.cu (nvcc
+# 13.3, tp.zig's flags; TP_FATBIN only when it passes the same checks), the glue fatbin checked against glue.cu. The
+# binaries embed that dir, and it is the prod image's: ZIG_FATBINS=KITDIR/fatbins scripts/zig-image.sh stage (zig-serve).
+# TRITON_FILL_WIDE=<a kept fill dir (its aot/, compile.json)>: copied to KITDIR/triton-fill-wide (W2's merge source).
 set -euo pipefail
 # the dev box's shared build lock (spark-work/heavy.sh: one heavy job at a time, 8 GiB, -j4), when it exists
 H=$HOME/Documents/Projects/spark-work/heavy.sh
 [[ -n "${HEAVY_HELD:-}" || ! -x "$H" ]] || exec env HEAVY_HELD=1 "$H" bash "$0" "$@"
-KIT=${1:?kit dir}; FB=${FATBINS:?sm_121 fatbin dir}; TPF=${TP_FATBIN:?tp_mailbox.fatbin}
+KIT=${1:?kit dir}; : "${FATBINS:?sm_121 fatbin dir}"
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); TREE=$(cd "$HERE/../../.." && pwd)
 export PATH=$HOME/.local/opt/zig:$PATH
-rm -rf "$KIT" && mkdir -p "$KIT/tools/zig/dsv41_m1"
+rm -rf "$KIT" && mkdir -p "$KIT/tools/zig/dsv41_m1" && KIT=$(cd "$KIT" && pwd)
 cd "$TREE"
-zig build -Dtarget=aarch64-linux-gnu -Dfatbins="$FB" -Dsm=121 -Doptimize=ReleaseSafe -j4 --prefix "$KIT/.build" install
+bash "$HERE/kit-fatbins.sh" "$KIT/fatbins"
+zig build -Dtarget=aarch64-linux-gnu -Dfatbins="$KIT/fatbins" -Dsm=121 -Doptimize=ReleaseSafe -j4 --prefix "$KIT/.build" install
 cp "$KIT/.build/bin/tf-dsv41-m1" "$KIT/.build/bin/tensorfold-dsv41" "$KIT/" && rm -rf "$KIT/.build"
-cp "$TPF" "$KIT/tp_mailbox.fatbin"
+cp "$KIT/fatbins/tp_mailbox.fatbin" "$KIT/tp_mailbox.fatbin"      # TF_TP_KERNEL_IMAGE=/kit/tp_mailbox.fatbin
 cp tools/zig/dsv41_m2b_ref.py tools/zig/dsv41_m1_capture.py tools/zig/triton_aot_manifest.py tools/zig/dsv41_engram_host.py \
     tools/zig/dsv41_aot_merge.py tools/zig/dsv41_m5_kv.py "$KIT/tools/zig/"
 cp tools/zig/dsv41_m1/prod-knobs.env tools/zig/dsv41_m1/r1c-knobs.env "$KIT/tools/zig/dsv41_m1/"
@@ -28,6 +33,10 @@ cp tools/zig/dsv41_m4/requests.sh tools/zig/dsv41_m4/prompts.txt "$KIT/"
 cp tools/zig/dsv41_m4/RUNBOOK-OVERNIGHT.md "$KIT/RUNBOOK.md"
 cp "$HERE/bench_http.py" tools/zig/dsv41_m4/restore.sh "$KIT/"
 mkdir -p "$KIT/tools/zig/dsv41_slots" && cp tools/zig/dsv41_slots/ref.py "$KIT/tools/zig/dsv41_slots/"
+# Zig vs Python replies (prompt tail, CED: `diverge.py ask / compare / fromtrace / trace`) and the phases / prefill gaps
+mkdir -p "$KIT/tools/zig/dsv41_diverge" "$KIT/tools/zig/dsv41_perf"
+cp tools/zig/dsv41_diverge/diverge.py "$KIT/tools/zig/dsv41_diverge/"
+cp tools/zig/dsv41_perf/gap.py "$KIT/tools/zig/dsv41_perf/"
 # the images' Spark gate (port doc 0a, dsq-zig-vision-1, FOR THE NIGHT RUN): spark.sh + vision_ref.py (it imports ../dsv41_m2b_ref.py)
 mkdir -p "$KIT/tools/zig/dsv41_vision" && cp tools/zig/dsv41_vision/vision_ref.py tools/zig/dsv41_vision/spark.sh "$KIT/tools/zig/dsv41_vision/"
 # long context (the long-aot phase's rope tables) and the serving / ops steps (RUNBOOK.md part 4)
@@ -54,6 +63,12 @@ if [[ "${TRITON_FILL:-0}" == 1 ]]; then
     "$PYF" tools/zig/triton_fill.py compile --py "$TRITON_FILL_PY" --needs "$FILL/needs.json" \
         --options tools/zig/dsv41_triton_options.json --arch 121 --out "$FILL/aot" \
         ${TRITON_FILL_HAVE:+--have $TRITON_FILL_HAVE} ${TRITON_FILL_STAMPS:+--stamps "$TRITON_FILL_STAMPS"} | tee "$FILL/compile.json"
+    cp tools/zig/triton_fill.py tools/zig/dsv41_triton_options.json "$KIT/tools/zig/"
+fi
+if [[ -n "${TRITON_FILL_WIDE:-}" ]]; then
+    [[ -d "$TRITON_FILL_WIDE/aot" ]] || { echo "TRITON_FILL_WIDE=$TRITON_FILL_WIDE has no aot/" >&2; exit 2; }
+    mkdir -p "$KIT/triton-fill-wide" && cp -R "$TRITON_FILL_WIDE/aot" "$KIT/triton-fill-wide/"
+    cp "$TRITON_FILL_WIDE"/*.json "$TRITON_FILL_WIDE"/*.env "$KIT/triton-fill-wide/" 2>/dev/null || true
     cp tools/zig/triton_fill.py tools/zig/dsv41_triton_options.json "$KIT/tools/zig/"
 fi
 chmod +x "$KIT/run_host.sh" "$KIT/run_m4.sh" "$KIT/requests.sh" "$KIT/restore.sh" "$KIT/tf-dsv41-m1" "$KIT/tensorfold-dsv41"
