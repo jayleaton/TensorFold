@@ -1515,6 +1515,29 @@ cap15 / cap18 / cap22 / cap24-1 / cap24-12 / cap24-16 and `dcheck cap16` **0 mis
 pass. No GPU: the prefetch launches themselves were replayed bit-exact in the M1 pods (they write nothing), but the
 side stream, the tables and the batched Engram issue are proven only on the Sparks (below).
 
+**BRANCHES port: the design, from the code (not built; no GPU to gate it).** The emitter already issues the
+sublayer in `branches.plan`'s order (the captures were taken with `BRANCHES=1`: `_plain` before the x group, the
+compressor chain and `index` before wq_b, the split q group, the SWA store after RoPE on index layers), so the work is
+streams, not order:
+1. `calls.Call` gets a stream tag and fork / join marks, set in `Emitter.attention` at `plan()`'s points: fork before
+   `_plain` and again after the x group (R1: there is no `_rms2`; `index` reads `L.qa` with q_norm folded), side =
+   `_plain`, the compressor chain (`_pool_norm`, `kvStore`, `ix_wk` upstream, `_index_k`), `index` (`ix_wq_b`,
+   `_scores`, top-k) and on non-index layers `swaStore` (with R1's kv_norm `rms`, as `RMS_FOLD` puts it beside the
+   store); join before the attention core. `check` ignores the new fields (it compares launches), so the captures stay
+   the gate for the bits.
+2. `run.zig`: a second `Side` (not L2PF's stream: Python's branches and prefetch streams are distinct) at
+   `BRANCHES_PRIO=side`'s high priority (`cuStreamCreateWithPriority`, not in `cuda/abi.zig` yet), and a **second ext
+   scratch**: every ext launch gets the runner's one 64 MiB `scratch` today, so two streams would share it.
+3. **Glue on the side**: the indexer's `topk`, `counts`, `block_pos` steps and `kvStore`'s paths are glue run by
+   `forward.zig` / `batch.zig` on `r.stream`; the glue interface needs the stream it runs on (and row mode's
+   transformed glue the same).
+4. A host hazard check like Python's `branches.check`: for every window program, each value a stream reads is written
+   on the same stream or before a join/fork that orders it (the roles' names give reads / writes), over every layer
+   kind, R1 on and off, row mode.
+5. GPU gate on the Sparks or a pod: `M2B` decode gate with `TF_DSV41_BRANCHES=1` (tokens and logits == off), graphs on
+   and off, then R4's A / B. Python's gain: -0.53 ms a 1-row window (serving rounds 30.4 -> 29.9 ms).
+MHC_DEFER's side coefficient kernel (`block_moe.zig` `mhc_cuda_v1.coef`, ~0.2 ms a window) uses the same machinery.
+
 #### NEXT SPARK WINDOW: decode runtime (not run; before S4)
 
 Check the lease on dgx-01 first. Image from engine **8774969 or later** and zig-serve
