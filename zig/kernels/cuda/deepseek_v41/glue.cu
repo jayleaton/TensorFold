@@ -341,27 +341,33 @@ __device__ __forceinline__ float vs_value(unsigned long long k) {
     return __uint_as_float((mono & 0x80000000u) ? (mono & 0x7FFFFFFFu) : ~mono);
 }
 
-// numpy's float64 pairwise sum of a[0..n) (np.add.reduce on a contiguous row; lanes.sampling.pairwiseSum)
-__device__ double vs_pairwise(const double* a, int n) {
+// numpy's float64 pairwise sum of a[0..n) (np.add.reduce on a contiguous row; lanes.sampling.pairwiseSum): blocks of
+// 8 to 128 elements, halves above (cut to a multiple of 8). The halving depth is a template (n <= 1024: 3 levels), so
+// the module has no runtime recursion (no call stack: the other kernels compile byte for byte as before).
+__device__ __forceinline__ double vs_leaf(const double* a, int n) {
     if (n < 8) {
         double r = -0.0;
         for (int i = 0; i < n; i++) r += a[i];
         return r;
     }
-    if (n <= 128) {
-        double r[8];
-        for (int j = 0; j < 8; j++) r[j] = a[j];
-        int i = 8;
-        for (; i < n - (n % 8); i += 8)
-            for (int j = 0; j < 8; j++) r[j] += a[i + j];
-        double res = ((r[0] + r[1]) + (r[2] + r[3])) + ((r[4] + r[5]) + (r[6] + r[7]));
-        for (; i < n; i++) res += a[i];
-        return res;
-    }
+    double r[8];
+    for (int j = 0; j < 8; j++) r[j] = a[j];
+    int i = 8;
+    for (; i < n - (n % 8); i += 8)
+        for (int j = 0; j < 8; j++) r[j] += a[i + j];
+    double res = ((r[0] + r[1]) + (r[2] + r[3])) + ((r[4] + r[5]) + (r[6] + r[7]));
+    for (; i < n; i++) res += a[i];
+    return res;
+}
+
+template <int D> __device__ __forceinline__ double vs_pairwise(const double* a, int n) {
+    if (n <= 128) return vs_leaf(a, n);
     int n2 = n / 2;
     n2 -= n2 % 8;
-    return vs_pairwise(a, n2) + vs_pairwise(a + n2, n - n2);
+    return vs_pairwise<D - 1>(a, n2) + vs_pairwise<D - 1>(a + n2, n - n2);
 }
+
+template <> __device__ __forceinline__ double vs_pairwise<0>(const double* a, int n) { return vs_leaf(a, n); }
 
 constexpr int VS_NT = 256, VS_MAX = 2048;
 
@@ -410,7 +416,7 @@ __global__ void __launch_bounds__(VS_NT) vs_choose_kernel(const float* __restric
     int keep = kk;
     if (top_p > 0.0 && top_p < 1.0) {
         for (int j = 0; j < kk; j++) work[j] = exp((double)vs_value(keys[j]) / tt - s0);
-        const double total = vs_pairwise(work, kk);
+        const double total = vs_pairwise<3>(work, kk);   // kk <= 1024
         double cum = 0.0;
         int below = 0;
         for (int j = 0; j < kk; j++) {
