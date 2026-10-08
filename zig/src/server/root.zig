@@ -42,4 +42,8 @@ test {
     _ = @import("deepseek_test.zig");
     _ = @import("spark.zig");
     _ = @import("wire_test.zig");
+    _ = @import("late_system_test.zig");
+    _ = @import("compact_test.zig");
+    _ = @import("decisions.zig");
+    _ = @import("decisions_test.zig");
 }

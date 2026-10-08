@@ -8,6 +8,10 @@ const Buf = replay.Buf;
 /// TP: a recorded lane projection over this Mac's output tiles only, in one dispatch: a copy of the kernel whose tile index goes through `ranges` ({first tile, count} pairs), with `sk` K slices; `groups` ({first, count}) cuts the sum to those input groups and writes fp32 partials. The recorded SK and no group cut keep its sums.
 pub fn laneTiles(r: *Run, role: []const u8, ins: []const Buf, y: Buf, ranges: []const [2]usize, sk: usize, groups: ?[2]usize) !void {
     if (r.skip & Run.class(role) != 0) return;
+    if (r.lane_new) { // fz_lane over the same tiles and K slices: the same sums
+        const s = try replay.dense.recorded(r, role);
+        return replay.dense.project(r, .{ .n = s.n, .k = s.k, .sk = sk, .ranges = ranges, .groups = groups, .pf = r.lane_pf }, ins[0], .{ .wq = ins[2], .sbt = ins[3] }, ins[4], y);
+    }
     var key: [96]u8 = undefined;
     const s = r.roles.get(try std.fmt.bufPrint(&key, "{s}|{d}", .{ role, r.rows })) orelse return error.NoSite;
     var h = std.hash.Wyhash.init(@intFromPtr(s.v));
@@ -16,8 +20,7 @@ pub fn laneTiles(r: *Run, role: []const u8, ins: []const Buf, y: Buf, ranges: []
     if (groups) |g| h.update(std.mem.asBytes(&g));
     var v = s.v.*;
     v.pipe = r.tp_lane.get(h.final()) orelse blk: {
-        const f = try mtl.MappedFile.open(try std.fmt.allocPrintSentinel(r.arena, "{s}", .{s.v.file}, 0));
-        var text: []const u8 = f.bytes[0..f.size];
+        var text: []const u8 = try Run.variantText(r.arena, s.v);
         const a = r.arena;
         const sk_at = std.mem.indexOf(u8, text, "constexpr int SK = ") orelse return error.LanePatch;
         const sk_end = sk_at + (std.mem.indexOfScalar(u8, text[sk_at..], ';') orelse return error.LanePatch);
@@ -59,13 +62,13 @@ fn swap(a: std.mem.Allocator, text: []const u8, from: []const u8, to: []const u8
 /// TP: the recorded DeltaNet step over value heads [24 rank, 24 rank + 24) only (rank 1 runs a copy of the kernel whose head index starts at 24); every other index the kernel derives from the head, at the full layout.
 pub fn gdnHeads(r: *Run, role: []const u8, as_rows: usize, ins: []const Buf, outs: []const Buf, rank: u32) !void {
     if (r.skip & Run.class(role) != 0) return;
+    if (r.gdn_pipe) |pipe| return replay.gdn_step.step(r, pipe, ins, outs, 24 * rank, 24);
     var key: [96]u8 = undefined;
     const s = r.roles.get(try std.fmt.bufPrint(&key, "{s}|{d}", .{ role, as_rows })) orelse return error.NoSite;
     var v = s.v.*;
     if (rank == 1) v.pipe = r.tp_gdn.get(s.v) orelse blk: {
-        const f = try mtl.MappedFile.open(try std.fmt.allocPrintSentinel(r.arena, "{s}", .{s.v.file}, 0));
         const from = "const int hv = int(threadgroup_position_in_grid.x);";
-        const text = f.bytes[0..f.size];
+        const text = try Run.variantText(r.arena, s.v);
         if (std.mem.count(u8, text, from) != 1) return error.GdnPatch;
         const patched = try std.mem.replaceOwned(u8, r.arena, text, from, "const int hv = int(threadgroup_position_in_grid.x) + 24;");
         const lib = try mtl.Library.fromSource(r.device, patched, mtl.CompileOptions.mlx());

@@ -35,9 +35,7 @@ pub fn stopping() bool {
 /// The hard limit macOS reads as unlimited.
 const rlim_infinity: u64 = std.c.RLIM.INFINITY;
 
-/// The targets to try, in order: the hard limit when it is finite; when it reads as unlimited, the PR's fallbacks,
-/// 65536 then 10240, first that works (PR #294). The soft limit is never set to unlimited: anything that loops over
-/// every possible descriptor would do absurd work. `out` holds the list; the caller gives room for two.
+/// The targets to try, in order: the hard limit when finite, else the fallbacks 65536 then 10240, first that works; never an unlimited soft limit, since a loop over every descriptor would do absurd work.
 fn fillTargets(max: u64, out: *[2]u64) []const u64 {
     if (max != rlim_infinity) {
         out[0] = max;
@@ -48,9 +46,7 @@ fn fillTargets(max: u64, out: *[2]u64) []const u64 {
     return out;
 }
 
-/// Raises the soft open-file limit toward the hard limit, so idle keep-alive connections cannot exhaust a default
-/// 1024 (PR #294). Best effort: a failure keeps the current limits, and an unlimited soft limit, or one already at
-/// every target, does nothing. Returns the old and new soft limits, or null when nothing changed; the caller logs.
+/// Best-effort raise of the soft open-file limit so idle keep-alives cannot exhaust a default 1024; a failure keeps the current limits, and null (caller logs) means nothing moved.
 fn raiseOpenFileLimit() ?[2]u64 {
     const limit = posix.getrlimit(.NOFILE) catch return null;
     const cur: u64 = @intCast(limit.cur);
@@ -121,6 +117,7 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         .reasoning_effort = args.reasoning_effort,
         .thinking_budget = args.thinking_budget,
         .loop_guard = args.loop_guard,
+        .keep_warm_s = args.keep_warm,
         .default_sampling = s.sampling,
         .use_drafts = !args.no_drafts,
         .seed_salt = salt,
@@ -129,6 +126,9 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         .family = s.family,
         .wire = s.wire,
         .spark = spark_settings,
+        .compact_at = if (args.compact_auto) .{ .auto = {} } else if (args.compact_fraction) |f| .{ .fraction = f } else null,
+        .compact_keep = args.compact_keep,
+        .compact_memory = args.compact_memory,
     };
     const srv = server_mod.Server.init(gpa, io, s.engine, s.text, config, if (store.enabled()) &store else null) catch {
         std.debug.print("tensorfold: the server could not start\n", .{});
@@ -152,6 +152,7 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
     const port = lis.port();
     if (s.on_listen) |f| f(port);
     const window = srv.info.context_window;
+    if (srv.info.startup.len > 0) log.line("{s}", .{srv.info.startup});
     const now = std.Io.Clock.awake.now(io).toNanoseconds();
     const loaded = if (s.started > 0) @as(f64, @floatFromInt(now - s.started)) / 1e9 else 0;
     var window_text: [24]u8 = undefined;

@@ -2,6 +2,7 @@
 const std = @import("std");
 const lanes = @import("lanes");
 const api = @import("engine_api.zig");
+const pc = @import("prompt_cache.zig");
 const Allocator = std.mem.Allocator;
 const Id = api.Id;
 const Request = api.Request;
@@ -32,9 +33,14 @@ pub const LaneHost = struct {
     prefill_rate: f64 = 0,
     prefill_at: i96 = 0,
     live_tokens: std.ArrayList(u32) = .empty,
+    /// A Metal engine's keepalive target, set by the family that owns the queue; null keeps the ticker off.
+    keepalive_target: ?api.keepalive.Target = null,
     live_generated: u64 = 0,
     lone: ?api.Lone = null, // the backend's driver for a lone greedy stream; null: every stream in the lane core
     lone_job: ?*Job = null, // the job that driver holds now
+    cache: ?*pc.Store = null, // kept prompt states (engine thread only); the backend restores and saves them
+    memory: ?api.MemorySource = null, // the backend's memory counts; null: Engine.memory reports none
+    explain: ?api.Explain = null, // the backend's words for a request it refuses; null: the error's name
     /// Runs first on the engine thread: a backend whose API state is per thread (a CUDA context) binds it there.
     on_thread: ?ThreadInit = null,
 
@@ -55,6 +61,26 @@ pub const LaneHost = struct {
         prefill_sent: bool = false, // a lone driver's prefilled event went out
         began: i96 = 0,
         prefilled: ?i96 = null,
+        entry: ?*pc.Entry = null, // the kept state the backend restores, until its prompt pass reports
+        marks: []const u32 = &.{}, // where the pass keeps states (gpa-owned)
+        kept0: u64 = 0, // the store's kept count when the job looked it up
+
+        /// The backend's prompt pass stands at a mark: the cache keeps the stream's state there.
+        fn kept(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
+            const job: *Job = @ptrCast(@alignCast(ptr));
+            job.reported(); // before a keep can evict the entry the pass restored
+            if (job.host.cache) |store| _ = store.keep(job.request.prompt, at, s, job.request.chunks);
+        }
+
+        /// Report a restored prefix or its failed copy; an untouched prefix remains kept.
+        fn reported(job: *Job) void {
+            const e = job.entry orelse return;
+            job.entry = null;
+            const store = job.host.cache orelse return;
+            if (!job.started) return;
+            job.stream.reuse.saved = null; // the backend restores before its first chunk; a later keep may free it
+            if (job.stream.reuse_failed) store.resumed(e, job.request.prompt, false) else if (job.stream.cached == e.at) store.resumed(e, job.request.prompt, true);
+        }
     };
 
     pub fn init(gpa: Allocator, io: std.Io, core: *lanes.Engine, info_: Info) LaneHost {
@@ -83,7 +109,12 @@ pub const LaneHost = struct {
     }
 
     pub fn engine(h: *LaneHost) Engine {
-        return .{ .ctx = h, .vtable = &.{ .info = infoFn, .submit = submitFn, .cancel = cancelFn, .status = statusFn, .memory = memoryFn } };
+        return .{ .ctx = h, .vtable = &.{ .info = infoFn, .submit = submitFn, .cancel = cancelFn, .status = statusFn, .memory = memoryFn, .keepalive = keepaliveFn } };
+    }
+
+    /// The family's queue as a keepalive target, when it set one.
+    fn keepaliveFn(ctx: *anyopaque) ?api.keepalive.Target {
+        return self(ctx).keepalive_target;
     }
 
     fn self(ctx: *anyopaque) *LaneHost {
@@ -146,8 +177,9 @@ pub const LaneHost = struct {
         };
     }
 
-    fn memoryFn(_: *anyopaque, _: bool) ?Memory {
-        return null;
+    fn memoryFn(ctx: *anyopaque, reset_peak: bool) ?Memory {
+        const source = self(ctx).memory orelse return null;
+        return source.read(source.ctx, reset_peak);
     }
 
     fn emit(job: *Job, event: Event) void {
@@ -187,8 +219,10 @@ pub const LaneHost = struct {
     }
 
     fn finish(h: *LaneHost, job: *Job, reason: Reason, message: []const u8) void {
+        job.reported();
+        h.gpa.free(job.marks);
         const s = &job.stream;
-        const stats: Stats = if (job.started) .{ .rounds = s.rounds, .drafted = s.drafted, .accepted = s.accepted, .min_rows = s.min_rows, .loop_period = s.loop_period, .prefill_seconds = if (job.prefilled) |done| @as(f64, @floatFromInt(@max(0, done - job.began))) / 1e9 else null } else .{};
+        const stats: Stats = if (job.started) .{ .rounds = s.rounds, .drafted = s.drafted, .accepted = s.accepted, .min_rows = s.min_rows, .loop_period = s.loop_period, .prefill_seconds = if (job.prefilled) |done| @as(f64, @floatFromInt(@as(i64, @intCast(@max(0, done - job.began))))) / 1e9 else null } else .{};
         emit(job, .{ .finished = .{ .reason = reason, .stats = stats, .message = message } });
         if (job.started) {
             s.deinit(h.gpa);
@@ -262,6 +296,14 @@ pub const LaneHost = struct {
         };
         h.unlock();
         const r = job.request;
+        var reuse: lanes.stream.Reuse = .{};
+        // the entry stays alive until the backend restores it: nothing keeps between here and this stream's own pass
+        if (h.cache) |store| if (store.lookup(h.gpa, r.prompt, r.history_len, r.shared_prefixes, r.chunks)) |l| {
+            job.entry = l.entry;
+            job.kept0 = store.counts.kept;
+            job.marks = l.marks;
+            reuse = .{ .saved = if (l.entry) |e| e.saved else null, .at = if (l.entry) |e| e.at else 0, .marks = l.marks, .hook = .{ .ptr = job, .at = Job.kept } };
+        } else |_| {};
         job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch return h.drop(job, "the drafter could not start");
         job.stream = lanes.Stream.init(h.gpa, .{
             .id = "request",
@@ -278,6 +320,7 @@ pub const LaneHost = struct {
             .think_end = if (r.think_end) |t| t else -1,
             .loop_guard = r.loop_guard,
             .chunks = r.chunks,
+            .reuse = reuse,
         }) catch {
             job.proposer.deinit();
             return h.drop(job, "out of memory");
@@ -286,7 +329,7 @@ pub const LaneHost = struct {
         const began = std.Io.Clock.awake.now(h.io).toNanoseconds();
         job.began = began;
         if (h.loneFits(job)) return h.runLone(job, began);
-        h.core.addStream(&job.stream) catch |e| return if (e == error.Cancelled) h.cancel(job) else h.drop(job, @errorName(e));
+        h.core.addStream(&job.stream) catch |e| return if (e == error.Cancelled) h.cancel(job) else h.drop(job, h.words(e));
         h.prefilled(job, began);
         if (h.deliver(job)) h.remove(job);
         return true;
@@ -295,23 +338,26 @@ pub const LaneHost = struct {
     fn prefilled(h: *LaneHost, job: *Job, began: i96) void {
         const done = std.Io.Clock.awake.now(h.io).toNanoseconds();
         h.lock();
-        if (done > began) h.prefill_rate = @as(f64, @floatFromInt(job.request.prompt.len)) / (@as(f64, @floatFromInt(done - began)) / 1e9);
+        if (done > began) h.prefill_rate = @as(f64, @floatFromInt(job.request.prompt.len - job.stream.cached)) / (@as(f64, @floatFromInt(done - began)) / 1e9);
         h.prefill_at = done;
         job.prefilled = done;
         h.unlock();
-        emit(job, .{ .prefilled = 0 });
+        job.reported();
+        if (h.cache) |store| store.report(job.request.prompt.len, job.stream.cached, store.counts.kept - job.kept0);
+        emit(job, .{ .prefilled = job.stream.cached });
     }
 
-    /// A greedy drafted request alone in the engine, with nothing waiting: the backend's own driver takes it.
+    /// An idle backend driver takes a lone drafted request, including sampling when supported.
     fn loneFits(h: *LaneHost, job: *Job) bool {
         const r = job.request;
-        if (h.lone == null or r.sampling != null or !r.drafts or r.think_budget > 0 or r.loop_guard or r.call != null or r.structure != null) return false;
+        const lone = h.lone orelse return false;
+        if ((r.sampling != null and !lone.sampled) or !r.drafts or r.think_budget > 0 or r.loop_guard or r.call != null or r.structure != null) return false;
         h.lock();
         defer h.unlock();
         return h.admitted.items.len == 1 and h.queued.items.len == 0 and h.cancels.items.len == 0 and h.core.activeCount() == 0;
     }
 
-    /// The lone driver's rounds, its tokens sent as they land; a request arriving or a cancel hands the stream to the lane core.
+    /// Send lone-driver tokens as they land; arrivals and cancellation return its stream to the lane core.
     fn runLone(h: *LaneHost, job: *Job, began: i96) bool {
         h.lone_job = job;
         job.delivered = 0;
@@ -340,7 +386,7 @@ pub const LaneHost = struct {
         const handed = paused catch |e| {
             if (!job.prefill_sent) emit(job, .{ .prefilled = 0 });
             h.remove(job);
-            h.finish(job, if (e == error.Cancelled) .cancelled else .failed, if (e == error.Cancelled) "" else @errorName(e));
+            h.finish(job, if (e == error.Cancelled) .cancelled else .failed, if (e == error.Cancelled) "" else h.words(e));
             return true;
         };
         if (!job.prefill_sent) h.prefilled(job, began);
@@ -351,6 +397,11 @@ pub const LaneHost = struct {
         }
         if (h.deliver(job)) h.remove(job);
         return true;
+    }
+
+    fn words(h: *const LaneHost, e: anyerror) []const u8 {
+        const x = h.explain orelse return @errorName(e);
+        return x.text(x.ctx, e) orelse @errorName(e);
     }
 
     fn drop(h: *LaneHost, job: *Job, message: []const u8) bool {
@@ -549,3 +600,5 @@ test "a lane host serves the core's own tokens, in order, and cancels between ro
     try std.testing.expect(target.prefill_count <= 3);
     try std.testing.expectEqual(@as(usize, 0), target.lanes.count());
 }
+
+test { _ = @import("lane_host_test.zig"); }

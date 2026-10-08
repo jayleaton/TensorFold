@@ -14,6 +14,7 @@ const clock = @import("clock.zig");
 const Server = @import("server.zig").Server;
 const family_mod = @import("family.zig");
 const spark = @import("spark.zig");
+const chunk_plan = @import("chunk_plan.zig");
 const Value = json.Value;
 const Cx = errors.Cx;
 const Allocator = std.mem.Allocator;
@@ -200,7 +201,8 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
         .background = background,
         .history_len = @intCast(rendered.history_len),
         .shared_prefixes = shared.items,
-        .chunks = try srv.chunks.starts(a, rendered.ids),
+        // a cut just before the conversation's own text: fresh sessions resume their whole harness
+        .chunks = try chunk_plan.withCut(a, try srv.chunks.starts(a, rendered.ids), if (srv.chunks.step > 0) @intCast(@max(system_len, 1) - 1) else 0, rendered.ids.len, srv.chunks.min_chunk),
         .tools_json = if (input.tools.len > 0) try json.stringify(a, .{ .array = @constCast(input.tools) }, .{ .ascii = false }) else "",
     };
     try srv.checkFeatures(cx, f, input.tools.len > 0, thinking, rendered.ids, input.tools, &request);
@@ -247,6 +249,8 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
     defer box.deinit();
     const id = srv.next_id.fetchAdd(1, .monotonic);
     const submitted = nowNs(io);
+    if (srv.keepalive) |k| k.begin(); // the GPU is busy: the idle ticker holds its commits
+    defer if (srv.keepalive) |k| k.end();
     // the Spark surface: the run in /health's bookkeeping and the request log, from here to its end
     const hid: ?u64 = if (srv.health) |h| h.begin(prepared.prompt_len) else null;
     const ticket = if (srv.reqlog) |l| l.begin(request.prompt) else null;
@@ -323,7 +327,8 @@ fn logEnded(id: []const u8, e: Failure, message: []const u8, prompt: usize, toke
 
 /// The reply to ``input``; ``sink`` hears the stream (null: not streamed). ``gone`` says the client left.
 pub fn run(srv: *Server, cx: *Cx, input: Input, sink: ?Sink, gone: anytype) Failure!Reply {
-    return generate(srv, cx, try prepare(srv, cx, input, gone), sink, gone);
+    if (srv.config.compact_at == null) return generate(srv, cx, try prepare(srv, cx, input, gone), sink, gone);
+    return @import("compact.zig").run(srv, cx, input, sink, gone);
 }
 
 /// Give back a foreground request's preparing count: at its submit, or when it is never generated.
@@ -422,8 +427,7 @@ const Generation = struct {
         return !g.ignore_eos and std.mem.indexOfScalar(u32, g.srv.eos, t) != null;
     }
 
-    /// What closes a call the model's end token left open (``tool_parse.closeCall``); nothing when a stop string, the
-    /// length or ``ignore_eos`` ended the reply instead.
+    /// What closes a call the model's end token left open (``tool_parse.closeCall``); nothing when a stop string, the length or ``ignore_eos`` ended the reply instead.
     fn closeCall(g: *const Generation, text: []const u8) Allocator.Error![]const u8 {
         const t = g.collected.items;
         if (g.tools.len == 0 or t.len == 0 or !g.eos(t[t.len - 1])) return "";

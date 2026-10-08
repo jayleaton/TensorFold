@@ -48,6 +48,7 @@ const jsonInt = fz.jsonInt;
 
 fn armName(seg_ab: bool, arm: usize) []const u8 {
     if (seg_ab) return if (arm == 1) "segments on " else "segments off";
+    if (std.c.getenv("FZ_AB") != null and std.mem.eql(u8, std.mem.span(std.c.getenv("FZ_AB").?), "fz")) return if (arm == 1) "fz kernels" else "recorded  ";
     return if (arm == 1) "copy on " else "copy off";
 }
 
@@ -55,6 +56,61 @@ fn armName(seg_ab: bool, arm: usize) []const u8 {
 fn promptCut() !usize {
     const v = std.c.getenv("FZ_PROMPT_N") orelse return std.math.maxInt(usize);
     return std.fmt.parseInt(usize, std.mem.span(v), 10);
+}
+
+/// FZ_CATCH_CHECK: catchUp's layers in one command buffer against each layer alone, then one shared slot (the control).
+fn catchCheck(r: *Run, arena: std.mem.Allocator) !void {
+    const upto = 1300;
+    const m = try arena.create(Model);
+    m.r = r;
+    m.gpu_seconds = 0;
+    m.t.eps = try f32Buf(r, 1e-6);
+    m.t.log2base = try f32Buf(r, std.math.log2(10_000_000.0));
+    const raw: Buf = .{ .b = try r.buffer(4 * upto * 256) };
+    var rng = std.Random.DefaultPrng.init(7);
+    for (raw.b.slice(u16, 4 * upto * 128)) |*v| v.* = @truncate(@as(u32, @bitCast(rng.random().float(f32) * 2 - 1)) >> 16);
+    const w: Buf = .{ .b = try r.buffer(128 * 4) };
+    for (w.b.slice(f32, 128), 0..) |*v, i| v.* = 1 + @as(f32, @floatFromInt(i)) / 256;
+    var firsts: [fz.CATCH]usize = undefined;
+    for (0..fz.CATCH) |k| firsts[k] = if (k + 1 < fz.CATCH) 600 + 31 * k else 0; // the head last, from block 0
+    var outs: [3][fz.CATCH]Buf = undefined; // arms: each layer alone (the reference), one command buffer, one shared slot
+    for (&outs) |*o| for (o) |*b| {
+        b.* = .{ .b = try r.buffer(upto * 256) };
+    };
+    var differ: [3]usize = .{ 0, 0, 0 };
+    for (0..3) |arm| {
+        var k: usize = 0;
+        for (&m.layers, 0..) |*L, i| {
+            L.linear = i % 4 != 3;
+            if (L.linear) continue;
+            L.raw, L.pool, L.pooled, L.pooled_n = .{ raw, w, outs[arm][k], firsts[k] };
+            k += 1;
+        }
+        m.mtp.raw, m.mtp.pool, m.mtp.pooled, m.mtp.pooled_n = .{ raw, w, outs[arm][k], firsts[k] };
+        var cb = r.queue.commandBuffer();
+        r.enc = cb.compute(if (r.serial) .serial else .concurrent);
+        switch (arm) {
+            0 => for (0..fz.CATCH) |j| {
+                if (j + 1 < fz.CATCH) try r.sel.?.catchLayer(r, &m.layers[4 * j + 3], m.t.eps, m.t.log2base, upto, 0) else try r.sel.?.catchLayer(r, &m.mtp, m.t.eps, m.t.log2base, upto, 0);
+                try m.finish(cb);
+                cb = r.queue.commandBuffer();
+                r.enc = cb.compute(if (r.serial) .serial else .concurrent);
+            },
+            1 => try r.sel.?.catchUp(r, m, upto),
+            else => {
+                for (&m.layers) |*L| if (!L.linear) try r.sel.?.catchLayer(r, L, m.t.eps, m.t.log2base, upto, 0);
+                try r.sel.?.catchLayer(r, &m.mtp, m.t.eps, m.t.log2base, upto, 0);
+            },
+        }
+        try m.finish(cb);
+        if (arm == 0) continue;
+        for (0..fz.CATCH) |j| {
+            const span = outs[arm][j].b.contents()[firsts[j] * 256 .. upto * 256];
+            if (!std.mem.eql(u8, span, outs[0][j].b.contents()[firsts[j] * 256 .. upto * 256])) differ[arm] += 1;
+        }
+    }
+    std.debug.print("catch-up: {d} layers in one command buffer, {d} differ from each layer alone; the control's one shared slot: {d} differ\n", .{ fz.CATCH, differ[1], differ[2] });
+    if (differ[1] != 0 or differ[2] == 0) return error.CatchUpCheck;
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -95,6 +151,7 @@ pub fn main(init: std.process.Init) !void {
         }
         std.process.exit(if (failed == 0) 0 else 1);
     }
+    if (std.c.getenv("FZ_OPORDER") != null) return @import("flashnext_bench.zig").opOrder(device); // no model loaded
     if (std.c.getenv("FZ_MMA_PEAK") != null) { // the tensor units' rate on register fragments: 16x32x16 ops a second
         const alib = try mtl.Library.fromSource(device, try fz.frags.source(device, arena, ks.flashnext_attn), mtl.CompileOptions.mlx());
         const pipe = try mtl.Pipeline.init(device, alib, "tf_mma_peak", false);
@@ -128,7 +185,7 @@ pub fn main(init: std.process.Init) !void {
         const items = all_items[0..@min(all_items.len, try promptCut())];
         const toks = try arena.alloc(u32, items.len);
         for (items, 0..) |x, i| toks[i] = @intCast(x.integer);
-        const e = try fx.Engine.load(gpa, args[1], args[2]);
+        const e = try fx.Engine.load(gpa, init.io, args[1], args[2]);
         if (std.c.getenv("FZ_COPY_MIN")) |v| e.copy_min = try std.fmt.parseInt(u32, std.mem.span(v), 10);
         if (std.c.getenv("FZ_COPY_LONG")) |v| e.copy_long = try std.fmt.parseInt(u32, std.mem.span(v), 10);
         if (std.c.getenv("FZ_ENGINE_WARM") != null) try e.warm();
@@ -148,18 +205,33 @@ pub fn main(init: std.process.Init) !void {
         const n_out: usize = if (std.c.getenv("FZ_N")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 256;
         var replies: [2][]u32 = undefined;
         const seg_ab = std.c.getenv("FZ_AB") != null and std.mem.eql(u8, std.mem.span(std.c.getenv("FZ_AB").?), "seg");
-        var depths: std.ArrayList(?usize) = .empty; // FZ_DEPTHS=3,5,7: each depth's arms in turn (0: the depth rule)
+        var depths: std.ArrayList(?usize) = .empty; // FZ_DEPTHS=3,5,7: each depth's arms in turn (0: the depth rule, p: plain)
         if (std.c.getenv("FZ_DEPTHS")) |v| {
             var it = std.mem.tokenizeScalar(u8, std.mem.span(v), ',');
             while (it.next()) |d| {
+                if (std.mem.eql(u8, d, "p")) {
+                    try depths.append(arena, 0);
+                    continue;
+                }
                 const n = try std.fmt.parseInt(usize, d, 10);
                 try depths.append(arena, if (n == 0) null else n);
             }
         } else try depths.append(arena, if (std.c.getenv("FZ_DEPTH")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else null);
+        // FZ_AB=fz (with FZ_LANE=1 FZ_GDN=2): the recorded dense and DeltaNet kernels, then fz_lane, fz_gdn and kept states
+        const fz_ab = std.c.getenv("FZ_AB") != null and std.mem.eql(u8, std.mem.span(std.c.getenv("FZ_AB").?), "fz");
+        const fz_on = .{ e.r.lane_new, e.r.gdn_pipe, e.r.gdn_kept };
         for (depths.items) |depth| for (0..2) |arm| { // copy drafts off, then on (FZ_AB=seg: staggered prompt segments off, then on)
-            if (seg_ab) e.segments = arm == 1 else e.copy = arm == 1;
+            const plain = depth != null and depth.? == 0; // one token a round: one arm (copies need drafts)
+            if (plain and arm == 1) continue;
+            const name = if (plain) "plain   " else armName(seg_ab, arm);
+            if (seg_ab) e.segments = arm == 1 else if (fz_ab) {
+                e.r.lane_new = arm == 1 and fz_on[0];
+                e.r.gdn_pipe = if (arm == 1) fz_on[1] else null;
+                e.r.gdn_kept = if (arm == 1) fz_on[2] else null;
+            } else e.copy = arm == 1;
             var sh: Show = .{ .a = arena };
-            _ = try e.generate(toks, 8, &.{}, null, .{ .ctx = &sh, .prefilled = Show.prefilled, .tokens = Show.tokens, .cancelled = Show.cancelled });
+            const warm: fx.Out = .{ .ctx = &sh, .prefilled = Show.prefilled, .tokens = Show.tokens, .cancelled = Show.cancelled };
+            _ = if (e.followsPeer()) try e.followWith(warm) else try e.generate(toks, 8, &.{}, null, warm); // speed-up rank 1 runs rank 0's requests
             sh = .{ .a = arena };
             var first_at: f64 = 0;
             const Timed = struct {
@@ -177,12 +249,13 @@ pub fn main(init: std.process.Init) !void {
             };
             const s0 = mtl.clock.seconds();
             var tm: Timed = .{ .sh = &sh, .t0 = s0, .first = &first_at };
-            const res = try e.generate(toks, n_out, &.{}, depth, .{ .ctx = &tm, .prefilled = Timed.prefilled, .tokens = Timed.tokens, .cancelled = Show.cancelled });
+            const timed: fx.Out = .{ .ctx = &tm, .prefilled = Timed.prefilled, .tokens = Timed.tokens, .cancelled = Show.cancelled };
+            const res = (if (e.followsPeer()) try e.followWith(timed) else try e.generate(toks, n_out, &.{}, depth, timed)) orelse return error.PeerClosed;
             const wall = mtl.clock.seconds() - s0;
             const made: f64 = @floatFromInt(sh.got.items.len - 1);
-            std.debug.print("{s} depth {d}: {d} tokens; prompt {d:.2} s; decode {d:.1} tok/s; {d:.2} tokens a round ({d} rounds, {d} copied rounds landing {d:.2})\n", .{ armName(seg_ab, arm), depth orelse 0, sh.got.items.len, first_at, made / (wall - first_at), made / @as(f64, @floatFromInt(@max(res.rounds, 1))), res.rounds, res.copy_rounds, @as(f64, @floatFromInt(res.copy_accepted)) / @as(f64, @floatFromInt(@max(res.copy_rounds, 1))) });
+            std.debug.print("{s} depth {d}: {d} tokens; prompt {d:.2} s; decode {d:.1} tok/s; {d:.2} tokens a round ({d} rounds, {d} copied rounds landing {d:.2})\n", .{ name, depth orelse 0, sh.got.items.len, first_at, made / (wall - first_at), made / @as(f64, @floatFromInt(@max(res.rounds, 1))), res.rounds, res.copy_rounds, @as(f64, @floatFromInt(res.copy_accepted)) / @as(f64, @floatFromInt(@max(res.copy_rounds, 1))) });
             replies[arm] = sh.got.items;
-            std.debug.print("{s}: reply hash {x:0>16}\n", .{ armName(seg_ab, arm), std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(sh.got.items)) });
+            std.debug.print("{s}: reply hash {x:0>16}\n", .{ name, std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(sh.got.items)) });
             if (arm == 1) for (res.copy_by_len, 0..) |cl, n| if (cl[0] > 0) std.debug.print("    match {d}: {d} rounds, {d:.2} landed\n", .{ n, cl[0], @as(f64, @floatFromInt(cl[1])) / @as(f64, @floatFromInt(cl[0])) });
         };
         if (std.c.getenv("FZ_NO_REF") != null) return; // the reply hashes are the check (two Macs against one)
@@ -220,6 +293,7 @@ pub fn main(init: std.process.Init) !void {
     r.split = std.c.getenv("FZ_SPLIT") != null;
     r.gdn_step = std.c.getenv("FZ_GDN_STEP") != null;
     r.hc_mma = std.c.getenv("FZ_HC_MMA") != null;
+    r.hc_up = std.c.getenv("FZ_HCCHECK") != null or if (std.c.getenv("FZ_HC_UP")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else false;
     r.event = try device.sharedEvent();
     r.dense = r.xnew and std.c.getenv("FZ_DENSE") != null;
     r.dense_target = r.dense and std.c.getenv("FZ_DENSE_TARGET") != null;
@@ -232,6 +306,9 @@ pub fn main(init: std.process.Init) !void {
     const t0 = mtl.clock.seconds();
     try r.compile(args[2]);
     r.sel = try Select.init(&r, MAXR);
+    if (std.c.getenv("FZ_CATCH_CHECK") != null) return catchCheck(&r, arena);
+    r.lane_new = r.xnew and std.c.getenv("FZ_LANE") != null; // fz_lane and fz_gdn on the target (same bits)
+    if (r.xnew and std.c.getenv("FZ_GDN") != null) r.gdn_pipe = try fz.gdn_step.compile(&r, false);
     const t1 = mtl.clock.seconds();
 
     const index_file = try mtl.MappedFile.open(try std.fmt.allocPrintSentinel(arena, "{s}/model.safetensors.index.json", .{args[1]}, 0));
@@ -425,15 +502,53 @@ pub fn main(init: std.process.Init) !void {
     const t2 = mtl.clock.seconds();
     std.debug.print("compiled in {d:.2} s, loaded {d:.1} GB in {d:.1} s\n", .{ t1 - t0, @as(f64, @floatFromInt(r.loaded)) / 1e9, t2 - t1 });
 
+    if (std.c.getenv("FZ_DBENCH") != null) { // dense classes and DeltaNet timed by rows (flashnext_bench.zig)
+        var toks: [MAXR]u32 = undefined;
+        for (0..MAXR) |i| toks[i] = @intCast(ref.object.get("prompt").?.array.items[i].integer);
+        return @import("flashnext_bench.zig").run(&r, m, &toks, gpa, arena);
+    }
     if (std.c.getenv("FZ_PROFILE") != null) {
         if (std.c.getenv("TF_FLASHNEXT_TP")) |path| r.tp = try fz.Tp2.init(arena, r.device, std.mem.span(path));
+        var hcskips: std.ArrayList(u32) = .empty; // FZ_HCSKIP=1,2,4: the profile again under each hc knock-out
+        if (std.c.getenv("FZ_HCSKIP")) |v| {
+            var it = std.mem.tokenizeScalar(u8, std.mem.span(v), ',');
+            while (it.next()) |x| try hcskips.append(arena, try std.fmt.parseInt(u32, x, 10));
+        } else try hcskips.append(arena, 0);
         const names = [_][]const u8{ "none", "hc", "dense", "experts", "router", "gdn", "attn", "ple", "head", "tp" };
         var toks: [MAXR]u32 = undefined;
         for (0..MAXR) |i| toks[i] = @intCast(ref.object.get("prompt").?.array.items[i].integer);
         var pk: [MAXR]u32 = undefined;
         m.reset();
         for (0..3) |_| try m.window(toks[0..1], &pk);
-        for ([_]usize{ 1, 4, 8 }) |rows| {
+        if (std.c.getenv("FZ_PROFILE_AB") != null) { // in-model A/B, interleaved: recorded, fz_lane, fz_gdn, both
+            const gpipe = try fz.gdn_step.compile(&r, false);
+            const arms = [_][2]bool{ .{ false, false }, .{ true, false }, .{ false, true }, .{ true, true } };
+            for ([_]usize{ 1, 2, 4, 6, 8, 16 }) |rows| {
+                var ms: [4]f64 = @splat(0);
+                for (0..5) |_| for (arms, 0..) |arm, a| {
+                    r.lane_new = arm[0];
+                    r.gdn_pipe = if (arm[1]) gpipe else null;
+                    m.gpu_seconds = 0;
+                    for (0..20) |_| try m.window(toks[0..rows], &pk);
+                    ms[a] += m.gpu_seconds * 1e3 / 100;
+                };
+                std.debug.print("rows {d:2}: window ms recorded {d:6.3}, fz_lane {d:6.3}, fz_gdn {d:6.3}, both {d:6.3}\n", .{ rows, ms[0], ms[1], ms[2], ms[3] });
+            }
+            return;
+        }
+        var ups: std.ArrayList(bool) = .empty; // FZ_HC_UP=0,1: the profile with the recorded up projection, then fz_hc_up
+        if (std.c.getenv("FZ_HC_UP")) |v| {
+            var it = std.mem.tokenizeScalar(u8, std.mem.span(v), ',');
+            while (it.next()) |x| try ups.append(arena, !std.mem.eql(u8, x, "0"));
+        } else try ups.append(arena, false);
+        var prow: std.ArrayList(usize) = .empty; // FZ_PROFILE_ROWS=2,3: the windows' widths (default 1, 4, 8)
+        if (std.c.getenv("FZ_PROFILE_ROWS")) |v| {
+            var it = std.mem.tokenizeScalar(u8, std.mem.span(v), ',');
+            while (it.next()) |x| try prow.append(arena, try std.fmt.parseInt(usize, x, 10));
+        } else try prow.appendSlice(arena, &.{ 1, 4, 8 });
+        for (ups.items) |up| for (hcskips.items) |hs| for (prow.items) |rows| {
+            r.hc_up = up;
+            r.hcskip = hs;
             var base: f64 = 0;
             for (names, 0..) |name, c| {
                 const only = std.c.getenv("FZ_PROFILE_ONLY") != null; // every class but this one knocked out
@@ -442,9 +557,10 @@ pub fn main(init: std.process.Init) !void {
                 for (0..20) |_| try m.window(toks[0..rows], &pk);
                 const ms = m.gpu_seconds * 1e3 / 20;
                 if (c == 0) base = ms;
-                std.debug.print("rows {d}: without {s:8} {d:6.2} ms GPU  ({d:5.2} ms)\n", .{ rows, name, ms, base - ms });
+                std.debug.print("hc_up {d} hcskip {d} rows {d}: without {s:8} {d:6.2} ms GPU  ({d:5.2} ms)\n", .{ @intFromBool(up), hs, rows, name, ms, base - ms });
             }
-        }
+        };
+        r.hcskip = 0;
         r.skip = 0;
         for ([_]usize{ 1, 4, 8 }) |rows| { // the MTP head: a chain step (one row) and a window's catch-up
             m.gpu_seconds = 0;
@@ -530,6 +646,45 @@ pub fn main(init: std.process.Init) !void {
             m.t = ta;
             std.debug.print("{d} lanes: one group {d:.2} ms, two groups in a row {d:.2} ms ({d:.2}x), two groups at once {d:.2} ms ({d:.2}x)\n", .{ rows, wall[0], wall[1], wall[1] / wall[0], wall[2], wall[2] / wall[0] });
         }
+        return;
+    }
+    if (std.c.getenv("FZ_HCCHECK") != null) { // fz_hc_up against the recorded up projection: every row's logits and streams, bit for bit
+        const want0 = ref.object.get("tokens").?.array.items;
+        const pr = ref.object.get("prompt").?.array.items;
+        var pk: [MAXR]u32 = undefined;
+        m.reset();
+        for (pr) |x| {
+            try m.window(&.{@intCast(x.integer)}, &pk);
+            m.keepRows(&.{@intCast(x.integer)}, 1);
+        }
+        const keep = try gpa.alloc(u8, MAXR * VOCAB * 2);
+        defer gpa.free(keep);
+        const keep_h = try gpa.alloc(u8, MAXR * WIDE * 2);
+        defer gpa.free(keep_h);
+        const Diff = struct {
+            fn of(a: []const u8, b: Buf, n: usize) usize {
+                var d: usize = 0;
+                const c = b.b.contents()[b.off .. b.off + 2 * n];
+                for (0..n) |i| d += @intFromBool(a[2 * i] != c[2 * i] or a[2 * i + 1] != c[2 * i + 1]);
+                return d;
+            }
+        };
+        var toks: [MAXR]u32 = undefined;
+        for (0..MAXR) |i| toks[i] = @intCast(want0[i].integer);
+        var bad: usize = 0;
+        for (1..MAXR + 1) |rows| {
+            r.hc_up = false;
+            try m.window(toks[0..rows], &pk);
+            @memcpy(keep[0 .. rows * VOCAB * 2], m.t.logits.b.contents()[0 .. rows * VOCAB * 2]);
+            @memcpy(keep_h[0 .. rows * WIDE * 2], m.last.b.contents()[m.last.off .. m.last.off + rows * WIDE * 2]);
+            r.hc_up = true;
+            try m.window(toks[0..rows], &pk);
+            const dl = Diff.of(keep, m.t.logits, rows * VOCAB);
+            const dh = Diff.of(keep_h, m.last, rows * WIDE);
+            std.debug.print("rows {d}: {d} of {d} logits and {d} of {d} stream values differ\n", .{ rows, dl, rows * VOCAB, dh, rows * WIDE });
+            bad += dl + dh;
+        }
+        std.debug.print("hc check: {s}\n", .{if (bad == 0) "bit-identical" else "DIFFERENT"});
         return;
     }
     if (std.c.getenv("FZ_GCHECK") != null) { // grouped or fused experts against fz_xgu/fz_xdown: every row's logits, bit for bit
@@ -1314,8 +1469,6 @@ pub fn main(init: std.process.Init) !void {
         r.ar = .{ .b = try r.buffer(4 * fz.AR_WORDS) };
         const ring = try r.buffer(fz.RING_WORDS * 4 * 512);
         const g_hist = try r.buffer((CAP + 64) * 4);
-        m.mtp.mixsel = .{ .b = try r.buffer(D * 2) };
-        m.mtp.hsel = .{ .b = try r.buffer(WIDE * 2) };
         const ar = r.ar.b.slice(i32, fz.AR_WORDS);
         const Copy = struct { // the kept row of every DeltaNet layer's window output into its state
             fn states(rr: *Run, gcs: mtl.Buffer, gso: mtl.Buffer, ocs: mtl.Buffer, oso: mtl.Buffer) void {
@@ -1421,8 +1574,7 @@ pub fn main(init: std.process.Init) !void {
         if (r.sel != null and prompt.len + want.len + 8 > 4 * TOP) { // long context: selection on the GPU
             const cb0 = r.queue.commandBuffer();
             r.enc = cb0.compute(if (r.serial) .serial else .concurrent);
-            for (&m.layers) |*L| if (!L.linear) try r.sel.?.catchUp(&r, L, m.t.eps, m.t.log2base, m.pos / 4);
-            try r.sel.?.catchUp(&r, &m.mtp, m.t.eps, m.t.log2base, m.pos / 4); // the head's absorbed rows
+            try r.sel.?.catchUp(&r, m, m.pos / 4); // the target's layers and the head's absorbed rows
             try m.finish(cb0);
             r.gsel = try GSelect.init(&r, m.pos / 4);
             m.mtp.gsel = try GSelect.init(&r, m.pos / 4);
@@ -1456,10 +1608,7 @@ pub fn main(init: std.process.Init) !void {
                 Copy.states(&r, g_cs, g_so, o_cs, o_so);
                 r.copyKept(cins[(round - 1) % 2], cins[round % 2], PLE_TAIL * WIDE / 2, WIDE / 2, 0, 0, 1, 0);
                 try m.mtpEncode(MAXR - 1 + wp, wp, m.t.picks, m.last, .{ .b = wids.b, .off = 4 });
-                for (1..wr - 1) |j| {
-                    const streams = if (j == 1) m.mtp.hsel else Buf{ .b = m.mtp.h[1].b, .off = 0 };
-                    try m.mtpEncode(j, 1, .{ .b = wids.b, .off = 4 * j }, streams, .{ .b = wids.b, .off = 4 * (j + 1) });
-                }
+                for (1..wr - 1) |j| try m.mtpEncode(j, 1, .{ .b = wids.b, .off = 4 * j }, m.mtp.h[1], .{ .b = wids.b, .off = 4 * (j + 1) });
             }
             m.ple.cin = cins[round % 2];
             m.pleIdsGpu(wr, wids);

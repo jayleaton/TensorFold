@@ -51,30 +51,58 @@ pub const Entry = struct {
 
 pub const Header = std.StringArrayHashMapUnmanaged(Entry);
 
-/// The header's entries (names live in `arena`); an entry past `data_len` bytes or of the wrong size is refused.
+/// The header's entries (names live in `arena`); an entry that breaks the format, runs past `data_len` bytes or has the wrong size is refused.
 pub fn parseHeader(arena: std.mem.Allocator, json: []const u8, data_len: usize) !Header {
+    return parseHeaderPrefix(arena, json, data_len, null);
+}
+
+/// Select one tensor namespace before interpreting shapes, so a text engine need not admit a vision tower's layouts.
+pub fn parseHeaderPrefix(arena: std.mem.Allocator, json: []const u8, data_len: usize, prefix: ?[]const u8) !Header {
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{});
+    if (parsed != .object) return error.BadSafetensors;
     var out: Header = .empty;
     var it = parsed.object.iterator();
     while (it.next()) |kv| {
         if (std.mem.eql(u8, kv.key_ptr.*, "__metadata__")) continue;
+        if (prefix) |p| if (!std.mem.startsWith(u8, kv.key_ptr.*, p)) continue;
+        if (kv.value_ptr.* != .object) return error.BadSafetensors;
         const o = kv.value_ptr.object;
-        const dtype = DType.parse(o.get("dtype").?.string) orelse return error.UnsupportedDType;
-        const shape = o.get("shape").?.array.items;
+        const dtype = DType.parse(str(o.get("dtype")) orelse return error.BadSafetensors) orelse return error.UnsupportedDType;
+        const shape = list(o.get("shape")) orelse return error.BadSafetensors;
         if (shape.len > max_rank) return error.RankTooHigh;
         var e: Entry = .{ .dtype = dtype, .rank = @intCast(shape.len), .shape = @splat(1), .begin = 0, .end = 0 };
         var n: usize = dtype.size();
         for (shape, 0..) |d, i| {
-            e.shape[i] = @intCast(d.integer);
-            n *= e.shape[i];
+            e.shape[i] = uint(d) orelse return error.BadSafetensors;
+            n = std.math.mul(usize, n, e.shape[i]) catch return error.BadSafetensors;
         }
-        const offs = o.get("data_offsets").?.array.items;
-        e.begin = @intCast(offs[0].integer);
-        e.end = @intCast(offs[1].integer);
+        const offs = list(o.get("data_offsets")) orelse return error.BadSafetensors;
+        if (offs.len != 2) return error.BadSafetensors;
+        e.begin = uint(offs[0]) orelse return error.BadSafetensors;
+        e.end = uint(offs[1]) orelse return error.BadSafetensors;
         if (e.end < e.begin or e.end - e.begin != n or e.end > data_len) return error.BadSafetensors;
         try out.put(arena, kv.key_ptr.*, e);
     }
     return out;
+}
+
+fn str(v: ?std.json.Value) ?[]const u8 {
+    const x = v orelse return null;
+    return if (x == .string) x.string else null;
+}
+
+fn list(v: ?std.json.Value) ?[]const std.json.Value {
+    const x = v orelse return null;
+    return if (x == .array) x.array.items else null;
+}
+
+/// A non-negative JSON integer, as `zig/src/cluster/checkpoint.zig` reads one; one past i64 arrives as a number string.
+fn uint(v: std.json.Value) ?usize {
+    return switch (v) {
+        .integer => |i| std.math.cast(usize, i),
+        .number_string => |s| std.fmt.parseInt(usize, s, 10) catch null,
+        else => null,
+    };
 }
 
 /// One tensor's bytes in a mapped file (they live as long as the file).
@@ -101,6 +129,7 @@ pub const Tensor = struct {
 
 /// A file mapped read-only with its header indexed.
 pub const File = struct {
+    path: [:0]const u8,
     file: Io.File,
     map: Io.File.MemoryMap,
     data: usize,
@@ -108,6 +137,9 @@ pub const File = struct {
     arena: std.heap.ArenaAllocator,
 
     pub fn open(gpa: std.mem.Allocator, io: Io, path: []const u8) !File {
+        return openPrefix(gpa, io, path, null);
+    }
+    pub fn openPrefix(gpa: std.mem.Allocator, io: Io, path: []const u8, prefix: ?[]const u8) !File {
         var file = try Io.Dir.cwd().openFile(io, path, .{});
         errdefer file.close(io);
         const len: usize = @intCast(try file.length(io));
@@ -118,8 +150,9 @@ pub const File = struct {
         if (header_len > len - 8) return error.BadSafetensors;
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
-        const names = try parseHeader(arena.allocator(), map.memory[8..][0..header_len], len - 8 - header_len);
-        return .{ .file = file, .map = map, .data = 8 + header_len, .names = names, .arena = arena };
+        const names = try parseHeaderPrefix(arena.allocator(), map.memory[8..][0..header_len], len - 8 - header_len, prefix);
+        const own = try arena.allocator().dupeSentinel(u8, path, 0);
+        return .{ .path = own, .file = file, .map = map, .data = 8 + header_len, .names = names, .arena = arena };
     }
 
     pub fn close(self: *File, io: Io) void {
@@ -146,4 +179,55 @@ test "header entries" {
     try std.testing.expectEqual(@as(usize, 2), h.count());
     try std.testing.expectEqual(DType.bf16, h.get("a.scales").?.dtype);
     try std.testing.expectError(error.BadSafetensors, parseHeader(arena.allocator(), json, 20));
+}
+
+test "namespace selection admits text without interpreting vision layouts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const json =
+        \\{"vision.weight":{"dtype":"BF16","shape":[1,1,1,1,1],"data_offsets":[0,2]},
+        \\ "text.weight":{"dtype":"U32","shape":[2,3],"data_offsets":[2,26]}}
+    ;
+    try std.testing.expectError(error.RankTooHigh, parseHeader(arena.allocator(), json, 26));
+    const h = try parseHeaderPrefix(arena.allocator(), json, 26, "text.");
+    try std.testing.expectEqual(@as(usize, 1), h.count());
+    try std.testing.expectEqual(@as(usize, 2), h.get("text.weight").?.begin);
+    try std.testing.expectError(error.BadSafetensors, parseHeaderPrefix(arena.allocator(), json, 25, "text."));
+    const empty = try parseHeaderPrefix(arena.allocator(), json, 26, "missing.");
+    try std.testing.expectEqual(@as(usize, 0), empty.count());
+}
+
+test "a header that breaks the format, or whose byte count overflows, is refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const bad = [_][]const u8{
+        // 2^62 rows of 4 bytes is 2^64 bytes, which wraps to 0 in a usize: the size of the empty range [0, 0]
+        "{\"t\": {\"dtype\": \"U8\", \"shape\": [4611686018427387904, 4], \"data_offsets\": [0, 0]}}",
+        "[1]",
+        "{\"t\": 5}",
+        "{\"t\": {\"shape\": [1], \"data_offsets\": [0, 1]}}",
+        "{\"t\": {\"dtype\": 5, \"shape\": [1], \"data_offsets\": [0, 1]}}",
+        "{\"t\": {\"dtype\": \"U8\", \"shape\": [-1], \"data_offsets\": [0, 1]}}",
+        "{\"t\": {\"dtype\": \"U8\", \"shape\": [1.0], \"data_offsets\": [0, 1]}}",
+        "{\"t\": {\"dtype\": \"U8\", \"shape\": [\"1\"], \"data_offsets\": [0, 1]}}",
+        "{\"t\": {\"dtype\": \"U8\", \"shape\": [1]}}",
+        "{\"t\": {\"dtype\": \"U8\", \"shape\": [1], \"data_offsets\": [0]}}",
+        "{\"t\": {\"dtype\": \"U8\", \"shape\": [1], \"data_offsets\": [0, 1, 2]}}",
+        "{\"t\": {\"dtype\": \"U8\", \"shape\": [1], \"data_offsets\": [\"0\", \"1\"]}}",
+    };
+    for (bad) |json| try std.testing.expectError(error.BadSafetensors, parseHeader(arena.allocator(), json, 16));
+}
+
+test "text namespace filtering skips a vision rank-five entry without hiding invalid text" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const json =
+        \\{"vision.patch.weight":{"dtype":"BF16","shape":[1,1,1,1,1],"data_offsets":[0,2]},
+        \\ "language_model.lm_head.weight":{"dtype":"U32","shape":[2,3],"data_offsets":[2,26]}}
+    ;
+    try std.testing.expectError(error.RankTooHigh, parseHeader(arena.allocator(), json, 26));
+    const h = try parseHeaderPrefix(arena.allocator(), json, 26, "language_model.");
+    try std.testing.expectEqual(@as(usize, 1), h.count());
+    try std.testing.expect(h.contains("language_model.lm_head.weight"));
+    try std.testing.expectError(error.BadSafetensors, parseHeaderPrefix(arena.allocator(), json, 25, "language_model."));
 }

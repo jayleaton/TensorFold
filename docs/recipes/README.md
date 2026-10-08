@@ -6,6 +6,7 @@ Each family page describes its supported checkpoint, kernels and operating limit
 | --- | --- |
 | Nemotron 3.5 Lightning | [MLX](nemotron-3.5.md) |
 | Qwen3.8-27B | [MLX, quantization and CUDA](qwen3.8-27b.md) |
+| Qwen3.5-2B | [Native Metal preview, tied affine 4-bit](qwen3.5-2b-native.md) |
 | Qwen3.8 Flash Next | [MLX prefill and CUDA](qwen3.8-flash-next.md), [CUDA images](flash-next-vision.md) |
 | Ternary Bonsai 2 27B | [MLX](ternary-bonsai-2.md) |
 | GLM-5.3-Flash | [MLX on a 256 GB Mac, two-rank CUDA](glm-5.3-flash.md) |
@@ -23,8 +24,10 @@ Quoted from the family pages, not measured per card.
 | Flash Next, CUDA | sm_120 and sm_121 only: DGX Spark GB10, RTX 50, RTX PRO 6000. A card below sm_120 refuses Flash Next at startup. |
 | MLX, Apple Silicon | GLM-5.3-Flash is written for a 256 GB Mac, about 151 GiB resident. DeepSeek-V4-Flash is the same, about 151 GiB resident. Flash Next's default command sizes to a 128 GiB M4 Max. Qwen3.8-27B on a 32 GB Mac needs more than the default 22.4 GiB. Machine classes, not measured minimums. |
 
-Contributor guides cover [adding an MLX family](adding-a-family.md),
-[adding a CUDA family](adding-a-cuda-family.md) and [CUDA implementation rules](cuda.md).
+New families go on the Zig engine: [adding a Zig family](adding-a-zig-family.md) has the steps in order, what each
+one gained, and which code owns it. For the Python engine, frozen at 0.6.5, the contributor guides cover
+[adding an MLX family](adding-a-family.md), [adding a CUDA family](adding-a-cuda-family.md) and
+[CUDA implementation rules](cuda.md).
 [EXL3 weights](exl3.md) and [universal EXL3 experts](exl3-universal-experts.md) describe the shared EXL3
 module every CUDA family can read: any codebook, any width per tensor, one grouped launch per MoE projection.
 

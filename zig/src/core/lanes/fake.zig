@@ -38,6 +38,7 @@ pub const Fake = struct {
     prefill_count: usize = 0,
     prefill_hook: ?*const fn (ctx: *anyopaque, s: *Stream, chunk: usize) void = null,
     prefill_hook_ctx: ?*anyopaque = null,
+    refuse_sampled: bool = false, // prefill refuses a sampled stream with error.SamplingRefused
 
     pub fn deinit(x: *Fake) void {
         var it = x.lanes.valueIterator();
@@ -97,6 +98,7 @@ pub const Fake = struct {
 
     fn prefill(ptr: *anyopaque, s: *Stream) anyerror!void {
         const x = self(ptr);
+        if (x.refuse_sampled and s.sampling != null) return error.SamplingRefused;
         const got = try x.lanes.getOrPut(x.gpa, s);
         if (got.found_existing) freeLane(x.gpa, got.value_ptr);
         got.value_ptr.* = .{};
@@ -106,7 +108,33 @@ pub const Fake = struct {
             if (x.prefill_hook) |hook| hook(x.prefill_hook_ctx.?, s, chunk);
             if (s.isCancelled()) return error.Cancelled;
         }
-        try got.value_ptr.history.appendSlice(x.gpa, s.prompt());
+        const h = &got.value_ptr.history;
+        s.cached = 0;
+        if (s.reuse.saved) |saved| { // the kept state's tokens stand in for the prompt's first `at`
+            const kept: *std.ArrayList(u32) = @ptrCast(@alignCast(saved));
+            try h.appendSlice(x.gpa, kept.items);
+            s.cached = s.reuse.at;
+        }
+        for (s.prompt()[h.items.len..], h.items.len + 1..) |t, at| {
+            try h.append(x.gpa, t);
+            if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(at)) != null) if (s.reuse.hook) |k| k.at(k.ptr, s, @intCast(at));
+        }
+    }
+
+    /// A copy of the stream's cache at `at` tokens (the prompt pass stands there), for core/prompt_cache.zig.
+    pub fn save(x: *Fake, s: *Stream, at: u32) !*anyopaque {
+        const l = x.lane(s);
+        if (l.history.items.len != at) return error.NotAtMark;
+        const kept = try x.gpa.create(std.ArrayList(u32));
+        kept.* = .empty;
+        try kept.appendSlice(x.gpa, l.history.items);
+        return kept;
+    }
+
+    pub fn drop(x: *Fake, saved: *anyopaque) void {
+        const kept: *std.ArrayList(u32) = @ptrCast(@alignCast(saved));
+        kept.deinit(x.gpa);
+        x.gpa.destroy(kept);
     }
 
     fn first(ptr: *anyopaque, s: *Stream, position: u64) anyerror!u64 {

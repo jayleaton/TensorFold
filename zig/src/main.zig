@@ -6,6 +6,7 @@ const cluster = @import("cluster");
 
 const lanes = tf.lanes;
 const nemotron = tf.nemotron;
+const checkpoint_cli = @import("cli/cli.zig");
 
 const usage =
     \\usage: tensorfold run MODEL --tokens ID,... --max-tokens N [--temperature T --seed S [--top-p P] [--top-k K]
@@ -211,6 +212,8 @@ fn generateGpu(gpa: std.mem.Allocator, metal: *nemotron.backend.Metal, prompt: [
     const r = Run{ .tokens = out, .prefill_s = g.prefill_s, .decode_s = g.decode_s, .rounds = g.rounds, .accepted = g.accepted };
     std.debug.print("gpu round, {d} levels, {d} copied windows, second choices {d} kept of {d}, guesses {d} of {d}: verify rows (rounds):", .{ o.depth, g.copied, g.siblings_kept, g.siblings, g.guesses_kept, g.guesses });
     for (g.by_rows, 0..) |k, n| if (k > 0) std.debug.print(" {d}: {d}", .{ n, k });
+    std.debug.print("\nhead depth the rule chose (rounds):", .{});
+    for (g.by_cap, 0..) |k, n| if (k > 0) std.debug.print(" {d}: {d}", .{ n, k });
     std.debug.print("\nhead windows, tokens kept (rounds) by verify rows:", .{});
     for (g.head_kept, 0..) |by_kept, n| if (std.mem.indexOfNone(u32, &by_kept, &.{0}) != null) {
         std.debug.print(" | {d} rows", .{n});
@@ -273,6 +276,7 @@ pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const argv = try init.minimal.args.toSlice(arena);
     if (cluster.cli.wants(@ptrCast(argv[1..]))) std.process.exit(try cluster.cli.main(init, argv[1..]));
+    if (checkpoint_cli.wants(@ptrCast(argv[1..]))) std.process.exit(try checkpoint_cli.main(init, argv[1..]));
     const o = try parseArgs(arena, argv);
     cli_chunks = o.chunks;
     const pool = mtl.objc.Pool.push();
