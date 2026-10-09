@@ -56,8 +56,9 @@ pub const Options = struct {
     /// TF_DSV41_MHC_DEFER (with R1): R1's coefficient launch tagged for the deferred stream, the next mHC call joins it
     mhc_defer: bool = false,
     /// TF_DSV41_MHC_DEFER_AT=exchange (ours, with mhc_defer): each deferred launch issued at the next exchange
-    /// (calls.holdDeferred)
+    /// (calls.holdDeferred); TF_DSV41_MHC_DEFER_AT_ROWS: only in programs of at most this many rows (0: every one)
     mhc_defer_hold: bool = false,
+    mhc_defer_hold_rows: i64 = 0,
     /// TF_DSV41_MHC_PFDEC (ours, 0 = off): mixing mHC sites of windows of at least this many rows (1-64) as mhc_pf's site
     /// + the normed input + mhc_cuda's coef_kernel (block_wide.zig); the same bits as the path they replace
     mhc_pf_rows: i64 = 0,
@@ -104,6 +105,11 @@ pub const Options = struct {
     /// a row-mode program (batch.zig, rowmode.zig: Python's RowWin): every row block scores the context bucket's keys
     /// (RowWin.sub keeps `cap`) and no window streams its top-k (backend.select: `not win.rows`)
     rows: bool = false,
+
+    /// TF_DSV41_MHC_DEFER_AT(_ROWS): a program of `rows` rows issues its deferred launches at the next exchange.
+    pub fn holdsDeferred(o: Options, rows: i64) bool {
+        return o.mhc_defer_hold and (o.mhc_defer_hold_rows == 0 or rows <= o.mhc_defer_hold_rows);
+    }
 };
 
 /// The paged pool as a window's calls see it (pool.py, slots.py: one slot's 1-D table, PT / PSH a family).
@@ -1083,7 +1089,7 @@ pub const Emitter = struct {
 pub fn emit(a: std.mem.Allocator, cfg: *const Config, w: *const Widths, o: Options, layers: []const u32, n: i64, start: i64, head: bool) ![]calls.Call {
     var e: Emitter = .{ .a = a, .cfg = cfg, .w = w, .o = o, .n = n, .start = start };
     try e.window(layers, head);
-    if (o.mhc_defer_hold) calls.holdDeferred(e.out.items);
+    if (o.holdsDeferred(n)) calls.holdDeferred(e.out.items);
     return e.out.items;
 }
 
