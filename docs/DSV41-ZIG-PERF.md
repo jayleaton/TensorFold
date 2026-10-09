@@ -1335,3 +1335,42 @@ profiled, not as the speed result.
 **The next prefill step:** P5's profile, the M2c-2 gate's (PREFILL=1 PROF_PREFILL=1) or the served one now. Read with
 `gap.py prefill-ab` against a 2K run, together with the allocation line above and glue.engram_rows' share after the
 read-ahead fix (10.8).
+
+## 13. The Engram read path: what a cold round waits for (2026-10-09)
+
+Section 12's warms were exact but did not pay (kit 72e41538: rep 0 140.9 vs 140.0, waited 5,414 vs 7,896; the all-on
+bench lost 2-6 % on four cells): the extra reads compete with the ones the GPU waits for. The read path first.
+
+Configuration, knob by knob, Zig = Python (8474f31 engram_gate.py / engram_native.py / prefetch.py): a pool of
+TF_DSV41_ENGRAM_QD = 64 `pread` threads (Docker's seccomp refuses io_uring in both), O_DIRECT shards (buffered + a
+page drop where refused), 512 B sector extents merged across holes <= 4 KiB, an LRU of 65,536 records a layer
+(TF_DSV41_ENGRAM_GATE_CACHE / the Zig `cap`, 17 MB), one gate worker issuing a round's two layers and waiting.
+
+A cold round (zig-cold-20261009, code T0.7 x4, rank 0): ~249 extents of ~770 B, 3.9 ms of the gate worker's wait;
+rep 1 (same prompts): 1 extent, 0.43 ms. Lookups found cached: rep 0 79 %, rep 2 (new salted prompts) 88 %, so the
+cache already holds the shared rows; what remains is new content.
+
+`tf-dsv41-m1 engram-probe DIR RANK WORLD` (no GPU): the shards' size, O_DIRECT reads at depth 1 / 8 / 32 / 64
+(reads a second, p50 / p99 / max latency), and a round's batch (1 / 32 / 128 / 256 fresh rows a layer, both layers
+issued then waited, the gate worker's order) through each reader: the threads, native AIO (TF_DSV41_ENGRAM_AIO=1:
+one io_submit a batch, io_getevents on the waiting thread, no threads to wake), io_uring where allowed; then the
+batches with every core but two spinning. On the dev box (in-memory files, ~1 us a read) every reader takes 1.3 ms
+for 2 x 256 rows at idle clocks and 0.22 ms with the cores busy: the host side is CPU frequency / idle exits, not
+the I/O call. GB10's numbers decide the fix.
+
+TF_DSV41_ENGRAM_AIO=1 (default off): the AIO reader in serving (falls back to the threads, logged, when io_setup is
+refused); TF_DSV41_ENGRAM_URING=0 forces a non-io_uring reader for A/Bs. Same extents into the same buffers:
+engram_rows_test's golden reads (Python ShardRows' SHA-256s) pass in every mode, AIO included.
+
+**GB10 numbers (results/zig-eprobe-20261009-130948, dgx-01).** Shards 2 x 192M rows, 47.21 GiB each, O_DIRECT. Device:
+depth 64 serves 270k (image) - 390k (host) reads a second at p50 125-200 us; depth 1 3-4k a second at 200-300 us. A
+2 x 256-row batch, p50: image threads 2.70 ms, image AIO 1.19 ms (in prod's containers io_uring is refused); host
+threads 2.00, AIO 1.61, io_uring 1.66. AIO halves the batch in the image and is close to the device's throughput
+(~512 reads at ~390k a second ~1.3 ms). The probe's "spinning cores" lines of that run were cache hits (each batch
+size re-read its idle run's rows: one seed a size; 0.05 ms for 2 x 128 rows is under one device read), so no
+wake-up conclusion follows from them; the probe now draws fresh rows each measurement and prints how many rows of each
+line were read cold (`issued`).
+
+TF_DSV41_ENGRAM_POLL=1 (with AIO, default off): a wait polls io_getevents with a zero timeout instead of sleeping in
+the kernel, up to 20 ms, then sleeps: the CPU spins only while a caller waits for reads in flight. Exact (the same
+completions); engram_rows_test's golden reads pass with it (mode aio_poll).

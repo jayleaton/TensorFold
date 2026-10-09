@@ -31,6 +31,8 @@ const usage =
     \\       tf-dsv41-m1 check CAPTURE   (host only: block.zig's calls against the capture's launches)
     \\       tf-dsv41-m1 plan            (host only: the whole model emitted from the q28-v2 listings, M2's buffer plan)
     \\       tf-dsv41-m1 m5-emit CAPTURE (host only: the pool / split programs' invariants for every captured window)
+    \\       tf-dsv41-m1 engram-probe DIR RANK WORLD (the Engram read path on a node's shards: device latency at depth
+    \\                   1 / 8 / 32 / 64, the serving pool's batch times, idle and with spinning cores; no GPU)
     \\       tf-dsv41-m1 aot-needs SIGS OUT (host only: every Triton variant the served config (env) can launch, for
     \\                   tools/zig/triton_fill.py compile; SIGS from its `sigs`)
     \\       tf-dsv41-m1 m5 paged|split|compact|park PACK REF OUT (M5: a rank of TP=2 on the paged pool vs the pool reference)
@@ -146,6 +148,17 @@ pub fn main(init: std.process.Init) !u8 {
         };
         out.interface.flush() catch {};
         return if (bad == 0) 0 else 1;
+    }
+    if (args.len == 5 and std.mem.eql(u8, args[1], "engram-probe")) {
+        var buf: [4096]u8 = undefined;
+        var out = std.Io.File.stdout().writer(init.io, &buf);
+        const rank = std.fmt.parseInt(u32, args[3], 10) catch return 2;
+        const world = std.fmt.parseInt(u32, args[4], 10) catch return 2;
+        @import("engram_probe.zig").main(init.gpa, args[2], rank, world, &out.interface) catch |e| {
+            std.debug.print("FAIL tf-dsv41-m1 engram-probe: {t}\n", .{e});
+            return 1;
+        };
+        return 0;
     }
     if (args.len == 4 and std.mem.eql(u8, args[1], "aot-needs")) {
         var buf: [4096]u8 = undefined;
