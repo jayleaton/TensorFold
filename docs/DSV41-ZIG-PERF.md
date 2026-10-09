@@ -463,3 +463,21 @@ Two exchange facts that do differ:
 
 Probe variants `sysmem` / `devmem` test the exchange's host traffic directly: 160 KiB written to pinned host memory and
 320 KiB read back from it by kernels just before the boundary, against the same on device memory.
+
+### 8.7 It is not the boundary: Zig's latency-bound kernels are all slower
+
+Spark (ea98bb27): `sysmem` 20.5 = `devmem` 20.5 us (the exchange's host traffic is not it); `TF_TP_ROCE_BLOCKS=8`
+exact, within +-0.6 % at x4, -2.4 % long (stays 16). No streamer writes with L2 hints (x3ld, dense3, L2PF: none), so
+each layer's ~90 MB of weights flushes L2 in both engines, and the kernels writing before a boundary are the same.
+
+Round 4's traces, every kernel kind's median Zig / Python (rows, grid alike), not only after an exchange:
+`rot_in` (1 x 16) 4.8x, `rot_in` (12 x 24) 1.7x, `_rope` 1.4-1.6x, `seg_rot_in` 1.1-1.5x, `_kv_store` 1.1-1.5x,
+gate/up epilogue 1.36x, `topk` 1.25x, the boundary 1.25x away from any exchange (19.3 vs 15.5 us) and 1.23x after one,
+`coef_kernel` 1.11x, the 320-CTA `lanes_linear` 1.11x; the DRAM-bound streamers (`ld_kernel`) 1.0x. Small,
+latency-bound kernels are slower whatever runs before them: an SM clock or memory-latency difference of the whole
+GPU, not a writer. On GB10 the CPU and the GPU share one power budget. Zig's host sits in `cuEventSynchronize` 11.3 s
+of the 13 s capture (the driver's `auto` schedule spins a core), with the RoCE proxy spinning another.
+
+- `mhc-probe` `spin-1`, `spin-<cores/2>`, `spin-<cores>`: the engine pattern while host threads busy-spin.
+- `TF_CUDA_SCHED=auto|spin|yield|blocking` (unset: the driver's `auto`, today): the primary context's schedule,
+  set before the context starts (model.zig, m2b.zig). Host scheduling only.

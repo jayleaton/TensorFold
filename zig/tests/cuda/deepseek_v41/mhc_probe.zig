@@ -13,12 +13,17 @@
 //!   sysmem       engine, then the exchange's host traffic: 160 KiB written to pinned host memory (the send slot)
 //!                and 320 KiB read back from it (the receive slot) by kernels just before the boundary
 //!   devmem       sysmem's two kernels on device memory instead (its control)
+//!   spin-N       engine while N host threads busy-spin (N = 1, half the cores, all of them): GB10's CPU and GPU share
+//!                one power budget; a busy host (an engine spinning in cuEventSynchronize, the RoCE proxy, pollers)
+//!                may cost the SM clock that latency-bound kernels need
 //! Reading: compare lines, not absolutes. engine ~ cold-read: the exchange's fresh lines don't matter. aligned2m or
 //! stagger far from engine: the buffers' relative addresses matter (L2 slices): then match Python's layout. cross
 //! above engine: the dependency costs inside the kernel. engine ~ in-engine nsys (26 us Zig, 16 Python) after the
 //! overhead: the bench reproduces the engine; well below: the engine's slowness comes from outside the launch.
 //! sysmem well above devmem: touching pinned host memory (tp_roce's slots) slows the next kernel: the exchange is
 //! the writer; sysmem ~ devmem: the exchange's host traffic is not it.
+//! spin-N rising with N toward the in-engine 26-31 us: host load slows the GPU's small kernels: TF_CUDA_SCHED=yield /
+//! blocking (and fewer spinning threads) is the lever; flat: host load is not it.
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -152,6 +157,32 @@ fn stats(xs: []f32) [3]f32 {
     return .{ xs[xs.len / 2], xs[xs.len / 10], xs[xs.len * 9 / 10] };
 }
 
+var spin_stop: std.atomic.Value(bool) = .init(false);
+
+fn spinner(sink: *u64) void {
+    var x: u64 = 1;
+    while (!spin_stop.load(.monotonic)) {
+        for (0..4096) |_| x = x *% 6364136223846793005 +% 1442695040888963407;
+    }
+    sink.* = x;
+}
+
+/// `engine` with `n` host threads busy-spinning.
+fn spun(b: *Bench, n: usize, windows: usize) !void {
+    var name_buf: [16]u8 = undefined;
+    const name = try std.fmt.bufPrint(&name_buf, "spin-{d}", .{n});
+    var sinks: [256]u64 = undefined;
+    var ts: [256]std.Thread = undefined;
+    const m = @min(n, ts.len);
+    spin_stop.store(false, .monotonic);
+    for (0..m) |i| ts[i] = try std.Thread.spawn(.{}, spinner, .{&sinks[i]});
+    defer {
+        spin_stop.store(true, .monotonic);
+        for (ts[0..m]) |t| t.join();
+    }
+    try b.run(name, .@"packed", .engine, false, null, windows);
+}
+
 pub fn run(gpu: Gpu, k: *const dsv41.Kernels, windows_arg: ?[]const u8) !void {
     const windows: usize = @max(1, if (windows_arg) |w| try std.fmt.parseInt(usize, w, 10) else 5);
     const d = gpu.d;
@@ -209,5 +240,7 @@ pub fn run(gpu: Gpu, k: *const dsv41.Kernels, windows_arg: ?[]const u8) !void {
     try b.run("cross", .@"packed", .engine, true, null, windows);
     try b.run("sysmem", .@"packed", .engine, false, true, windows);
     try b.run("devmem", .@"packed", .engine, false, false, windows);
+    const cores = std.Thread.getCpuCount() catch 8;
+    for ([_]usize{ 1, @max(cores / 2, 2), cores }) |n| try spun(&b, n, windows);
     check.pass("mhc-probe: {d} windows a variant", .{windows});
 }
