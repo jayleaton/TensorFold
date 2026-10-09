@@ -267,7 +267,7 @@ fn runFinals(cases: []const Case, together: bool, calls: *usize, most: *usize) !
     if (together) {
         const errs = try gpa.alloc(?anyerror, cases.len);
         defer gpa.free(errs);
-        try engine.finishStreams(ptrs, errs);
+        _ = try engine.finishStreams(ptrs, errs);
         for (errs) |x| if (x) |e| return e;
     } else for (ptrs) |s| try engine.finishStream(s);
     calls.* = target.drafts_calls;
