@@ -85,6 +85,9 @@ pub fn bootCheck(ctx: *const cuda.Context, cfg: *const Config, o: Options, rank:
     }
     // the prefill price's knobs by prod's names (TF_DSV41_PREFILL_ROWS, TF_DSV41_INDEX_BUDGET_MIB)
     if (std.c.getenv("TF_DSV41_PREFILL_ROWS")) |v| knobs.prefill_rows = try std.fmt.parseInt(u32, std.mem.span(v), 10);
+    // TF_DSV41_PF_4K: 4,096-row segments, priced as such (memory.py's chunk_gib scales by the window)
+    const pk = @import("prod_knobs.zig");
+    if (try pk.pf4k(&pk.env)) knobs.prefill_rows = pk.pf4k_rows;
     if (std.c.getenv("TF_DSV41_INDEX_BUDGET_MIB")) |v| knobs.index_budget_mib = try std.fmt.parseInt(u32, std.mem.span(v), 10);
     var layout = try kv.Layout.fromConfig(cfg, .{ .split = o.split and world > 1 });
     var terms = try budget.Serve.fromEnv(rank);

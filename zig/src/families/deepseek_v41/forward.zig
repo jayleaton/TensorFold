@@ -838,6 +838,24 @@ pub const Forward = struct {
             const send = c.args[0].arg.t;
             return f.comm.allGather(try r.tensorAddr(send), try r.tensorAddr(c.args[1].arg.t), numel(send), .bf16, s);
         }
+        if (std.mem.eql(u8, step, "exchange_rows")) {
+            // TF_DSV41_PF_OVERLAP: rows [r0, r0 + m) of a bf16 partial into the gathered [world, n, D], where the
+            // whole exchange's all-gather puts them: this rank's copied, the peer's received (TP=2: one peer)
+            const send = c.args[0].arg.t;
+            const into = c.args[1].arg.t;
+            const r0: usize = @intCast(c.args[2].arg.i);
+            const n: usize = @intCast(into.shape[1]);
+            const m = numel(send) / D;
+            if (W != 2 or r0 + m > n) return error.BadGlue;
+            const me = f.comm.rank();
+            const src = try r.tensorAddr(send);
+            const base = try r.tensorAddr(into);
+            for (0..W) |q| {
+                const dst = base + ((q * n + r0) * D) * 2;
+                if (q == me) try r.d.check(r.d.api.cuMemcpyDtoDAsync_v2(dst, src, m * D * 2, s), "cuMemcpyDtoDAsync") else try f.comm.exchange(src, dst, m * D, .bf16, @intCast(q), s);
+            }
+            return;
+        }
         if (std.mem.eql(u8, step, "exchange_f32")) {
             // the MoE's fp32 partial rounded to bf16, then gathered
             const part = c.args[0].arg.t;
