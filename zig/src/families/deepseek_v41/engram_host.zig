@@ -177,6 +177,47 @@ pub fn lookbackAt(tail: []const u32, pos: u64, pending: ?[]const u32, start: u64
     return buf[m - n .. m];
 }
 
+/// A slot's Engram tail after keeping `ids` (Batch.keep's row-mode commit): the last `keep_n` of tail + ids, into
+/// `tail`; its new length.
+pub fn tailAfter(tail: []u32, len: usize, keep_n: usize, ids: []const u32) usize {
+    var all: [2 * max_ngram + 64]u32 = undefined;
+    const old = tail[0..len];
+    const take = ids[ids.len -| keep_n..];
+    @memcpy(all[0..old.len], old);
+    @memcpy(all[old.len..][0..take.len], take);
+    const m = old.len + take.len;
+    const k = @min(m, keep_n);
+    @memcpy(tail[0..k], all[m - k .. m]);
+    return k;
+}
+
+test "an Engram warm's lookback at a draft before its window's keep is the window's tail after it" {
+    // TF_DSV41_ENGRAM_WARM: Batch.warmEngram asks at (start = pos + kept), the pending window still in flight; the
+    // next window's own round job (Batch.stageEngram) reads after the slot's tail once the keep ran
+    var prng = std.Random.DefaultPrng.init(56);
+    const rnd = prng.random();
+    for (0..500) |_| {
+        const keep_n = 3;
+        var tail: [max_ngram]u32 = undefined;
+        const len = rnd.uintAtMost(usize, keep_n);
+        for (tail[0..len]) |*t| t.* = rnd.int(u32);
+        var pend: [6]u32 = undefined;
+        const pn = 1 + rnd.uintLessThan(usize, pend.len);
+        for (pend[0..pn]) |*t| t.* = rnd.int(u32);
+        const pos: u64 = 100 + rnd.uintAtMost(u64, 50);
+        const kept = rnd.uintLessThan(usize, pn); // drafts kept: rows 0..kept, the next window starts past them
+        const start = pos + kept + 1;
+        var buf: [2 * max_ngram + 64]u32 = undefined;
+        const before = lookbackAt(tail[0..len], pos, pend[0..pn], start, keep_n, &buf).?;
+        var after = tail;
+        const alen = tailAfter(&after, len, keep_n, pend[0 .. kept + 1]);
+        try std.testing.expectEqualSlices(u32, after[0..alen], before);
+        // a keep already done (the commit before the draft): no pending window, the same tail
+        var buf2: [2 * max_ngram + 64]u32 = undefined;
+        try std.testing.expectEqualSlices(u32, after[0..alen], lookbackAt(after[0..alen], start, null, start, keep_n, &buf2).?);
+    }
+}
+
 /// Python engram_host._is_prime: small primes, then Miller-Rabin with bases 2, 7, 61 (exact below 4.7e9).
 pub fn isPrime(n: u64) bool {
     if (n < 2) return false;

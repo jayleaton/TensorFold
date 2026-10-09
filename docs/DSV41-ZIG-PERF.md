@@ -434,3 +434,33 @@ no forward past 24 rows in the acceptance log when Python has none, and code x4 
 Also here: the phases report carries "engram" counters (row reader hits / waited / misses / reads / bytes / wait_ms,
 gate rounds / syncs / warm / failed; cumulative, a cell's are two snapshots' difference), for the cold rep 0
 question (section 10 of the sampled work).
+
+## 12. Engram reads ahead of a 4-slot window: Python's commit and draft-end warms (TF_DSV41_ENGRAM_WARM=1, 2026-10-09)
+
+The cold rep (code T0.7 x4, no warm-up, kit e63bf019): rep 0 140.0 tok/s, rep 1 on the same prompts 148.9, rep 2 on
+new salted prompts 142.9. Row-graph host time 73 / 0 / 13 ms; Engram reads found in flight ("waited") 7,896 / 112 /
+5,811 for 490 / 53 / 473 ms of the gate worker's wait. The window phase grew 646 ms in rep 0 over rep 1 (the host's
+engram.wait phase only 55): the GPU's gate kernel spins before layers 1 and 14 until the round job's rows land, and
+layer 1 leaves the reads about one layer of cover.
+
+Python (decode.py, 8474f31) starts them earlier, on both ranks: at every commit (rounds.py `_commit` ->
+`prefetch_pending`: the next window's pending row, a gate warm before the DSpark pass) and at draft end
+(`decode.draft`: a gate warm of the pending row and every drafted position, before depth and grammar cut them).
+Zig's only early read was R3, the pending row at `op_ds_propose`, the one-slot pass's message; with TF_DSV41_SLOTS=4
+and TF_DSV41_SLOT_DRAFTS=1 (the slot pass, ops 40-42) every read started at the window's arm.
+
+Port: `iface.Target.warm` (forwarded by the timed and grammar wrappers), called by the lanes' `draft` at Python's two
+points (each stream's pending row before the pass or its speculation, then each drafted slot's pending row and all
+its block's drafts). `GpuTarget.warm` with TF_DSV41_ENGRAM_WARM=1 (default off): row mode -> `Batch.warmEngram`,
+plan-link op 56 [op, n, (slot, start, rows, ids...)] so every rank warms its own columns, then a gate warm job a rank;
+one slot -> `prefetchEngram` on this rank. A warm's lookback is the slot's committed tail plus, for a draft before
+its window's keep, the pending window's rows its start implies are kept (`engram_host.lookbackAt`, R3's rule;
+`engram_host.tailAfter` is the keep's own update). Reads only: a window's rows are its own round job's bytes whatever
+was warmed, a wrong guess is one wasted read.
+
+Gate: `engram_host` test "an Engram warm's lookback at a draft before its window's keep is the window's tail after it"
+(500 random slot states, pending or kept), the emitter checks and the host tests.
+
+Spark: the same 3-rep cold diagnostic with TF_DSV41_ENGRAM_WARM=1 (rep 0 cold, rep 1 same prompts, rep 2 salted):
+pass = equal hashes, "waited" / wait_ms and rep 0's tok/s against the run above (gate_warm in the phases' "engram"
+counts the warm jobs, which must be > 0).

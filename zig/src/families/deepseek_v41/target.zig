@@ -66,6 +66,8 @@ pub const GpuTarget = struct {
     admission: ?Planned = null,
     /// releases wait for `settleReleases` (the rounds: after the next round's admissions are decided)
     defer_release: bool = false,
+    /// TF_DSV41_ENGRAM_WARM=1 (`warm`): Python's commit and draft-end Engram warms (every rank alike)
+    engram_warm: bool = false,
     releasing: [16]bool = @splat(false),
 
     /// A request's admission (kv/sched.zig Admission + the round's spills, with its first admission).
@@ -75,7 +77,7 @@ pub const GpuTarget = struct {
         return .{ .ptr = t, .vtable = &vtable };
     }
 
-    const vtable: iface.Target.VTable = .{ .prefill = prefill, .window = window, .keep = keep, .taps = taps, .release = release, .admit = admit, .begin = begin, .piece = piece, .finish = finish, .tail = tail };
+    const vtable: iface.Target.VTable = .{ .prefill = prefill, .window = window, .keep = keep, .taps = taps, .release = release, .admit = admit, .begin = begin, .piece = piece, .finish = finish, .tail = tail, .warm = warm };
 
     fn admit(p: *anyopaque, slot: u32, max_new: u64) void {
         const t = self_(p);
@@ -211,6 +213,26 @@ pub const GpuTarget = struct {
         var out = [_][]u32{&one};
         try window(p, &.{.{ .slot = slot, .start = ids.len - 1, .tokens = ids[ids.len - 1 ..], .parents = null, .draws = &.{draw}, .sampling = sampling }}, &out);
         return one[0];
+    }
+
+    /// Iface.Target.warm: row mode warms on every rank (Batch.warmEngram, op 56); one slot, this rank's reads of the
+    /// one slot (the followers have R3's row-0 read at op_ds_propose). Off unless TF_DSV41_ENGRAM_WARM=1.
+    fn warm(p: *anyopaque, asks: []const iface.Warm) void {
+        const t = self_(p);
+        if (!t.engram_warm or asks.len == 0) return;
+        if (t.rows) |b| {
+            b.warmEngram(asks) catch |e| std.log.scoped(.dsv41).warn("engram warm: {t} (the windows read their own rows)", .{e});
+            return;
+        }
+        for (asks) |a| if (a.slot == 0) t.f.prefetchEngram(a.start, a.ids);
+    }
+
+    /// TF_DSV41_ENGRAM_WARM: 0 (default) | 1.
+    pub fn engramWarmEnv() !bool {
+        const v = std.mem.trim(u8, std.mem.span(std.c.getenv("TF_DSV41_ENGRAM_WARM") orelse return false), " ");
+        if (v.len == 0 or std.mem.eql(u8, v, "0")) return false;
+        if (std.mem.eql(u8, v, "1")) return true;
+        return error.BadEngramWarm;
     }
 
     /// `finish` up to the last token (TF_DSV41_TAIL_JOIN): the decoder replay and its taps; the slot stays at the last

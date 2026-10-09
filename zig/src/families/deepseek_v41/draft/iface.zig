@@ -54,7 +54,16 @@ pub const Target = struct {
         /// a round's shared one (Python's batcher `finals`). null from the call: done so; a choice: the target ran the
         /// last row as `finish` (a grammar's first mask). null: `finish`.
         tail: ?*const fn (ptr: *anyopaque, slot: u32, ids: []const u32, sampling: ?lanes.Sampling, draw: u64) anyerror!?u32 = null,
+        /// Engram reads ahead of the next window (TF_DSV41_ENGRAM_WARM, Python's decode.prefetch_pending at a commit
+        /// and its draft-end gate.warm): each ask's rows `ids` from position `start` on its slot. Reads only: a
+        /// window's rows are its own reads' bytes whatever was warmed.
+        warm: ?*const fn (ptr: *anyopaque, asks: []const Warm) void = null,
     };
+
+
+    pub fn warm(t: Target, asks: []const Warm) void {
+        if (t.vtable.warm) |f| f(t.ptr, asks);
+    }
 
     pub const Begun = struct { at: u64 = 0, damaged: bool = false };
 
@@ -148,3 +157,6 @@ pub fn ingestSpan(n: usize, window: usize) struct { skip: usize, count: usize } 
     const skip = n -| window;
     return .{ .skip = skip, .count = n - skip };
 }
+
+/// An Engram warm ask (Target.warm).
+pub const Warm = struct { slot: u32, start: u64, ids: []const u32 };

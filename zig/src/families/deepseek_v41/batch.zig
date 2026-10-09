@@ -317,6 +317,78 @@ pub const Batch = struct {
         b.pend[slot] = null;
     }
 
+    /// 56 (op 55's neighbour, dsq-zig-sampled's range 56-59): [op, n, (slot, start, rows, ids...) an ask] the
+    /// Engram warm (TF_DSV41_ENGRAM_WARM), every rank's own columns
+    pub const op_engram_warm: i64 = 56;
+    pub const max_warm = 16;
+    pub const max_warm_ids = 16;
+
+    /// TF_DSV41_ENGRAM_WARM (target.warm): Python's commit (decode.prefetch_pending: the next window's pending row)
+    /// and draft-end (decode.draft's gate.warm: the pending row and every drafted one, before depth cuts them) Engram
+    /// reads, as gate warm jobs on every rank: the round's own reads then find the rows cached or in flight. Each
+    /// ask's lookback is its slot's committed tail plus, for a draft before its window's keep, the rows of the window
+    /// in flight that `start` implies are kept (engram_host.lookbackAt, R3's rule). Reads only: a window's rows are
+    /// its own reads' bytes whatever is warmed, and a wrong guess is a wasted read.
+    pub fn warmEngram(b: *Batch, asks: []const iface.Warm) !void {
+        const f = b.f;
+        if (f.gate == null or f.engram == null) return;
+        if (b.ss.leads()) {
+            var msg: [2 + max_warm * (3 + max_warm_ids)]i64 = undefined;
+            var at: usize = 2;
+            var n: usize = 0;
+            for (asks) |a| {
+                if (n == max_warm or a.ids.len == 0 or a.slot >= b.ss.n) continue;
+                const m = @min(a.ids.len, max_warm_ids);
+                msg[at..][0..3].* = .{ a.slot, @intCast(a.start), @intCast(m) };
+                for (a.ids[0..m], msg[at + 3 ..][0..m]) |t, *y| y.* = t;
+                at += 3 + m;
+                n += 1;
+            }
+            if (n == 0) return;
+            msg[0] = op_engram_warm;
+            msg[1] = @intCast(n);
+            try f.link.?.send(msg[0..at]);
+        }
+        b.warmLocal(asks);
+    }
+
+    /// op 56's asks into `asks` (their ids in `ids`); the count.
+    fn parseWarm(msg: []const i64, asks: *[max_warm]iface.Warm, ids: *[max_warm * max_warm_ids]u32) !usize {
+        if (msg.len < 2) return error.BadPlan;
+        const n: usize = @intCast(msg[1]);
+        if (n > max_warm) return error.BadPlan;
+        var at: usize = 2;
+        for (0..n) |i| {
+            if (at + 3 > msg.len) return error.BadPlan;
+            const m: usize = @intCast(msg[at + 2]);
+            if (m == 0 or m > max_warm_ids or at + 3 + m > msg.len) return error.BadPlan;
+            const out = ids[i * max_warm_ids ..][0..m];
+            for (msg[at + 3 ..][0..m], out) |x, *y| y.* = @intCast(x);
+            asks[i] = .{ .slot = @intCast(msg[at]), .start = @intCast(msg[at + 1]), .ids = out };
+            at += 3 + m;
+        }
+        if (at != msg.len) return error.BadPlan;
+        return n;
+    }
+
+    /// This rank's warm job for `asks` (the leader's or op 56's), the same items on every rank.
+    fn warmLocal(b: *Batch, asks: []const iface.Warm) void {
+        const f = b.f;
+        const g = f.gate orelse return;
+        const h = f.engram orelse return;
+        var items: [max_warm]egate.Item = undefined;
+        var bufs: [max_warm][2 * eh.max_ngram + 64]u32 = undefined;
+        var n: usize = 0;
+        for (asks) |a| {
+            if (n == max_warm or a.ids.len == 0 or a.slot >= b.ss.n) continue;
+            const items_n = @min(a.ids.len, max_warm_ids);
+            const lb = warmLookback(b.ss.state(a.slot).*, b.pend[a.slot], a.start, h.max_ngram - 1, &bufs[n]) orelse continue;
+            items[n] = .{ .ids = a.ids[0..items_n], .tail = lb };
+            n += 1;
+        }
+        if (n > 0) g.warm(items[0..n]);
+    }
+
     fn dropPending(b: *Batch, slot: u32) void {
         b.pend[slot] = null;
         b.ss.state(slot).pending = null;
@@ -446,6 +518,12 @@ pub const Batch = struct {
             slots_mod.op_select => try b.ss.activate(@intCast(msg[1])),
             slots_mod.op_rows_keep => try b.keep(@intCast(msg[1]), @intCast(msg[2])),
             slots_mod.op_rows_drop => b.dropPending(@intCast(msg[1])),
+            op_engram_warm => {
+                var asks: [max_warm]iface.Warm = undefined;
+                var ids: [max_warm * max_warm_ids]u32 = undefined;
+                const n = try parseWarm(msg, &asks, &ids);
+                b.warmLocal(asks[0..n]);
+            },
             slots_mod.op_rows => {
                 const k: usize = @intCast(msg[1] & 0xff);
                 const more = (msg[1] >> 8) & 1 == 1;
@@ -616,15 +694,7 @@ fn engramCols(f: *const fwd.Forward, h: *const eh.Host) usize {
 
 /// Engram's tail after committing `ids`: (tail + ids)[-keep_n:].
 fn tailAfter(st: *fwd.Slot, keep_n: usize, ids: []const u32) void {
-    var all: [2 * eh.max_ngram + 64]u32 = undefined;
-    const old = st.tail[0..st.tail_len];
-    const take = ids[ids.len -| keep_n..];
-    @memcpy(all[0..old.len], old);
-    @memcpy(all[old.len..][0..take.len], take);
-    const m = old.len + take.len;
-    const k = @min(m, keep_n);
-    @memcpy(st.tail[0..k], all[m - k .. m]);
-    st.tail_len = k;
+    st.tail_len = eh.tailAfter(&st.tail, st.tail_len, keep_n, ids);
 }
 
 /// The row table on the device ([NCOL, rmax] int64, then the int32 rslot copy) and its two pinned staging halves; a
@@ -709,4 +779,11 @@ const Graphs = struct {
 var room_floor: f64 = 5.0;
 fn roomFn() bool {
     return graphs.roomAbove(room_floor);
+}
+
+/// The lookback a warm of a window at `start` reads after: the slot's committed tail, plus the rows of its pending
+/// window (starting at the slot's position) that `start` implies are kept; null when `start` is not reachable.
+pub fn warmLookback(st: anytype, pend: anytype, start: u64, keep_n: usize, buf: []u32) ?[]const u32 {
+    const pending: ?[]const u32 = if (pend) |p| (if (p.start == st.pos) p.ids[0..p.n] else null) else null;
+    return eh.lookbackAt(st.tail[0..st.tail_len], st.pos, pending, start, keep_n, buf);
 }
