@@ -202,7 +202,7 @@ pub const Served = struct {
         // the row windows' first uses (batch.zig): programs emitted and graphs captured, their host ms
         if (m.gt.rows) |b| {
             const st = b.stats;
-            try w.print(", \"rowgraphs\": {{\"windows\": {d}, \"rows\": {d}, \"padded\": {d}, \"builds\": {d}, \"build_ms\": {d:.2}, \"captures\": {d}, \"capture_ms\": {d:.2}, \"eager\": {d}}}", .{ st.windows, st.rows, st.padded, st.builds, @as(f64, @floatFromInt(st.build_ns)) / 1e6, st.captures, @as(f64, @floatFromInt(st.capture_ns)) / 1e6, st.eager });
+            try w.print(", \"rowgraphs\": {{\"windows\": {d}, \"rows\": {d}, \"padded\": {d}, \"builds\": {d}, \"build_ms\": {d:.2}, \"captures\": {d}, \"capture_ms\": {d:.2}, \"eager\": {d}, \"prep_ms\": {d:.2}, \"stage_ms\": {d:.2}, \"launch_ms\": {d:.2}, \"keep_ms\": {d:.2}}}", .{ st.windows, st.rows, st.padded, st.builds, @as(f64, @floatFromInt(st.build_ns)) / 1e6, st.captures, @as(f64, @floatFromInt(st.capture_ns)) / 1e6, st.eager, @as(f64, @floatFromInt(st.prep_ns)) / 1e6, @as(f64, @floatFromInt(st.stage_ns)) / 1e6, @as(f64, @floatFromInt(st.launch_ns)) / 1e6, @as(f64, @floatFromInt(st.keep_ns)) / 1e6 });
         }
     }
 

@@ -478,7 +478,7 @@ pub const SlotPass = struct {
         for (slots) |sl| {
             const pd = b.pend[sl].?;
             const pos: i32 = @intCast(pd.start);
-            try cuda.DeviceBuffer.uploadAsync(.{ .d = r.d, .ptr = pos_at, .len = 4 }, 0, std.mem.asBytes(&pos), st.handle);
+            try gpu.setPos(r.d, pos_at, pos, st);
             const sl_: emit.Slots = .{ .ring_slots = x.nslots, .slot = sl, .taps_role = "w.taps" };
             var cs = if (proj) |a0|
                 try emit.emitIngestBlocks(a, x.f.cfg, x.f.widths, x.f.opts, pd.n, pd.a - a0, sl_)
@@ -563,7 +563,7 @@ pub const SlotPass = struct {
     fn ingestAsync(x: *SlotPass, slot: u32, start: u64, at: rows.TapsAt, n: u32) !void {
         const r = x.f.runner;
         const pos: i32 = @intCast(start);
-        try cuda.DeviceBuffer.uploadAsync(.{ .d = r.d, .ptr = r.addressOf("w.ds.pos") orelse return error.Unbound, .len = 4 }, 0, std.mem.asBytes(&pos), r.stream.handle);
+        try gpu.setPos(r.d, r.addressOf("w.ds.pos") orelse return error.Unbound, pos, r.stream);
         var la = std.heap.ArenaAllocator.init(x.gpa);
         defer la.deinit();
         const sl: emit.Slots = .{ .ring_slots = x.nslots, .slot = slot, .taps_role = if (at.src == 1) batch.taps_stash_role else "w.taps" };
@@ -621,7 +621,7 @@ pub const SlotPass = struct {
         const r = x.f.runner;
         try r.stream.synchronize();
         const pos: i32 = @intCast(start);
-        try cuda.DeviceBuffer.uploadAsync(.{ .d = r.d, .ptr = r.addressOf("w.ds.pos") orelse return error.Unbound, .len = 4 }, 0, std.mem.asBytes(&pos), r.stream.handle);
+        try gpu.setPos(r.d, r.addressOf("w.ds.pos") orelse return error.Unbound, pos, r.stream);
         var la = std.heap.ArenaAllocator.init(x.gpa);
         defer la.deinit();
         const sl: emit.Slots = .{ .ring_slots = x.nslots, .slot = slot, .taps_role = if (at.src == 1) batch.taps_stash_role else "w.taps" };
