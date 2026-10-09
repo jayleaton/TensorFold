@@ -126,20 +126,41 @@ done
 #     "replay runs: ". The ASSETS' AOT set is the reference's plus the kit's fill.
 # Every stage runs under a timeout (PIECES_REF_MIN 20, PIECES_RUN_MIN 12; its container removed on expiry) and the
 # first failure stops the stage with exit 1 ("FAIL pieces: ..."); rank 0's last line is "PASS pieces" or "FAIL pieces".
+# The two hosts share a status channel (tools/zig/dsv41_m2c2/peer.py, rank 0 serving on $MASTER:PIECES_PEER_PORT, 29890):
+# each posts a heartbeat and, on its failure, "FAIL <reason>"; a watcher beside every container removes it as soon as
+# the other rank fails or stops answering, so neither waits out a deadline on a dead peer. The AOT merges and the
+# tokens' comparison run in the image as the references wrote their files (root), not as the host user.
 # PIECES_PROMPTS (160 300 500 700: every piece past 16 rows, their rows within one 2,048-row run), PIECES_STEPS (24),
 # PIECES_RUNS ("1 0 2"). About 30 min.
 if [[ "${PIECES:-0}" == 1 ]]; then
     P=/out/pieces; mkdir -p "$OUT/pieces"
     prompts=${PIECES_PROMPTS:-160 300 500 700}; psteps=${PIECES_STEPS:-24}
     fillenv=$KIT/triton-fill/fill-prod.env
-    pfail() { log "FAIL pieces: $*"; exit 1; }
-    # a container under a deadline: removed on expiry (the client's exit does not stop it)
+    peerport=${PIECES_PEER_PORT:-29890}; peer=(python3 -B "$KIT/tools/zig/dsv41_m2c2/peer.py")
+    srvpid=""; beatpid=""
+    pstop() { [[ -n "$beatpid" ]] && kill "$beatpid" 2>/dev/null; [[ -n "$srvpid" ]] && kill "$srvpid" 2>/dev/null; beatpid=""; srvpid=""; }
+    pfail() {
+        log "FAIL pieces: $*"
+        [[ -n "$beatpid" ]] && kill "$beatpid" 2>/dev/null; beatpid=""
+        "${peer[@]}" set "$MASTER" "$peerport" "$RANK" "FAIL $*" > /dev/null 2>&1
+        [[ "$RANK" == 0 ]] && sleep 15      # the server lives long enough for rank 1's watcher to read it
+        pstop
+        exit 1
+    }
+    trap pstop EXIT
+    if [[ "$RANK" == 0 ]]; then "${peer[@]}" serve "$peerport" >> "$OUT/pieces/peer.log" 2>&1 & srvpid=$!; sleep 1; fi
+    "${peer[@]}" beat "$MASTER" "$peerport" "$RANK" $$ >> "$OUT/pieces/peer.log" 2>&1 & beatpid=$!
+    # a container under a deadline (removed on expiry: the client's exit does not stop it) and the peer's watch
     timed() {
-        local min=$1 name=$2; shift 2
+        local min=$1 name=$2 wpid rc; shift 2
+        rm -f "$OUT/pieces/peer-$name"
+        "${peer[@]}" watch "$MASTER" "$peerport" "$RANK" "$name" > "$OUT/pieces/peer-$name" 2>&1 & wpid=$!
         timeout --kill-after=30 "$(( min * 60 ))" docker run --name "$name" "$@"
-        local rc=$?
+        rc=$?
+        kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
         docker rm -f "$name" > /dev/null 2>&1
         (( rc == 124 || rc == 137 )) && log "pieces: $name passed its $min min deadline"
+        if [[ -s "$OUT/pieces/peer-$name" ]]; then pfail "$(cat "$OUT/pieces/peer-$name")"; fi
         return $rc
     }
     [[ -f "$fillenv" && -f "$KIT/triton-fill/aot/aot.json" ]] || pfail "the kit has no triton-fill (build-kit.sh TRITON_FILL=1 or TRITON_FILL_FROM)"
@@ -161,16 +182,17 @@ if [[ "${PIECES:-0}" == 1 ]]; then
     timed 5 "dsv41-zig-peng-r$RANK" "${ARGS[@]}" --entrypoint python "$IMAGE" -B /kit/tools/zig/dsv41_engram_host.py \
         --py-src /dsv41-tf/src --config /model/config.json --tokenizer /model/tokenizer.json \
         --out "$P/ref-batched/engram-host.bin" > "$OUT/pieces/engram-host.log" 2>&1 || pfail "engram host tables"
-    for src in "$OUT/pieces/ref-alone/aot" "$KIT/triton-fill/aot"; do
-        python3 -B "$KIT/tools/zig/dsv41_aot_merge.py" "$OUT/pieces/ref-batched/aot" "$src" >> "$OUT/pieces/aot-merge.log" 2>&1 \
+    for src in "$P/ref-alone/aot" /kit/triton-fill/aot; do
+        timed 3 "dsv41-zig-pmerge-r$RANK" "${ARGS[@]}" --entrypoint python "$IMAGE" -B /kit/tools/zig/dsv41_aot_merge.py \
+            "$P/ref-batched/aot" "$src" >> "$OUT/pieces/aot-merge.log" 2>&1 \
             || pfail "merging $src into the reference's AOT set (aot-merge.log)"
     done
-    python3 - "$OUT/pieces" $prompts <<'PYEOF' | tee -a "$OUT/run.log"
+    timed 2 "dsv41-zig-pcmp-r$RANK" "${ARGS[@]}" --entrypoint python "$IMAGE" -B -c '
 import json, sys
 d, ps = sys.argv[1], sys.argv[2:]
 same = sum(json.load(open(f"{d}/ref-batched/p{p}/ref.json"))["tokens"] == json.load(open(f"{d}/ref-alone/p{p}/ref.json"))["tokens"] for p in ps)
-print(f"pieces: Python batched == alone, tokens: {same}/{len(ps)} (informational)")
-PYEOF
+print(f"pieces: Python batched == alone, tokens: {same}/{len(ps)} (informational)")' "$P" $prompts > "$OUT/pieces/compare.log" 2>&1
+    log "$(tail -1 "$OUT/pieces/compare.log")"
     refs=(); for p in $prompts; do refs+=("$P/ref-batched/p$p"); done
     for runs in ${PIECES_RUNS:-1 0 2}; do
         drop_caches
@@ -197,6 +219,8 @@ PYEOF
         fi
     done
     log "PASS pieces: runs ${PIECES_RUNS:-1 0 2} == Python's batched reference"
+    [[ "$RANK" == 0 ]] && sleep 10      # rank 1's last watcher reads the server once more before it goes
+    pstop; trap - EXIT
     port=$((port + 20))
 fi
 drop_caches
