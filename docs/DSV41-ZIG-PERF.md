@@ -1516,3 +1516,40 @@ S1 measures it.
 | --- | --- | --- |
 | S1 | kit fill with `TRITON_FILL_ENV=tools/zig/dsv41_m4/fill-rb.env` (and a second with TF_DSV41_STREAM_RB=4); `TF_DSV41_TEST=<tf-dsv41-test> AOT=<kit aot> bash zig/tests/cuda/deepseek_v41/stream_rb_job.sh <out>` | `bits rb2: PASS` and `bits rb4: PASS` at every (start, rows); `stream-rb: PASS`; the speedups |
 | S2 | all-on + `TF_DSV41_STREAM_RB=<the faster>`, `bench_http.py --long 32768,131072` | long replies == Python's (sha unchanged), T0 20/20; prompt tok/s against the same base |
+
+## 14. Zig's own draft-cost table (TF_DSV41_CALIB=measure / zig, 2026-10-10, offline)
+
+Why: Zig priced draft depth and the lookup plan with Python's `calib-*.json` (`draft/calib_env.zig`). Prod's Python
+boot re-measures (TF_DSV41_CALIB=real) and overwrites that entry, so Zig's depth followed Python's cost curve. The
+1-slot windows cost the same in both engines, but Zig's 4-slot 24-row rounds are ~4 ms cheaper (Spark nsys c13: 108.2
+vs 112.3 ms), so at 4 streams Zig was priced as if rows cost more than they do. Replies never depend on drafts (exact at
+T0, keyed at T0.7): only drafting depth and round sizes move.
+
+Port (Zig knob values; the default `cached` is unchanged):
+- `TF_DSV41_CALIB=measure`: Python's `calib.measure` on the served engine at boot (`calib_gpu.zig`, the plan and the
+  arithmetic in `draft/calib_measure.zig`): the calibration text (glm5_next `calib.TEXT`, the checkpoint's
+  tokenizer.json, first 256 ids; fallback_ids without one), `n` slots (1 on one slot, 4 on the 4-slot shape: the 64-row
+  bucket over 16-row slots), each slot's text less 7 x i tokens prefilled through the served target (session store
+  detached on rank 0), its greedy continuation decoded 1 row at a time, prefilled again; then G15's method (rows 1-4
+  cycled after 3 warm cycles, median of 5; rows 5-8 3 + 5; rows 9-16 1 + 5; the 4 + 4 window and the 24/32/48/64
+  buckets 1 + 3; rows 1-4 rechecked, the lower kept; the DSpark pass 1 + 3). Timed windows are dropped after their end
+  mark (op_rows_drop / op 20), so every run sees the same slot state. The knobs TF_DSV41_CALIB_SHAPE / _REPS / _WARM /
+  _STAT / _RECHECK / _CYCLE / _DEEP_REPS read as Python's.
+- Both ranks: the followers replay every operation; op 64 (`calibMark`) syncs every rank's device and reads its clock
+  around each run, op 65 all-gathers the samples; rank 0 takes each entry's slower rank (Python's gather_max).
+- Stored as `calib-zig-<shape hash>.json` (`"engine": "zig"`) in TF_DSV41_CALIB_DIR; `TF_DSV41_CALIB=zig` reads the
+  newest Zig entry for the shape and measures when there is none. `cached` / `real` never pick a Zig entry.
+- Boot line (rank 0): `dsv41 calibration (zig): draft X ms, slot Y ms, verify 1/2/4/6/8/16/24/32/48/64 rows ... ms,
+  measured in S s (stored ...)`, after a `dsv41 calib method (zig)` line.
+
+Gates (host): `test-dsv41-draft` replays `draft/fixtures/calib-measure-golden.json` (`draft/tools/
+calib_measure_golden.py` on prod 8474f31: `calib.measure` over a fake forward on two ranks, 5 shapes / methods): the
+same runs in the same order on the same slots, each rank's gathered ints and the table bit for bit; and method /
+statistic / table_of raw + fit / extend / split / wide_buckets / fallback_ids / TEXT. `calib_env_test.zig`: measure /
+zig modes, the stored file read back by `zig` only.
+
+Spark step (not run): boot the all-on set with `TF_DSV41_CALIB=measure` (and a writable TF_DSV41_CALIB_DIR). Check:
+the two calibration lines on rank 0 (no `calibration: ... marks` error on rank 1); a 24-row entry below Python's
+(c13: ~110-112 ms at 4 slots); boot time added (Python's measurement took ~16 s); `calib-zig-*.json` in the dir; T0
+replies unchanged (hashes); then a 1-rep bench against c13 (prose / code x4 and x1). A second boot with
+`TF_DSV41_CALIB=zig` must read the stored file (log `dsv41 draft costs: cached .../calib-zig-...json`).

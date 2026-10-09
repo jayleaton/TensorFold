@@ -406,6 +406,16 @@ pub const Batch = struct {
         if (n > 0) g.warm(items[0..n]);
     }
 
+    /// The slot's pending window dropped on every rank without a row committed (op_rows_drop; TF_DSV41_CALIB=measure's
+    /// timed windows, calib_gpu.zig): the slot stays at its position, the next window rewrites the dropped rows'
+    /// positions before any read (as a rejected draft's).
+    pub fn drop(b: *Batch, slot: u32) !void {
+        if (slot >= b.ss.n) return error.Slots;
+        if (b.pend[slot] == null) return;
+        if (b.ss.leads()) try b.f.link.?.send(&.{ slots_mod.op_rows_drop, slot });
+        b.dropPending(slot);
+    }
+
     fn dropPending(b: *Batch, slot: u32) void {
         b.pend[slot] = null;
         b.ss.state(slot).pending = null;
