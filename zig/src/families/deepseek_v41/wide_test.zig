@@ -259,3 +259,37 @@ test "wide rows: a 4-slot DSpark pass (20 rows) as Python's drafter at pad_slots
     try testing.expectEqual(sites.items.len, k);
     try testing.expectEqual(cfg.mtp_layers, try expectRouters(cs));
 }
+
+test "KV norm/store removes only R1 SWA producers and row mode binds slot writes" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const w = try widths(a);
+    const cfg: Config = .{};
+    var backbone: [40]u32 = undefined;
+    for (&backbone, 0..) |*l, i| l.* = @intCast(i);
+    const off = prodOptions(1 << 20);
+    var on = off;
+    on.kv_norm_store = true;
+    for ([_]i64{ 1, 2, 16, 17, 24, 64 }) |n| {
+        const plain = try block.emit(a, &cfg, &w, off, &backbone, n, 4080, true);
+        const fused = try block.emit(a, &cfg, &w, on, &backbone, n, 4080, true);
+        try @import("kv_glue_emit_test.zig").compare(plain, fused, cfg.layers);
+        const transformed = try rowmode.transform(a, fused, @intCast(n), .{ .slots = 4, .rmax = 64, .pts = on.pool.?.pts });
+        var count: usize = 0;
+        for (transformed) |c| if (std.mem.eql(u8, c.name, "tf_dsv41_kv_glue_v1.norm_store")) {
+            try testing.expect(c.args[14].arg.b);
+            try testing.expectEqual(@as(i64, n), c.args[5].arg.t.shape[0]);
+            try testing.expectEqual(@as(i64, @intCast(@import("rowtab.zig").colOffset(.pos, 64))), c.args[5].arg.t.offset);
+            try testing.expectEqual(@as(i64, @intCast(@import("rowtab.zig").colOffset(.wslot, 64))), c.args[6].arg.t.offset);
+            try testing.expectEqual(@as(i64, 4 * 2 * cfg.window), c.args[3].arg.t.shape[0]);
+            count += 1;
+        };
+        try testing.expectEqual(@as(usize, cfg.layers), count);
+    }
+    var legacy = off;
+    legacy.r1 = false;
+    var legacy_on = legacy;
+    legacy_on.kv_norm_store = true;
+    try testing.expectEqualDeep(try block.emit(a, &cfg, &w, legacy, &backbone, 1, 4080, true), try block.emit(a, &cfg, &w, legacy_on, &backbone, 1, 4080, true));
+}

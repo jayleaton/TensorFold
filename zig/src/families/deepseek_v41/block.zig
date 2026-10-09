@@ -82,6 +82,8 @@ pub const Options = struct {
     r1: bool = false,
     /// TF_DSV41_ROUTER_GROUP_ROT: wide grouping and expert input rotation in one launch (default off).
     router_group_rot: bool = false,
+    /// KV-only RMS feeding SWA store; separately gated, default off.
+    kv_norm_store: bool = false,
     /// R1 off, but the bindings of a twin that always takes R1's trailing arguments (the midprofile twin, dba6a1f+):
     /// each call R1 extends gets them at their off values (mHC spin -1 / defer 0, the attention's split 0 / rope 0, the
     /// route's empty prune list, `_prune`'s KIT false). The same launches; the check reads it from a capture's calls
@@ -670,10 +672,28 @@ pub const Emitter = struct {
         });
     }
 
+    /// Only the 512-wide KV producer belongs to this fusion; other RMS norms keep their calls.
+    pub fn kvNormStoreOn(e: *const Emitter) bool {
+        return e.o.kv_norm_store and e.cfg.head_dim == 512 and e.n >= 1 and e.n <= 64;
+    }
+
+    pub fn normStore(e: *Emitter, x: Arg, w: Arg, v: Arg, s: Arg, p: Arg, sl: Arg, ring: i64, rows: bool) !void {
+        try e.ext("tf_dsv41_kv_glue_v1.norm_store", &.{
+            x, w, try e.ropeTable(), v, s, p, sl,
+            .{ .i = 512 }, .{ .i = 64 }, .{ .i = 576 }, .{ .i = 8 },
+            .{ .f = 1.0 / 512.0 }, .{ .f = dec(e.cfg.eps) }, .{ .i = ring }, .{ .b = rows },
+        });
+    }
+
     /// The SWA store of the window's kv rows (R1: kv_norm runs here, RMS_FOLD's `Normed.tensor()`).
     fn swaStore(e: *Emitter, L: u32, kv: Arg, kvn: Arg) !void {
-        if (e.o.r1) try e.rms(kv, try e.weight("L{d}.attn.kv_norm", .{L}, .f32, &.{e.cfg.head_dim}), kvn, e.cfg.head_dim);
-        try e.kvStore(kvn, L, 0);
+        if (e.o.r1 and e.kvNormStoreOn()) {
+            const rows = try e.pool(L, 0);
+            try e.normStore(kv, try e.weight("L{d}.attn.kv_norm", .{L}, .f32, &.{e.cfg.head_dim}), rows[0], rows[1], try e.pos(), .none, 2 * @as(i64, e.cfg.window), false);
+        } else {
+            if (e.o.r1) try e.rms(kv, try e.weight("L{d}.attn.kv_norm", .{L}, .f32, &.{e.cfg.head_dim}), kvn, e.cfg.head_dim);
+            try e.kvStore(kvn, L, 0);
+        }
     }
 
     /// branches.plan's marks: `fork` (the next calls on the side stream, after everything main issued), `onMain`,

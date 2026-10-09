@@ -18,7 +18,7 @@ are steady averages, not identically paired rounds.
 | Rank | Opportunity | Zig launches/round | GPU ms/round | GPU us/launch | Decision |
 | --- | --- | ---: | ---: | ---: | --- |
 | 1 | Wide expert grouping + input rotation | 29.667 pairs | 1.207 + 0.521 = 1.729 | group 40.696; rotation 17.571 | Implemented |
-| 2 | KV-store producer fusion | 59.125 | 0.396 | 6.706 | Requires an exact producer design; SWA producer is RMS-norm owned by glue-mhc |
+| 2 | KV-store producer fusion | 59.125 | 0.396 | 6.706 | SWA producer fusion implemented separately; see [KV glue](DSV41-ZIG-KV-GLUE.md) |
 | 3 | Index query RoPE into its consumer | 11.167 | 0.052 | 4.644 | Small ceiling; needs the Triton score loader's bf16 rounding preserved |
 | 4 | Carry producer integration | 12 | 0.030 | 2.479 | Small ceiling |
 | 5 | Row statics/acceptance and gather staging | 1 stage + 1 accept + 2 gather | 0.016 | 4.991 / 2.796 / 4.096 | Small ceiling; dependencies prevent treating them as one operation |

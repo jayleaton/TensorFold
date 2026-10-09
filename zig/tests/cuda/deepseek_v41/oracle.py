@@ -512,6 +512,33 @@ def mhcdec_case(out: Path, g, *, R: int, mode: str, tap: bool = False, in_place:
 
 mhc_mode = {"boundary": 0, "site1": 1, "site2": 2}
 
+def kv_norm_store_case(out: Path, rows: bool) -> dict:
+    from tensorfold.families.deepseek_v41.cuda import rmsnorm
+    from tensorfold.families.deepseek_v41.cuda.csa2 import compress
+    g = torch.Generator().manual_seed(4143)
+    n, ring = 24, 256
+    x = torch.randn(n, 512, generator=g).to(torch.bfloat16).to(DEV)
+    x[0].zero_()
+    w = (torch.randn(512, generator=g) * 0.3 + 1).to(DEV)
+    angles = torch.randn(1024, 32, generator=g).to(DEV)
+    cs = torch.cat((angles.cos(), angles.sin()), dim=1).contiguous()
+    pos = ((torch.arange(n, device=DEV) * 7 + 251).to(torch.int64) if rows
+           else torch.tensor([251], dtype=torch.int32, device=DEV))
+    sl = (torch.arange(n, device=DEV) % 3).to(torch.int64)
+    sl[::5] = -1
+    v = torch.full((3 * ring + 1, 576), 0xa5, dtype=torch.uint8, device=DEV)
+    scales = torch.full((3 * ring + 1, 8), 0xa5, dtype=torch.uint8, device=DEV)
+    norm = torch.empty_like(x)
+    rmsnorm._rms[(n,)](x, 512, w, norm, 512, 512, 1.0 / 512.0, 1e-20,
+                       BK=512, HAS_W=True, NARROW=True, PDL=False, num_warps=4, **rmsnorm.LAUNCH)
+    compress._kv_store[(n,)](norm, 512, cs, 64, v, scales, 576, 8, pos,
+                            RATIO=0, RING=ring, PT=None, PSH=0, SL=sl if rows else None,
+                            PTS=0, ROWS=rows, PDL=False, num_warps=4)
+    torch.cuda.synchronize()
+    save(out, {"kind": "kvglue", "n": n, "ring": ring, "rows": int(rows), "eps": 1e-20},
+         {"x": x, "w": w, "cs": cs, "pos": pos, "sl": sl, "norm": norm, "v": v, "s": scales})
+    return {"rows": n, "row_mode": rows}
+
 
 def want(name: str) -> bool:
     """TF_DSV41_ORACLE_ONLY: a regex of the case names to write (unset: every case)."""
@@ -522,7 +549,12 @@ def want(name: str) -> bool:
 def main() -> None:
     out = Path(sys.argv[1]) / "fixtures"
     g = torch.Generator().manual_seed(4141)
+    # Independent generators leave every existing fixture's random sequence unchanged.
     report = {}
+    for rows in (False, True):
+        name = "kv_norm_store_rows" if rows else "kv_norm_store_scalar"
+        if want(name):
+            report[name] = kv_norm_store_case(out / name, rows)
     D, I, E = 1024, 512, 13
     # decode / verify (x3ld): routed 2-3.5 bits + a 6-bit shared expert (E1 (2, 12)), 5-bit shared (2, 10), DSpark (8, 8)
     mixed_g = [4, 5, 6, 7, 4, 5, 6, 7, 4, 6, 5, 7, 12]

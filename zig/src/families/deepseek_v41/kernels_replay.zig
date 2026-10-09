@@ -160,6 +160,21 @@ fn is(a: []const u8, b: []const u8) bool {
 /// One captured extension call re-issued on `s`; false when there is no binding for it (reported as skipped).
 pub fn call(k: *const Kernels, s: cuda.Stream, ext: []const u8, func: []const u8, args: []const Arg, kwargs: []const Kw, scratch: *Scratch) !bool {
     _ = scratch;
+    if (is(ext, "tf_dsv41_kv_glue_v1") and is(func, "norm_store")) {
+        const c: Call = .{ .args = args, .kwargs = kwargs, .names = &.{ "x", "w", "cs", "v", "s", "pos", "sl", "x_stride", "cs_stride", "v_stride", "s_stride", "inv_k", "eps", "ring", "rows" } };
+        const x = try c.tensor(0);
+        const rows = try c.boolean(14, false);
+        if (x.dtype != .bf16 or try dim(x, 1) != 512 or (try c.tensor(1)).dtype != .f32 or
+            (try c.tensor(2)).dtype != .f32 or (try c.tensor(5)).dtype != (if (rows) DType.i64 else DType.i32) or
+            (rows and (try c.tensor(6)).dtype != .i64)) return error.WrongArgument;
+        try k.kvStore(s).normStore(.{
+            .x = x.ptr, .w = try c.ptr(1), .cs = try c.ptr(2), .v = try c.ptr(3), .s = try c.ptr(4),
+            .pos = try c.ptr(5), .sl = try c.ptrOrNull(6), .x_stride = try c.int(7), .cs_stride = try c.int(8),
+            .v_stride = try c.int(9), .s_stride = try c.int(10), .inv_k = @floatCast(try c.float(11)),
+            .eps = @floatCast(try c.float(12)), .ring = @intCast(try c.int(13)), .rows = @intFromBool(rows),
+        }, try dim(x, 0));
+        return true;
+    }
     if (is(ext, "tensorfold_exl3_linear_v4")) return linearExt(k.linears(s), func, args, kwargs);
     if (is(ext, "tf_dsv41_x3seg_v3")) return segExt(k.linears(s), func, args, kwargs, false);
     if (is(ext, "tf_dsv41_dense3_v1")) return segExt(k.linears(s), func, args, kwargs, true);
