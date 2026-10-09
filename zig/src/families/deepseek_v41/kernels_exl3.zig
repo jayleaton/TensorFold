@@ -47,6 +47,15 @@ pub fn ldSymbol(comptime nt: u32, comptime pd: u32, comptime lo: u32, comptime h
     return std.fmt.comptimePrint("_ZN10dsv41_x3ld9ld_kernelILi2ELi{d}ELi{d}ELi{d}ELi{d}ELi{d}EEEv" ++ tail16, .{ nt, pd, lo, hi, probe });
 }
 
+/// TF_DSV41_X3LD_EPI (x3ld_epi.cu, ours): x3ld (nt 8) with the gate/up epilogue (`gu`) or down_combine (`dn`: fp32
+/// out, `dnb`: bf16 out) in its tail; pd 1 / 2 and the (lo, hi) ranges as x3ld's.
+pub const EpiKind = enum { gu, dn, dnb };
+pub const epi_pds = [_]u32{ 1, 2 };
+
+pub fn epiSymbol(comptime kind: EpiKind, comptime pd: u32, comptime lo: u32, comptime hi: u32) [:0]const u8 {
+    return std.fmt.comptimePrint("dsv41_x3ld_epi_{s}_{d}_{d}_{d}", .{ @tagName(kind), pd, lo, hi });
+}
+
 pub fn pfSymbol(comptime nt: u32, comptime mtl: u32, comptime lo: u32, comptime hi: u32) [:0]const u8 {
     return std.fmt.comptimePrint("_ZN10dsv41_x3pf9pf_kernelILi2ELi{d}ELi{d}ELi{d}ELi{d}EEEv" ++ tail16, .{ nt, mtl, lo, hi });
 }
@@ -320,9 +329,10 @@ pub const Functions = struct {
     gm2_gu: [2][v2_gu.len]Gm, // [xm - 1][cfg]
     gm2_dn: Gm,
     gm3: [v3_variants.len]Gm,
+    epi: [3][epi_pds.len][ranges.len]cuda.Function, // [EpiKind][pd - 1][range]
 
     /// Resolves every instance (a wrong name fails here, not on a rare path) and opts x3gm into its shared memory.
-    pub fn resolve(experts: cuda.Module, x3ld: cuda.Module, x3pf: cuda.Module, x3gm: cuda.Module, x3gm_plan: cuda.Module, x3gm3: cuda.Module, router_glue: cuda.Module, optin: u32) !Functions {
+    pub fn resolve(experts: cuda.Module, x3ld: cuda.Module, x3pf: cuda.Module, x3gm: cuda.Module, x3gm_plan: cuda.Module, x3gm3: cuda.Module, router_glue: cuda.Module, x3ld_epi: cuda.Module, optin: u32) !Functions {
         var f: Functions = undefined;
         inline for (ld_cfgs, 0..) |c, ci| inline for (ranges, 0..) |r, ri| {
             f.ld[0][ci][ri] = try x3ld.function(ldSymbol(c[0], c[1], r[0], r[1], 0));
@@ -330,6 +340,9 @@ pub const Functions = struct {
         };
         inline for (pf_cfgs, 0..) |c, ci| inline for (ranges, 0..) |r, ri| {
             f.pf[ci][ri] = try x3pf.function(pfSymbol(c[0], c[1], r[0], r[1]));
+        };
+        inline for (.{ EpiKind.gu, EpiKind.dn, EpiKind.dnb }, 0..) |kind, ki| inline for (epi_pds, 0..) |pd, pi| inline for (ranges, 0..) |r, ri| {
+            f.epi[ki][pi][ri] = try x3ld_epi.function(epiSymbol(kind, pd, r[0], r[1]));
         };
         inline for (grouped_cfgs, 0..) |c, ci| inline for (upstream_ranges, 0..) |r, ri| {
             f.grouped[ci][ri] = try experts.function(groupedSymbol(c[0], c[1], c[2], r[0], r[1]));
@@ -453,6 +466,45 @@ pub fn gmCheck(kind: GmKind, cfg: usize, K: usize, N: usize) Error!void {
     if ((K / 16) % ks != 0 or N % 128 != 0) return error.Shape;
 }
 
+/// x3ld_epi.cu's Epi (by value): the epilogue's operands, 0 where a kind does not use one.
+pub const Epi = extern struct {
+    pick: u64 = 0,
+    sv0: u64 = 0, // gate/up: svh_g; down: svh_d
+    sv1: u64 = 0, // gate/up: svh_u
+    sd: u64 = 0, // gate/up: suh_d
+    xd: u64 = 0, // gate/up: Xd
+    y: u64 = 0, // down: y
+    wts: u64 = 0, // down: the combine's weights
+    out: u64 = 0, // down: L.moe (fp32 or bf16)
+    ticket: u64 = 0, // int32, zero between launches
+    E: c_int = 0,
+    limit: f32 = 0,
+    act_mode: c_int = 0,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(Epi) == 88 and @offsetOf(Epi, "E") == 72);
+}
+
+/// The ticket words a fused launch counts on: gate/up one an (expert, member tile, 128-column block), down one a
+/// (row, 128-column block); the role holds the larger.
+pub fn epiTicketWords(g: Grouped, kind: EpiKind) usize {
+    return if (kind == .gu) g.nexp * ((g.maxm + 15) / 16) * (g.N / 128) else (g.P / g.slots) * (g.N / 128);
+}
+
+/// TF_DSV41_X3LD_EPI's checks: x3ld's at nt 8 and pd 1 / 2, plus the fused tails' shapes (gate/up: two matrices;
+/// down: one matrix, one split, so a CTA holds the whole Z of its block).
+pub fn x3ldEpiCheck(g: Grouped, kind: EpiKind, pd: u32) Error!struct { pd: usize, range: usize } {
+    const c = try x3ldCheck(g, 8, pd, 0);
+    const pi = std.mem.indexOfScalar(u32, &epi_pds, pd) orelse return error.Unsupported;
+    if (g.N % 128 != 0 or g.slots == 0 or g.slots > 32 or g.P % g.slots != 0) return error.Shape;
+    switch (kind) {
+        .gu => if (g.mats != 2) return error.Shape,
+        .dn, .dnb => if (g.mats != 1 or g.SK != 1) return error.Shape,
+    }
+    return .{ .pd = pi, .range = c.range };
+}
+
 pub const Ops = struct {
     f: *const Functions,
     s: cuda.Stream,
@@ -465,6 +517,18 @@ pub const Ops = struct {
         var a: cuda.Args = .{};
         g.add(&a);
         try go(o.f.ld[if (probe == 3) 1 else 0][c.cfg][c.range].?, o.s, .{ g.nexp, g.N / (16 * nt), g.mats * g.SK * mt }, 128, 0, pdl, &a);
+    }
+
+    /// TF_DSV41_X3LD_EPI: x3ld (nt 8) with the epilogue in its tail: `gu` Z and Xd (x3ld + gateup_epilogue), `dn` /
+    /// `dnb` y and out (x3ld + down_combine; Z not stored). x3ld's grid; the ticket words zero before and after.
+    pub fn x3ldEpi(o: Ops, g: Grouped, kind: EpiKind, pd: u32, epi: Epi) !void {
+        const c = try x3ldEpiCheck(g, kind, pd);
+        if (epi.ticket == 0 or epi.pick == 0) return error.Shape;
+        const mt = (g.maxm + 15) / 16;
+        var a: cuda.Args = .{};
+        g.add(&a);
+        a.add(epi);
+        try go(o.f.epi[@intFromEnum(kind)][c.pd][c.range], o.s, .{ g.nexp, g.N / 128, g.mats * g.SK * mt }, 128, 0, false, &a);
     }
 
     /// x3pf (expert_prefill.grouped): the same Z, MTL member tiles a program.
@@ -758,4 +822,19 @@ test "x3gm shapes, fits and tuning as x3gm.py" {
     try std.testing.expectEqual([2]usize{ 3, 2 }, gmTuned(&tune_default, null, null, 4096, 6, 384, true, 6, 6));
     try std.testing.expectEqual([2]usize{ 2, 2 }, gmTuned(&tune_default, null, null, 4096, 6, 384, false, 6, 6));
     try std.testing.expectEqual([2]usize{ 5, 4 }, gmTuned(&tune_default, 5, 4, 4096, 6, 384, false, 6, 6));
+}
+
+test "x3ld_epi checks" {
+    const g: Grouped = .{ .x0 = 0, .x1 = 0, .tp0 = 0, .tp1 = 0, .k2_0 = 0, .k2_1 = 0, .uids = 0, .ucount = 0, .members = 0, .z = 0, .mats = 2, .K = 5120, .N = 1152, .P = 28, .SK = 4, .slots = 7, .maxm = 4, .nexp = 28, .lo = 4, .hi = 10 };
+    _ = try x3ldEpiCheck(g, .gu, 1);
+    try std.testing.expectError(error.Shape, x3ldEpiCheck(g, .dn, 1));
+    var d = g;
+    d.mats = 1;
+    d.K = 1152;
+    d.N = 5120;
+    d.SK = 1;
+    _ = try x3ldEpiCheck(d, .dnb, 1);
+    try std.testing.expectEqual(@as(usize, 4 * 40), epiTicketWords(d, .dn));
+    try std.testing.expectEqual(@as(usize, 28 * 1 * 9), epiTicketWords(g, .gu));
+    try std.testing.expectEqualStrings("dsv41_x3ld_epi_dnb_2_2_10", epiSymbol(.dnb, 2, 2, 10));
 }

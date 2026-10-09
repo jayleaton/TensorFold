@@ -28,6 +28,7 @@ test {
     _ = @import("coef_late_test.zig");
     _ = @import("ibound_test.zig");
     _ = @import("dev_arena_test.zig");
+    _ = @import("x3ld_epi_test.zig");
 }
 
 fn widths(a: std.mem.Allocator) !block.Widths {

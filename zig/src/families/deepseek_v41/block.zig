@@ -106,6 +106,11 @@ pub const Options = struct {
     r1: bool = false,
     /// TF_DSV41_ROUTER_GROUP_ROT: wide grouping and expert input rotation in one launch (default off).
     router_group_rot: bool = false,
+    /// TF_DSV41_X3LD_EPI (ours, prod_knobs.zig; default off): the decode MoE's x3ld + gateup_epilogue and x3ld +
+    /// down_combine as two fused launches (x3ld_epi.cu: the epilogue in the streamer's tail behind a last-arrival
+    /// ticket, the same arithmetic in the same order, so the same Xd / y / L.moe bits); ticket words "s.ex.epi" /
+    /// "s.dx.epi" (zero between launches)
+    x3ld_epi: bool = false,
     /// KV-only RMS feeding SWA store; separately gated, default off.
     kv_norm_store: bool = false,
     /// R1 off, but the bindings of a twin that always takes R1's trailing arguments (the midprofile twin, dba6a1f+):

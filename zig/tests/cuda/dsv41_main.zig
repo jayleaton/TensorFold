@@ -16,6 +16,7 @@ const replay_case = @import("deepseek_v41/replay.zig");
 const x3gm3_bench = @import("deepseek_v41/x3gm3_bench.zig");
 const stream_rb_bench = @import("deepseek_v41/stream_rb_bench.zig");
 const scores_b_bench = @import("deepseek_v41/scores_b_bench.zig");
+const x3ld_epi_bench = @import("deepseek_v41/x3ld_epi_bench.zig");
 
 const usage =
     \\usage: tf-dsv41-test <command> [fixture dir]
@@ -25,6 +26,7 @@ const usage =
     \\  experts <dir>      decode chain: group, rot_in, x3ld (every setting) / upstream grouped / x3pf, epilogues, combine
     \\  x3gm <dir>         fast prefill: rot, gate/up and down at every configuration (uniform and ragged), combine
     \\  x3gm3-bench [rows,..] [reps]  x3gm v3 against v2 at prod's prefill shapes: bits and time (synthetic data)
+    \\  x3ld-epi [rows,..] [reps]  TF_DSV41_X3LD_EPI: fused x3ld + epilogues against prod's four launches (bits, time)
     \\  mhc-alloc [windows]  the 16-row mHC boundary's time with buffers per cuMemAlloc / arena / VMM (TF_DSV41_ARENA)
     \\  mhc-probe [windows]  the 16-row mHC boundary under cache states, buffer layouts and a cross-stream dependency
     \\  stream-rb <aot dir> [--reps N]  _stream_rb2 / _rb4 against _stream (Triton AOT set): bits and time (synthetic)
@@ -77,6 +79,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "mhc-probe")) return mhc_probe.run(gpu, &k, if (rest.len > 0) rest[0] else null);
     if (std.mem.eql(u8, cmd, "mhc-alloc")) return mhc_alloc.run(gpu, &k, if (rest.len > 0) rest[0] else null);
     if (std.mem.eql(u8, cmd, "x3gm3-bench")) return x3gm3_bench.run(gpu, &k, if (rest.len > 0) rest[0] else null, if (rest.len > 1) rest[1] else null);
+    if (std.mem.eql(u8, cmd, "x3ld-epi")) return x3ld_epi_bench.run(gpu, &k, if (rest.len > 0) rest[0] else null, if (rest.len > 1) rest[1] else null);
     if (std.mem.eql(u8, cmd, "replay")) {
         if (try replay_case.run(gpu, &k, try arg(rest, 0)) == .skipped) std.debug.print("SKIP no binding\n", .{});
         return;

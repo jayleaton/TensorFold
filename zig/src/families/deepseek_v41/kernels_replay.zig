@@ -181,6 +181,7 @@ pub fn call(k: *const Kernels, s: cuda.Stream, ext: []const u8, func: []const u8
     if (is(ext, "tensorfold_exl3_experts_v1")) return expertsExt(k.experts(s), func, args, kwargs);
     if (is(ext, "tf_dsv41_x3ld_v1") or is(ext, "tf_dsv41_x3pf_v1")) return groupedExt(k.experts(s), ext, func, args, kwargs);
     if (is(ext, "tf_dsv41_x3gm_v1")) return x3gmExt(k.experts(s), func, args, kwargs);
+    if (is(ext, "tf_dsv41_x3ld_epi_v1")) return x3ldEpiExt(k.experts(s), func, args, kwargs);
     if (is(ext, "tf_dsv41_attn_cuda_v1")) return attnExt(k.others(s), func, args, kwargs);
     if (is(ext, "tf_dsv41_mhc_cuda_v1") and is(func, "run")) return mhcRun(k.others(s), args, kwargs);
     if (is(ext, "tf_dsv41_mhc_cuda_v1") and is(func, "coef")) return mhcCoef(k.others(s), args, kwargs);
@@ -424,6 +425,34 @@ fn groupedExt(o: exl3.Ops, ext: []const u8, func: []const u8, args: []const Arg,
     if (try c.int(16) != 2) return error.Unsupported;
     try o.x3pf(try groupedArgs(c, 19), try c.u(17), try c.u(18));
     return true;
+}
+
+// tf_dsv41_x3ld_epi_v1 (ours, TF_DSV41_X3LD_EPI; no Python twin): x3ld.grouped's arguments up to its hi (cb, nt, pd,
+// lo, hi; no probe or PDL), then the epilogue's: gateup (gateup_epilogue's pick, svh_g, svh_u, suh_d, xd, E, limit,
+// act_mode) and down (down_combine's pick, svh_d, y, wts, out, E), each followed by the ticket words.
+fn x3ldEpiExt(o: exl3.Ops, func: []const u8, args: []const Arg, kwargs: []const Kw) !bool {
+    const base = grouped_names ++ [_][]const u8{ "nt", "pd", "lo", "hi", "pick" };
+    if (is(func, "gateup")) {
+        const c: Call = .{ .args = args, .kwargs = kwargs, .names = &(base ++ [_][]const u8{ "svh_g", "svh_u", "suh_d", "xd", "E", "limit", "act_mode", "ticket" }) };
+        if (try c.int(16) != 2 or try c.int(17) != 8) return error.Unsupported;
+        try o.x3ldEpi(try groupedArgs(c, 19), .gu, try c.u(18), .{
+            .pick = try c.ptr(21), .sv0 = try c.ptr(22), .sv1 = try c.ptr(23), .sd = try c.ptr(24), .xd = try c.ptr(25),
+            .E = @intCast(try c.int(26)), .limit = @floatCast(try c.float(27)), .act_mode = @intCast(try c.int(28)), .ticket = try c.ptr(29),
+        });
+        return true;
+    }
+    if (is(func, "down")) {
+        const c: Call = .{ .args = args, .kwargs = kwargs, .names = &(base ++ [_][]const u8{ "svh_d", "y", "wts", "out", "E", "ticket" }) };
+        if (try c.int(16) != 2 or try c.int(17) != 8) return error.Unsupported;
+        const out = try c.tensor(25);
+        if (out.dtype != .f32 and out.dtype != .bf16) return error.WrongArgument;
+        try o.x3ldEpi(try groupedArgs(c, 19), if (out.dtype == .bf16) .dnb else .dn, try c.u(18), .{
+            .pick = try c.ptr(21), .sv0 = try c.ptr(22), .y = try c.ptr(23), .wts = try c.ptr(24), .out = out.ptr,
+            .E = @intCast(try c.int(26)), .ticket = try c.ptr(27),
+        });
+        return true;
+    }
+    return false;
 }
 
 // tf_dsv41_x3gm_v1 (x3gm.cpp)
