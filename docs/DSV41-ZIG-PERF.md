@@ -534,3 +534,143 @@ the same share (twice the bytes behind twice the work).
 | P4-1 | `scripts/v2-rollback.sh <allon1's overrides> TF_DSV41_PF_4K=1 TF_DSV41_PF_4K_MEMORY_OK=1 TF_DSV41_PREFILL_CHUNK=4096 TF_DSV41_PREFILL_ROWS=4096 TF_DSV41_PF_OVERLAP=4`, then `bench_http.py --long 32768,131072` and the 8 cells, `--compare` with `zig-allon/bench-allon1` | boot log `prefill rows 4096 (4K: one x3gm block a segment)` and `prefill overlap: ... 4 row pieces`; no `MissingTritonVariant`; **long replies == Python's** (sha 30710c1d388d4cd7 / c5c36138ceaea475) and T0 20/20; 32K >= 2,750, 131K >= 2,550 prompt tok/s; worker MemAvailable minimum above the floor |
 | P4-1b (only on a failure) | the same with `TF_DSV41_PF_OVERLAP=0` (4K alone), then with 4K off and `TF_DSV41_PF_OVERLAP=4` alone (prod's 2K rows) | names the failing lever |
 | P4-2 (optional) | one 32K prefill under the levers with `TF_DSV41_PROFILE=1` (or nsys) | replaces 10.1's model with a measured budget, and sizes lever 5 |
+
+### 10.6 P4 on the Sparks (2026-10-09) and what changed
+
+**4K without the drafter overlap (P4b): exact, prompt +7 %, decode -7..-14 %.** Code x4 lost 921 ms with the same
+rounds, tokens and prefill. The time went to the window phase outside its launch: 0.52 ms a round in allon2b and
+0.30 with the drafter overlap off (the one-pass base), but **11.67 ms in P4b**, while the launch itself got faster.
+That is the row graphs losing their room: the cache captures only while MemAvailable >= TF_DSV41_GRAPH_FLOOR_GIB (5).
+The crash run logged 8 keys held, 4 evicted and 1 eager, where every base run shows 0 / 0. The cause was 4K's
+resident bytes. In the forward's buffer plan, 4,096-row segments grew the window / layer arena (which decode shares)
+from 1,175 to 1,966 MiB and the prefill scratch from 356 to 649 MiB: **+1.1 GiB a rank, all the time**.
+
+**Fix: the 4K workspace (forward_prefill.K4).**
+- Under TF_DSV41_PF_4K the forward's options, buffer plan and arena are the 2K ones, byte for byte (prod_knobs.apply
+  no longer touches them).
+- A 4,096-row segment runs its program in its own namespace (block_prefill.ownCalls, "k4~"). Its roles are sized by
+  its own plan at boot, allocated (zeroed) at a prompt's first 4K segment and freed at the prompt's CED finish. The
+  slot's state and the constant tables are the forward's.
+- Its send and gathered buffers are the workspace's while it runs (swapped), so the buffers decode graphs hold
+  addresses of are never regrown.
+- Host gate (pf4k_test.zig): every role the 4K program names outside its namespace is in the 2K plan, at no more than
+  the 2K plan's size, and none of them is a scratch role. 4K adds no byte to the forward's plan; its workspace is
+  > 1 GiB, held only while a long prompt prefills.
+
+**The 4K + drafter overlap crash.** `cuEventRecordWithFlags: CUDA_ERROR_ILLEGAL_STATE` on both ranks was the drafter's
+taps mark recorded with CU_EVENT_RECORD_EXTERNAL in an eager row window. That flag is valid only inside a capture.
+4K produced the first eager window (no graph room). Fixed on dsv41-zig-draftovl 150f0c9f: an external node in a
+capture, a plain record otherwise. Any eager window with TF_DSV41_DRAFT_OVERLAP=1 would have crashed the same way.
+
+**Why TF_DSV41_PF_OVERLAP=4 lost 1.6-3.3 %.** The pieces cut the producers into 512-row GEMMs:
+- wo_a's group GEMM at 512 x 1,024 is 32 tiles on 48 SMs, under one wave;
+- the shared expert's w1 / w3 are 36 tiles;
+- wo_b's is 3.3 waves against 13.3.
+
+That is four times the launches (~32 GEMMs + 32 rot_in a layer instead of 8 + 8). The NCCL pieces still move the same
+bytes at link speed, and their kernels hold SMs beside the shortened GEMMs. Net: ~+45 ms a segment of fragmentation
+against ~20 ms hidden. k = 2 halves the fragmentation, but wo_a is still 1.3 waves. The structural fix is TBO (section
+11): the other micro-batch's whole GEMMs run while one's exchange is in flight, nothing split. PF_OVERLAP stays off
+(and is off under TBO).
+
+**Prompt speed under 4K (+7 % against a modelled +14-16 %).** One 4,096-row x3gm block has never been timed on the
+GB10; the model extrapolated from the 512 / 2,048-row points. proto/tbo_bench.cu times x3gm alone at 2,048 and
+4,096 rows (its first table rows), which says how much of the model's per-row gain the GB10 gives. If one 4K block is
+only ~15 % a row cheaper, ~2,700 / ~2,485 is 4K's ceiling. The next gains inside 4K are then the 128-member v2 tiles
+(one pass an expert at ~64 members) and TBO.
+
+## 11. Two-batch overlap: x3gm beside the dense GEMMs (TF_DSV41_PF_TBO, 2026-10-09, offline)
+
+### 11.1 Why
+
+Per 2,048-row micro-batch and layer (10.1), the two halves of a layer use different limits:
+- **the MoE part** is x3gm v2, ~19 ms at ~1.27x its DRAM floor. Its SM issue is ~9.5 ms;
+- **the attention part** is ~18.5 ms: the dense GEMMs (~9.5 ms, compute-bound), mHC sites (~3.5, DRAM), attention
+  (~2), exchanges (~2) and small glue.
+
+Run serially, the two parts add up to ~37.5 ms a layer for two micro-batches. If one micro-batch's MoE runs beside the
+other's attention, the pair's layer is bounded by the SM work of both (~22-25 ms) and DRAM (~17 ms) instead. That is
+**up to -25..-33 % a layer pair; expected +10-30 % prompt tok/s**, depending on how well the GB10 shares its SMs between
+a persistent x3gm grid and pfdense's waves. proto/tbo_bench.cu measures that split (11.4).
+
+### 11.2 The program (block_prefill.emitTbo)
+
+A prompt's CED encoder segments go two at a time (forward_prefill.pairOf: two whole segments, or what is left halved
+on the 16-row grid, each half at least 512 rows). The pair is one program on two streams:
+
+```
+main:  A.attn(L)        A.moe(L)          A.attn(L+1)        A.moe(L+1) ...
+side:        [fork] B.attn(L)    B.moe(L)    [fork] B.attn(L+1) ...
+```
+
+- A's calls are exactly `emitReplay(.encoder)` of rows [start, start + na); B's are those of [start + na, start + na +
+  nb), with B's scratch renamed (`tboRole`: "w." / "L." roles "w.b~" / "L.b~", scratch "s." roles "s.b~": x3gm's z / xg,
+  the dense workspace, the router's counters, the staging ring). So each row runs a consecutive segment's arithmetic,
+  which is segmentation-invariant (Python's 1K / 2K / 4K tests; the Zig 2K path relies on the same). **Bits: Python's.**
+- Every B attention part is forked behind A's (the side stream waits for everything the main stream issued). So B
+  reads the slot's state of layer L (SWA ring rows, the pool's compressed rows and index keys) only after A wrote it.
+- A hands its ratio-2 carry of each kv source to the slot at the end of that layer's attention (glue `copy_rows`:
+  the copy A's commit would make), before B's layer reads it.
+- The only state both streams touch at once is a kv source's compressed rows. A's later layers read them up to A's
+  positions while B's source layer appends past them. The boundary is even, so no ratio-2 pair straddles it.
+- A's CED stash is left out: B's, of at least 128 rows, overwrites all of it.
+- An Engram layer's A part joins B first when B ran an Engram step since the last join (the Engram glue's gathered
+  buffer and pinned stages are one set). That happens once a pair, at layer 14.
+- The program ends joined (glue `tbo_join`). The commit is the pair's: B's last rows' carries, then the Engram tail,
+  the position and the stash ids after both.
+- The glue runs each micro-batch's steps with its own host side: ids, window, Engram tail, MoE count and its own
+  long-prompt buffers (forward_prefill.glueFn's swap).
+- x3gm's persistent grid covers at most `TF_DSV41_PF_TBO_GM_SMS` SMs (default 32 of 48; 0: all). Its CTAs claim items
+  by ticket, so the grid changes no bit. The remaining SMs run the other micro-batch's attention.
+- The round planner's rows double (a piece is a pair), and the boot check prices a pair.
+
+Knobs:
+- `TF_DSV41_PF_TBO=1`: needs `TF_DSV41_BRANCHES=1` and replay. It turns `TF_DSV41_PF_OVERLAP` off, since B's work hides
+  A's exchanges.
+- `TF_DSV41_PF_TBO_GM_SMS=<8-48|0>`.
+- TBO and `TF_DSV41_PF_4K` are exclusive for now: with both on, a prompt runs 4K segments in the 4K workspace (10.6).
+  4K micro-batches (8,192-row pairs) would need B's namespace inside the workspace.
+
+Refused, so the segments run one at a time: split KV, images, an odd boundary, a half under 512 rows.
+
+### 11.3 Host gate (pftbo_test.zig in test-dsv41-knobs)
+
+- the readers and the pair split;
+- at (2,048 + 2,048 at 0), (1,504 + 1,505 at 6,144) and (512 + 512 at 40,000):
+  - the main stream's calls == A's encoder program, call for call and role for role, except its stash;
+  - the side's == B's renamed;
+  - one `copy_rows` a ratio-2 kv source, each right before the fork of B's same layer;
+  - one Engram join;
+  - the closing join;
+- `branches.shared` (roles both streams touch inside a fork region): constant tables and the kv sources' compressed rows
+  only. It found the compressed rows on its first run, which is what the even boundary is for;
+- refusals.
+
+### 11.4 The Spark micro-benchmark (proto/tbo_bench.cu)
+
+`zig/kernels/cuda/deepseek_v41/proto/tbo_bench.cu` (+ `tbo_bench.sh`, which builds and runs it in the Sparks' CUDA
+devel image) runs one layer's x3gm v2 (rotation, gateup2 GU1 with two inputs, down2 DN0; 384 experts top-6, K2 6) and
+the dense set of one layer (pfdense lanes at the Zig heuristic's configs: wq_a, wkv, wq_b, ix_wq_b, wo_a x 4, wo_b,
+the shared expert's w1 / w3 / w2) at 2,048 and 4,096 rows. Each is median of 5 after a warm-up, with L2 flushed by a
+64 MB memset. It times:
+- serial (one stream);
+- x3gm alone with its persistent grid capped at S x per_sm for S in 48 .. 24;
+- the dense set alone;
+- both at once (x3gm capped on the low-priority stream, the dense set on the high one);
+- with `--green`, CUDA green contexts (x3gm S SMs, dense the rest; host-timed against a host-timed serial).
+
+At every cap Y is compared on the device with the uncapped run: `x3gm bits: PASS (same at every cap)`. The output is a
+table a row and `BEST R=<rows>: x3gm <S> SMs, <mode>, <ms> vs serial <ms> (-x %)`. Its x3gm-alone rows at 2,048 and
+4,096 rows are also the first GB10 timing of one 4,096-row block (10.6).
+
+Run on dgx-01, about a minute and no model (check the test-window lease first):
+copy `zig/kernels/cuda/deepseek_v41/` there, then `proto/tbo_bench.sh --green`. Set
+`TF_DSV41_PF_TBO_GM_SMS` to BEST's S.
+
+### 11.5 Spark step (T1, after P4)
+
+| step | what | pass |
+| --- | --- | --- |
+| T1-0 | `tbo_bench.sh` on dgx-01 (1 min, no model): the best x3gm SM count S | `x3gm bits: PASS`; a split under serial |
+| T1-1 | allon2b's overrides + `TF_DSV41_PF_TBO=1 TF_DSV41_PF_TBO_GM_SMS=<S>` (4K off: pairs of 2 x 2,048), `bench_http.py --long 32768,131072` + the 8 cells | boot log `prefill tbo: ... at most S SMs`; long replies == Python's (sha 30710c1d388d4cd7 / c5c36138ceaea475), T0 20/20; prompt tok/s against P4-1; MemAvailable minimum (a pair holds two segments' activations) |
+| T1-1b (on a failure) | `TF_DSV41_PF_TBO_GM_SMS=0` (no cap), then TBO off | names the part |
