@@ -49,6 +49,8 @@ KNOBS=(); while read -r kv; do [[ "$kv" =~ ^TF_ ]] && KNOBS+=(-e "$kv"); done < 
 if [[ "${R1:-1}" == 1 ]]; then while read -r kv; do [[ "$kv" =~ ^TF_ ]] && KNOBS+=(-e "$kv"); done < "$KIT/tools/zig/dsv41_m1/r1c-knobs.env"; fi
 
 port=29811
+# PIECES_ONLY=1: only the PIECES=1 stage below (no seed's reference or decode gate)
+[[ "${PIECES_ONLY:-0}" == 1 ]] && SEEDS=""
 for seed in $SEEDS; do
     R=/out/seed$seed
     mkdir -p "$OUT/seed$seed"
@@ -113,5 +115,62 @@ for seed in $SEEDS; do
     fi
     port=$((port + 20))
 done
+# PIECES=1 (TF_DSV41_PIECE_RUNS, dsq-zig-beat-1; the pod form is tools/zig/dsv41_pieces/job.sh): several prompts admitted
+# in one round. 1. Python's batched round at TP=2 (dsv41_m2b_ref.py --batched: one CED encoder run over every prompt's
+# piece, slots.prefill_runs) and the same prompts alone (Python's batched == alone for the record; its AOT set merged:
+# the piece-at-a-time run's shapes); 2. ours serving the prompts at once through the served engine (rank 0 tf-dsv41-m1
+# sess4, rank 1 follow) with the round planner and TF_DSV41_PIECE_RUNS=1, then =0: each "PASS sess4 turn 1 == Python"
+# against the batched reference, and the =1 run's rank 0 log shows "piece runs: ". PIECES_PROMPTS (160 300 500 700: every
+# piece past 16 rows, their rows within one 2,048-row run), PIECES_STEPS (24). About 25 min (two references, two runs).
+if [[ "${PIECES:-0}" == 1 ]]; then
+    P=/out/pieces; mkdir -p "$OUT/pieces"
+    prompts=${PIECES_PROMPTS:-160 300 500 700}; psteps=${PIECES_STEPS:-24}
+    refargs=(--pack /model --layers 0-39 --steps "$psteps" --prompts "$(echo $prompts | tr ' ' ',')" --prefill replay
+             --prompt-tail verify --limit 4096 --rank "$RANK" --master "$MASTER")
+    pport=$port
+    for kind in batched alone; do
+        pport=$(( pport + 2 ))
+        drop_caches
+        log "pieces: Python reference ($kind, prompts $prompts)"
+        t0=$(date +%s)
+        # engine defaults on both sides (as the pod's sess4 gate): the served Zig run reads its own knobs, not prod-knobs.env
+        docker run "${ARGS[@]}" --name "dsv41-zig-pref-r$RANK" --entrypoint python "$IMAGE" -u -B \
+            /kit/tools/zig/dsv41_m2b_ref.py "${refargs[@]}" $( [[ $kind == batched ]] && echo --batched ) --out "$P/ref-$kind" \
+            --port "$pport" > "$OUT/pieces/ref-$kind.log" 2>&1
+        rc=$?; log "pieces: $kind reference rc $rc in $(( $(date +%s) - t0 )) s ($(tail -1 "$OUT/pieces/ref-$kind.log"))"
+        (( rc == 0 )) || exit 1
+    done
+    docker run "${ARGS[@]}" --entrypoint python "$IMAGE" -B /kit/tools/zig/dsv41_engram_host.py --py-src /dsv41-tf/src \
+        --config /model/config.json --tokenizer /model/tokenizer.json --out "$P/ref-batched/engram-host.bin" > "$OUT/pieces/engram-host.log" 2>&1 \
+        || { log "pieces: engram host tables failed"; exit 1; }
+    python3 -B "$KIT/tools/zig/dsv41_aot_merge.py" "$OUT/pieces/ref-batched/aot" "$OUT/pieces/ref-alone/aot" >> "$OUT/pieces/aot-merge.log" 2>&1
+    python3 - "$OUT/pieces" $prompts <<'PYEOF' | tee -a "$OUT/run.log"
+import json, sys
+d, ps = sys.argv[1], sys.argv[2:]
+same = sum(json.load(open(f"{d}/ref-batched/p{p}/ref.json"))["tokens"] == json.load(open(f"{d}/ref-alone/p{p}/ref.json"))["tokens"] for p in ps)
+print(f"pieces: Python batched == alone, tokens: {same}/{len(ps)} (informational)")
+PYEOF
+    refs=(); for p in $prompts; do refs+=("$P/ref-batched/p$p"); done
+    for runs in 1 0; do
+        drop_caches
+        log "pieces: ours, TF_DSV41_PIECE_RUNS=$runs"
+        t0=$(date +%s)
+        if [[ "$RANK" == 0 ]]; then cmd="sess4 /model $P/ref-batched $P/zig-runs$runs ${refs[*]}"; else cmd="follow /model $P/ref-batched"; fi
+        docker run "${ARGS[@]}" -e TF_TP_WORLD=2 -e TF_TP_RANK="$RANK" -e TF_TP_DEVICE=0 -e TF_TP_MASTER="$MASTER" \
+            -e TF_TP_PORT=$(( port + 5 + runs )) -e TF_DSV41_PLAN_TIMEOUT=1800 -e TF_COMM_BACKEND="$BACKEND" -e TF_TP_ROCE_FALLBACK=error \
+            -e TF_TP_KERNEL_IMAGE=/kit/tp_mailbox.fatbin -e TF_DSV41_FAILFAST=0 -e TF_DSV41_ASSETS="$P/ref-batched" \
+            -e TF_DSV41_SLOTS=4 -e TF_DSV41_POOL_TOKENS=$(( 4 * 4096 + 2048 )) -e TF_DSV41_CONTEXT=4096 -e TF_DSV41_PREFILL=replay \
+            -e TF_DSV41_PROMPT_TAIL=verify -e TF_DSV41_OWN_PREFILL=1 -e TF_DSV41_DRAFTS=0 -e TF_DSV41_PREFILL_PIECES=1 \
+            -e TF_DSV41_SESSIONS=0 -e TF_DSV41_GRAPHS=1 -e TF_DSV41_PIECE_RUNS=$runs -e SESS4_TURNS=1 -e SESS4_STEPS="$psteps" \
+            --name "dsv41-zig-pieces-r$RANK" \
+            --entrypoint bash "$IMAGE" -c 'export TF_NCCL_LIB=$(python -c "import nvidia.nccl, os; print(os.path.join(os.path.dirname(nvidia.nccl.__file__), \"lib\", \"libnccl.so.2\"))" 2>/dev/null || echo libnccl.so.2); mkdir -p '"$P/zig-runs$runs"'; exec /kit/tf-dsv41-m1 '"$cmd" \
+            > "$OUT/pieces/zig-runs$runs.log" 2>&1
+        rc=$?; log "pieces: PIECE_RUNS=$runs rc $rc in $(( $(date +%s) - t0 )) s: $(grep -h '^PASS sess4\|^FAIL sess4' "$OUT/pieces/zig-runs$runs.log" | tail -1)"
+        if [[ "$RANK" == 0 && $runs == 1 ]] && ! grep -q "piece runs: " "$OUT/pieces/zig-runs$runs.log"; then
+            log "FAIL pieces: the PIECE_RUNS=1 run's log shows no multi-segment run (piece runs)"
+        fi
+    done
+    port=$((port + 20))
+fi
 drop_caches
 log "done: $(grep -h '^PASS\|^FAIL' "$OUT"/seed*/zig.log | tr '\n' ' ')"
