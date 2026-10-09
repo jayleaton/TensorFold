@@ -168,6 +168,18 @@ fn badRows(name: []const u8, raw: []const u8, big: bool) error{BadKnob} {
     return error.BadKnob;
 }
 
+/// TF_DSV41_PF_OVERLAP (ours, no Python twin; unset / 0 / 1: off): a prefill segment's two exchanges a layer in this
+/// many row pieces (2-8), each on the branches' side stream behind its producer's piece (block_prefill.zig `pieces`).
+pub fn pfOverlap(get: Get) !i64 {
+    const raw = std.mem.trim(u8, get("TF_DSV41_PF_OVERLAP") orelse "0", " ");
+    const v = std.fmt.parseInt(i64, raw, 10) catch -1;
+    if (v < 0 or v > 8) {
+        std.log.warn("TF_DSV41_PF_OVERLAP={s}: 0 (off) or row pieces 2-8", .{raw});
+        return error.BadKnob;
+    }
+    return if (v < 2) 0 else v;
+}
+
 /// TF_DSV41_PREFETCH_AHEAD (0 by default): the next prompt segment's Engram reads before this one runs.
 pub fn prefetchAhead(get: Get) bool {
     const v = get("TF_DSV41_PREFETCH_AHEAD") orelse return false;
@@ -281,6 +293,12 @@ pub fn apply(f: *@import("forward.zig").Forward, a: std.mem.Allocator, io: std.I
     f.prefill_state.mode = try prefillMode(&env);
     // TF_DSV41_BRANCHES: the side stream exists before any capture
     if (f.branches == null) f.branches = try @import("branches.zig").install(f.gpa, f, rank);
+    // TF_DSV41_PF_OVERLAP: the pieces' exchanges go on the branches' side stream (one peer: TP=2)
+    f.opts.pf_overlap = try pfOverlap(&env);
+    if (f.opts.pf_overlap > 0 and (!f.opts.branches or f.opts.world != 2)) {
+        std.log.scoped(.dsv41).err("TF_DSV41_PF_OVERLAP={d} needs TF_DSV41_BRANCHES=1 (its side stream) and TP=2 (world {d})", .{ f.opts.pf_overlap, f.opts.world });
+        return error.BadKnob;
+    }
     if (f.prefill_state.mode == .replay) {
         const ced = @import("ced.zig");
         const d = ced.decoderStart(f.cfg) catch |e| {
@@ -294,6 +312,7 @@ pub fn apply(f: *@import("forward.zig").Forward, a: std.mem.Allocator, io: std.I
     }
     if (rank != 0) return;
     const log = std.log.scoped(.dsv41);
+    if (f.opts.pf_overlap > 0) log.info("prefill overlap: a segment's exchanges in {d} row pieces on the side stream", .{f.opts.pf_overlap});
     log.info("prod knobs: pf_dense {s}, prefill rows {d}{s}, index budget {d} MiB, R1 {s}, prefetch ahead {s}, x3gm v2 {t}, prefill {t}", .{ if (f.opts.pfd != null) "fused" else "off", f.opts.prefill_rows, if (f.opts.pf4k) " (4K: one x3gm block a segment)" else "", f.opts.index_budget >> 20, if (f.opts.r1) "on" else "off", if (f.prefill_state.ahead) "on" else "off", f.opts.gm_v2, f.prefill_state.mode });
 }
 

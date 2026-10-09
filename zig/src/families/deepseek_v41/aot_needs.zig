@@ -208,6 +208,9 @@ pub const Served = struct {
         // TF_DSV41_PF_4K: 4,096-row segments (their Triton variants at those rows), x3gm v2 as apply has it
         o.pf4k = try knobs.pf4k(&knobs.env);
         o.gm_v2 = try @import("gm2pf.zig").mode(&knobs.env);
+        // TF_DSV41_PF_OVERLAP: its pieces' projections (their own row counts) where the side stream is on
+        o.pf_overlap = try knobs.pfOverlap(&knobs.env);
+        if (o.pf_overlap > 0) o.branches = (try @import("branches.zig").settings()).on;
         if (try knobs.indexBudget(&knobs.env)) |b| o.index_budget = b;
         const drafts = envOn("TF_DSV41_DRAFTS", true);
         o.taps = drafts;

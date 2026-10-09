@@ -70,6 +70,7 @@ const gm_bm: i64 = 64; // x3gm: members a pass of the gate/up (cfg 1) and down (
 const gm_widths: u32 = 7; // x3gm.MAX_WIDTHS: the ticket's down half starts there
 const index_budget: i64 = 256 << 20; // TF_DSV41_INDEX_BUDGET_MIB's default: block.Options.index_budget is the run's
 const dtopk_rows: i64 = 64; // dtopk.MAX_ROWS: windows up to this many rows select with attn_cuda's top-k (backend._dt)
+const overlap_min: i64 = 256; // TF_DSV41_PF_OVERLAP: rows a piece at least (a smaller GEMM's waves cost more than it hides)
 
 fn size(dt: Dt) i64 {
     return switch (dt) {
@@ -107,6 +108,47 @@ const Seg = struct {
     /// a multi-segment run (`emitMulti`): its segments; the attention core and the compressor run a segment at a
     /// time on that segment's slot (glue "pf_seg"), every other step over all the run's rows
     multi: ?[]const Span = null,
+    /// TF_DSV41_PF_OVERLAP: this layer's attention / MoE partial already went out a piece at a time (`pieces`), so
+    /// `run` emits no whole exchange after it
+    sent_attn: bool = false,
+    sent_moe: bool = false,
+
+    // -----------------------------------------------------------------------------------------------------------
+    // TF_DSV41_PF_OVERLAP: the exchanges in row pieces, overlapped with their producers' next piece
+
+    /// Row pieces of this segment's exchanges: Options.pf_overlap when it applies (branches' side stream, TP=2, not a
+    /// short segment, at least `overlap_min` rows a piece), else 1 (one exchange after its producer).
+    fn pieces(s: *const Seg) i64 {
+        const e = s.e;
+        const k = e.o.pf_overlap;
+        if (k < 2 or s.short or !e.o.branches or e.o.world != 2 or e.n < k * overlap_min) return 1;
+        return k;
+    }
+
+    /// Piece `p` of `k` over `n` rows: [r0, r1) on the 16-row grid, the last to `n`.
+    fn pieceAt(n: i64, k: i64, p: i64) [2]i64 {
+        const cut = struct {
+            fn at(nn: i64, kk: i64, q: i64) i64 {
+                return if (q >= kk) nn else @divFloor(@divFloor(nn * q, kk), 16) * 16;
+            }
+        };
+        return .{ cut.at(n, k, p), cut.at(n, k, p + 1) };
+    }
+
+    /// Exchange of rows [r0, r0 + rows) of `part` [n, D] into `into` [world, n, D] (glue exchange_rows: this rank's
+    /// rows copied, the peer's received: the whole exchange's bytes at the same places, a piece at a time). Every piece
+    /// but the last goes on the side stream once the main stream issued its producer (fork); the last runs on the main
+    /// stream after the side stream's pieces (join), so the consumer (the next mHC site) reads a whole buffer.
+    fn sendPiece(s: *Seg, part: Arg, into: Arg, r0: i64, rows: i64, last: bool) !void {
+        const e = s.e;
+        const send = try rowsOf(e, part, .bf16, r0, rows, e.cfg.hidden);
+        if (last) e.br_join = true else {
+            e.br_fork = true;
+            e.br_side = true;
+        }
+        defer e.br_side = false;
+        try e.glue("exchange_rows", &.{ send, into, .{ .i = r0 } });
+    }
 
     // -----------------------------------------------------------------------------------------------------------
     // dense EXL3 projections (prefill_mm.matmul)
@@ -774,13 +816,38 @@ const Seg = struct {
         const ol: i64 = e.cfg.o_lora;
         const gk = hg * hd;
         const z: Out = .{ .role = .{ .buf = "L.z" }, .dt = .bf16, .stride = groups * ol };
-        var g: i64 = 0;
-        while (g < groups) : (g += 1) {
-            var zg = z;
-            zg.offset = g * ol * 2;
-            try s.matmul(try e.fmt("L{d}.attn.wo_a.{d}", .{ L, g }), .lanes, try e.view(o.t.role, .bf16, &.{ n, gk }, &.{ gk, 1 }, g * n * gk * 2), gk, ol, zg);
+        const k = s.pieces();
+        if (k == 1) {
+            var g: i64 = 0;
+            while (g < groups) : (g += 1) {
+                var zg = z;
+                zg.offset = g * ol * 2;
+                try s.matmul(try e.fmt("L{d}.attn.wo_a.{d}", .{ L, g }), .lanes, try e.view(o.t.role, .bf16, &.{ n, gk }, &.{ gk, 1 }, g * n * gk * 2), gk, ol, zg);
+            }
+            return s.proj(try e.fmt("L{d}.attn.wo_b", .{L}), .lanes, try e.buf("L.z", .{}, .bf16, &.{ n, groups * ol }), groups * ol, D, try e.buf("L.part", .{}, .bf16, &.{ n, D }));
         }
-        try s.proj(try e.fmt("L{d}.attn.wo_b", .{L}), .lanes, try e.buf("L.z", .{}, .bf16, &.{ n, groups * ol }), groups * ol, D, try e.buf("L.part", .{}, .bf16, &.{ n, D }));
+        // TF_DSV41_PF_OVERLAP: wo_a's groups and wo_b a row piece at a time (each GEMM row-independent, the same bits at
+        // any M), each piece's partial sent while the next piece's GEMMs run
+        const part = try e.buf("L.part", .{}, .bf16, &.{ n, D });
+        const zall = try e.buf("L.z", .{}, .bf16, &.{ n, groups * ol });
+        const gath = try s.recv("attn");
+        defer e.n = n;
+        var p: i64 = 0;
+        while (p < k) : (p += 1) {
+            const r = pieceAt(n, k, p);
+            const m = r[1] - r[0];
+            e.n = m;
+            var g: i64 = 0;
+            while (g < groups) : (g += 1) {
+                var zg = z;
+                zg.offset = g * ol * 2 + r[0] * groups * ol * 2;
+                try s.matmul(try e.fmt("L{d}.attn.wo_a.{d}", .{ L, g }), .lanes, try e.view(o.t.role, .bf16, &.{ m, gk }, &.{ gk, 1 }, (g * n + r[0]) * gk * 2), gk, ol, zg);
+            }
+            try s.matmul(try e.fmt("L{d}.attn.wo_b", .{L}), .lanes, try rowsOf(e, zall, .bf16, r[0], m, groups * ol), groups * ol, D, .{ .role = part.t.role, .dt = .bf16, .stride = D, .offset = r[0] * D * 2 });
+            e.n = n;
+            try s.sendPiece(part, gath, r[0], m, p + 1 == k);
+        }
+        s.sent_attn = true;
     }
 
     /// The CSA2 steps of the current segment (blocks._segment): its SWA rows stored (through the staging ring when its
@@ -1043,6 +1110,37 @@ const Seg = struct {
         const routed = try e.buf("L.routed", .{}, .f32, &.{ n, D });
         try e.ext("tensorfold_exl3_experts_v1.combine", &.{ y, w6, routed, .{ .i = n }, .{ .i = D }, .{ .i = topk } });
         // the shared expert: gate and up GEMMs, the clamped SiLU product (torch), the down GEMM
+        // TF_DSV41_PF_OVERLAP (a whole segment's MoE call): the shared expert and bf16(routed + shared) a row piece at a
+        // time (row-independent GEMMs and row-wise glue: the same bits), each piece's partial sent while the next runs
+        const k: i64 = if (e.cfg.shared_experts > 0 and n == seg_rows and part.t.role == .buf and std.mem.eql(u8, part.t.role.buf, "L.moe16")) s.pieces() else 1;
+        if (k > 1) {
+            const sh = try e.fmt("{s}.shared.0", .{pre});
+            const g = try e.buf("L.sh.g", .{}, .f32, &.{ n, I });
+            const u = try e.buf("L.sh.u", .{}, .f32, &.{ n, I });
+            const act = try e.buf("L.sh.act", .{}, .f32, &.{ n, I });
+            const sy = try e.buf("L.sh.y", .{}, .f32, &.{ n, D });
+            const gath = try s.recv("moe");
+            var p: i64 = 0;
+            while (p < k) : (p += 1) {
+                const r = pieceAt(n, k, p);
+                const m = r[1] - r[0];
+                e.n = m;
+                const xr = try rowsOf(e, x, .bf16, r[0], m, D);
+                const gr = try rowsOf(e, g, .f32, r[0], m, I);
+                const ur = try rowsOf(e, u, .f32, r[0], m, I);
+                const ar = try rowsOf(e, act, .f32, r[0], m, I);
+                const yr = try rowsOf(e, sy, .f32, r[0], m, D);
+                try s.proj(try e.fmt("{s}.w1", .{sh}), .stored, xr, D, I, gr);
+                try s.proj(try e.fmt("{s}.w3", .{sh}), .stored, xr, D, I, ur);
+                try e.glue("swiglu", &.{ gr, ur, ar, .{ .f = lim } });
+                try s.proj(try e.fmt("{s}.w2", .{sh}), .stored, ar, I, D, yr);
+                try e.glue("moe_sum", &.{ try rowsOf(e, routed, .f32, r[0], m, D), yr, try rowsOf(e, part, .bf16, r[0], m, D) });
+                e.n = n;
+                try s.sendPiece(part, gath, r[0], m, p + 1 == k);
+            }
+            s.sent_moe = true;
+            return;
+        }
         if (e.cfg.shared_experts > 0) {
             const sh = try e.fmt("{s}.shared.0", .{pre});
             const g = try e.buf("L.sh.g", .{}, .f32, &.{ n, I });
@@ -1137,11 +1235,14 @@ const Seg = struct {
             if (s.part == .encoder and i + 1 == layers.len) return s.encoderEnd(L);
             try s.attention(L);
             if (s.short) try e.prefetchF(L);
-            try e.glue("exchange", &.{ try e.buf("L.part", .{}, .bf16, &.{ n, D }), try s.recv("attn") });
+            // TF_DSV41_PF_OVERLAP: the partial went out a piece at a time behind its producer
+            if (!s.sent_attn) try e.glue("exchange", &.{ try e.buf("L.part", .{}, .bf16, &.{ n, D }), try s.recv("attn") });
+            s.sent_attn = false;
             try s.site(L, "hc_ffn", .boundary);
             try s.moeBlock(L);
             if (s.short and i + 1 < layers.len) try e.prefetchX(layers[i + 1]);
-            try e.glue("exchange", &.{ try e.buf("L.moe16", .{}, .bf16, &.{ n, D }), try s.recv("moe") });
+            if (!s.sent_moe) try e.glue("exchange", &.{ try e.buf("L.moe16", .{}, .bf16, &.{ n, D }), try s.recv("moe") });
+            s.sent_moe = false;
             if (e.o.trace) {
                 const y = try e.buf("w.trace", .{}, .bf16, &.{ n, 4 * D });
                 try s.postOnly(y);

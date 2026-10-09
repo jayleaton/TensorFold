@@ -76,6 +76,10 @@ pub const Options = struct {
     /// expert scratch holds it, as pf4k's arena: the trellis streams once a segment, not once a 2,048 rows), the router
     /// in 2,048-row launches (router_gemv.CHUNK). Off: Python prod's 2,048 (a longer segment is refused)
     pf4k: bool = false,
+    /// TF_DSV41_PF_OVERLAP (block_prefill.zig `pieces`): a prefill segment's two exchanges a layer in this many row
+    /// pieces, each sent on the branches' side stream while the main stream computes the next piece's producer (wo_a /
+    /// wo_b, the shared expert); 0 / 1: one exchange after its producer (Python's order). Needs `branches` and TP=2
+    pf_overlap: i64 = 0,
     /// R1 (prod-perf1's decode knobs, docs DSV41-DECODE-R1.md; the same bits): attention split 4 with q's RoPE in the
     /// kernel (ATTN_SPLIT, ATTN_ROPE), mHC's parallel tail + deferred coefficients (MHC_TAIL, MHC_DEFER), the router's
     /// prune + kit rounding (RG_PRUNE, PRUNE_KIT), a bf16 MoE partial (MOE_BF16), q_norm folded into its consumers'
