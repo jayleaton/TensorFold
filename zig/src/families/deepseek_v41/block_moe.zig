@@ -107,7 +107,7 @@ pub fn mhcInto(e: *E, layer: ?u32, which: []const u8, mode: Mode, in_place: bool
 }
 
 /// mhc.await_coefs: an mHC call reads the coefficients a deferred launch wrote: the main stream joins it first.
-fn awaitCoefs(e: *E) void {
+pub fn awaitCoefs(e: *E) void {
     if (!e.df_pending) return;
     e.df_pending = false;
     e.df_join = true;
