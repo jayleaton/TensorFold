@@ -30,10 +30,20 @@ assert [getattr(Args, name).offset for name, _ in Args._fields_] == [
 
 
 class Driver:
-    def __init__(self, fatbin):
-        self.lib = C.CDLL("libcuda.so.1")
+    def __init__(self, fatbin, device=0):
+        try:
+            self.lib = C.CDLL("libcuda.so.1")
+        except OSError as error:
+            raise RuntimeError("CUDA driver unavailable; KV byte oracle requires a CUDA GPU") from error
         self.functions = {}
         signatures = {
+            "cuInit": [C.c_uint],
+            "cuDeviceGetCount": [C.POINTER(C.c_int)],
+            "cuDeviceGet": [C.POINTER(C.c_int), C.c_int],
+            "cuDevicePrimaryCtxRetain": [C.POINTER(C.c_void_p), C.c_int],
+            "cuDevicePrimaryCtxRelease_v2": [C.c_int],
+            "cuCtxSetCurrent": [C.c_void_p],
+            "cuCtxGetCurrent": [C.POINTER(C.c_void_p)],
             "cuModuleLoad": [C.POINTER(C.c_void_p), C.c_char_p],
             "cuModuleGetFunction": [C.POINTER(C.c_void_p), C.c_void_p, C.c_char_p],
             "cuLaunchKernel": [C.c_void_p] + [C.c_uint] * 7 +
@@ -51,21 +61,58 @@ class Driver:
             function = getattr(self.lib, name)
             function.argtypes, function.restype = signature, C.c_int
             self.functions[name] = function
+        self.device, self.context = C.c_int(), C.c_void_p()
         self.module, self.kernel = C.c_void_p(), C.c_void_p()
-        self.call("cuModuleLoad", C.byref(self.module), os.fsencode(fatbin))
-        self.call("cuModuleGetFunction", C.byref(self.kernel), self.module, b"kv_norm_store")
+        self.call("cuInit", 0)
+        count = C.c_int()
+        self.call("cuDeviceGetCount", C.byref(count))
+        if count.value == 0:
+            raise RuntimeError("No CUDA device present; KV byte oracle requires a CUDA GPU")
+        if not 0 <= device < count.value:
+            raise RuntimeError(f"CUDA device ordinal {device} unavailable ({count.value} devices)")
+        self.call("cuDeviceGet", C.byref(self.device), device)
+        self.call("cuDevicePrimaryCtxRetain", C.byref(self.context), self.device)
+        try:
+            self.call("cuCtxSetCurrent", self.context)
+            self.call("cuModuleLoad", C.byref(self.module), os.fsencode(fatbin))
+            self.call("cuModuleGetFunction", C.byref(self.kernel), self.module, b"kv_norm_store")
+        except BaseException:
+            self.close()
+            raise
 
     def call(self, name, *args):
         status = self.functions[name](*args)
+        if status == 100:  # CUDA_ERROR_NO_DEVICE, including cuInit on a GPU-free host
+            raise RuntimeError(f"{name}: no CUDA device present; KV byte oracle requires a CUDA GPU")
         if status:
             raise RuntimeError(f"{name}: CUDA driver error {status}")
 
+    def assert_current(self):
+        current = C.c_void_p()
+        self.call("cuCtxGetCurrent", C.byref(current))
+        if current.value != self.context.value:
+            raise RuntimeError("CUDA context changed: Torch reference and fused kernel must use "
+                               "the selected device's same primary context")
+
+    def close(self):
+        try:
+            if self.module.value:
+                self.call("cuCtxSetCurrent", self.context)
+                self.call("cuModuleUnload", self.module)
+                self.module = C.c_void_p()
+        finally:
+            if self.context.value:
+                self.call("cuDevicePrimaryCtxRelease_v2", self.device)
+                self.context = C.c_void_p()
+
     def launch(self, arguments, rows, stream, block):
+        self.assert_current()
         parameters = (C.c_void_p * 1)(C.addressof(arguments))
         self.call("cuLaunchKernel", self.kernel, rows, 1, 1, block, 1, 1,
                   0, C.c_void_p(stream.cuda_stream), parameters, None)
 
     def capture(self, function, stream, expected_nodes):
+        self.assert_current()
         handle = C.c_void_p(stream.cuda_stream)
         self.call("cuStreamBeginCapture", handle, 0)
         graph = C.c_void_p()
@@ -256,13 +303,15 @@ def main():
         print("BASELINE", source, "sha256", hashlib.sha256(source.read_bytes()).hexdigest())
     print("DEVICE", torch.cuda.get_device_name(), "capability", torch.cuda.get_device_capability())
     torch.cuda.init()
-    driver = Driver(Path(args.fatbin).resolve())
-    stream = torch.cuda.Stream()
+    device = torch.cuda.current_device()
+    driver = Driver(Path(args.fatbin).resolve(), device)
     patterns = ("random", "zeros", "subnormal", "large_finite", "mixed_exponents", "signed_zero",
                 "weight_signs", "fp8_ties", "rope_quadrants", "rope_identity", "eps_1e5",
                 "input_nan", "input_inf", "weight_nan", "weight_inf", "reduction_stress", "bf16_ties")
     tested = 0
     try:
+        stream = torch.cuda.Stream(device=device)
+        driver.assert_current()  # Torch stream creation must retain the same primary context.
         with torch.cuda.stream(stream):
             for rows in (1, 2, 3, 4, 5, 6, 9, 12, 15, 16, 20, 24, 32, 48, 64):
                 for mode in ("scalar", "rows", "all_padding"):
@@ -318,8 +367,10 @@ def main():
                         driver.call("cuGraphExecDestroy", new)
             print("PASS", tested, "byte cases; timings are GPU event durations, not throughput forecasts")
     finally:
-        torch.cuda.synchronize()
-        driver.call("cuModuleUnload", driver.module)
+        try:
+            torch.cuda.synchronize(device)
+        finally:
+            driver.close()
 
 
 if __name__ == "__main__":
