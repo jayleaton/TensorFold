@@ -15,7 +15,7 @@
 #   ./zig-bench.sh prod      before the window, Python prod up (the reference replies and cells)
 #   ./zig-bench.sh zig       in the window, the Zig server up with TF_DSV41_PHASES=1 TF_DSV41_PHASES_OUT=/state/phases.json
 # Env: URL (http://127.0.0.1:8000), PHASES (the host path of /state/phases.json: /home/dgx01/ai/dsv41-tf/phases.json),
-# REPS (2), LONG (32768,131072), MIX_LONG (131072), PARTS (replies speed long mix: a subset, e.g. the window's
+# WARM (1: an untimed warm-up a speed cell), REPS (2), LONG (32768,131072), MIX_LONG (131072), PARTS (replies speed long mix: a subset, e.g. the window's
 # crash repro `PARTS=speed CELLS=code-t0-s4 REPS=1`), CELLS (speed cells by name; default all 8).
 # Exit: 0 verdict PASS (or the prod label), 1 verdict FAIL, 2 no server at the start, 3 the server died during the bench.
 set -u
@@ -63,6 +63,9 @@ if part speed; then
         c="$work-t$temp-s$s"
         [[ -n "${CELLS:-}" && " $CELLS " != *" $c "* ]] && continue
         rm -f "$OUT/cells/$c.json"
+        # WARM (1): one untimed request set at the cell's own temperature and streams first, so rep 0 is not the
+        # engine's cold first pass at that shape
+        [[ "${WARM:-1}" == 1 ]] && $B --work "$work" --temps "$temp" --streams "$s" --reps 1 --max-tokens 64 > /dev/null 2>> "$OUT/bench.log"
         $B --work "$work" --temps "$temp" --streams "$s" --reps "${REPS:-2}" --out "$OUT/cells/$c.json" > /dev/null 2>> "$OUT/bench.log" \
             || failed "$c"
         after "$c"; phases "$c"
