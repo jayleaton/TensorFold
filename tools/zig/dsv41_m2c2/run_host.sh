@@ -33,9 +33,15 @@ log() { echo "[m2c2 r$RANK $(date +%H:%M:%S)] $*" | tee -a "$OUT/run.log"; }
 drop_caches() { sync; sudo -n sh -c 'echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null || sh -c 'echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null || log "drop_caches refused"; }
 
 # preflight: nothing else on the GPU, the kit intact, the tree and pack where prod keeps them
+# PIECES_DRYRUN=1 (with PIECES=1 PIECES_ONLY=1, on any host): the stage's own code without containers, from an OUT that
+# already holds pieces/ref-batched and pieces/ref-alone: the run's assets dir, its env and pieces_check.py's preflight
+# of every file and limit each Zig run boots with (the dev box's dry run before a Spark slot)
+DRY=${PIECES_DRYRUN:-0}
+if [[ "$DRY" != 1 ]]; then
 if docker ps --format '{{.Names}}' | grep -q 'dsv41'; then log "a dsv41 container is running: stop prod first (RUNBOOK.md)"; exit 2; fi
 (cd "$KIT" && sha256sum -c --quiet SHA256SUMS) || { log "kit checksum mismatch"; exit 2; }
 [[ -d "$TF/src" && -f "$MODEL/config.json" ]] || { log "missing $TF/src or $MODEL/config.json"; exit 2; }
+fi
 ulimit -l unlimited 2> /dev/null || log "warning: memlock $(ulimit -l) KiB"
 { hostname; nvidia-smi -L; free -g; } > "$OUT/host.txt" 2>&1
 ARGS=(--rm --gpus all --ipc=host --network host --device /dev/infiniband --ulimit memlock=-1 --cap-add IPC_LOCK
@@ -165,6 +171,11 @@ if [[ "${PIECES:-0}" == 1 ]]; then
     }
     [[ -f "$fillenv" && -f "$KIT/triton-fill/aot/aot.json" ]] || pfail "the kit has no triton-fill (build-kit.sh TRITON_FILL=1 or TRITON_FILL_FROM)"
     grep -q '^TF_DSV41_PIECE_RUNS=1' "$fillenv" || pfail "the kit's fill was built without the runs' variants ($fillenv: TF_DSV41_PIECE_RUNS / _REPLAY_RUNS)"
+    # the served assets' full rope table (prod's TF_DSV41_CONTEXT): the runs boot at the fill's 1M context
+    if [[ "$RANK" == 0 ]]; then served=/home/dgx01/ai/dsv41-zig-assets; else served=/home/root/ai/dsv41-zig-assets; fi
+    served=${PIECES_SERVED_ASSETS:-$served}
+    [[ -f "$served/rope.bin" ]] || pfail "no served rope table at $served/rope.bin (PIECES_SERVED_ASSETS)"
+    if [[ "$DRY" != 1 ]]; then
     refargs=(--pack /model --layers 0-39 --steps "$psteps" --prompts "$(echo $prompts | tr ' ' ',')" --prefill replay
              --prompt-tail verify --limit 4096 --rank "$RANK" --master "$MASTER")
     pport=$port
@@ -193,20 +204,37 @@ d, ps = sys.argv[1], sys.argv[2:]
 same = sum(json.load(open(f"{d}/ref-batched/p{p}/ref.json"))["tokens"] == json.load(open(f"{d}/ref-alone/p{p}/ref.json"))["tokens"] for p in ps)
 print(f"pieces: Python batched == alone, tokens: {same}/{len(ps)} (informational)")' "$P" $prompts > "$OUT/pieces/compare.log" 2>&1
     log "$(tail -1 "$OUT/pieces/compare.log")"
+    fi
+    # the runs' assets: the reference's AOT set (the kit's fill merged in) and Engram host tables, the served rope table
+    # (mounted at /served-assets: the reference's covers its 4,096-token limit, the runs need TF_DSV41_CONTEXT + 2,048)
+    mkdir -p "$OUT/pieces/assets"
+    ln -sfn ../ref-batched/aot "$OUT/pieces/assets/aot"
+    ln -sfn ../ref-batched/engram-host.bin "$OUT/pieces/assets/engram-host.bin"
+    ln -sfn /served-assets/rope.bin "$OUT/pieces/assets/rope.bin"
+    A=$P/assets
     refs=(); for p in $prompts; do refs+=("$P/ref-batched/p$p"); done
     for runs in ${PIECES_RUNS:-1 0 2}; do
         drop_caches
         pr=$(( runs > 0 )); rr=$(( runs == 2 ))
         log "pieces: ours, TF_DSV41_PIECE_RUNS=$pr TF_DSV41_REPLAY_RUNS=$rr"
         t0=$(date +%s)
-        if [[ "$RANK" == 0 ]]; then cmd="sess4 /model $P/ref-batched $P/zig-runs$runs ${refs[*]}"; else cmd="follow /model $P/ref-batched"; fi
-        timed "${PIECES_RUN_MIN:-12}" "dsv41-zig-pieces-r$RANK" "${ARGS[@]}" --env-file "$fillenv" \
-            -e TF_TP_WORLD=2 -e TF_TP_RANK="$RANK" -e TF_TP_DEVICE=0 -e TF_TP_MASTER="$MASTER" \
-            -e TF_TP_PORT=$(( port + 5 + runs )) -e TF_DSV41_PLAN_TIMEOUT=600 -e TF_COMM_BACKEND="$BACKEND" -e TF_TP_ROCE_FALLBACK=error \
-            -e TF_TP_KERNEL_IMAGE=/kit/tp_mailbox.fatbin -e TF_DSV41_FAILFAST=1 -e TF_DSV41_ASSETS="$P/ref-batched" \
-            -e TF_DSV41_POOL_TOKENS=1400000 -e TF_DSV41_PROMPT_TAIL=verify -e TF_DSV41_OWN_PREFILL=1 -e TF_DSV41_PREFILL_PIECES=1 \
-            -e TF_DSV41_SESSIONS=0 -e TF_DSV41_GRAPHS=1 -e TF_DSV41_PIECE_RUNS=$pr -e TF_DSV41_REPLAY_RUNS=$rr \
-            -e SESS4_TURNS=1 -e SESS4_STEPS="$psteps" \
+        if [[ "$RANK" == 0 ]]; then cmd="sess4 /model $A $P/zig-runs$runs ${refs[*]}"; else cmd="follow /model $A"; fi
+        # the run's env after the fill's (docker: the last value of a key wins); the preflight reads the same list
+        zenv=(TF_TP_WORLD=2 TF_TP_RANK="$RANK" TF_TP_DEVICE=0 TF_TP_MASTER="$MASTER" TF_TP_PORT=$(( port + 5 + runs ))
+              TF_DSV41_PLAN_TIMEOUT=600 TF_COMM_BACKEND="$BACKEND" TF_TP_ROCE_FALLBACK=error TF_TP_KERNEL_IMAGE=/kit/tp_mailbox.fatbin
+              TF_DSV41_FAILFAST=1 TF_DSV41_ASSETS="$A" TF_DSV41_POOL_TOKENS=1400000 TF_DSV41_PROMPT_TAIL=verify
+              TF_DSV41_OWN_PREFILL=1 TF_DSV41_PREFILL_PIECES=1 TF_DSV41_SESSIONS=0 TF_DSV41_GRAPHS=1
+              TF_DSV41_PIECE_RUNS=$pr TF_DSV41_REPLAY_RUNS=$rr SESS4_TURNS=1 SESS4_STEPS="$psteps")
+        mounts=(/out="$OUT" /kit="$KIT" /served-assets="$served" /model="$MODEL")
+        names=(); [[ -f "$KIT/tools/zig/dsv41_m2c2/knob-names.txt" ]] && names=(--names "$KIT/tools/zig/dsv41_m2c2/knob-names.txt")
+        python3 -B "$KIT/tools/zig/dsv41_m2c2/pieces_check.py" --env-file "$fillenv" $(printf -- '--set %s ' "${zenv[@]}") \
+            $(printf -- '--map %s ' "${mounts[@]}") --assets "$A" --refs "${refs[@]}" --kit-aot "$KIT/triton-fill/aot" \
+            --steps "$psteps" "${names[@]}" > "$OUT/pieces/check-runs$runs.log" 2>&1
+        crc=$?; log "pieces: run $runs preflight: $(tail -1 "$OUT/pieces/check-runs$runs.log")"
+        (( crc == 0 )) || pfail "run $runs preflight ($(grep -h '^pieces_check: FAIL [^0-9]' "$OUT/pieces/check-runs$runs.log" | head -3 | cut -c20- | tr '\n' ';'))"
+        [[ "$DRY" == 1 ]] && continue
+        timed "${PIECES_RUN_MIN:-12}" "dsv41-zig-pieces-r$RANK" "${ARGS[@]}" -v "$served:/served-assets:ro" --env-file "$fillenv" \
+            $(printf -- '-e %s ' "${zenv[@]}") \
             --entrypoint bash "$IMAGE" -c 'export TF_NCCL_LIB=$(python -c "import nvidia.nccl, os; print(os.path.join(os.path.dirname(nvidia.nccl.__file__), \"lib\", \"libnccl.so.2\"))" 2>/dev/null || echo libnccl.so.2); mkdir -p '"$P/zig-runs$runs"'; exec /kit/tf-dsv41-m1 '"$cmd" \
             > "$OUT/pieces/zig-runs$runs.log" 2>&1
         rc=$?; verdict=$(grep -h '^PASS sess4\|^FAIL sess4' "$OUT/pieces/zig-runs$runs.log" | tail -1)
@@ -218,6 +246,7 @@ print(f"pieces: Python batched == alone, tokens: {same}/{len(ps)} (informational
             (( rr == 0 )) || grep -q "replay runs: " "$OUT/pieces/zig-runs$runs.log" || pfail "run $runs logged no batched decoder replay (replay runs)"
         fi
     done
+    [[ "$DRY" == 1 ]] && { log "PASS pieces dry run: every run's preflight"; pstop; trap - EXIT; exit 0; }
     log "PASS pieces: runs ${PIECES_RUNS:-1 0 2} == Python's batched reference"
     [[ "$RANK" == 0 ]] && sleep 10      # rank 1's last watcher reads the server once more before it goes
     pstop; trap - EXIT

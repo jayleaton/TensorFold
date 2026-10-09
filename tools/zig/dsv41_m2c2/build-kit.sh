@@ -28,7 +28,9 @@ cp tools/zig/dsv41_m2b_ref.py tools/zig/dsv41_m1_capture.py tools/zig/triton_aot
     tools/zig/dsv41_aot_merge.py tools/zig/dsv41_m5_kv.py "$KIT/tools/zig/"
 cp tools/zig/dsv41_m1/prod-knobs.env tools/zig/dsv41_m1/r1c-knobs.env "$KIT/tools/zig/dsv41_m1/"
 cp "$HERE/run_host.sh" "$KIT/"
-mkdir -p "$KIT/tools/zig/dsv41_m2c2" && cp "$HERE/peer.py" "$KIT/tools/zig/dsv41_m2c2/"
+mkdir -p "$KIT/tools/zig/dsv41_m2c2" && cp "$HERE/peer.py" "$HERE/pieces_check.py" "$KIT/tools/zig/dsv41_m2c2/"
+# the engine's knob names (pieces_check.py: a run's every TF_ / GLM53_ / SESS4_ key is one it reads)
+grep -rhoE '"(TF|GLM53|SESS4)_[A-Z0-9_]+"' --include=*.zig zig/src | tr -d '"' | sort -u > "$KIT/tools/zig/dsv41_m2c2/knob-names.txt"
 # M4: the Zig server on rank 0, the CLI replay, DSpark's acceptance (tools/zig/dsv41_m4)
 cp tools/zig/dsv41_m4/run_host.sh "$KIT/run_m4.sh"
 cp tools/zig/dsv41_m4/requests.sh tools/zig/dsv41_m4/prompts.txt "$KIT/"
