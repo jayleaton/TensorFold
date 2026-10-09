@@ -13,10 +13,14 @@ for the RB rows (under the union of their masks), and the RB rows' chains interl
 Bits: each row's scores are `score_tile`'s expression on the same operands - the same q [32, 128] and w, the same key
 tile values (a key column a row cannot see is replaced by -inf after the dot, as `score_tile`'s `where`; a dot output
 element depends on its own column only), the same dot shape and warps (`SCORE_WARPS` fixes the head sum's tree) - so
-the same fp32 scores; each row keeps its own buffer, count and threshold and offers its own keys tile by tile in the
-same tile order; tiles past a row's visible end (the block's later rows see one more key every RATIO positions) offer
-nothing (every key masked: no append, no compaction). Keys are unique, so a row's selected set is `_stream`'s, and its
-split buffer is `_stream`'s slot for slot. `merge` is unchanged.
+the same fp32 scores - provided each dot gets `_stream`'s MMA layout: Triton's MMAv2 warps-per-tile heuristic
+(AccelerateMatmul) switches to a chained-dots warp split ([1, 8] instead of `_stream`'s [2, 4]) when a dot's slice in
+its own region reaches another dot, which the shared key tile does, and that split reorders the head sum (1 ulp: Spark
+S1 on 82ac5521). So every row after the first runs in its own `if r < R` region (the ragged block's guard anyway): no
+dot sees another, every dot is `_stream`'s [2, 4]. Each row keeps its own buffer, count and threshold and offers its
+own keys tile by tile in the same tile order; tiles past a row's visible end (the block's later rows see one more key
+every RATIO positions) offer nothing (every key masked: no append, no compaction). Keys are unique, so a row's
+selected set is `_stream`'s, and its split buffer is `_stream`'s slot for slot. `merge` is unchanged.
 """
 
 from __future__ import annotations
@@ -94,9 +98,10 @@ def _stream_rb2(QI, W, w_stride, IK, POS, R, BUF, nsplit, RATIO: tl.constexpr, H
         ok0 = j < h0
         ok1 = j < h1
         s0 = _row_scores(qv0, w0, k, ok0, SCALE)
-        s1 = _row_scores(qv1, w1, k, ok1, SCALE)
         n0, t0_ = _offer(buf0, score_key(s0, j), ok0, n0, t0_, K, CAP)
-        n1, t1_ = _offer(buf1, score_key(s1, j), ok1, n1, t1_, K, CAP)
+        if r1 < R:  # its own region: see the module doc (the dot's MMA layout)
+            s1 = _row_scores(qv1, w1, k, ok1, SCALE)
+            n1, t1_ = _offer(buf1, score_key(s1, j), ok1, n1, t1_, K, CAP)
     _row_end(buf0, n0, K, CAP)
     if r1 < R:
         _row_end(buf1, n1, K, CAP)
@@ -145,13 +150,16 @@ def _stream_rb4(QI, W, w_stride, IK, POS, R, BUF, nsplit, RATIO: tl.constexpr, H
         ok2 = j < h2
         ok3 = j < h3
         s0 = _row_scores(qv0, w0, k, ok0, SCALE)
-        s1 = _row_scores(qv1, w1, k, ok1, SCALE)
-        s2 = _row_scores(qv2, w2, k, ok2, SCALE)
-        s3 = _row_scores(qv3, w3, k, ok3, SCALE)
         n0, th0 = _offer(buf0, score_key(s0, j), ok0, n0, th0, K, CAP)
-        n1, th1 = _offer(buf1, score_key(s1, j), ok1, n1, th1, K, CAP)
-        n2, th2 = _offer(buf2, score_key(s2, j), ok2, n2, th2, K, CAP)
-        n3, th3 = _offer(buf3, score_key(s3, j), ok3, n3, th3, K, CAP)
+        if r1 < R:  # each later row in its own region: see the module doc (the dot's MMA layout)
+            s1 = _row_scores(qv1, w1, k, ok1, SCALE)
+            n1, th1 = _offer(buf1, score_key(s1, j), ok1, n1, th1, K, CAP)
+        if r2 < R:
+            s2 = _row_scores(qv2, w2, k, ok2, SCALE)
+            n2, th2 = _offer(buf2, score_key(s2, j), ok2, n2, th2, K, CAP)
+        if r3 < R:
+            s3 = _row_scores(qv3, w3, k, ok3, SCALE)
+            n3, th3 = _offer(buf3, score_key(s3, j), ok3, n3, th3, K, CAP)
     _row_end(buf0, n0, K, CAP)
     if r1 < R:
         _row_end(buf1, n1, K, CAP)

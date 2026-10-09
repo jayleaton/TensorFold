@@ -1481,6 +1481,29 @@ Expected: the key load and dequant per pair fall by RB, and twice the rows inter
   misses torch's true top-k in the rows where the two disagree. It passes the ragged and multi-split cases where the
   reference is right.
 
+**S1 on 82ac5521 (dgx-01, kit 934aa26c): FAIL, 12 compares, 1 ulp.** rb2 ran x1.49-1.51 and rb4 x1.14, but a first
+differing key moved by exactly 2^32, i.e. only the score half. Cause, from the TTGIR:
+- `_stream`'s dot is `#mma warpsPerCTA = [2, 4]`; the twins' dots were `[1, 8]`.
+- Triton's MMAv2 warps-per-tile pick (AccelerateMatmul) switches to the chained-dots split when a dot's slice reaches
+  another dot in its region. The shared key tile linked the rows' dots.
+- `[1, 8]` splits the 32 heads differently over the 8 warps. The head sum then took a shorter shuffle tree: 2/3 of
+  `_stream`'s shuffles a dot, giving a different order and 1 ulp.
+
+**Fix:** every row after the first runs in its own `if r < R` region (the ragged block's guard anyway), so no dot sees
+another. Each dot is back to `[2, 4]`. The key tile is still loaded and dequantised once.
+
+**Offline check:** `tools/zig/dsv41_triton/check_stream_rb.py --src <served src>` uses the fill's venv and ptxas, no
+GPU. It compiles `_stream` and both twins for sm_121 with the fill options and asserts:
+- every `#mma` layout is `_stream`'s;
+- the dot count, the score path's float ops (mma, shuffles, fma / add / max) and the shuffle offsets are exactly RB
+  times `_stream`'s.
+
+It passes on the fix. On 82ac5521's kernel it fails 6 of its 8 checks (layout, ops, offsets). The PTX order differs
+from `_stream`'s only by scheduling between rows' independent registers.
+
+The separate regions may cost some of the 1.5x, since the rows' chains no longer interleave freely within a tile.
+S1 measures it.
+
 **Wiring:**
 - `TF_DSV41_STREAM_RB=2|4` (default 0): the emitter swaps each positions-mode `_stream` for `_stream_rb<N>`. The grid
   is ceil(rows / N) x splits, with the same buffers and merge.
