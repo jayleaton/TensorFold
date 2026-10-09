@@ -74,12 +74,20 @@ pub const Branches = struct {
             s.stream.deinit();
             s.fork.deinit();
             s.join.deinit();
+            for (&s.marks) |*m| if (m.*) |*ev| ev.deinit();
         };
     }
 };
 
 fn sideOf(d: *const cuda.Driver, prio: cuda.Stream.Priority) !run.Runner.Side {
     return .{ .stream = try cuda.Stream.initPriority(d, prio), .fork = try cuda.Event.init(d, false), .join = try cuda.Event.init(d, false) };
+}
+
+/// The branches' side with its marks (TF_DSV41_PF_OVERLAP_SITE's per-piece events).
+fn sideWithMarks(d: *const cuda.Driver, prio: cuda.Stream.Priority) !run.Runner.Side {
+    var s = try sideOf(d, prio);
+    for (&s.marks) |*m| m.* = try cuda.Event.init(d, false);
+    return s;
 }
 
 /// TF_DSV41_MHC_DEFER (with R1): on unless unset / 0.
@@ -100,7 +108,7 @@ pub fn install(gpa: std.mem.Allocator, f: *fwd.Forward, rank: u32) !?*Branches {
     b.* = .{};
     errdefer b.deinit();
     if (s.on) {
-        b.side = try sideOf(r.d, if (s.prio == .side) .highest else .default);
+        b.side = try sideWithMarks(r.d, if (s.prio == .side) .highest else .default);
         f.opts.branches = true;
         f.opts.branch_rows = s.rows;
         r.br = &b.side.?;
@@ -123,26 +131,44 @@ pub fn install(gpa: std.mem.Allocator, f: *fwd.Forward, rank: u32) !?*Branches {
 /// Roles both streams touch inside one fork region of `cs` (calls after a fork on the side, calls on main from the
 /// fork until the join), with branches.check's ordering: a fork orders the side after everything main issued, a
 /// join orders main after everything the side issued. Weights are left out (read only). Also checks the marks'
-/// structure: a side call only inside an open fork, a join only after a fork, no fork open at the end.
+/// structure: a side call only inside an open fork, a join only after a fork, no fork open at the end. A `wait` m
+/// (TF_DSV41_PF_OVERLAP_SITE) orders main after the side calls up to mark m only: a role only those touched is no
+/// longer the side's; a wait needs its mark recorded in the open fork.
 pub fn shared(a: std.mem.Allocator, cs: []const calls.Call) ![]const []const u8 {
     var main_t: std.StringHashMapUnmanaged(void) = .empty;
-    var side_t: std.StringHashMapUnmanaged(void) = .empty;
+    var side_t: std.StringHashMapUnmanaged(u32) = .empty; // role -> the last side call touching it (1, 2, ...)
     var out: std.StringArrayHashMapUnmanaged(void) = .empty;
+    var marks: [run.Runner.max_marks]?u32 = @splat(null);
+    var seq: u32 = 0;
     var open = false;
     for (cs) |c| {
         if (c.join) {
             if (!open) return error.JoinWithoutFork;
             open = false;
             side_t.clearRetainingCapacity();
+            marks = @splat(null);
+        }
+        if (c.wait > 0) {
+            if (!open or c.side or c.wait > marks.len) return error.WaitWithoutMark;
+            const at = marks[c.wait - 1] orelse return error.WaitWithoutMark;
+            var done: std.ArrayList([]const u8) = .empty;
+            var it = side_t.iterator();
+            while (it.next()) |kv| if (kv.value_ptr.* <= at) try done.append(a, kv.key_ptr.*);
+            for (done.items) |k| _ = side_t.remove(k);
         }
         if (c.fork) {
             open = true;
             main_t.clearRetainingCapacity();
         }
         if (c.side and !open) return error.SideOutsideFork;
-        const mine = if (c.side) &side_t else &main_t;
-        const other = if (c.side) &main_t else &side_t;
-        for (c.args) |x| try roles(a, x.arg, mine, other, &out);
+        if (c.side) {
+            seq += 1;
+            for (c.args) |x| try roles(a, x.arg, &side_t, seq, &main_t, &out);
+            if (c.mark > 0) {
+                if (c.mark > marks.len) return error.WaitWithoutMark;
+                marks[c.mark - 1] = seq;
+            }
+        } else for (c.args) |x| try roles(a, x.arg, &main_t, {}, &side_t, &out);
     }
     if (open) return error.OpenFork;
     return out.keys();
@@ -168,22 +194,23 @@ pub fn sharedDeferred(a: std.mem.Allocator, cs: []const calls.Call) ![]const []c
         }
         const mine = if (c.defer_side) &side_t else &main_t;
         const other = if (c.defer_side) &main_t else &side_t;
-        for (c.args) |x| try roles(a, x.arg, mine, other, &out);
+        for (c.args) |x| try roles(a, x.arg, mine, {}, other, &out);
     }
     if (open) return error.OpenFork;
     return out.keys();
 }
 
-fn roles(a: std.mem.Allocator, x: calls.Arg, mine: *std.StringHashMapUnmanaged(void), other: *std.StringHashMapUnmanaged(void), out: *std.StringArrayHashMapUnmanaged(void)) !void {
+/// `x`'s buffer roles into `mine` (with `val`), and into `out` when `other` holds them.
+fn roles(a: std.mem.Allocator, x: calls.Arg, mine: anytype, val: anytype, other: anytype, out: *std.StringArrayHashMapUnmanaged(void)) !void {
     switch (x) {
         .t, .opaque_table => |t| switch (t.role) {
             .buf => |b| {
-                try mine.put(a, b, {});
+                try mine.put(a, b, val);
                 if (other.contains(b)) try out.put(a, b, {});
             },
             else => {},
         },
-        .list => |items| for (items) |y| try roles(a, y, mine, other, out),
+        .list => |items| for (items) |y| try roles(a, y, mine, val, other, out),
         else => {},
     }
 }

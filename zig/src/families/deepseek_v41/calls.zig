@@ -54,6 +54,11 @@ pub const Call = struct {
     side: bool = false,
     fork: bool = false,
     join: bool = false,
+    /// TF_DSV41_PF_OVERLAP_SITE: `mark` m > 0 on a side call: after it, the side stream records its mark m (the side
+    /// work issued so far); `wait` m > 0 on a main call: the main stream first waits for mark m only, so it can run
+    /// beside the side calls issued after the mark (a `join` still waits for all of them)
+    mark: u8 = 0,
+    wait: u8 = 0,
     /// TF_DSV41_MHC_DEFER: an mHC coefficient launch on the deferred stream (forked from main first); `defer_join`:
     /// the main stream waits for it first (the next mHC call, the coefficients' reader)
     defer_side: bool = false,

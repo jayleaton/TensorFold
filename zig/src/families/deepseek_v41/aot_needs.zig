@@ -210,6 +210,7 @@ pub const Served = struct {
         o.gm_v2 = try @import("gm2pf.zig").mode(&knobs.env);
         // TF_DSV41_PF_OVERLAP: its pieces' projections (their own row counts) where the side stream is on
         o.pf_overlap = try knobs.pfOverlap(&knobs.env);
+        o.pf_overlap_site = o.pf_overlap > 0 and try knobs.pfOverlapSite(&knobs.env); // the site pieces' `_finish_k`
         o.stream_rb = try knobs.streamRb(&knobs.env); // TF_DSV41_STREAM_RB: the twin's variants
         if (o.pf_overlap > 0) o.branches = (try @import("branches.zig").settings()).on;
         if (try knobs.indexBudget(&knobs.env)) |b| o.index_budget = b;
