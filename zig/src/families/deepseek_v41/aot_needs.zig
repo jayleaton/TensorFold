@@ -403,6 +403,12 @@ pub fn enumerate(gpa: std.mem.Allocator, n: *Needs, cfg: *const Config, w: *cons
             const world: i64 = sv.o.world;
             const c = world * @min(64, @divTrunc(128, world));
             for ([_]bool{ true, false }) |conf| _ = try n.program(try dspark_emit.emitChain(pb, cfg, w, sv.o, cfg.dspark_block, sv.slots, c, conf));
+            try log.print("aot-needs: DSpark chain (TF_DSV41_DRAFT_CHAIN), N {d}, KP {d}, {d} candidates, with and without the confidence head\n", .{ cfg.dspark_block, dspark_emit.chain_kp, c });
+        } else if (try @import("dspark_dev.zig").chainFromEnv()) {
+            // the served config would boot without its chain (dspark_slots refuses it): a fill env that drifted
+            try log.print("aot-needs: TF_DSV41_DRAFT_CHAIN=1 without slot drafts (TF_DSV41_SLOTS > 1, TF_DSV41_SLOT_DRAFTS=1, row mode): no _chain variant listed\n", .{});
+            try log.flush();
+            return error.ChainWithoutSlotDrafts;
         }
         try log.print("aot-needs: DSpark, {d} programs, {d} variants\n", .{ n.programs, n.keys.count() });
         try log.flush();

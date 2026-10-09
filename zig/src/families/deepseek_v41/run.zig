@@ -121,6 +121,26 @@ pub const Runner = struct {
         };
     }
 
+    /// The first Triton call of `cs` the AOT set has no variant for (its function's name), null when every one has:
+    /// a program's launches resolved without issuing them (a boot-time probe), every tensor taken 16-aligned as the
+    /// runner's buffers are.
+    pub fn missingTriton(r: *const Runner, cs: []const calls.Call) !?[]const u8 {
+        var arena = std.heap.ArenaAllocator.init(r.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        for (cs) |*c| if (c.triton) {
+            var mine: std.ArrayList(cuda.aot.Spec) = .empty;
+            for (r.triton.variants) |v| if (std.mem.eql(u8, v.spec.@"fn", c.name)) try mine.append(a, v.spec);
+            const sp = tc.split(a, c, mine.items, .{ .ctx = @constCast(r), .of = alignedAddr }) catch return c.name;
+            _ = r.triton.find(c.name, sp.args, sp.consts) catch return c.name; // error.MissingTritonVariant
+        };
+        return null;
+    }
+
+    fn alignedAddr(_: *anyopaque, _: calls.Tensor) anyerror!u64 {
+        return 1 << 20;
+    }
+
     fn addrOf(ctx: *anyopaque, t: calls.Tensor) anyerror!u64 {
         const r: *const Runner = @ptrCast(@alignCast(ctx));
         return r.tensorAddr(t);
