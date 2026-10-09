@@ -140,7 +140,9 @@ done
 # the other rank fails or stops answering, so neither waits out a deadline on a dead peer. The AOT merges and the
 # tokens' comparison run in the image as the references wrote their files (root), not as the host user.
 # PIECES_PROMPTS (160 300 500 700: every piece past 16 rows, their rows within one 2,048-row run), PIECES_STEPS (24),
-# PIECES_RUNS ("1 0 2"). About 30 min.
+# PIECES_RUNS ("1 0 2", or "0,2": the runs to do). Each run starts when both ranks posted ready on the peer channel
+# (PIECES_BARRIER_S, 900); rank 0 posts the run's pass once its own checks hold, and rank 1 takes it as the run's verdict
+# (its follower's exit 70 when rank 0's process ends is then no failure; PIECES_PASS_S, 120). About 30 min.
 if [[ "${PIECES:-0}" == 1 ]]; then
     P=/out/pieces; mkdir -p "$OUT/pieces"
     prompts=${PIECES_PROMPTS:-160 300 500 700}; psteps=${PIECES_STEPS:-24}
@@ -216,7 +218,19 @@ print(f"pieces: Python batched == alone, tokens: {same}/{len(ps)} (informational
     ln -sfn /served-assets/rope.bin "$OUT/pieces/assets/rope.bin"
     A=$P/assets
     refs=(); for p in $prompts; do refs+=("$P/ref-batched/p$p"); done
-    for runs in ${PIECES_RUNS:-1 0 2}; do
+    runlist=${PIECES_RUNS:-1 0 2}; runlist=${runlist//,/ }
+    other=$(( 1 - RANK ))
+    # a mark on the peer channel (a run's ready / pass), retried while rank 0's server comes up
+    ppost() {
+        local i
+        for i in $(seq 90); do "${peer[@]}" set "$MASTER" "$peerport" "$1" "$2" > /dev/null 2>&1 && return 0; sleep 2; done
+        return 1
+    }
+    for runs in $runlist; do
+        # both ranks ready before either starts the run (the other may still be in its previous run's ending)
+        ppost "ready.$runs.$RANK" "ready" || pfail "run $runs: the peer channel at $MASTER:$peerport"
+        msg=$("${peer[@]}" await "$MASTER" "$peerport" "ready.$runs.$other" "${PIECES_BARRIER_S:-900}" "$other") \
+            || pfail "run $runs: rank $other not ready ($msg)"
         drop_caches
         pr=$(( runs > 0 )); rr=$(( runs == 2 ))
         log "pieces: ours, TF_DSV41_PIECE_RUNS=$pr TF_DSV41_REPLAY_RUNS=$rr"
@@ -236,22 +250,36 @@ print(f"pieces: Python batched == alone, tokens: {same}/{len(ps)} (informational
             > "$OUT/pieces/check-runs$runs.log" 2>&1
         crc=$?; log "pieces: run $runs preflight: $(tail -1 "$OUT/pieces/check-runs$runs.log")"
         (( crc == 0 )) || pfail "run $runs preflight ($(grep -h '^pieces_check: FAIL [^0-9]' "$OUT/pieces/check-runs$runs.log" | head -3 | cut -c20- | tr '\n' ';'))"
-        [[ "$DRY" == 1 ]] && continue
+        if [[ "$DRY" == 1 ]]; then
+            echo "PASS sess4 turn 1 == Python: (dry run)" > "$OUT/pieces/zig-runs$runs.log"
+            [[ "$RANK" == 0 ]] && { echo "piece runs: (dry)"; echo "replay runs: (dry)"; } >> "$OUT/pieces/zig-runs$runs.log"
+            rc=${PIECES_DRY_RC:-0}     # the dry run's stand-in for the run's exit (70: a follower's fail-fast at rank 0's end)
+        else
         timed "${PIECES_RUN_MIN:-12}" "dsv41-zig-pieces-r$RANK" "${ARGS[@]}" -v "$served:/served-assets:ro" --env-file "$fillenv" \
             $(printf -- '-e %s ' "${zenv[@]}") \
             --entrypoint bash "$IMAGE" -c 'export TF_NCCL_LIB=$(python -c "import nvidia.nccl, os; print(os.path.join(os.path.dirname(nvidia.nccl.__file__), \"lib\", \"libnccl.so.2\"))" 2>/dev/null || echo libnccl.so.2); mkdir -p '"$P/zig-runs$runs"'; exec /kit/tf-dsv41-m1 '"$cmd" \
             > "$OUT/pieces/zig-runs$runs.log" 2>&1
-        rc=$?; verdict=$(grep -h '^PASS sess4\|^FAIL sess4' "$OUT/pieces/zig-runs$runs.log" | tail -1)
+        rc=$?
+        fi
+        verdict=$(grep -h '^PASS sess4\|^FAIL sess4' "$OUT/pieces/zig-runs$runs.log" | tail -1)
         log "pieces: run $runs rc $rc in $(( $(date +%s) - t0 )) s: ${verdict:-no verdict}"
-        (( rc == 0 )) || pfail "run $runs (rc $rc, zig-runs$runs.log: $(grep -m1 -h 'error\|panic\|MissingTriton\|no captured' "$OUT/pieces/zig-runs$runs.log" | cut -c1-160))"
         if [[ "$RANK" == 0 ]]; then
+            (( rc == 0 )) || pfail "run $runs (rc $rc, zig-runs$runs.log: $(grep -m1 -h 'error\|panic\|MissingTriton\|no captured' "$OUT/pieces/zig-runs$runs.log" | cut -c1-160))"
             [[ "$verdict" == PASS* ]] || pfail "run $runs: ${verdict:-no turn-1 verdict}"
             (( pr == 0 )) || grep -q "piece runs: " "$OUT/pieces/zig-runs$runs.log" || pfail "run $runs logged no multi-segment run (piece runs)"
             (( rr == 0 )) || grep -q "replay runs: " "$OUT/pieces/zig-runs$runs.log" || pfail "run $runs logged no batched decoder replay (replay runs)"
+            # the run's verdict for rank 1: its follower ends when rank 0's does (fail-fast's exit 70 included)
+            ppost "pass.$runs" "PASS run $runs" || pfail "run $runs: could not post its pass"
+        else
+            # the verdict is rank 0's: a follower's exit after rank 0 posted the pass (rc 70: fail-fast once rank 0's
+            # process ended) is a pass; rank 0's FAIL, or no pass, is a failure
+            msg=$("${peer[@]}" await "$MASTER" "$peerport" "pass.$runs" "${PIECES_PASS_S:-120}" 0) \
+                || pfail "run $runs: rank 0's verdict ($msg; this rank's rc $rc, zig-runs$runs.log: $(grep -m1 -h 'error\|panic' "$OUT/pieces/zig-runs$runs.log" | cut -c1-120))"
+            (( rc == 0 )) || log "pieces: run $runs: rc $rc after rank 0's pass (fail-fast at rank 0's exit): pass"
         fi
     done
-    [[ "$DRY" == 1 ]] && { log "PASS pieces dry run: every run's preflight"; pstop; trap - EXIT; exit 0; }
-    log "PASS pieces: runs ${PIECES_RUNS:-1 0 2} == Python's batched reference"
+    [[ "$DRY" == 1 ]] && { log "PASS pieces dry run: runs $runlist (preflight, barrier, verdict)"; [[ "$RANK" == 0 ]] && sleep 5; pstop; trap - EXIT; exit 0; }
+    log "PASS pieces: runs $runlist == Python's batched reference"
     [[ "$RANK" == 0 ]] && sleep 10      # rank 1's last watcher reads the server once more before it goes
     pstop; trap - EXIT
     port=$((port + 20))

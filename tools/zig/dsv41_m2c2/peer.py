@@ -6,6 +6,9 @@ it waiting on a collective until its deadline.
     peer.py serve PORT                    rank 0, in the background for the stage's life
     peer.py set HOST PORT RANK STATE      STATE: "ok ..." or "FAIL <reason>"
     peer.py beat HOST PORT RANK PID       this rank's heartbeat every 3 s while process PID (the stage's shell) lives
+    peer.py await HOST PORT KEY SECONDS OTHER   until KEY was posted (`set HOST PORT KEY ...`: a run's ready or pass
+                                          mark), exit 0 with its message; exit 1 when rank OTHER posted FAIL, its
+                                          heartbeat stopped, or SECONDS passed
     peer.py watch HOST PORT RANK NAME     while NAME runs: when the other rank posts
                                           FAIL, its heartbeat stops (after it was seen) or the server is gone (past a
                                           grace): `docker rm -f NAME`, exit 1; the caller kills it when NAME is done
@@ -66,6 +69,34 @@ def main() -> int:
                 return 0
             except OSError:
                 time.sleep(2)
+        return 1
+    if cmd == "await":
+        key, limit, other = sys.argv[4], float(sys.argv[5]), sys.argv[6]
+        t0 = time.time()
+        heard = False
+        while time.time() - t0 < limit:
+            try:
+                st = {}
+                for l in talk(host, port, "GET").splitlines():
+                    if l and l != "end":
+                        r, age, msg = l.split(" ", 2)
+                        st[r] = (float(age), msg)
+                if key in st:
+                    print(st[key][1], flush=True)
+                    return 0
+                if other in st:
+                    age, msg = st[other]
+                    if msg.startswith("FAIL"):
+                        print(f"rank {other} failed: {msg}", flush=True)
+                        return 1
+                    if heard and age > LOST_S:
+                        print(f"rank {other} stopped answering ({age:.0f} s)", flush=True)
+                        return 1
+                    heard = heard or age < LOST_S
+            except OSError:
+                pass
+            time.sleep(1)
+        print(f"{key} not posted within {limit:.0f} s", flush=True)
         return 1
     if cmd == "beat":
         rank, pid = sys.argv[4], int(sys.argv[5])
