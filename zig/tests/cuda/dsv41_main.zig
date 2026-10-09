@@ -8,6 +8,7 @@ const dsv41 = @import("dsv41_kernels");
 const check = @import("check.zig");
 const experts = @import("deepseek_v41/experts.zig");
 const kvsplit = @import("deepseek_v41/kvsplit.zig");
+const mhcdec = @import("deepseek_v41/mhcdec.zig");
 const replay_case = @import("deepseek_v41/replay.zig");
 const x3gm3_bench = @import("deepseek_v41/x3gm3_bench.zig");
 
@@ -111,6 +112,8 @@ fn all(gpu: check.Gpu, k: *const dsv41.Kernels, root: []const u8) !void {
             experts.glueCases(gpu, k, path)
         else if (std.mem.eql(u8, kind.slice(), "pfglue"))
             experts.pfglueCases(gpu, k, path)
+        else if (std.mem.eql(u8, kind.slice(), "mhcdec"))
+            mhcdec.cases(gpu, k, path)
         else if (std.mem.eql(u8, kind.slice(), "replay")) blk: {
             const o = replay_case.run(gpu, k, path) catch |e| break :blk e;
             if (o == .skipped) {

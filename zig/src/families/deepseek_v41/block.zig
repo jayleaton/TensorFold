@@ -55,6 +55,9 @@ pub const Options = struct {
     branch_rows: i64 = 64,
     /// TF_DSV41_MHC_DEFER (with R1): R1's coefficient launch tagged for the deferred stream, the next mHC call joins it
     mhc_defer: bool = false,
+    /// TF_DSV41_MHC_PFDEC (ours, 0 = off): mixing mHC sites of windows of at least this many rows (1-64) as mhc_pf's site
+    /// + the normed input + mhc_cuda's coef_kernel (block_wide.zig); the same bits as the path they replace
+    mhc_pf_rows: i64 = 0,
     /// TF_DSV41_L2PF_MB (bytes), _CHUNK_KB, _PACE_GBPS, _PACE_CTAS; the GPU's SMs (a segments launch's grid bound)
     l2pf_budget: u64 = 12 << 20,
     l2pf_chunk: i64 = 32768,

@@ -29,7 +29,8 @@ pub fn mhc(e: *E, layer: ?u32, which: []const u8, mode: Mode) !void {
 /// decoder replay, replay.finish's Streams has no `alt`).
 pub fn mhcInto(e: *E, layer: ?u32, which: []const u8, mode: Mode, in_place: bool) !void {
     // past mhc_cuda's 16 rows (TF_DSV41_ROWS_CAP past 16): Python's Triton `_site` + `_finish_k` (block_wide.zig)
-    if (e.n > wide.cuda_rows) return wide.decode(e, layer, which, mode, in_place);
+    // TF_DSV41_MHC_PFDEC: a mixing site of the knob's rows or more, mhc_pf + coef_kernel (block_wide.zig)
+    if (e.n > wide.cuda_rows or wide.pfOn(e, mode)) return wide.decode(e, layer, which, mode, in_place);
     const n = e.n;
     const D: i64 = e.cfg.hidden;
     const post = mode == .boundary or mode == .final;

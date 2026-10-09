@@ -9,7 +9,7 @@
 //! allocations; the empty role is address 0).
 //!
 //! The served config is the environment the engine reads (TF_DSV41_CONTEXT, TF_DSV41_SLOTS, TF_DSV41_ROWS_CAP,
-//! TF_DSV41_PREFILL_ROWS, TF_DSV41_INDEX_BUDGET_MIB, R1's knobs, TF_TP_WORLD, TF_DSV41_KV_SPLIT, TF_DSV41_DRAFTS,
+//! TF_DSV41_PREFILL_ROWS, TF_DSV41_INDEX_BUDGET_MIB, R1's knobs, TF_DSV41_MHC_PFDEC, TF_TP_WORLD, TF_DSV41_KV_SPLIT, TF_DSV41_DRAFTS,
 //! TF_DSV41_SLOT_DRAFTS / TF_DSV41_SLOT_DRAFT_GROUP, the graph buckets), with the release config and the q28-v2 widths (the served pack's).
 //! Its programs:
 //! - one-slot decode windows of 1 .. max(16, block + 1) rows: eager at every end position (the scan below), and graphed
@@ -206,6 +206,8 @@ pub const Served = struct {
         o.rope_rows = o.limit + 2048;
         if (try knobs.prefillRows(&knobs.env)) |r| o.prefill_rows = r;
         if (try knobs.indexBudget(&knobs.env)) |b| o.index_budget = b;
+        // TF_DSV41_MHC_PFDEC: its norm is `_finish_k` without COEF at the windows it covers
+        o.mhc_pf_rows = try knobs.mhcPfRows(&knobs.env);
         const drafts = envOn("TF_DSV41_DRAFTS", true);
         o.taps = drafts;
         const pages = @divExact(o.limit, block.Pool.page);

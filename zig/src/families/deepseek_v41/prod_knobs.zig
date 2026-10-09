@@ -167,6 +167,18 @@ pub fn r1(get: Get) bool {
 
 /// TF_DSV41_INDEX_BUDGET_MIB (Python's default 256; prod 64): the indexer's scores and sort keys a launch, in bytes;
 /// prefill's row blocks follow it (csa2 backend; the same bits at any budget), so its scratch shrinks with it.
+/// TF_DSV41_MHC_PFDEC (ours, block_wide.zig): unset / 0 off, else the fewest rows a window's mixing mHC sites take
+/// mhc_pf + coef_kernel at (1-64; 17: only the windows past mhc_cuda's 16 rows, which run Triton today).
+pub fn mhcPfRows(get: Get) !i64 {
+    const raw = std.mem.trim(u8, get("TF_DSV41_MHC_PFDEC") orelse return 0, " \t");
+    const v = std.fmt.parseInt(i64, raw, 10) catch -1;
+    if (v < 0 or v > 64) {
+        std.log.warn("TF_DSV41_MHC_PFDEC={s}: expected 0 (off) or the fewest rows, 1..64", .{raw});
+        return error.BadKnob;
+    }
+    return v;
+}
+
 pub fn indexBudget(get: Get) !?i64 {
     const raw = get("TF_DSV41_INDEX_BUDGET_MIB") orelse return null;
     const v = std.fmt.parseInt(i64, std.mem.trim(u8, raw, " "), 10) catch return badBudget(raw);
@@ -246,6 +258,7 @@ pub fn apply(f: *@import("forward.zig").Forward, a: std.mem.Allocator, io: std.I
     if (try indexBudget(&env)) |b| f.opts.index_budget = b;
     f.prefill_state.ahead = prefetchAhead(&env);
     f.opts.gm_v2 = try @import("gm2pf.zig").mode(&env);
+    f.opts.mhc_pf_rows = try mhcPfRows(&env);
     f.prefill_state.mode = try prefillMode(&env);
     // TF_DSV41_BRANCHES: the side stream exists before any capture
     if (f.branches == null) f.branches = try @import("branches.zig").install(f.gpa, f, rank);
@@ -262,7 +275,7 @@ pub fn apply(f: *@import("forward.zig").Forward, a: std.mem.Allocator, io: std.I
     }
     if (rank != 0) return;
     const log = std.log.scoped(.dsv41);
-    log.info("prod knobs: pf_dense {s}, prefill rows {d}, index budget {d} MiB, R1 {s}, prefetch ahead {s}, x3gm v2 {t}, prefill {t}", .{ if (f.opts.pfd != null) "fused" else "off", f.opts.prefill_rows, f.opts.index_budget >> 20, if (f.opts.r1) "on" else "off", if (f.prefill_state.ahead) "on" else "off", f.opts.gm_v2, f.prefill_state.mode });
+    log.info("prod knobs: pf_dense {s}, prefill rows {d}, index budget {d} MiB, R1 {s}, prefetch ahead {s}, x3gm v2 {t}, prefill {t}, mhc pfdec {d}", .{ if (f.opts.pfd != null) "fused" else "off", f.opts.prefill_rows, f.opts.index_budget >> 20, if (f.opts.r1) "on" else "off", if (f.prefill_state.ahead) "on" else "off", f.opts.gm_v2, f.prefill_state.mode, f.opts.mhc_pf_rows });
 }
 
 pub fn env(name: []const u8) ?[]const u8 {

@@ -22,6 +22,11 @@ const rowmode = @import("rowmode.zig");
 const dspark_emit = @import("dspark_emit.zig");
 const Config = @import("config.zig").Config;
 
+// TF_DSV41_MHC_PFDEC on the same emitters
+test {
+    _ = @import("mhc_pfdec_test.zig");
+}
+
 fn widths(a: std.mem.Allocator) !block.Widths {
     var w: block.Widths = .{};
     try check.parseDense(a, &w, @embedFile("fixtures/q28v2-dense-k2.txt"));
