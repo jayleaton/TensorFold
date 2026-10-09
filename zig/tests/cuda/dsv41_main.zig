@@ -9,6 +9,7 @@ const check = @import("check.zig");
 const experts = @import("deepseek_v41/experts.zig");
 const kvsplit = @import("deepseek_v41/kvsplit.zig");
 const mhcdec = @import("deepseek_v41/mhcdec.zig");
+const mhc_alloc = @import("deepseek_v41/mhc_alloc_bench.zig");
 const replay_case = @import("deepseek_v41/replay.zig");
 const x3gm3_bench = @import("deepseek_v41/x3gm3_bench.zig");
 
@@ -19,6 +20,7 @@ const usage =
     \\  experts <dir>      decode chain: group, rot_in, x3ld (every setting) / upstream grouped / x3pf, epilogues, combine
     \\  x3gm <dir>         fast prefill: rot, gate/up and down at every configuration (uniform and ragged), combine
     \\  x3gm3-bench [rows,..] [reps]  x3gm v3 against v2 at prod's prefill shapes: bits and time (synthetic data)
+    \\  mhc-alloc [windows]  the 16-row mHC boundary's time with buffers per cuMemAlloc / arena / VMM (TF_DSV41_ARENA)
     \\  replay <dir>       one recorded Python extension call (dsv41_capture.py) re-issued and compared, storage by storage
     \\  all <fixtures>     every case directory under <fixtures> by its manifest's "kind"
     \\
@@ -60,6 +62,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "kvsplit")) return kvsplit.run(gpu, &k);
     if (std.mem.eql(u8, cmd, "experts")) return experts.decodeChain(gpu, &k, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "x3gm")) return experts.x3gm(gpu, &k, try arg(rest, 0));
+    if (std.mem.eql(u8, cmd, "mhc-alloc")) return mhc_alloc.run(gpu, &k, if (rest.len > 0) rest[0] else null);
     if (std.mem.eql(u8, cmd, "x3gm3-bench")) return x3gm3_bench.run(gpu, &k, if (rest.len > 0) rest[0] else null, if (rest.len > 1) rest[1] else null);
     if (std.mem.eql(u8, cmd, "replay")) {
         if (try replay_case.run(gpu, &k, try arg(rest, 0)) == .skipped) std.debug.print("SKIP no binding\n", .{});

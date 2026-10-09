@@ -407,3 +407,31 @@ of it.
   `tf-dsv41-test` runs mhc_pf + coef_kernel on the same inputs and compares the streams, the collapsed row, the tap,
   the partials and the coefficients bit for bit, and the normed input from those partials on the host.
 - Spark: an A/B of the code x4 and mix cells with `TF_DSV41_MHC_PFDEC=17` (then `=1`), replies vs Python 4/4.
+
+### 8.5 TF_DSV41_ARENA: the device buffers from a few large chunks (default off)
+
+The suspect behind 8.1's gap: Zig gives each buffer its own `cuMemAlloc` (`cuda/memory.zig`), so the small ones the
+glue kernels read every launch (each layer's mHC `fn16` at 983 KB, norm weights, coefficients, router I/O, tables)
+each sit on pages of their own among the weights, while PyTorch's caching allocator carves them from 2 MiB and
+20 MiB+ segments. If GB10's unified memory pays for that spread (smaller pages, TLB misses on a cold launch), every
+small kernel pays it, not only mHC.
+
+`cuda/arena.zig` sits under `DeviceBuffer.alloc` / `free` when installed (`memory.setHook`):
+- requests up to 4 MiB are bumped, 512-byte aligned, from shared 64 MiB chunks (a freed range is reused for the same
+  rounded size); larger ones get a chunk of their own, rounded to the granularity;
+- backend `vmm` (`TF_DSV41_ARENA=1`): one reserved virtual range (2x the device's memory), physical chunks of the
+  device's recommended granularity (at least 2 MiB) mapped in order; `plain` (`TF_DSV41_ARENA=plain`, and the
+  fallback without VMM): one `cuMemAlloc` a chunk;
+- installed by `dev_arena.zig` right after the TP session opens (the fabric keeps its buffers) and before the
+  weights load, in the server (`model.zig`) and the M2b gate, on every rank.
+
+Only addresses change. Host gate: `dev_arena_test.zig` (every program kind emitted with and without the knob is the
+same call list, argument for argument) and the arena's unit tests (packing, alignment, reuse, large chunks,
+fallback, the hook).
+
+Spark micro-check (seconds, one GPU, prod stopped or on rank 1 between benches): `tf-dsv41-test mhc-alloc [windows]`
+times prod's 16-row boundary and its coef_kernel over 80 per-layer site buffers with a 512 MiB fill between launches,
+with the buffers per `cuMemAlloc`, in the plain arena and in the VMM arena. If per-buffer is ~26 us and the arenas
+~16 us, the theory holds and the knob goes into the next A/B; if all three match, the next suspects are the buffers'
+relative addresses (L2 slice aliasing between x, xout, the gathered rows and the partials) and the instruction side
+(the boundary's code cold after ~1 ms of other kernels in both engines, so less likely).

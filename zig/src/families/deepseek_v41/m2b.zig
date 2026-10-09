@@ -80,6 +80,8 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, ref: []con
         &.{};
     try session.open(&driver, tcfg, image);
     defer session.close();
+    // TF_DSV41_ARENA: every device buffer from here on (weights, forms, roles, scratch) carved from large chunks
+    _ = try @import("dev_arena.zig").install(gpa, &ctx, rank);
     const comm = session.comm();
 
     const t0 = std.Io.Clock.awake.now(io);
