@@ -19,6 +19,15 @@ step() { echo "=== $(date -u +%H:%M:%S) $*"; }
 step "device"
 nvidia-smi --query-gpu=name,compute_cap,clocks.max.sm,memory.total --format=csv | tee "$OUT/device.txt"
 grep -o '"fn": *"_dtopk[a-z0-9_]*"' "$A/aot.json" | sort | uniq -c | tee "$OUT/variants.txt"
+# the gate compares the served kernel with its twin: the AOT set must hold both (the served set with the
+# fill-ibound.env fill merged in: tools/zig/triton_fill.py merge <copy of the served aot dir> <the fill's aot dir>);
+# a set holding one of them skips every compare, which is no verdict
+for fn in _dtopk _dtopk_b; do
+    if ! grep -q "\"fn\": *\"$fn\"" "$A/aot.json"; then
+        echo "no $fn variant in $A/aot.json: merge the served set and the fill-ibound.env fill (triton_fill.py merge)" | tee "$OUT/no-variants.txt"
+        exit 2
+    fi
+done
 
 step "topk-b: topk_b_kernel / _dtopk_b against topk_kernel / _dtopk"
 "$T" topk-b "$A" --reps "${TOPK_B_REPS:-20}" 2>&1 | tee "$OUT/topk_b.log"

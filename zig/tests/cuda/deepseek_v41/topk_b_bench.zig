@@ -34,6 +34,9 @@ const tk = dsv41.ops.topk;
 const K: i64 = 512;
 const CB: i64 = 2048;
 const BS: i64 = 8;
+/// graphs.Settings.bucket: a served window's keys end at a multiple of it (Triton's div16 specialization of NK and
+/// the strides: the served variants)
+const bucket: i64 = 2048;
 const LONG: i64 = 154_183; // the bench's 131K prompt (long-131072: 154,183 prompt tokens)
 
 const Rng = struct {
@@ -222,7 +225,9 @@ pub fn run(gpu: Gpu, k: *const dsv41.Kernels, rest: []const [:0]const u8) !void 
         const R = pos.len;
         var last: i64 = 0;
         for (pos) |q| last = @max(last, q);
-        const nk: i64 = @max(@divFloor(last + 1, sh.ratio), 1);
+        // the served window's NK: its context bucket's end (a 2,048-token step) over the ratio, every row's keys past
+        // its own visible end -inf (fillScores); a multiple of 16, as the served row-mode variants' NK / s_stride are
+        const nk: i64 = @divFloor(std.mem.alignForward(i64, last + 1, bucket), sh.ratio);
         const nku: usize = @intCast(nk);
         const host = try gpa.alloc(f32, R * nku);
         defer gpa.free(host);
