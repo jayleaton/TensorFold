@@ -21,6 +21,13 @@
 //! - CED replay (TF_DSV41_PREFILL=replay, ced.zig): the decoder pass over a prompt's tail, 127 rows from any R0 (the
 //!   scan) and every shorter tail from 0 (a prompt of at most 128 tokens); its encoder segments are the prefill
 //!   segments' launches.
+//! - Multi-segment runs (block_prefill.emitMulti; TF_DSV41_PIECE_RUNS / TF_DSV41_REPLAY_RUNS with several slots and
+//!   replay): a run's launches are its one-segment programs' except where its rows' place in the run is an argument:
+//!   the fused core's OR (the run's rows: an int's class) and its CNT (the selection counts at row0: 4-byte rows, so
+//!   aligned or not) with attn_cuda's top-k for a short segment. Two-segment runs cover them: each segment next to a
+//!   17..64-row one (aligned and not, every short segment's top-k) and a 100-row one next to every pad of 17..48 (every
+//!   OR class, both alignments), at each prefill regime's start; decoder tails the same from 0 (33..127 rows) and a
+//!   127-row tail at every R0 (the scan) beside a 33-row one.
 //! The scan: a window's launches change only where a threshold crosses (the index budget, attn_cuda.plan, the stream
 //! threshold, ...), and between them an int's class repeats every 256 positions (keys = end / ratio, ratio <= 2;
 //! blocks = keys / 8; % 16). So every position of the first 512 is emitted, then every 256th; where two samples'
@@ -195,6 +202,9 @@ pub const Served = struct {
     graphs: graphs.Settings,
     /// TF_DSV41_PREFILL=replay: the decoder pass's programs too
     replay: bool = false,
+    /// TF_DSV41_PIECE_RUNS / TF_DSV41_REPLAY_RUNS (several slots, replay): the multi-segment runs' programs too
+    runs: bool = false,
+    replay_runs: bool = false,
 
     /// The engine's knobs as model.zig / prod_knobs.zig read them (the dense prefill's table and image paths aside:
     /// PF_DENSE's fused kernel is CUDA, so the `_gemm` variants it replaces are listed too).
@@ -223,6 +233,8 @@ pub const Served = struct {
             .group = try rows_mod.groupFromEnv((Config{}).dspark_block),
             .graphs = try graphs.Settings.fromEnvOr(true),
             .replay = try knobs.prefillMode(&knobs.env) == .replay,
+            .runs = slots > 1 and envOn("TF_DSV41_PIECE_RUNS", false) and try knobs.prefillMode(&knobs.env) == .replay,
+            .replay_runs = slots > 1 and envOn("TF_DSV41_REPLAY_RUNS", false) and try knobs.prefillMode(&knobs.env) == .replay,
         };
     }
 };
@@ -284,6 +296,32 @@ fn decoderAt(ctx: *const anyopaque, a: std.mem.Allocator, end: i64) anyerror![]c
 fn prefillAt(ctx: *const anyopaque, a: std.mem.Allocator, end: i64) anyerror![]const calls.Call {
     const c: *const Ctx = @ptrCast(@alignCast(ctx));
     return block_prefill.emitPrefill(a, c.cfg, c.w, c.o, c.layers, c.rows, end - c.rows, true);
+}
+
+/// One multi-segment run's program (block_prefill.emitMulti); a run the options refuse adds nothing.
+fn run(n: *Needs, cfg: *const Config, w: *const block.Widths, o: block.Options, layers: []const u32, part: block_prefill.Part, spans: []const block_prefill.Span) !void {
+    var pa = std.heap.ArenaAllocator.init(n.gpa);
+    defer pa.deinit();
+    const cs = block_prefill.emitMulti(pa.allocator(), cfg, w, o, layers, spans, part) catch |e| switch (e) {
+        error.Unsupported => return,
+        else => return e,
+    };
+    _ = try n.program(cs);
+}
+
+/// Decoder replay runs at a position: a 127-row tail ending at `end` beside a 33-row tail from 0 (`first`: the 127-row
+/// tail is the run's first segment).
+const MultiCtx = struct { c: Ctx, first: bool };
+
+fn tailsAt(ctx: *const anyopaque, a: std.mem.Allocator, end: i64) anyerror![]const calls.Call {
+    const m: *const MultiCtx = @ptrCast(@alignCast(ctx));
+    const long: block_prefill.Span = .{ .slot = 0, .start = end - m.c.rows, .n = m.c.rows };
+    const short: block_prefill.Span = .{ .slot = 1, .start = 0, .n = 33 };
+    const spans = if (m.first) [_]block_prefill.Span{ long, short } else [_]block_prefill.Span{ short, long };
+    return block_prefill.emitMulti(a, m.c.cfg, m.c.w, m.c.o, m.c.layers, &spans, .decoder) catch |e| switch (e) {
+        error.Unsupported => &.{},
+        else => e,
+    };
 }
 
 /// The context buckets' ends up to the limit (graphs.bucketEnd).
@@ -367,6 +405,23 @@ pub fn enumerate(gpa: std.mem.Allocator, n: *Needs, cfg: *const Config, w: *cons
             try log.print("aot-needs: prefill from {d}, {d} programs, {d} variants\n", .{ s0, n.programs, n.keys.count() });
             try log.flush();
         }
+        if (sv.runs) {
+            const enc = layers[0 .. try ced.decoderStart(cfg) + 1];
+            for (starts.items) |s0| {
+                var k: i64 = 17;
+                while (k <= 64) : (k += 1) {
+                    try run(n, cfg, w, sv.o, enc, .encoder, &.{ .{ .slot = 0, .start = s0, .n = 17 }, .{ .slot = 1, .start = s0, .n = k } });
+                    try run(n, cfg, w, sv.o, enc, .encoder, &.{ .{ .slot = 0, .start = s0, .n = k }, .{ .slot = 1, .start = s0, .n = 17 } });
+                }
+                k = 17;
+                while (k <= 48) : (k += 1) {
+                    try run(n, cfg, w, sv.o, enc, .encoder, &.{ .{ .slot = 0, .start = s0, .n = k }, .{ .slot = 1, .start = s0, .n = 100 } });
+                    try run(n, cfg, w, sv.o, enc, .encoder, &.{ .{ .slot = 0, .start = s0, .n = 100 }, .{ .slot = 1, .start = s0, .n = k } });
+                }
+            }
+            try log.print("aot-needs: piece runs, {d} programs, {d} variants\n", .{ n.programs, n.keys.count() });
+            try log.flush();
+        }
     }
     // CED replay's decoder pass (ced.tailOf): a prompt of n > 128 tokens replays 127 rows ending at n - 1 (the scan),
     // a shorter one its n - 1 rows from 0
@@ -382,6 +437,24 @@ pub fn enumerate(gpa: std.mem.Allocator, n: *Needs, cfg: *const Config, w: *cons
         }
         try log.print("aot-needs: CED decoder, {d} programs, {d} variants\n", .{ n.programs, n.keys.count() });
         try log.flush();
+        if (sv.replay_runs) {
+            var k: i64 = 33;
+            while (k <= ced.keep) : (k += 1) {
+                try run(n, cfg, w, sv.o, dec, .decoder, &.{ .{ .slot = 0, .start = 0, .n = 33 }, .{ .slot = 1, .start = 0, .n = k } });
+                try run(n, cfg, w, sv.o, dec, .decoder, &.{ .{ .slot = 0, .start = 0, .n = k }, .{ .slot = 1, .start = 0, .n = 33 } });
+            }
+            k = 33;
+            while (k <= 48) : (k += 1) {
+                try run(n, cfg, w, sv.o, dec, .decoder, &.{ .{ .slot = 0, .start = 0, .n = k }, .{ .slot = 1, .start = 0, .n = ced.keep } });
+                try run(n, cfg, w, sv.o, dec, .decoder, &.{ .{ .slot = 0, .start = 0, .n = ced.keep }, .{ .slot = 1, .start = 0, .n = k } });
+            }
+            for ([_]bool{ false, true }) |first| {
+                const mc: MultiCtx = .{ .c = c, .first = first };
+                try scan(n, .{ .ctx = &mc, .emit = tailsAt }, ced.keep, limit - 1);
+            }
+            try log.print("aot-needs: replay runs, {d} programs, {d} variants\n", .{ n.programs, n.keys.count() });
+            try log.flush();
+        }
     }
     // DSpark
     if (sv.drafts) {
