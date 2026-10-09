@@ -618,3 +618,18 @@ This is not the lever that beats Python in the 4-stream cells: there the gap is 
      kernel" ~0.03 ms (was 0.48), GPU idle ~1.3 ms a round (was 2.13).
    - If the gain is lower, try `TF_DSV41_ROUND_GRAPH_HEAD=2`.
 3. **Rollback**: `TF_DSV41_ROUND_GRAPH=0` (unset). On a FAIL, set the failing word off: `split` alone, or `gate` alone.
+
+`TF_DSV41_DRAFT_BATCH_PROJ=1` (default off; `check` = on with the first 8 rounds compared; needs the device-started
+round): the round's ingests run `main_proj` and `main_norm` once over every slot's rows (window rows [a0, a1), the
+slots' rows back to back) instead of once a slot, then each slot's 3 blocks (wkv, kv_norm, store) read its rows of
+"w.ds.mx" (`emitIngestProj` + `emitIngestBlocks`; the two together are `emitIngestAt`, call for call). With the
+overlap it runs on the side stream, on its own scratch. Exactness: linear.cu's bits of a row depend on that row alone
+for 1-128 rows. A warp's k range is fixed by (K, N, SK, WK), `dense.plan(K, N)` takes no row count, mma keeps rows
+apart, and the warp and split sums are added in a fixed order; the launcher picks the same kernel and grid at any row
+count (only M and the reduction buffer's size change). `rot_in` and `_rms` are one program a row. So the reduction
+order does not depend on the row count, and batching is exact by construction. `check` proves it on the GPU: each
+check round also projects every slot alone ("w.chk." roles) and compares the rows byte for byte before any block
+reads them; any difference turns batching off, and that round runs the per-slot ingests, so no ring ever holds a
+differing row. Expected: -0.6 ms a 4-slot round (`main_proj` 0.19-0.22 a slot, the weight streamed once instead of
+4 times), +0.5 % code x4 / the mix / prose x4, nothing at 1 stream; with the overlap on, the saving is partly
+already hidden (the ingests then sit beside the window's tail), so the two do not add fully.

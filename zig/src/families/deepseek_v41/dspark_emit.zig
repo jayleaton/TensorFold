@@ -219,15 +219,29 @@ const Ds = struct {
 
     /// One ingest: `n` committed rows' taps (from row `skip` of "w.taps") into every block's ring.
     fn ingest(d: *Ds, skip: i64) !void {
+        try d.ingestProj(skip);
+        try d.ingestBlocks(0);
+    }
+
+    /// An ingest's first half: main_proj and main_norm of `n` taps rows (from row `skip`) into "w.ds.mx" rows [0, n).
+    fn ingestProj(d: *Ds, skip: i64) !void {
         const e = d.e;
         const D: i64 = d.cfg().hidden;
-        const hd: i64 = d.cfg().head_dim;
         const T: i64 = @as(i64, @intCast(d.cfg().dspark_targets.items().len)) * D;
         const taps = try e.view(.{ .buf = d.sl.taps_role }, .bf16, &.{ e.n, T }, &.{ T, 1 }, skip * T * 2);
         const mp = try e.buf("L.ds.mp", .{}, .bf16, &.{ e.n, D });
         const mx = try e.buf("w.ds.mx", .{}, .bf16, &.{ e.n, D });
         try d.mainProj(taps, mp);
         try d.rms(mp, try e.weight("dspark.main_norm", .{}, .f32, &.{D}), mx, D);
+    }
+
+    /// An ingest's second half: each block's wkv, kv_norm and store of `n` rows of "w.ds.mx" from row `mx_row` into
+    /// slot `sl.slot`'s rings at "w.ds.pos".
+    fn ingestBlocks(d: *Ds, mx_row: i64) !void {
+        const e = d.e;
+        const D: i64 = d.cfg().hidden;
+        const hd: i64 = d.cfg().head_dim;
+        const mx = try e.view(.{ .buf = "w.ds.mx" }, .bf16, &.{ e.n, D }, &.{ D, 1 }, mx_row * D * 2);
         var bs: [8]u32 = undefined;
         for (blocks(d.cfg(), &bs), 0..) |L, i| {
             if (i > 0) e.begin = .layer;
@@ -443,6 +457,26 @@ pub fn emitIngest(a: std.mem.Allocator, cfg: *const Config, w: *const block.Widt
     return emitIngestAt(a, cfg, w, o, n, skip, .{});
 }
 
+/// TF_DSV41_DRAFT_BATCH_PROJ (dspark_slots.zig): main_proj and main_norm of `n` taps rows from row `skip` of
+/// `taps_role` into "w.ds.mx" rows [0, n): one call over every slot of a round instead of one a slot. linear.cu's
+/// bits of a row depend on that row alone (its k ranges fixed by (K, N): dense.plan takes no row count; mma keeps
+/// rows apart; warp and split sums in a fixed order), so a row's projection is its slot's alone, bit for bit.
+pub fn emitIngestProj(a: std.mem.Allocator, cfg: *const Config, w: *const block.Widths, o: block.Options, n: i64, skip: i64, taps_role: []const u8) ![]calls.Call {
+    var e: E = .{ .a = a, .cfg = cfg, .w = w, .o = o, .n = n, .start = 0 };
+    var d: Ds = .{ .e = &e, .st = .{ .n = n, .window = cfg.window }, .sl = .{ .taps_role = taps_role } };
+    try d.ingestProj(skip);
+    return e.out.items;
+}
+
+/// The rest of a slot's ingest after emitIngestProj: `n` rows of "w.ds.mx" from row `mx_row` through every block
+/// into slot `sl.slot`'s rings. emitIngestProj(n, skip) ++ emitIngestBlocks(n, 0) is emitIngestAt(n, skip).
+pub fn emitIngestBlocks(a: std.mem.Allocator, cfg: *const Config, w: *const block.Widths, o: block.Options, n: i64, mx_row: i64, sl: Slots) ![]calls.Call {
+    var e: E = .{ .a = a, .cfg = cfg, .w = w, .o = o, .n = n, .start = 0, .begin = .none };
+    var d: Ds = .{ .e = &e, .st = .{ .n = n, .window = cfg.window }, .sl = sl };
+    try d.ingestBlocks(mx_row);
+    return e.out.items;
+}
+
 /// An ingest of `n` rows from row `skip` of `sl.taps_role` into slot `sl.slot`'s rings.
 pub fn emitIngestAt(a: std.mem.Allocator, cfg: *const Config, w: *const block.Widths, o: block.Options, n: i64, skip: i64, sl: Slots) ![]calls.Call {
     var e: E = .{ .a = a, .cfg = cfg, .w = w, .o = o, .n = n, .start = 0 };
@@ -456,10 +490,16 @@ pub fn emitIngestAt(a: std.mem.Allocator, cfg: *const Config, w: *const block.Wi
 /// own stream while a row window still uses the names it shares with block.zig ("L.kv", "L.kvn", ...). The rings,
 /// the weights and the taps keep their roles: the same kernels, arguments and launches, other scratch addresses.
 pub fn sideRoles(a: std.mem.Allocator, cs: []const calls.Call) ![]calls.Call {
+    return renameRoles(a, cs, "w.ovl.");
+}
+
+/// `cs` with every role sideRole names renamed `prefix` ++ role (sideRoles; TF_DSV41_DRAFT_BATCH_PROJ=check's
+/// one-slot projections beside the batched one: "w.chk.").
+pub fn renameRoles(a: std.mem.Allocator, cs: []const calls.Call, prefix: []const u8) ![]calls.Call {
     const out = try a.dupe(calls.Call, cs);
     for (out) |*c| {
         const args = try a.dupe(calls.Named, c.args);
-        for (args) |*x| x.arg = try sideArg(a, x.arg);
+        for (args) |*x| x.arg = try sideArg(a, x.arg, prefix);
         c.args = args;
     }
     return out;
@@ -470,24 +510,24 @@ pub fn sideRole(role: []const u8) bool {
     return buffers.scopeOf(role) != .persistent and !std.mem.eql(u8, role, "w.taps");
 }
 
-fn sideArg(a: std.mem.Allocator, x: Arg) !Arg {
+fn sideArg(a: std.mem.Allocator, x: Arg, prefix: []const u8) !Arg {
     return switch (x) {
-        .t => |t| .{ .t = try sideTensor(a, t) },
-        .opaque_table => |t| .{ .opaque_table = try sideTensor(a, t) },
+        .t => |t| .{ .t = try sideTensor(a, t, prefix) },
+        .opaque_table => |t| .{ .opaque_table = try sideTensor(a, t, prefix) },
         .list => |items| blk: {
             const l = try a.alloc(Arg, items.len);
-            for (items, l) |y, *z| z.* = try sideArg(a, y);
+            for (items, l) |y, *z| z.* = try sideArg(a, y, prefix);
             break :blk .{ .list = l };
         },
         else => x,
     };
 }
 
-fn sideTensor(a: std.mem.Allocator, t: calls.Tensor) !calls.Tensor {
+fn sideTensor(a: std.mem.Allocator, t: calls.Tensor, prefix: []const u8) !calls.Tensor {
     var u = t;
     switch (t.role) {
         .buf => |r| if (sideRole(r)) {
-            u.role = .{ .buf = try std.fmt.allocPrint(a, "w.ovl.{s}", .{r}) };
+            u.role = .{ .buf = try std.fmt.allocPrint(a, "{s}{s}", .{ prefix, r }) };
         },
         else => {},
     }
