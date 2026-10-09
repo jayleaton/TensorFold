@@ -443,3 +443,66 @@ mark): see the port doc's "NEXT SPARK WINDOW: the drafter off the critical path"
 
 Not done, worth it next: one `main_proj` over every slot's rows instead of one a slot (-0.6 ms a 4-slot round, the
 weight streamed once; needs the batched rows' bits proven equal to a slot's alone on the GPU, then also overlapped).
+
+## 8. The mHC family in decode (2026-10-09, offline)
+
+### 8.1 Measured: round 4's code x4 cell (nsys, rank 0, the middle 60 % of the capture: 7.8 s, ~73 rounds)
+
+| launch | rows | Zig n | Zig us | Python us | ms a round (Zig) |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Triton `_site` (split, z 4) | 17-48 | 3,895 | 49.5 | 47.9 | 2.64 |
+| Triton `_finish_k` (COEF) | 17-48 | ~4,360 | 12.7 | 11.9 | 0.76 |
+| mhc_cuda `boundary_kernel` (tail) | 12-16 | 2,000 | 32.0 | 26.0 | 0.88 |
+| mhc_cuda `coef_kernel` (deferred stream) | 12-16 | 2,000 | 9.4 | 8.4 | (overlapped) |
+| Triton `_site` (z 1: DSpark's in-place boundaries, finals, Engram's post) | 5-40 | 736 | 9-72 | | 0.35 |
+| Triton `_rms` (kv_norm beside the SWA store: not mHC) | | 4,400 | 5.3 | 5.5 | 0.32 |
+
+A 4-stream round is ~107 ms; two in three of its windows have 17-48 rows (4 streams' drafts), past mhc_cuda's 16
+(`MAXR`), so their 81 sites run Python's Triton pair at 62 us each, against ~32 us for a 16-row mhc_cuda boundary.
+Python runs the same pair (it is prod's path), so this is a lead over Python, not parity. Zig's 16-row boundary is 6 us
+slower than Python's only when it shares the GPU with the L2 prefetch's `paced_kernel` (32.3 vs 25.9 us; alone 22.0 vs
+19.7): an L2PF pacing difference, not the kernel.
+
+### 8.2 TF_DSV41_MHC_PFDEC=<rows> (block_wide.zig, default 0 = off): the Triton pair as two CUDA launches and the norm
+
+A mixing site of a window of at least <rows> rows (1-64), decode windows, DSpark passes (their in-place boundaries
+too) and short prefill segments alike:
+1. mhc_pf's `site_kernel` (G16's prefill site, a verbatim copy: the same operations as `_site`, checked against Triton
+   bit for bit in G13, any row count, all 4 streams a CTA, so in place is safe);
+2. `_finish_k` without COEF (the normed input alone: the final's instance, NORM_FIRST computes it from the partials
+   and the collapsed row only);
+3. mhc_cuda's `coef_kernel` (R1: `_finish_k`'s sums, sigmoids and Sinkhorn in its instructions, a CTA a row; the
+   Zig launcher now takes up to 64 rows, the kernel has no row limit), on the deferred stream with MHC_DEFER.
+
+No new device code. Every output has the bits of the path it replaces: mhc_pf == `_site` (G13, and the oracle case
+below), coef_kernel == `_finish_k`'s coefficients (R1's replay gate, row independent), the norm is `_finish_k`'s own
+code. Finals and Engram's post-only keep their launches (mhc_pf always mixes).
+
+Expected, from 8.1 (mhc_pf at 24 rows is 80 CTAs of ~49 KB loads each: ~15-20 us estimated, not measured):
+- `PFDEC=17` (the Triton windows only): ~(62 - 21) us x 80 sites = ~3.3 ms a 17-48-row window, ~2.2 ms a 4-stream
+  round (two in three windows) plus ~0.2 ms in the 4-slot DSpark pass: **code x4 / mix ~+2 %**; 1-stream cells
+  unchanged.
+- `PFDEC=1` also replaces mhc_cuda at <= 16 rows: 40 CTAs a site there against mhc_cuda's 160; whether that beats the
+  ~22-32 us boundary is the bench's to say (+0..2 % at 1 stream if it does).
+
+### 8.3 MHC_DEFER in the DSpark pass (fixed)
+
+A DSpark pass of at most 16 rows (1-3 slots) runs block 0's site on mhc_cuda with R1, which leaves its coefficients
+on the deferred stream. The pass's next boundary (Triton `_site`, in place) and its final read exactly those
+coefficients, but the emitter joined the stream only at the end of the program: the reads raced `coef_kernel`
+(Python's `mhc.boundary` / `mhc.final` call `await_coefs(prev)` first). `dspark_emit.zig` now joins before both. The
+launches are unchanged (the M1 gates do not see streams); only the drafts can differ, toward Python's. Round 3's
+1-stream code cell had Zig at 3.375 tokens a round against Python's 3.475; the Spark bench says whether this was part
+of it.
+
+### 8.4 Gates
+
+- Host (`test-dsv41-wide`, mhc_pfdec_test.zig): at 1-64 rows, thresholds 1 and 17, MHC_DEFER on and off, every
+  mixing site becomes the three calls on the tensors the old site read and wrote, every other call is unchanged,
+  each deferred launch is joined before its reader (the off path's DSpark pass included), no new role is shared
+  across the streams, row mode takes the programs.
+- GPU (pod: `TF_DSV41_ORACLE_ONLY='mhcdec.*' bash zig/tests/cuda/deepseek_v41/job.sh <out>`): oracle cases
+  `mhcdec_*` (1-64 rows, boundary with and without tap, in place, site1, site2) run Python's Triton decode path;
+  `tf-dsv41-test` runs mhc_pf + coef_kernel on the same inputs and compares the streams, the collapsed row, the tap,
+  the partials and the coefficients bit for bit, and the normed input from those partials on the host.
+- Spark: an A/B of the code x4 and mix cells with `TF_DSV41_MHC_PFDEC=17` (then `=1`), replies vs Python 4/4.

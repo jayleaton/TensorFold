@@ -253,6 +253,11 @@ const Ds = struct {
     /// exchanged partials `recv`, then `_finish_k` the next coefficients and the normed sublayer input).
     fn site(d: *Ds, L: u32, which: []const u8, recv: []const u8) !void {
         const e = d.e;
+        // MHC_DEFER: block 0's site (mhc_cuda, <= 16 rows) may have left its coefficients on the deferred stream;
+        // they are this boundary's post and pre (Python's mhc.boundary: await_coefs(prev) first)
+        moe.awaitCoefs(e);
+        // TF_DSV41_MHC_PFDEC: mhc_pf in place (a CTA reads only what it writes) + coef_kernel (block_wide.zig)
+        if (wide.pfOn(e, wide.Mode.boundary)) return wide.mhc(e, L, which, .boundary, true, null, null);
         const n = e.n;
         const D: i64 = d.cfg().hidden;
         const x = try e.streams();
@@ -379,6 +384,7 @@ const Ds = struct {
         const b0 = try e.empty(.bf16);
         const x = try e.streams();
         const prev = try d.coefs(e.coef);
+        moe.awaitCoefs(e); // mhc.final: await_coefs(prev)
         try e.ext("tf_dsv41_mhc_cuda_v1.run", &.{
             x,                                                                x,
             try e.buf("w.recv.moe", .{}, .bf16, &.{ e.o.world, n, D }),       prev[1],

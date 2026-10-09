@@ -119,6 +119,9 @@ pub const mhc = struct {
     pub const NT = 128;
     pub const MAXR = 16;
     pub const ROWB = 128;
+    /// coef_kernel is a CTA a row with nothing sized by R: TF_DSV41_MHC_PFDEC launches it past MAXR, up to a decode
+    /// window's 64 rows (the Python binding stops at MAXR, the only rows it launches)
+    pub const COEF_ROWS = 64;
 
     pub const Args = extern struct {
         x: u64 = 0,
@@ -670,7 +673,7 @@ pub const Ops = struct {
     /// dsv41_mhc_coef_cuda (R1): the next site's coefficients of a deferred boundary, a CTA a row; reads part, base,
     /// scale, R, eps, hc_eps, post_alpha, iters and writes opre / opost / ocomb.
     pub fn mhcCoef(o: Ops, a: mhc.Args) !void {
-        if (a.R < 1 or a.R > mhc.MAXR) return error.Shape;
+        if (a.R < 1 or a.R > mhc.COEF_ROWS) return error.Shape;
         var args: cuda.Args = .{};
         args.add(a);
         try o.go(o.f.mhc_coef, .{ @intCast(a.R), 1, 1 }, mhc.NT, 0, null, &args);
