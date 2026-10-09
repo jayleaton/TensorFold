@@ -14,6 +14,7 @@ const Config = @import("config.zig").Config;
 // CED replay's programs on the same emitter (TF_DSV41_PREFILL=replay)
 test {
     _ = @import("ced_test.zig");
+    _ = @import("multi_test.zig");
 }
 
 const Fake = struct {

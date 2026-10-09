@@ -122,8 +122,8 @@ def rank_main(rank: int, a) -> None:
     kv = None
     if kvmode == "contig":
         fw = Forward(cfg, tree, csa2=Triton(128, cfg.num_attention_heads // 2, dev), comm=comm, device=dev,
-                     limit=a.limit, chunk=128, engram_rows=rows, hasher=NgramHasher(cfg, tmap), slots=1,
-                     contiguous=True, pchunk=2048)
+                     limit=a.limit, chunk=128, engram_rows=rows, hasher=NgramHasher(cfg, tmap),
+                     slots=len(a.prompts) if a.batched else 1, contiguous=True, pchunk=2048)
     else:                          # M5: the slot in a (split) KV pool, bound as serving binds it
         import dsv41_m5_kv as M5
         from tensorfold.families.deepseek_v41.cuda.slots import SlotsForward
@@ -140,7 +140,9 @@ def rank_main(rank: int, a) -> None:
 
         rec = aot.Recorder().install()
     dirs = [Path(a.out) / f"p{p}" for p in a.prompts] if a.prompts else [Path(a.out)]
-    for i, (prompt, out) in enumerate(zip(a.prompts or [a.prompt], dirs)):
+    if a.batched:
+        batched(rank, a, fw, cfg, greedy, Seg, digest, dirs, lo, hi, t0, load_s)
+    for i, (prompt, out) in enumerate(zip([] if a.batched else (a.prompts or [a.prompt]), dirs)):
         if i > 0:
             if kv is None:
                 fw.slots[0] = fw.new_slot(contiguous=True)
@@ -373,18 +375,60 @@ def replay_prompt(fw, Seg, ids):
     return lg[-1:]
 
 
-def one(rank, a, fw, cfg, greedy, Seg, digest, prompt, out, lo, hi, t0, load_s, last, kv=None) -> None:
-    """One prompt from the slot as it is: its state dump, greedy steps and digests into ``out``."""
+def prompt_ids(a, cfg, prompt: int) -> list[int]:
+    import torch
+
+    g = torch.Generator().manual_seed(a.seed)
+    return torch.randint(3, cfg.vocab_size, (prompt,), generator=g).tolist()
+
+
+def batched(rank, a, fw, cfg, greedy, Seg, digest, dirs, lo, hi, t0, load_s) -> None:
+    """``--batched`` (with ``--prefill replay --prompt-tail verify``): prod's batcher with every prompt admitted in one
+    round (batch.py ``_pieces``: each prompt's [0, n - 1) a piece; rounds.py: the round's pieces in one encoder run a
+    ``slots.prefill_runs`` run, GLM 0560's one expert pass over every prefilling slot), then each slot's final
+    (``replay.finish``), then each prompt as ``one`` writes it from its slot (its first verify window, its state, its
+    greedy steps) into its DIR/p<N>. The Zig side: TF_DSV41_PIECE_RUNS=1 (block_prefill.emitMulti)."""
+
+    from tensorfold.families.deepseek_v41.cuda import replay as RP
+    from tensorfold.families.deepseek_v41.cuda.protocol import REPLAY, Piece
+    from tensorfold.families.deepseek_v41.cuda.slots import prefill_runs
+
+    if a.prefill != "replay" or a.prompt_tail != "verify":
+        raise ValueError("--batched: prod's server shape in replay mode only (--prefill replay --prompt-tail verify)")
+    idss = [prompt_ids(a, cfg, p) for p in a.prompts]
+    if not isinstance(getattr(fw, "stash", None), dict):
+        fw.stash = {}
+    runs = prefill_runs([Piece(j, 0, tuple(ids[:-1])) for j, ids in enumerate(idss)], fw.pchunk)
+    if rank == 0:
+        print(f"batched: {len(idss)} prompts, {len(runs)} encoder run(s) of {[len(r) for r in runs]} segments", flush=True)
+    RP.encode(fw, runs)
+    for j, ids in enumerate(idss):
+        n = len(ids)
+        RP.finish(fw, j, n - 1, tuple(ids[max(0, n - REPLAY):n - 1]))
+    for j, (prompt, out) in enumerate(zip(a.prompts, dirs)):
+        fw.slots[0], fw.slots[j] = fw.slots[j], fw.slots[0]     # slot j's state where `one` reads it
+        one(rank, a, fw, cfg, greedy, Seg, digest, prompt, out, lo, hi, t0, load_s, j == len(dirs) - 1, prefilled=True)
+        fw.slots[0], fw.slots[j] = fw.slots[j], fw.slots[0]
+
+
+def one(rank, a, fw, cfg, greedy, Seg, digest, prompt, out, lo, hi, t0, load_s, last, kv=None,
+        prefilled: bool = False) -> None:
+    """One prompt from the slot as it is: its state dump, greedy steps and digests into ``out``. ``prefilled``: the
+    prompt's [0, n - 1) is in the slot already (``batched``): its last token's verify window only."""
 
     import torch
 
     if kv is not None:
         one_kv(rank, a, fw, cfg, greedy, Seg, digest, prompt, out, lo, hi, t0, load_s, last, kv)
         return
-    g = torch.Generator().manual_seed(a.seed)
-    ids = torch.randint(3, cfg.vocab_size, (prompt,), generator=g).tolist()
+    ids = prompt_ids(a, cfg, prompt)
     t1 = time.time()
-    logits = served_prompt(fw, Seg, ids, a.prompt_tail, a.prefill)
+    if prefilled:
+        logits = fw.run([Seg(0, fw.slot.pos, (ids[-1],))])
+        fw.keep(0, 0)
+        logits = logits[-1:]
+    else:
+        logits = served_prompt(fw, Seg, ids, a.prompt_tail, a.prefill)
     tok = int(greedy(fw, logits[-1:])[0])
     torch.cuda.synchronize()
     if rank == 0:
@@ -523,6 +567,9 @@ def main() -> int:
     ap.add_argument("--prompts", type=lambda v: [int(x) for x in v.split(",") if x], default=[],
                     help="several prompts in one load, each from a fresh slot into DIR/p<N> (with --rank: this host's rank)")
     ap.add_argument("--steps", type=int, default=64)
+    ap.add_argument("--batched", action="store_true",
+                    help="--prompts in one batched round (prod's batcher: one encoder run over every prompt's piece, "
+                         "slots.prefill_runs), each from its own slot; needs --prefill replay --prompt-tail verify")
     ap.add_argument("--prompt-tail", choices=("prefill", "verify"), default="prefill",
                     help="verify: the prompt as prod's server runs it ([0, n - 1) prefilled, the last token a decode row; "
                          "the Zig side's TF_DSV41_PROMPT_TAIL default); prefill: Forward.prompt (contiguous slot only)")

@@ -104,6 +104,9 @@ const Seg = struct {
     short: bool = false,
     /// CED replay's passes (`emitReplay`, ced.zig); `.whole`: a full segment
     part: Part = .whole,
+    /// a multi-segment run (`emitMulti`): its segments; the attention core and the compressor run a segment at a
+    /// time on that segment's slot (glue "pf_seg"), every other step over all the run's rows
+    multi: ?[]const Span = null,
 
     // -----------------------------------------------------------------------------------------------------------
     // dense EXL3 projections (prefill_mm.matmul)
@@ -351,6 +354,11 @@ const Seg = struct {
     }
 
     fn rope(e: *E, x: Arg, heads: i64, dim: i64) !void {
+        return ropeAt(e, x, heads, dim, "w.pos64");
+    }
+
+    /// `rope` reading each row's position from `positions` (a multi-segment run: every segment's, "w.mpos64").
+    fn ropeAt(e: *E, x: Arg, heads: i64, dim: i64, positions: []const u8) !void {
         const n = e.n;
         const xv = try e.view(x.t.role, .bf16, &.{ n, heads, dim }, &.{ heads * dim, dim, 1 }, 0);
         try e.triton("_rope", .{ n, @divExact(heads, 4), 1 }, &.{
@@ -358,7 +366,7 @@ const Seg = struct {
             .{ .name = "x_hs", .arg = .{ .i = dim } },                 .{ .name = "OUT", .arg = xv },
             .{ .name = "o_rs", .arg = .{ .i = heads * dim } },         .{ .name = "o_hs", .arg = .{ .i = dim } },
             .{ .name = "CS", .arg = try e.ropeTable() },              .{ .name = "cs_rs", .arg = .{ .i = 64 } },
-            .{ .name = "POS", .arg = try e.buf("w.pos64", .{}, .i64, &.{n}) }, .{ .name = "H", .arg = .{ .i = heads } },
+            .{ .name = "POS", .arg = try e.t(.{ .buf = positions }, .i64, &.{n}) }, .{ .name = "H", .arg = .{ .i = heads } },
             .{ .name = "NOPE", .arg = .{ .i = dim - 64 } },            .{ .name = "NB", .arg = .{ .i = 64 } },
             .{ .name = "HALF", .arg = .{ .i = 32 } },                  .{ .name = "BH", .arg = .{ .i = 4 } },
             .{ .name = "INV", .arg = .{ .b = false } },                .{ .name = "COPY", .arg = .{ .b = false } },
@@ -445,12 +453,22 @@ const Seg = struct {
 
     /// The segment's selection of index layer `src` (reuse layers read the latest source's).
     fn selection(e: *E, src: u32) ![2]Arg {
-        return .{ try e.buf("w.sel{d}", .{src}, .i32, &.{ e.n, e.cfg.index_topk }), try e.buf("w.cnt{d}", .{src}, .i32, &.{e.n}) };
+        const k: i64 = e.cfg.index_topk;
+        return .{
+            try e.view(.{ .buf = try e.fmt("w.sel{d}", .{src}) }, .i32, &.{ e.n, k }, &.{ k, 1 }, e.row0 * k * 4),
+            try e.view(.{ .buf = try e.fmt("w.cnt{d}", .{src}) }, .i32, &.{e.n}, &.{1}, e.row0 * 4),
+        };
+    }
+
+    /// The segment's rows of the run's per-row candidates (layer 20's, read by the reindex layers).
+    fn cands(e: *E) !Arg {
+        const cb: i64 = e.cfg.candidate_blocks;
+        return e.view(.{ .buf = "w.cand" }, .i32, &.{ e.n, cb }, &.{ cb, 1 }, e.row0 * cb * 4);
     }
 
     /// Rows [a, a + rows) of a row-major [n, cols] role.
     fn rowsOf(e: *E, x: Arg, dt: Dt, a: i64, rows: i64, cols: i64) !Arg {
-        return e.view(x.t.role, dt, &.{ rows, cols }, &.{ cols, 1 }, a * cols * size(dt));
+        return e.view(x.t.role, dt, &.{ rows, cols }, &.{ cols, 1 }, x.t.offset + a * cols * size(dt));
     }
 
     /// index.scores over rows [a, a + rows) of the segment: dense (key i = position i) or over `keys`' positions
@@ -462,8 +480,8 @@ const Seg = struct {
         const out = try e.buf("L.ix.scores", .{}, .f32, &.{ rows, nk });
         const spg = try e.paging(ratio, false);
         try e.triton("_scores", .{ rows, cdiv(nk, 64), 1 }, &.{
-            .{ .name = "QI", .arg = try e.view(.{ .buf = "L.qi" }, .bf16, &.{ rows, IH, ID }, &.{ IH * ID, ID, 1 }, a * IH * ID * 2) },
-            .{ .name = "W", .arg = try e.view(.{ .buf = "L.ix_w" }, .f32, &.{ rows, IH }, &.{ IH, 1 }, a * IH * 4) },
+            .{ .name = "QI", .arg = try e.view(.{ .buf = "L.qi" }, .bf16, &.{ rows, IH, ID }, &.{ IH * ID, ID, 1 }, (e.row0 + a) * IH * ID * 2) },
+            .{ .name = "W", .arg = try e.view(.{ .buf = "L.ix_w" }, .f32, &.{ rows, IH }, &.{ IH, 1 }, (e.row0 + a) * IH * 4) },
             .{ .name = "w_stride", .arg = .{ .i = IH } },               .{ .name = "IK", .arg = try indexKeys(e, keys_of) },
             .{ .name = "OUT", .arg = out },                             .{ .name = "POS", .arg = p },
             .{ .name = "KEYS", .arg = keys orelse out },                .{ .name = "k_stride", .arg = .{ .i = if (cbs > 0) keys.?.t.shape[1] else nk } },
@@ -509,7 +527,7 @@ const Seg = struct {
             .{ .name = "RATIO", .arg = .{ .i = ratio } }, .{ .name = "BS", .arg = .{ .i = cbs } },
             .{ .name = "TB", .arg = .{ .i = 256 } },      .{ .name = "ROWS", .arg = .{ .b = false } },
         });
-        try e.glue("topk", &.{ k, try rowsOf(e, try e.buf("w.cand", .{}, .i32, &.{ e.n, cb }), .i32, a, rows, cb), .{ .i = cb } });
+        try e.glue("topk", &.{ k, try rowsOf(e, try cands(e), .i32, a, rows, cb), .{ .i = cb } });
     }
 
     /// Row blocks of the materialised indexer (backend._row_blocks): `per_row` bytes a row under the index budget.
@@ -538,7 +556,7 @@ const Seg = struct {
         if (n <= dtopk_rows and fits and !streamed) {
             // the whole segment's scores, then attn_cuda's top-k (its job list picks a source's candidate blocks; a
             // Reindex layer scores over them) and visible counts
-            const cand = try e.buf("w.cand", .{}, .i32, &.{ n, cb });
+            const cand = try cands(e);
             if (reindexing) {
                 const sc = try s.scores(src, ratio, 0, n, try pos(e), cb * cbs, cand, cbs);
                 return e.topk(L, sc, cand, cb * cbs, ratio);
@@ -562,7 +580,7 @@ const Seg = struct {
                 const rows = @min(st, n - a);
                 const p = if (whole) try pos(e) else try s.blockPos(j, a);
                 const ck = try e.buf("L.ix.ckeys", .{}, .i32, &.{ rows, NK });
-                try e.glue("cand_keys", &.{ try rowsOf(e, try e.buf("w.cand", .{}, .i32, &.{ n, cb }), .i32, a, rows, cb), ck, .{ .i = cbs } });
+                try e.glue("cand_keys", &.{ try rowsOf(e, try cands(e), .i32, a, rows, cb), ck, .{ .i = cbs } });
                 const sc = try s.scores(src, ratio, a, rows, p, NK, ck, 0);
                 try e.glue("topk", &.{ try s.sortKeys(sc, rows, NK, ck), try rowsOf(e, sel[0], .i32, a, rows, topk), .{ .i = topk } });
             }
@@ -616,8 +634,8 @@ const Seg = struct {
             const ns = longpf.splits(nk);
             const buf = try e.buf("L.ix.stream", .{}, .i64, &.{ rows, ns, 2 * topk });
             try e.triton("_stream", .{ rows, ns, 1 }, &.{
-                .{ .name = "QI", .arg = try e.view(.{ .buf = "L.qi" }, .bf16, &.{ rows, IH, ID }, &.{ IH * ID, ID, 1 }, a * IH * ID * 2) },
-                .{ .name = "W", .arg = try e.view(.{ .buf = "L.ix_w" }, .f32, &.{ rows, IH }, &.{ IH, 1 }, a * IH * 4) },
+                .{ .name = "QI", .arg = try e.view(.{ .buf = "L.qi" }, .bf16, &.{ rows, IH, ID }, &.{ IH * ID, ID, 1 }, (e.row0 + a) * IH * ID * 2) },
+                .{ .name = "W", .arg = try e.view(.{ .buf = "L.ix_w" }, .f32, &.{ rows, IH }, &.{ IH, 1 }, (e.row0 + a) * IH * 4) },
                 .{ .name = "w_stride", .arg = .{ .i = IH } },           .{ .name = "IK", .arg = try indexKeys(e, src) },
                 .{ .name = "POS", .arg = p },                           .{ .name = "KEYS", .arg = buf },
                 .{ .name = "k_stride", .arg = .{ .i = 0 } },            .{ .name = "NK", .arg = .{ .i = nk } },
@@ -673,8 +691,19 @@ const Seg = struct {
     fn encoderEnd(s: *Seg, L: u32) !void {
         const e = s.e;
         if (e.cfg.mode(L) != .full) return error.Unsupported;
-        try s.compress(L, try s.compProj(L));
-        try e.glue("ced_stash", &try stashArgs(e));
+        const p = try s.compProj(L);
+        const segs = s.multi orelse {
+            try s.compress(L, p);
+            return e.glue("ced_stash", &try stashArgs(e));
+        };
+        // blocks.compress_rows: the projection over every row, then each segment's compressor and stash (replay.encode)
+        const total = e.n;
+        for (segs, 0..) |sp, j| {
+            try s.enter(sp, j);
+            try s.compress(L, try rowsOf(e, p, .f32, e.row0, e.n, p.t.stride[0]));
+            try e.glue("ced_stash", &try stashArgs(e));
+        }
+        try s.leave(total);
     }
 
     fn attention(s: *Seg, L: u32) !void {
@@ -682,7 +711,6 @@ const Seg = struct {
         const n = e.n;
         const D: i64 = e.cfg.hidden;
         const md = e.cfg.mode(L);
-        const ratio: i64 = e.cfg.compressRatio(L);
         const H: i64 = e.cfg.heads / e.o.world;
         const hd: i64 = e.cfg.head_dim;
         const IH: i64 = e.cfg.index_heads;
@@ -715,9 +743,10 @@ const Seg = struct {
         const qi = try e.buf("L.qi", .{}, .bf16, &.{ n, IH * ID });
         if (indexer) try s.proj(try e.fmt("L{d}.attn.ix_wq_b", .{L}), .lanes, qn, e.cfg.q_lora, IH * ID, qi);
         if (s.short) try e.prefetchO(L);
-        try rope(e, q, H, hd);
+        const positions = if (s.multi != null) "w.mpos64" else "w.pos64";
+        try ropeAt(e, q, H, hd, positions);
         if (indexer) {
-            try rope(e, qi, IH, ID);
+            try ropeAt(e, qi, IH, ID, positions);
             // the head weights: `_plain`'s fp64 sums, cast to bf16 then fp32 by torch
             const w64 = try e.buf("L.ix_w64", .{}, .f64, &.{ n, IH });
             try e.triton("_plain", .{ n, IH, 1 }, &.{
@@ -729,20 +758,52 @@ const Seg = struct {
             });
             try e.glue("ix_w", &.{ w64, try e.buf("L.ix_w", .{}, .f32, &.{ n, IH }) });
         }
+        // the CSA2 steps a segment at a time (blocks.attention's loop over its contexts), into the group-major core output
+        const groups: i64 = e.cfg.o_groups / e.o.world;
+        if (@mod(H, bmq) != 0 or @mod(H, groups) != 0) return error.Unsupported;
+        const hg = @divExact(H, groups);
+        const o = try e.buf("L.o", .{}, .bf16, &.{ groups, n, hg * hd });
+        if (s.multi) |segs| {
+            for (segs, 0..) |sp, j| {
+                try s.enter(sp, j);
+                try s.core(L, q, kv, cproj, own_kv, indexer, o, n);
+            }
+            try s.leave(n);
+        } else try s.core(L, q, kv, cproj, own_kv, indexer, o, n);
+        // _out_pf: each wo_a group's GEMM over its contiguous slice into its columns of z, then wo_b (bf16 partial)
+        const ol: i64 = e.cfg.o_lora;
+        const gk = hg * hd;
+        const z: Out = .{ .role = .{ .buf = "L.z" }, .dt = .bf16, .stride = groups * ol };
+        var g: i64 = 0;
+        while (g < groups) : (g += 1) {
+            var zg = z;
+            zg.offset = g * ol * 2;
+            try s.matmul(try e.fmt("L{d}.attn.wo_a.{d}", .{ L, g }), .lanes, try e.view(o.t.role, .bf16, &.{ n, gk }, &.{ gk, 1 }, g * n * gk * 2), gk, ol, zg);
+        }
+        try s.proj(try e.fmt("L{d}.attn.wo_b", .{L}), .lanes, try e.buf("L.z", .{}, .bf16, &.{ n, groups * ol }), groups * ol, D, try e.buf("L.part", .{}, .bf16, &.{ n, D }));
+    }
+
+    /// The CSA2 steps of the current segment (blocks._segment): its SWA rows stored (through the staging ring when its
+    /// slot's ring cannot hold them), a kv source's compressor, an index layer's selection, the fused core into rows
+    /// [row0, row0 + n) of the run's group-major output `o` (`total` rows a group). `q`, `kv`, `cproj`: the run's rows.
+    fn core(s: *Seg, L: u32, q: Arg, kv: Arg, cproj: Arg, own_kv: bool, indexer: bool, o: Arg, total: i64) !void {
+        const e = s.e;
+        const n = e.n;
+        const ratio: i64 = e.cfg.compressRatio(L);
+        const H: i64 = e.cfg.heads / e.o.world;
+        const hd: i64 = e.cfg.head_dim;
+        const groups: i64 = e.cfg.o_groups / e.o.world;
+        const hg = @divExact(H, groups);
         // blocks._segment: a segment the slot's ring cannot hold runs on the staging ring, the window before it in
         const rows = try s.swa(L);
         const slot = try slotRing(e, L);
         const W: i64 = e.cfg.window;
         const ring0 = 2 * W;
         if (s.staged) try e.glue("stage_in", &.{ rows[0], rows[1], .{ .i = s.ring }, slot[0], slot[1], .{ .i = ring0 }, .{ .i = @max(0, e.start - W + 1) }, .{ .i = e.start } });
-        try s.kvStore(kv, rows, 0);
-        if (own_kv) try s.compress(L, cproj);
+        try s.kvStore(try rowsOf(e, kv, .bf16, e.row0, n, hd), rows, 0);
+        if (own_kv) try s.compress(L, try rowsOf(e, cproj, .f32, e.row0, n, cproj.t.stride[0]));
         if (indexer) try s.select(L);
         // the fused prefill core over the SWA ring and (a compressed layer) the source's pool at the latest selection
-        const groups: i64 = e.cfg.o_groups / e.o.world;
-        if (@mod(H, bmq) != 0 or @mod(H, groups) != 0) return error.Unsupported;
-        const hg = @divExact(H, groups);
-        const o = try e.buf("L.o", .{}, .bf16, &.{ groups, n, hg * hd });
         const lo = try e.buf("w.lo", .{}, .i32, &.{n});
         var cv = rows[0];
         var cs = rows[1];
@@ -770,7 +831,7 @@ const Seg = struct {
             }
         }
         try e.triton("_fused", .{ n, @divExact(H, bmq), 1 }, &.{
-            .{ .name = "Q", .arg = try e.view(q.t.role, .bf16, &.{ n, H, hd }, &.{ H * hd, hd, 1 }, 0) },
+            .{ .name = "Q", .arg = try e.view(q.t.role, .bf16, &.{ n, H, hd }, &.{ H * hd, hd, 1 }, e.row0 * H * hd * 2) },
             .{ .name = "CV", .arg = cv },                         .{ .name = "CSC", .arg = cs },
             .{ .name = "cvs", .arg = .{ .i = cv.t.stride[0] } },  .{ .name = "css", .arg = .{ .i = cs.t.stride[0] } },
             .{ .name = "TOK", .arg = tok },                       .{ .name = "t_stride", .arg = .{ .i = t_stride } },
@@ -779,26 +840,46 @@ const Seg = struct {
             .{ .name = "sss", .arg = .{ .i = 8 } },               .{ .name = "LO", .arg = lo },
             .{ .name = "POS", .arg = try pos(e) },                .{ .name = "SINK", .arg = try e.weight("L{d}.attn.sink", .{L}, .f32, &.{H}) },
             .{ .name = "CS", .arg = try e.ropeTable() },          .{ .name = "cs_stride", .arg = .{ .i = 64 } },
-            .{ .name = "OUT", .arg = o },                         .{ .name = "H", .arg = .{ .i = H } },
+            .{ .name = "OUT", .arg = try e.view(o.t.role, .bf16, &.{ groups, n, hg * hd }, &.{ total * hg * hd, hg * hd, 1 }, e.row0 * hg * hd * 2) },
+            .{ .name = "H", .arg = .{ .i = H } },
             .{ .name = "KT", .arg = .{ .i = kt } },               .{ .name = "BMQ", .arg = .{ .i = bmq } },
             // Python's D ** -0.5 (libm pow, correctly rounded): sqrt of the exact 1 / 512 rounds the same way
             .{ .name = "SCALE", .arg = .{ .f = @sqrt(1.0 / @as(f64, @floatFromInt(hd))) } }, .{ .name = "RING", .arg = .{ .i = s.ring } },
             .{ .name = "WINDOW", .arg = .{ .i = W } },            .{ .name = "COMP", .arg = .{ .b = ratio > 0 } },
             .{ .name = "PT", .arg = fpg.pt },                     .{ .name = "PSH", .arg = .{ .i = fpg.psh } },
-            .{ .name = "HG", .arg = .{ .i = hg } },               .{ .name = "OR", .arg = .{ .i = n } },
+            .{ .name = "HG", .arg = .{ .i = hg } },               .{ .name = "OR", .arg = .{ .i = total } },
         });
         if (s.staged) try e.glue("stage_out", &.{ slot[0], slot[1], .{ .i = ring0 }, rows[0], rows[1], .{ .i = s.ring }, .{ .i = @max(0, e.end() - W) }, .{ .i = e.end() } });
-        // _out_pf: each wo_a group's GEMM over its contiguous slice into its columns of z, then wo_b (bf16 partial)
-        const ol: i64 = e.cfg.o_lora;
-        const gk = hg * hd;
-        const z: Out = .{ .role = .{ .buf = "L.z" }, .dt = .bf16, .stride = groups * ol };
-        var g: i64 = 0;
-        while (g < groups) : (g += 1) {
-            var zg = z;
-            zg.offset = g * ol * 2;
-            try s.matmul(try e.fmt("L{d}.attn.wo_a.{d}", .{ L, g }), .lanes, try e.view(o.t.role, .bf16, &.{ n, gk }, &.{ gk, 1 }, g * n * gk * 2), gk, ol, zg);
-        }
-        try s.proj(try e.fmt("L{d}.attn.wo_b", .{L}), .lanes, try e.buf("L.z", .{}, .bf16, &.{ n, groups * ol }), groups * ol, D, try e.buf("L.part", .{}, .bf16, &.{ n, D }));
+    }
+
+    /// A multi-segment run's segment `j` (`sp`, its first row in the run): the emitter at its rows and position, the
+    /// glue on its slot (pf_seg: the slot's views, the segment's positions and window starts).
+    fn enter(s: *Seg, sp: Span, j: usize) !void {
+        const e = s.e;
+        e.row0 = sp.row0;
+        e.n = sp.n;
+        e.start = sp.start;
+        s.setRing();
+        try e.glue("pf_seg", &.{ .{ .i = @intCast(j) }, try pos(e), try e.buf("w.pos64", .{}, .i64, &.{sp.n}), try e.buf("w.lo", .{}, .i32, &.{sp.n}) });
+    }
+
+    /// Back at the whole run (`total` rows from its first segment's start): the glue's state the run's again.
+    fn leave(s: *Seg, total: i64) !void {
+        const e = s.e;
+        const first = s.multi.?[0];
+        e.row0 = 0;
+        e.n = total;
+        e.start = first.start;
+        s.setRing();
+        try e.glue("pf_seg", &.{.{ .i = -1 }});
+    }
+
+    /// forward.staging for `e.n` rows: the slot's ring (2 x window rows), or the staging ring past it.
+    fn setRing(s: *Seg) void {
+        const e = s.e;
+        const W: i64 = e.cfg.window;
+        s.staged = e.n + W - 1 > 2 * W;
+        s.ring = if (s.staged) stageRows(e) else 2 * W;
     }
 
     // -----------------------------------------------------------------------------------------------------------
@@ -1011,6 +1092,10 @@ const Seg = struct {
             try e.glue("positions", &.{ try pos(e), try e.buf("w.pos64", .{}, .i64, &.{n}), try e.buf("w.lo", .{}, .i32, &.{n}), .{ .i = e.start } });
             const st = try stashArgs(e);
             try e.glue("ced_load", &st);
+        } else if (s.multi != null) {
+            // every segment's positions (rope over the run's rows); each segment's own at its CSA2 steps (pf_seg)
+            try e.glue("mpositions", &.{try e.buf("w.mpos64", .{}, .i64, &.{n})});
+            try e.glue("embed", &.{ try e.streams(), try e.buf("w.recv.moe", .{}, .bf16, &.{ e.o.world, n, D }) });
         } else {
             try e.glue("positions", &.{ try pos(e), try e.buf("w.pos64", .{}, .i64, &.{n}), try e.buf("w.lo", .{}, .i32, &.{n}) });
             try e.glue("embed", &.{ try e.streams(), try e.buf("w.recv.moe", .{}, .bf16, &.{ e.o.world, n, D }) });
@@ -1052,13 +1137,50 @@ fn stashArgs(e: *E) ![10]Arg {
     const D: i64 = e.cfg.hidden;
     const R: i64 = ced.ring;
     const c = try Seg.coefs(e, e.coef);
+    const x = try e.streams();
+    const r0 = e.row0;
     return .{
-        try e.streams(),                                      try e.buf("w.out", .{}, .bf16, &.{ e.n, D }),
-        c[0],                                                 c[1],
-        c[2],                                                 try e.buf(ced.roles[0], .{}, .bf16, &.{ R, 4 * D }),
+        try Seg.rowsOf(e, x, .bf16, r0, e.n, 4 * D),              try Seg.rowsOf(e, try e.buf("w.out", .{}, .bf16, &.{ e.n, D }), .bf16, r0, e.n, D),
+        try Seg.rowsOf(e, c[0], .f32, r0, e.n, 4),                try Seg.rowsOf(e, c[1], .f32, r0, e.n, 4),
+        try Seg.rowsOf(e, c[2], .f32, r0, e.n, 16),               try e.buf(ced.roles[0], .{}, .bf16, &.{ R, 4 * D }),
         try e.buf(ced.roles[1], .{}, .bf16, &.{ R, D }),      try e.buf(ced.roles[2], .{}, .f32, &.{ R, 4 }),
         try e.buf(ced.roles[3], .{}, .f32, &.{ R, 4 }),       try e.buf(ced.roles[4], .{}, .f32, &.{ R, 16 }),
     };
+}
+
+/// One segment of a multi-segment run (`emitMulti`): its slot's rows from position `start`, rows [row0, row0 + n) of
+/// the run.
+pub const Span = struct { slot: u32, start: i64, n: i64, row0: i64 = 0 };
+
+/// forward.staging's ring rows for a prefill segment the slot's ring cannot hold.
+fn stageRows(e: *const E) i64 {
+    const W: i64 = e.cfg.window;
+    return @intCast(std.math.ceilPowerOfTwo(u64, @intCast(e.o.prefill_rows + W - 1)) catch unreachable);
+}
+
+/// Several slots' prompt segments in one run (Python's slots.prefill_runs / forward._run over several contexts, GLM
+/// 0560): the embedding, the mHC sites, every dense projection, the experts and the exchanges over all the run's rows
+/// (the segments' rows in order), and each segment's CSA2 steps (SWA store, compressor, selection, fused core) on its
+/// own slot (glue "pf_seg" switches the slot's views), as blocks.attention's loop over its contexts. `part`: `.whole`
+/// (full mode, no head: a prompt's pieces never take logits) or `.encoder` (CED replay's encoder pass, each segment's
+/// stash). Every segment past 16 rows (a short segment's decode-kernel mix is one segment's), the run within one
+/// prefill segment's rows, no image rows; error.Unsupported otherwise (the caller runs the segments one at a time).
+pub fn emitMulti(a: std.mem.Allocator, cfg: *const Config, w: *const block.Widths, o: block.Options, layers: []const u32, spans_in: []const Span, part: Part) ![]calls.Call {
+    if (spans_in.len == 0 or part == .decoder or o.image_rows != 0) return error.Unsupported;
+    if (o.pool) |pl| if (pl.split) return error.Unsupported; // split KV's exchanges: one segment a run
+    const spans = try a.dupe(Span, spans_in);
+    var total: i64 = 0;
+    for (spans) |*sp| {
+        if (sp.n <= 16) return error.Unsupported;
+        sp.row0 = total;
+        total += sp.n;
+    }
+    if (total > o.prefill_rows or total > router_chunk) return error.Unsupported;
+    var e: E = .{ .a = a, .cfg = cfg, .w = w, .o = o, .n = total, .start = spans[0].start };
+    var s: Seg = .{ .e = &e, .staged = false, .ring = 0, .part = part, .multi = spans };
+    s.setRing();
+    try s.run(layers, false);
+    return e.out.items;
 }
 
 /// A prefill program's part: a whole segment, or one of CED replay's passes (ced.zig).

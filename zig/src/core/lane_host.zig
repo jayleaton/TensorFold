@@ -445,7 +445,28 @@ pub const LaneHost = struct {
             return true;
         };
         const t0 = std.Io.Clock.awake.now(h.io).toNanoseconds();
-        for (h.pieces.items) |piece| {
+        if (h.core.cfg.piece_runs and h.core.backend.vtable.pieces != null) {
+            // one call for the round's pieces (the backend runs several slots' rows in one forward); a failure fails each
+            var list: [16]lanes.backend.Backend.Piece = undefined;
+            var jobs: [16]*Job = undefined;
+            var n: usize = 0;
+            for (h.pieces.items) |piece| {
+                if (!piece.run) continue;
+                did = true;
+                const job: *Job = @ptrFromInt(piece.key);
+                if (job.stream.finished) continue;
+                if (n == list.len) {
+                    _ = h.drop(job, "too many prompt pieces in one round");
+                    continue;
+                }
+                list[n] = .{ .stream = &job.stream, .start = piece.start, .end = piece.end, .save = piece.save };
+                jobs[n] = job;
+                n += 1;
+            }
+            if (n > 0) h.core.pieces(list[0..n]) catch |e| {
+                for (jobs[0..n]) |job| _ = h.drop(job, h.words(e));
+            };
+        } else for (h.pieces.items) |piece| {
             if (!piece.run) continue;
             did = true;
             const job: *Job = @ptrFromInt(piece.key);

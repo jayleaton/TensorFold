@@ -135,6 +135,7 @@ pub const Lanes = struct {
         v.piece = piece;
         v.finish = finish;
         v.join = join;
+        v.pieces = roundPieces;
         break :blk v;
     };
 
@@ -158,12 +159,17 @@ pub const Lanes = struct {
         for (window, 0..) |*w, i| w.* = .{ .width = @intCast(i + 1), .ms = v[i] };
         const shared = try arena.alloc(lanes.config.Cost, @min(v.len, batch_rows));
         for (shared, 0..) |*w, i| w.* = .{ .width = @intCast(i + 1), .ms = v[i] };
-        return .{ .exact_width = costs_mod.slot_rows, .mtp = true, .speculate = true, .speculate_early = false, .drafts = x.opts.shape.block, .window_costs = window, .mtp_step_ms = 0.0, .hidden_rows = true, .batch_rows = batch_rows, .max_streams = x.opts.slots, .shared_costs = shared, .draft_probabilities = true, .draft_streams = true, .join_tail = x.target.vtable.tail != null and joinTail() };
+        return .{ .exact_width = costs_mod.slot_rows, .mtp = true, .speculate = true, .speculate_early = false, .drafts = x.opts.shape.block, .window_costs = window, .mtp_step_ms = 0.0, .hidden_rows = true, .batch_rows = batch_rows, .max_streams = x.opts.slots, .shared_costs = shared, .draft_probabilities = true, .draft_streams = true, .join_tail = x.target.vtable.tail != null and joinTail(), .piece_runs = envOn("TF_DSV41_PIECE_RUNS") };
     }
 
     /// TF_DSV41_TAIL_JOIN=1: a prompt in pieces leaves its last token to its first round's shared window (default off).
     fn joinTail() bool {
-        const v = std.c.getenv("TF_DSV41_TAIL_JOIN") orelse return false;
+        return envOn("TF_DSV41_TAIL_JOIN");
+    }
+
+    /// TF_DSV41_PIECE_RUNS=1: a round's prompt pieces of several slots in one forward (target.zig `pieces`; default off).
+    fn envOn(name: [*:0]const u8) bool {
+        const v = std.c.getenv(name) orelse return false;
         return std.mem.eql(u8, std.mem.span(v), "1");
     }
 
@@ -254,6 +260,19 @@ pub const Lanes = struct {
         const st = try x.get(s);
         try x.settle();
         return x.target.piece(st.slot, s.prompt(), start, end, save);
+    }
+
+    /// A round's pieces of several streams: the target's (one forward over their slots' rows where it can).
+    fn roundPieces(ptr: *anyopaque, list: []const be.Backend.Piece) anyerror!void {
+        const x = self(ptr);
+        try x.settle();
+        var ps: [16]iface.Target.Piece = undefined;
+        if (list.len > ps.len) return error.TooManySlots;
+        for (list, ps[0..list.len]) |p, *q| {
+            const st = try x.get(p.stream);
+            q.* = .{ .slot = st.slot, .ids = p.stream.prompt(), .start = p.start, .end = p.end, .save = p.save };
+        }
+        return x.target.runPieces(ps[0..list.len]);
     }
 
     /// The prompt's rows are in: its last token's window (the first choice), its taps to the drafter as `prefill`'s.

@@ -27,6 +27,7 @@ const samp = @import("sampling_gpu.zig");
 const branches = @import("draft/branches.zig");
 const pk = @import("prod_knobs.zig");
 const ced = @import("ced.zig");
+const pf = @import("forward_prefill.zig");
 
 pub const Error = error{ TreeWindow, Sampling, Slots, NotAChain, WindowRows };
 
@@ -67,6 +68,8 @@ pub const GpuTarget = struct {
     /// releases wait for `settleReleases` (the rounds: after the next round's admissions are decided)
     defer_release: bool = false,
     releasing: [16]bool = @splat(false),
+    /// TF_DSV41_PIECE_RUNS: rounds whose pieces ran as one multi-segment run
+    piece_runs: u64 = 0,
 
     /// A request's admission (kv/sched.zig Admission + the round's spills, with its first admission).
     pub const Planned = struct { need: u32, hit: ?@import("kv").sessions.store.Hit, spills: []const u32 = &.{} };
@@ -75,7 +78,7 @@ pub const GpuTarget = struct {
         return .{ .ptr = t, .vtable = &vtable };
     }
 
-    const vtable: iface.Target.VTable = .{ .prefill = prefill, .window = window, .keep = keep, .taps = taps, .release = release, .admit = admit, .begin = begin, .piece = piece, .finish = finish, .tail = tail };
+    const vtable: iface.Target.VTable = .{ .prefill = prefill, .window = window, .keep = keep, .taps = taps, .release = release, .admit = admit, .begin = begin, .piece = piece, .finish = finish, .tail = tail, .pieces = pieces };
 
     fn admit(p: *anyopaque, slot: u32, max_new: u64) void {
         const t = self_(p);
@@ -211,6 +214,34 @@ pub const GpuTarget = struct {
         var out = [_][]u32{&one};
         try window(p, &.{.{ .slot = slot, .start = ids.len - 1, .tokens = ids[ids.len - 1 ..], .parents = null, .draws = &.{draw}, .sampling = sampling }}, &out);
         return one[0];
+    }
+
+    /// A round's pieces of several slots (TF_DSV41_PIECE_RUNS, lanes' Config.piece_runs): CED replay's encoder passes
+    /// of all of them in one run (Forward.prefillMulti: Python's prefill over prefill_runs), then each piece's prompt
+    /// snapshot, as `piece` a piece; the run's refusals (a short or image segment, more rows than a prefill segment, split
+    /// KV) and full mode (its drafter taps a piece) run a piece at a time.
+    fn pieces(p: *anyopaque, list: []const iface.Target.Piece) anyerror!void {
+        const t = self_(p);
+        if (list.len > 1 and list.len <= 16 and t.f.prefill_state.mode == .replay and t.f.pf_switch != null) {
+            var segs: [16]pf.MultiSeg = undefined;
+            for (list, segs[0..list.len]) |q, *seg| {
+                if (q.start >= q.end or q.end + 1 > q.ids.len) return error.NotAChain;
+                seg.* = .{ .slot = q.slot, .start = q.start, .ids = q.ids[q.start..q.end] };
+            }
+            if (try pf.runnable(t.f, segs[0..list.len])) {
+                try t.onSlot(list[0].slot); // the slots' pending windows kept (every rank), as each `piece` does
+                try t.f.prefillMulti(segs[0..list.len]);
+                t.piece_runs += 1;
+                if (t.piece_runs == 1 or t.piece_runs % 256 == 0) std.log.scoped(.dsv41).info("piece runs: {d} (this one {d} segments in one run)", .{ t.piece_runs, list.len });
+                // rounds.py `_save` after the round's prefill, a piece at a time
+                for (list) |q| if (q.save and q.end >= ced.session_min) if (t.sessions) |ss| {
+                    try t.onSlot(q.slot);
+                    _ = try ss.savePrompt();
+                };
+                return;
+            }
+        }
+        for (list) |q| try piece(p, q.slot, q.ids, q.start, q.end, q.save);
     }
 
     /// `finish` up to the last token (TF_DSV41_TAIL_JOIN): the decoder replay and its taps; the slot stays at the last
