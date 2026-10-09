@@ -510,6 +510,23 @@ pub const LaneHost = struct {
 
     /// The prompts whose rows are in: each stream's last row (Engine.finishStream), then it decodes with the rounds.
     fn runFinals(h: *LaneHost) void {
+        if (h.core.cfg.replay_runs) {
+            // the finals' shared work first (the DSV4.1 target: their decoder replays in one forward); a failure fails each
+            var ss: [16]*lanes.Stream = undefined;
+            var jobs: [16]*Job = undefined;
+            var n: usize = 0;
+            for (h.finals.items) |key| {
+                const job: *Job = @ptrFromInt(key);
+                if (job.stream.finished or n == ss.len) continue;
+                ss[n] = &job.stream;
+                jobs[n] = job;
+                n += 1;
+            }
+            h.core.prepareFinals(ss[0..n]) catch |e| {
+                for (jobs[0..n]) |job| _ = h.drop(job, h.words(e));
+                return;
+            };
+        }
         for (h.finals.items) |key| {
             const job: *Job = @ptrFromInt(key);
             if (job.stream.finished) continue;

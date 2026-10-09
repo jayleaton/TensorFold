@@ -633,3 +633,36 @@ reads them; any difference turns batching off, and that round runs the per-slot 
 differing row. Expected: -0.6 ms a 4-slot round (`main_proj` 0.19-0.22 a slot, the weight streamed once instead of
 4 times), +0.5 % code x4 / the mix / prose x4, nothing at 1 stream; with the overlap on, the saving is partly
 already hidden (the ingests then sit beside the window's tail), so the two do not add fully.
+
+## 9. Several slots' CED decoder replays in one run (TF_DSV41_REPLAY_RUNS=1, 2026-10-09, offline)
+
+Python's rounds.py replays each finished prompt's tail alone (`finish_prompt` a slot at a time): layers 20-39 over up
+to 127 rows, which at that row count streams most of 20 layers' expert weights. When several prompts finish in the same
+round (a burst of requests, the 4-stream cells' first round), Zig now runs their replays as one decoder run on the
+section 8 machinery (`block_prefill.emitMulti` with `.decoder`):
+- every replayed row's per-row launches (mHC sites, projections, experts, exchanges) over all the tails' rows;
+- each tail's rows entering the decoder loaded from its own slot's stash (glue `ced_load` at its rows of the run),
+  every row's window from its tail's R0 (glue `pf_seg`'s decoder flag), its CSA2 steps on its slot;
+- nothing committed: each slot stays at its prompt's last token; each slot's taps go to the drafter from its rows of
+  "w.taps" (`GpuTarget.handTapsAt`), in the finals' order, as Python's `replayed` does.
+
+The finals reach the target together before their `finish` / `tail` calls (lanes `Backend.finals`,
+`iface.Target.replays`, `LaneHost.runFinals` with `Config.replay_runs`); `forward.replayMulti` sends the run to the
+followers (op 53); a replayed slot's `finish` / `tail` then skips its own replay.
+
+Bits: Python never batches a replay, so each batched tail must be its one-slot replay row for row. The dense prefill
+GEMM is row-independent with the same bits in every configuration (pfdense.cuh), x3gm the same (its configs move data
+only), and Python's mhc_pf is the bit-identical twin of its `_site` from 256 rows. The split mHC programs (32 rows or
+fewer) and the short segment's decode kernels (16 or fewer) are other paths, so a tail of 32 rows or fewer (a prompt
+of 33 tokens or fewer) replays alone. The GPU gate checks it: our replies with the knob on against Python's reference,
+whose finals replay alone.
+
+Host gate (multi_test.zig): a one-tail run is the one-slot decoder program tensor for tensor (33-127 rows, R0 0 and
+past it); three tails (127 rows from 3,873, 64 and 33 from 0) are the all-rows launches plus each tail's own CSA2 steps
+and stash load at its rows; a 32-row tail is refused.
+
+GPU gate: the PIECES=1 stage (Sparks, run_host.sh) and M2B_PIECES (pod) add a third run, TF_DSV41_PIECE_RUNS=1 with
+TF_DSV41_REPLAY_RUNS=1, against the batched reference ("replay runs: " in the log). Not run yet.
+
+Expected: one expert weight pass of layers 20-39 saved per extra tail in a run, ~40-50 ms each on the Spark for 127-row
+tails; four prompts finishing together: ~120-150 ms. Python cannot do this without batching its finals.

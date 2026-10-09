@@ -860,7 +860,8 @@ const Seg = struct {
         e.n = sp.n;
         e.start = sp.start;
         s.setRing();
-        try e.glue("pf_seg", &.{ .{ .i = @intCast(j) }, try pos(e), try e.buf("w.pos64", .{}, .i64, &.{sp.n}), try e.buf("w.lo", .{}, .i32, &.{sp.n}) });
+        // the decoder replay: every row's window from the segment's first row (replay.finish's ctx.lo)
+        try e.glue("pf_seg", &.{ .{ .i = @intCast(j) }, try pos(e), try e.buf("w.pos64", .{}, .i64, &.{sp.n}), try e.buf("w.lo", .{}, .i32, &.{sp.n}), .{ .b = s.part == .decoder } });
     }
 
     /// Back at the whole run (`total` rows from its first segment's start): the glue's state the run's again.
@@ -1086,7 +1087,16 @@ const Seg = struct {
         const e = s.e;
         const n = e.n;
         const D: i64 = e.cfg.hidden;
-        if (s.part == .decoder) {
+        if (s.part == .decoder and s.multi != null) {
+            // several slots' decoder replays (`emitMulti`): every segment's positions (rope over the run's rows), then
+            // each segment's rows entering the decoder from its slot's stash, at its rows of the run
+            try e.glue("mpositions", &.{try e.buf("w.mpos64", .{}, .i64, &.{n})});
+            for (s.multi.?, 0..) |sp, j| {
+                try s.enter(sp, j);
+                try e.glue("ced_load", &try stashArgs(e));
+            }
+            try s.leave(n);
+        } else if (s.part == .decoder) {
             // replay.finish: every row's window starts at the pass's first row R0 (ctx.lo), and the rows entering the
             // decoder come from the stash (its Streams: the streams, the normed input, coefficient set 0)
             try e.glue("positions", &.{ try pos(e), try e.buf("w.pos64", .{}, .i64, &.{n}), try e.buf("w.lo", .{}, .i32, &.{n}), .{ .i = e.start } });
@@ -1159,19 +1169,23 @@ fn stageRows(e: *const E) i64 {
 }
 
 /// Several slots' prompt segments in one run (Python's slots.prefill_runs / forward._run over several contexts, GLM
-/// 0560): the embedding, the mHC sites, every dense projection, the experts and the exchanges over all the run's rows
+/// 0560), or several slots' CED decoder replays (`.decoder`: each segment a slot's prefilled tail from its R0, its rows
+/// entering the decoder from its slot's stash; Python replays a slot at a time): the embedding, the mHC sites, every dense projection, the experts and the exchanges over all the run's rows
 /// (the segments' rows in order), and each segment's CSA2 steps (SWA store, compressor, selection, fused core) on its
 /// own slot (glue "pf_seg" switches the slot's views), as blocks.attention's loop over its contexts. `part`: `.whole`
 /// (full mode, no head: a prompt's pieces never take logits) or `.encoder` (CED replay's encoder pass, each segment's
 /// stash). Every segment past 16 rows (a short segment's decode-kernel mix is one segment's), the run within one
 /// prefill segment's rows, no image rows; error.Unsupported otherwise (the caller runs the segments one at a time).
 pub fn emitMulti(a: std.mem.Allocator, cfg: *const Config, w: *const block.Widths, o: block.Options, layers: []const u32, spans_in: []const Span, part: Part) ![]calls.Call {
-    if (spans_in.len == 0 or part == .decoder or o.image_rows != 0) return error.Unsupported;
+    if (spans_in.len == 0 or o.image_rows != 0) return error.Unsupported;
     if (o.pool) |pl| if (pl.split) return error.Unsupported; // split KV's exchanges: one segment a run
     const spans = try a.dupe(Span, spans_in);
     var total: i64 = 0;
+    // the decoder replay's rows past the split mHC programs' 32 (a replay batched is the one-slot replay's arithmetic
+    // row for row: the same kernel paths at every row count it takes); a prompt piece's past the short segment's 16
+    const floor: i64 = if (part == .decoder) split_rows else 16;
     for (spans) |*sp| {
-        if (sp.n <= 16) return error.Unsupported;
+        if (sp.n <= floor) return error.Unsupported;
         sp.row0 = total;
         total += sp.n;
     }

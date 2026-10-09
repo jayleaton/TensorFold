@@ -89,12 +89,13 @@ fn named(c: calls.Call, name: []const u8) ?calls.Arg {
     return null;
 }
 
-const Layers = struct { all: [25]u32, enc: []const u32 };
+const Layers = struct { all: [25]u32, enc: []const u32, dec: []const u32 };
 
 fn layersOf(cfg: *const Config, l: *Layers) !void {
     for (&l.all, 0..) |*x, i| x.* = @intCast(i);
     const d = try ced.decoderStart(cfg);
     l.enc = l.all[0 .. d + 1];
+    l.dec = l.all[d..];
 }
 
 test "a one-segment run is the one-segment program (full mode without the head, and CED's encoder pass)" {
@@ -106,12 +107,19 @@ test "a one-segment run is the one-segment program (full mode without the head, 
     var l: Layers = undefined;
     try layersOf(&cfg, &l);
     const o = options();
-    for ([_]i64{ 17, 100, 300, 2048 }) |n| for ([_]i64{ 0, 1000 }) |start| {
+    for ([_]i64{ 33, 100, 127, 300, 2048 }) |n| for ([_]i64{ 0, 1000 }) |start| {
         const sp = [_]bp.Span{.{ .slot = 2, .start = start, .n = n }};
         const one = try body(a, try bp.emitPrefill(a, &cfg, &w, o, &l.all, n, start, false));
         const run = try body(a, try bp.emitMulti(a, &cfg, &w, o, &l.all, &sp, .whole));
         try testing.expectEqual(one.len, run.len);
         for (one, run) |x, y| try testing.expect(same(x, y, true));
+        if (n <= 127) {
+            // the decoder replay of a tail of n rows from R0 = start
+            const dec1 = try body(a, try bp.emitReplay(a, &cfg, &w, o, l.dec, n, start, .decoder));
+            const decr = try body(a, try bp.emitMulti(a, &cfg, &w, o, l.dec, &sp, .decoder));
+            try testing.expectEqual(dec1.len, decr.len);
+            for (dec1, decr) |x, y| try testing.expect(same(x, y, true));
+        }
         const enc1 = try body(a, try bp.emitReplay(a, &cfg, &w, o, l.enc, n, start, .encoder));
         const encr = try body(a, try bp.emitMulti(a, &cfg, &w, o, l.enc, &sp, .encoder));
         try testing.expectEqual(enc1.len, encr.len);
@@ -134,11 +142,20 @@ test "a run of several segments: the rows' launches over all of them, each segme
     const spans = [_]bp.Span{ .{ .slot = 3, .start = 4000, .n = 700 }, .{ .slot = 0, .start = 0, .n = 100 }, .{ .slot = 1, .start = 129, .n = 33 } };
     var total: i64 = 0;
     for (spans) |sp| total += sp.n;
-    for ([_]bp.Part{ .whole, .encoder }) |part| {
-        const layers = if (part == .encoder) l.enc else &l.all;
-        const run = try bp.emitMulti(a, &cfg, &w, o, layers, &spans, part);
+    // the decoder replays: slots' tails from their R0 (a full 127-row tail, shorter prompts' tails)
+    const tails = [_]bp.Span{ .{ .slot = 2, .start = 3873, .n = 127 }, .{ .slot = 0, .start = 0, .n = 64 }, .{ .slot = 3, .start = 0, .n = 33 } };
+    for ([_]bp.Part{ .whole, .encoder, .decoder }) |part| {
+        const layers = switch (part) {
+            .encoder => l.enc,
+            .decoder => l.dec,
+            else => &l.all,
+        };
+        const segs: []const bp.Span = if (part == .decoder) &tails else &spans;
+        total = 0;
+        for (segs) |sp| total += sp.n;
+        const run = try bp.emitMulti(a, &cfg, &w, o, layers, segs, part);
         // the run's per-row launches (outside its segments' CSA2 steps): an all-rows one-segment program's, in order
-        const whole = try body(a, if (part == .encoder) try bp.emitReplay(a, &cfg, &w, o, layers, total, spans[0].start, .encoder) else try bp.emitPrefill(a, &cfg, &w, o, layers, total, spans[0].start, false));
+        const whole = try body(a, if (part != .whole) try bp.emitReplay(a, &cfg, &w, o, layers, total, segs[0].start, part) else try bp.emitPrefill(a, &cfg, &w, o, layers, total, segs[0].start, false));
         var at: usize = 0;
         var seg: ?usize = null;
         var cores: [3]std.ArrayList(calls.Call) = @splat(.empty);
@@ -164,10 +181,10 @@ test "a run of several segments: the rows' launches over all of them, each segme
         }
         // each segment's CSA2 steps: its own one-segment program's launches of those kinds, in order, at its rows
         var r0: i64 = 0;
-        for (spans, 0..) |sp, j| {
+        for (segs, 0..) |sp, j| {
             defer r0 += sp.n;
             try testing.expect(entered[j] > 0);
-            const own = try body(a, if (part == .encoder) try bp.emitReplay(a, &cfg, &w, o, layers, sp.n, sp.start, .encoder) else try bp.emitPrefill(a, &cfg, &w, o, layers, sp.n, sp.start, false));
+            const own = try body(a, if (part != .whole) try bp.emitReplay(a, &cfg, &w, o, layers, sp.n, sp.start, part) else try bp.emitPrefill(a, &cfg, &w, o, layers, sp.n, sp.start, false));
             var k: usize = 0;
             for (cores[j].items) |c| {
                 while (k < own.len and !same(own[k], c, false)) k += 1;
@@ -201,5 +218,6 @@ test "a run refuses what one segment's program must run alone" {
     // a short segment (the decode kernels' mix), more rows than a prefill segment, the decoder pass
     try testing.expectError(error.Unsupported, bp.emitMulti(a, &cfg, &w, o, &l.all, &.{ .{ .slot = 0, .start = 0, .n = 100 }, .{ .slot = 1, .start = 0, .n = 16 } }, .whole));
     try testing.expectError(error.Unsupported, bp.emitMulti(a, &cfg, &w, o, &l.all, &.{ .{ .slot = 0, .start = 0, .n = 2000 }, .{ .slot = 1, .start = 0, .n = 100 } }, .whole));
-    try testing.expectError(error.Unsupported, bp.emitMulti(a, &cfg, &w, o, &l.all, &.{.{ .slot = 0, .start = 0, .n = 100 }}, .decoder));
+    // a decoder tail of 32 rows or fewer (the split mHC programs: its replay alone is another kernel path)
+    try testing.expectError(error.Unsupported, bp.emitMulti(a, &cfg, &w, o, l.dec, &.{ .{ .slot = 0, .start = 0, .n = 100 }, .{ .slot = 1, .start = 0, .n = 32 } }, .decoder));
 }

@@ -468,8 +468,24 @@ pub const Forward = struct {
     /// 48-51: dsq-zig-sess4-1 (sessions over several slots); 48: [op, need, n, spilled entry ids...] a request's admission
     const op_sess_admit: i64 = 48;
 
-    /// 52-55: dsq-zig-beat-1 (multi-segment prefill runs); 52: [op, segments, (slot, start, rows) a segment, ids...]
+    /// 52-55: dsq-zig-beat-1 (multi-segment prefill runs); 52: [op, segments, (slot, start, rows) a segment, ids...];
+    /// 53: [op, n, slots...] the slots' CED decoder replays in one run (replayMulti)
     const op_pf_multi: i64 = 52;
+    const op_ced_multi: i64 = 53;
+
+    /// Several slots' CED decoder replays in one run (forward_prefill.finishMulti, TF_DSV41_REPLAY_RUNS): every rank,
+    /// the leader's message first. `out`: each slot's replayed tail and its rows of "w.taps".
+    pub fn replayMulti(f: *Forward, slots: []const u32, out: []pf.Replayed) !void {
+        if (f.leads()) {
+            var msg: [2 + 16]i64 = undefined;
+            if (slots.len > 16) return error.BadWindow;
+            msg[0] = op_ced_multi;
+            msg[1] = @intCast(slots.len);
+            for (slots, msg[2 .. 2 + slots.len]) |s, *y| y.* = s;
+            try f.link.?.send(msg[0 .. 2 + slots.len]);
+        }
+        return pf.finishMulti(f, slots, out);
+    }
 
     /// A slot's views made current on this rank (slots.zig SlotSet.view), for a multi-segment run's segments.
     pub const PfSwitch = struct { ctx: *anyopaque, run: *const fn (ctx: *anyopaque, slot: u32) anyerror!void };
@@ -673,6 +689,14 @@ pub const Forward = struct {
                     }
                     if (at != prompt.items.len) return error.BadPlan;
                     try f.prefillMulti(segs[0..ns]);
+                },
+                op_ced_multi => {
+                    const ns: usize = @intCast(msg[1]);
+                    if (ns < 2 or ns > 16 or msg.len != 2 + ns) return error.BadPlan;
+                    var slots: [16]u32 = undefined;
+                    for (msg[2..], slots[0..ns]) |x, *y| y.* = @intCast(x);
+                    var out: [16]pf.Replayed = undefined;
+                    try f.replayMulti(slots[0..ns], &out);
                 },
                 op_ced_finish => {
                     // the leader's slot ends where this one does, and both run replay (the same TF_DSV41_PREFILL)

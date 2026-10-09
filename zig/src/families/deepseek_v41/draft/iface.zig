@@ -57,7 +57,13 @@ pub const Target = struct {
         /// A round's pieces of several slots (TF_DSV41_PIECE_RUNS): one forward over them where the target can, else
         /// `piece` a piece. null: `piece` a piece.
         pieces: ?*const fn (ptr: *anyopaque, list: []const Piece) anyerror!void = null,
+        /// A round's finished prompts before their `finish` / `tail` (TF_DSV41_REPLAY_RUNS): the target may run their
+        /// CED decoder replays together (those finishes then skip theirs). null: nothing.
+        replays: ?*const fn (ptr: *anyopaque, list: []const Final) anyerror!void = null,
     };
+
+    /// A slot's whole prompt whose rows but the last are in (its `finish` / `tail` follows).
+    pub const Final = struct { slot: u32, ids: []const u32 };
 
     /// A slot's prompt `ids` (the whole prompt) rows [start, end) of a round; `save`: its snapshot right after them.
     pub const Piece = struct { slot: u32, ids: []const u32, start: u64, end: u64, save: bool };
@@ -79,6 +85,9 @@ pub const Target = struct {
     }
     pub fn finish(t: Target, slot: u32, ids: []const u32, sampling: ?lanes.Sampling, draw: u64) !u32 {
         return (t.vtable.finish orelse return error.NoPieces)(t.ptr, slot, ids, sampling, draw);
+    }
+    pub fn runReplays(t: Target, list: []const Final) !void {
+        if (t.vtable.replays) |f| return f(t.ptr, list);
     }
     pub fn runPieces(t: Target, list: []const Piece) !void {
         if (t.vtable.pieces) |f| return f(t.ptr, list);

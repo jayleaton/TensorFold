@@ -70,6 +70,10 @@ pub const GpuTarget = struct {
     releasing: [16]bool = @splat(false),
     /// TF_DSV41_PIECE_RUNS: rounds whose pieces ran as one multi-segment run
     piece_runs: u64 = 0,
+    /// TF_DSV41_REPLAY_RUNS: slots whose decoder replay a batched run did (their `finish` / `tail` skips it), and the
+    /// runs so far
+    replayed: [16]bool = @splat(false),
+    replay_runs: u64 = 0,
 
     /// A request's admission (kv/sched.zig Admission + the round's spills, with its first admission).
     pub const Planned = struct { need: u32, hit: ?@import("kv").sessions.store.Hit, spills: []const u32 = &.{} };
@@ -78,7 +82,7 @@ pub const GpuTarget = struct {
         return .{ .ptr = t, .vtable = &vtable };
     }
 
-    const vtable: iface.Target.VTable = .{ .prefill = prefill, .window = window, .keep = keep, .taps = taps, .release = release, .admit = admit, .begin = begin, .piece = piece, .finish = finish, .tail = tail, .pieces = pieces };
+    const vtable: iface.Target.VTable = .{ .prefill = prefill, .window = window, .keep = keep, .taps = taps, .release = release, .admit = admit, .begin = begin, .piece = piece, .finish = finish, .tail = tail, .pieces = pieces, .replays = replays };
 
     fn admit(p: *anyopaque, slot: u32, max_new: u64) void {
         const t = self_(p);
@@ -92,6 +96,7 @@ pub const GpuTarget = struct {
     fn prefill(p: *anyopaque, slot: u32, ids: []const u32, sampling: ?lanes.Sampling, draw: u64) anyerror!u32 {
         const t = self_(p);
         if (t.rows) |b| try b.beginPrefill(slot) else if (slot != 0) return error.Slots;
+        _ = t.takeReplayed(slot);
         const keyed = try t.keyedOf(sampling);
         t.tree.clear();
         if (t.resume_first) |first| if (t.f.slot.pos == ids.len and t.f.slot.pending == null) return first;
@@ -169,6 +174,7 @@ pub const GpuTarget = struct {
     fn begin(p: *anyopaque, slot: u32, ids: []const u32) anyerror!iface.Target.Begun {
         const t = self_(p);
         if (!(t.own_prefill and t.prompt_tail == .verify)) return error.NoPieces;
+        _ = t.takeReplayed(slot); // a batched replay of a request that never finished is not this one's
         const planned = t.admission;
         t.admission = null;
         try t.onSlot(slot);
@@ -204,7 +210,7 @@ pub const GpuTarget = struct {
         const t = self_(p);
         try t.onSlot(slot);
         if (ids.len == 0 or t.f.slot.pos != ids.len - 1) return error.NotAChain;
-        if (t.f.prefill_state.mode == .replay) {
+        if (t.f.prefill_state.mode == .replay and !t.takeReplayed(slot)) {
             // the decoder replay over the prompt's tail (rounds.py `finish_prompt`), its taps the drafter's context
             t.f.prefill_state.taps_rows = 0;
             try t.f.finishPrompt();
@@ -252,7 +258,7 @@ pub const GpuTarget = struct {
         try t.onSlot(slot);
         if (ids.len == 0 or t.f.slot.pos != ids.len - 1) return error.NotAChain;
         _ = try t.keyedOf(sampling); // refused here as `finish` would, not in the round
-        if (t.f.prefill_state.mode == .replay) {
+        if (t.f.prefill_state.mode == .replay and !t.takeReplayed(slot)) {
             t.f.prefill_state.taps_rows = 0;
             try t.f.finishPrompt();
             try t.handTaps(slot);
@@ -292,15 +298,58 @@ pub const GpuTarget = struct {
 
     /// The prompt's prefilled tail's taps into the DSpark pass (ced.handoff): its last `ingest_window` rows, one ingest.
     fn handTaps(t: *GpuTarget, slot: u32) !void {
-        const ps = t.pass orelse return;
         const st = &t.f.prefill_state;
-        const h = ced.handoff(st.taps_at, st.taps_rows, t.ingest_window) orelse return;
+        return t.handTapsAt(slot, st.taps_at, st.taps_rows, 0);
+    }
+
+    /// The drafter's context from "w.taps": positions [at, at + rows) at rows [base, base + rows) (a batched replay's
+    /// slot at its rows of the run), the last `ingest_window` of them (ced.handoff).
+    fn handTapsAt(t: *GpuTarget, slot: u32, at: u64, n: u32, base: u32) !void {
+        const ps = t.pass orelse return;
+        const h = ced.handoff(at, n, t.ingest_window) orelse return;
         var rows: [256]u32 = undefined;
         if (h.n > rows.len) return error.WindowRows;
-        for (rows[0..h.n], 0..) |*r, i| r.* = h.row0 + @as(u32, @intCast(i));
+        for (rows[0..h.n], 0..) |*r, i| r.* = base + h.row0 + @as(u32, @intCast(i));
         const k: u32 = @intCast(t.f.cfg.dspark_targets.items().len);
-        const tp: iface.Taps = .{ .address = t.f.runner.addressOf("w.taps") orelse return error.Unbound, .rows = st.taps_rows, .stride = k * t.f.cfg.hidden };
+        const tp: iface.Taps = .{ .address = t.f.runner.addressOf("w.taps") orelse return error.Unbound, .rows = base + n, .stride = k * t.f.cfg.hidden };
         try ps.ingest(slot, h.start, tp, rows[0..h.n]);
+    }
+
+    /// A batched run replayed `slot`'s tail (TF_DSV41_REPLAY_RUNS): true once, and the flag cleared.
+    fn takeReplayed(t: *GpuTarget, slot: u32) bool {
+        if (slot >= t.replayed.len or !t.replayed[slot]) return false;
+        t.replayed[slot] = false;
+        return true;
+    }
+
+    /// TF_DSV41_REPLAY_RUNS: the round's finished prompts' CED decoder replays in one run (Forward.replayMulti), before
+    /// their `finish` / `tail` (which then skip theirs), each slot's taps to the drafter as `finish` hands them, in the
+    /// finals' order. A tail of 32 rows or fewer (a short prompt) and the run's other refusals replay alone there.
+    fn replays(p: *anyopaque, list: []const iface.Target.Final) anyerror!void {
+        const t = self_(p);
+        if (list.len < 2 or t.f.prefill_state.mode != .replay or t.f.pf_switch == null) return;
+        var segs: [16]pf.MultiSeg = undefined;
+        var n: usize = 0;
+        for (list) |q| {
+            if (q.ids.len < 2 or n == segs.len) continue;
+            const end: u64 = q.ids.len - 1;
+            const tl = ced.tailOf(end);
+            if (tl.m <= 32) continue;
+            segs[n] = .{ .slot = q.slot, .start = tl.r0, .ids = q.ids[tl.r0..end] };
+            n += 1;
+        }
+        if (n < 2 or !try pf.replayRunnable(t.f, segs[0..n])) return;
+        try t.onSlot(segs[0].slot); // the slots' pending windows kept (every rank), as each `finish` does
+        var slots: [16]u32 = undefined;
+        for (segs[0..n], slots[0..n]) |seg, *x| x.* = seg.slot;
+        var out: [16]pf.Replayed = undefined;
+        try t.f.replayMulti(slots[0..n], &out);
+        for (out[0..n]) |o| {
+            t.replayed[o.slot] = true;
+            try t.handTapsAt(o.slot, o.at, o.rows, o.row0);
+        }
+        t.replay_runs += 1;
+        if (t.replay_runs == 1 or t.replay_runs % 256 == 0) std.log.scoped(.dsv41).info("replay runs: {d} (this one {d} slots' tails in one run)", .{ t.replay_runs, n });
     }
 
     /// T > 0: the sampling the sampler keys (null: greedy); refused without a sampler.
