@@ -139,7 +139,7 @@ pub const GpuTarget = struct {
         if (t.own_prefill) {
             // the keyed choice after the prompt: the last segment's last row
             try t.f.prefill(rest);
-            const seg: usize = @intCast(t.f.opts.prefill_rows);
+            const seg: usize = @import("forward_prefill.zig").segmentRows(t.f);
             const last = if (rest.len % seg == 0) seg else rest.len % seg;
             if (keyed) |s| return t.pickOne(@intCast(last - 1), s, draw);
             const picks = try t.f.gpa.alloc(u32, last);

@@ -303,18 +303,24 @@ pub fn promptSplit(n: usize, tail: PromptTail) struct { prefill: usize, window: 
 /// prefill mode (CED replay: the model's decoder layer checked). R1 is read where the forward is made (`r1`).
 pub fn apply(f: *@import("forward.zig").Forward, a: std.mem.Allocator, io: std.Io, rank: u32) !void {
     f.opts.pfd = try pfDense(a, io, &env);
-    if (try prefillRows(&env)) |r| f.opts.prefill_rows = r;
+    // TF_DSV41_PF_4K: the forward's own options (decode windows, the drafter, the buffer plan) keep 2,048-row
+    // segments byte for byte; 4,096-row segments run in the prefill's own workspace (forward_prefill.K4)
+    const big = try pf4k(&env);
+    if (try prefillRows(&env)) |r| if (!big) {
+        f.opts.prefill_rows = r;
+    };
     if (try indexBudget(&env)) |b| f.opts.index_budget = b;
     f.prefill_state.ahead = prefetchAhead(&env);
     f.opts.gm_v2 = try @import("gm2pf.zig").mode(&env);
-    f.opts.pf4k = try pf4k(&env);
+    f.prefill_state.mode = try prefillMode(&env);
+    f.prefill_state.k4 = big;
     // x3gm v1 at 4K runs pf4k's tuning table (128-member passes past 48 members an expert), which the emitter does not
-    // take; v2 keeps G6's tiles at any rows (x3gm.tuned2), so 4K is v2's alone
-    if (f.opts.pf4k and f.opts.gm_v2 == .off) {
-        std.log.scoped(.dsv41).err("TF_DSV41_PF_4K=1 needs TF_DSV41_GM_V2=1 (or split): x3gm v1's 4K tiles are not on the Zig emitter", .{});
+    // take; v2 keeps G6's tiles at any rows (x3gm.tuned2), so 4K is v2's alone; the workspace is released at a
+    // prompt's CED finish, so 4K is replay's alone
+    if (big and (f.opts.gm_v2 == .off or f.prefill_state.mode != .replay)) {
+        std.log.scoped(.dsv41).err("TF_DSV41_PF_4K=1 needs TF_DSV41_GM_V2=1 (or split) and TF_DSV41_PREFILL=replay", .{});
         return error.BadKnob;
     }
-    f.prefill_state.mode = try prefillMode(&env);
     f.opts.pf_tbo = try pfTbo(&env);
     // TF_DSV41_BRANCHES: the side stream exists before any capture
     if (f.branches == null) f.branches = try @import("branches.zig").install(f.gpa, f, rank);
@@ -347,7 +353,7 @@ pub fn apply(f: *@import("forward.zig").Forward, a: std.mem.Allocator, io: std.I
     const log = std.log.scoped(.dsv41);
     if (f.opts.pf_tbo) log.info("prefill tbo: encoder segments two at a time on two streams, x3gm on at most {d} SMs (0: all){s}", .{ dk.exl3.gm_sms_cap, if (f.opts.pf_overlap > 0) "; TF_DSV41_PF_OVERLAP is off under it" else "" });
     if (f.opts.pf_overlap > 0) log.info("prefill overlap: a segment's exchanges in {d} row pieces on the side stream", .{f.opts.pf_overlap});
-    log.info("prod knobs: pf_dense {s}, prefill rows {d}{s}, index budget {d} MiB, R1 {s}, prefetch ahead {s}, x3gm v2 {t}, prefill {t}", .{ if (f.opts.pfd != null) "fused" else "off", f.opts.prefill_rows, if (f.opts.pf4k) " (4K: one x3gm block a segment)" else "", f.opts.index_budget >> 20, if (f.opts.r1) "on" else "off", if (f.prefill_state.ahead) "on" else "off", f.opts.gm_v2, f.prefill_state.mode });
+    log.info("prod knobs: pf_dense {s}, prefill rows {d}{s}, index budget {d} MiB, R1 {s}, prefetch ahead {s}, x3gm v2 {t}, prefill {t}", .{ if (f.opts.pfd != null) "fused" else "off", if (big) pf4k_rows else @as(u32, @intCast(f.opts.prefill_rows)), if (big) " (4K: one x3gm block a segment, in the prefill's own workspace)" else "", f.opts.index_budget >> 20, if (f.opts.r1) "on" else "off", if (f.prefill_state.ahead) "on" else "off", f.opts.gm_v2, f.prefill_state.mode });
 }
 
 pub fn env(name: []const u8) ?[]const u8 {

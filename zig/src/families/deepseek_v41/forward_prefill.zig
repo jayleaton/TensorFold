@@ -26,6 +26,7 @@ const cuda = @import("cuda");
 const calls = @import("calls.zig");
 const buffers = @import("buffers.zig");
 const run = @import("run.zig");
+const block = @import("block.zig");
 const block_prefill = @import("block_prefill.zig");
 const longpf = @import("longpf.zig");
 const vision_rows = @import("vision_rows.zig");
@@ -59,6 +60,10 @@ pub const State = struct {
     /// flight (the glue runs each micro-batch's steps with its own ids, window, Engram tail and MoE count)
     long_b: longpf.State = .{},
     tbo: ?*Pair = null,
+    /// TF_DSV41_PF_4K (prod_knobs.apply): 4,096-row segments in the prefill's own workspace (`K4`); the forward's
+    /// options, buffer plan and arena stay the 2,048-row ones, so decode windows and the drafter are untouched
+    k4: bool = false,
+    k4ws: K4 = .{},
     /// TF_DSV41_PREFILL (prod_knobs.apply): `.replay` = CED (ced.zig), segments are encoder passes and `finish` runs
     /// the decoder; `.full`: every layer over every row
     mode: prod_knobs.PrefillMode = .full,
@@ -100,6 +105,21 @@ pub fn plan(f: *Forward, p: *buffers.Plan, rows: u32) !void {
     const replay = f.prefill_state.mode == .replay;
     const runs = try block_prefill.planRuns(ra.allocator(), f.cfg, f.widths, vision_rows.planOptions(f), if (replay) try encoderLayers(f, layers) else layers, if (replay) try decoderLayers(f, layers) else null, rows, if (replay) .encoder else .whole);
     for (runs.items) |cs| try p.add(cs);
+    // TF_DSV41_PF_4K: the 4,096-row encoder segment in the workspace's namespace, at 0 and at its last start (its own
+    // plan: nothing here grows the forward's)
+    if (f.prefill_state.k4) {
+        const ws = &f.prefill_state.k4ws;
+        if (ws.plan == null) ws.plan = .{ .a = f.gpa };
+        const enc = try encoderLayers(f, layers);
+        const o4 = k4Options(vision_rows.planOptions(f));
+        const top4 = try lastStartWith(f, o4, enc, K4.rows, .encoder);
+        for ([_]i64{ 0, top4 }) |start| {
+            var ka = std.heap.ArenaAllocator.init(f.gpa);
+            defer ka.deinit();
+            const cs = try block_prefill.emitReplay(ka.allocator(), f.cfg, f.widths, o4, enc, K4.rows, start, .encoder);
+            try ws.plan.?.add(try block_prefill.ownCalls(ka.allocator(), cs, K4.tag));
+        }
+    }
     // TF_DSV41_PF_TBO: a pair of whole segments (B's own scratch roles), at 0 and at the last start a pair takes
     if (replay and f.opts.pf_tbo and rows >= 2 * block_prefill.tbo_min) {
         const enc = try encoderLayers(f, layers);
@@ -147,10 +167,10 @@ fn decoderLayers(f: *Forward, layers: []const u32) ![]const u32 {
 }
 
 /// Whether an `n`-row segment (`part` of it) at `start` is on the prefill path (block_prefill's emitter takes it).
-fn emits(f: *Forward, layers: []const u32, n: u32, start: i64, part: block_prefill.Part) !bool {
+fn emits(f: *Forward, o: block.Options, layers: []const u32, n: u32, start: i64, part: block_prefill.Part) !bool {
     var ea = std.heap.ArenaAllocator.init(f.gpa);
     defer ea.deinit();
-    _ = block_prefill.emitReplay(ea.allocator(), f.cfg, f.widths, f.opts, layers, n, start, part) catch |e| switch (e) {
+    _ = block_prefill.emitReplay(ea.allocator(), f.cfg, f.widths, o, layers, n, start, part) catch |e| switch (e) {
         error.Unsupported => return false,
         else => return e,
     };
@@ -160,20 +180,96 @@ fn emits(f: *Forward, layers: []const u32, n: u32, start: i64, part: block_prefi
 /// The last start an `n`-row segment emits at (the stream top-k's threshold moves with the segment's end). The decoder
 /// pass ends a row before the prompt's last token: its last start is one lower.
 fn lastStart(f: *Forward, layers: []const u32, n: u32, part: block_prefill.Part) !i64 {
-    var hi: i64 = f.opts.limit - n - @intFromBool(part == .decoder);
+    return lastStartWith(f, f.opts, layers, n, part);
+}
+
+/// `lastStart` with options `o` (TF_DSV41_PF_4K's segments: k4Options).
+fn lastStartWith(f: *Forward, o: block.Options, layers: []const u32, n: u32, part: block_prefill.Part) !i64 {
+    var hi: i64 = o.limit - n - @intFromBool(part == .decoder);
     if (hi < 0) return error.BadWindow;
-    if (try emits(f, layers, n, hi, part)) return hi;
-    if (!try emits(f, layers, n, 0, part)) {
+    if (try emits(f, o, layers, n, hi, part)) return hi;
+    if (!try emits(f, o, layers, n, 0, part)) {
         log.warn("prefill: a {d}-row segment is not on the prefill path at any position (block_prefill: Unsupported)", .{n});
         return error.Unsupported;
     }
     var lo: i64 = 0;
     while (hi - lo > 1) {
         const mid = lo + @divFloor(hi - lo, 2);
-        if (try emits(f, layers, n, mid, part)) lo = mid else hi = mid;
+        if (try emits(f, o, layers, n, mid, part)) lo = mid else hi = mid;
     }
     log.info("prefill: {d}-row segments emit up to start {d}", .{ n, lo });
     return lo;
+}
+
+/// TF_DSV41_PF_4K's workspace: every role a 4,096-row segment's program names in its own namespace ("k4~":
+/// block_prefill.ownRole; the slot's state and the constants are the forward's), sized by its own plan at boot and
+/// allocated at a prompt's first 4K segment, released at the prompt's CED finish. Nothing of it is resident while no
+/// long prompt prefills: the 4K path adds no byte to the forward's plan, decode's graphs keep their room.
+pub const K4 = struct {
+    pub const rows: u32 = prod_knobs.pf4k_rows;
+    pub const tag = "k4~";
+    plan: ?buffers.Plan = null,
+    buf: ?cuda.DeviceBuffer = null,
+    bytes: u64 = 0,
+    allocs: u64 = 0,
+    /// the exchange's send buffer and Engram's gathered rows while a 4K segment runs (the glue grows them here): the
+    /// forward's own, which decode graphs hold the addresses of, are never regrown by a 4K segment
+    send: ?cuda.DeviceBuffer = null,
+    gathered: ?cuda.DeviceBuffer = null,
+};
+
+/// The rows a prompt segment holds: 4,096 under TF_DSV41_PF_4K, else the forward's (the round planner's rows too).
+pub fn segmentRows(f: *const Forward) usize {
+    return if (f.prefill_state.k4) K4.rows else @intCast(f.opts.prefill_rows);
+}
+
+/// The options a 4,096-row segment emits with: the forward's at 4,096 rows with x3gm one block a segment.
+pub fn k4Options(o: block.Options) block.Options {
+    var x = o;
+    x.prefill_rows = K4.rows;
+    x.pf4k = true;
+    return x;
+}
+
+/// The workspace's roles bound to one fresh zeroed allocation (the first 4K segment of a prompt).
+fn k4Acquire(f: *Forward) !void {
+    const ws = &f.prefill_state.k4ws;
+    if (ws.buf != null) return;
+    const pl = ws.plan orelse return error.Unbound;
+    var total: u64 = 0;
+    for (pl.sizes.keys(), pl.sizes.values()) |k, v| {
+        if (std.mem.indexOf(u8, k, K4.tag) == null) continue;
+        total += std.mem.alignForward(u64, v, 256);
+    }
+    const b = try cuda.DeviceBuffer.alloc(f.runner.d, @max(total, 256));
+    errdefer {
+        var x = b;
+        x.free();
+    }
+    try b.fill8(0, null);
+    var at: u64 = 0;
+    for (pl.sizes.keys(), pl.sizes.values()) |k, v| {
+        if (std.mem.indexOf(u8, k, K4.tag) == null) continue;
+        try f.runner.external(k, b.ptr + at);
+        at += std.mem.alignForward(u64, v, 256);
+    }
+    ws.buf = b;
+    ws.bytes = total;
+    ws.allocs += 1;
+    if (ws.allocs == 1 and f.comm.rank() == 0) log.info("prefill 4K: workspace {d} MiB, held while a prompt prefills 4,096-row segments", .{total >> 20});
+}
+
+/// The workspace back (a prompt's CED finish: no 4K segment runs until the next prompt's first).
+fn k4Release(f: *Forward) !void {
+    const ws = &f.prefill_state.k4ws;
+    var b = ws.buf orelse return;
+    try f.runner.stream.synchronize();
+    b.free();
+    ws.buf = null;
+    if (ws.send) |*x| x.free();
+    if (ws.gathered) |*x| x.free();
+    ws.send = null;
+    ws.gathered = null;
 }
 
 /// TF_DSV41_PF_TBO: one micro-batch's host side of a pair in flight (what `segment` sets on the forward for its one
@@ -201,11 +297,11 @@ pub fn prompt(f: *Forward, ids_in: []const u32) !void {
     const ids = st.ids.items;
     st.taps_rows = 0;
     try ready(f);
-    const seg: usize = @intCast(f.opts.prefill_rows);
+    const seg: usize = segmentRows(f);
     var at: usize = 0;
     while (at < ids.len) {
         // TF_DSV41_PF_TBO: two segments at a time (the second at least tbo_min rows), else one
-        if (pairOf(f, ids.len - at)) |pr| {
+        if (if (st.k4) null else pairOf(f, ids.len - at)) |pr| {
             const n = pr[0] + pr[1];
             if (st.ahead and at + n < ids.len) readAhead(f, ids, at, n, @min(seg, ids.len - at - n));
             if (try segmentPair(f, ids[at .. at + pr[0]], ids[at + pr[0] .. at + n])) {
@@ -318,12 +414,16 @@ fn segment(f: *Forward, ids: []const u32, head: bool) !void {
     const layers = if (replay) try encoderLayers(f, try f.backbone(a)) else try f.backbone(a);
     const start = f.slot.pos;
     if (f.kv) |kx| try kx.reserve(start + n);
-    const o = vision_rows.segmentOptions(f, ids);
+    // TF_DSV41_PF_4K: a segment past the forward's rows runs in the workspace (its own roles: block_prefill.ownCalls)
+    const big = st.k4 and n > f.opts.prefill_rows;
+    const o = if (big) k4Options(vision_rows.segmentOptions(f, ids)) else vision_rows.segmentOptions(f, ids);
     const emitted = if (replay) block_prefill.emitReplay(a, f.cfg, f.widths, o, layers, n, @intCast(start), .encoder) else block_prefill.emitPrefill(a, f.cfg, f.widths, o, layers, n, @intCast(start), head);
-    const cs = emitted catch |e| {
+    const plain = emitted catch |e| {
         if (e == error.Unsupported) log.warn("prefill: the {d}-row segment at {d} is not on the prefill path (block_prefill: Unsupported)", .{ n, start });
         return e;
     };
+    const cs = if (big) try block_prefill.ownCalls(a, plain, K4.tag) else plain;
+    if (big) try k4Acquire(f);
     // the glue reads the ids (embedding, Engram) and the pending window (positions)
     f.ids = ids;
     f.slot.pending = .{ .start = start, .n = n };
@@ -331,8 +431,17 @@ fn segment(f: *Forward, ids: []const u32, head: bool) !void {
     st.layers = layers;
     st.moe = 0;
     f.runner.glue = .{ .ctx = f, .run = glueFn };
+    // TF_DSV41_PF_4K: the segment's send / gathered buffers are the workspace's while it runs
+    if (big) {
+        std.mem.swap(?cuda.DeviceBuffer, &f.send, &st.k4ws.send);
+        std.mem.swap(?cuda.DeviceBuffer, &f.gathered, &st.k4ws.gathered);
+    }
+    defer if (big) {
+        std.mem.swap(?cuda.DeviceBuffer, &f.send, &st.k4ws.send);
+        std.mem.swap(?cuda.DeviceBuffer, &f.gathered, &st.k4ws.gathered);
+    };
     try longpf.window(&st.long, f.gpa, f.runner, f.kv, start, cs);
-    try commit(f, n);
+    if (big) try commitRoles(f, n, 0, K4.tag, n) else try commit(f, n);
     // replay.encode: the stash's ids follow its rows (a segment that does not continue it starts it over)
     if (replay) f.slot.ced.extend(start, ids);
     f.last_rows = if (replay) 0 else n;
@@ -514,6 +623,7 @@ pub fn finishMulti(f: *Forward, slots: []const u32, out: []Replayed) !void {
         o.* = .{ .slot = sg.slot, .at = sg.start, .rows = @intCast(sg.ids.len), .row0 = @intCast(r0) };
     }
     f.last_rows = 0;
+    try k4Release(f); // TF_DSV41_PF_4K: these prompts are prefilled
 }
 
 /// The glue's view of the whole run (Forward.multi): the first segment's slot, every row's ids, the run's rows pending.
@@ -584,6 +694,8 @@ pub fn finish(f: *Forward) !void {
     f.runner.glue = .{ .ctx = f, .run = glueFn };
     try longpf.window(&st.long, f.gpa, f.runner, f.kv, t.r0, cs);
     f.last_rows = 0;
+    // TF_DSV41_PF_4K: the prompt is prefilled, its workspace goes back
+    try k4Release(f);
     // the drafter's context rows: the tail's taps (replay.finish's, which slots.finish_prompt hands to `replayed`)
     st.taps_at = t.r0;
     st.taps_rows = t.m;

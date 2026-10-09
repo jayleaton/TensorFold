@@ -48,7 +48,7 @@ pub const SchedHost = struct {
     /// The settings as prod's batcher reads them; the rows a round are the forward's prefill segment.
     pub fn settings(gt: *const target.GpuTarget) !sched.Settings {
         var s = try sched.Settings.fromEnv();
-        s.rows = @intCast(gt.f.opts.prefill_rows);
+        s.rows = @intCast(@import("forward_prefill.zig").segmentRows(gt.f));
         // TF_DSV41_PF_TBO: a round's piece holds a pair of segments (forward_prefill.prompt runs them on two streams)
         if (gt.f.opts.pf_tbo) s.rows *= 2;
         s.sessions = gt.sessions != null;

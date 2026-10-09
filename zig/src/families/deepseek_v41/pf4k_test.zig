@@ -228,3 +228,47 @@ fn argEql(p: calls.Arg, q: calls.Arg) bool {
         .none => true,
     };
 }
+
+const buffers = @import("buffers.zig");
+const fp = @import("forward_prefill.zig");
+
+test "TF_DSV41_PF_4K adds no byte to the forward's buffer plan: the 4K program's own roles are its workspace's, the rest the 2K plan's at their sizes" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const cfg: Config = .{};
+    const w = try widths(aa);
+    var enc: [21]u32 = undefined;
+    for (&enc, 0..) |*l, i| l.* = @intCast(i);
+    // the forward's options under 4K are its 2K ones (prod_knobs.apply leaves them); 4K segments emit with k4Options
+    const base: block.Options = .{ .gm_v2 = .one, .limit = 1 << 20, .rope_rows = (1 << 20) + 2048, .index_budget = 64 << 20, .taps = true };
+    const o4 = fp.k4Options(base);
+    try testing.expectEqual(@as(i64, 4096), o4.prefill_rows);
+    try testing.expect(o4.pf4k and !base.pf4k and base.prefill_rows == 2048);
+    var p2: buffers.Plan = .{ .a = aa };
+    var p4: buffers.Plan = .{ .a = aa };
+    for ([_]i64{ 0, (1 << 20) - 4096 - 1 }) |start| {
+        try p2.add(try bp.emitReplay(aa, &cfg, &w, base, &enc, 2048, start + 2048, .encoder));
+        try p4.add(try bp.ownCalls(aa, try bp.emitReplay(aa, &cfg, &w, o4, &enc, 4096, start, .encoder), fp.K4.tag));
+    }
+    var own: u64 = 0;
+    for (p4.sizes.keys(), p4.sizes.values()) |k, v| {
+        if (std.mem.indexOf(u8, k, fp.K4.tag) != null) {
+            own += v;
+            continue;
+        }
+        // shared with the forward: the slot's state (pool, rings, carries, keys, stash) and constant tables
+        const b = p2.sizes.get(k) orelse {
+            std.debug.print("the 4K program reads a role the 2K plan does not hold: {s}\n", .{k});
+            return error.TestUnexpectedResult;
+        };
+        if (v > b) std.debug.print("the 4K program needs {s} at {d} bytes, the 2K plan holds {d}\n", .{ k, v, b });
+        try testing.expect(v <= b);
+        for (bp.own_scratch) |sc| try testing.expect(!std.mem.startsWith(u8, k, sc));
+    }
+    for (p2.sizes.keys()) |k| try testing.expect(std.mem.indexOf(u8, k, fp.K4.tag) == null);
+    // the workspace: the 4K segment's scratch and window roles (x3gm's z at 24,576 pairs, the 8,192-row staging ring)
+    try testing.expect(p4.sizes.get("s.k4~ex.z").? >= 4096 * 6 * 5120 * 4);
+    try testing.expect(p4.sizes.contains("s.k4~stage.v") or p4.sizes.contains("s.k4~stage.s"));
+    try testing.expect(own > 1 << 30);
+}

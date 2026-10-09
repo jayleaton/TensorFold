@@ -1366,33 +1366,55 @@ fn emitPart(a: std.mem.Allocator, cfg: *const Config, w: *const block.Widths, o:
 /// interleave's joins cost more than the overlap hides)
 pub const tbo_min: i64 = 512;
 
-/// The persistent roles a segment uses as scratch (rewritten every segment, never read by the next): a micro-batch
-/// of a TF_DSV41_PF_TBO pair takes its own copy of each. Every other "s." role is the slot's state (the KV pool, SWA
-/// rings, ratio-2 carries, index keys, the CED stash) or a constant table, which both micro-batches share.
-const tbo_scratch = [_][]const u8{ "s.ex.", "s.pf.xh", "s.pf.w", "s.router.", "s.stage.", "s.attn." };
+/// The persistent roles a segment uses as scratch (rewritten every segment, never read by the next): a program in
+/// a namespace of its own (`ownRole`: a TF_DSV41_PF_TBO pair's B, TF_DSV41_PF_4K's workspace) takes its own copy of
+/// each. Every other "s." role is the slot's state (the KV pool, SWA rings, ratio-2 carries, index keys, the CED
+/// stash) or a constant table, which every namespace shares.
+pub const own_scratch = [_][]const u8{ "s.ex.", "s.pf.xh", "s.pf.w", "s.router.", "s.stage.", "s.attn." };
 
-/// Micro-batch B's name of a role: "w.x" -> "w.b~x", "L.x" -> "L.b~x" (the same scope), a scratch "s.x" -> "s.b~x";
-/// the slot's state and the constants keep theirs.
-pub fn tboRole(a: std.mem.Allocator, r: []const u8) ![]const u8 {
+/// A role in namespace `tag`: "w.x" -> "w.<tag>x", "L.x" -> "L.<tag>x" (the same scope), a scratch "s.x" ->
+/// "s.<tag>x"; the slot's state and the constants keep theirs.
+pub fn ownRole(a: std.mem.Allocator, r: []const u8, comptime tag: []const u8) ![]const u8 {
     if (std.mem.startsWith(u8, r, "s.")) {
-        for (tbo_scratch) |p| if (std.mem.startsWith(u8, r, p)) return std.fmt.allocPrint(a, "s.b~{s}", .{r[2..]});
+        for (own_scratch) |p| if (std.mem.startsWith(u8, r, p)) return std.fmt.allocPrint(a, "s." ++ tag ++ "{s}", .{r[2..]});
         return r;
     }
-    const dot = std.mem.indexOfScalar(u8, r, '.') orelse return std.fmt.allocPrint(a, "b~{s}", .{r});
-    return std.fmt.allocPrint(a, "{s}b~{s}", .{ r[0 .. dot + 1], r[dot + 1 ..] });
+    const dot = std.mem.indexOfScalar(u8, r, '.') orelse return std.fmt.allocPrint(a, tag ++ "{s}", .{r});
+    return std.fmt.allocPrint(a, "{s}" ++ tag ++ "{s}", .{ r[0 .. dot + 1], r[dot + 1 ..] });
 }
 
-fn tboArg(a: std.mem.Allocator, x: Arg) !Arg {
+/// Micro-batch B's name of a role (TF_DSV41_PF_TBO).
+pub fn tboRole(a: std.mem.Allocator, r: []const u8) ![]const u8 {
+    return ownRole(a, r, "b~");
+}
+
+fn ownArg(a: std.mem.Allocator, x: Arg, comptime tag: []const u8) !Arg {
     return switch (x) {
-        .t => |t| if (t.role == .buf) .{ .t = .{ .role = .{ .buf = try tboRole(a, t.role.buf) }, .dt = t.dt, .shape = t.shape, .stride = t.stride, .offset = t.offset } } else x,
-        .opaque_table => |t| if (t.role == .buf) .{ .opaque_table = .{ .role = .{ .buf = try tboRole(a, t.role.buf) }, .dt = t.dt, .shape = t.shape, .stride = t.stride, .offset = t.offset } } else x,
+        .t => |t| if (t.role == .buf) .{ .t = .{ .role = .{ .buf = try ownRole(a, t.role.buf, tag) }, .dt = t.dt, .shape = t.shape, .stride = t.stride, .offset = t.offset } } else x,
+        .opaque_table => |t| if (t.role == .buf) .{ .opaque_table = .{ .role = .{ .buf = try ownRole(a, t.role.buf, tag) }, .dt = t.dt, .shape = t.shape, .stride = t.stride, .offset = t.offset } } else x,
         .list => |l| blk: {
             const out = try a.alloc(Arg, l.len);
-            for (l, out) |y, *z| z.* = try tboArg(a, y);
+            for (l, out) |y, *z| z.* = try ownArg(a, y, tag);
             break :blk .{ .list = out };
         },
         else => x,
     };
+}
+
+fn tboArg(a: std.mem.Allocator, x: Arg) !Arg {
+    return ownArg(a, x, "b~");
+}
+
+/// `cs` with every role in namespace `tag` (ownRole), the calls otherwise as they are.
+pub fn ownCalls(a: std.mem.Allocator, cs: []const calls.Call, comptime tag: []const u8) ![]calls.Call {
+    const out = try a.alloc(calls.Call, cs.len);
+    for (cs, out) |c, *x| {
+        x.* = c;
+        const args = try a.alloc(calls.Named, c.args.len);
+        for (c.args, args) |y, *z| z.* = .{ .name = y.name, .arg = try ownArg(a, y.arg, tag) };
+        x.args = args;
+    }
+    return out;
 }
 
 /// TF_DSV41_PF_TBO: two consecutive CED encoder segments as one program on two streams (two micro-batches; DeepSeek's
