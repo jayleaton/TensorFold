@@ -167,6 +167,10 @@
    "num_ctas": 1,
    "num_stages": 3,
    "num_warps": 8
+  },
+  "dsv41_zig_triton.dtopk_b._dtopk_b": {
+   "num_warps": 8,
+   "source": "dtopk_b.py = csa2/dtopk.py's _dtopk launch: csa2/dtopk.py:167 num_warps=WARPS"
   }
  },
  "generator": "tools/zig/triton_fill.py",

@@ -49,6 +49,7 @@ const dsv41_kernels = [_]Kernel{
     .{ .name = "dsv41_dense3", .src = "deepseek_v41/dense3", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // tf_dsv41_dense3_v1
     .{ .name = "dsv41_attn", .src = "deepseek_v41/attn_cuda", .flags = &.{ "-O3", "-lineinfo", "--fmad=false" } }, // tf_dsv41_attn_cuda_v1
     .{ .name = "dsv41_topk", .src = "deepseek_v41/topk_cuda", .flags = &.{ "-O3", "-lineinfo", "--fmad=false" } }, // tf_dsv41_attn_cuda_v1
+    .{ .name = "dsv41_topk_b", .src = "deepseek_v41/topk_b", .flags = &.{ "-O3", "-lineinfo", "--fmad=false" } }, // ours: topk_cuda.cu row-bounded (TF_DSV41_INDEX_BOUND)
     .{ .name = "dsv41_mhc", .src = "deepseek_v41/mhc_cuda", .flags = &.{ "-O3", "-lineinfo", "--fmad=false" } }, // tf_dsv41_mhc_cuda_v1
     .{ .name = "dsv41_mhc_pf", .src = "deepseek_v41/mhc_pf", .flags = &.{ "-O3", "-lineinfo", "--fmad=false" } }, // tf_dsv41_mhc_pf_v1
     .{ .name = "dsv41_router_gemv", .src = "deepseek_v41/router_gemv", .flags = &.{ "-O3", "-lineinfo" } }, // tf_dsv41_router_gemv_v2
@@ -221,7 +222,10 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const dsv41_api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true });
     dsv41_api.addImport("lanes", dsv41_lanes);
     dsv41_m1.addImport("engine_api", dsv41_api);
-    dsv41_m1.addImport("dsv41_serve", @import("sampling.zig").serve(b, target, optimize, dsv41_lanes).serve); // the keyed sampler's Picker
+    const m1_serve = @import("sampling.zig").serve(b, target, optimize, dsv41_lanes).serve;
+    dsv41_m1.addImport("dsv41_serve", m1_serve); // the keyed sampler's Picker
+    // TF_DSV41_CALIB=measure's calibration text (calib_gpu.zig, via serve_engine.zig): the serving module's tokenizer
+    dsv41_m1.addImport("tokenizer", m1_serve.import_table.get("tokenizer").?);
     @import("grammar.zig").addTo(b, dsv41_m1, target, optimize); // structured output (grammar_gpu.zig): xgrammar's core, the mask PTX
     @import("sampling.zig").gpu(b, target, optimize, cuda, dsv41); // tf-dsv41-samp: the keyed sampler's device steps
     b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-m1", .root_module = dsv41_m1 }));

@@ -183,6 +183,7 @@ pub fn call(k: *const Kernels, s: cuda.Stream, ext: []const u8, func: []const u8
     if (is(ext, "tf_dsv41_x3gm_v1")) return x3gmExt(k.experts(s), func, args, kwargs);
     if (is(ext, "tf_dsv41_x3ld_epi_v1")) return x3ldEpiExt(k.experts(s), func, args, kwargs);
     if (is(ext, "tf_dsv41_attn_cuda_v1")) return attnExt(k.others(s), func, args, kwargs);
+    if (is(ext, "tf_dsv41_topk_b_v1") and is(func, "topk")) return topkCall(k.others(s), args, kwargs, true);
     if (is(ext, "tf_dsv41_mhc_cuda_v1") and is(func, "run")) return mhcRun(k.others(s), args, kwargs);
     if (is(ext, "tf_dsv41_mhc_cuda_v1") and is(func, "coef")) return mhcCoef(k.others(s), args, kwargs);
     if (is(ext, "tf_dsv41_mhc_pf_v1") and is(func, "run")) return mhcPfRun(k.others(s), args, kwargs);
@@ -560,19 +561,23 @@ fn attnExt(o: ops.Ops, func: []const u8, args: []const Arg, kwargs: []const Kw) 
         try o.attention(b, try c.u(22), numel(sl) > 0, numel(hi) > 0, split);
         return true;
     }
-    if (is(func, "topk")) {
-        const c: Call = .{ .args = args, .kwargs = kwargs, .names = &.{ "s0", "c0", "o0", "n0", "nk0", "k0", "m0", "e0", "s1", "c1", "o1", "n1", "nk1", "k1", "m1", "e1", "jobs", "pos", "ratio", "bs", "R", "CL" } };
-        const jobs = try c.usz(16);
-        const pos = try c.tensor(17);
-        var a: ops.topk.Args = .{ .job = undefined, .pos = pos.ptr, .pos64 = @intFromBool(pos.dtype == .i64), .ratio = @intCast(try c.int(18)), .bs = @intCast(try c.int(19)) };
-        a.job[0] = try topkJob(c, 0);
-        a.job[1] = if (jobs > 1) try topkJob(c, 8) else a.job[0];
-        const e0 = try c.usz(7);
-        const ept = if (jobs > 1) @max(e0, try c.usz(15)) else e0;
-        try o.topK(a, jobs, try c.usz(20), try c.usz(21), ept);
-        return true;
-    }
+    if (is(func, "topk")) return topkCall(o, args, kwargs, false);
     return false;
+}
+
+/// tf_dsv41_attn_cuda_v1.topk (dsv41_topk_run_cuda), or with `bounded` tf_dsv41_topk_b_v1.topk (ours,
+/// TF_DSV41_INDEX_BOUND: topk_b.cu's twin, the same arguments)
+fn topkCall(o: ops.Ops, args: []const Arg, kwargs: []const Kw, bounded: bool) !bool {
+    const c: Call = .{ .args = args, .kwargs = kwargs, .names = &.{ "s0", "c0", "o0", "n0", "nk0", "k0", "m0", "e0", "s1", "c1", "o1", "n1", "nk1", "k1", "m1", "e1", "jobs", "pos", "ratio", "bs", "R", "CL" } };
+    const jobs = try c.usz(16);
+    const pos = try c.tensor(17);
+    var a: ops.topk.Args = .{ .job = undefined, .pos = pos.ptr, .pos64 = @intFromBool(pos.dtype == .i64), .ratio = @intCast(try c.int(18)), .bs = @intCast(try c.int(19)) };
+    a.job[0] = try topkJob(c, 0);
+    a.job[1] = if (jobs > 1) try topkJob(c, 8) else a.job[0];
+    const e0 = try c.usz(7);
+    const ept = if (jobs > 1) @max(e0, try c.usz(15)) else e0;
+    if (bounded) try o.topKB(a, jobs, try c.usz(20), try c.usz(21), ept) else try o.topK(a, jobs, try c.usz(20), try c.usz(21), ept);
+    return true;
 }
 
 fn topkJob(c: Call, at: usize) !ops.topk.Job {

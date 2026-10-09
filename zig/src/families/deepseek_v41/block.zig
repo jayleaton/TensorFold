@@ -104,7 +104,10 @@ pub const Options = struct {
     stream_rb: i64 = 0,
     /// TF_DSV41_INDEX_BOUND (ours, prod_knobs.indexBound): a decode window's dense index scores as the Zig-own twin
     /// `_scores_b` (tools/zig/dsv41_triton/dsv41_zig_triton/scores_b.py): a (row, key tile) past the row's own visible
-    /// keys stores `_scores`' -inf without its key loads and dot (a row window scores every row over the mix's bucket)
+    /// keys stores `_scores`' -inf without its key loads and dot (a row window scores every row over the mix's bucket);
+    /// and the decode window's top-k as the Zig-own twins `_dtopk_b` (tools/zig/dsv41_triton/dsv41_zig_triton/
+    /// dtopk_b.py) and `tf_dsv41_topk_b_v1.topk` (zig/kernels/cuda/deepseek_v41/topk_b.cu): each row's selection
+    /// stops at its own visible end (dense select: max(nvis, K); candidate blocks: the visible blocks), the same bytes
     index_bound: bool = false,
     /// R1 (prod-perf1's decode knobs, docs DSV41-DECODE-R1.md; the same bits): attention split 4 with q's RoPE in the
     /// kernel (ATTN_SPLIT, ATTN_ROPE), mHC's parallel tail + deferred coefficients (MHC_TAIL, MHC_DEFER), the router's
@@ -980,7 +983,7 @@ pub const Emitter = struct {
         }
         const sc = try e.buf("L.scores", .{}, .f32, &.{ n, nk });
         try e.scoreRows(qi, iw, src, ratio, 0, n, try e.pos(), nk, sc, if (reindex) cand else null);
-        try e.topk(L, sc, cand, nk, ratio);
+        try e.topkOf(L, sc, cand, nk, ratio, e.o.index_bound);
     }
 
     /// index.scores over rows [a, a + rows) of the window into `out` [rows, nk]: dense (key i = position i), or over
@@ -1070,7 +1073,16 @@ pub const Emitter = struct {
     /// single job). A candidate source also picks the candidate blocks into `cand`; a Reindex layer's scores are over
     /// `cand`'s blocks. Python's short prefill segments take it too (block_prefill.zig).
     pub fn topk(e: *Emitter, L: u32, scores: Arg, cand: Arg, nk: i64, ratio: i64) !void {
+        return e.topkOf(L, scores, cand, nk, ratio, false);
+    }
+
+    /// `topk`; `bound` (TF_DSV41_INDEX_BOUND, decode windows): the dense select and candidate-block launches as the
+    /// row-bounded twins `_dtopk_b` / `tf_dsv41_topk_b_v1.topk` (the same grids, arguments and bytes); a Reindex
+    /// layer's selection over its candidates (mode 3: not in position order) keeps attn_cuda's.
+    fn topkOf(e: *Emitter, L: u32, scores: Arg, cand: Arg, nk: i64, ratio: i64, bound: bool) !void {
         const n = e.n;
+        const dtopk = if (bound) "_dtopk_b" else "_dtopk";
+        const topk_ext = if (bound and e.cfg.mode(L) != .reindex) "tf_dsv41_topk_b_v1.topk" else "tf_dsv41_attn_cuda_v1.topk";
         const reindex = e.cfg.mode(L) == .reindex;
         const cbs: i64 = e.cfg.candidate_block_size;
         const sel = try e.selection(L);
@@ -1081,7 +1093,7 @@ pub const Emitter = struct {
             // the counts in the same launch), then a candidate source's blocks alone (attn_cuda.blocks: one job over
             // the cdiv(nk, 8) blocks). A Reindex layer's scores are over the candidate blocks (16,384 keys): never here.
             if (reindex) return error.Unsupported;
-            try e.triton("_dtopk", .{ n, 1, 1 }, &.{
+            try e.triton(dtopk, .{ n, 1, 1 }, &.{
                 .{ .name = "S", .arg = scores },                 .{ .name = "s_stride", .arg = .{ .i = scores.t.stride[0] } },
                 .{ .name = "P", .arg = scores },                 .{ .name = "p_stride", .arg = .{ .i = 0 } },
                 .{ .name = "POS", .arg = try e.pos() },          .{ .name = "NK", .arg = .{ .i = nk } },
@@ -1099,7 +1111,7 @@ pub const Emitter = struct {
             if (bp[1] > topk_max_ept) {
                 // past 8 x 512 x 31 blocks too (positions past ~1,015,808): dtopk.blocks (_dtopk mode 2, no counts)
                 const cb: i64 = e.cfg.candidate_blocks;
-                return e.triton("_dtopk", .{ n, 1, 1 }, &.{
+                return e.triton(dtopk, .{ n, 1, 1 }, &.{
                     .{ .name = "S", .arg = scores },             .{ .name = "s_stride", .arg = .{ .i = scores.t.stride[0] } },
                     .{ .name = "P", .arg = scores },             .{ .name = "p_stride", .arg = .{ .i = 0 } },
                     .{ .name = "POS", .arg = try e.pos() },      .{ .name = "NK", .arg = .{ .i = nb } },
@@ -1117,7 +1129,7 @@ pub const Emitter = struct {
             try one.appendSlice(e.a, &job);
             try one.appendSlice(e.a, &job);
             try one.appendSlice(e.a, &.{ .{ .i = 1 }, try e.pos(), .{ .i = ratio }, .{ .i = cbs }, .{ .i = n }, .{ .i = bp[0] } });
-            return e.ext("tf_dsv41_attn_cuda_v1.topk", one.items);
+            return e.ext(topk_ext, one.items);
         }
         var jobs: [2][8]Arg = undefined;
         jobs[0] = .{ scores, if (reindex) cand else try e.empty(.i32), sel[0], sel[1], .{ .i = nk }, .{ .i = k }, .{ .i = if (reindex) 3 else 0 }, .{ .i = pl[1] } };
@@ -1131,7 +1143,7 @@ pub const Emitter = struct {
         try args.appendSlice(e.a, &jobs[0]);
         try args.appendSlice(e.a, &jobs[1]);
         try args.appendSlice(e.a, &.{ .{ .i = if (blocks) 2 else 1 }, try e.pos(), .{ .i = ratio }, .{ .i = if (blocks or reindex) cbs else 1 }, .{ .i = n }, .{ .i = pl[0] } });
-        try e.ext("tf_dsv41_attn_cuda_v1.topk", args.items);
+        try e.ext(topk_ext, args.items);
     }
 
     // -----------------------------------------------------------------------------------------------------------

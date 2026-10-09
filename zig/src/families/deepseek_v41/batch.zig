@@ -103,6 +103,9 @@ pub const Batch = struct {
         launch_ns: u64 = 0,
         keep_ns: u64 = 0,
     } = .{},
+    /// TF_DSV41_WIN_PROF=1: host ns a row window spends in each step of runRows (and in keeps), every rank, logged at
+    /// deinit; null when off (no clock reads)
+    prof: ?*WinProf = null,
     /// the session store (model.zig): each slot's kept rows are its committed ids
     sess: ?*sessions_gpu.Sessions = null,
 
@@ -114,6 +117,8 @@ pub const Batch = struct {
         // graphs as the one-slot forward's default (M4: on unless TF_DSV41_GRAPHS=0; the gates' drivers: off)
         const s = try graphs.Settings.fromEnvOr(f.graphs_default);
         b.* = .{ .gpa = gpa, .f = f, .ss = ss, .cap = cap, .settings = s, .tab = try Table.init(r.d, cap), .pend = try gpa.alloc(?Pend, ss.n), .rg = try round_graph.current() };
+        if (WinProf.fromEnv()) b.prof = try gpa.create(WinProf);
+        if (b.prof) |p| p.* = .{};
         @memset(b.pend, null);
         {
             var la = std.heap.ArenaAllocator.init(gpa);
@@ -155,6 +160,10 @@ pub const Batch = struct {
     }
 
     pub fn deinit(b: *Batch) void {
+        if (b.prof) |p| {
+            p.log(b.f.comm.rank());
+            b.gpa.destroy(p);
+        }
         if (b.g) |*g| g.deinit();
         for (b.stash.items) |*x| x.buf.free();
         b.stash.deinit(b.gpa);
@@ -218,6 +227,8 @@ pub const Batch = struct {
     fn runRows(b: *Batch, mix: []const rowtab.Seg, ids: []const u32, more: bool) !void {
         const f = b.f;
         var tp = ph.nowNs();
+        var pt = WinProf.start(b.prof);
+        defer pt.end();
         try rowtab.check(mix, b.ss.n, @intCast(f.opts.limit));
         const n = rowtab.totalRows(mix);
         if (ids.len != n) return error.BadWindow;
@@ -226,19 +237,24 @@ pub const Batch = struct {
         for (mix) |m| if (m.start != b.ss.states[m.slot].pos or b.pend[m.slot] != null) return error.NotAChain;
         if (b.ss.leads()) try b.send(mix, ids, more);
         if (more) try b.stashPending();
+        pt.mark(.send);
         // every slot's pages for its positions, the changed table rows up before the launches
         const k = f.kv.?;
         for (mix) |m| try k.slots[m.slot].ensure(m.start + m.rows);
         try k.dev.syncTables();
+        pt.mark(.tables);
         const s = b.settings;
         const key: graphs.Key = .{ .rows = R, .ctx = graphs.bucketOf(rowtab.lastPos(mix), s.bucket, s.grow) };
         const cs = try b.program(key, s);
+        pt.mark(.program);
         const r = f.runner;
         b.lap(&tp, &b.stats.prep_ns);
         try b.tab.stage(r.stream, mix, ids, R, b.ss.n);
+        pt.mark(.rowtab);
         try b.stageEngram(mix, ids, R);
         b.lap(&tp, &b.stats.stage_ns);
         defer b.lap(&tp, &b.stats.launch_ns);
+        pt.mark(.engram);
         var a: u32 = 0;
         for (mix) |m| {
             b.pend[m.slot] = .{ .a = a, .start = m.start, .n = m.rows };
@@ -267,8 +283,10 @@ pub const Batch = struct {
         defer if (r.taps_mark) |*m| {
             m.armed = false;
         };
+        pt.mark(.bookkeep);
         if (b.g) |*g| {
             const fp = b.fingerprint();
+            pt.mark(.fingerprint);
             // TF_DSV41_ROUND_GRAPH=split: the head's graph, then the tail's, launched while the GPU runs the head
             const at = if (b.rg.split) round_graph.splitAt(cs, b.rg.head) else null;
             const parts: [2][2]usize = if (at) |i| .{ .{ 0, i }, .{ i, cs.len } } else .{ .{ 0, cs.len }, .{ cs.len, cs.len } };
@@ -278,6 +296,7 @@ pub const Batch = struct {
                 const pk: graphs.Key = .{ .rows = key.rows, .ctx = key.ctx, .part = if (at == null) 0 else @intCast(pi + 1) };
                 const t0 = ph.nowNs();
                 const out = try g.cache.run(pk, r.stream, fp, .{ .ctx = b, .run = body });
+                pt.mark(if (pi == 0) .launch_head else .launch_tail);
                 switch (out) {
                     .captured => {
                         const ns = ph.nowNs() - t0;
@@ -328,6 +347,8 @@ pub const Batch = struct {
         defer b.lap(&tk, &b.stats.keep_ns);
         if (accepted >= p.n) return error.BadWindow;
         const f = b.f;
+        var pt = WinProf.start(b.prof);
+        defer pt.endAs(.keep);
         if (b.ss.leads()) try f.link.?.send(&.{ slots_mod.op_rows_keep, slot, accepted });
         const r = f.runner;
         var nb: [64]u8 = undefined;
@@ -422,6 +443,16 @@ pub const Batch = struct {
             n += 1;
         }
         if (n > 0) g.warm(items[0..n]);
+    }
+
+    /// The slot's pending window dropped on every rank without a row committed (op_rows_drop; TF_DSV41_CALIB=measure's
+    /// timed windows, calib_gpu.zig): the slot stays at its position, the next window rewrites the dropped rows'
+    /// positions before any read (as a rejected draft's).
+    pub fn drop(b: *Batch, slot: u32) !void {
+        if (slot >= b.ss.n) return error.Slots;
+        if (b.pend[slot] == null) return;
+        if (b.ss.leads()) try b.f.link.?.send(&.{ slots_mod.op_rows_drop, slot });
+        b.dropPending(slot);
     }
 
     fn dropPending(b: *Batch, slot: u32) void {
@@ -846,4 +877,80 @@ fn roomFn() bool {
 pub fn warmLookback(st: anytype, pend: anytype, start: u64, keep_n: usize, buf: []u32) ?[]const u32 {
     const pending: ?[]const u32 = if (pend) |p| (if (p.start == st.pos) p.ids[0..p.n] else null) else null;
     return eh.lookbackAt(st.tail[0..st.tail_len], st.pos, pending, start, keep_n, buf);
+}
+
+/// TF_DSV41_WIN_PROF=1 (Batch.prof): host time of a row window's steps (runRows: the plan send, page tables, the
+/// program, the row table, Engram staging / the gate's arm, bookkeeping, the fingerprint, the head and tail graph
+/// launches, the rest) and of keeps, summed over the run; logged by every rank at deinit. Host clock reads only.
+pub const WinProf = struct {
+    pub const Step = enum { send, tables, program, rowtab, engram, bookkeep, fingerprint, launch_head, launch_tail, rest, keep };
+    const nsteps = std.enums.values(Step).len;
+    ns: [nsteps]u64 = @splat(0),
+    n: [nsteps]u64 = @splat(0),
+    windows: u64 = 0,
+
+    pub fn fromEnv() bool {
+        const v = std.c.getenv("TF_DSV41_WIN_PROF") orelse return false;
+        return std.mem.eql(u8, std.mem.span(v), "1");
+    }
+
+    /// A timer from now (no clock read when profiling is off).
+    pub fn start(p: ?*WinProf) Timer {
+        return .{ .p = p, .last = if (p != null) ph.nowNs() else 0 };
+    }
+
+    pub const Timer = struct {
+        p: ?*WinProf,
+        last: u64,
+
+        /// The time since the last mark (or the start) booked to `s`.
+        pub fn mark(t: *Timer, s: Step) void {
+            const p = t.p orelse return;
+            const x = ph.nowNs();
+            p.ns[@intFromEnum(s)] += x - t.last;
+            p.n[@intFromEnum(s)] += 1;
+            t.last = x;
+        }
+
+        pub fn end(t: *Timer) void {
+            const p = t.p orelse return;
+            t.mark(.rest);
+            p.windows += 1;
+        }
+
+        pub fn endAs(t: *Timer, s: Step) void {
+            if (t.p == null) return;
+            t.mark(s);
+        }
+    };
+
+    pub fn log(p: *const WinProf, rank: u32) void {
+        var buf: [1024]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        for (std.enums.values(Step)) |st| {
+            const i = @intFromEnum(st);
+            if (p.n[i] > 0) w.print(" {t} {d:.1}", .{ st, @as(f64, @floatFromInt(p.ns[i])) / 1e3 / @as(f64, @floatFromInt(p.n[i])) }) catch {};
+        }
+        std.log.scoped(.dsv41).info("window host steps (rank {d}, {d} windows, us a call):{s}", .{ rank, p.windows, w.buffered() });
+    }
+};
+
+test "TF_DSV41_WIN_PROF: marks book each step's time once, the rest at the end, keeps on their own" {
+    var p: WinProf = .{};
+    var t = WinProf.start(&p);
+    t.mark(.send);
+    t.mark(.engram);
+    t.end();
+    var k = WinProf.start(&p);
+    k.endAs(.keep);
+    try std.testing.expectEqual(@as(u64, 1), p.windows);
+    try std.testing.expectEqual(@as(u64, 1), p.n[@intFromEnum(WinProf.Step.send)]);
+    try std.testing.expectEqual(@as(u64, 1), p.n[@intFromEnum(WinProf.Step.engram)]);
+    try std.testing.expectEqual(@as(u64, 1), p.n[@intFromEnum(WinProf.Step.rest)]);
+    try std.testing.expectEqual(@as(u64, 1), p.n[@intFromEnum(WinProf.Step.keep)]);
+    try std.testing.expectEqual(@as(u64, 0), p.n[@intFromEnum(WinProf.Step.tables)]);
+    var off = WinProf.start(null);
+    off.mark(.send);
+    off.end();
+    try std.testing.expectEqual(@as(u64, 0), off.last);
 }

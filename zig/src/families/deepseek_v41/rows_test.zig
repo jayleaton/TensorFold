@@ -19,6 +19,7 @@ test {
     _ = rowtab;
     _ = rowmode;
     _ = @import("aot_needs.zig");
+    _ = @import("batch.zig"); // TF_DSV41_WIN_PROF's timer
 }
 
 const S: u32 = 4;
