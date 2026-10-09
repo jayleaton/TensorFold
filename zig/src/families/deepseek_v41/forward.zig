@@ -125,6 +125,8 @@ pub const Forward = struct {
     sess: ?Sess = null,
     /// a workstream's plan-link operations (docs 0a's ranges; slots.zig 16-19), run by a follower in the leader's order
     ext: ?Ext = null,
+    /// rank 0's clean stop of every rank (model.zig: the TP session's announceStop), run by `stop`
+    on_stop: ?struct { ctx: *anyopaque, run: *const fn (ctx: *anyopaque) void } = null,
     /// several live slots (slots.zig): a multi-segment prefill run's slot switch, on this rank only (every rank runs the
     /// same run); null: one slot, no runs
     pf_switch: ?PfSwitch = null,
@@ -610,6 +612,8 @@ pub const Forward = struct {
     /// Rank 0: the followers' loops end (after the last operation they were sent).
     pub fn stop(f: *Forward) !void {
         if (f.leads()) try f.link.?.send(&.{op_stop});
+        // every rank's clean end, before rank 0 closes its sockets (tp.Session.announceStop: no fail-fast exit 70)
+        if (f.leads()) if (f.on_stop) |h| h.run(h.ctx);
     }
 
     /// Ranks > 0: run the leader's operations as they arrive, in its order (every collective then pairs up), until

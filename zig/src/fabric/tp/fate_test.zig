@@ -131,3 +131,19 @@ test "a rank failing at boot ends both with its reason, and its channel is down 
     sock.sleepNs(5 * 20 * std.time.ns_per_ms);
     try std.testing.expect(std.mem.indexOf(u8, f0.reason(), "rank 1 failed in boot: RopeTooShort") != null);
 }
+
+test "rank 0's clean stop ends every rank with no fail-fast exit, whatever order the ranks close in" {
+    // Spark 2026-10-09: rank 0 ended its run (the plan link's stop sent) and closed; the follower, still tearing down,
+    // saw the hang-up first and exited 70
+    reset();
+    var fates: [2]Fate = undefined;
+    try pair(&fates);
+    sock.sleepNs(60 * std.time.ns_per_ms);
+    fates[0].announceStop();
+    fates[0].close(); // rank 0 gone before rank 1 even started its own stop
+    sock.sleepNs(2 * grace + 100 * std.time.ns_per_ms);
+    fates[1].close();
+    try std.testing.expectEqual(@as(u32, 0), exits.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), hooks.load(.acquire));
+}
+

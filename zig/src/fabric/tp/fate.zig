@@ -10,6 +10,8 @@ pub const exit_code: u8 = 70;
 const magic: u32 = 0x46463431;
 const kind_mem: u32 = 1;
 const kind_fail: u32 = 2;
+/// rank 0's clean stop: the hang-up that follows is no failure (sent before rank 0 closes its sockets)
+const kind_stop: u32 = 3;
 const Frame = extern struct { magic: u32, kind: u32, value: i64 };
 
 pub const max_ranks = 64;
@@ -82,6 +84,20 @@ pub const Fate = struct {
     /// follow are no failure.
     pub fn expectStop(f: *Fate) void {
         f.closing.store(true, .release);
+    }
+
+    /// Rank 0's clean stop of every rank (the leader's `Forward.stop`): a STOP frame to each rank ahead of the hang-up
+    /// its close brings, so a follower ends quietly whatever it is still doing; elsewhere `expectStop`. The channel is
+    /// ordered: a follower reads the STOP before it can see rank 0's socket close.
+    pub fn announceStop(f: *Fate) void {
+        if (f.closing.swap(true, .acq_rel)) return;
+        if (f.rank != 0) return;
+        const h: Frame = .{ .magic = magic, .kind = kind_stop, .value = 0 };
+        f.lock();
+        defer f.unlock();
+        for (f.fds[1..f.world]) |fd| if (fd >= 0) {
+            _ = sock.trySend(fd, std.mem.asBytes(&h));
+        };
     }
 
     /// A normal stop: the thread ends and the sockets close.
@@ -164,6 +180,11 @@ pub const Fate = struct {
         };
         if (h.magic != magic) {
             f.die("a frame that is not the fate channel's", false);
+            return false;
+        }
+        if (h.kind == kind_stop) {
+            // rank 0 stops every rank: its hang-up is next, and no failure
+            f.closing.store(true, .release);
             return false;
         }
         if (h.kind == kind_mem) {

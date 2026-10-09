@@ -295,6 +295,7 @@ pub const Model = struct {
         m.host = try eh.Host.load(ehb, m.cfg.engram_heads, m.cfg.engram_pad, m.cfg.engram_vocab, &m.lbuf);
         m.f.engram = &m.host;
         if (world > 1) m.f.link = &m.session.plan;
+        m.f.on_stop = .{ .ctx = &m.session, .run = announceStop };
         const so = try sg.optionsFromEnv();
         const several_ok = m.slots == 1 or so.several;
         if (so.enabled and m.f.kv != null and !several_ok)
@@ -376,6 +377,11 @@ pub const Model = struct {
     pub fn piecesEnv() bool {
         const v = std.c.getenv("TF_DSV41_PREFILL_PIECES") orelse return false;
         return std.mem.eql(u8, std.mem.trim(u8, std.mem.span(v), " "), "1");
+    }
+
+    fn announceStop(ctx: *anyopaque) void {
+        const s: *tp.Session = @ptrCast(@alignCast(ctx));
+        s.announceStop();
     }
 
     pub fn close(m: *Model) void {
