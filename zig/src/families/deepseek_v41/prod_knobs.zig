@@ -215,13 +215,15 @@ fn badSms(raw: []const u8) error{BadKnob} {
     return error.BadKnob;
 }
 
-/// TF_DSV41_STREAM_RB (ours; unset / 0 off, 2 or 4): the stream top-k's rows a program (block_prefill streamSelect).
+/// TF_DSV41_STREAM_RB (ours; unset / 0 off, 1, 2 or 4): the stream top-k's twin (block_prefill streamSelect): 1 the
+/// prefetch twin `_stream_pf` (one row a program), 2 / 4 the row-blocked `_stream_rb<N>`.
 pub fn streamRb(get: Get) !i64 {
     const raw = std.mem.trim(u8, get("TF_DSV41_STREAM_RB") orelse "0", " ");
     if (std.mem.eql(u8, raw, "0")) return 0;
+    if (std.mem.eql(u8, raw, "1")) return 1;
     if (std.mem.eql(u8, raw, "2")) return 2;
     if (std.mem.eql(u8, raw, "4")) return 4;
-    std.log.warn("TF_DSV41_STREAM_RB={s}: 0, 2 or 4", .{raw});
+    std.log.warn("TF_DSV41_STREAM_RB={s}: 0, 1, 2 or 4", .{raw});
     return error.BadKnob;
 }
 
@@ -378,7 +380,8 @@ pub fn apply(f: *@import("forward.zig").Forward, a: std.mem.Allocator, io: std.I
     }
     if (rank != 0) return;
     const log = std.log.scoped(.dsv41);
-    if (f.opts.stream_rb > 0) log.info("stream top-k: {d} rows a program (_stream_rb{d})", .{ f.opts.stream_rb, f.opts.stream_rb });
+    if (f.opts.stream_rb == 1) log.info("stream top-k: _stream_pf (the next tile's key loads issued ahead)", .{});
+    if (f.opts.stream_rb > 1) log.info("stream top-k: {d} rows a program (_stream_rb{d})", .{ f.opts.stream_rb, f.opts.stream_rb });
     if (f.opts.pf_tbo) log.info("prefill tbo: encoder segments two at a time on two streams, x3gm on at most {d} SMs (0: all){s}", .{ dk.exl3.gm_sms_cap, if (f.opts.pf_overlap > 0) "; TF_DSV41_PF_OVERLAP is off under it" else "" });
     if (f.opts.pf_overlap > 0) log.info("prefill overlap: a segment's exchanges in {d} row pieces on the side stream{s}", .{ f.opts.pf_overlap, if (f.opts.pf_overlap_site) ", every piece; the next mixing site in the same pieces, each after its own" else "" });
     log.info("prod knobs: pf_dense {s}, prefill rows {d}{s}, index budget {d} MiB, R1 {s}, prefetch ahead {s}, x3gm v2 {t}, prefill {t}", .{ if (f.opts.pfd != null) "fused" else "off", if (big) pf4k_rows else @as(u32, @intCast(f.opts.prefill_rows)), if (big) " (4K: one x3gm block a segment, in the prefill's own workspace)" else "", f.opts.index_budget >> 20, if (f.opts.r1) "on" else "off", if (f.prefill_state.ahead) "on" else "off", f.opts.gm_v2, f.prefill_state.mode });

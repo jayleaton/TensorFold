@@ -737,10 +737,15 @@ const Seg = struct {
             const nk = @max(@divFloor(e.start + a + rows, ratio), 1);
             const ns = longpf.splits(nk);
             const buf = try e.buf("L.ix.stream", .{}, .i64, &.{ rows, ns, 2 * topk });
-            if (e.o.stream_rb == 2 or e.o.stream_rb == 4) {
-                // TF_DSV41_STREAM_RB: `_stream_rb<N>`, N rows a program (the same buffers, the same merge)
+            if (e.o.stream_rb == 1 or e.o.stream_rb == 2 or e.o.stream_rb == 4) {
+                // TF_DSV41_STREAM_RB: `_stream_pf` (1) or `_stream_rb<N>`, N rows a program (the same buffers, the
+                // same merge)
                 const rb = e.o.stream_rb;
-                try e.triton(if (rb == 2) "_stream_rb2" else "_stream_rb4", .{ cdiv(rows, rb), ns, 1 }, &.{
+                try e.triton(switch (rb) {
+                    1 => "_stream_pf",
+                    2 => "_stream_rb2",
+                    else => "_stream_rb4",
+                }, .{ cdiv(rows, rb), ns, 1 }, &.{
                     .{ .name = "QI", .arg = try e.view(.{ .buf = "L.qi" }, .bf16, &.{ rows, IH, ID }, &.{ IH * ID, ID, 1 }, (e.row0 + a) * IH * ID * 2) },
                     .{ .name = "W", .arg = try e.view(.{ .buf = "L.ix_w" }, .f32, &.{ rows, IH }, &.{ IH, 1 }, (e.row0 + a) * IH * 4) },
                     .{ .name = "w_stride", .arg = .{ .i = IH } },           .{ .name = "IK", .arg = try indexKeys(e, src) },

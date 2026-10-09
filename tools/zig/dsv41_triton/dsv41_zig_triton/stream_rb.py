@@ -169,4 +169,65 @@ def _stream_rb4(QI, W, w_stride, IK, POS, R, BUF, nsplit, RATIO: tl.constexpr, H
         _row_end(buf3, n3, K, CAP)
 
 
-__all__ = ["_stream_rb2", "_stream_rb4"]
+@triton.jit
+def _raw_keys(IK, j, ok, D: tl.constexpr, PT, PSH: tl.constexpr, KFP8: tl.constexpr):
+    """load_keys' loads for positions j under mask ok, not yet dequantized: (KFP8) the e4m3 bytes [BP, D] and the
+    fp32 scales [BP], else the bf16 rows and zeros."""
+
+    d = tl.arange(0, D)
+    jr = prow(tl.where(ok, j, 0).to(tl.int64), PT, PSH, ok)
+    if KFP8:
+        b = tl.load(IK + jr[:, None] * (D + 4) + d[None, :], mask=ok[:, None], other=0)
+        sc = tl.load((IK + jr * (D + 4) + D).to(tl.pointer_type(tl.float32)), mask=ok, other=0.0)
+    else:
+        b = tl.load(IK + jr[:, None] * D + d[None, :], mask=ok[:, None], other=0.0)
+        sc = tl.where(ok, 0.0, 0.0)
+    return b, sc
+
+
+@triton.jit
+def _dequant(b, sc, KFP8: tl.constexpr):
+    """load_keys' bf16 keys from `_raw_keys`' loads."""
+
+    if KFP8:
+        return (b.to(tl.float8e4nv, bitcast=True).to(tl.float32) * sc[:, None]).to(tl.bfloat16)
+    return b.to(tl.bfloat16)
+
+
+@triton.jit
+def _stream_pf(QI, W, w_stride, IK, POS, R, BUF, nsplit, RATIO: tl.constexpr, H: tl.constexpr, D: tl.constexpr,
+               BP: tl.constexpr, WS: tl.constexpr, SCALE: tl.constexpr, SPLIT: tl.constexpr, K: tl.constexpr,
+               CAP: tl.constexpr, PT=None, PSH: tl.constexpr = 0, KFP8: tl.constexpr = False):
+    """Program (row r < R, split c): `_stream` MODE 0, statement for statement, with each tile's key loads (the page
+    table, then the key bytes and scales) issued one tile ahead: tile t + 1's loads go out before tile t's dequant,
+    dot, head sum and offer, so their latency hides behind them (`_stream`'s loads are gathers, which Triton's
+    pipeliner leaves in place: its loop has no async copy). The row's q and w are loaded once (the values score_tile
+    loads every tile). The dot is score_tile's on the same operands, one row a program (the [2, 4] MMA layout:
+    check_stream_rb.py), so every score, every offer and the split buffer are `_stream`'s."""
+
+    r = tl.program_id(0)
+    c = tl.program_id(1)
+    q = tl.load(POS) + r
+    nvis = (q + 1) // RATIO
+    buf = BUF + (r.to(tl.int64) * nsplit + c) * CAP
+    lo = c * SPLIT
+    hi = tl.minimum(lo + SPLIT, nvis)
+    qv, w = _row_q(QI, W, w_stride, r, H, D, WS)
+    n = 0
+    thr = tl.full((), -9223372036854775808, tl.int64)
+    j0 = lo + tl.arange(0, BP)
+    b, sc = _raw_keys(IK, j0, j0 < hi, D, PT, PSH, KFP8)
+    for t0 in range(lo, hi, BP):
+        j = t0 + tl.arange(0, BP)
+        ok = j < hi
+        jn = j + BP
+        bn, scn = _raw_keys(IK, jn, jn < hi, D, PT, PSH, KFP8)        # the next tile's (masked past hi: none)
+        k = _dequant(b, sc, KFP8)
+        s = _row_scores(qv, w, k, ok, SCALE)
+        n, thr = _offer(buf, score_key(s, j), ok, n, thr, K, CAP)
+        b = bn
+        sc = scn
+    _row_end(buf, n, K, CAP)
+
+
+__all__ = ["_stream_pf", "_stream_rb2", "_stream_rb4"]

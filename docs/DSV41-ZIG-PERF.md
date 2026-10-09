@@ -976,6 +976,41 @@ S1 measures it.
 | S1 | kit fill with `TRITON_FILL_ENV=tools/zig/dsv41_m4/fill-rb.env` (and a second with TF_DSV41_STREAM_RB=4); `TF_DSV41_TEST=<tf-dsv41-test> AOT=<kit aot> bash zig/tests/cuda/deepseek_v41/stream_rb_job.sh <out>` | `bits rb2: PASS` and `bits rb4: PASS` at every (start, rows); `stream-rb: PASS`; the speedups |
 | S2 | all-on + `TF_DSV41_STREAM_RB=<the faster>`, `bench_http.py --long 32768,131072` | long replies == Python's (sha unchanged), T0 20/20; prompt tok/s against the same base |
 
+### 12.4 S1 on 9dbdd6a9: exact, slower; the prefetch twin `_stream_pf` (TF_DSV41_STREAM_RB=1)
+
+The recheck (old inexact variants removed): `stream-rb: PASS`, 12 of 12 compares bit-exact, but the twins are now
+slower than `_stream`.
+
+| shape | rb2 | rb4 |
+| --- | ---: | ---: |
+| 32K x 2,048 | x0.86 | x0.96 |
+| 32K x 300 | x0.79 | x0.87 |
+| 131K x 2,048 | x0.85 | x0.95 |
+| 131K x 300 | x0.84 | x0.88 |
+
+Separate regions keep the `[2, 4]` layout but serialize the rows' chains. The shared key tile then saves less than
+the larger program costs.
+
+What `_stream` does not do is overlap a tile's loads with anything. Each tile is page-table gather -> key-byte gather
+-> dequant -> dot -> head sum -> offer, and its TTGIR has no async copy: the gathers are not loads Triton's pipeliner
+takes, so `num_stages=3` changes nothing. It also reloads the row's q (32 x 128 bf16) and w every tile.
+
+**`_stream_pf`** (stream_rb.py, TF_DSV41_STREAM_RB=1: one row a program):
+- `_stream` MODE 0 statement for statement, except that tile t + 1's page-table and key loads (bytes and scales,
+  `_raw_keys`) are issued before tile t's dequant, dot, head sum and offer, carried in registers (~8 a thread);
+- q and w are loaded once.
+
+Bits: the dot is score_tile's on the same operand values, one row a program. check_stream_rb.py: pf's MMA layout is
+`[2, 4]`, and its dot, float ops and shuffle offsets are `_stream`'s exactly once. In its PTX, the loop's global loads
+all precede the mma and none sits between the barrier and the mma; `_stream` waits on its loads before the mma.
+
+Step S1b:
+
+| step | what | pass |
+| --- | --- | --- |
+| S1b | kit fill with `TRITON_FILL_ENV=tools/zig/dsv41_m4/fill-pf.env`; `STREAM_RB_TWINS=1 TF_DSV41_TEST=<tf-dsv41-test> AOT=<kit aot> bash zig/tests/cuda/deepseek_v41/stream_rb_job.sh <out>` | `bits pf: PASS` at every (start, rows), `stream-rb: PASS`; `_stream_pf`'s x against `_stream` (worth S2 at >= x1.15) |
+| S2b (if S1b gains) | all-on + `TF_DSV41_STREAM_RB=1`, `bench_http.py --long 32768,131072` | long replies == Python's; prompt tok/s (131K: `_stream` is 12.5 % of the 4K wall, so x1.3 is ~-3 %) |
+
 ## 13. P5b's reading, and the exchange hidden at 4K (TF_DSV41_PF_OVERLAP_SITE, 2026-10-09, offline)
 
 ### 13.1 What P5b says (dgx-01 / dgx-02, 131K, 154,644 encoder rows, 2K in 95 segments, 4K in 57)
@@ -1103,3 +1138,43 @@ Run W1 first: X1-X3 measure against 4K, which needs W1 to run at all.
 | X4 (optional) | X2 with `TF_DSV41_PROFILE=1` at 131K, `gap.py prefill-ab` vs P5b's 4K profile | the exchange family on the main stream's critical path; wall per 1K rows |
 
 On a failure: X1 alone names PF_OVERLAP at 4K, X2 the site pieces.
+
+### 13.5 Is 32K behind 131K? (bench long cells against Python prod's best of 3)
+
+| run | 32K prompt tok/s | vs Python | 131K | vs Python |
+| --- | ---: | ---: | ---: | ---: |
+| Python prod | 2,436.1 | | 2,265.7 | |
+| c12-allon (2K segments) | 2,507.4 | +2.9 % | 2,318.4 | +2.3 % |
+| c13-allon (2K segments) | 2,511.5 | +3.1 % | 2,317.5 | +2.3 % |
+| t21-4k (4K running) | 2,661.3 | +9.2 % | 2,495.2 | +10.1 % |
+
+At 2K, 32K is ahead. At 4K, it is 0.9 points behind: 4K saved 23.1 µs a prompt token at 32K and 30.6 at 131K. Two
+fixed costs a prompt explain it:
+- **The workspace's allocation and zero fill.** 89-92 ms a prompt, both ranks at once, with the GPU idle while the
+  GB10 maps the pages: 0.6 % of 32K's 14.3 s TTFT, 0.15 % of 131K's 61.8 s.
+- **The last piece.** PREFILL_PIECES cuts 4,096-row pieces (boot log `prompts in pieces of 4096 rows`). 37,974 tokens
+  end on a ~1,110-row piece, and x3gm's trellis streams once a segment whatever its rows (T ≈ W + slope x rows, W
+  ~118 ms a segment). That is ~90 ms over the 4K rate at 32K (0.6 %) against ~45 ms at 131K (0.07 %). Rebalancing
+  the pieces does not help: the segment count, hence the W terms, stays the same.
+
+Together ~1.1 points, the gap seen. WS_SHARE shrinks the first (fewer pages to map). Nothing else is 32K-specific:
+per row, P5b's families scale the same, and attention / `_stream` grow with context, which makes 131K's per-row cost
+larger for both engines.
+
+### 13.6 Is the GPU idle between segments or pieces?
+
+Little. The c13 nsys trace (code x4, all-on: prefill pieces between decode rounds) shows:
+- inside the prefill spans the GPU is busy 98-99.6 % of the time;
+- each decode window opens with 0.13-0.18 ms idle before `positions_kernel`;
+- a prefill segment's start costs 0.15-0.5 ms (one 2.1 ms outlier at a piece boundary);
+- a 2K segment synchronizes its stream before staging its ids (`n <= chunk`, Python's `ids_of`), a 4K segment does
+  not.
+
+A 131K prompt's 38 pieces add ~10-20 ms of idle in ~62 s (0.03 %). The one real idle is 13.5's workspace mapping
+(~90 ms a prompt).
+
+Pipelining the next segment:
+- Engram's rows are already read ahead (op 60 across pieces, c96b9662).
+- The embedding is the segment's first exchange: rank 1, the critical rank, spends 1.10 ms / 1K rows on `glue.embed`
+  (0.26 %). Rank 0's 7.85 is its wait for rank 1, i.e. skew. Precomputing segment N + 1's embedding on the side
+  stream would save at most that 0.26 %, so it is not built.

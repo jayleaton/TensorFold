@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Jay Leaton. The DeepSeek-V4.1-Flash family of TensorFold (Apache-2.0): see THIRD_PARTY_NOTICES.md.
 """Offline bit-shape check of the STREAM_RB twins against `_stream` (no GPU): compiles `_stream` (positions mode) and
-`_stream_rb2` / `_stream_rb4` for sm_121 with the fill's options and the served constants, and checks what fixes a
+`_stream_pf` / `_stream_rb2` / `_stream_rb4` for sm_121 with the fill's options and the served constants, and checks what fixes a
 score's bits:
 
 - every dot's MMA layout (TTGIR `#mma`, warpsPerCTA: the head sum's split across the 8 warps) is `_stream`'s;
@@ -61,7 +61,7 @@ def main() -> int:
     sig = {"QI": "*bf16", "W": "*fp32", "w_stride": "i32", "IK": "*u8", "POS": "*i32", "R": "i32", "BUF": "*i64",
            "nsplit": "i32", "PT": "*i32"}
     bad = 0
-    for n, fn in ((2, rb._stream_rb2), (4, rb._stream_rb4)):
+    for n, fn in ((1, rb._stream_pf), (2, rb._stream_rb2), (4, rb._stream_rb4)):
         ttgir, ptx = comp(fn, sig, dict(common))
         checks = {
             "mma layout": (set(MMA.findall(ttgir)), ref_mma),
@@ -72,7 +72,7 @@ def main() -> int:
         for what, (got, want) in checks.items():
             ok = got == want
             bad += not ok
-            print(f"rb{n} {what}: {'ok' if ok else f'FAIL {got} != {want}'}")
+            print(f"{'pf' if n == 1 else f'rb{n}'} {what}: {'ok' if ok else f'FAIL {got} != {want}'}")
     print("PASS" if bad == 0 else f"FAIL ({bad})")
     return 1 if bad else 0
 

@@ -1,4 +1,5 @@
-//! The row-blocked streaming top-k (stream_rb.py's `_stream_rb2` / `_stream_rb4`) against the served `_stream`
+//! The stream top-k twins (stream_rb.py's `_stream_pf`: one row a program with the next tile's key loads issued
+//! ahead; `_stream_rb2` / `_stream_rb4`: row-blocked) against the served `_stream`
 //! (csa2/stream_topk.py, MODE 0) at prod's indexer shapes (H 32, D 128, BP 64, ratio 2, SPLIT 16,384, K 512, CAP
 //! 1,024, FP8 keys paged at 128 rows a page), on synthetic data: random bf16 queries and fp32 head weights, random
 //! e4m3 key rows (NaN codes avoided) with scale 0.0625, an identity page table. For every (start, rows) case each
@@ -6,7 +7,7 @@
 //! `_stream`'s slot for slot; then each is timed with events (2 warm-ups, the median of `reps`). The kernels come from
 //! a Triton AOT set (aot.json + cubins/); a variant missing from it is SKIPPED (never PASS).
 //!
-//!   tf-dsv41-test stream-rb <aot dir> [--reps 5]
+//!   tf-dsv41-test stream-rb <aot dir> [--reps 5] [--twins 1,2,4]   (1: `_stream_pf`, 2 / 4: `_stream_rb<N>`)
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -41,6 +42,14 @@ const Rng = struct {
     }
 };
 
+fn twinName(rb: u32) []const u8 {
+    return switch (rb) {
+        1 => "_stream_pf",
+        2 => "_stream_rb2",
+        else => "_stream_rb4",
+    };
+}
+
 fn median(xs: []f32) f32 {
     std.mem.sort(f32, xs, {}, std.sort.asc(f32));
     return xs[xs.len / 2];
@@ -70,7 +79,7 @@ const Case = struct {
     nk: i64,
     ns: i64,
 
-    /// `_stream` (rb 0) or `_stream_rbN` into `buf`.
+    /// `_stream` (rb 0), `_stream_pf` (rb 1) or `_stream_rbN` into `buf`.
     fn launch(c: *const Case, a: std.mem.Allocator, rb: u32, buf: u64) !void {
         var args: std.ArrayList(aot.Arg) = .empty;
         var consts: std.ArrayList(aot.Const) = .empty;
@@ -89,7 +98,7 @@ const Case = struct {
         }
         try args.append(a, aot.int("R", @intCast(c.rows)));
         const blocks: u32 = @intCast(@divFloor(c.rows + rb - 1, rb));
-        return c.set.run(c.stream, if (rb == 2) "_stream_rb2" else "_stream_rb4", .{ blocks, ns, 1 }, args.items, consts.items);
+        return c.set.run(c.stream, twinName(rb), .{ blocks, ns, 1 }, args.items, consts.items);
     }
 
     /// The median ms of `reps` launches after 2 warm-ups.
@@ -150,11 +159,25 @@ pub fn run(gpu: Gpu, rest: []const [:0]const u8) !void {
     if (rest.len < 1) return error.MissingArgument;
     const dir = rest[0];
     var reps: usize = 5;
+    var twins_buf: [3]u32 = .{ 1, 2, 4 };
+    var twins: []const u32 = &twins_buf;
     var i: usize = 1;
     while (i < rest.len) : (i += 1) {
         if (std.mem.eql(u8, rest[i], "--reps") and i + 1 < rest.len) {
             i += 1;
             reps = try std.fmt.parseInt(usize, rest[i], 10);
+        } else if (std.mem.eql(u8, rest[i], "--twins") and i + 1 < rest.len) {
+            i += 1;
+            var it = std.mem.tokenizeScalar(u8, rest[i], ',');
+            var nt: usize = 0;
+            while (it.next()) |x| {
+                if (nt == twins_buf.len) return error.BadArgument;
+                const v = try std.fmt.parseInt(u32, x, 10);
+                if (v != 1 and v != 2 and v != 4) return error.BadArgument;
+                twins_buf[nt] = v;
+                nt += 1;
+            }
+            twins = twins_buf[0..nt];
         } else return error.BadArgument;
     }
     var set = try aot.Set.load(gpa, gpu.io, d, gpu.ctx.device, dir);
@@ -233,9 +256,9 @@ pub fn run(gpu: Gpu, rest: []const [:0]const u8) !void {
             std.debug.print("  _stream SKIPPED (no AOT variant for these args, see above)\n", .{});
             skipped += 1;
         }
-        for ([_]u32{ 2, 4 }) |rb| {
-            const name = if (rb == 2) "_stream_rb2" else "_stream_rb4";
-            const short = if (rb == 2) "rb2" else "rb4";
+        for (twins) |rb| {
+            const name = twinName(rb);
+            const short = if (rb == 1) "pf" else if (rb == 2) "rb2" else "rb4";
             if (!try once(&c, a, rb, brb, 0xA5, got)) {
                 std.debug.print("  {s} SKIPPED (no AOT variant for these args, see above)\n  bits {s}: SKIPPED\n", .{ name, short });
                 skipped += 1;
