@@ -1223,7 +1223,7 @@ pub const Graphed = struct {
         const rg = try round_graph.current();
         if (rg.split) g.split = rg;
         // `split`: a window's head and tail graphs in one cache of twice the cap (a head is ~1/43 of a window)
-        g.cache = graphs.Cache.init(f.gpa, g.engine.engine(), .{ .on = true, .max = if (rg.split) 2 * s.max else s.max });
+        g.cache = graphs.Cache.init(f.gpa, g.engine.engine(), .{ .on = true, .max = if (rg.split) 2 * s.max else s.max, .hold = s.floor_hold });
         g.cache.agree = g.agreement.agree();
         g.cache.room = roomFn;
         room_floor = s.floor_gib;

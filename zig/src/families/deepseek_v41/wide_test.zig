@@ -25,6 +25,7 @@ const Config = @import("config.zig").Config;
 // TF_DSV41_MHC_PFDEC on the same emitters
 test {
     _ = @import("mhc_pfdec_test.zig");
+    _ = @import("coef_late_test.zig");
     _ = @import("dev_arena_test.zig");
 }
 
