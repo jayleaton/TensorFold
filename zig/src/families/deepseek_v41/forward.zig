@@ -450,7 +450,7 @@ pub const Forward = struct {
     const op_ds_reset: i64 = 11;
     /// 12-15: dsq-zig-samp-1 (the keyed sampler); 12: [op, row0, n, T, top_k, top_p, min_p]
     pub const op_sample: i64 = 12;
-    /// 13: [op, n, (row0, rows, T, top_k, top_p, min_p) a segment] several nucleus segments in one call
+    /// 13: [op, n, (row0, rows, T, top_k, top_p, min_p, seed, pos0) a segment] several keyed segments in one call
     /// (TF_DSV41_SAMP_BATCH, sampling_gpu.chooseSegments)
     pub const op_sample_many: i64 = 13;
 

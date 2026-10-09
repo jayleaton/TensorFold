@@ -32,9 +32,13 @@ pub const GpuSampler = struct {
     pinned: ?cuda.HostBuffer = null,
     done: ?cuda.Event = null,
     chosen: ?cuda.DeviceBuffer = null,
-    /// TF_DSV41_SAMP_BATCH=1 (rank 0 decides; followers run what op 13 brings): a forward's nucleus segments in one
-    /// call (`chooseSegments`), as Python's one candidates gather + one statistics exchange a forward
+    /// TF_DSV41_SAMP_BATCH=1 (rank 0 decides; followers run what op 13 brings): a forward's keyed segments in one call
+    /// (`chooseSegments`), as Python's one candidates gather (+ one statistics exchange) a forward
     batch: bool = false,
+    /// the batched call's per-segment device-choice start (null: none), for its hook
+    seg_pos0: []const ?u64 = &.{},
+    /// keyed paths already logged (`note`)
+    seen: u8 = 0,
 
     const Cur = struct { row0: u32, s: Sampling, pos0: ?u64 };
 
@@ -66,47 +70,127 @@ pub const GpuSampler = struct {
 
     /// The most segments one op_sample_many carries.
     pub const max_segments = 16;
+    const seg_words = 8;
 
-    /// Rank 0: several nucleus segments of "w.logits" in one call (op 13 first: [op, n, (row0, rows, T, top_k, top_p,
-    /// min_p) a segment]); no device start (nucleus rows have none).
+    /// Rank 0: several keyed segments of "w.logits" in one call (op 13 first: [op, n, (row0, rows, T, top_k, top_p,
+    /// min_p, seed, pos0) a segment], pos0 -1: no device choice). A top_k segment with consecutive draws gets its
+    /// device choice (vsample.choose) as `choose` gives it, from the one gather.
     pub fn chooseSegments(x: *GpuSampler, segs: []const pipe.Pipe.Seg) !void {
         if (segs.len == 0 or segs.len > max_segments) return error.BadSegments;
-        var msg: [2 + 6 * max_segments]i64 = undefined;
+        var msg: [2 + seg_words * max_segments]i64 = undefined;
+        var pos0: [max_segments]?u64 = @splat(null);
         msg[0] = fwd.Forward.op_sample_many;
         msg[1] = @intCast(segs.len);
         for (segs, 0..) |g, i| {
+            if (x.f.after_sample != null) if (g.positions) |ps| if (consecutive(ps[0..g.n])) {
+                pos0[i] = ps[0];
+            };
             const o = opOf(g.row0, g.n, g.s);
-            @memcpy(msg[2 + 6 * i ..][0..6], o[1..7]);
+            @memcpy(msg[2 + seg_words * i ..][0..6], o[1..7]);
+            msg[2 + seg_words * i + 6] = @bitCast(g.s.seed);
+            msg[2 + seg_words * i + 7] = if (pos0[i]) |p0| @intCast(p0) else -1;
         }
-        try x.f.sendSample(msg[0 .. 2 + 6 * segs.len]);
-        try x.runSegments(segs);
+        try x.f.sendSample(msg[0 .. 2 + seg_words * segs.len]);
+        try x.runSegments(segs, pos0[0..segs.len]);
     }
 
-    fn runSegments(x: *GpuSampler, segs: []const pipe.Pipe.Seg) !void {
+    fn runSegments(x: *GpuSampler, segs: []const pipe.Pipe.Seg, pos0: []const ?u64) !void {
         const f = x.f;
         const lg = f.runner.addressOf("w.logits") orelse return error.Unbound;
         if (f.grammar) |g| for (segs) |sg| try g.apply(g.ptr, sg.row0, sg.n);
-        x.cur = null; // no device start
-        try x.p.chooseSegments(x.gpu.device(), lg, segs);
+        x.cur = null; // the single call's hook stays off: the segments' own below
+        x.seg_pos0 = pos0;
+        defer x.seg_pos0 = &.{};
+        for (segs) |sg| x.note(sg.s, true);
+        try x.p.chooseSegments(x.gpu.device(), lg, segs, .{ .ctx = x, .run = segGather });
         if (x.p.whole_rows > 0) std.log.scoped(.dsv41).debug("sampling: {d} rows taken whole ({d} segments)", .{ x.p.whole_rows, segs.len });
     }
 
-    /// A follower: op_sample_many's segments (tokens dropped).
+    /// A follower: op_sample_many's segments (tokens dropped; device choices as the leader's).
     fn followSegments(x: *GpuSampler, msg: []const i64) !void {
         if (msg.len < 2) return error.BadPlan;
         const ns: usize = @intCast(msg[1]);
-        if (ns == 0 or ns > max_segments or msg.len != 2 + 6 * ns) return error.BadPlan;
+        if (ns == 0 or ns > max_segments or msg.len != 2 + seg_words * ns) return error.BadPlan;
         var segs: [max_segments]pipe.Pipe.Seg = undefined;
+        var pos0: [max_segments]?u64 = undefined;
         var outs: [64]u32 = undefined;
         var used: usize = 0;
         for (0..ns) |i| {
-            const w = msg[2 + 6 * i ..][0..6];
+            const w = msg[2 + seg_words * i ..][0..seg_words];
             const n: u32 = @intCast(w[1]);
             if (n == 0 or used + n > outs.len) return error.BadPlan;
-            segs[i] = .{ .row0 = @intCast(w[0]), .n = n, .s = .{ .seed = 0, .temperature = @bitCast(w[2]), .top_k = @intCast(w[3]), .top_p = @bitCast(w[4]), .min_p = @bitCast(w[5]) }, .out = outs[used..][0..n] };
+            segs[i] = .{ .row0 = @intCast(w[0]), .n = n, .s = .{ .seed = @bitCast(w[6]), .temperature = @bitCast(w[2]), .top_k = @intCast(w[3]), .top_p = @bitCast(w[4]), .min_p = @bitCast(w[5]) }, .out = outs[used..][0..n] };
+            pos0[i] = if (w[7] >= 0) @intCast(w[7]) else null;
             used += n;
         }
-        try x.runSegments(segs[0..ns]);
+        try x.runSegments(segs[0..ns], pos0[0..ns]);
+    }
+
+    /// chooseSegments' hook (every rank): with a device choice wanted for any segment, the candidates' copy goes to
+    /// pinned memory with an event, then each such segment's vsample.choose over the shared gather (row r of the span
+    /// drawn at pos0 - (row0 - first row0) + r, its own count; only its rows are read) and the forward's after_sample
+    /// with its rows; then the host waits for the copy alone. False: the pipe's own download.
+    fn segGather(ctx: *anyopaque, gathered: u64, n: usize, k: usize, segs: []const pipe.Pipe.Seg, host: []u8) anyerror!bool {
+        const x: *GpuSampler = @ptrCast(@alignCast(ctx));
+        const h = x.f.after_sample orelse return false;
+        const r = x.f.runner;
+        const ops = r.kernels.others(r.stream);
+        const W: usize = x.f.comm.world();
+        if (ops.f.vs_choose == null or W * k > kops.glue.vs_max) return false;
+        const r0 = segs[0].row0;
+        var any = false;
+        for (segs, x.seg_pos0) |g, p0| any = any or (p0 != null and !isNucleusRow(g.s));
+        if (!any) return false;
+        try x.ensureDevice(host.len, n);
+        try r.d.check(r.d.api.cuMemcpyDtoHAsync_v2(x.pinned.?.bytes.ptr, gathered, host.len, r.stream.handle), "cuMemcpyDtoHAsync");
+        try x.done.?.record(r.stream);
+        const vocab: u32 = x.f.cfg.vocab;
+        for (segs, x.seg_pos0) |g, p0| {
+            const p = p0 orelse continue;
+            const a = g.row0 - r0;
+            if (isNucleusRow(g.s)) continue;
+            const count = pipe.countOf(g.s, vocab, x.p.nucleus);
+            try ops.vsChoose(gathered, W, n, k, count, g.s.seed, p -% a, g.s.top_k, g.s.temperature, g.s.top_p, g.s.min_p, x.chosen.?.ptr);
+            try h.run(h.ctx, g.row0, g.n, x.chosen.?.ptr + 8 * @as(u64, a));
+        }
+        try x.done.?.synchronize();
+        @memcpy(host, x.pinned.?.bytes[0..host.len]);
+        return true;
+    }
+
+    /// The pinned copy, its event and the device choices, grown to `bytes` / `n` rows.
+    fn ensureDevice(x: *GpuSampler, bytes: usize, n: usize) !void {
+        const r = x.f.runner;
+        if (x.pinned == null or x.pinned.?.bytes.len < bytes) {
+            if (x.pinned) |*b| b.free();
+            x.pinned = null;
+            x.pinned = try cuda.HostBuffer.alloc(r.d, @max(bytes, 1 << 16));
+        }
+        if (x.chosen == null or x.chosen.?.len < 8 * n) {
+            if (x.chosen) |*b| b.free();
+            x.chosen = null;
+            x.chosen = try cuda.DeviceBuffer.alloc(r.d, @max(8 * n, 1024));
+        }
+        if (x.done == null) x.done = try cuda.Event.init(r.d, false);
+    }
+
+    /// Rank 0, once a path: which keyed path serving takes. The server's default sampling decides it (the Spark
+    /// server's is top_k 20, top_p 0.95: a request without top_k never reaches the nucleus path).
+    fn note(x: *GpuSampler, s: Sampling, batched: bool) void {
+        if (x.f.comm.rank() != 0) return;
+        const V: usize = x.p.V;
+        const count = pipe.countOf(s, @intCast(V * x.f.comm.world()), x.p.nucleus);
+        const kind: u3 = if (@min(count, V) > pipe.max_k or V > pipe.max_cols) 0 else if (isNucleusRow(s)) 1 else 2;
+        const bit = @as(u8, 1) << (kind + @as(u3, if (batched) 3 else 0));
+        if (x.seen & bit != 0) return;
+        x.seen |= bit;
+        const what = switch (kind) {
+            0 => "whole rows (top_k 0 without the nucleus path, or past the device top-k)",
+            1 => "nucleus candidates + row statistics",
+            else => "top_k candidates",
+        };
+        const start = x.f.after_sample != null and kind == 2;
+        std.log.scoped(.dsv41).info("sampling: first keyed call ({s}): {s}, {d} candidates a rank (top_k {d}, top_p {d}, T {d}), device choice {s}", .{ if (batched) "one call a forward" else "one call a segment", what, @min(count, V), s.top_k, s.top_p, s.temperature, if (start) "on" else "off" });
     }
 
     pub fn deinit(x: *GpuSampler) void {
@@ -118,6 +202,8 @@ pub const GpuSampler = struct {
         x.p.deinit();
         x.gpa.destroy(x);
     }
+
+    /// Rank 0: the keyed choices of "w.logits" rows [row0, row0 + n) under `s` (T > 0), row i drawn at `draws[i]`.
 
     /// Rank 0: the keyed choices of "w.logits" rows [row0, row0 + n) under `s` (T > 0), row i drawn at `draws[i]`.
     pub fn choose(x: *GpuSampler, row0: u32, n: u32, s: Sampling, draws: []const u64, out: []u32) !void {
@@ -140,6 +226,7 @@ pub const GpuSampler = struct {
         if (f.grammar) |g| try g.apply(g.ptr, row0, n);
         x.cur = .{ .row0 = row0, .s = s, .pos0 = pos0 };
         defer x.cur = null;
+        x.note(s, false);
         try x.p.choose(x.gpu.device(), lg, n, s, draws, out);
         if (x.p.whole_rows > 0) std.log.scoped(.dsv41).debug("sampling: {d} of {d} rows taken whole", .{ x.p.whole_rows, n });
     }
@@ -181,17 +268,7 @@ pub const GpuSampler = struct {
         const ops = r.kernels.others(r.stream);
         const W: usize = x.f.comm.world();
         if (ops.f.vs_choose == null or pipe.sampled(c.s) == false or isNucleusRow(c.s) or W * k > kops.glue.vs_max) return false;
-        if (x.pinned == null or x.pinned.?.bytes.len < host.len) {
-            if (x.pinned) |*b| b.free();
-            x.pinned = null;
-            x.pinned = try cuda.HostBuffer.alloc(r.d, @max(host.len, 1 << 16));
-        }
-        if (x.chosen == null or x.chosen.?.len < 8 * n) {
-            if (x.chosen) |*b| b.free();
-            x.chosen = null;
-            x.chosen = try cuda.DeviceBuffer.alloc(r.d, @max(8 * n, 1024));
-        }
-        if (x.done == null) x.done = try cuda.Event.init(r.d, false);
+        try x.ensureDevice(host.len, n);
         try r.d.check(r.d.api.cuMemcpyDtoHAsync_v2(x.pinned.?.bytes.ptr, gathered, host.len, r.stream.handle), "cuMemcpyDtoHAsync");
         try x.done.?.record(r.stream);
         try ops.vsChoose(gathered, W, n, k, count, c.s.seed, p0, c.s.top_k, c.s.temperature, c.s.top_p, c.s.min_p, x.chosen.?.ptr);

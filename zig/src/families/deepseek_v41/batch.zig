@@ -386,8 +386,8 @@ pub const Batch = struct {
             var greedy_rows = false;
             for (segments[rg[0]..rg[1]]) |sg| greedy_rows = greedy_rows or !samp.sampled(sg.sampling);
             if (greedy_rows) try b.f.greedy(picks[0..n]);
-            // TF_DSV41_SAMP_BATCH: the forward's nucleus segments in one sampler call (when two or more), the rest one
-            // call a segment as before
+            // TF_DSV41_SAMP_BATCH: the forward's keyed segments in one sampler call (when two or more), the rest (whole
+            // rows) one call a segment as before
             var many: [16]samp.Seg = undefined;
             var nm: usize = 0;
             var batched: [16]bool = @splat(false);

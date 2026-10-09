@@ -19,7 +19,14 @@ pub const Gpu = struct {
 
     pub fn init(d: *const cuda.Driver, stream: cuda.Stream, kernels: *const dk.Kernels) !Gpu {
         const fns = try dk.sampling.Functions.load(d);
-        return .{ .d = d, .stream = stream, .kernels = kernels, .fns = fns, .split = fns.split != null and !(try rowStats()) };
+        const row = try rowStats();
+        const log = std.log.scoped(.dsv41);
+        if (fns.split_missing) |m| {
+            log.warn("sampling: nucleus statistics one CTA a row: the sampling fatbin's {s} did not resolve ({t}); rebuild dsv41_sampling.fatbin from sampling.cu at 2e777c10 or later", .{ m.symbol, m.err });
+        } else if (row) {
+            log.info("sampling: nucleus statistics one CTA a row (TF_DSV41_SAMP_STATS=row)", .{});
+        } else log.info("sampling: nucleus statistics split over every SM ({d} columns a CTA)", .{dk.sampling.Functions.chunk});
+        return .{ .d = d, .stream = stream, .kernels = kernels, .fns = fns, .split = fns.split != null and !row };
     }
 
     /// TF_DSV41_SAMP_STATS: split (default) | row.

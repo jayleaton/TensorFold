@@ -686,7 +686,10 @@ tails; four prompts finishing together: ~120-150 ms. Python cannot do this witho
 
 ## 10. Sampled rounds: the nucleus statistics on one SM a row (2026-10-09, offline)
 
-Sampled decode (T 0.7, top-p 0.95, top_k 0: nucleus rows) trailed Python in every run while T 0 was level
+**Correction (Spark S1 / S2, same day): the bench's T 0.7 rows are not nucleus rows, and the gap below was mostly a
+measurement artifact; see "What the Spark runs showed" at the end of this section.**
+
+Sampled decode (T 0.7, top-p 0.95) trailed Python in every run while T 0 was level
 (k860-base: code x1 89.2 vs 92.2, code x4 142.8 vs 147.0, prose x1 49.0 vs 50.4 tok/s).
 
 **Acceptance is not it.** Both engines choose every verify row by the same keyed rule (no residual sampling): the
@@ -1045,11 +1048,49 @@ top-k over rows [first row0, last end), each segment's statistics at its own T, 
 then each row picked as before; whole-row fallbacks after every pick. Other sampled segments (top_k rows, which may
 start the speculative pass from the device choice) keep one call each.
 
-Exactness: nothing is reduced in another order. Only nucleus segments are batched, so every row asks the same
-candidate count (TF_DSV41_NUCLEUS); topk_keys is a CTA a row, pack a row, and both statistics kernels compute a row
-from its own columns and T alone (the split grid's chunks are a row's own, summed in chunk order). Each row's
-gathered candidates and statistics are therefore the bits of the one-segment call, and the host picks them with
-the same position-keyed draws. Host test (`test-dsv41-sampling`): three segments with different T / top_p / min_p
-/ seed, a row between them in no segment and two flat rows that take the whole-row fallback, on one and two ranks:
-batched == one call a segment (tokens and whole-row count), and every token == the keyed rule over its whole row.
+**One sampler call a forward (`TF_DSV41_SAMP_BATCH=1`, default off).** Per segment, Zig runs top-k, an all-gather,
+the device choice (`vs_choose`, the speculative round's start) and a blocking copy back, then the host picks, before
+the next segment's call; Python runs one `cand_gather` a forward. With the knob, `Batch.targetWindow` hands a
+forward's keyed segments (two or more; top_k rows and nucleus rows) to `GpuSampler.chooseSegments` (plan-link op 13:
+[op, n, (row0, rows, T, top_k, top_p, min_p, seed, pos0) a segment], pos0 -1 = no device choice): one top-k at the
+segments' largest count over rows [first row0, last end), the nucleus segments' statistics each at its own T, one
+gather of each, one copy back; each top_k segment's `vs_choose` over the shared gather (its rows drawn at
+pos0 - row offset + r, its own count) and the forward's `after_sample` with its rows, so the row window's
+speculative round (`SlotPass.tryLaunch`, which waits for every armed slot's choice) starts after one call instead of
+four; then each row picked, cut to its own count. Whole-row segments keep one call each.
 
+Exactness: no reduction changes order (topk_keys a CTA a row, pack a row, the statistics a row from its own row and
+T). A row whose count is below the shared k gets more candidates from each rank than its own call gathers; its merge
+sorts every rank's candidates by (value, lower id) and keeps its count: the global top `count`, keys unique, each of
+them within its own rank's top `count`, so the kept candidates and their order are the one-segment call's. Host test
+(`test-dsv41-sampling`): nucleus segments (different T / top_p / min_p / seed, a row in no segment, two flat rows
+taking the whole-row fallback) and mixed segments (the served top_k 20 / top_p 0.95, top_k 5 with min_p, top_k 300,
+a nucleus segment, a segment whose first position is below its row offset), one and two ranks: batched == one call a
+segment (tokens, whole-row count), every token == the keyed rule over its whole row, and each top_k segment's
+`vs_choose` mirror over the shared gather == its host pick (a mutation dropping the row-offset shift fails it).
+
+**What the Spark runs showed (S1 / S2 on 2e777c10).** T 0.7 hashes equal, tokens a round unchanged, and almost no
+gain (code x1 89.2 -> 89.7, x4 142.8 -> 142.9). Two reasons:
+
+- The bench's T 0.7 rows never take the nucleus path. `bench_http.py` sends `temperature`, `top_p` and `seed`, not
+  `top_k`, and both servers fill it from their defaults: Python `cuda/server.py` `{"temperature": 1.0, "top_k": 20,
+  "top_p": 0.95}`, Zig `server/main.zig` the same under the Spark wire (the serve log: "sampling: temperature 1.0,
+  top_k 20, top_p 0.95"). Rows are top_k 20 rows: 21 candidates a rank, no statistics; the split kernel (and
+  `SAMP_BATCH`'s nucleus-only first version, and `SPEC_NUCLEUS`) never ran. The split kernel stays right for clients
+  that send top_k 0. Boot now logs the statistics path, and rank 0 logs the first keyed call of each path (whole
+  rows / nucleus / top_k, per call or batched, device choice on or off).
+- The 1-rep loop compares Zig's rep 0 with Python's best of 3. `zig-bench.sh` keeps each cell's best rep;
+  `bench_http.py`'s one warm-up is code T 0, 1 stream, 32 tokens, so a cell's first rep pays the first sampled /
+  4-stream use (graph captures, scratch) on both engines. Same rep on both sides:
+
+  | cell | Python rep 0 | Zig rep 0 | Python best | Zig best (3-rep runs) |
+  |---|---:|---:|---:|---:|
+  | code T0.7 x1 | 89.1 / 88.9 | 89.1 / 89.4 / 90.0 | 92.2 / 92.2 | 92.4 / 92.5 / 92.0 |
+  | prose T0.7 x1 | 47.4 / 47.6 | 49.3 / 49.3 | 50.4 / 50.4 | 50.8 / 50.5 |
+  | code T0.7 x4 | 141.8 / 141.8 | 135.0 / 135.4 / 138.7 | 147.0 / 145.5 | 142.7 / 142.5 / 144.7 |
+  | code T0 x4 | 140.4 / 142.5 | 141.4 / 140.3 / 141.5 | 145.4 / 146.5 | 143.0 / 142.5 / 143.8 |
+
+  (Python: onepass and round 4 bench-prod; Zig: r5-off, r5-on, onepass base.) At x1 and in prose, T 0.7 is level
+  rep for rep. The real gap is code x4: about -1.3 % at T 0 and -2 % at T 0.7 best for best, and Zig's first x4 T 0.7
+  rep is 3-5 % colder than Python's. The sampled-only part at x4 (~0.7 % a round) is the four serialized sampler calls
+  before the speculative round can start: what `SAMP_BATCH` now removes.

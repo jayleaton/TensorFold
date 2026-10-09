@@ -19,6 +19,8 @@ pub const Functions = struct {
     pack_fn: cuda.Function,
     /// the split statistics (every SM; null in a fatbin built before them: `stats` then runs one CTA a row)
     split: ?Split = null,
+    /// why `split` is null: the symbol that did not resolve, and the driver's error
+    split_missing: ?struct { symbol: [:0]const u8, err: anyerror } = null,
 
     pub const Split = struct { max: cuda.Function, sum: cuda.Function, fin: cuda.Function };
 
@@ -29,21 +31,21 @@ pub const Functions = struct {
         if (!available) return error.SamplingKernelNotBuilt;
         var m = try cuda.Module.load(d, image);
         errdefer m.unload();
-        return .{
+        var f: Functions = .{
             .module = m,
             .stats_fn = try m.function("_ZN14dsv41_sampling12stats_kernelEPKfxidPd"),
             .pack_fn = try m.function("_ZN14dsv41_sampling11pack_kernelEPKfPKxiiPf"),
-            .split = splitOf(&m),
         };
+        var fs: [3]cuda.Function = undefined;
+        for (split_syms, &fs) |sym, *x| x.* = m.function(sym) catch |e| {
+            f.split_missing = .{ .symbol = sym, .err = e };
+            return f;
+        };
+        f.split = .{ .max = fs[0], .sum = fs[1], .fin = fs[2] };
+        return f;
     }
 
-    fn splitOf(m: *const cuda.Module) ?Split {
-        return .{
-            .max = m.function("dsv41_sampling_stats_max") catch return null,
-            .sum = m.function("dsv41_sampling_stats_sum") catch return null,
-            .fin = m.function("dsv41_sampling_stats_fin") catch return null,
-        };
-    }
+    const split_syms = [3][:0]const u8{ "dsv41_sampling_stats_max", "dsv41_sampling_stats_sum", "dsv41_sampling_stats_fin" };
 
     /// Bytes of device scratch `statsSplit` needs for `rows` rows of C columns.
     pub fn splitScratch(rows: usize, C: usize) usize {
