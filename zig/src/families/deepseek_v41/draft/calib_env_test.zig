@@ -96,6 +96,16 @@ test "no entry for this engine: the defaults; more slots fit; a named file wins;
     try std.testing.expectError(error.CalibMode, calib_env.load(gpa, io, .{ .mode = "measured" }, want, 16));
 }
 
+test "code acceptance is default off and rejects invalid flags" {
+    Env.pairs = &.{};
+    try std.testing.expect(!(try calib_env.depthSettings(&Env.get)).code_accept);
+    Env.pairs = &.{.{ "TF_DSV41_CODE_ACCEPT", "on" }};
+    try std.testing.expect((try calib_env.depthSettings(&Env.get)).code_accept);
+    Env.pairs = &.{.{ "TF_DSV41_CODE_ACCEPT", "maybe" }};
+    try std.testing.expectError(error.CodeAccept, calib_env.depthSettings(&Env.get));
+    Env.pairs = &.{};
+}
+
 const Env = struct {
     var pairs: []const [2][]const u8 = &.{};
     fn get(name: [*:0]const u8) ?[]const u8 {

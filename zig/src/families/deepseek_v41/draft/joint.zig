@@ -98,6 +98,76 @@ pub fn allocate(gpa: Allocator, slots: []const Slot, shared: u64, costs: Costs, 
     return best;
 }
 
+/// Expand an existing allocation only when its current expected tokens / full round ms improves by 1%.
+/// Sorting survival gains gives the best expansion at every total row count; scan all counts because row prices
+/// need not be convex. Fixed draft/slot/host costs matter to the ratio even though allocate cancels them out.
+/// Ineligible slots have top == ks[i]. No clock or sampling state is read here.
+pub fn expand(gpa: Allocator, slots: []const Slot, shared: u64, costs: Costs, fixed_ms: f64, max_rows: u64, priced_rows: ?u64, ks: []usize) !usize {
+    var rows: u64 = shared;
+    var tokens: f64 = 0;
+    var cands: std.ArrayList(Cand) = .empty;
+    defer cands.deinit(gpa);
+    for (slots, ks, 0..) |s, k, i| {
+        rows += 1 + k;
+        var survival: f64 = 1;
+        tokens += 1;
+        for (s.qs[0..s.top], 0..) |q, j| {
+            survival *= q;
+            if (j < k) tokens += survival else try cands.append(gpa, .{ .neg = -survival, .slot = @intCast(i), .pos = @intCast(j) });
+        }
+    }
+    if (rows >= max_rows or cands.items.len == 0) return 0;
+    std.mem.sort(Cand, cands.items, {}, before);
+    const baseline = tokens / (costs.rowsMs(@intCast(priced_rows orelse rows)) + fixed_ms);
+    var best = baseline;
+    var count: usize = 0;
+    for (cands.items[0..@min(cands.items.len, max_rows - rows)], 0..) |c, i| {
+        tokens -= c.neg;
+        const ratio = tokens / (costs.rowsMs(@intCast(priced_rows orelse (rows + i + 1))) + fixed_ms);
+        if (ratio > best + eps) {
+            best = ratio;
+            count = i + 1;
+        }
+    }
+    if (best < baseline * 1.01) return 0;
+    for (cands.items[0..count]) |c| ks[c.slot] += 1;
+    return count;
+}
+
+test "expansion maximizes full round throughput under every depth floor and row cap" {
+    const gpa = std.testing.allocator;
+    // Nonconvex row prices: scanning past an expensive row can still win.
+    var verify = [_]f64{ 20, 22, 27, 27, 28, 33, 33, 34, 36, 40, 41, 42 };
+    const c: Costs = .{ .verify = &verify, .draft = 4 };
+    const qs = [_][5]f64{ .{ 0.95, 0.9, 0.85, 0.8, 0.75 }, .{ 0.9, 0.8, 0.7, 0.6, 0.5 } };
+    const slots = [_]Slot{ .{ .qs = &qs[0], .least = 1, .top = 5 }, .{ .qs = &qs[1], .least = 1, .top = 5 } };
+    for (1..6) |a| for (1..6) |b| for (4..13) |cap| {
+        var ks = [_]usize{ a, b };
+        var es: [2][6]f64 = undefined;
+        for (qs, &es) |q, *e| {
+            e[0] = 1;
+            var survival: f64 = 1;
+            for (q, e[1..], 0..) |v, *out, j| {
+                survival *= v;
+                out.* = e[j] + survival;
+            }
+        }
+        const baseline = (es[0][a] + es[1][b]) / (c.rowsMs(@intCast(2 + a + b)) + 8);
+        var best = baseline;
+        for (a..6) |x| for (b..6) |y| {
+            if (2 + x + y > cap) continue;
+            best = @max(best, (es[0][x] + es[1][y]) / (c.rowsMs(@intCast(2 + x + y)) + 8));
+        };
+        const added = try expand(gpa, &slots, 0, c, 8, cap, null, &ks);
+        const got = (es[0][ks[0]] + es[1][ks[1]]) / (c.rowsMs(@intCast(2 + ks[0] + ks[1])) + 8);
+        try std.testing.expect(ks[0] >= a and ks[1] >= b);
+        if (best < baseline * 1.01) {
+            try std.testing.expectEqual(@as(usize, 0), added);
+            try std.testing.expectEqual(baseline, got);
+        } else try std.testing.expectApproxEqAbs(best, got, 1e-12);
+    };
+}
+
 /// allocate's objective of given depths (the brute-force check).
 pub fn objective(gpa: Allocator, slots: []const Slot, ks: []const usize, shared: u64, costs: Costs, rate: f64) !f64 {
     var total: f64 = 0.0;

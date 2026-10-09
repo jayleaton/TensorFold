@@ -52,7 +52,7 @@ pub const Policy = struct {
             }
             const main = @min(st.?.n, w.rows - 1);
             const conf = try arena.dupe(f64, st.?.conf[0..main]);
-            try asks.append(arena, .{ .slot = st.?.slot, .conf = conf, .most = main, .first = st.?.held[0] });
+            try asks.append(arena, .{ .slot = st.?.slot, .conf = conf, .most = main, .first = st.?.held[0], .position = st.?.start });
             try at.append(arena, i);
         }
         if (asks.items.len == 0) return;
