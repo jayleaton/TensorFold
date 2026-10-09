@@ -84,6 +84,10 @@ pub const Options = struct {
     /// next mixing site (a boundary's mhc_pf.run + `_finish_k`, row-wise) runs in the same row pieces, piece p after
     /// exchange piece p only, so the site's early pieces hide the later pieces' exchanges
     pf_overlap_site: bool = false,
+    /// TF_DSV41_MHC_SITE_ROWS (0 off; 256-4,096, a multiple of 16): a prefill boundary site (mhc_pf.run + `_finish_k`,
+    /// row-wise) in pieces of about this many rows on the main stream, so `_finish_k` reads a piece's partials from
+    /// L2; a site the exchange pieces already cut (pf_overlap_site) keeps theirs
+    mhc_site_rows: i64 = 0,
     /// TF_DSV41_PF_TBO (block_prefill.emitTbo): a prompt's CED encoder segments two at a time, the second half a layer
     /// behind the first on the branches' side stream, so one's routed experts (DRAM-bound) run beside the other's
     /// attention and dense GEMMs (compute-bound). Needs `branches`; the exchange pieces (pf_overlap) are off under it
@@ -112,6 +116,9 @@ pub const Options = struct {
     /// TF_DSV41_GM_V2 (gm2pf.zig): prefill's routed experts on x3gm v2 (gm2_kernel); off: v1 (the captures' path). The
     /// same bits either way.
     gm_v2: @import("gm2pf.zig").Mode = .off,
+    /// TF_DSV41_GM_GU2 (gm2pf.zig, with gm_v2 `one`): a 4,096-row segment's gate / up at the 128-member tile GU2 over
+    /// its own 128-member plan; down keeps DN0 and the 64-member plan
+    gm_gu2: bool = false,
     /// TF_DSV41_INDEX_BUDGET_MIB (bytes): the indexer's materialised scores + sort keys a launch (backend.index_budget:
     /// prefill segments and decode windows past it select in row blocks through `_keys`; the same bits)
     index_budget: i64 = 256 << 20,

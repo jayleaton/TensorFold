@@ -180,6 +180,29 @@ pub fn pfOverlap(get: Get) !i64 {
     return if (v < 2) 0 else v;
 }
 
+/// TF_DSV41_MHC_SITE_ROWS (ours; unset / 0 off, else 256-4,096 and a multiple of 16): a prefill boundary site's rows a
+/// piece (block_prefill.zig `sitePieces`).
+pub fn mhcSiteRows(get: Get) !i64 {
+    const raw = std.mem.trim(u8, get("TF_DSV41_MHC_SITE_ROWS") orelse "0", " ");
+    const v = std.fmt.parseInt(i64, raw, 10) catch -1;
+    if (v == 0) return 0;
+    if (v < 256 or v > 4096 or @rem(v, 16) != 0) {
+        std.log.warn("TF_DSV41_MHC_SITE_ROWS={s}: 0 (off) or 256-4096, a multiple of 16", .{raw});
+        return error.BadKnob;
+    }
+    return v;
+}
+
+/// TF_DSV41_GM_GU2 (ours; 0 / 1, default 0; with TF_DSV41_GM_V2=1): a 4,096-row segment's routed gate / up at x3gm.cu's
+/// 128-member tile GU2 (gm2pf.zig).
+pub fn gmGu2(get: Get) !bool {
+    const raw = std.mem.trim(u8, get("TF_DSV41_GM_GU2") orelse "0", " ");
+    if (std.mem.eql(u8, raw, "0")) return false;
+    if (std.mem.eql(u8, raw, "1")) return true;
+    std.log.warn("TF_DSV41_GM_GU2={s}: 0 or 1", .{raw});
+    return error.BadKnob;
+}
+
 /// TF_DSV41_PF_OVERLAP_SITE (ours; 0 / 1, default 0; with TF_DSV41_PF_OVERLAP >= 2): every exchange piece on the side
 /// stream, and the next boundary mixing site in the same row pieces, each after its own exchange piece
 /// (block_prefill.zig `sitePieces`).
@@ -351,6 +374,14 @@ pub fn apply(f: *@import("forward.zig").Forward, a: std.mem.Allocator, io: std.I
     // TF_DSV41_PF_OVERLAP: the pieces' exchanges go on the branches' side stream (one peer: TP=2)
     f.opts.pf_overlap = try pfOverlap(&env);
     f.opts.pf_overlap_site = try pfOverlapSite(&env);
+    f.opts.gm_gu2 = try gmGu2(&env);
+    f.opts.mhc_site_rows = try mhcSiteRows(&env);
+    if (f.opts.mhc_site_rows > 0) std.log.scoped(.dsv41).info("mhc: prefill boundary sites in pieces of about {d} rows", .{f.opts.mhc_site_rows});
+    if (f.opts.gm_gu2 and f.opts.gm_v2 != .one) {
+        std.log.scoped(.dsv41).err("TF_DSV41_GM_GU2=1 needs TF_DSV41_GM_V2=1 (x3gm v2's one plan a block)", .{});
+        return error.BadKnob;
+    }
+    if (f.opts.gm_gu2) std.log.scoped(.dsv41).info("x3gm: gate / up at 128-member passes (GU2) in 4,096-row segments", .{});
     if (f.opts.pf_overlap_site and f.opts.pf_overlap < 2) {
         std.log.scoped(.dsv41).err("TF_DSV41_PF_OVERLAP_SITE=1 needs TF_DSV41_PF_OVERLAP=2..8 (the pieces it overlaps)", .{});
         return error.BadKnob;

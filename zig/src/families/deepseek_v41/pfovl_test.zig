@@ -305,3 +305,62 @@ fn sitePieces(cs: []const calls.Call, n: i64, k: i64, D: i64) !void {
     try testing.expectEqual(@as(i64, 0), sp);
     try testing.expect(sites > 0);
 }
+
+test "TF_DSV41_MHC_SITE_ROWS: the reader, and every boundary site in row pieces on the main stream, every other call unchanged" {
+    Fake.pairs = &.{};
+    try testing.expectEqual(@as(i64, 0), try pk.mhcSiteRows(&Fake.get));
+    Fake.pairs = &.{.{ "TF_DSV41_MHC_SITE_ROWS", "512" }};
+    try testing.expectEqual(@as(i64, 512), try pk.mhcSiteRows(&Fake.get));
+    for ([_][]const u8{ "128", "520", "8192", "x" }) |v| {
+        Fake.pairs = &.{.{ "TF_DSV41_MHC_SITE_ROWS", v }};
+        try testing.expectError(error.BadKnob, pk.mhcSiteRows(&Fake.get));
+    }
+    Fake.pairs = &.{};
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const cfg: Config = .{};
+    const w = try widths(aa);
+    const layers = [_]u32{ 1, 2, 3 };
+    const D: i64 = cfg.hidden;
+    const base: block.Options = .{ .gm_v2 = .one, .limit = 1 << 16, .rope_rows = (1 << 16) + 2048 };
+    var big = base;
+    big.pf4k = true;
+    big.prefill_rows = 4096;
+    for ([_]Mode{ .{ .n = 2048, .o = base }, .{ .n = 4096, .o = big } }) |md| {
+        var on_o = md.o;
+        on_o.mhc_site_rows = 512;
+        const off = try bp.emitPrefill(aa, &cfg, &w, md.o, &layers, md.n, 0, false);
+        const on = try bp.emitPrefill(aa, &cfg, &w, on_o, &layers, md.n, 0, false);
+        var i: usize = 0;
+        var j: usize = 0;
+        while (true) {
+            while (i < off.len and isSite(off[i])) i += 1;
+            while (j < on.len and isSite(on[j])) j += 1;
+            if (i == off.len or j == on.len) break;
+            try testing.expectEqualStrings(off[i].name, on[j].name);
+            i += 1;
+            j += 1;
+        }
+        try testing.expectEqual(off.len - i, on.len - j);
+        const k: usize = @intCast(@divExact(md.n, 512));
+        const sites: usize = 2 * layers.len - 1; // the boundaries: every site but the first block's attention site
+        try testing.expectEqual(count(off, "tf_dsv41_mhc_pf_v1.run") + (k - 1) * sites, count(on, "tf_dsv41_mhc_pf_v1.run"));
+        try testing.expectEqual(count(off, "_finish_k") + (k - 1) * sites, count(on, "_finish_k"));
+        // the pieces tile each site's rows in order: its streams' rows, its gathered rows, its "w.out" rows
+        var next: i64 = 0;
+        for (on, 0..) |c, idx| {
+            try testing.expect(!c.side and !c.fork and c.wait == 0 and c.mark == 0);
+            if (!std.mem.eql(u8, c.name, "tf_dsv41_mhc_pf_v1.run")) continue;
+            const R = c.args[10].arg.i;
+            if (R == md.n) continue;
+            try testing.expectEqual(@as(i64, 512), R);
+            try testing.expectEqual(next * 4 * D * 2, c.args[0].arg.t.offset);
+            try testing.expectEqual(next * D * 2, c.args[2].arg.t.offset);
+            for (on[idx + 1].args) |x| if (std.mem.eql(u8, x.name, "OUT")) try testing.expectEqual(next * D * 2, x.arg.t.offset);
+            next += R;
+            if (next == md.n) next = 0;
+        }
+        try testing.expectEqual(@as(i64, 0), next);
+    }
+}

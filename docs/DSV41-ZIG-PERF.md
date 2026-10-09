@@ -1178,3 +1178,86 @@ Pipelining the next segment:
 - The embedding is the segment's first exchange: rank 1, the critical rank, spends 1.10 ms / 1K rows on `glue.embed`
   (0.26 %). Rank 0's 7.85 is its wait for rank 1, i.e. skew. Precomputing segment N + 1's embedding on the side
   stream would save at most that 0.26 %, so it is not built.
+
+## 14. x3gm at 4K: gate / up at 128-member passes (TF_DSV41_GM_GU2, 2026-10-10, offline)
+
+T2-0 (tbo_bench --tiles, dgx-01, 4,096 rows): GU2 / DN0 is the best tile pair, -3.3 % of x3gm. That is gate / up
+at x3gm.cu's 128-member tile GU2 (MTL 1, NG 16, KS 2, NSA 4, NGR 4; 512 threads), down at prod's DN0. With x3gm
+~27 % of a 4K segment's wall, that is ~-0.9 % prompt time. Small, but it lands on the critical path that every other
+lever leaves.
+
+**Built:**
+- `x3gm3.cu` (Zig-own) instantiates `gm2_kernel<2, 2, GM_GU2>`, which x3gm.cu's bindings never build. sm_121: 128
+  registers, a 12-byte spill (GU1 spills at 128 too).
+- `kernels_exl3`: `gm2_gu2` is resolved from x3gm3, and `gm2Gateup` launches it at cfg 2 with two inputs.
+- `gm2pf.emit` (`one` mode) under the knob, in a segment of >= 4,096 rows:
+  - a second `gm_plan` at 128-member passes into its own roles (`L.gm.h0.*`);
+  - `gateup2` at cfg 2 over that plan;
+  - `down2` unchanged: DN0 over the 64-member plan.
+- **TF_DSV41_GM_GU2=1** (default 0; refused without TF_DSV41_GM_V2=1); boot log `x3gm: gate / up at 128-member
+  passes (GU2) in 4,096-row segments`.
+
+**Bits.**
+- gm2_kernel at any tile is one mma chain per element over ascending k tiles from +0.0 and the same epilogue. A
+  tile moves only which warp holds which member columns.
+- The two plans share `order`, a stable counting sort by expert that does not depend on the pass size, so gate / up
+  writes each pair's Xd row where down's 64-member passes read it.
+- tbo_bench --tiles compares GU2 / DN0's Y with G6's bit for bit on the GB10 (Spark G1).
+
+**Host tests:**
+- pf4k_test, the reader;
+- pf4k_test, a 4,096-row segment: one more plan per MoE call (128, its own roles, the same picks), gate / up at cfg 2
+  on it, down's call identical, every other call unchanged;
+- pf4k_test, a 2,048-row segment: unchanged;
+- kernels_exl3: GU2's shape fits sm_121's opt-in shared memory, and its mangled symbol is the compiled one.
+
+**Not a lever: rebalancing the last short piece.** 37,974 tokens run 9 x 4,096 + 1,104 + 5 rows. The 5 is the
+snapshot point, the last 16-token grid point before the end. x3gm's weight stream is a per-segment cost, and the
+segment count is ceil(rows / 4,096) however the rows split. Two ~2,600-row segments in place of 4,096 + 1,104 cost
+the same two streams, so the 32K gap of 13.5 stays.
+
+**Spark steps:**
+
+| step | what | pass |
+| --- | --- | --- |
+| G1 (no model, ~1 min) | `tbo_bench --rows 4096 --tiles` (proto, 980132f0's build) | the `GU2/DN0` line: Y bit-identical to G6, and its ms against `GU1/DN0` |
+| G2 (if G1 is exact) | kit at this commit; W1's all-on set + `TF_DSV41_GM_GU2=1`, `bench_http.py --long 32768,131072` | boot log line; long replies == Python's, T0 20/20; prompt tok/s vs W1 (expect +0.5-1 %) |
+
+## 15. mHC sites in L2-sized row pieces (TF_DSV41_MHC_SITE_ROWS, 2026-10-10, offline)
+
+P5b at 4K: mhc_pf.run 26.8 + `_finish_k` 8.5 = 35.3 ms per 1K rows over the segment's 41 sites. Per 1K rows, a
+boundary site moves ~170 MB:
+- `mhc_pf` reads the streams (40 MB) and the gathered partials (20 MB), and writes the streams (40 MB), `c` (10 MB)
+  and the fp32 partials (20 MB);
+- `_finish_k` reads the partials and `c` back (30 MB) and writes `w.out` (10 MB).
+
+41 x 170 MB at 273 GB/s is ~25.5 ms, so the sites run at ~1.4x their DRAM floor. The 30 MB `_finish_k` reads back
+were written one kernel earlier. At 4K they are 120 MB a site, far past the GB10's L2, so they come from DRAM.
+
+**TF_DSV41_MHC_SITE_ROWS=r** (default 0; 256-4,096, a multiple of 16): every prefill boundary site runs in
+ceil(n / r) row pieces, each piece mhc_pf.run then `_finish_k` over its rows, on the main stream (block_prefill
+`sitePieces`, unmarked). At r = 512 a piece's partials and `c` are ~15 MB, written and read back while L2 holds them.
+A site that the exchange pieces already cut (TF_DSV41_PF_OVERLAP_SITE) keeps their pieces.
+
+**Bits:** the pieced site's argument, as in 13.2:
+- both kernels are row-wise, every piece is >= 256 rows (mhc_pf's path, the whole site's instance) and starts on the
+  16-row grid;
+- the full gate's aot-needs lists the same Triton variants as without the knob.
+
+**Expected:**
+- up to the 30 MB a site from L2 instead of DRAM: ~-4.5 ms / 1K;
+- less 2 x (k - 1) launches a site at ~5 us each: k = 8 at 4K costs ~3 ms / 1K rows.
+
+So net **~+0.5-1 % at r = 512**. Try r = 1024 too: half the launches, partials ~30 MB, about the L2's size. This is
+the cheap half of the mHC floor. The other half, fusing `_finish_k` into mhc_pf, needs Triton's reduction order
+reproduced in CUDA (section 12's lesson), and is not built.
+
+**Host test** (pfovl_test):
+- the reader;
+- at 2,048 and 4,096 rows with r = 512, every call but the sites is the knob-off program's;
+- each boundary site is k pieces tiling its rows in order (streams, gathered rows, `w.out` rows);
+- nothing goes on the side stream.
+
+**Spark step M1:** W1's all-on set + `TF_DSV41_MHC_SITE_ROWS=512`, then `=1024`, with `bench_http.py --long
+32768,131072`. Pass: long replies == Python's, T0 20/20; prompt tok/s against W1 (or against X2 with
+PF_OVERLAP_SITE, whose own site pieces take precedence).
