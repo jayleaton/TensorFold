@@ -36,6 +36,7 @@ pub const Fake = struct {
     answer_cycles: bool = false,
     prefill_chunks: usize = 0,
     prefill_count: usize = 0,
+    fail_pieces: usize = 0, // the next this many `piece` calls fail with error.Unbound
     prefill_hook: ?*const fn (ctx: *anyopaque, s: *Stream, chunk: usize) void = null,
     prefill_hook_ctx: ?*anyopaque = null,
     refuse_sampled: bool = false, // prefill refuses a sampled stream with error.SamplingRefused
@@ -104,6 +105,10 @@ pub const Fake = struct {
     fn piece(ptr: *anyopaque, s: *Stream, start: u64, end: u64, snapshot: bool) anyerror!void {
         _ = snapshot;
         const x = self(ptr);
+        if (x.fail_pieces > 0) {
+            x.fail_pieces -= 1;
+            return error.Unbound;
+        }
         const h = &x.lane(s).history;
         if (h.items.len != start or end + 1 > s.prompt_len) return error.PositionMismatch;
         try h.appendSlice(x.gpa, s.prompt()[start..end]);
