@@ -25,6 +25,7 @@ const fwd = @import("forward.zig");
 const eh = @import("engram_host.zig");
 const egate = @import("engram_gate.zig");
 const graphs = @import("graphs.zig");
+const round_graph = @import("round_graph.zig");
 const rowtab = @import("rowtab.zig");
 const rowmode = @import("rowmode.zig");
 const slots_mod = @import("slots.zig");
@@ -71,7 +72,11 @@ pub const Batch = struct {
     n: u32 = 0,
     R: u32 = 0,
     current: []const calls.Call = &.{},
-    stats: struct { windows: u64 = 0, rows: u64 = 0, padded: u64 = 0 } = .{},
+    /// the calls of `current` the graph body issues (TF_DSV41_ROUND_GRAPH's `split`: the head's, then the tail's)
+    span: [2]usize = .{ 0, 0 },
+    /// TF_DSV41_ROUND_GRAPH (round_graph.zig)
+    rg: round_graph.Settings = .{},
+    stats: struct { windows: u64 = 0, rows: u64 = 0, padded: u64 = 0, split: u64 = 0 } = .{},
     /// the session store (model.zig): each slot's kept rows are its committed ids
     sess: ?*sessions_gpu.Sessions = null,
 
@@ -82,7 +87,7 @@ pub const Batch = struct {
         const r = f.runner;
         // graphs as the one-slot forward's default (M4: on unless TF_DSV41_GRAPHS=0; the gates' drivers: off)
         const s = try graphs.Settings.fromEnvOr(f.graphs_default);
-        b.* = .{ .gpa = gpa, .f = f, .ss = ss, .cap = cap, .settings = s, .tab = try Table.init(r.d, cap), .pend = try gpa.alloc(?Pend, ss.n) };
+        b.* = .{ .gpa = gpa, .f = f, .ss = ss, .cap = cap, .settings = s, .tab = try Table.init(r.d, cap), .pend = try gpa.alloc(?Pend, ss.n), .rg = try round_graph.current() };
         @memset(b.pend, null);
         {
             var la = std.heap.ArenaAllocator.init(gpa);
@@ -117,8 +122,8 @@ pub const Batch = struct {
         }
         if (s.on) {
             b.g = @as(Graphs, undefined); // non-null, payload set by init (a bare undefined leaves the optional's tag undefined: ReleaseSafe's .? panics)
-            try b.g.?.init(f, s);
-            std.log.scoped(.dsv41).info("row graphs: on, buckets up to {d} rows, context buckets of {d}", .{ cap, s.bucket });
+            try b.g.?.init(f, s, b.rg.split);
+            std.log.scoped(.dsv41).info("row graphs: on, buckets up to {d} rows, context buckets of {d}{s}", .{ cap, s.bucket, if (b.rg.split) " (split after the head's layers)" else "" });
         }
         return b;
     }
@@ -222,17 +227,28 @@ pub const Batch = struct {
         b.stats.padded += R - n;
         r.rows = R; // l2pf: the window's rows (with its padding, the graph's key) past 16 skip the prefetch sites
         if (b.g) |*g| {
-            const out = try g.cache.run(key, r.stream, b.fingerprint(), .{ .ctx = b, .run = body });
-            if (outcomeLog(out, g)) std.log.scoped(.dsv41).info("row graphs: capture {d} ({d} rows, context bucket {d}), {d} replayed", .{ g.cache.stats.captured, key.rows, key.ctx, g.cache.stats.replayed });
-            return;
+            const fp = b.fingerprint();
+            // TF_DSV41_ROUND_GRAPH=split: the head's graph, then the tail's, launched while the GPU runs the head
+            const at = if (b.rg.split) round_graph.splitAt(cs, b.rg.head) else null;
+            const parts: [2][2]usize = if (at) |i| .{ .{ 0, i }, .{ i, cs.len } } else .{ .{ 0, cs.len }, .{ cs.len, cs.len } };
+            for (parts, 0..) |sp, pi| {
+                if (sp[0] == sp[1]) continue;
+                b.span = sp;
+                const pk: graphs.Key = .{ .rows = key.rows, .ctx = key.ctx, .part = if (at == null) 0 else @intCast(pi + 1) };
+                const out = try g.cache.run(pk, r.stream, fp, .{ .ctx = b, .run = body });
+                if (outcomeLog(out, g)) std.log.scoped(.dsv41).info("row graphs: capture {d} ({d} rows, context bucket {d}, part {d}), {d} replayed", .{ g.cache.stats.captured, pk.rows, pk.ctx, pk.part, g.cache.stats.replayed });
+            }
+            if (at != null) b.stats.split += 1;
+            return f.gatedEnd();
         }
         try r.timedWindow(cs);
+        try f.gatedEnd();
     }
 
     fn body(ctx: *anyopaque, stream: cuda.Stream) anyerror!void {
         const b: *Batch = @ptrCast(@alignCast(ctx));
         _ = stream; // the runner's stream: the one the cache captures
-        try b.f.runner.window(b.current);
+        try b.f.runner.window(b.current[b.span[0]..b.span[1]]);
     }
 
     /// The key's program: block.emit at R rows ending at the context bucket's end, in row mode.
@@ -640,10 +656,11 @@ const Graphs = struct {
     agreement: graphs.Agreement,
     cache: graphs.Cache,
 
-    fn init(g: *Graphs, f: *fwd.Forward, s: graphs.Settings) !void {
+    /// `split`: a window's two graphs (head, tail) held in one cache of twice the cap (a head is ~1/43 of a window)
+    fn init(g: *Graphs, f: *fwd.Forward, s: graphs.Settings, split: bool) !void {
         const r = f.runner;
         g.* = .{ .engine = .{ .d = r.d }, .agreement = try graphs.Agreement.init(r.d, f.comm, r.stream), .cache = undefined };
-        g.cache = graphs.Cache.init(f.gpa, g.engine.engine(), .{ .on = true, .max = s.max });
+        g.cache = graphs.Cache.init(f.gpa, g.engine.engine(), .{ .on = true, .max = if (split) 2 * s.max else s.max });
         g.cache.agree = g.agreement.agree();
         g.cache.room = roomFn;
         room_floor = s.floor_gib;

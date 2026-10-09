@@ -85,7 +85,8 @@ pub fn bucketEnd(b: u32, size: u64, limit: u64, grow: f64) u64 {
     return @min(endOf(b, size, grow) - 1, limit - 1);
 }
 
-pub const Key = struct { rows: u32, ctx: u32 };
+/// `part`: 0 a whole window; 1 / 2 its head / tail graph (TF_DSV41_ROUND_GRAPH=split, round_graph.zig)
+pub const Key = struct { rows: u32, ctx: u32, part: u8 = 0 };
 
 pub const Cache = gc.Cache(Key);
 
