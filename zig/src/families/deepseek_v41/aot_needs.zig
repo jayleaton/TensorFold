@@ -306,7 +306,23 @@ fn run(n: *Needs, cfg: *const Config, w: *const block.Widths, o: block.Options, 
         error.Unsupported => return,
         else => return e,
     };
+    try aligned(cs);
     _ = try n.program(cs);
+}
+
+/// A run's every Triton tensor view 16-byte aligned from its role's base: a pointer's class in the key is then the
+/// one-segment programs' (the runs add only the fused core's OR); a misaligned slice is a specialization no fill holds.
+fn aligned(cs: []const calls.Call) !void {
+    for (cs) |c| {
+        if (!c.triton) continue;
+        for (c.args) |x| switch (x.arg) {
+            .t, .opaque_table => |t| if (@mod(t.offset, 16) != 0) {
+                std.log.err("aot-needs: a multi-segment run's {s} {s} at offset {d} is not 16-byte aligned", .{ c.name, x.name, t.offset });
+                return error.MisalignedRun;
+            },
+            else => {},
+        };
+    }
 }
 
 /// Decoder replay runs at a position: a 127-row tail ending at `end` beside a 33-row tail from 0 (`first`: the 127-row
@@ -417,6 +433,12 @@ pub fn enumerate(gpa: std.mem.Allocator, n: *Needs, cfg: *const Config, w: *cons
                 while (k <= 48) : (k += 1) {
                     try run(n, cfg, w, sv.o, enc, .encoder, &.{ .{ .slot = 0, .start = s0, .n = k }, .{ .slot = 1, .start = s0, .n = 100 } });
                     try run(n, cfg, w, sv.o, enc, .encoder, &.{ .{ .slot = 0, .start = s0, .n = 100 }, .{ .slot = 1, .start = s0, .n = k } });
+                }
+                // a staged segment (past 129 rows: the staging ring) beside short ones, at every residue mod 4
+                k = 17;
+                while (k <= 20) : (k += 1) {
+                    try run(n, cfg, w, sv.o, enc, .encoder, &.{ .{ .slot = 0, .start = s0, .n = k }, .{ .slot = 1, .start = s0, .n = 1500 + k } });
+                    try run(n, cfg, w, sv.o, enc, .encoder, &.{ .{ .slot = 0, .start = s0, .n = 1500 + k }, .{ .slot = 1, .start = s0, .n = k } });
                 }
             }
             try log.print("aot-needs: piece runs, {d} programs, {d} variants\n", .{ n.programs, n.keys.count() });

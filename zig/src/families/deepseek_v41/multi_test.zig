@@ -243,6 +243,8 @@ test "every role a run reads is in the buffer plan, at its run's rows (forward_p
         .{ .part = .encoder, .spans = &.{ .{ .slot = 0, .start = 0, .n = 1000 }, .{ .slot = 1, .start = 0, .n = 1048 } } },
         .{ .part = .encoder, .spans = &.{ .{ .slot = 0, .start = 0, .n = 17 }, .{ .slot = 1, .start = 0, .n = 300 }, .{ .slot = 2, .start = 0, .n = 33 } } },
         .{ .part = .decoder, .spans = &.{ .{ .slot = 0, .start = 0, .n = 127 }, .{ .slot = 1, .start = 0, .n = 127 }, .{ .slot = 2, .start = 0, .n = 127 }, .{ .slot = 3, .start = 0, .n = 64 } } },
+        // the counts' widest layout (each 17-row segment's counts padded to the next multiple of 4)
+        .{ .part = .encoder, .spans = &.{ .{ .slot = 0, .start = 0, .n = 17 }, .{ .slot = 1, .start = 0, .n = 17 }, .{ .slot = 2, .start = 0, .n = 17 }, .{ .slot = 3, .start = 0, .n = 17 }, .{ .slot = 4, .start = 0, .n = 17 }, .{ .slot = 5, .start = 0, .n = 17 }, .{ .slot = 6, .start = 0, .n = 17 }, .{ .slot = 7, .start = 0, .n = 17 }, .{ .slot = 8, .start = 0, .n = 17 }, .{ .slot = 9, .start = 0, .n = 17 }, .{ .slot = 10, .start = 0, .n = 17 }, .{ .slot = 11, .start = 0, .n = 17 }, .{ .slot = 12, .start = 0, .n = 17 }, .{ .slot = 13, .start = 0, .n = 17 }, .{ .slot = 14, .start = 0, .n = 17 }, .{ .slot = 15, .start = 0, .n = 1793 } } },
     };
     for (runs) |r| {
         const cs = try bp.emitMulti(a, &cfg, &w, o, if (r.part == .decoder) l.dec else l.enc, r.spans, r.part);
@@ -257,6 +259,57 @@ test "every role a run reads is in the buffer plan, at its run's rows (forward_p
                 std.debug.print("role {s}: a run needs {d} bytes, the plan holds {d}\n", .{ role, bytes, have });
                 return error.TestUnplanned;
             }
+        }
+    }
+}
+
+/// The first tensor argument of a Triton launch in `cs` whose view is not 16-byte aligned from its role's base (the
+/// runner's bases are 256-aligned, block.zig's pool too), or null. Triton specializes a pointer on 16-byte alignment (and
+/// aot-needs keys on it); the extension calls are compiled CUDA and take any offset (x3gm's per-width views).
+pub fn misaligned(cs: []const calls.Call) ?struct { call: []const u8, arg: []const u8, offset: i64 } {
+    for (cs) |c| {
+        if (!c.triton) continue;
+        for (c.args) |x| switch (x.arg) {
+            .t, .opaque_table => |t| if (@mod(t.offset, 16) != 0) return .{ .call = c.name, .arg = x.name, .offset = t.offset },
+            else => {},
+        };
+    }
+    return null;
+}
+
+test "every tensor a piece run or replay run hands Triton is 16-byte aligned (Triton's specialization, aot-needs' key)" {
+    // Spark 2026-10-09: a run's second segment read its selection counts (4-byte rows) at row0 * 4: _fused's CNT
+    // pointer was not 16-aligned, a variant no fill had
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cfg: Config = .{};
+    var w = try widths(a);
+    var l: Layers = undefined;
+    try layersOf(&cfg, &l);
+    const o = options();
+    // first rows at every residue mod 4, staged segments (past 129 rows), the counts' widest layout
+    var widest: [16]bp.Span = undefined;
+    for (widest[0..15], 0..) |*x, i| x.* = .{ .slot = @intCast(i), .start = 0, .n = 17 };
+    widest[15] = .{ .slot = 15, .start = 0, .n = 2048 - 15 * 17 };
+    const runs = [_]struct { part: bp.Part, spans: []const bp.Span }{
+        .{ .part = .encoder, .spans = &.{ .{ .slot = 0, .start = 0, .n = 17 }, .{ .slot = 1, .start = 0, .n = 18 }, .{ .slot = 2, .start = 700, .n = 19 }, .{ .slot = 3, .start = 0, .n = 20 } } },
+        .{ .part = .encoder, .spans = &.{ .{ .slot = 0, .start = 0, .n = 159 }, .{ .slot = 1, .start = 4000, .n = 1497 } } },
+        .{ .part = .encoder, .spans = &.{ .{ .slot = 0, .start = 2048, .n = 1501 }, .{ .slot = 1, .start = 0, .n = 131 }, .{ .slot = 2, .start = 0, .n = 33 } } },
+        .{ .part = .whole, .spans = &.{ .{ .slot = 0, .start = 0, .n = 299 }, .{ .slot = 1, .start = 0, .n = 499 }, .{ .slot = 2, .start = 0, .n = 699 } } },
+        .{ .part = .encoder, .spans = &widest },
+        .{ .part = .decoder, .spans = &.{ .{ .slot = 0, .start = 33, .n = 127 }, .{ .slot = 1, .start = 0, .n = 33 }, .{ .slot = 2, .start = 0, .n = 66 }, .{ .slot = 3, .start = 900, .n = 127 } } },
+    };
+    for (runs) |r| {
+        const layers = switch (r.part) {
+            .encoder => l.enc,
+            .decoder => l.dec,
+            else => &l.all,
+        };
+        const cs = try bp.emitMulti(a, &cfg, &w, o, layers, r.spans, r.part);
+        if (misaligned(cs)) |m| {
+            std.debug.print("{s} {s}: offset {d} is not 16-byte aligned\n", .{ m.call, m.arg, m.offset });
+            return error.TestMisaligned;
         }
     }
 }

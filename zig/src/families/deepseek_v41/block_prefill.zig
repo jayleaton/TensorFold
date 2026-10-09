@@ -456,7 +456,8 @@ const Seg = struct {
         const k: i64 = e.cfg.index_topk;
         return .{
             try e.view(.{ .buf = try e.fmt("w.sel{d}", .{src}) }, .i32, &.{ e.n, k }, &.{ k, 1 }, e.row0 * k * 4),
-            try e.view(.{ .buf = try e.fmt("w.cnt{d}", .{src}) }, .i32, &.{e.n}, &.{1}, e.row0 * 4),
+            // the counts' 4-byte rows: a run's segment from a row a multiple of 4 (cnt0), so the slice is 16-aligned
+            try e.view(.{ .buf = try e.fmt("w.cnt{d}", .{src}) }, .i32, &.{e.n}, &.{1}, e.cnt0 * 4),
         };
     }
 
@@ -857,6 +858,7 @@ const Seg = struct {
     fn enter(s: *Seg, sp: Span, j: usize) !void {
         const e = s.e;
         e.row0 = sp.row0;
+        e.cnt0 = sp.cnt0;
         e.n = sp.n;
         e.start = sp.start;
         s.setRing();
@@ -869,6 +871,7 @@ const Seg = struct {
         const e = s.e;
         const first = s.multi.?[0];
         e.row0 = 0;
+        e.cnt0 = 0;
         e.n = total;
         e.start = first.start;
         s.setRing();
@@ -1160,7 +1163,7 @@ fn stashArgs(e: *E) ![10]Arg {
 
 /// One segment of a multi-segment run (`emitMulti`): its slot's rows from position `start`, rows [row0, row0 + n) of
 /// the run.
-pub const Span = struct { slot: u32, start: i64, n: i64, row0: i64 = 0 };
+pub const Span = struct { slot: u32, start: i64, n: i64, row0: i64 = 0, cnt0: i64 = 0 };
 
 /// forward.staging's ring rows for a prefill segment the slot's ring cannot hold.
 fn stageRows(e: *const E) i64 {
@@ -1184,10 +1187,13 @@ pub fn emitMulti(a: std.mem.Allocator, cfg: *const Config, w: *const block.Width
     // the decoder replay's rows past the split mHC programs' 32 (a replay batched is the one-slot replay's arithmetic
     // row for row: the same kernel paths at every row count it takes); a prompt piece's past the short segment's 16
     const floor: i64 = if (part == .decoder) split_rows else 16;
+    var cnt: i64 = 0;
     for (spans) |*sp| {
         if (sp.n <= floor) return error.Unsupported;
         sp.row0 = total;
+        sp.cnt0 = cnt;
         total += sp.n;
+        cnt = std.mem.alignForward(i64, cnt + sp.n, 4);
     }
     if (total > o.prefill_rows or total > router_chunk) return error.Unsupported;
     var e: E = .{ .a = a, .cfg = cfg, .w = w, .o = o, .n = total, .start = spans[0].start };
@@ -1205,6 +1211,13 @@ pub fn planRuns(a: std.mem.Allocator, cfg: *const Config, w: *const block.Widths
     var out: std.ArrayList([]const calls.Call) = .empty;
     if (rows > 2 * 17) {
         const sp = [_]Span{ .{ .slot = 0, .start = 0, .n = rows - 17 }, .{ .slot = 1, .start = 0, .n = 17 } };
+        if (emitMulti(a, cfg, w, o, enc, &sp, part)) |cs| try out.append(a, cs) else |e| if (e != error.Unsupported) return e;
+    }
+    // the counts' widest layout: 15 segments of 17 rows (each padded 3 to the next multiple of 4) and the rest
+    if (rows > 16 * 17) {
+        var sp: [16]Span = undefined;
+        for (sp[0..15], 0..) |*x, i| x.* = .{ .slot = @intCast(i), .start = 0, .n = 17 };
+        sp[15] = .{ .slot = 15, .start = 0, .n = rows - 15 * 17 };
         if (emitMulti(a, cfg, w, o, enc, &sp, part)) |cs| try out.append(a, cs) else |e| if (e != error.Unsupported) return e;
     }
     if (dec) |d| {
