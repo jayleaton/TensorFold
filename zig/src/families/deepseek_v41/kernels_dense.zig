@@ -252,6 +252,11 @@ fn lanesUnpackSymbol(comptime k2: u32) [:0]const u8 {
 fn lanes2Symbol(comptime k2: u32, comptime wk: u32, comptime mb: u32) [:0]const u8 {
     return std.fmt.comptimePrint("_ZN10dsv41_lin213lanes2_kernelILi{d}ELi2ELi{d}ELi{d}EEEvN11dsv41_x3seg8LinTableEii", .{ k2, wk, mb });
 }
+fn lanescSymbol(comptime k2: u32, comptime wk: u32, comptime mb: u32, comptime t: u32) [:0]const u8 {
+    return std.fmt.comptimePrint("_ZN10dsv41_lin213lanesc_kernelILi{d}ELi2ELi{d}ELi{d}ELi{d}EEEvN11dsv41_x3seg8LinTableEii", .{ k2, wk, mb, t });
+}
+/// lanesc's instances in lin2.cu's order (WK, MINB, T): a 4-warp and an 8-warp CTA at T 1 and at T 2
+pub const lanesc_cfgs = [_][3]u32{ .{ 4, 3, 1 }, .{ 8, 1, 1 }, .{ 4, 2, 2 }, .{ 8, 1, 2 } };
 fn linear2Symbol(comptime k2: u32, comptime wk: u32, comptime pf: bool) [:0]const u8 {
     return std.fmt.comptimePrint("_ZN10dsv41_lin214linear2_kernelILi{d}ELi2ELi{d}ELb{d}EEEvPK6__halfPKjxxS3_S3_PviPfPiiiiiPKi", .{ k2, wk, @intFromBool(pf) });
 }
@@ -263,7 +268,29 @@ fn linear2Symbol(comptime k2: u32, comptime wk: u32, comptime pf: bool) [:0]cons
 /// (0: 170 registers against 243). TF_DSV41_LIN2_WK: the dense3 launches lanes2 takes, by CTA width (4 | 8; unset:
 /// both): lanes2 runs 8 warps an SM where the original's 4-warp CTAs run 12, so `tf-dsv41-test lin2`'s timing may
 /// favour one width only. Anything else is refused.
-pub const Lin2Mode = struct { lanes: bool = false, linear: bool = false, pf: bool = true, wk4: bool = true, wk8: bool = true };
+/// TF_DSV41_LIN2_CLUSTER (0 | 1, unset 0): dense3's split-K launches of up to 32 rows as lin2.cu's lanesc_kernel, the
+/// SK split programs of a column block one thread-block cluster reducing their partials in distributed shared memory
+/// in split order (no Z in global memory); 1-16 rows as the original's single pass, 17-32 with lanes2's shared decode
+/// (the latter with `lanes` alone, and LIN2_WK's widths). Every launch it takes: all segments the same SK, 2-8.
+pub const Lin2Mode = struct { lanes: bool = false, linear: bool = false, pf: bool = true, wk4: bool = true, wk8: bool = true, cluster: bool = false };
+
+/// TF_DSV41_LIN2_CLUSTER's value: unset / empty / 0 off, 1 on, anything else refused.
+pub fn lin2Cluster(v: ?[]const u8) !bool {
+    const t = std.mem.trim(u8, v orelse "", " \t\r\n");
+    if (t.len == 0 or std.mem.eql(u8, t, "0")) return false;
+    if (std.mem.eql(u8, t, "1")) return true;
+    return error.BadLin2;
+}
+
+/// A dense3 launch the cluster variant takes: at most 32 rows and every segment the same split count, 2-8 (the
+/// cluster's CTAs, the portable cluster size); that SK, else null.
+pub fn clusterSplits(tab: LinTable, m: usize) ?u32 {
+    if (m < 1 or m > 32 or tab.n < 1) return null;
+    const sk = tab.s[0].SK;
+    if (sk < 2 or sk > 8) return null;
+    for (tab.s[0..@intCast(tab.n)]) |x| if (x.SK != sk or @mod(x.p0, sk) != 0) return null;
+    return @intCast(sk);
+}
 
 pub fn lin2Mode(v: ?[]const u8, pf: ?[]const u8) !Lin2Mode {
     return lin2ModeWk(v, pf, null);
@@ -311,6 +338,8 @@ pub const Lin2 = struct {
     mode: Lin2Mode,
     lanes: [dense3_k2s.len][2]cuda.Function, // WK 4, 8
     linear: [linear_k2s.len][3]cuda.Function, // WK 2, 4, 8
+    /// TF_DSV41_LIN2_CLUSTER: lanesc at lanesc_cfgs (resolved only with the knob: an older lin2 fatbin still loads)
+    lanesc: [dense3_k2s.len][lanesc_cfgs.len]cuda.Function = undefined,
 
     pub fn resolve(module: cuda.Module, mode: Lin2Mode) !Lin2 {
         var l: Lin2 = .{ .module = module, .mode = mode, .lanes = undefined, .linear = undefined };
@@ -320,6 +349,9 @@ pub const Lin2 = struct {
         }
         inline for (linear_k2s, 0..) |k2, i| inline for (.{ 2, 4, 8 }, 0..) |wk, j| {
             l.linear[i][j] = try module.function(if (mode.pf) linear2Symbol(k2, wk, true) else linear2Symbol(k2, wk, false));
+        };
+        if (mode.cluster) inline for (dense3_k2s, 0..) |k2, i| inline for (lanesc_cfgs, 0..) |c, j| {
+            l.lanesc[i][j] = try module.function(lanescSymbol(k2, c[0], c[1], c[2]));
         };
         return l;
     }
@@ -480,8 +512,25 @@ pub const Ops = struct {
             const per_warp: usize = @intCast(@divTrunc(@divTrunc(@divTrunc(s.K, 16), s.SK), s.wk));
             if (per_warp % groupSteps(k2) != 0) return error.Shape;
         }
-        var f = o.f.lanes[ki][ci orelse return error.Unsupported];
-        if (o.f.lin2) |l2| if (l2.mode.lanes and twoTile(M) and (if (wk == 8) l2.mode.wk8 else l2.mode.wk4)) {
+        const cfg = ci orelse return error.Unsupported;
+        var f = o.f.lanes[ki][cfg];
+        const width_ok = if (o.f.lin2) |l2| (if (wk == 8) l2.mode.wk8 else l2.mode.wk4) else false;
+        // TF_DSV41_LIN2_CLUSTER: the split programs of a column block one cluster, the partials reduced in shared memory
+        if (o.f.lin2) |l2| if (l2.mode.cluster) if (clusterSplits(tab, M)) |sk| {
+            const two = twoTile(M);
+            if (!two or (l2.mode.lanes and width_ok)) {
+                const j: usize = (if (two) @as(usize, 2) else 0) + @intFromBool(wk == 8);
+                const t: usize = if (two) 2 else 1;
+                if (tab.n < 1 or tab.n > max_seg) return error.Shape;
+                var a: cuda.Args = .{};
+                a.add(tab);
+                a.add(@intFromEnum(y_dtype));
+                a.add(int(M));
+                const shared = redSmem(wk, M) + 16 * t * 128 * 4;
+                return cuda.launch.launch(l2.lanesc[ki][j], .{ .grid = .{ .x = dim(programs), .y = 1, .z = 1 }, .block = .{ .x = dim(wk * 32) }, .shared = dim(shared), .cluster = .{ .x = sk, .y = 1, .z = 1 }, .pdl = pdl }, o.s, &a);
+            }
+        };
+        if (o.f.lin2) |l2| if (l2.mode.lanes and twoTile(M) and width_ok) {
             f = l2.lanes[ki][if (wk == 8) 1 else 0]; // TF_DSV41_LIN2: the same programs, one pass over the weights
         };
         try o.tableLaunch(f, tab, y_dtype, M, programs, wk, pdl);
@@ -589,4 +638,30 @@ test "TF_DSV41_LIN2: only the original's two-pass launches (17-32 rows) take the
     for (1..17) |m| try t.expect(!twoTile(m));
     for (17..33) |m| try t.expect(twoTile(m));
     for (33..129) |m| try t.expect(!twoTile(m));
+}
+
+test "TF_DSV41_LIN2_CLUSTER: the reader, and the launches the cluster variant takes" {
+    const t = std.testing;
+    for ([_]?[]const u8{ null, "", "0" }) |v| try t.expect(!try lin2Cluster(v));
+    try t.expect(try lin2Cluster(" 1 "));
+    for ([_][]const u8{ "on", "2", "yes" }) |v| try t.expectError(error.BadLin2, lin2Cluster(v));
+    var tab = std.mem.zeroes(LinTable);
+    tab.n = 2;
+    tab.s[0] = .{ .xh = 0, .T = 0, .stride_k = 0, .stride_nb = 0, .svh = 0, .y = 0, .Z = 0, .counters = 0, .K = 4096, .N = 512, .SK = 4, .wk = 4, .p0 = 0, .ld = 512 };
+    tab.s[1] = tab.s[0];
+    tab.s[1].p0 = 16; // 4 column blocks x 4 splits
+    try t.expectEqual(@as(?u32, 4), clusterSplits(tab, 1));
+    try t.expectEqual(@as(?u32, 4), clusterSplits(tab, 32));
+    try t.expectEqual(@as(?u32, null), clusterSplits(tab, 33)); // past two row tiles
+    tab.s[1].SK = 2; // a launch whose segments split differently
+    try t.expectEqual(@as(?u32, null), clusterSplits(tab, 8));
+    tab.s[1].SK = 4;
+    tab.s[1].p0 = 18; // a segment not starting on a cluster boundary
+    try t.expectEqual(@as(?u32, null), clusterSplits(tab, 8));
+    tab.s[1].p0 = 16;
+    tab.s[0].SK = 1;
+    tab.s[1].SK = 1; // no split: no partials to reduce
+    try t.expectEqual(@as(?u32, null), clusterSplits(tab, 8));
+    for (&tab.s) |*x| x.SK = 16; // past the portable cluster size
+    try t.expectEqual(@as(?u32, null), clusterSplits(tab, 8));
 }

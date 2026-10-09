@@ -13,6 +13,7 @@
 
 #include "linear.cu"
 #include "dense3.cu"
+#include <cooperative_groups.h>
 
 namespace dsv41_lin2 {
 
@@ -336,6 +337,151 @@ __global__ void __launch_bounds__(WK * 32) linear2_kernel(
     }
 }
 
+
+// -- TF_DSV41_LIN2_CLUSTER: dense3's split-K launches with the partials reduced in distributed shared memory ----
+// The original (and lanes2) write every split's warp-order sums to Z [SK, M, N] in global memory, fence, count
+// arrivals and let the last split's CTA read the SK partials back (Z[0] + Z[1] + ... in split order) and finish.
+// Z grows with the rows: at K 4,096 / N 5,120 / SK 8 it is 5.2 MB of writes and reads at 16 rows and 7.9 MB at 24,
+// a third to a half of the matrix's 15.7 MB of weights. Here a column block's SK split programs are one thread-block
+// cluster (program q: column block q / SK, split q % SK = the CTA's rank in its cluster): each CTA keeps its warp-order
+// sums in its own shared memory, the cluster syncs, and every output row is summed over the ranks' shared memory in
+// split order from rank 0's (the same floats added in the same order as Z's reader), finished (Hadamard, svh, the
+// output rounding) and stored by one warp of one CTA. No Z, no counters, no fences. T row tiles of 16 (T = 1: up to
+// 16 rows, the original's single pass; T = 2: 17-32 rows, lanes2's shared decode). Every segment of a launch must
+// have the same SK (> 1); the launcher checks it.
+template <int K2, int CB, int WK, int MINB, int T>
+__global__ void __launch_bounds__(WK * 32, MINB) lanesc_kernel(const dsv41_x3seg::LinTable tab, int y_dtype, int M) {
+    using namespace dsv41_dense3;
+    namespace cg = cooperative_groups;
+    constexpr int G = group_steps(K2), GW = gwords<K2>();
+    extern __shared__ __align__(16) float smem[];
+    const int RH = min(M, 8);
+    float* red = smem;                                        // WK * RH * 128 floats (the original's)
+    float* part = smem + WK * RH * 128;                       // [16 T, 128] this split's warp-order sums
+
+    dsv41_x3seg::LinSeg s = tab.s[0];
+#pragma unroll
+    for (int i = 1; i < dsv41_x3seg::MAXSEG; ++i)
+        if (i < tab.n && (int)blockIdx.x >= tab.s[i].p0) s = tab.s[i];
+    const half* __restrict__ xh = s.xh;
+    const half* __restrict__ svh = s.svh;
+    void* __restrict__ y = s.y;
+    const int K = s.K, SK = s.SK, wk = s.wk, ld = s.ld;
+
+    const int q = (int)blockIdx.x - s.p0, nb = q / SK, split = q % SK;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int g = lane >> 2, t = lane & 3;
+    const bool on = warp < wk;
+    const int per_warp = (K >> 4) / SK / wk;
+    const int kt0 = split * (per_warp * wk) + warp * per_warp;
+    const int steps = on ? per_warp : 0, groups = steps / G;
+    const uint32_t* base = s.T + nb * s.stride_nb + (size_t)kt0 * s.stride_k + 4 * lane;
+    const size_t gstride = (size_t)G * s.stride_k;
+    const int col0 = nb * 128;
+
+    float acc[T][8][2][4];
+#pragma unroll
+    for (int u = 0; u < T; ++u)
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+#pragma unroll
+            for (int h = 0; h < 2; ++h)
+#pragma unroll
+                for (int c = 0; c < 4; ++c) acc[u][i][h][c] = 0.f;
+    const half* x0[T];
+    const half* x1[T];
+#pragma unroll
+    for (int u = 0; u < T; ++u) {
+        const int m0 = 16 * u, R = max(1, min(16, M - m0));
+        const int r0 = m0 + (g < R ? g : R - 1), r1 = m0 + (g + 8 < R ? g + 8 : R - 1);
+        x0[u] = xh + (size_t)r0 * K;
+        x1[u] = xh + (size_t)r1 * K;
+    }
+    uint32_t cur[GW], nxt[GW];
+    if (groups > 0) load_group(base, cur);
+    pdl_wait();
+    uint32_t a[T][4], an[T][4];
+    if (steps > 0)
+#pragma unroll
+        for (int u = 0; u < T; ++u) load_a(x0[u], x1[u], kt0, t, a[u]);
+#pragma unroll 1
+    for (int gi = 0; gi < groups; ++gi) {
+        if (gi + 1 < groups) load_group(base + (size_t)(gi + 1) * gstride, nxt);
+#pragma unroll
+        for (int st = 0; st < G; ++st) {
+            const int i = gi * G + st;
+            if (i + 1 < steps)
+#pragma unroll
+                for (int u = 0; u < T; ++u) load_a(x0[u], x1[u], kt0 + i + 1, t, an[u]);
+#pragma unroll
+            for (int j = 0; j < 8; j += 2) {
+                uint32_t b[2][2][2];
+                pair_frags<K2, CB>(cur, st, j, lane, b);
+#pragma unroll
+                for (int u = 0; u < T; ++u) {
+                    mma16816(acc[u][j][0], a[u], b[0][0]);
+                    mma16816(acc[u][j][1], a[u], b[0][1]);
+                    mma16816(acc[u][j + 1][0], a[u], b[1][0]);
+                    mma16816(acc[u][j + 1][1], a[u], b[1][1]);
+                }
+            }
+#pragma unroll
+            for (int u = 0; u < T; ++u)
+#pragma unroll
+                for (int c = 0; c < 4; ++c) a[u][c] = an[u][c];
+        }
+#pragma unroll
+        for (int c = 0; c < GW; ++c) cur[c] = nxt[c];
+    }
+    pdl_trigger();                                            // every weight is read
+
+    // this split's partials: the original's SK > 1 statements, into `part` instead of Z
+#pragma unroll
+    for (int pass = 0; pass < T; ++pass) {
+        const int m0 = 16 * pass, R = min(16, M - m0);
+        for (int rlo = 0; rlo < R; rlo += 8) {
+            const int rn = min(R - rlo, 8);
+            __syncthreads();
+            if (on && g < RH) {
+#pragma unroll
+                for (int i = 0; i < 8; ++i)
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        const int col = i * 16 + h * 8 + 2 * t;
+                        *reinterpret_cast<float2*>(red + (warp * RH + g) * 128 + col) =
+                            rlo ? make_float2(acc[pass][i][h][2], acc[pass][i][h][3])
+                                : make_float2(acc[pass][i][h][0], acc[pass][i][h][1]);
+                    }
+            }
+            __syncthreads();
+            for (int idx = threadIdx.x; idx < rn * 32; idx += WK * 32) {
+                const int r = idx >> 5, c = 4 * (idx & 31);
+                float4 sm = *reinterpret_cast<const float4*>(red + r * 128 + c);
+                for (int w = 1; w < wk; ++w) {
+                    const float4 qv = *reinterpret_cast<const float4*>(red + (w * RH + r) * 128 + c);
+                    sm.x += qv.x; sm.y += qv.y; sm.z += qv.z; sm.w += qv.w;
+                }
+                *reinterpret_cast<float4*>(part + (m0 + rlo + r) * 128 + c) = sm;
+            }
+        }
+    }
+
+    // the splits' sums in split order (Z's reader: Z[0], then + Z[1], + Z[2], ...), a row a warp over the cluster
+    cg::cluster_group cl = cg::this_cluster();
+    cl.sync();                                                // every rank's partials written (release / acquire)
+    for (int r = split * WK + warp; r < M; r += SK * WK) {
+        float4 sm = *reinterpret_cast<const float4*>(cl.map_shared_rank(part, 0) + r * 128 + 4 * lane);
+        for (int qq = 1; qq < SK; ++qq) {
+            const float4 u = *reinterpret_cast<const float4*>(cl.map_shared_rank(part, qq) + r * 128 + 4 * lane);
+            sm.x += u.x; sm.y += u.y; sm.z += u.z; sm.w += u.w;
+        }
+        float v[4] = {sm.x, sm.y, sm.z, sm.w};
+        dsv41_x3seg::finish(v, lane, svh, nullptr, col0 + 4 * lane);
+        dsv41_x3seg::store4(y, y_dtype, (size_t)r * ld + col0 + 4 * lane, v);
+    }
+    cl.sync();                                                // no rank leaves while another still reads its partials
+}
+
 }  // namespace dsv41_lin2
 
 // The variants kernels_dense.zig resolves (TF_DSV41_LIN2): lanes2 at dense3's widths, a 4-warp and an 8-warp CTA;
@@ -352,3 +498,9 @@ LIN2_LANES(4) LIN2_LANES(6) LIN2_LANES(8) LIN2_LANES(10) LIN2_LANES(12)
 #define LIN2_LINEAR_W(K2) LIN2_LINEAR(K2, 2) LIN2_LINEAR(K2, 4) LIN2_LINEAR(K2, 8)
 LIN2_LINEAR_W(2) LIN2_LINEAR_W(3) LIN2_LINEAR_W(4) LIN2_LINEAR_W(5) LIN2_LINEAR_W(6) LIN2_LINEAR_W(7)
 LIN2_LINEAR_W(8) LIN2_LINEAR_W(10) LIN2_LINEAR_W(12) LIN2_LINEAR_W(14) LIN2_LINEAR_W(16)
+// TF_DSV41_LIN2_CLUSTER: a 4-warp and an 8-warp CTA at T = 1 (MINB 3 / 1: 136-164 registers; MINB 4 / 2 capped
+// them at 128 and spilled up to 112 B at K2 10-12) and at T = 2 (lanes2's 2 / 1). MINB is a launch bound only.
+#define LIN2_CL(K2, WK, MB, T) \
+    template __global__ void dsv41_lin2::lanesc_kernel<K2, 2, WK, MB, T>(const dsv41_x3seg::LinTable, int, int);
+#define LIN2_CL_W(K2) LIN2_CL(K2, 4, 3, 1) LIN2_CL(K2, 8, 1, 1) LIN2_CL(K2, 4, 2, 2) LIN2_CL(K2, 8, 1, 2)
+LIN2_CL_W(4) LIN2_CL_W(6) LIN2_CL_W(8) LIN2_CL_W(10) LIN2_CL_W(12)

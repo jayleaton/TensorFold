@@ -5,6 +5,9 @@
 //! k-split counters must be back at zero. Then both are timed with events (2 warm-ups, the median of `reps`) at the
 //! shapes a 4-stream decode window runs: the attention's projections and the head.
 //!
+//! TF_DSV41_LIN2_CLUSTER's lanesc is checked the same way (every width and split count at 1-32 rows) and timed beside
+//! them.
+//!
 //!   tf-dsv41-test lin2 [reps]     (default 15)
 
 const std = @import("std");
@@ -197,6 +200,10 @@ pub fn run(gpu: Gpu, k: *const dsv41.Kernels, reps_arg: ?[]const u8) !void {
     f_np.lin2 = try dense.Lin2.resolve(module, .{ .lanes = true, .linear = true, .pf = false });
     const two_pf: dense.Ops = .{ .f = &f_pf, .s = stream };
     const two_np: dense.Ops = .{ .f = &f_np, .s = stream };
+    // TF_DSV41_LIN2_CLUSTER: lanes2 plus the cluster reduction (1-16 rows the original's single pass, 17-32 lanes2's)
+    var f_cl = k.dense;
+    f_cl.lin2 = try dense.Lin2.resolve(module, .{ .lanes = true, .linear = true, .pf = true, .cluster = true });
+    const cl: dense.Ops = .{ .f = &f_cl, .s = stream };
     var rng: Rng = .{ .s = 0x2545f4914f6cdd1d };
     const rows = [_]usize{ 17, 20, 24, 29, 32 };
     var name: [160]u8 = undefined;
@@ -235,6 +242,24 @@ pub fn run(gpu: Gpu, k: *const dsv41.Kernels, reps_arg: ?[]const u8) !void {
     };
     check.pass("lin2 lanes2: {d} launches equal to lanes_linear_kernel byte for byte", .{cases});
 
+    // -- bits: the cluster reduction, every width and (WK, MINB), split counts 2 / 4 / 8, 1-32 rows -----------------
+    cases = 0;
+    const cl_rows = [_]usize{ 1, 6, 12, 16, 17, 24, 29, 32 };
+    for (dense.dense3_k2s) |k2| for (dense.lanes_cfgs) |c| for ([_][3]usize{ .{ 2048, 1024, 2 }, .{ 4096, 512, 4 }, .{ 4096, 1024, 8 } }) |sh| {
+        const wk: usize = c[0];
+        const per_warp = sh[0] / 16 / sh[2] / wk;
+        if ((sh[0] / 16) % (sh[2] * wk) != 0 or per_warp == 0 or per_warp % dense.groupSteps(k2) != 0) continue;
+        var l = try Lanes.init(gpa, d, &rng, .{ .k = sh[0], .n = sh[1], .k2 = k2, .sk = sh[2], .wk = wk }, c[1]);
+        defer l.deinit();
+        for (cl_rows) |m| {
+            l.M = m;
+            const what = try std.fmt.bufPrint(&name, "lanesc K2 {d} WK {d} MINB {d} K {d} N {d} SK {d} M {d}", .{ k2, wk, c[1], sh[0], sh[1], sh[2], m });
+            try compare(gpu, stream, orig, cl, .{ .ctx = &l, .run = Lanes.run }, l.y, l.counters, what);
+            cases += 1;
+        }
+    };
+    check.pass("lin2 lanesc: {d} cluster launches equal to lanes_linear_kernel byte for byte", .{cases});
+
     // -- time: the head (linear.cu at 6 bits, prod's plan) and attention-sized dense3 launches ---------------------
     std.debug.print("lin2 timing ({d} reps, median us; 'one pass' = the original at 16 rows)\n", .{reps});
     {
@@ -263,11 +288,14 @@ pub fn run(gpu: Gpu, k: *const dsv41.Kernels, reps_arg: ?[]const u8) !void {
         defer l.deinit();
         l.M = 16;
         const one = try timeIt(stream, d, orig, .{ .ctx = &l, .run = Lanes.run }, reps);
+        const one_cl = if (sk > 1) try timeIt(stream, d, cl, .{ .ctx = &l, .run = Lanes.run }, reps) else one;
+        std.debug.print("  lanes K {d} N {d} K2 {d} SK {d} WK {d} MINB {d} M 16: original {d:.1} us, cluster {d:.1} us\n", .{ sh[0], sh[1], k2, sk, wk, c[1], one * 1e3, one_cl * 1e3 });
         for ([_]usize{ 24, 32 }) |m| {
             l.M = m;
             const a = try timeIt(stream, d, orig, .{ .ctx = &l, .run = Lanes.run }, reps);
             const b = try timeIt(stream, d, two_pf, .{ .ctx = &l, .run = Lanes.run }, reps);
-            std.debug.print("  lanes K {d} N {d} K2 {d} SK {d} WK {d} MINB {d} M {d}: original {d:.1} us, lanes2 {d:.1} us (one pass {d:.1})\n", .{ sh[0], sh[1], k2, sk, wk, c[1], m, a * 1e3, b * 1e3, one * 1e3 });
+            const cc = if (sk > 1) try timeIt(stream, d, cl, .{ .ctx = &l, .run = Lanes.run }, reps) else b;
+            std.debug.print("  lanes K {d} N {d} K2 {d} SK {d} WK {d} MINB {d} M {d}: original {d:.1} us, lanes2 {d:.1} us, lanes2 + cluster {d:.1} us (one pass {d:.1})\n", .{ sh[0], sh[1], k2, sk, wk, c[1], m, a * 1e3, b * 1e3, cc * 1e3, one * 1e3 });
         }
     };
 }
