@@ -248,6 +248,68 @@ fn lanesUnpackSymbol(comptime k2: u32) [:0]const u8 {
     return std.fmt.comptimePrint("_ZN12dsv41_dense319lanes_unpack_kernelILi{d}ELi2EEEvPKjP6__halfill", .{k2});
 }
 
+// TF_DSV41_LIN2 (ours, lin2.cu): the 17-32-row programs of the dense linears in one pass over the weights
+fn lanes2Symbol(comptime k2: u32, comptime wk: u32, comptime mb: u32) [:0]const u8 {
+    return std.fmt.comptimePrint("_ZN10dsv41_lin213lanes2_kernelILi{d}ELi2ELi{d}ELi{d}EEEvN11dsv41_x3seg8LinTableEii", .{ k2, wk, mb });
+}
+fn linear2Symbol(comptime k2: u32, comptime wk: u32, comptime pf: bool) [:0]const u8 {
+    return std.fmt.comptimePrint("_ZN10dsv41_lin214linear2_kernelILi{d}ELi2ELi{d}ELb{d}EEEvPK6__halfPKjxxS3_S3_PviPfPiiiiiPKi", .{ k2, wk, @intFromBool(pf) });
+}
+
+/// TF_DSV41_LIN2 (ours, default off): which dense linears run a launch of 17-32 rows as lin2.cu's two-tile variant
+/// (one pass over the weights where the original makes two, every output element the original's): unset / empty /
+/// 0 none, 1 both, `lanes` dense3's (the attention's projections), `linear` linear.cu's (the head, the drafter's
+/// projections). TF_DSV41_LIN2_PF: linear2's k-step prefetch as the original's (1, the default) or per-tile loads
+/// (0: 170 registers against 243). Anything else is refused.
+pub const Lin2Mode = struct { lanes: bool = false, linear: bool = false, pf: bool = true };
+
+pub fn lin2Mode(v: ?[]const u8, pf: ?[]const u8) !Lin2Mode {
+    var m: Lin2Mode = .{};
+    const t = std.mem.trim(u8, v orelse "", " \t\r\n");
+    if (t.len == 0 or std.mem.eql(u8, t, "0") or std.ascii.eqlIgnoreCase(t, "off")) {
+        m = .{};
+    } else if (std.mem.eql(u8, t, "1") or std.ascii.eqlIgnoreCase(t, "on")) {
+        m = .{ .lanes = true, .linear = true };
+    } else if (std.ascii.eqlIgnoreCase(t, "lanes")) {
+        m = .{ .lanes = true };
+    } else if (std.ascii.eqlIgnoreCase(t, "linear")) {
+        m = .{ .linear = true };
+    } else return error.BadLin2;
+    const p = std.mem.trim(u8, pf orelse "", " \t\r\n");
+    if (p.len == 0 or std.mem.eql(u8, p, "1")) {
+        m.pf = true;
+    } else if (std.mem.eql(u8, p, "0")) {
+        m.pf = false;
+    } else return error.BadLin2;
+    return m;
+}
+
+/// A launch of `m` rows the two-tile variant takes: the original's two passes (rows 17-32).
+pub fn twoTile(m: usize) bool {
+    return m > 16 and m <= 32;
+}
+
+/// lin2.cu's instances: lanes2 at dense3's widths, a 4-warp (2 CTAs an SM) and an 8-warp CTA (1); linear2 at
+/// linear.cu's widths and CTA widths, with the k-step prefetch or without.
+pub const Lin2 = struct {
+    module: cuda.Module,
+    mode: Lin2Mode,
+    lanes: [dense3_k2s.len][2]cuda.Function, // WK 4, 8
+    linear: [linear_k2s.len][3]cuda.Function, // WK 2, 4, 8
+
+    pub fn resolve(module: cuda.Module, mode: Lin2Mode) !Lin2 {
+        var l: Lin2 = .{ .module = module, .mode = mode, .lanes = undefined, .linear = undefined };
+        inline for (dense3_k2s, 0..) |k2, i| {
+            l.lanes[i][0] = try module.function(lanes2Symbol(k2, 4, 2));
+            l.lanes[i][1] = try module.function(lanes2Symbol(k2, 8, 1));
+        }
+        inline for (linear_k2s, 0..) |k2, i| inline for (.{ 2, 4, 8 }, 0..) |wk, j| {
+            l.linear[i][j] = try module.function(if (mode.pf) linear2Symbol(k2, wk, true) else linear2Symbol(k2, wk, false));
+        };
+        return l;
+    }
+};
+
 /// x3seg's (WK, MINB) instances (TF_SEG_WIDTH: WK 8 takes any minb) and dense3's (TF_D3_WIDTH).
 pub const seg_cfgs = [_][2]u32{ .{ 4, 3 }, .{ 4, 2 }, .{ 8, 1 } };
 pub const lanes_cfgs = [_][2]u32{ .{ 4, 3 }, .{ 4, 4 }, .{ 8, 1 }, .{ 8, 2 } };
@@ -262,9 +324,12 @@ pub const Functions = struct {
     lanes_unpack: [dense3_k2s.len]cuda.Function,
     to_lanes: cuda.Function,
     to_strips: cuda.Function,
+    /// TF_DSV41_LIN2: the two-tile variants, set by Kernels.load when the knob asks for them
+    lin2: ?Lin2 = null,
 
     pub fn resolve(linear: cuda.Module, x3seg: cuda.Module, dense3: cuda.Module) !Functions {
         var f: Functions = undefined;
+        f.lin2 = null;
         f.rot_in = try linear.function("_ZN14tf_exl3_linear13rot_in_kernelEPKviPK6__halfPS2_i");
         inline for (linear_k2s, 0..) |k2, i| {
             inline for (.{ 2, 4, 8 }, 0..) |wk, j| f.linear[i][j] = try linear.function(linearSymbol(k2, wk));
@@ -338,7 +403,11 @@ pub const Ops = struct {
         for ([_]u64{ z, counters }) |v| a.add(v);
         for ([_]usize{ M, K, N, SK }) |v| a.add(int(v));
         a.add(skip);
-        try go(o.f.linear[ki][wi], o.s, .{ N / 128, SK, 1 }, WK * 32, redSmem(WK, M), false, &a);
+        var f = o.f.linear[ki][wi];
+        if (o.f.lin2) |l2| if (l2.mode.linear and twoTile(M)) {
+            f = l2.linear[ki][wi]; // TF_DSV41_LIN2: the same programs, one pass over the weights
+        };
+        try go(f, o.s, .{ N / 128, SK, 1 }, WK * 32, redSmem(WK, M), false, &a);
     }
 
     /// exl3_unpack_cuda (mul1): W_q [K, N] fp16.
@@ -396,7 +465,11 @@ pub const Ops = struct {
             const per_warp: usize = @intCast(@divTrunc(@divTrunc(@divTrunc(s.K, 16), s.SK), s.wk));
             if (per_warp % groupSteps(k2) != 0) return error.Shape;
         }
-        try o.tableLaunch(o.f.lanes[ki][ci orelse return error.Unsupported], tab, y_dtype, M, programs, wk, pdl);
+        var f = o.f.lanes[ki][ci orelse return error.Unsupported];
+        if (o.f.lin2) |l2| if (l2.mode.lanes and twoTile(M)) {
+            f = l2.lanes[ki][if (wk == 8) 1 else 0]; // TF_DSV41_LIN2: the same programs, one pass over the weights
+        };
+        try o.tableLaunch(f, tab, y_dtype, M, programs, wk, pdl);
     }
 
     fn tableLaunch(o: Ops, f: cuda.Function, tab: LinTable, y_dtype: DType, M: usize, programs: usize, wk: usize, pdl: bool) !void {
@@ -473,4 +546,24 @@ test "fused_proj.layout: offsets, one launch a width, 8 segments a launch" {
     try std.testing.expectEqualSlices(usize, &.{ 0, 32 }, l0.p0[0..l0.count]);
     try std.testing.expectEqual(@as(usize, 32 + 16), l0.programs);
     try std.testing.expectError(error.Shape, layout(&segs, 129));
+}
+
+test "TF_DSV41_LIN2 reader: unset / 0 / off none, 1 both, lanes / linear one, _PF 1 / 0, anything else refused" {
+    const t = std.testing;
+    for ([_]?[]const u8{ null, "", "0", "off" }) |v| {
+        const m = try lin2Mode(v, null);
+        try t.expect(!m.lanes and !m.linear and m.pf);
+    }
+    try t.expectEqual(Lin2Mode{ .lanes = true, .linear = true }, try lin2Mode("1", null));
+    try t.expectEqual(Lin2Mode{ .lanes = true }, try lin2Mode(" lanes ", "1"));
+    try t.expectEqual(Lin2Mode{ .linear = true, .pf = false }, try lin2Mode("linear", "0"));
+    for ([_][]const u8{ "2", "head", "lanes,linear" }) |v| try t.expectError(error.BadLin2, lin2Mode(v, null));
+    try t.expectError(error.BadLin2, lin2Mode("1", "on"));
+}
+
+test "TF_DSV41_LIN2: only the original's two-pass launches (17-32 rows) take the variant" {
+    const t = std.testing;
+    for (1..17) |m| try t.expect(!twoTile(m));
+    for (17..33) |m| try t.expect(twoTile(m));
+    for (33..129) |m| try t.expect(!twoTile(m));
 }
