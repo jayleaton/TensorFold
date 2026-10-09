@@ -244,6 +244,36 @@ const Multi = struct {
     batched: bool,
     got: []u32,
     whole: usize = 0,
+    /// rank 0, batched: vs_choose's mirror of each top_k segment over the one gather (row0-shifted draws), its rows
+    mirror: []i64 = &.{},
+};
+
+/// The batched call's hook on rank 0 (sampling_gpu.segGather's place): each top_k segment's device choice as the
+/// GPU makes it from the shared gather, then the pipe's own download (false).
+const SegMirror = struct {
+    c: *Multi,
+    fn run(ctx: *anyopaque, gathered: u64, n: usize, k: usize, segs: []const pipe.Pipe.Seg, host: []u8) anyerror!bool {
+        _ = host;
+        const m: *SegMirror = @ptrCast(@alignCast(ctx));
+        const W: usize = m.c.world;
+        const g: [*]const f32 = @ptrFromInt(gathered);
+        const a = testing.allocator;
+        const keys = try a.alloc(u64, W * k);
+        defer a.free(keys);
+        const work = try a.alloc(f64, 1024);
+        defer a.free(work);
+        const out = try a.alloc(i64, n);
+        defer a.free(out);
+        const r0 = segs[0].row0;
+        for (segs) |sg| {
+            if (serve.sampling.isNucleus(sg.s)) continue;
+            const off = sg.row0 - r0;
+            const count = pipe.countOf(sg.s, @intCast(m.c.logits.len / m.c.rows), serve.sampling.nucleus_count);
+            pipe.chooseMirror(keys, work, g[0 .. W * n * 2 * k], W, n, k, count, sg.s, sg.positions.?[0] -% off, out);
+            @memcpy(m.c.mirror[sg.row0..][0..sg.n], out[off..][0..sg.n]);
+        }
+        return false;
+    }
 };
 
 fn multiBody(comm: tp.collective.Collective, me: u32, c: *Multi) anyerror!void {
@@ -268,7 +298,8 @@ fn multiBody(comm: tp.collective.Collective, me: u32, c: *Multi) anyerror!void {
             try testing.expect(p.batchable(g.s));
             x.* = .{ .row0 = g.row0, .n = g.n, .s = g.s, .positions = if (me == 0) g.positions else null, .out = out[g.row0..][0..g.n] };
         }
-        try p.chooseSegments(dev.device(), lg, segs[0..c.segs.len]);
+        var mh: SegMirror = .{ .c = c };
+        try p.chooseSegments(dev.device(), lg, segs[0..c.segs.len], if (me == 0) .{ .ctx = &mh, .run = SegMirror.run } else null);
         whole = p.whole_rows;
     } else for (c.segs) |g| {
         try p.choose(dev.device(), lg + 4 * @as(u64, g.row0) * V, g.n, g.s, if (me == 0) g.positions else null, out[g.row0..][0..g.n]);
@@ -280,7 +311,7 @@ fn multiBody(comm: tp.collective.Collective, me: u32, c: *Multi) anyerror!void {
     }
 }
 
-test "a forward's nucleus segments in one call (TF_DSV41_SAMP_BATCH) pick the tokens and keyed draws of one call a segment" {
+test "a forward's keyed segments in one call (TF_DSV41_SAMP_BATCH) pick the tokens and keyed draws of one call a segment" {
     const a = testing.allocator;
     var prng = std.Random.DefaultPrng.init(4113);
     const rnd = prng.random();
@@ -294,22 +325,39 @@ test "a forward's nucleus segments in one call (TF_DSV41_SAMP_BATCH) pick the to
         logits[r * vocab + c] = @bitCast(@as(u32, @bitCast(@as(f32, @floatCast(x)))) & 0xFFFF_0000);
     };
     const T = pipe.Sampling;
-    const segs = [_]SegSpec{ // row 5 belongs to no segment (another window's row)
+    // row 5 belongs to no segment (another window's row); rows 3 and 9 (flat) take the nucleus fallback
+    const nucleus_segs = [_]SegSpec{
         .{ .row0 = 0, .n = 5, .s = T{ .seed = 7, .temperature = 0.7, .top_k = 0, .top_p = 0.95 }, .positions = &.{ 40, 41, 42, 43, 44 } },
         .{ .row0 = 6, .n = 2, .s = T{ .seed = 1 << 63 | 9, .temperature = 1.1, .top_k = 0, .top_p = 0.8, .min_p = 0.02 }, .positions = &.{ 900, 901 } },
         .{ .row0 = 8, .n = 4, .s = T{ .seed = 7, .temperature = 0.5, .top_k = 0, .top_p = 0.9 }, .positions = &.{ 3, 4, 5, 6 } },
     };
-    for ([_]u32{ 1, 2 }) |world| {
+    // the served shape (the Spark server's default top_k 20 under top_p 0.95), other top_k cuts beside it, a
+    // segment starting at a position below its row offset (its device draws wrap), and a nucleus segment among them
+    const topk_segs = [_]SegSpec{
+        .{ .row0 = 0, .n = 5, .s = T{ .seed = 1234, .temperature = 0.7, .top_k = 20, .top_p = 0.95 }, .positions = &.{ 40, 41, 42, 43, 44 } },
+        .{ .row0 = 6, .n = 2, .s = T{ .seed = 1 << 63 | 9, .temperature = 1.1, .top_k = 5, .top_p = 1.0, .min_p = 0.05 }, .positions = &.{ 2, 3 } },
+        .{ .row0 = 8, .n = 3, .s = T{ .seed = 1234, .temperature = 0.7, .top_k = 0, .top_p = 0.9 }, .positions = &.{ 70, 71, 72 } },
+        .{ .row0 = 11, .n = 1, .s = T{ .seed = 3, .temperature = 0.4, .top_k = 300, .top_p = 0.99 }, .positions = &.{500} },
+    };
+    for ([_][]const SegSpec{ &nucleus_segs, &topk_segs }) |segs| for ([_]u32{ 1, 2 }) |world| {
         var got: [2][rows]u32 = undefined;
         var whole: [2]usize = undefined;
+        var mirror: [rows]i64 = @splat(-2);
         for ([_]bool{ false, true }, 0..) |batched, i| {
-            var c: Multi = .{ .logits = logits, .world = world, .rows = rows, .segs = &segs, .batched = batched, .got = &got[i] };
+            var c: Multi = .{ .logits = logits, .world = world, .rows = rows, .segs = segs, .batched = batched, .got = &got[i], .mirror = &mirror };
             try tp.host.run(world, &c, multiBody);
             whole[i] = c.whole;
         }
         try testing.expectEqualSlices(u32, &got[0], &got[1]);
         try testing.expectEqual(whole[0], whole[1]);
-        try testing.expect(whole[1] >= 2); // the flat rows took the fallback
+        if (segs.ptr == &nucleus_segs) try testing.expect(whole[1] >= 2); // the flat rows took the fallback
+        // each top_k segment's device choice from the shared gather == its host pick
+        var mirrored: usize = 0;
+        for (segs) |g| if (!serve.sampling.isNucleus(g.s)) for (0..g.n) |j| {
+            try testing.expectEqual(@as(i64, got[1][g.row0 + j]), mirror[g.row0 + j]);
+            mirrored += 1;
+        };
+        if (segs.ptr == &topk_segs) try testing.expect(mirrored == 8);
         // each row's token is the keyed rule over its whole row (exact_sampling.choose at its own position)
         for (segs) |g| for (0..g.n) |j| {
             const r = g.row0 + j;
@@ -324,5 +372,5 @@ test "a forward's nucleus segments in one call (TF_DSV41_SAMP_BATCH) pick the to
             const want = try @import("lanes").sampling.choose(a, vals, ids, g.positions[j], g.s);
             try testing.expectEqual(@as(u32, @intCast(want)), got[1][r]);
         };
-    }
+    };
 }

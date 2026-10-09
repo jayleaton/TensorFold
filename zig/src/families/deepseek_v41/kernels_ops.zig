@@ -998,7 +998,7 @@ pub const Ops = struct {
         a.add(@as(i32, @intCast(k)));
         a.add(@as(i32, @intCast(count)));
         a.add(seed);
-        a.add(@as(i64, @intCast(pos0)));
+        a.add(@as(i64, @bitCast(pos0))); // the kernel draws at pos0 + r in int64: a pos0 below 0 (a row-shifted start) wraps back
         a.add(@as(i32, @intCast(top_k)));
         a.add(temp);
         a.add(top_p);
