@@ -75,6 +75,12 @@ pub const Runner = struct {
 
     /// A persistent role whose memory another owner holds (M5: the KV pool's family tensors and tables): bind leaves it.
     pub fn external(r: *Runner, role: []const u8, addr: u64) !void {
+        // Triton specializes pointers on 16-byte alignment and the AOT sets hold the aligned variants (aot-needs keys
+        // offsets from 16-aligned bases): a misaligned base fails here by name, not later as a missing variant
+        if (addr % 16 != 0) {
+            std.log.scoped(.dsv41).err("role {s} bound at 0x{x}: not 16-byte aligned", .{ role, addr });
+            return error.MisalignedRole;
+        }
         const g = try r.addrs.getOrPut(r.gpa, role);
         if (!g.found_existing) g.key_ptr.* = try r.gpa.dupe(u8, role);
         g.value_ptr.* = addr;

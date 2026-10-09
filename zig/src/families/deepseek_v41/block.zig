@@ -175,6 +175,9 @@ pub const Emitter = struct {
     row0: i64 = 0,
     /// TF_DSV41_PF_TBO (block_prefill.emitTbo): the call indexes where each layer's attention part and MoE part start
     marks: ?*std.ArrayList(usize) = null,
+    /// its first row in the run's narrow per-row roles (the selection counts: 4 bytes a row), a multiple of 4 so every
+    /// segment's slice is 16-byte aligned as Triton's specialization (and aot-needs) assume; 0 elsewhere
+    cnt0: i64 = 0,
 
     pub fn fmt(e: *Emitter, comptime f: []const u8, args: anytype) ![]const u8 {
         return std.fmt.allocPrint(e.a, f, args);
@@ -659,7 +662,8 @@ pub const Emitter = struct {
         const k: i64 = e.cfg.index_topk;
         return .{
             try e.view(.{ .buf = try e.fmt("w.sel{d}", .{src}) }, .i32, &.{ e.n, k }, &.{ k, 1 }, e.row0 * k * 4),
-            try e.view(.{ .buf = try e.fmt("w.cnt{d}", .{src}) }, .i32, &.{e.n}, &.{1}, e.row0 * 4),
+            // the counts' 4-byte rows: a run's segment from a row a multiple of 4 (cnt0), so the slice is 16-aligned
+            try e.view(.{ .buf = try e.fmt("w.cnt{d}", .{src}) }, .i32, &.{e.n}, &.{1}, e.cnt0 * 4),
         };
     }
 
