@@ -49,6 +49,22 @@ EOF
     # the piece-at-a-time run's encoder shapes (one prompt a forward) are the alone reference's kernels
     [[ -f "$alone/aot/aot.json" ]] && python3 -B "$Z/tools/zig/dsv41_aot_merge.py" "$ref/aot" "$alone/aot" >> "$out/summary.log" 2>&1
     rm -rf "$alone"
+    # the AOT fill for this gate's own config (sess4's way): every Triton variant our runs can launch (aot-needs with the
+    # gate's env and both runs' knobs) compiled from prod's Triton source, the reference's set not compiled again
+    local fill=$LOCAL/pieces-fill arch
+    arch=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '. ')
+    rm -rf "$fill"; mkdir -p "$fill"
+    if ! (export TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas TRITON_PTXAS_BLACKWELL_PATH=/usr/local/cuda/bin/ptxas
+          python -B "$Z/tools/zig/triton_fill.py" sigs --py /dsv41-tf/src --out "$fill/sigs.json" \
+          && env "${gate_env[@]}" TF_DSV41_PIECE_RUNS=1 TF_DSV41_REPLAY_RUNS=1 "$Z/bin/tf-dsv41-m1" aot-needs "$fill/sigs.json" "$fill/needs.json" > "$out/needs.log" 2>&1 \
+          && step pieces-fill "$(( $(left) > 10 ? 10 : $(left) ))" python -B "$Z/tools/zig/triton_fill.py" compile \
+              --py /dsv41-tf/src --needs "$fill/needs.json" --options "$Z/tools/zig/dsv41_triton_options.json" \
+              --arch "$arch" --have "$ref/aot" --out "$fill/aot" \
+          && python -B "$Z/tools/zig/triton_fill.py" merge "$ref/aot" "$fill/aot") > "$out/fill.log" 2>&1; then
+        echo "FAIL pieces: the AOT fill failed (fill.log)" | tee -a "$out/summary.log"
+        return 1
+    fi
+    rm -rf "$fill"
     for run in run one replay; do
         (( $(left) >= 3 )) || { echo "FAIL pieces: $(left) min left before pieces-$run" | tee -a "$out/summary.log"; return 1; }
         local runs=1 replays=0
