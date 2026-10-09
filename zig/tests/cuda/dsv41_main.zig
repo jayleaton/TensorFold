@@ -7,6 +7,7 @@ const cuda = @import("cuda");
 const dsv41 = @import("dsv41_kernels");
 const check = @import("check.zig");
 const experts = @import("deepseek_v41/experts.zig");
+const kvglue = @import("deepseek_v41/kv_glue.zig");
 const kvsplit = @import("deepseek_v41/kvsplit.zig");
 const replay_case = @import("deepseek_v41/replay.zig");
 const x3gm3_bench = @import("deepseek_v41/x3gm3_bench.zig");
@@ -14,6 +15,7 @@ const x3gm3_bench = @import("deepseek_v41/x3gm3_bench.zig");
 const usage =
     \\usage: tf-dsv41-test <command> [fixture dir]
     \\  symbols            load every DeepSeek-V4.1 fatbin and resolve every instance
+    \\  kvglue <dir>      fused KV RMS/SWA store against Python Triton bytes
     \\  kvsplit            split KV's exchange copies against kv/split.zig's host reference (no fixture)
     \\  experts <dir>      decode chain: group, rot_in, x3ld (every setting) / upstream grouped / x3pf, epilogues, combine
     \\  x3gm <dir>         fast prefill: rot, gate/up and down at every configuration (uniform and ragged), combine
@@ -57,6 +59,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
         return;
     }
     if (std.mem.eql(u8, cmd, "kvsplit")) return kvsplit.run(gpu, &k);
+    if (std.mem.eql(u8, cmd, "kvglue")) return kvglue.run(gpu, &k, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "experts")) return experts.decodeChain(gpu, &k, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "x3gm")) return experts.x3gm(gpu, &k, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "x3gm3-bench")) return x3gm3_bench.run(gpu, &k, if (rest.len > 0) rest[0] else null, if (rest.len > 1) rest[1] else null);
@@ -99,6 +102,8 @@ fn all(gpu: check.Gpu, k: *const dsv41.Kernels, root: []const u8) !void {
         };
         const r = if (std.mem.eql(u8, kind.slice(), "experts"))
             experts.decodeChain(gpu, k, path)
+        else if (std.mem.eql(u8, kind.slice(), "kvglue"))
+            kvglue.run(gpu, k, path)
         else if (std.mem.eql(u8, kind.slice(), "x3gm"))
             experts.x3gm(gpu, k, path)
         else if (std.mem.eql(u8, kind.slice(), "plan"))

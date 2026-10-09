@@ -196,6 +196,13 @@ const Ds = struct {
         });
     }
 
+    fn normStore(d: *Ds, kv: Arg, L: u32, rows: bool) !void {
+        const r = try d.ring(L, !rows);
+        try d.e.normStore(kv, try d.e.weight("L{d}.attn.kv_norm", .{L}, .f32, &.{d.cfg().head_dim}), r[0], r[1],
+            if (rows) try d.i64s(d.st.positions(), &.{d.e.n}) else try d.e.buf("w.ds.pos", .{}, .i32, &.{1}),
+            if (rows) try d.i64s(d.st.writeRows(), &.{d.e.n}) else .none, ringRows(d.cfg()), rows);
+    }
+
     /// main_proj: upstream rot_in + linear with split K (its workspace "L.ds.z"), [n, 3 D] -> [n, D].
     fn mainProj(d: *Ds, x: Arg, y: Arg) !void {
         const e = d.e;
@@ -234,8 +241,12 @@ const Ds = struct {
             const kv = try e.buf("L.kv", .{}, .bf16, &.{ e.n, hd });
             const kvn = try e.buf("L.kvn", .{}, .bf16, &.{ e.n, hd });
             try e.fused("x", &.{.{ .w = try e.fmt("L{d}.attn.wkv", .{L}), .x = mx, .y = kv, .k = @intCast(D), .n = @intCast(hd) }});
-            try d.rms(kv, try e.weight("L{d}.attn.kv_norm", .{L}, .f32, &.{hd}), kvn, hd);
-            try d.store(kvn, L, false);
+            if (e.kvNormStoreOn()) {
+                try d.normStore(kv, L, false);
+            } else {
+                try d.rms(kv, try e.weight("L{d}.attn.kv_norm", .{L}, .f32, &.{hd}), kvn, hd);
+                try d.store(kvn, L, false);
+            }
         }
     }
 
@@ -311,7 +322,7 @@ const Ds = struct {
         const qn = try e.buf("L.qn", .{}, .bf16, &.{ n, cf.q_lora });
         const kvn = try e.buf("L.kvn", .{}, .bf16, &.{ n, hd });
         try d.rms(qa, try e.weight("L{d}.attn.q_norm", .{L}, .f32, &.{cf.q_lora}), qn, cf.q_lora);
-        try d.rms(kv, try e.weight("L{d}.attn.kv_norm", .{L}, .f32, &.{hd}), kvn, hd);
+        if (!e.kvNormStoreOn()) try d.rms(kv, try e.weight("L{d}.attn.kv_norm", .{L}, .f32, &.{hd}), kvn, hd);
         const q = try e.buf("L.q", .{}, .bf16, &.{ n, H * hd });
         try e.fused("q", &.{.{ .w = try e.fmt("L{d}.attn.wq_b", .{L}), .x = qn, .y = q, .k = cf.q_lora, .n = @intCast(H * hd) }});
         // table.apply(q.to(fp32)): the cast is torch's (glue), the rotation copies into bf16
@@ -329,7 +340,7 @@ const Ds = struct {
             .{ .name = "INV", .arg = .{ .b = false } },                .{ .name = "COPY", .arg = .{ .b = true } },
             .{ .name = "PDL", .arg = .{ .b = false } },
         });
-        try d.store(kvn, L, true);
+        if (e.kvNormStoreOn()) try d.normStore(kv, L, true) else try d.store(kvn, L, true);
         const r = try d.ring(L, false);
         const W: i64 = cf.window;
         const rows_scr = n * 5 * H;

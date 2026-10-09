@@ -9,6 +9,7 @@ const options = @import("dsv41_kernel_options");
 
 pub const exl3 = @import("kernels_exl3.zig");
 pub const dense = @import("kernels_dense.zig");
+pub const kv_glue = @import("kernels_kv_glue.zig");
 pub const replay = @import("kernels_replay.zig");
 pub const ops = @import("kernels_ops.zig");
 /// sampling.cu (its own module, loaded by the keyed sampler)
@@ -53,11 +54,13 @@ pub const images = struct {
     pub const glue: []const u8 = if (available) &Blob("dsv41_fatbin_dsv41_glue").bytes else &.{};
     pub const x3gm3: []const u8 = if (available) &Blob("dsv41_fatbin_dsv41_x3gm3").bytes else &.{};
     pub const pfglue: []const u8 = if (available) &Blob("dsv41_fatbin_dsv41_pfglue").bytes else &.{};
+    pub const kv_glue: []const u8 = if (available) &Blob("dsv41_fatbin_dsv41_kv_glue").bytes else &.{};
     pub const router_glue: []const u8 = if (available) &Blob("dsv41_fatbin_dsv41_router_glue").bytes else &.{};
 };
 
 pub const Kernels = struct {
-    mods: [27]cuda.Module,
+    mods: [28]cuda.Module,
+    kv_glue: kv_glue.Functions,
     exl3: exl3.Functions,
     dense: dense.Functions,
     ops: ops.Functions,
@@ -68,7 +71,7 @@ pub const Kernels = struct {
         if (!available) return error.BuiltWithoutKernels;
         const d = ctx.d;
         var k: Kernels = undefined;
-        const list = [_][]const u8{ images.exl3_experts, images.x3ld, images.x3pf, images.x3gm, images.linear, images.x3seg, images.dense3, images.attn, images.topk, images.mhc, images.mhc_pf, images.router_gemv, images.pfdense_k8, images.pfdense_k10, images.pfdense_k12, images.pfdense_k16, images.engram_gate, images.l2pace, images.l2pf, images.x3gm_plan, images.topk_keys, images.pointwise, images.kvsplit, images.glue, images.x3gm3, images.pfglue, images.router_glue };
+        const list = [_][]const u8{ images.exl3_experts, images.x3ld, images.x3pf, images.x3gm, images.linear, images.x3seg, images.dense3, images.attn, images.topk, images.mhc, images.mhc_pf, images.router_gemv, images.pfdense_k8, images.pfdense_k10, images.pfdense_k12, images.pfdense_k16, images.engram_gate, images.l2pace, images.l2pf, images.x3gm_plan, images.topk_keys, images.pointwise, images.kvsplit, images.glue, images.x3gm3, images.pfglue, images.router_glue, images.kv_glue };
         comptime std.debug.assert(list.len == @typeInfo(@FieldType(Kernels, "mods")).array.len);
         var loaded: usize = 0;
         errdefer for (k.mods[0..loaded]) |*m| m.unload();
@@ -78,6 +81,7 @@ pub const Kernels = struct {
         }
         // the per-block shared memory opt-in (sm_120 / sm_121: 101,376 B): instances above it are refused one by one
         const optin: u32 = @intCast(try ctx.attribute(.max_shared_memory_per_block_optin));
+        k.kv_glue = try kv_glue.Functions.resolve(k.mods[27]);
         k.exl3 = try exl3.Functions.resolve(k.mods[0], k.mods[1], k.mods[2], k.mods[3], k.mods[19], k.mods[24], k.mods[26], optin);
         k.dense = try dense.Functions.resolve(k.mods[4], k.mods[5], k.mods[6]);
         const m = k.mods;
@@ -100,6 +104,10 @@ pub const Kernels = struct {
         return .{ .f = &k.ops, .s = s };
     }
 
+    pub fn kvStore(k: *const Kernels, s: cuda.Stream) kv_glue.Ops {
+        return .{ .f = &k.kv_glue, .stream = s };
+    }
+
     /// The dense-linear launches on one stream.
     pub fn linears(k: *const Kernels, s: cuda.Stream) dense.Ops {
         return .{ .f = &k.dense, .s = s };
@@ -107,6 +115,8 @@ pub const Kernels = struct {
 };
 
 test {
+    std.testing.refAllDecls(kv_glue);
+    std.testing.refAllDecls(kv_glue.Ops);
     std.testing.refAllDecls(exl3);
     std.testing.refAllDecls(exl3.Ops);
     std.testing.refAllDecls(exl3.Functions);

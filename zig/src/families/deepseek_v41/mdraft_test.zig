@@ -359,3 +359,29 @@ test "the slot passes' device start: ds_accept_rows / ds_stage_rows over the pla
         try testing.expectEqualSlices(i32, want32[0..l32], got32[0..l32]);
     }
 }
+
+test "KV norm/store fuses DSpark ingest and multislot passes without touching other norms" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cfg: Config = .{};
+    const w = try widths(a);
+    const off: block.Options = .{ .taps = true };
+    var on = off;
+    on.kv_norm_store = true;
+    for ([_]i64{ 1, 16, 24, 64 }) |n| {
+        const plain = try emit.emitIngest(a, &cfg, &w, off, n, 0);
+        const fused = try emit.emitIngest(a, &cfg, &w, on, n, 0);
+        try @import("kv_glue_emit_test.zig").compare(plain, fused, cfg.mtp_layers);
+    }
+    for ([_]i64{ 1, 2, 3, 4 }) |slots| {
+        const plain = try emit.emitPassSlots(a, &cfg, &w, off, cfg.dspark_block, slots, slots);
+        const fused = try emit.emitPassSlots(a, &cfg, &w, on, cfg.dspark_block, slots, slots);
+        try @import("kv_glue_emit_test.zig").compare(plain, fused, cfg.mtp_layers);
+        for (fused) |c| if (std.mem.eql(u8, c.name, "tf_dsv41_kv_glue_v1.norm_store")) {
+            try testing.expect(c.args[14].arg.b);
+            try testing.expectEqual(@as(i64, slots * cfg.dspark_block), c.args[5].arg.t.shape[0]);
+            try testing.expectEqual(@as(i64, slots * emit.ringRows(&cfg)), c.args[3].arg.t.shape[0]);
+        };
+    }
+}

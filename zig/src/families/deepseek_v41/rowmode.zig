@@ -134,6 +134,13 @@ pub const Rewriter = struct {
             return out;
         }
         if (c.triton) return w.triton(out);
+        if (eq(c.name, "tf_dsv41_kv_glue_v1.norm_store")) {
+            if (args.len != 15) return error.BadCall;
+            args[5].arg = w.col(.pos);
+            args[6].arg = w.col(.wslot);
+            args[14].arg = .{ .b = true };
+            return out;
+        }
         if (eq(c.name, "tf_dsv41_attn_cuda_v1.attn")) {
             if (args.len < 23) return error.BadCall;
             args[9].arg = w.col(.pos);

@@ -51,6 +51,7 @@ const dsv41_kernels = [_]Kernel{
     .{ .name = "dsv41_mhc", .src = "deepseek_v41/mhc_cuda", .flags = &.{ "-O3", "-lineinfo", "--fmad=false" } }, // tf_dsv41_mhc_cuda_v1
     .{ .name = "dsv41_mhc_pf", .src = "deepseek_v41/mhc_pf", .flags = &.{ "-O3", "-lineinfo", "--fmad=false" } }, // tf_dsv41_mhc_pf_v1
     .{ .name = "dsv41_router_gemv", .src = "deepseek_v41/router_gemv", .flags = &.{ "-O3", "-lineinfo" } }, // tf_dsv41_router_gemv_v2
+    .{ .name = "dsv41_kv_glue", .src = "deepseek_v41/kv_glue", .flags = &.{ "-O3", "-lineinfo" } }, // KV RMS uses explicit rounded FP64; store preserves Triton FMA
     .{ .name = "dsv41_router_glue", .src = "deepseek_v41/router_glue", .flags = &.{ "-O3", "-lineinfo" } }, // histogram group + upstream rotation; same FMA policy as experts
     .{ .name = "dsv41_pfdense_k8", .src = "deepseek_v41/pfdense_k8", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // tf_dsv41_pfdense_v1
     .{ .name = "dsv41_pfdense_k10", .src = "deepseek_v41/pfdense_k10", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } },
