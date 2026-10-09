@@ -22,6 +22,9 @@ const Gpu = check.Gpu;
 const H = 32;
 const D = 128;
 const BP = 64;
+/// graphs.Settings.bucket: a served window's keys end at a multiple of it (Triton's div16 specialization of NK, the
+/// strides and PTS: the served variants)
+const bucket: i64 = 2048;
 const LONG: i64 = 154_183; // the bench's 131K prompt (long-131072: 154,183 prompt tokens)
 
 const Rng = struct {
@@ -157,7 +160,8 @@ pub fn run(gpu: Gpu, rest: []const [:0]const u8) !void {
         _ = arena_state.reset(.retain_capacity);
         const a = arena_state.allocator();
         // page tables: 4 slots, each a permutation-free offset into the pool (slot k starts k x 7 pages in), PTS pages a slot
-        const pages_a_slot: usize = (@as(usize, @intCast(@divFloor(LONG + 64, s.ratio))) >> s.psh) + 2;
+        // a slot's page-table row: the served pool's pages a slot are a multiple of 16 (PTS, div16 in every served variant)
+        const pages_a_slot: usize = std.mem.alignForward(usize, (@as(usize, @intCast(@divFloor(std.mem.alignForward(i64, LONG + 64, bucket), s.ratio))) >> s.psh) + 2, 16);
         const pool_pages_s = key_rows >> s.psh;
         const pth = try a.alloc(i32, 4 * pages_a_slot);
         for (0..4) |k| for (0..pages_a_slot) |p| {
@@ -167,7 +171,9 @@ pub fn run(gpu: Gpu, rest: []const [:0]const u8) !void {
         defer pt.free();
         var last: i64 = 0;
         for (c.rows) |r| last = @max(last, r[1]);
-        const nk = @max(@divFloor(last + 1, s.ratio), 1);
+        // the served window's NK: its context bucket's end (a 2,048-token step) over the ratio (a multiple of 16, as
+        // every served row-mode variant's NK / strides); rows past their own visible keys are -inf in both kernels
+        const nk = @divFloor(std.mem.alignForward(i64, last + 1, bucket), s.ratio);
         const R = c.rows.len;
         var pos = try cuda.DeviceBuffer.alloc(d, 8 * R);
         defer pos.free();
