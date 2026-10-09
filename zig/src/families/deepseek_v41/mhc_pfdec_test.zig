@@ -427,3 +427,34 @@ test "calls.holdDeferred: a launch with no exchange or join after it, or carryin
     calls.holdDeferred(&fs);
     try testing.expectEqualStrings("coef", fs[0].name);
 }
+
+test "TF_DSV41_MHC_DEFER_AT_ROWS: the reader; programs over the threshold keep the launch after its site, the rest hold it" {
+    try testing.expectEqual(@as(i64, 0), try branches.deferAtRows(null));
+    try testing.expectEqual(@as(i64, 0), try branches.deferAtRows(" "));
+    try testing.expectEqual(@as(i64, 16), try branches.deferAtRows("16"));
+    for ([_][]const u8{ "-1", "65", "x" }) |v| try testing.expectError(error.BadDeferAt, branches.deferAtRows(v));
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const w = try widths(a);
+    const cfg: Config = .{};
+    var backbone: [40]u32 = undefined;
+    for (&backbone, 0..) |*l, i| l.* = @intCast(i);
+    const o = prodOptions(1 << 20, 17, true);
+    var oh = o;
+    oh.mhc_defer_hold = true;
+    oh.mhc_defer_hold_rows = 16;
+    var ho = o;
+    ho.mhc_defer_hold = true;
+    for ([_]i64{ 1, 6, 16, 17, 24, 32 }) |n| {
+        errdefer std.debug.print("{d} rows\n", .{n});
+        const base = try block.emit(a, &cfg, &w, o, &backbone, n, 300_000, true);
+        const all = try block.emit(a, &cfg, &w, ho, &backbone, n, 300_000, true);
+        const cut = try block.emit(a, &cfg, &w, oh, &backbone, n, 300_000, true);
+        // at or under the threshold: the held program; over it: the program without the hold, call for call
+        const want = if (n <= 16) all else base;
+        try testing.expectEqual(want.len, cut.len);
+        for (want, cut) |x, y| try testing.expect(sameCall(x, y) and x.defer_side == y.defer_side and x.defer_join == y.defer_join);
+    }
+    try testing.expect(oh.holdsDeferred(16) and !oh.holdsDeferred(17) and ho.holdsDeferred(64) and !o.holdsDeferred(1));
+}

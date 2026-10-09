@@ -111,6 +111,17 @@ pub fn coefLate() bool {
     return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or std.ascii.eqlIgnoreCase(v, "false"));
 }
 
+/// TF_DSV41_MHC_DEFER_AT_ROWS (ours, with MHC_DEFER_AT): the hold only in programs of at most this many rows (1-64:
+/// one stream's windows hold, a 4-stream round's 17-32-row windows keep the launch after its site); unset / empty / 0:
+/// every program. Another value is refused.
+pub fn deferAtRows(v: ?[]const u8) !i64 {
+    const t = std.mem.trim(u8, v orelse return 0, " \t\r\n");
+    if (t.len == 0) return 0;
+    const n = std.fmt.parseInt(i64, t, 10) catch return error.BadDeferAt;
+    if (n < 0 or n > 64) return error.BadDeferAt;
+    return n;
+}
+
 /// With TF_DSV41_BRANCHES and / or TF_DSV41_MHC_DEFER (R1) on: the emitter's options, the side streams (before any
 /// capture), the runner pointed at them. Null when both are off.
 pub fn install(gpa: std.mem.Allocator, f: *fwd.Forward, rank: u32) !?*Branches {
@@ -133,12 +144,13 @@ pub fn install(gpa: std.mem.Allocator, f: *fwd.Forward, rank: u32) !?*Branches {
         f.opts.mhc_defer = true;
         f.opts.mhc_defer_hold = try deferAt(get("TF_DSV41_MHC_DEFER_AT"));
         f.opts.coef_late = coefLate();
+        f.opts.mhc_defer_hold_rows = try deferAtRows(get("TF_DSV41_MHC_DEFER_AT_ROWS"));
         r.dfr = &b.deferred.?;
     }
     if (rank == 0) {
         if (s.on and s.prio == .main) log.warn("branches: TF_DSV41_BRANCHES_PRIO=main raises the main stream, the model's own here: run as equal", .{});
         if (s.on) log.info("branches: the indexer / compressor on a side stream (priority {s}), windows <= {d} rows", .{ if (s.prio == .side) "highest" else "default", s.rows });
-        if (dfr) log.info("mhc defer: R1's coefficient launches on their own stream, issued {s}, joined by the next mHC call", .{if (f.opts.mhc_defer_hold) "at the next exchange (TF_DSV41_MHC_DEFER_AT)" else "after their site"});
+        if (dfr) log.info("mhc defer: R1's coefficient launches on their own stream, issued {s}, joined by the next mHC call", .{if (!f.opts.mhc_defer_hold) "after their site" else if (f.opts.mhc_defer_hold_rows > 0) "at the next exchange in windows of at most TF_DSV41_MHC_DEFER_AT_ROWS rows" else "at the next exchange (TF_DSV41_MHC_DEFER_AT)"});
         if (dfr and coefLate()) log.info("coef late: each deferred coefficient launch issued just before its sublayer's exchange", .{});
     }
     return b;
