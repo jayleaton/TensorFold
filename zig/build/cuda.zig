@@ -208,8 +208,10 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const dsv41_api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true });
     dsv41_api.addImport("lanes", dsv41_lanes);
     dsv41_m1.addImport("engine_api", dsv41_api);
-    dsv41_m1.addImport("dsv41_serve", @import("sampling.zig").serve(b, target, optimize, dsv41_lanes).serve); // the keyed sampler's Picker
-    dsv41_m1.addImport("tokenizer", mods.tokenizer); // TF_DSV41_CALIB=measure's calibration text (calib_gpu.zig, via serve_engine.zig)
+    const m1_serve = @import("sampling.zig").serve(b, target, optimize, dsv41_lanes).serve;
+    dsv41_m1.addImport("dsv41_serve", m1_serve); // the keyed sampler's Picker
+    // TF_DSV41_CALIB=measure's calibration text (calib_gpu.zig, via serve_engine.zig): the serving module's tokenizer
+    dsv41_m1.addImport("tokenizer", m1_serve.import_table.get("tokenizer").?);
     @import("grammar.zig").addTo(b, dsv41_m1, target, optimize); // structured output (grammar_gpu.zig): xgrammar's core, the mask PTX
     @import("sampling.zig").gpu(b, target, optimize, cuda, dsv41); // tf-dsv41-samp: the keyed sampler's device steps
     b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-m1", .root_module = dsv41_m1 }));
