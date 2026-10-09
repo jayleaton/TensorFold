@@ -756,3 +756,80 @@ Spark check: the same all-on + 4K run. Pass:
 
 If the MemAvailable after the free stays low (the driver keeps the pages), the next step is one workspace allocated
 at boot and held (priced in the boot check) instead of per prompt.
+
+### 10.8 Where 4K's missing gain is (T2-0, dgx-01, 2026-10-09)
+
+tbo_bench at 4,096 rows: x3gm 25.5 ms a layer, the dense set 12.0, serial 37.5. TBO at 4K buys 2.2 %, the best
+128-member tiles (GU2 / DN0) 3.3 % of x3gm, about 1 % of a segment. GU2 / DN0 is not built: it needs a second plan
+a MoE call (gate/up at BM 128, down at 64), a Zig-own gm2 instance and its resolution, for about 1 %.
+
+The segment arithmetic is where the gap shows. At 4K a segment is 4,096 / 2,668 = 1,535 ms. 20 layers x 37.5 =
+750 ms of it is x3gm + dense, which leaves **~785 ms outside them, ~392 ms a 2,048 rows**. At 2K the same split is
+817 - 20 x 26.96 = 278 ms. The work outside x3gm + dense grew ~40 % per row with the segment.
+
+Offline check: the emitted work does not grow. Every kernel's total grid and every glue step's tensor volume over one
+4,096-row segment equals two consecutive 2,048-row segments' at 32K and 131K, except one ticket memset fewer a layer.
+So the extra ~115 ms a 2,048 rows is runtime:
+- a kernel's efficiency at 4K shapes (attention, mHC, the indexer's row blocks under the 64 MiB index budget, the
+  exchange at 40 / 80 MiB);
+- host stalls the GPU waits on (Engram's layer-1 fill, with only layer 0 queued ahead of it);
+- the per-prompt workspace allocation.
+
+Only a profile splits it.
+
+**Found while reading the piece path: Zig had lost Python's Engram read-ahead across pieces.** With
+TF_DSV41_PREFILL_PIECES=1 (the all-on base), each round's piece is its own `prefill` call. forward_prefill.prompt
+reads ahead only to the next segment inside a call, so it never read ahead at all: every segment's Engram rows at
+layers 1 and 14 were synchronous reads, even with TF_DSV41_PREFETCH_AHEAD=1. Layer 1 has only layer 0 queued ahead
+of it on the GPU, so its read is exposed.
+
+Python reads the next round's piece ahead (rounds._prefetch(ahead=prefetch.next_pieces): the rows after the piece,
+as many as it held, up to the prompt's last token). Now Zig does the same:
+- GpuTarget.piece sends those ids (Forward.prefillAhead, plan-link op 60, every rank);
+- the call's last segment issues their reads behind itself (forward_prefill.ahead).
+
+I/O only: the rows are the shard's whatever the path. This applies at 2K and at 4K. P5's profile shows it as
+glue.engram_rows' time per 1K rows; compare with the 3e5c3756 run.
+
+Tooling (this commit):
+- the prefill profile records the encoder rows and CED tail rows it covered (`"rows"`, `"tail_rows"`);
+- `gap.py prefill-ab --a <2K profile> --b <4K profile> --labels 2K,4K` prints, per 1K encoder rows: wall, GPU,
+  host (wall - GPU), GPU by family, and the calls that moved most. A glue step's time includes a host stall the GPU
+  waited on.
+
+**Spark step P5** (two boots, 1 rep each, the same base as the all-on 4K run, kit with 4764d3b1 and this commit):
+
+| step | what | pass / read |
+| --- | --- | --- |
+| P5-1 | base (4K off) + `TF_DSV41_PROFILE=/state/prof-2k.json`; `bench_http.py --long 131072` alone; stop the server cleanly (the profile is written at close) | `/state/prof-2k.json` has `"prefill"` with `"rows"` |
+| P5-2 | the same + `TF_DSV41_PF_4K=1 TF_DSV41_PF_4K_MEMORY_OK=1 TF_DSV41_PREFILL_CHUNK=4096 TF_DSV41_PREFILL_ROWS=4096`, profile to `/state/prof-4k.json` | the handoff line `prefill 4K: workspace ... MemAvailable X -> Y GiB`; any `graph cache: ... cap` lines |
+| P5-3 | dev box: `python3 tools/zig/dsv41_perf/gap.py prefill-ab --a prof-2k.json --b prof-4k.json --labels 2K,4K --top 25` (rank 0's, and rank 1's) | the family / calls whose ms per 1K rows grew: the next lever |
+
+Profiling times every prefill call with an event pair (eager anyway). Read the prompt tok/s of these runs as
+profiled, not as the speed result.
+
+### 10.9 T2-1 (kit 1fc03a5b, 2026-10-09): 4K joins the all-on set; TBO + 4K refused at boot now
+
+- **Arm 1, all-on + 4K: PASS.** Exact. Prompts 32K 2,661 (+9.2 % vs Python), 131K 2,495 (+10.1 %). 131K decode 64.8
+  (base 65.2). The frees logged MemAvailable 5.10 -> 7.60 and 4.95 -> 7.46 GiB, with no cap drop and 0 evicted. The
+  cache's cap recovery (10.7) holds.
+- **Arm 1p, profile: no file.** The serving model never set the runner's profile; only tf-dsv41-m1's gates did. Now
+  Model.open sets it from TF_DSV41_PROFILE and Model.close (the SIGTERM / SIGINT stop) writes it (`profile: <file>
+  written (...)`).
+- **Arm 2, 4K + TBO: rank 1 killed by the kernel's OOM** at its first long prompt (workspace 5,091 MiB). The boot
+  check predicted 6.87 GiB worst without the workspace, so 1.8 GiB with it, under the 4.0 floor. Two fixes:
+  - **Boot:** forward_prefill.workspaceBytes sizes the workspace from its own plan before the pool. kv_state.bootCheck
+    subtracts it from the predicted worst MemAvailable and refuses under the hard floor, naming the pool cut or
+    TBO's removal. At T2-1's numbers 4K alone passes (4.95 GiB measured at the free) and TBO + 4K is refused.
+  - **Runtime:** k4Acquire checks MemAvailable against the workspace and the hard floor before allocating. On the
+    GB10 an allocation past host memory is a kernel OOM kill, not an error return. A short check logs `prefill
+    workspace: N MiB would leave X GiB ...` and returns OutOfMemory, so fail-fast takes both ranks down with that line.
+    An allocation error is logged too.
+- **TBO + 4K is not pursued further** (T2-0: at most 2.2 % at 4K).
+- **The workspace's allocation is timed:** `prefill 4K: workspace N MiB allocated and zeroed in T ms (prompt k)`. On
+  the GB10 it maps ~2.5 GiB of host pages once a prompt, outside the prefill profile's segments. At ~1 s it would be
+  ~7 % of a 32K prompt's 14 s.
+
+**The next prefill step:** P5's profile, the M2c-2 gate's (PREFILL=1 PROF_PREFILL=1) or the served one now. Read with
+`gap.py prefill-ab` against a 2K run, together with the allocation line above and glue.engram_rows' share after the
+read-ahead fix (10.8).

@@ -197,6 +197,10 @@ pub const GpuTarget = struct {
         const t = self_(p);
         try t.onSlot(slot);
         if (t.f.slot.pos != start or start >= end or end + 1 > ids.len) return error.NotAChain;
+        // the next round's piece of this prompt read ahead behind this one (Python's rounds._prefetch(ahead=
+        // prefetch.next_pieces): the rows after it, as many as it holds, up to the prompt's last token)
+        const last = ids.len - 1;
+        if (end < last) try t.f.prefillAhead(ids[end..@min(last, end + (end - start))]);
         try t.f.prefill(ids[start..end]);
         // rounds.py `_save`: a history under session_min is not snapshotted (a damaged entry's restart cuts there)
         if (save and end >= ced.session_min) if (t.sessions) |ss| {

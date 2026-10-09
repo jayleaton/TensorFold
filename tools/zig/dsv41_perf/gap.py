@@ -30,6 +30,14 @@ Spark or pod (the full prefill, Python against Zig on the same prompt: the M2c-2
   the glue included: an Engram read the GPU waits for shows as glue.engram_rows' time). Rows: wall and GPU a prompt on
   each side, then GPU ms a prompt by family, then each side's largest kernels.
 
+Spark (two Zig runs of the same prompts, e.g. TF_DSV41_PF_4K off / on, each with TF_DSV41_PROFILE=<file>):
+
+    python3 gap.py prefill-ab --a zig-2k.json --b zig-4k.json [--labels 2K,4K] [--top 20]
+
+  Both profiles' ``prefill`` per 1K encoder rows (``rows``; the CED decoder replays' ``tail_rows`` apart): wall, GPU
+  (event-timed calls, glue included: a host stall the GPU waits on shows as its glue step's time) and the host's
+  share (wall - GPU), GPU ms by family, then the calls whose ms per 1K rows moved most between the runs.
+
     python3 gap.py selftest
 """
 
@@ -202,6 +210,40 @@ def prefill_table(py: dict, zig: dict, top: int = 20) -> list[str]:
     return lines
 
 
+def prefill_ab(a: dict, b: dict, labels: tuple[str, str], top: int = 20) -> list[str]:
+    """Two Zig profiles' ``prefill`` objects, per 1K encoder rows."""
+
+    ka = 1024.0 / max(1, a.get("rows") or 0)
+    kb = 1024.0 / max(1, b.get("rows") or 0)
+    la, lb = labels
+    lines = [f"| per 1K encoder rows | {la} | {lb} | {lb} - {la} |", "|---|---:|---:|---:|"]
+    lines.append(f"| encoder rows / tail rows / segments | {a.get('rows')} / {a.get('tail_rows')} / {a.get('segments')} | "
+                 f"{b.get('rows')} / {b.get('tail_rows')} / {b.get('segments')} | |")
+    for label, f in (("wall ms", lambda x: x["wall_ms"]), ("GPU ms", lambda x: x["gpu_ms"]),
+                     ("host ms (wall - GPU)", lambda x: x["wall_ms"] - x["gpu_ms"])):
+        va, vb = f(a) * ka, f(b) * kb
+        lines.append(f"| {label} | {va:.1f} | {vb:.1f} | {vb - va:+.1f} |")
+    fa: dict[str, float] = {}
+    fb: dict[str, float] = {}
+    for d, k, fam in ((a, ka, fa), (b, kb, fb)):
+        for name, v in d.get("calls", {}).items():
+            fam[family(name)] = fam.get(family(name), 0.0) + v["ms"] * k
+    lines += ["", "GPU ms per 1K encoder rows by family", f"| family | {la} | {lb} | {lb} - {la} |", "|---|---:|---:|---:|"]
+    for fam in sorted(set(fa) | set(fb), key=lambda x: -(fb.get(x, 0) - fa.get(x, 0))):
+        lines.append(f"| {fam} | {fa.get(fam, 0):.1f} | {fb.get(fam, 0):.1f} | {fb.get(fam, 0) - fa.get(fam, 0):+.1f} |")
+    ca, cb = a.get("calls", {}), b.get("calls", {})
+    moved = []
+    for name in set(ca) | set(cb):
+        x = ca.get(name, {"ms": 0.0, "calls": 0})
+        y = cb.get(name, {"ms": 0.0, "calls": 0})
+        moved.append((y["ms"] * kb - x["ms"] * ka, name, x, y))
+    lines += ["", f"the {top} calls that moved most (ms per 1K encoder rows)", f"| name | family | {la} | {lb} | delta | calls {la} / {lb} |",
+              "|---|---|---:|---:|---:|---:|"]
+    for d, name, x, y in sorted(moved, key=lambda t: -abs(t[0]))[:top]:
+        lines.append(f"| {name[:80]} | {family(name)} | {x['ms'] * ka:.2f} | {y['ms'] * kb:.2f} | {d:+.2f} | {x['calls']} / {y['calls']} |")
+    return lines
+
+
 def selftest() -> int:
     py = {"mode": "1", "wall_ms": 1000.0, "window": {"ms": 600.0, "n": 20, "ms_avg": 30.0},
           "draft.pass": {"ms": 80.0, "n": 20, "ms_avg": 4.0}, "commit": {"ms": 20.0, "n": 20, "ms_avg": 1.0}}
@@ -233,6 +275,14 @@ def selftest() -> int:
                        {"segments": 2, "wall_ms": 6000.0, "gpu_ms": 5000.0,
                         "calls": {"glue.topk": {"calls": 40, "ms": 400.0}, "_fused": {"calls": 40, "ms": 900.0}}})
     assert "| wall ms | 3000.0 | 6000.0 | +3000.0 |" in pt and "| indexer | 50.0 | 400.0 | +350.0 |" in pt, pt
+    ab = prefill_ab({"rows": 4096, "tail_rows": 127, "segments": 3, "wall_ms": 1600.0, "gpu_ms": 1500.0,
+                     "calls": {"_fused": {"calls": 40, "ms": 100.0}, "glue.engram_rows": {"calls": 4, "ms": 40.0}}},
+                    {"rows": 8192, "tail_rows": 127, "segments": 3, "wall_ms": 3600.0, "gpu_ms": 3000.0,
+                     "calls": {"_fused": {"calls": 40, "ms": 200.0}, "glue.engram_rows": {"calls": 4, "ms": 400.0}}},
+                    ("2K", "4K"), 5)
+    assert "| wall ms | 400.0 | 450.0 | +50.0 |" in ab and "| host ms (wall - GPU) | 25.0 | 75.0 | +50.0 |" in ab, ab
+    moved = [l for l in ab if l.startswith("| glue.engram_rows") or l.startswith("| _fused")]
+    assert moved[0].startswith("| glue.engram_rows") and "+40.00" in moved[0], ab  # the call that moved most first
     print("gap.py selftest: OK")
     return 0
 
@@ -248,6 +298,11 @@ def main() -> int:
     b.add_argument("--py", required=True)
     b.add_argument("--zig", action="append", default=[])
     b.add_argument("--zig-profile", default=None)
+    e = sub.add_parser("prefill-ab")
+    e.add_argument("--a", required=True)
+    e.add_argument("--b", required=True)
+    e.add_argument("--labels", default="A,B")
+    e.add_argument("--top", type=int, default=20)
     c = sub.add_parser("prefill")
     c.add_argument("--py", required=True)
     c.add_argument("--zig-profile", required=True)
@@ -266,6 +321,14 @@ def main() -> int:
             print(f"### Python {label} vs Zig {next(iter(zigs))}")
             print("\n".join(phases_table(rep, zigs[next(iter(zigs))])))
             print()
+        return 0
+    if x.cmd == "prefill-ab":
+        pa, pb = json.load(open(x.a)).get("prefill"), json.load(open(x.b)).get("prefill")
+        if not pa or not pb or not pa.get("rows") or not pb.get("rows"):
+            print("both profiles need a \"prefill\" with \"rows\" (an engine with profile.prefillRows)", file=sys.stderr)
+            return 2
+        la, lb = (x.labels.split(",") + ["B"])[:2]
+        print("\n".join(prefill_ab(pa, pb, (la, lb), x.top)))
         return 0
     if x.cmd == "prefill":
         py, zig = json.load(open(x.py)).get("prefill"), json.load(open(x.zig_profile)).get("prefill")
