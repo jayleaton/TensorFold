@@ -196,9 +196,14 @@ pub const SlotPass = struct {
                     if (ko.vs_choose != null) f.after_sample = .{ .ctx = x, .run = afterSample };
                 }
                 if (try dsd.chainFromEnv()) {
-                    if (!hasVariant(r, "_chain")) {
-                        std.log.scoped(.dsv41).warn("draft chain: TF_DSV41_DRAFT_CHAIN=1, but the AOT set has no _chain (TRITON_FILL): the host's chain", .{});
-                    } else x.dev.?.chain = try dsd.Chain.init(gpa, r, n, nslots, c, f.cfg.hidden, one.conf != null);
+                    // refused, not a silent host chain: the variant comes from the kit's fill (aot-needs lists it)
+                    const ch = try dsd.Chain.init(gpa, r, n, nslots, c, f.cfg.hidden, one.conf != null);
+                    errdefer ch.deinit();
+                    if (try ch.probe(r, f.cfg, f.widths, f.opts)) |S| {
+                        std.log.err("draft chain: TF_DSV41_DRAFT_CHAIN=1, but the AOT set has no _chain variant for {d} slot(s) (N {d}, KP {d}, candidates {d}, confidence head {}): merge a fill that holds it (tf-dsv41-m1 aot-needs lists it, tools/zig/triton_fill.py compile), or set TF_DSV41_DRAFT_CHAIN=0", .{ S, n, emit.chain_kp, c, one.conf != null });
+                        return error.MissingChainVariant;
+                    }
+                    x.dev.?.chain = ch;
                 }
                 if (try overlapFromEnv()) {
                     if (x.bat == null) {
@@ -1061,11 +1066,6 @@ pub fn overlapFromEnv() !bool {
 }
 
 /// The engine's AOT set has some variant of Triton function `name`.
-fn hasVariant(r: *const run.Runner, name: []const u8) bool {
-    for (r.triton.variants) |v| if (std.mem.eql(u8, v.spec.@"fn", name)) return true;
-    return false;
-}
-
 /// TF_DSV41_DRAFT_BATCH_PROJ: 1 = one main_proj over a device-started round's slots, `check` = the same with the first
 /// rounds' rows compared with each slot's projection alone, unset / 0 = one a slot.
 pub const BatchProj = enum { off, on, check };

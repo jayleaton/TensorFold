@@ -388,6 +388,14 @@ pub const Chain = struct {
     }
 
     /// The `S`-slot program (dspark_emit.emitChain), emitted once.
+    /// The first slot count whose `_chain` launch the AOT set cannot serve (null: every one, 1..slots), probed at boot
+    /// (Runner.missingTriton): a kit fill without the variant would otherwise fall back to the host chain at the first
+    /// round, logged once among the serving lines.
+    pub fn probe(x: *Chain, r: *const run.Runner, cfg: anytype, w: anytype, o: anytype) !?usize {
+        for (1..x.slots + 1) |S| if (try r.missingTriton(try x.program(cfg, w, o, S)) != null) return S;
+        return null;
+    }
+
     fn program(x: *Chain, cfg: anytype, w: anytype, o: anytype, S: usize) ![]const calls.Call {
         if (x.programs[S - 1]) |p| return p;
         const p = try emit.emitChain(x.arena.allocator(), cfg, w, o, @intCast(x.n), @intCast(S), @intCast(x.c), x.conf);
