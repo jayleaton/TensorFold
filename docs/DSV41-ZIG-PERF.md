@@ -1516,3 +1516,21 @@ S1 measures it.
 | --- | --- | --- |
 | S1 | kit fill with `TRITON_FILL_ENV=tools/zig/dsv41_m4/fill-rb.env` (and a second with TF_DSV41_STREAM_RB=4); `TF_DSV41_TEST=<tf-dsv41-test> AOT=<kit aot> bash zig/tests/cuda/deepseek_v41/stream_rb_job.sh <out>` | `bits rb2: PASS` and `bits rb4: PASS` at every (start, rows); `stream-rb: PASS`; the speedups |
 | S2 | all-on + `TF_DSV41_STREAM_RB=<the faster>`, `bench_http.py --long 32768,131072` | long replies == Python's (sha unchanged), T0 20/20; prompt tok/s against the same base |
+
+### 8.8 Correction to 8.7: the "all small kernels are slower" reading was selection bias
+
+Spark: SM clock 2216-2242 MHz on both ranks during Zig decode (= idle), power ~62 W, throttle flags 0; `mhc-probe`
+spin-1 / 5 / 10 all 19.5 us: neither clocks nor host load. Then the launches themselves, round 4's traces, matched by
+kernel, grid, block, registers and dynamic shared memory:
+- every launch configuration is the same in both engines (grid, block, registers, static and dynamic shared memory);
+  only CUPTI's `launchType` / `cacheConfig` fields differ, and the two captures used different nsys versions
+  (2025.3.2 for Zig, 2026.3.1 for Python), so those fields do not compare;
+- per configuration the ratios scatter both ways (`rot_in` 1 x 16: Zig 11.5 / Python 2.5 us; 1 x 24: 6.6 / 12.7):
+  8.7's list was the top of a sorted noisy distribution;
+- weighted by Python's launch counts: small kernels (< 15 us) Zig / Python 1.04 (+18 ms over the capture), mid
+  (15-100 us) 1.02, big 1.00. Consistently slower in every configuration: only the mHC boundary (1.20, 9 / 9) and
+  `_kv_store` (1.25, 22 / 22).
+
+Size: about 0.26 ms (boundary) + 0.1 ms (`_kv_store`) a 107 ms code x4 round, ~0.35 %; the whole kernel-time
+difference, all kinds, is ~0.9 ms a round. There is no broad small-kernel lever. TF_CUDA_SCHED stays (harmless,
+default unset) but is not expected to move anything.

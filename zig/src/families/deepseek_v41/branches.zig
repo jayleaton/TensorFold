@@ -88,6 +88,15 @@ pub fn mhcDefer() bool {
     return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or std.ascii.eqlIgnoreCase(v, "false"));
 }
 
+/// TF_DSV41_MHC_DEFER_AT (ours, with MHC_DEFER): `exchange` issues each deferred coefficient launch at the next
+/// exchange (calls.holdDeferred); unset / empty / 0 / off: right after its site, as prod. Another value is refused.
+pub fn deferAt(v: ?[]const u8) !bool {
+    const t = std.mem.trim(u8, v orelse return false, " \t\r\n");
+    if (t.len == 0 or std.mem.eql(u8, t, "0") or std.ascii.eqlIgnoreCase(t, "off")) return false;
+    if (std.ascii.eqlIgnoreCase(t, "exchange")) return true;
+    return error.BadDeferAt;
+}
+
 /// With TF_DSV41_BRANCHES and / or TF_DSV41_MHC_DEFER (R1) on: the emitter's options, the side streams (before any
 /// capture), the runner pointed at them. Null when both are off.
 pub fn install(gpa: std.mem.Allocator, f: *fwd.Forward, rank: u32) !?*Branches {
@@ -108,12 +117,13 @@ pub fn install(gpa: std.mem.Allocator, f: *fwd.Forward, rank: u32) !?*Branches {
     if (dfr) {
         b.deferred = try sideOf(r.d, .default); // mhc_cuda._side: torch's default priority
         f.opts.mhc_defer = true;
+        f.opts.mhc_defer_hold = try deferAt(get("TF_DSV41_MHC_DEFER_AT"));
         r.dfr = &b.deferred.?;
     }
     if (rank == 0) {
         if (s.on and s.prio == .main) log.warn("branches: TF_DSV41_BRANCHES_PRIO=main raises the main stream, the model's own here: run as equal", .{});
         if (s.on) log.info("branches: the indexer / compressor on a side stream (priority {s}), windows <= {d} rows", .{ if (s.prio == .side) "highest" else "default", s.rows });
-        if (dfr) log.info("mhc defer: R1's coefficient launches on their own stream, joined by the next mHC call", .{});
+        if (dfr) log.info("mhc defer: R1's coefficient launches on their own stream, issued {s}, joined by the next mHC call", .{if (f.opts.mhc_defer_hold) "at the next exchange (TF_DSV41_MHC_DEFER_AT)" else "after their site"});
     }
     return b;
 }
