@@ -60,6 +60,10 @@ pub const Target = struct {
         /// A round's finished prompts before their `finish` / `tail` (TF_DSV41_REPLAY_RUNS): the target may run their
         /// CED decoder replays together (those finishes then skip theirs). null: nothing.
         replays: ?*const fn (ptr: *anyopaque, list: []const Final) anyerror!void = null,
+        /// Engram reads ahead of the next window (TF_DSV41_ENGRAM_WARM, Python's decode.prefetch_pending at a commit
+        /// and its draft-end gate.warm): each ask's rows `ids` from position `start` on its slot. Reads only: a
+        /// window's rows are its own reads' bytes whatever was warmed.
+        warm: ?*const fn (ptr: *anyopaque, asks: []const Warm) void = null,
     };
 
     /// A slot's whole prompt whose rows but the last are in (its `finish` / `tail` follows).
@@ -67,6 +71,11 @@ pub const Target = struct {
 
     /// A slot's prompt `ids` (the whole prompt) rows [start, end) of a round; `save`: its snapshot right after them.
     pub const Piece = struct { slot: u32, ids: []const u32, start: u64, end: u64, save: bool };
+
+
+    pub fn warm(t: Target, asks: []const Warm) void {
+        if (t.vtable.warm) |f| f(t.ptr, asks);
+    }
 
     pub const Begun = struct { at: u64 = 0, damaged: bool = false };
 
@@ -167,3 +176,6 @@ pub fn ingestSpan(n: usize, window: usize) struct { skip: usize, count: usize } 
     const skip = n -| window;
     return .{ .skip = skip, .count = n - skip };
 }
+
+/// An Engram warm ask (Target.warm).
+pub const Warm = struct { slot: u32, start: u64, ids: []const u32 };

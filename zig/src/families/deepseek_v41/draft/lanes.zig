@@ -470,6 +470,9 @@ pub const Lanes = struct {
         const asks = try a.alloc(iface.Ask, requests.len);
         const whose = try a.alloc(*St, requests.len);
         const depths = try a.alloc(u32, requests.len);
+        const row0 = try a.alloc(iface.Warm, requests.len);
+        const row0_ids = try a.alloc(u32, requests.len);
+        var n_row0: usize = 0;
         var n: usize = 0;
         for (requests) |r| {
             const st = try x.get(r.stream);
@@ -482,6 +485,12 @@ pub const Lanes = struct {
             }
             if (r.position != at + 1) return error.PositionMismatch;
             const anchor = if (r.first) |f| x.value(f) else r.follow[r.follow.len - 1];
+            // Python's commit warm (decode.prefetch_pending): the next window's pending row, before the pass
+            if (x.target.vtable.warm != null and n_row0 < row0.len) {
+                row0_ids[n_row0] = anchor;
+                row0[n_row0] = .{ .slot = st.slot, .start = at, .ids = row0_ids[n_row0..][0..1] };
+                n_row0 += 1;
+            }
             st.n = 0;
             st.n_sib = 0;
             st.start = at;
@@ -492,6 +501,7 @@ pub const Lanes = struct {
             depths[n] = r.depth;
             n += 1;
         }
+        x.target.warm(row0[0..n_row0]);
         if (n == 0) return;
         const b = x.opts.shape.block;
         const c = x.opts.shape.candidates;
@@ -505,6 +515,18 @@ pub const Lanes = struct {
         };
         const took = if (x.spec) |*sp| sp.take(asks[0..n], props) else false;
         if (!took) try x.pass.propose(asks[0..n], props);
+        // Python's draft-end warm (decode.draft's gate.warm): the pending row and every drafted one, before the depth
+        // cuts them
+        if (x.target.vtable.warm != null) {
+            const ws = try a.alloc(iface.Warm, n);
+            for (ws, props, asks[0..n]) |*w, p, ask| {
+                const ids = try a.alloc(u32, 1 + b);
+                ids[0] = ask.anchor;
+                @memcpy(ids[1..], p.drafts[0..b]);
+                w.* = .{ .slot = ask.slot, .start = ask.start, .ids = ids };
+            }
+            x.target.warm(ws);
+        }
         for (props, whose[0..n], depths[0..n], asks[0..n]) |p, st, d, ask| {
             st.n = @min(d, b);
             @memcpy(st.held[0..st.n], p.drafts[0..st.n]);

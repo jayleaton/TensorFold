@@ -362,6 +362,7 @@ pub const Model = struct {
         m.f.ext = m.rows.?.ext();
         m.f.graphs_read = true;
         m.gt.rows = m.rows;
+        m.gt.engram_warm = try target_mod.GpuTarget.engramWarmEnv();
     }
 
     fn setDsValid(ctx: *anyopaque, slot: u32, valid: u64) void {

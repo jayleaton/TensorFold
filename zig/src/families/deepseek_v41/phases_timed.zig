@@ -21,7 +21,7 @@ pub const TimedTarget = struct {
         return .{ .ptr = t, .vtable = &vtable };
     }
 
-    const vtable: iface.Target.VTable = .{ .prefill = prefill, .window = window, .keep = keep, .taps = taps, .release = release, .admit = admit, .begin = begin, .piece = piece, .finish = finish, .tail = tail, .pieces = pieces, .replays = replays };
+    const vtable: iface.Target.VTable = .{ .prefill = prefill, .window = window, .keep = keep, .taps = taps, .release = release, .admit = admit, .begin = begin, .piece = piece, .finish = finish, .tail = tail, .pieces = pieces, .replays = replays, .warm = warm };
 
     fn admit(p: *anyopaque, slot: u32, max_new: u64) void {
         self(p).inner.admit(slot, max_new);
@@ -53,6 +53,10 @@ pub const TimedTarget = struct {
         const tm = ph.start(t.p, .prefill);
         defer tm.stop();
         return t.inner.tail(slot, ids, sampling, draw);
+    }
+
+    fn warm(p: *anyopaque, asks: []const iface.Warm) void {
+        self(p).inner.warm(asks);
     }
 
     fn piece(p: *anyopaque, slot: u32, ids: []const u32, start: u64, end: u64, save: bool) anyerror!void {
