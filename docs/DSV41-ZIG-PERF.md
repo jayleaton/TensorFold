@@ -666,3 +666,42 @@ TF_DSV41_REPLAY_RUNS=1, against the batched reference ("replay runs: " in the lo
 
 Expected: one expert weight pass of layers 20-39 saved per extra tail in a run, ~40-50 ms each on the Spark for 127-row
 tails; four prompts finishing together: ~120-150 ms. Python cannot do this without batching its finals.
+
+## 10. Sampled rounds: the nucleus statistics on one SM a row (2026-10-09, offline)
+
+Sampled decode (T 0.7, top-p 0.95, top_k 0: nucleus rows) trailed Python in every run while T 0 was level
+(k860-base: code x1 89.2 vs 92.2, code x4 142.8 vs 147.0, prose x1 49.0 vs 50.4 tok/s).
+
+**Acceptance is not it.** Both engines choose every verify row by the same keyed rule (no residual sampling): the
+keyed Gumbel-max of `uniform(seed, position, id)` over the row's top-k / top-p / min-p cut (Python
+`nucleus.choose` / `choose_rows`, Zig `serve/sampling.zig` `Picker`), drafts kept while they equal the choices, the
+bonus the first differing row's choice. The draw is keyed by position, so there is no consumption order to differ.
+The bench's tokens a round at T 0.7: code x1 3.632 vs 3.623, code x4 3.722 vs 3.718, prose x1 1.607 vs 1.602, prose
+x4 1.635 vs 1.634; replies equal.
+
+**The round costs more.** From the acceptance logs of allon1, allon2b, r5-off and r5-on (choose -> last commit of
+the forward, the same committed rows, T 0.7 minus T 0, medians weighted by count): code x1 +0.37 ms a forward,
+code x4 +2.0 ms (every row count 11..24 within +0.7..+3.8), prose x1 +0.24. Python's sampled round costs what its
+greedy round does (tok/s / tokens a round: x1 39.30 vs 39.37 ms, x4 101.2 vs 102.4).
+
+Cause: `sampling.cu`'s `stats_kernel` (`nucleus.row_stats`: each row's max and sum of `exp(v / T - max / T)` in
+float64 over the rank's 64,640 columns) ran one CTA a row: a segment of n rows used n of GB10's 48 SMs, each doing
+~30 float64 operations a column (an IEEE double divide and exp) at FP64's 1/64 rate, about 0.4 ms a call whatever
+n. Zig calls the sampler once a sampled segment (one call at x1, four at x4: +0.4 / +1.6 ms of the measured +0.37 /
++2.0); torch's `row_stats` spreads the same work over the whole GPU once a forward.
+
+Fix (always on, tokens unchanged): `dsv41_sampling_stats_max / _sum / _fin`, grid (32 chunks of 2,048 columns,
+rows): the chunk maxima in fp32 (the f64 of the fp32 max is the f64 max: the conversion is exact and monotone),
+each chunk's sum of the same terms `exp(f64(v) / T - m / T)` with the row's exact max, the row's sum in chunk order.
+Only the summation order changes, and it was not torch's before either: `nucleus.keep_count`'s GUARD (1e-9) is what
+makes the token independent of the last bits of Z, and a guard hit takes the whole row (the same token). The max is
+bit-equal. `TF_DSV41_SAMP_STATS=row` keeps the old kernel; a fatbin without the split symbols keeps it too (kits
+built before it still load). `tf-dsv41-samp` checks both kernels against the host (max bit-equal, sum within 1e-12)
+and prints each one's time a call at 1 / 5 / 16 rows.
+
+Left for after the Spark numbers:
+- One sampler call a forward (Python's one `cand_gather` + one statistics exchange): Zig still runs top-k, two
+  all-gathers and two blocking downloads a sampled segment (~0.2 ms each, an estimate, x4 only).
+- `TF_DSV41_SPEC_NUCLEUS=1`: the speculative pass for nucleus rounds. Zig's host holds the exact choices when
+  `speculate` runs, so the knob needs no `device_z` and is exact; T 0 gets that overlap today (T 0.7's `draft.pass`
+  +0.15 ms and `engram.wait` +0.1 ms a round are its absence). Python leaves it off; pod step `spec-samp` covers it.
