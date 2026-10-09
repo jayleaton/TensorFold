@@ -797,7 +797,7 @@ const Graphs = struct {
     fn init(g: *Graphs, f: *fwd.Forward, s: graphs.Settings, split: bool) !void {
         const r = f.runner;
         g.* = .{ .engine = .{ .d = r.d }, .agreement = try graphs.Agreement.init(r.d, f.comm, r.stream), .cache = undefined };
-        g.cache = graphs.Cache.init(f.gpa, g.engine.engine(), .{ .on = true, .max = if (split) 2 * s.max else s.max });
+        g.cache = graphs.Cache.init(f.gpa, g.engine.engine(), .{ .on = true, .max = if (split) 2 * s.max else s.max, .hold = s.floor_hold });
         g.cache.agree = g.agreement.agree();
         g.cache.room = roomFn;
         room_floor = s.floor_gib;
