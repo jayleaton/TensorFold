@@ -27,6 +27,7 @@ test {
     _ = depth;
     _ = tree;
     _ = dspark;
+    _ = @import("dspark_test.zig"); // the chain lanes, bit for bit
     _ = iface;
     _ = policy;
     _ = lanes;

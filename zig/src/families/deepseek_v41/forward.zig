@@ -16,6 +16,7 @@ const Config = @import("config.zig").Config;
 const eh = @import("engram_host.zig");
 const vision_rows = @import("vision_rows.zig");
 const graphs = @import("graphs.zig");
+const round_graph = @import("round_graph.zig");
 const pf = @import("forward_prefill.zig");
 const kvs = @import("kv_state.zig");
 const er = @import("engram_rows.zig");
@@ -95,6 +96,8 @@ pub const Forward = struct {
     /// engram_rows steps launch the gate kernel instead of copying staged rows
     gate: ?*egate.Gate = null,
     gated: bool = false,
+    /// TF_DSV41_ROUND_GRAPH's `gate`: recorded after each gated window, the gate's arm waits for it (not the stream)
+    gated_end: ?cuda.Event = null,
     /// TF_DSV41_BRANCHES / TF_DSV41_MHC_DEFER (branches.zig): the runner's side streams, owned here
     branches: ?*@import("branches.zig").Branches = null,
     /// TF_DSV41_PHASES (phases.zig): the window path's timers
@@ -163,6 +166,7 @@ pub const Forward = struct {
         if (f.pick_dev) |*b| b.free();
         if (f.greedy_dev) |*b| b.free();
         if (f.pick_done) |*e| e.deinit();
+        if (f.gated_end) |*e| e.deinit();
         f.programs.deinit(f.gpa);
         f.ids_own.deinit(f.gpa);
         f.arena.deinit();
@@ -251,7 +255,7 @@ pub const Forward = struct {
         const tf = ph.start(f.phases, .forward);
         defer tf.stop();
         f.runner.rows = @intCast(ids.len); // l2pf: wider windows skip the prefetch sites
-        if (try f.graphedWindow(ids)) return;
+        if (try f.graphedWindow(ids)) return f.gatedEnd();
         // the gate (its worker reads every layer at once) or every layer's reads in flight while the calls are emitted
         f.gated = try f.armEngram(&.{.{ .ids = ids, .tail = f.slot.tail[0..f.slot.tail_len] }}, @intCast(ids.len));
         if (!f.gated) f.issueEngram(ids, f.slot.tail[0..f.slot.tail_len]);
@@ -263,6 +267,7 @@ pub const Forward = struct {
         f.slot.pending = .{ .start = f.slot.pos, .n = @intCast(ids.len) };
         f.runner.glue = .{ .ctx = f, .run = glueFn };
         try f.runner.timedWindow(cs);
+        try f.gatedEnd();
     }
 
     /// Greedy choices of the last window's rows (Python's forward.greedy): each rank's max a row (the lowest column on
@@ -915,7 +920,7 @@ pub const Forward = struct {
                     var layers: std.ArrayList(u32) = .empty;
                     for (try f.backbone(la.allocator())) |L| if (std.mem.indexOfScalar(u32, h.layer_ids, L) != null) try layers.append(la.allocator(), L);
                     const g = try egate.Gate.open(std.heap.c_allocator, f.runner.d, h, x.source(), layers.items, f.comm.rank(), f.comm.world(), f.cfg.engram_head_dim, s);
-                    g.sync = .{ .ctx = f.runner, .run = syncRunner };
+                    g.sync = if ((try round_graph.current()).gate) .{ .ctx = f, .run = syncGatedEnd } else .{ .ctx = f.runner, .run = syncRunner };
                     f.gate = g;
                 } else std.log.scoped(.dsv41).warn("engram gate off: no packed table (TF_DSV41_ENGRAM_DIR)", .{});
             }
@@ -940,6 +945,21 @@ pub const Forward = struct {
     fn syncRunner(ctx: *anyopaque) anyerror!void {
         const r: *run.Runner = @ptrCast(@alignCast(ctx));
         try r.stream.synchronize();
+    }
+
+    /// TF_DSV41_ROUND_GRAPH's `gate`: the gate's arm waits for the last gated window's end, not for everything queued
+    /// since (a keep's carries, a row table: the GPU drained before the window's launch).
+    fn syncGatedEnd(ctx: *anyopaque) anyerror!void {
+        const f: *Forward = @ptrCast(@alignCast(ctx));
+        if (f.gated_end) |e| return e.synchronize();
+        try f.runner.stream.synchronize();
+    }
+
+    /// After a window's launches (one-slot or row): a gated window's end recorded for the next arm (`syncGatedEnd`).
+    pub fn gatedEnd(f: *Forward) !void {
+        if (!f.gated or f.gate == null or !(try round_graph.current()).gate) return;
+        if (f.gated_end == null) f.gated_end = try cuda.Event.init(f.runner.d, false);
+        try f.gated_end.?.record(f.runner.stream);
     }
 
     /// The armed round's errors (a failed read, a GPU wait past the timeout); nothing when no window was gated.
@@ -1045,7 +1065,20 @@ pub const Forward = struct {
         r.glue = .{ .ctx = f, .run = glueFn };
         g.current = cs;
         const t0 = ph.nowNs();
-        const outcome = try g.cache.run(key, r.stream, f.fingerprint(g), .{ .ctx = f, .run = graphBody });
+        const fp = f.fingerprint(g);
+        // TF_DSV41_ROUND_GRAPH=split: the head's graph, then the tail's, launched while the GPU runs the head
+        const at = if (g.split) |rg| round_graph.splitAt(cs, rg.head) else null;
+        var outcome: graphs.gc.Outcome = .replayed;
+        if (at) |i| {
+            g.span = .{ 0, i };
+            const o1 = try g.cache.run(.{ .rows = key.rows, .ctx = key.ctx, .part = 1 }, r.stream, fp, .{ .ctx = f, .run = graphBody });
+            g.span = .{ i, cs.len };
+            outcome = try g.cache.run(.{ .rows = key.rows, .ctx = key.ctx, .part = 2 }, r.stream, fp, .{ .ctx = f, .run = graphBody });
+            if (o1 == .captured) outcome = .captured;
+        } else {
+            g.span = .{ 0, cs.len };
+            outcome = try g.cache.run(key, r.stream, fp, .{ .ctx = f, .run = graphBody });
+        }
         if (f.phases) |x| x.add(if (outcome == .captured) .@"graph.capture" else .@"graph.replay", ph.nowNs() - t0);
         if (outcome == .captured and g.cache.stats.captured == 1)
             std.log.scoped(.dsv41).info("graphs: first capture ({d} rows, context bucket {d})", .{ key.rows, key.ctx });
@@ -1055,7 +1088,8 @@ pub const Forward = struct {
     fn graphBody(ctx: *anyopaque, stream: cuda.Stream) anyerror!void {
         const f: *Forward = @ptrCast(@alignCast(ctx));
         _ = stream; // the runner's stream: the one the cache captures
-        try f.runner.window(f.graphed.?.current);
+        const g = f.graphed.?;
+        try f.runner.window(g.current[g.span[0]..g.span[1]]);
     }
 
     /// The addresses a graphed window bakes in beyond the runner's bound roles: any change drops every graph.
@@ -1094,6 +1128,9 @@ pub const Graphed = struct {
     stages: std.ArrayList(graphs.EngramStage) = .empty,
     programs: std.AutoHashMapUnmanaged(graphs.Key, []const calls.Call) = .empty,
     current: []const calls.Call = &.{},
+    /// the calls of `current` the graph body issues (TF_DSV41_ROUND_GRAPH's `split`: the head's, then the tail's)
+    span: [2]usize = .{ 0, 0 },
+    split: ?round_graph.Settings = null,
     active: bool = false,
 
     fn init(g: *Graphed, f: *Forward, s: graphs.Settings) !void {
@@ -1111,7 +1148,10 @@ pub const Graphed = struct {
         errdefer g.agreement.deinit();
         g.statics = try graphs.Statics.init(r.d, rows);
         errdefer g.statics.deinit();
-        g.cache = graphs.Cache.init(f.gpa, g.engine.engine(), .{ .on = true, .max = s.max });
+        const rg = try round_graph.current();
+        if (rg.split) g.split = rg;
+        // `split`: a window's head and tail graphs in one cache of twice the cap (a head is ~1/43 of a window)
+        g.cache = graphs.Cache.init(f.gpa, g.engine.engine(), .{ .on = true, .max = if (rg.split) 2 * s.max else s.max });
         g.cache.agree = g.agreement.agree();
         g.cache.room = roomFn;
         room_floor = s.floor_gib;

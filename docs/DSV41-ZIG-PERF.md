@@ -506,3 +506,115 @@ of it.
   `tf-dsv41-test` runs mhc_pf + coef_kernel on the same inputs and compares the streams, the collapsed row, the tap,
   the partials and the coefficients bit for bit, and the normed input from those partials on the host.
 - Spark: an A/B of the code x4 and mix cells with `TF_DSV41_MHC_PFDEC=17` (then `=1`), replies vs Python 4/4.
+
+## 8. The round's launches: where a round idles, and TF_DSV41_ROUND_GRAPH (2026-10-09, offline)
+
+### 8.1 Measured: the GPU idles 2 % of a round
+
+Source: the served 4-stream code cell under nsys (`zig-nsys-20261008-134407`, rank 0, Zig at 141.5 tok/s, Python at
+146.7). Rounds are cut at `pick_pack_kernel` (once a round), over the capture's middle 60 % (72 rounds). Tool:
+`tools/zig/dsv41_perf/roundgap.py <sqlite>`: the busy union of every kernel, copy and memset on every stream, the
+idle between them, each gap named by its bounding launches.
+
+| per round (code x4) | Zig | Python |
+| --- | ---: | ---: |
+| span | 106.5 ms | 104.6 ms |
+| GPU busy | 104.4 | 102.0 |
+| GPU idle | **2.13** (2.0 %) | **2.54** (2.4 %) |
+
+Zig's GPU already idles less than Python's. A round is about 98 % GPU work, so even a perfect one-graph round cannot
+gain more than ~2 % in this cell. What remains is GPU time: the window's expert stream (`ld_kernel`, 65.9 ms a
+round), the exchanges (`tp_roce`, 4.0 ms, part of it spin while rank 1 catches up) and the glue. That is the R1 glue
+family and the prefill work (sections 4 and 7), not the host.
+
+Zig's idle, by where it falls in the round (medians):
+- **pass end -> window: 1.36 ms.** In host order:
+  - 0.64 ms: the pass's candidates and head hidden downloaded (225 KB), the host chain (`draft.chain`, 0.33 ms), the
+    lanes' take, then the keep;
+  - 0.23 ms: the keep's 12 `carry_kernel` launches and the row table's HtoD, paced by the host. The Engram gate's arm
+    then synchronizes the stream (`Gate.arm` -> `syncRunner`), so the GPU has drained before the window is
+    submitted;
+  - **0.48 ms: the window graph's `cuGraphLaunch` itself.** The host is inside the call for 0.48 ms, and the window's
+    first kernel starts as it returns.
+- pick -> pass: 1.39 ms, but mostly busy. The device accept, the drafter's eager ingest kernels and `ds_stage_rows`
+  are enqueued ahead by `after_pick`, so only ~0.2 ms of small gaps remain.
+- inside graphs: ~0.7 ms of gaps under 10 us (kernel-to-kernel), not addressable by graph boundaries.
+
+Only this cell was captured. In the 1-stream code cell, a ~39.6 ms round has the same per-round host costs, but the
+chain is per slot (0.16 ms), so the transition is ~1.2 ms and the idle share of the round about 3-4 %.
+
+### 8.2 Why not one graph for the whole round
+
+The window's rows are not known when the pass is launched. Each slot's depth `k` is chosen after the chain from its
+confidences (`win.allocate` -> `Policy.choose` -> `Depth.chooseJoint`, prod's depth policy). The window graph is
+keyed by its row bucket. Its Engram rows are read on the host from the drafts (the gate's worker), and the
+follower's window waits for rank 0's op 17. One launch across pass and window needs all of these on the device:
+- the chain on the GPU, exactly;
+- the depth policy on the GPU (f64 calibration tables);
+- a conditional SWITCH node over row buckets, each body a whole window;
+- device-side graph launch, or the Engram worker woken from the device;
+- the follower's plan carried by the device.
+
+That is several weeks of GPU-only work with no host gate, for at most ~2 % here. Two exact host changes take most of
+the idle, plus a faster host chain:
+
+### 8.3 TF_DSV41_ROUND_GRAPH (default off; round_graph.zig)
+
+`1` = every part, or words: `split`, `gate`.
+- **`split`**: the window's graph is captured and launched as a head (its first `TF_DSV41_ROUND_GRAPH_HEAD` layers,
+  default 1) and a tail. The head's launch carries ~1/43 of the nodes, so the GPU starts within tens of microseconds
+  and runs the head (0.8-2.2 ms a layer) while the host is inside the tail's 0.45 ms launch.
+  - The boundary is the first call of layer `head` at which neither the branches' side stream nor the mHC deferred
+    stream is open (`splitAt`). The head's end joins the L2 prefetchers, which adds an ordering, never a different
+    launch.
+  - Keys get a `part` (1 head, 2 tail). One cache at twice `TF_DSV41_GRAPHS_MAX` holds both. The row path
+    (batch.zig) and the one-slot path (forward.zig) both split.
+- **`gate`**: the Engram gate's arm waits for an event recorded after the last gated window, not for the whole
+  stream. The guarantee is unchanged: every window armed before has read its rows. The keep's carries, the row table
+  and the window's launch then overlap instead of draining first.
+- Always on (no knob), **the host chain in vector lanes** (draft/dspark.zig `markovZ`, `Markov.hidDots`):
+  - the Markov bias runs 8 candidates at a time, each lane its candidate's own sum in rank order (bf16 products are
+    exact in f32);
+  - the confidence head's hidden dot runs 8 rows at a time, each lane its row's own sequential sum;
+  - same products, same additions, same order, no contraction: the same bits (dspark.zig's test against the
+    one-at-a-time code, greedy and keyed chains).
+  - Dev box, prod's shape (4 slots x 5 rows, 128 candidates, rank 256, hidden 5120, 129K vocab): 1.30 -> 0.69 ms a
+    round. The Spark's old chain was 0.33 ms, so ~0.17 ms expected.
+
+Bits: no launch, operand or order changes. Graph boundaries and host waits move, and the chain is the same arithmetic.
+Replies, draws and drafts are the knob-off round's.
+
+Host gates (2026-10-09):
+- `test-dsv41`: the knob's words;
+- `test-dsv41-rows`: `splitAt` on the served row window (row mode, 4 slots, R1 on / off, branches + MHC_DEFER
+  on / off, 1 / 5 / 16 rows, heads of 1 / 2 / 7 layers). Head + tail is the window, no side or deferred fork is open
+  at the boundary, the tail's first side launch follows its own fork, and the head holds exactly its layers;
+- `test-dsv41-draft`: the chain lanes bit for bit.
+- plus the full gate list, with the emitter checks at 0 mismatches.
+
+Expected per round, both ranks: about -0.45 ms (split), -0.1..-0.2 ms (gate: the keep and table no longer drained
+before the launch), -0.17 ms (chain at 4 streams, -0.05 at 1). The follower's start lag shrinks with its own launch.
+
+| cell | round now | saved | expected tok/s |
+| --- | ---: | ---: | ---: |
+| code x1 | ~39.6 ms | ~0.6-0.7 ms | 89.8 -> ~91.3 (+1.6 %) |
+| code x4 | ~106 ms | ~0.75-0.8 ms | 143.2 -> ~144.3 (+0.7 %) |
+| mix (4 short) | ~106 ms + prefill | ~0.75 ms a round | 133.1 -> ~133.9 (+0.6 %) |
+| prose x4 | ~106 ms | ~0.75 ms | 101.0 -> ~101.7 (+0.7 %) |
+| 131K | longer rounds | ~0.6 ms | 67.0 -> ~67.3 (+0.4 %) |
+
+This is not the lever that beats Python in the 4-stream cells: there the gap is prefill (section 7) and GPU time.
+
+**NEXT SPARK WINDOW, step RG** (kit built from this branch; dsq-zig-loop-1):
+1. **RG-1**: `zig-bench.sh zig` with prod-zig.env as is (knob off), then again with `TF_DSV41_ROUND_GRAPH=1` on both
+   ranks (label `zig-rg`), `PARTS="replies speed"`.
+   - PASS: replies 16/16 vs prod for both labels;
+   - every T0 and T0.7 cell's reply sha equal between the two labels (keyed draws: the same keys);
+   - tokens a round equal to the third decimal;
+   - decode tok/s higher with the knob on (code x1 most).
+2. **RG-2**: the nsys capture of the code x4 cell, plus one code x1, with the knob on, then
+   `roundgap.py nsys-zig.sqlite`.
+   - Expected: "pass end -> next graphed kernel" ~0.5 ms (was 1.36), "cuGraphLaunch host time before its first
+     kernel" ~0.03 ms (was 0.48), GPU idle ~1.3 ms a round (was 2.13).
+   - If the gain is lower, try `TF_DSV41_ROUND_GRAPH_HEAD=2`.
+3. **Rollback**: `TF_DSV41_ROUND_GRAPH=0` (unset). On a FAIL, set the failing word off: `split` alone, or `gate` alone.
