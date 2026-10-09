@@ -67,6 +67,9 @@ pub const Batch = struct {
     stages: std.ArrayList(graphs.EngramStage) = .empty,
     /// each key's row program (emitted once, the forward's arena)
     programs: std.AutoHashMapUnmanaged(graphs.Key, []const calls.Call) = .empty,
+    /// each key's program's last "w.taps" call (run.lastTaps, once a key: a scan of every argument of ~1,300 calls at
+    /// 24 rows, which ran before every window's launch)
+    taps_at: std.AutoHashMapUnmanaged(graphs.Key, ?usize) = .empty,
     g: ?Graphs = null,
     pend: []?Pend,
     /// the last window's rows (real, padded)
@@ -92,6 +95,13 @@ pub const Batch = struct {
         captures: u64 = 0,
         capture_ns: u64 = 0,
         eager: u64 = 0,
+        /// a window's host time on the round's critical path, by stretch: `prep` (checks, the plan link's send, pages,
+        /// the program), `stage` (the row table, Engram's arm or rows), `launch` (the graph's launch or the eager
+        /// window); `keep_ns`: the keeps (carries)
+        prep_ns: u64 = 0,
+        stage_ns: u64 = 0,
+        launch_ns: u64 = 0,
+        keep_ns: u64 = 0,
     } = .{},
     /// the session store (model.zig): each slot's kept rows are its committed ids
     sess: ?*sessions_gpu.Sessions = null,
@@ -152,6 +162,7 @@ pub const Batch = struct {
         for (b.stages.items) |*st| st.deinit();
         b.stages.deinit(b.gpa);
         b.programs.deinit(b.gpa);
+        b.taps_at.deinit(b.gpa);
         b.tab.deinit();
         b.gpa.free(b.pend);
         b.gpa.destroy(b);
@@ -206,6 +217,7 @@ pub const Batch = struct {
 
     fn runRows(b: *Batch, mix: []const rowtab.Seg, ids: []const u32, more: bool) !void {
         const f = b.f;
+        var tp = ph.nowNs();
         try rowtab.check(mix, b.ss.n, @intCast(f.opts.limit));
         const n = rowtab.totalRows(mix);
         if (ids.len != n) return error.BadWindow;
@@ -222,8 +234,11 @@ pub const Batch = struct {
         const key: graphs.Key = .{ .rows = R, .ctx = graphs.bucketOf(rowtab.lastPos(mix), s.bucket, s.grow) };
         const cs = try b.program(key, s);
         const r = f.runner;
+        b.lap(&tp, &b.stats.prep_ns);
         try b.tab.stage(r.stream, mix, ids, R, b.ss.n);
         try b.stageEngram(mix, ids, R);
+        b.lap(&tp, &b.stats.stage_ns);
+        defer b.lap(&tp, &b.stats.launch_ns);
         var a: u32 = 0;
         for (mix) |m| {
             b.pend[m.slot] = .{ .a = a, .start = m.start, .n = m.rows };
@@ -247,7 +262,7 @@ pub const Batch = struct {
         b.marked = false;
         if (r.taps_mark) |*m| {
             m.armed = true;
-            b.marked = run.lastTaps(cs) != null;
+            b.marked = (b.taps_at.get(key) orelse null) != null;
         }
         defer if (r.taps_mark) |*m| {
             m.armed = false;
@@ -301,6 +316,7 @@ pub const Batch = struct {
         const start = graphs.emitStart(key.rows, key.ctx, s, @intCast(f.opts.limit));
         const one = try block.emit(a, f.cfg, f.widths, rowOptions(f), try f.backbone(a), key.rows, start, true);
         const cs = try rowmode.transform(a, one, key.rows, .{ .slots = b.ss.n, .rmax = b.cap, .pts = f.kv.?.slot.max_pages });
+        try b.taps_at.put(b.gpa, key, run.lastTaps(cs));
         try b.programs.put(b.gpa, key, cs);
         return cs;
     }
@@ -308,6 +324,8 @@ pub const Batch = struct {
     /// Commits slot's pending window: its first row + `accepted` drafts (Forward.keep, by row).
     pub fn keep(b: *Batch, slot: u32, accepted: u32) !void {
         const p = b.pend[slot] orelse return error.BadWindow;
+        var tk = ph.nowNs();
+        defer b.lap(&tk, &b.stats.keep_ns);
         if (accepted >= p.n) return error.BadWindow;
         const f = b.f;
         if (b.ss.leads()) try f.link.?.send(&.{ slots_mod.op_rows_keep, slot, accepted });
@@ -691,6 +709,13 @@ pub const Batch = struct {
     }
 
     /// The addresses a row graph bakes in beyond its program's roles: any change drops every graph.
+    /// Adds the time since `*t` to `*acc` and restarts `*t`.
+    fn lap(_: *const Batch, t: *u64, acc: *u64) void {
+        const now = ph.nowNs();
+        acc.* += now - t.*;
+        t.* = now;
+    }
+
     fn fingerprint(b: *const Batch) u64 {
         const f = b.f;
         var h = std.hash.Wyhash.init(0x5107);
