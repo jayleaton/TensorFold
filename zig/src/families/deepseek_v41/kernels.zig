@@ -58,6 +58,17 @@ pub const images = struct {
     pub const router_glue: []const u8 = if (available) &Blob("dsv41_fatbin_dsv41_router_glue").bytes else &.{};
 };
 
+/// lin2.cu (ours, TF_DSV41_LIN2): optional (zig/build/cuda.zig), an empty image when the build has none.
+const Lin2Blob = struct {
+    pub const bytes align(16) = @embedFile("dsv41_fatbin_dsv41_lin2").*;
+};
+pub const lin2_image: []const u8 = &Lin2Blob.bytes;
+
+fn env(name: [:0]const u8) ?[]const u8 {
+    const v = std.c.getenv(name) orelse return null;
+    return std.mem.span(v);
+}
+
 pub const Kernels = struct {
     mods: [28]cuda.Module,
     kv_glue: kv_glue.Functions,
@@ -87,10 +98,23 @@ pub const Kernels = struct {
         const m = k.mods;
         k.ops = try ops.Functions.resolve(m[7], m[8], m[9], m[10], m[11], .{ m[12], m[13], m[14], m[15] }, m[16], m[17], m[18], m[20], m[21], m[22], m[23], m[25], optin);
         k.sms = @intCast(try ctx.attribute(.multiprocessor_count));
+        try k.loadLin2(d, try dense.lin2Mode(env("TF_DSV41_LIN2"), env("TF_DSV41_LIN2_PF")));
         return k;
     }
 
+    /// TF_DSV41_LIN2: lin2.cu's module and instances behind the dense launches (dense.Ops); refused when the build
+    /// has no lin2 fatbin (-Dnvcc, or -Dfatbins with dsv41_lin2.fatbin).
+    pub fn loadLin2(k: *Kernels, d: *const cuda.Driver, mode: dense.Lin2Mode) !void {
+        if (!mode.lanes and !mode.linear) return;
+        if (lin2_image.len == 0) return error.Lin2KernelNotBuilt;
+        var m = try cuda.Module.load(d, lin2_image);
+        errdefer m.unload();
+        k.dense.lin2 = try dense.Lin2.resolve(m, mode);
+        std.log.scoped(.dsv41).info("lin2: 17-32-row {s} launches as two-tile variants (one pass over the weights){s}", .{ if (mode.lanes and mode.linear) "dense3 and linear.cu" else if (mode.lanes) "dense3" else "linear.cu", if (mode.linear and !mode.pf) ", linear2 without the k-step prefetch" else "" });
+    }
+
     pub fn deinit(k: *Kernels) void {
+        if (k.dense.lin2) |*l| l.module.unload();
         for (&k.mods) |*m| m.unload();
     }
 
