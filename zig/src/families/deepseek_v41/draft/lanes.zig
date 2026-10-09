@@ -160,7 +160,7 @@ pub const Lanes = struct {
         for (window, 0..) |*w, i| w.* = .{ .width = @intCast(i + 1), .ms = v[i] };
         const shared = try arena.alloc(lanes.config.Cost, @min(v.len, batch_rows));
         for (shared, 0..) |*w, i| w.* = .{ .width = @intCast(i + 1), .ms = v[i] };
-        return .{ .exact_width = costs_mod.slot_rows, .mtp = true, .speculate = true, .speculate_early = false, .drafts = x.opts.shape.block, .window_costs = window, .mtp_step_ms = 0.0, .hidden_rows = true, .batch_rows = batch_rows, .max_streams = x.opts.slots, .shared_costs = shared, .draft_probabilities = true, .draft_streams = true, .join_tail = x.target.vtable.tail != null and joinTail(), .piece_runs = envOn("TF_DSV41_PIECE_RUNS"), .replay_runs = envOn("TF_DSV41_REPLAY_RUNS") };
+        return .{ .exact_width = costs_mod.slot_rows, .mtp = true, .speculate = true, .speculate_early = false, .drafts = x.opts.shape.block, .window_costs = window, .mtp_step_ms = 0.0, .hidden_rows = true, .batch_rows = batch_rows, .max_streams = x.opts.slots, .shared_costs = shared, .draft_probabilities = true, .draft_streams = true, .join_tail = x.target.vtable.tail != null and joinTail(), .piece_runs = envOn("TF_DSV41_PIECE_RUNS"), .join_drafts = envOn("TF_DSV41_JOIN_DRAFTS"), .replay_runs = envOn("TF_DSV41_REPLAY_RUNS") };
     }
 
     /// TF_DSV41_TAIL_JOIN=1: a prompt in pieces leaves its last token to its first round's shared window (default off).

@@ -42,6 +42,8 @@ pub const Fake = struct {
     refuse_sampled: bool = false, // prefill refuses a sampled stream with error.SamplingRefused
     pieces_run: usize = 0, // prompt pieces run (`pieceBackend`)
     joins: usize = 0, // prompts whose last token joined a round (`joinBackend`)
+    drafts_calls: usize = 0, // `draft` calls, and the most requests one took
+    drafts_most: usize = 0,
     fail_runs: usize = 0, // the next this many `pieces` calls fail with error.Unbound (`runBackend`)
     runs: usize = 0, // `pieces` calls that ran
 
@@ -258,6 +260,8 @@ pub const Fake = struct {
 
     fn draft(ptr: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
         const x = self(ptr);
+        x.drafts_calls += 1;
+        x.drafts_most = @max(x.drafts_most, requests.len);
         for (requests) |r| {
             const l = x.lane(r.stream);
             // the head reads the last verify's kept rows (a shared round drafts before its rollback)

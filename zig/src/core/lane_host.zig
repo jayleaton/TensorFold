@@ -556,6 +556,38 @@ pub const LaneHost = struct {
                 return;
             };
         }
+        if (h.core.cfg.join_tail and h.core.cfg.join_drafts) {
+            // the round's finals together: the joined prompts' first drafts in one pass (Engine.finishStreams)
+            var ss: [16]*lanes.Stream = undefined;
+            var jobs: [16]*Job = undefined;
+            var errs: [16]?anyerror = undefined;
+            var at: usize = 0;
+            while (at < h.finals.items.len) {
+                var n: usize = 0;
+                while (at < h.finals.items.len and n < ss.len) : (at += 1) {
+                    const job: *Job = @ptrFromInt(h.finals.items[at]);
+                    if (job.stream.finished) continue;
+                    ss[n] = &job.stream;
+                    jobs[n] = job;
+                    n += 1;
+                }
+                h.core.finishStreams(ss[0..n], errs[0..n]) catch |e| for (errs[0..n]) |*x| {
+                    x.* = e;
+                };
+                for (jobs[0..n], errs[0..n]) |job, x| {
+                    if (x) |e| {
+                        if (e == error.Cancelled) {
+                            h.core.discard(&job.stream);
+                            h.remove(job);
+                            h.finish(job, .cancelled, "");
+                        } else _ = h.drop(job, h.words(e));
+                        continue;
+                    }
+                    h.prefilled(job, job.began);
+                }
+            }
+            return;
+        }
         for (h.finals.items) |key| {
             const job: *Job = @ptrFromInt(key);
             if (job.stream.finished) continue;

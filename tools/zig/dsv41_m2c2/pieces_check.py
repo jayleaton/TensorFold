@@ -11,6 +11,9 @@ Model.open, serve_engine.zig, sess4_cli.zig):
 - each reference (`--refs`): ref.json with prompt_ids and tokens; its prompt plus `--steps` within TF_DSV41_CONTEXT;
   the pool (TF_DSV41_POOL_TOKENS) holds every chat at once;
 - with `--names` (the engine's knob names, build-kit.sh): every TF_ / GLM53_ / SESS4_ key set is one it reads.
+`--pending` (the dry run before the stage ran): the files the stage builds itself (the references, the assets' aot/ and
+engram-host.bin) may be absent ("pend"); the references' limits are checked from `--prompt-lens` instead, and the kit
+fill's own aot (every cubin) in place of the run's set.
 Prints the effective env and one line a check; exit 1 on any failure ("pieces_check: FAIL ..."). Standard library only.
 """
 
@@ -36,6 +39,9 @@ def main() -> int:
     ap.add_argument("--kit-aot", help="the kit fill's aot dir (host path)")
     ap.add_argument("--steps", type=int, default=24)
     ap.add_argument("--names", help="the engine's knob names, one a line")
+    ap.add_argument("--pending", action="store_true", help="the stage has not built its own files yet")
+    ap.add_argument("--prompt-lens", type=lambda v: [int(x) for x in v.split(",") if x], default=[],
+                    help="the references' prompt lengths (with --pending)")
     a = ap.parse_args()
     maps = sorted((m.split("=", 1) for m in a.map), key=lambda m: -len(m[0]))
     fails: list[str] = []
@@ -53,6 +59,13 @@ def main() -> int:
                 continue
             return p
         return p
+
+    def pend(what: str, path: str) -> bool:
+        """With --pending, a file the stage builds: absent is fine (not checked yet)."""
+        if a.pending and not os.path.exists(path):
+            print(f"pieces_check: pend {what}: {path} (the stage builds it)", flush=True)
+            return True
+        return False
 
     def ok(what: str, cond: bool, detail: str = "") -> bool:
         print(f"pieces_check: {'ok  ' if cond else 'FAIL'} {what}{(': ' + detail) if detail else ''}", flush=True)
@@ -91,8 +104,12 @@ def main() -> int:
         ok("rope.bin rows >= TF_DSV41_CONTEXT + 2048", rows >= rows_need, f"{rows} rows, {rows_need} needed")
         ok("rope.bin size = its header's", size == 16 + 2 * rows * cols * 4, f"{size} bytes, {rows} x {cols}")
     ehb = host(os.path.join(a.assets, "engram-host.bin"))
-    ok("engram-host.bin", os.path.isfile(ehb) and os.path.getsize(ehb) > 0, ehb)
+    if not pend("engram-host.bin", ehb):
+        ok("engram-host.bin", os.path.isfile(ehb) and os.path.getsize(ehb) > 0, ehb)
     aotj = host(os.path.join(a.assets, "aot", "aot.json"))
+    if a.pending and not os.path.exists(aotj) and a.kit_aot:
+        pend("aot/aot.json", aotj)
+        aotj = os.path.join(a.kit_aot, "aot.json")       # the kit fill's own set: its every cubin
     if ok("aot/aot.json", os.path.isfile(aotj), aotj):
         have = {k["hash"] for k in json.load(open(aotj))["kernels"]}
         cub = os.path.join(os.path.dirname(aotj), "cubins")
@@ -110,8 +127,14 @@ def main() -> int:
             ok(f"{k}'s directory exists", os.path.isdir(d), d)
 
     total = 0
+    if a.pending:
+        for n in a.prompt_lens:
+            ok(f"prompt of {n}: prompt + steps within TF_DSV41_CONTEXT", n + a.steps <= context, f"{n + a.steps} <= {context}")
+            total += n + a.steps
     for r in a.refs:
         j = host(os.path.join(r, "ref.json"))
+        if pend(f"reference {r}", j):
+            continue
         if not ok(f"reference {r}", os.path.isfile(j), j):
             continue
         ref = json.load(open(j))
@@ -124,7 +147,8 @@ def main() -> int:
         ok("TF_DSV41_POOL_TOKENS holds every chat at once", int(env["TF_DSV41_POOL_TOKENS"]) >= total,
            f"{env['TF_DSV41_POOL_TOKENS']} >= {total}")
     slots = int(env.get("TF_DSV41_SLOTS", "1"))
-    ok("TF_DSV41_SLOTS holds every chat", slots >= len(a.refs), f"{slots} slots, {len(a.refs)} chats")
+    chats = max(len(a.refs), len(a.prompt_lens))
+    ok("TF_DSV41_SLOTS holds every chat", slots >= chats, f"{slots} slots, {chats} chats")
     if fails:
         print(f"pieces_check: FAIL {len(fails)} check(s): {'; '.join(fails)}", flush=True)
         return 1

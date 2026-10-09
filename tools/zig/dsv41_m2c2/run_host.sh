@@ -34,9 +34,10 @@ log() { echo "[m2c2 r$RANK $(date +%H:%M:%S)] $*" | tee -a "$OUT/run.log"; }
 drop_caches() { sync; sudo -n sh -c 'echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null || sh -c 'echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null || log "drop_caches refused"; }
 
 # preflight: nothing else on the GPU, the kit intact, the tree and pack where prod keeps them
-# PIECES_DRYRUN=1 (with PIECES=1 PIECES_ONLY=1, on any host): the stage's own code without containers, from an OUT that
-# already holds pieces/ref-batched and pieces/ref-alone: the run's assets dir, its env and pieces_check.py's preflight
-# of every file and limit each Zig run boots with (the dev box's dry run before a Spark slot)
+# PIECES_DRYRUN=1 (with PIECES=1 PIECES_ONLY=1, on any host): the stage's own code without containers: the run's assets
+# dir, its env and pieces_check.py's preflight of every file and limit each Zig run boots with, on a fresh OUT too (the
+# files the stage builds itself are "pend", the prompts' limits from PIECES_PROMPTS; an OUT a real run left is checked
+# in full)
 DRY=${PIECES_DRYRUN:-0}
 if [[ "$DRY" != 1 ]]; then
 if docker ps --format '{{.Names}}' | grep -q 'dsv41'; then log "a dsv41 container is running: stop prod first (RUNBOOK.md)"; exit 2; fi
@@ -231,7 +232,8 @@ print(f"pieces: Python batched == alone, tokens: {same}/{len(ps)} (informational
         names=(); [[ -f "$KIT/tools/zig/dsv41_m2c2/knob-names.txt" ]] && names=(--names "$KIT/tools/zig/dsv41_m2c2/knob-names.txt")
         python3 -B "$KIT/tools/zig/dsv41_m2c2/pieces_check.py" --env-file "$fillenv" $(printf -- '--set %s ' "${zenv[@]}") \
             $(printf -- '--map %s ' "${mounts[@]}") --assets "$A" --refs "${refs[@]}" --kit-aot "$KIT/triton-fill/aot" \
-            --steps "$psteps" "${names[@]}" > "$OUT/pieces/check-runs$runs.log" 2>&1
+            --steps "$psteps" "${names[@]}" $( [[ "$DRY" == 1 ]] && echo --pending --prompt-lens "$(echo $prompts | tr ' ' ',')" ) \
+            > "$OUT/pieces/check-runs$runs.log" 2>&1
         crc=$?; log "pieces: run $runs preflight: $(tail -1 "$OUT/pieces/check-runs$runs.log")"
         (( crc == 0 )) || pfail "run $runs preflight ($(grep -h '^pieces_check: FAIL [^0-9]' "$OUT/pieces/check-runs$runs.log" | head -3 | cut -c20- | tr '\n' ';'))"
         [[ "$DRY" == 1 ]] && continue

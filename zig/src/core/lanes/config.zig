@@ -33,6 +33,7 @@ pub const Model = struct {
     head_trees: bool = false, // the head drafts trees of lanes (DraftRequest.lanes) and holds them
     join_tail: bool = false, // a prompt in pieces leaves its last token for the next shared round's window (Backend.join)
     piece_runs: bool = false, // a round's pieces go to the backend in one call (Backend.pieces: one forward over them)
+    join_drafts: bool = false, // with join_tail: a round's joined prompts' first drafts in one call (Engine.finishStreams)
     replay_runs: bool = false, // a round's finals go to the backend together first (Backend.finals)
     lane_costs: []const Cost = &.{}, // a lone stream's window ms by rows, up to its widest tree (timed at load)
 };
@@ -61,6 +62,8 @@ pub const Config = struct {
     join_tail: bool = false,
     /// a round's pieces of several streams in one backend call (Backend.pieces), which may run them as one forward
     piece_runs: bool = false,
+    /// with join_tail: a round's joined prompts get their first drafts in one backend call (Python's `_windows`)
+    join_drafts: bool = false,
     /// a round's finished prompts to the backend together before their finishes (Backend.finals)
     replay_runs: bool = false,
     head_lanes: u32 = 0, // a lone stream's lanes at most, the planner picking each round's (0: the depth rule's chain)
@@ -124,6 +127,7 @@ pub const Config = struct {
             .head_trees = m.head_trees,
             .join_tail = m.join_tail,
             .piece_runs = m.piece_runs,
+            .join_drafts = m.join_drafts,
             .replay_runs = m.replay_runs,
             .depth_prior = depth_prior,
             .family_costs = family_costs,
