@@ -70,6 +70,14 @@ pub const Fate = struct {
         f.die(msg, true);
     }
 
+    /// This rank failed while booting (after the session came up, before serving): every rank goes down with its
+    /// reason (`fatal`), and the channel's thread is stopped and joined before the caller frees what holds this Fate.
+    /// In serving `fatal` exits the process; where it returns (tests), the thread may not outlive the memory.
+    pub fn failBoot(f: *Fate, where: []const u8, err: anyerror) void {
+        f.fatal(where, err);
+        f.close();
+    }
+
     /// A normal stop is coming (rank 0 before it tells the others to stop; the others when told): hang-ups that
     /// follow are no failure.
     pub fn expectStop(f: *Fate) void {
