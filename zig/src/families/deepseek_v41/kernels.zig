@@ -98,7 +98,7 @@ pub const Kernels = struct {
         const m = k.mods;
         k.ops = try ops.Functions.resolve(m[7], m[8], m[9], m[10], m[11], .{ m[12], m[13], m[14], m[15] }, m[16], m[17], m[18], m[20], m[21], m[22], m[23], m[25], optin);
         k.sms = @intCast(try ctx.attribute(.multiprocessor_count));
-        try k.loadLin2(d, try dense.lin2Mode(env("TF_DSV41_LIN2"), env("TF_DSV41_LIN2_PF")));
+        try k.loadLin2(d, try dense.lin2ModeWk(env("TF_DSV41_LIN2"), env("TF_DSV41_LIN2_PF"), env("TF_DSV41_LIN2_WK")));
         return k;
     }
 
@@ -110,7 +110,7 @@ pub const Kernels = struct {
         var m = try cuda.Module.load(d, lin2_image);
         errdefer m.unload();
         k.dense.lin2 = try dense.Lin2.resolve(m, mode);
-        std.log.scoped(.dsv41).info("lin2: 17-32-row {s} launches as two-tile variants (one pass over the weights){s}", .{ if (mode.lanes and mode.linear) "dense3 and linear.cu" else if (mode.lanes) "dense3" else "linear.cu", if (mode.linear and !mode.pf) ", linear2 without the k-step prefetch" else "" });
+        std.log.scoped(.dsv41).info("lin2: 17-32-row {s} launches as two-tile variants (one pass over the weights){s}{s}", .{ if (mode.lanes and mode.linear) "dense3 and linear.cu" else if (mode.lanes) "dense3" else "linear.cu", if (mode.linear and !mode.pf) ", linear2 without the k-step prefetch" else "", if (mode.lanes and !mode.wk8) ", lanes2 at 4-warp CTAs only" else if (mode.lanes and !mode.wk4) ", lanes2 at 8-warp CTAs only" else "" });
     }
 
     pub fn deinit(k: *Kernels) void {

@@ -1534,3 +1534,78 @@ kernel, grid, block, registers and dynamic shared memory:
 Size: about 0.26 ms (boundary) + 0.1 ms (`_kv_store`) a 107 ms code x4 round, ~0.35 %; the whole kernel-time
 difference, all kinds, is ~0.9 ms a round. There is no broad small-kernel lever. TF_CUDA_SCHED stays (harmless,
 default unset) but is not expected to move anything.
+
+## 10. The 4-stream decode round, and the two-tile dense linears (TF_DSV41_LIN2=1, 2026-10-09, offline)
+
+### 10.1 What the c13 timeline shows (code T0 x4, 149.7 vs Python 145.4 tok/s)
+
+Spark nsys `zig-c13-20261009-131740` against Python's `zig-nsys-20261008-134407/nsys-pyn`, rounds between `_chain`
+launches in the middle 60 % of the capture:
+
+| per round | Zig c13 | Python |
+|---|---:|---:|
+| round | 101.1 ms | 104.6 ms |
+| GPU idle (roundgap.py) | 1.2 ms | - |
+| routed experts (ld_kernel, 86 launches) | 64.3 ms | 64.3 ms |
+| dense3 lanes_linear (197 launches) | 12.7 ms | 11.8 ms |
+| linear_kernel (heads, Engram, ingest) | 5.1 ms | 5.3 ms |
+| exchanges (tp_roce / gather_fast) | 3.8 ms | 3.9 ms |
+| mHC (sites, coefficients, Triton pair) | 2.9 ms | 3.9 ms |
+
+- The host is off the critical path: 1.2 ms of GPU idle a round. The drafter pass (~6.3 ms: three layers, a 1.7 ms
+  head, ds_cands) follows the target's pick in both engines. Its first input is the bonus token, so it cannot start
+  before the window's logits. Its ingest already overlaps the window (TF_DSV41_DRAFT_OVERLAP, side stream at ~92 ms).
+- Row buckets are the same in both engines: 64 % of the 4-slot windows are 24 rows.
+- Same-day pair (zign / pyn, the same row buckets, nothing concurrent): Zig's lanes_linear (320 programs) runs +11 %
+  and the mHC boundary +13 %. This is memory behaviour, ~1 ms a round (section 8 of the glue-mhc branch).
+
+### 10.2 The double decode
+
+dense3's `lanes_linear_kernel` and linear.cu's `linear_kernel` take a launch's rows 16 at a time
+(`for (m0 = 0; m0 < M; m0 += 16)`). Each pass loads and decodes every trellis tile again, so a 17-32-row launch
+decodes the weights twice.
+- lanes_linear (320 programs): 88.5 us at 24 rows against 44.6 at 10.
+- The head (505 programs, 6 bits): 1,585 against 1,098 us. The target's head and the drafter's head run every round,
+  and the drafter's 4-slot pass is 20 rows.
+
+### 10.3 lin2.cu (ours)
+
+lin2.cu includes both originals verbatim. Each decoded B fragment feeds the mma of both row tiles:
+- rows 0-15 and 16-31 keep their own accumulators and inputs;
+- each warp keeps its k range and its chain over ascending k steps;
+- each tile then runs the original's statements after its k loop, as its pass did: the warps' sums in warp order, the
+  Z partials and the split-order last arriver at its pass's counters, the Hadamard epilogue and the output rounding.
+
+So every output element has the original's bits. Only the launch bounds change, which changes no value.
+
+Instances:
+- `lanes2_kernel` at dense3's widths, as a 4-warp CTA (2 an SM) and an 8-warp CTA;
+- `linear2_kernel` at linear.cu's widths and CTA widths, with and without the k-step prefetch.
+
+ptxas (nvcc 13.3, sm_121): 0 spills. lanes2 uses 239-248 registers (the original: 166 at 3 CTAs an SM). linear2
+uses 166-174 registers without the prefetch and 192-243 with it (the head's original: 218).
+
+The knob:
+- `TF_DSV41_LIN2` = 1 | lanes | linear; `TF_DSV41_LIN2_PF` = 1 (default) | 0.
+- `kernels_dense.Ops.linear` / `lanesLinearRaw` swap the function for 17-32 rows, keeping the same grid, block and
+  shared memory.
+- The fatbin is optional (`dsv41_lin2`): without it the knob refuses at boot.
+- The boot logs a line starting "lin2:".
+
+Prefill does not decode twice: pfdense decodes a stage once into shared memory for all its m16 tiles. The CED
+replay's 127-row tails go through pfdense too. Routed experts (x3ld) decode again only for an expert with more than 16
+members (the shared expert in a 24-row window): ~1 % of their time, not worth the variant's occupancy.
+
+Expected on code x4: -4 to -6 ms a round (lanes_linear in 24-row windows ~40 % faster, both heads -0.4 ms). The drafter's
+20-row pass gains in prose x4 too. Windows of 16 rows or fewer (x1, most prose windows) are untouched.
+
+### 10.4 Spark steps
+
+- **L1** (one Spark, ~2 min): copy `dsv41-zig-ref/fatbin-lin2/dsv41_lin2.fatbin` (sha256 c75f37a2...) into the kit's
+  FATBINS, then run `tf-dsv41-test lin2`. It must print both PASS lines: every width, CTA shape and split at 17-32
+  rows equal to the original byte for byte, with the counters back at zero. Its timing lines then compare head pf
+  against no pf, and lanes2 against the original.
+- **L2**: code x4 all-on plus `TF_DSV41_LIN2=1` (with `TF_DSV41_LIN2_PF=0` if L1 timed it faster). Replies must
+  match Python's 4/4.
+- **L3**: L2 plus `TF_DSV41_DRAFT_TIMED=1`. Depth then prices from the measured rounds rather than Python's stored
+  table, which predates the cheaper 17-32-row windows.

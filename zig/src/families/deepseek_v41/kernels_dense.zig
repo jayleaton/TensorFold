@@ -260,10 +260,16 @@ fn linear2Symbol(comptime k2: u32, comptime wk: u32, comptime pf: bool) [:0]cons
 /// (one pass over the weights where the original makes two, every output element the original's): unset / empty /
 /// 0 none, 1 both, `lanes` dense3's (the attention's projections), `linear` linear.cu's (the head, the drafter's
 /// projections). TF_DSV41_LIN2_PF: linear2's k-step prefetch as the original's (1, the default) or per-tile loads
-/// (0: 170 registers against 243). Anything else is refused.
-pub const Lin2Mode = struct { lanes: bool = false, linear: bool = false, pf: bool = true };
+/// (0: 170 registers against 243). TF_DSV41_LIN2_WK: the dense3 launches lanes2 takes, by CTA width (4 | 8; unset:
+/// both): lanes2 runs 8 warps an SM where the original's 4-warp CTAs run 12, so `tf-dsv41-test lin2`'s timing may
+/// favour one width only. Anything else is refused.
+pub const Lin2Mode = struct { lanes: bool = false, linear: bool = false, pf: bool = true, wk4: bool = true, wk8: bool = true };
 
 pub fn lin2Mode(v: ?[]const u8, pf: ?[]const u8) !Lin2Mode {
+    return lin2ModeWk(v, pf, null);
+}
+
+pub fn lin2ModeWk(v: ?[]const u8, pf: ?[]const u8, wk: ?[]const u8) !Lin2Mode {
     var m: Lin2Mode = .{};
     const t = std.mem.trim(u8, v orelse "", " \t\r\n");
     if (t.len == 0 or std.mem.eql(u8, t, "0") or std.ascii.eqlIgnoreCase(t, "off")) {
@@ -280,6 +286,15 @@ pub fn lin2Mode(v: ?[]const u8, pf: ?[]const u8) !Lin2Mode {
         m.pf = true;
     } else if (std.mem.eql(u8, p, "0")) {
         m.pf = false;
+    } else return error.BadLin2;
+    const w = std.mem.trim(u8, wk orelse "", " \t\r\n");
+    if (w.len == 0) {
+        m.wk4 = true;
+        m.wk8 = true;
+    } else if (std.mem.eql(u8, w, "4")) {
+        m.wk8 = false;
+    } else if (std.mem.eql(u8, w, "8")) {
+        m.wk4 = false;
     } else return error.BadLin2;
     return m;
 }
@@ -466,7 +481,7 @@ pub const Ops = struct {
             if (per_warp % groupSteps(k2) != 0) return error.Shape;
         }
         var f = o.f.lanes[ki][ci orelse return error.Unsupported];
-        if (o.f.lin2) |l2| if (l2.mode.lanes and twoTile(M)) {
+        if (o.f.lin2) |l2| if (l2.mode.lanes and twoTile(M) and (if (wk == 8) l2.mode.wk8 else l2.mode.wk4)) {
             f = l2.lanes[ki][if (wk == 8) 1 else 0]; // TF_DSV41_LIN2: the same programs, one pass over the weights
         };
         try o.tableLaunch(f, tab, y_dtype, M, programs, wk, pdl);
@@ -559,6 +574,14 @@ test "TF_DSV41_LIN2 reader: unset / 0 / off none, 1 both, lanes / linear one, _P
     try t.expectEqual(Lin2Mode{ .linear = true, .pf = false }, try lin2Mode("linear", "0"));
     for ([_][]const u8{ "2", "head", "lanes,linear" }) |v| try t.expectError(error.BadLin2, lin2Mode(v, null));
     try t.expectError(error.BadLin2, lin2Mode("1", "on"));
+    // TF_DSV41_LIN2_WK: lanes2 at one CTA width only
+    const four = try lin2ModeWk("lanes", null, "4");
+    try t.expect(four.lanes and four.wk4 and !four.wk8);
+    const eight = try lin2ModeWk("1", "0", " 8 ");
+    try t.expect(eight.lanes and eight.linear and !eight.pf and !eight.wk4 and eight.wk8);
+    const both = try lin2ModeWk("1", null, null);
+    try t.expect(both.wk4 and both.wk8);
+    for ([_][]const u8{ "2", "48", "all" }) |w| try t.expectError(error.BadLin2, lin2ModeWk("1", null, w));
 }
 
 test "TF_DSV41_LIN2: only the original's two-pass launches (17-32 rows) take the variant" {
