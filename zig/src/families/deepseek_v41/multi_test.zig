@@ -12,6 +12,7 @@ const block = @import("block.zig");
 const bp = @import("block_prefill.zig");
 const check = @import("m1_check.zig");
 const ced = @import("ced.zig");
+const buffers = @import("buffers.zig");
 const Config = @import("config.zig").Config;
 
 const limit: i64 = 8192;
@@ -220,4 +221,42 @@ test "a run refuses what one segment's program must run alone" {
     try testing.expectError(error.Unsupported, bp.emitMulti(a, &cfg, &w, o, &l.all, &.{ .{ .slot = 0, .start = 0, .n = 2000 }, .{ .slot = 1, .start = 0, .n = 100 } }, .whole));
     // a decoder tail of 32 rows or fewer (the split mHC programs: its replay alone is another kernel path)
     try testing.expectError(error.Unsupported, bp.emitMulti(a, &cfg, &w, o, l.dec, &.{ .{ .slot = 0, .start = 0, .n = 100 }, .{ .slot = 1, .start = 0, .n = 32 } }, .decoder));
+}
+
+test "every role a run reads is in the buffer plan, at its run's rows (forward_prefill.plan: the one-segment programs + planRuns)" {
+    // Spark 2026-10-09: the runs' positions "w.mpos64" were in no planned program: every run failed with Unbound
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cfg: Config = .{};
+    var w = try widths(a);
+    var l: Layers = undefined;
+    try layersOf(&cfg, &l);
+    const o = options();
+    const rows: i64 = 2048;
+    var plan: buffers.Plan = .{ .a = a };
+    try plan.add(try bp.emitPrefill(a, &cfg, &w, o, &l.all, rows, 0, true));
+    try plan.add(try bp.emitReplay(a, &cfg, &w, o, l.enc, rows, 0, .encoder));
+    try plan.add(try bp.emitReplay(a, &cfg, &w, o, l.dec, ced.keep, 0, .decoder));
+    for ((try bp.planRuns(a, &cfg, &w, o, l.enc, l.dec, rows, .encoder)).items) |cs| try plan.add(cs);
+    const runs = [_]struct { part: bp.Part, spans: []const bp.Span }{
+        .{ .part = .encoder, .spans = &.{ .{ .slot = 0, .start = 0, .n = 1000 }, .{ .slot = 1, .start = 0, .n = 1048 } } },
+        .{ .part = .encoder, .spans = &.{ .{ .slot = 0, .start = 0, .n = 17 }, .{ .slot = 1, .start = 0, .n = 300 }, .{ .slot = 2, .start = 0, .n = 33 } } },
+        .{ .part = .decoder, .spans = &.{ .{ .slot = 0, .start = 0, .n = 127 }, .{ .slot = 1, .start = 0, .n = 127 }, .{ .slot = 2, .start = 0, .n = 127 }, .{ .slot = 3, .start = 0, .n = 64 } } },
+    };
+    for (runs) |r| {
+        const cs = try bp.emitMulti(a, &cfg, &w, o, if (r.part == .decoder) l.dec else l.enc, r.spans, r.part);
+        var need: buffers.Plan = .{ .a = a };
+        try need.add(cs);
+        for (need.sizes.keys(), need.sizes.values()) |role, bytes| {
+            const have = plan.sizes.get(role) orelse {
+                std.debug.print("role {s} of a run is in no planned program\n", .{role});
+                return error.TestUnplanned;
+            };
+            if (have < bytes) {
+                std.debug.print("role {s}: a run needs {d} bytes, the plan holds {d}\n", .{ role, bytes, have });
+                return error.TestUnplanned;
+            }
+        }
+    }
 }

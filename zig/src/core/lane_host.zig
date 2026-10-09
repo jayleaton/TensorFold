@@ -464,7 +464,7 @@ pub const LaneHost = struct {
                 n += 1;
             }
             if (n > 0) h.core.pieces(list[0..n]) catch |e| {
-                for (jobs[0..n]) |job| _ = h.drop(job, h.words(e));
+                for (jobs[0..n]) |job| h.dropPiece(job, h.words(e));
             };
         } else for (h.pieces.items) |piece| {
             if (!piece.run) continue;
@@ -472,7 +472,7 @@ pub const LaneHost = struct {
             const job: *Job = @ptrFromInt(piece.key);
             if (job.stream.finished) continue;
             h.core.piece(&job.stream, piece.start, piece.end, piece.save) catch |e| {
-                _ = h.drop(job, h.words(e));
+                h.dropPiece(job, h.words(e));
             };
         }
         const t1 = std.Io.Clock.awake.now(h.io).toNanoseconds();
@@ -506,6 +506,17 @@ pub const LaneHost = struct {
         }
         rd.vtable.after(rd.ctx, seconds(t1 - t0), seconds(t2 - t1));
         return did;
+    }
+
+    /// A job whose piece failed: dropped, and out of this round's finals (the planner may have listed its prompt as
+    /// finished in the same round; `drop` frees the job, so runFinals must not see its key).
+    fn dropPiece(h: *LaneHost, job: *Job, message: []const u8) void {
+        const key = @intFromPtr(job);
+        var i: usize = 0;
+        while (i < h.finals.items.len) {
+            if (h.finals.items[i] == key) _ = h.finals.orderedRemove(i) else i += 1;
+        }
+        _ = h.drop(job, message);
     }
 
     /// The prompts whose rows are in: each stream's last row (Engine.finishStream), then it decodes with the rounds.

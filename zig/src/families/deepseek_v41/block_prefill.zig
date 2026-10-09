@@ -1197,6 +1197,27 @@ pub fn emitMulti(a: std.mem.Allocator, cfg: *const Config, w: *const block.Width
     return e.out.items;
 }
 
+/// The multi-segment runs' programs at their largest, for the buffer plan (forward_prefill.plan): a run reads roles no
+/// one-segment program has (the run's positions "w.mpos64") and the run's rows' roles at up to `rows` rows. `enc`: a
+/// prompt piece run's layers (CED's encoder, or every layer in full mode: `part`); `dec`: CED's decoder layers (null in
+/// full mode), its runs of tails of 127 rows (ced.keep) up to `rows`. A run its options refuse (split KV) adds nothing.
+pub fn planRuns(a: std.mem.Allocator, cfg: *const Config, w: *const block.Widths, o: block.Options, enc: []const u32, dec: ?[]const u32, rows: i64, part: Part) !std.ArrayList([]const calls.Call) {
+    var out: std.ArrayList([]const calls.Call) = .empty;
+    if (rows > 2 * 17) {
+        const sp = [_]Span{ .{ .slot = 0, .start = 0, .n = rows - 17 }, .{ .slot = 1, .start = 0, .n = 17 } };
+        if (emitMulti(a, cfg, w, o, enc, &sp, part)) |cs| try out.append(a, cs) else |e| if (e != error.Unsupported) return e;
+    }
+    if (dec) |d| {
+        var tails: [16]Span = undefined;
+        const k: usize = @intCast(@min(16, @divFloor(rows, ced.keep)));
+        if (k >= 2) {
+            for (tails[0..k], 0..) |*t, i| t.* = .{ .slot = @intCast(i), .start = 0, .n = ced.keep };
+            if (emitMulti(a, cfg, w, o, d, tails[0..k], .decoder)) |cs| try out.append(a, cs) else |e| if (e != error.Unsupported) return e;
+        }
+    }
+    return out;
+}
+
 /// A prefill program's part: a whole segment, or one of CED replay's passes (ced.zig).
 pub const Part = enum { whole, encoder, decoder };
 
