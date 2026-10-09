@@ -240,6 +240,11 @@ pub const Pipe = struct {
     /// The rows in `full`, each gathered whole (every rank's vocabulary slice, rank order) and picked from all of its
     /// tokens (``count`` = their cut; 0: all of them, the nucleus fallback's ``fw.vocab``).
     fn wholeRows(p: *Pipe, dev: Device, lg: u64, s: Sampling, count: usize, positions: ?[]const u64, out: []u32) !void {
+        for (p.full.items) |r| out[r] = try p.wholeRow(dev, lg + 4 * @as(u64, r) * p.V, s, count, if (positions) |ps| ps[r] else 0);
+    }
+
+    /// One row at `row` (this rank's slice), gathered whole and picked at `position` (`wholeRows`' step).
+    fn wholeRow(p: *Pipe, dev: Device, row: u64, s: Sampling, count: usize, position: u64) !u32 {
         const W: usize = p.comm.world();
         const V: usize = p.V;
         const vt = dev.vtable;
@@ -247,15 +252,86 @@ pub const Pipe = struct {
         const host = try p.hostBytes(4 * W * V);
         const vals: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, host));
         for (p.ids[0 .. W * V], 0..) |*id, i| id.* = @intCast(i); // rank order: global id = the index
-        for (p.full.items) |r| {
-            try p.comm.allGather(lg + 4 * @as(u64, r) * V, recv, V, .f32, vt.stream(dev.ptr));
-            try vt.download(dev.ptr, recv, host);
-            @memcpy(p.values[0 .. W * V], vals);
-            const row: smp.Row = .{ .values = p.values[0 .. W * V], .ids = p.ids[0 .. W * V], .count = count };
-            const t = p.picker.pick(row, if (positions) |ps| ps[r] else 0, s);
-            out[r] = t.token; // no statistics: never .full_row
-            p.whole_rows += 1;
+        try p.comm.allGather(row, recv, V, .f32, vt.stream(dev.ptr));
+        try vt.download(dev.ptr, recv, host);
+        @memcpy(p.values[0 .. W * V], vals);
+        const r: smp.Row = .{ .values = p.values[0 .. W * V], .ids = p.ids[0 .. W * V], .count = count };
+        p.whole_rows += 1;
+        return p.picker.pick(r, position, s).token; // no statistics: never .full_row
+    }
+
+    /// A sampled segment of a forward's rows: rows [row0, row0 + n) of the logits under `s`, row i keyed at
+    /// `positions[i]` (followers: null), its tokens into `out`.
+    pub const Seg = struct { row0: u32, n: u32, s: Sampling, positions: ?[]const u64 = null, out: []u32 };
+
+    /// Whether `chooseSegments` takes a segment under `s`: a nucleus row on the candidates' path (top_k 0,
+    /// 0 < top_p < 1, TF_DSV41_NUCLEUS on, its count within the device top-k and one rank's slice within its columns).
+    pub fn batchable(p: *const Pipe, s: Sampling) bool {
+        if (!smp.isNucleus(s) or p.nucleus == 0 or p.V > max_cols) return false;
+        return @min(countOf(s, @intCast(@as(usize, p.V) * p.comm.world()), p.nucleus), p.V) <= max_k;
+    }
+
+    /// Several nucleus segments of one forward (`batchable`, ascending, not overlapping) in one call, as Python's
+    /// one ``cand_gather`` + one statistics exchange a forward: the top k over rows [first row0, last end) (rows
+    /// between them that no segment holds are computed and never read), each segment's statistics at its own
+    /// temperature, one gather of each, one download, then each row picked as `choose` picks it. Every device step is
+    /// a row's own (topk_keys a CTA a row, pack a row, the statistics a row from its row and T alone; the count is the
+    /// nucleus count for all), so each row's gathered candidates and statistics are the bits `choose` on its segment
+    /// gathers: the same tokens, nothing summed in another order. Every rank calls it with the same segments.
+    pub fn chooseSegments(p: *Pipe, dev: Device, lg: u64, segs: []const Seg) !void {
+        std.debug.assert(segs.len > 0);
+        const W: usize = p.comm.world();
+        const V: usize = p.V;
+        const count: usize = countOf(segs[0].s, @intCast(V * W), p.nucleus);
+        const k = @min(count, V);
+        const r0: usize = segs[0].row0;
+        var end: usize = r0;
+        for (segs) |g| {
+            if (!p.batchable(g.s) or countOf(g.s, @intCast(V * W), p.nucleus) != count) return error.NotBatchable;
+            if (g.row0 < end or g.n == 0 or g.out.len < g.n) return error.BadSegments;
+            end = g.row0 + g.n;
         }
+        const n = end - r0;
+        p.whole_rows = 0;
+        const vt = dev.vtable;
+        const stream = vt.stream(dev.ptr);
+        const row_f32 = 2 * k;
+        const span = lg + 4 * @as(u64, r0) * V;
+        const packed_ = try vt.scratch(dev.ptr, 0, 4 * n * row_f32);
+        const gathered = try vt.scratch(dev.ptr, 1, 4 * W * n * row_f32);
+        try vt.top(dev.ptr, span, n, V, k, @intCast(p.comm.rank() * V), packed_);
+        try p.comm.allGather(packed_, gathered, n * row_f32, .f32, stream);
+        const st = try vt.scratch(dev.ptr, 2, 16 * n);
+        const stats_dev = try vt.scratch(dev.ptr, 3, 16 * W * n);
+        for (segs) |g| try vt.stats(dev.ptr, lg + 4 * @as(u64, g.row0) * V, g.n, V, g.s.temperature, st + 16 * (g.row0 - r0));
+        try p.comm.allGather(st, stats_dev, 2 * n, .f64, stream);
+        const cand_bytes = 4 * W * n * row_f32;
+        const stat_bytes = 16 * W * n;
+        const host = try p.hostBytes(cand_bytes + stat_bytes);
+        try vt.download(dev.ptr, gathered, host[0..cand_bytes]);
+        try vt.download(dev.ptr, stats_dev, host[cand_bytes..][0..stat_bytes]);
+        const cand: smp.Candidates = .{ .data = @alignCast(std.mem.bytesAsSlice(f32, host[0..cand_bytes])), .world = @intCast(W), .rows = @intCast(n), .k = @intCast(k) };
+        const all_stats: []const f64 = @alignCast(std.mem.bytesAsSlice(f64, host[cand_bytes..][0..stat_bytes]));
+        var stats: [tp.host.max_ranks][2]f64 = undefined;
+        // every pick from the downloaded rows first (a whole row reuses the host buffer), the whole rows after
+        p.full.clearRetainingCapacity();
+        for (segs) |g| for (0..g.n) |i| {
+            const r = g.row0 - r0 + i;
+            const m = cand.row(@intCast(r), p.values, p.ids);
+            for (stats[0..W], 0..) |*x, w| x.* = .{ all_stats[2 * (w * n + r)], all_stats[2 * (w * n + r) + 1] };
+            const row: smp.Row = .{ .values = p.values[0..m], .ids = p.ids[0..m], .stats = stats[0..W], .count = count };
+            switch (p.picker.pick(row, if (g.positions) |ps| ps[i] else 0, g.s)) {
+                .token => |t| g.out[i] = t,
+                .full_row => try p.full.append(p.gpa, @intCast(r)),
+            }
+        };
+        var j: usize = 0;
+        for (segs) |g| for (0..g.n) |i| {
+            const r = g.row0 - r0 + i;
+            if (j == p.full.items.len or p.full.items[j] != r) continue;
+            j += 1;
+            g.out[i] = try p.wholeRow(dev, lg + 4 * @as(u64, g.row0 + i) * V, g.s, 0, if (g.positions) |ps| ps[i] else 0);
+        };
     }
 };
 
