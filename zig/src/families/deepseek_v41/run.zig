@@ -283,11 +283,15 @@ pub const Runner = struct {
         return lastTaps(cs);
     }
 
-    /// The mark after call `c`, on the stream `c` ran on (a branch's side stream when the emitter put it there).
+    /// The mark after call `c`, on the stream `c` ran on (a branch's side stream when the emitter put it there). In a
+    /// capture it is an external record node (each launch of the graph records it at that point); an eager window (a
+    /// capture that fell back, or a key the row graphs had no room for under TF_DSV41_GRAPH_FLOOR_GIB) records it as a
+    /// plain record at the same point: CU_EVENT_RECORD_EXTERNAL is invalid outside a capture (cuEventRecordWithFlags:
+    /// CUDA_ERROR_ILLEGAL_STATE, Spark P4 2026-10-09: the first eager row window with TF_DSV41_DRAFT_OVERLAP=1).
     fn recordMark(r: *Runner, c: *const calls.Call) !void {
         const m = &r.taps_mark.?;
         const s = if (c.side and r.br != null) r.br.?.stream else if (c.defer_side and r.dfr != null) r.dfr.?.stream else r.stream;
-        try m.ev.recordExternal(s);
+        if (try cuda.graph.captureStatus(s) != .none) try m.ev.recordExternal(s) else try m.ev.record(s);
         m.recorded += 1;
     }
 
