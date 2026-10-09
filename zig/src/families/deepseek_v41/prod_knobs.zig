@@ -180,6 +180,30 @@ pub fn pfOverlap(get: Get) !i64 {
     return if (v < 2) 0 else v;
 }
 
+/// TF_DSV41_PF_TBO (ours; 0 / 1, default 0): CED encoder segments two at a time on two streams (block_prefill.emitTbo).
+pub fn pfTbo(get: Get) !bool {
+    const raw = std.mem.trim(u8, get("TF_DSV41_PF_TBO") orelse "0", " ");
+    if (std.mem.eql(u8, raw, "0")) return false;
+    if (std.mem.eql(u8, raw, "1")) return true;
+    std.log.warn("TF_DSV41_PF_TBO={s}: 0 or 1", .{raw});
+    return error.BadKnob;
+}
+
+/// TF_DSV41_PF_TBO_GM_SMS (under TF_DSV41_PF_TBO): the SMs x3gm's persistent grid covers at most, 8-48 (default
+/// `tbo_gm_sms`: proto/tbo_bench.cu's split decides it on the Spark); 0: every SM.
+pub const tbo_gm_sms: u32 = 32;
+pub fn pfTboGmSms(get: Get) !u32 {
+    const raw = std.mem.trim(u8, get("TF_DSV41_PF_TBO_GM_SMS") orelse return tbo_gm_sms, " ");
+    const v = std.fmt.parseInt(u32, raw, 10) catch return badSms(raw);
+    if (v != 0 and (v < 8 or v > 48)) return badSms(raw);
+    return v;
+}
+
+fn badSms(raw: []const u8) error{BadKnob} {
+    std.log.warn("TF_DSV41_PF_TBO_GM_SMS={s}: 0 (every SM) or 8-48", .{raw});
+    return error.BadKnob;
+}
+
 /// TF_DSV41_PREFETCH_AHEAD (0 by default): the next prompt segment's Engram reads before this one runs.
 pub fn prefetchAhead(get: Get) bool {
     const v = get("TF_DSV41_PREFETCH_AHEAD") orelse return false;
@@ -305,23 +329,38 @@ pub fn apply(f: *@import("forward.zig").Forward, a: std.mem.Allocator, io: std.I
     f.opts.kv_norm_store = kvNormStore(&env);
     f.opts.router_group_rot = routerGroupRot(&env);
     f.opts.pfd = try pfDense(a, io, &env);
-    if (try prefillRows(&env)) |r| f.opts.prefill_rows = r;
+    // TF_DSV41_PF_4K: the forward's own options (decode windows, the drafter, the buffer plan) keep 2,048-row
+    // segments byte for byte; 4,096-row segments run in the prefill's own workspace (forward_prefill.K4)
+    const big = try pf4k(&env);
+    if (try prefillRows(&env)) |r| if (!big) {
+        f.opts.prefill_rows = r;
+    };
     if (try indexBudget(&env)) |b| f.opts.index_budget = b;
     f.prefill_state.ahead = prefetchAhead(&env);
     f.opts.gm_v2 = try @import("gm2pf.zig").mode(&env);
     f.opts.mhc_pf_rows = try mhcPfRows(&env);
-    f.opts.pf4k = try pf4k(&env);
+    f.prefill_state.mode = try prefillMode(&env);
+    f.prefill_state.k4 = big;
     // x3gm v1 at 4K runs pf4k's tuning table (128-member passes past 48 members an expert), which the emitter does not
-    // take; v2 keeps G6's tiles at any rows (x3gm.tuned2), so 4K is v2's alone
-    if (f.opts.pf4k and f.opts.gm_v2 == .off) {
-        std.log.scoped(.dsv41).err("TF_DSV41_PF_4K=1 needs TF_DSV41_GM_V2=1 (or split): x3gm v1's 4K tiles are not on the Zig emitter", .{});
+    // take; v2 keeps G6's tiles at any rows (x3gm.tuned2), so 4K is v2's alone; the workspace is released at a
+    // prompt's CED finish, so 4K is replay's alone
+    if (big and (f.opts.gm_v2 == .off or f.prefill_state.mode != .replay)) {
+        std.log.scoped(.dsv41).err("TF_DSV41_PF_4K=1 needs TF_DSV41_GM_V2=1 (or split) and TF_DSV41_PREFILL=replay", .{});
         return error.BadKnob;
     }
-    f.prefill_state.mode = try prefillMode(&env);
+    f.opts.pf_tbo = try pfTbo(&env);
     // TF_DSV41_BRANCHES: the side stream exists before any capture
     if (f.branches == null) f.branches = try @import("branches.zig").install(f.gpa, f, rank);
     // TF_DSV41_PF_OVERLAP: the pieces' exchanges go on the branches' side stream (one peer: TP=2)
     f.opts.pf_overlap = try pfOverlap(&env);
+    // TF_DSV41_PF_TBO: the second micro-batch on the side stream, CED's encoder segments only; x3gm's grid capped
+    if (f.opts.pf_tbo) {
+        if (!f.opts.branches or f.prefill_state.mode != .replay) {
+            std.log.scoped(.dsv41).err("TF_DSV41_PF_TBO=1 needs TF_DSV41_BRANCHES=1 (its side stream) and TF_DSV41_PREFILL=replay", .{});
+            return error.BadKnob;
+        }
+        dk.exl3.gm_sms_cap = try pfTboGmSms(&env);
+    }
     if (f.opts.pf_overlap > 0 and (!f.opts.branches or f.opts.world != 2)) {
         std.log.scoped(.dsv41).err("TF_DSV41_PF_OVERLAP={d} needs TF_DSV41_BRANCHES=1 (its side stream) and TP=2 (world {d})", .{ f.opts.pf_overlap, f.opts.world });
         return error.BadKnob;
@@ -341,8 +380,9 @@ pub fn apply(f: *@import("forward.zig").Forward, a: std.mem.Allocator, io: std.I
     const log = std.log.scoped(.dsv41);
     log.info("KV norm/store fusion: {s}", .{if (f.opts.kv_norm_store) "on" else "off"});
     log.info("router grouping/rotation fusion: {s}", .{if (f.opts.router_group_rot) "on" else "off"});
+    if (f.opts.pf_tbo) log.info("prefill tbo: encoder segments two at a time on two streams, x3gm on at most {d} SMs (0: all){s}", .{ dk.exl3.gm_sms_cap, if (f.opts.pf_overlap > 0) "; TF_DSV41_PF_OVERLAP is off under it" else "" });
     if (f.opts.pf_overlap > 0) log.info("prefill overlap: a segment's exchanges in {d} row pieces on the side stream", .{f.opts.pf_overlap});
-    log.info("prod knobs: pf_dense {s}, prefill rows {d}{s}, index budget {d} MiB, R1 {s}, prefetch ahead {s}, x3gm v2 {t}, prefill {t}, mhc pfdec {d}", .{ if (f.opts.pfd != null) "fused" else "off", f.opts.prefill_rows, if (f.opts.pf4k) " (4K: one x3gm block a segment)" else "", f.opts.index_budget >> 20, if (f.opts.r1) "on" else "off", if (f.prefill_state.ahead) "on" else "off", f.opts.gm_v2, f.prefill_state.mode, f.opts.mhc_pf_rows });
+    log.info("prod knobs: pf_dense {s}, prefill rows {d}{s}, index budget {d} MiB, R1 {s}, prefetch ahead {s}, x3gm v2 {t}, prefill {t}, mhc pfdec {d}", .{ if (f.opts.pfd != null) "fused" else "off", if (big) pf4k_rows else @as(u32, @intCast(f.opts.prefill_rows)), if (big) " (4K: one x3gm block a segment, in the prefill's own workspace)" else "", f.opts.index_budget >> 20, if (f.opts.r1) "on" else "off", if (f.prefill_state.ahead) "on" else "off", f.opts.gm_v2, f.prefill_state.mode, f.opts.mhc_pf_rows });
 }
 
 pub fn env(name: []const u8) ?[]const u8 {

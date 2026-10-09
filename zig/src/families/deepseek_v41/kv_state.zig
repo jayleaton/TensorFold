@@ -88,6 +88,8 @@ pub fn bootCheck(ctx: *const cuda.Context, cfg: *const Config, o: Options, rank:
     // TF_DSV41_PF_4K: 4,096-row segments, priced as such (memory.py's chunk_gib scales by the window)
     const pk = @import("prod_knobs.zig");
     if (try pk.pf4k(&pk.env)) knobs.prefill_rows = pk.pf4k_rows;
+    // TF_DSV41_PF_TBO: a pair of segments in flight at once
+    if (try pk.pfTbo(&pk.env)) knobs.prefill_rows *= 2;
     if (std.c.getenv("TF_DSV41_INDEX_BUDGET_MIB")) |v| knobs.index_budget_mib = try std.fmt.parseInt(u32, std.mem.span(v), 10);
     var layout = try kv.Layout.fromConfig(cfg, .{ .split = o.split and world > 1 });
     var terms = try budget.Serve.fromEnv(rank);
