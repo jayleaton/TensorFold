@@ -112,9 +112,36 @@ pub const Engine = struct {
     /// round. A failure leaves the stream with the backend (the host discards it).
     pub fn finishStream(e: *Engine, s: *Stream) !void {
         _ = e.arena.reset(.retain_capacity);
+        // Config.join_tail: the last token waits for the next round (a forced or budget-cut first token keeps its row)
+        if (e.cfg.join_tail and e.cfg.family_mtp and s.drafts and s.prompt_len > 0 and s.force.items.len == 0 and !s.cutsNext()) {
+            if (e.backend.vtable.join) |join| {
+                if (try join(e.backend.ptr, s)) return e.joined(s);
+                return e.opened(s);
+            }
+        }
         const fin = e.backend.vtable.finish orelse return error.NoPieces;
         try fin(e.backend.ptr, s);
         return e.opened(s);
+    }
+
+    /// A joined prompt (Backend.join): its last token is the stream's pending row at the prompt's last position, the
+    /// head's drafts after it asked now, so the stream's first round verifies them with the round's other windows
+    /// (Python's batcher: a `finals` slot decodes in the same round, its first window drafted). The reply's first
+    /// token is that round's choice at the prompt's last row, keyed at the same position as `first`'s.
+    fn joined(e: *Engine, s: *Stream) !void {
+        s.context.shrinkRetainingCapacity(s.prompt_len);
+        const last = s.context.items[s.prompt_len - 1];
+        s.cache_len = s.prompt_len - 1;
+        s.pending = last;
+        const position: u64 = s.prompt_len;
+        var who = win.who(s);
+        const d: u32 = @intCast(if (e.cfg.node_probabilities) try e.rule.headDepth(&who, null, win.probe(e)) else try e.rule.depth(who));
+        try e.backend.draft(&.{.{ .stream = s, .follow = &.{}, .first = .{ .value = last }, .rows = null, .start = s.cache_len, .position = position, .depth = d }});
+        s.dropHeld(e.gpa);
+        s.next = .{ .count = d };
+        try trail.event(e, &.{ f("ev", str("draft")), f("stream", str(s.id)), f("depth", int(d)), f("position", int(position)), f("follow", .{ .u32s = &.{last} }), f("rows", .null) });
+        try trail.resolve(e);
+        try e.live.append(e.gpa, s);
     }
 
     /// After the prompt: the first token, the first drafts; the stream joins the rounds (or ends at once).

@@ -427,7 +427,7 @@ pub const GrammarTarget = struct {
         return .{ .ptr = t, .vtable = &vtable };
     }
 
-    const vtable: iface.Target.VTable = .{ .prefill = prefill, .window = window, .keep = keep, .taps = taps, .release = release, .admit = admit, .begin = begin, .piece = piece, .finish = finish };
+    const vtable: iface.Target.VTable = .{ .prefill = prefill, .window = window, .keep = keep, .taps = taps, .release = release, .admit = admit, .begin = begin, .piece = piece, .finish = finish, .tail = tail };
 
     fn admit(p: *anyopaque, slot: u32, max_new: u64) void {
         self(p).inner.admit(slot, max_new);
@@ -462,11 +462,33 @@ pub const GrammarTarget = struct {
         return first;
     }
 
+    /// TF_DSV41_TAIL_JOIN: a request without a grammar leaves its last token to the round; one with a grammar runs it
+    /// as `finish` (the grammar's first mask on the prompt's last row).
+    fn tail(p: *anyopaque, slot: u32, ids: []const u32, sampling: ?lanes.Sampling, draw: u64) anyerror!?u32 {
+        const t = self(p);
+        if (slot >= t.slots.len) return t.inner.tail(slot, ids, sampling, draw);
+        const reg = t.requests.claim(ids);
+        if (reg == null or reg.?.compiled == null) {
+            try t.masks.release(slot);
+            return t.inner.tail(slot, ids, sampling, draw);
+        }
+        try t.bindClaimed(slot, ids, reg.?);
+        const first = try t.inner.finish(slot, ids, sampling, draw);
+        if (t.masks.failed) |e| {
+            t.masks.failed = null;
+            return e;
+        }
+        return first;
+    }
+
     /// The request's grammar bound to the slot (none: the slot's masks released), the prompt's last row's mask staged.
     fn bindPrompt(t: *GrammarTarget, slot: u32, ids: []const u32) !void {
         const reg = t.requests.claim(ids);
         if (reg == null or reg.?.compiled == null) return t.masks.release(slot);
-        const r = reg.?;
+        return t.bindClaimed(slot, ids, reg.?);
+    }
+
+    fn bindClaimed(t: *GrammarTarget, slot: u32, ids: []const u32, r: *Registration) !void {
         const active = grammar.constraint.thinkActive(ids, t.masks.g.think_open, t.masks.g.think_end);
         try t.masks.bind(slot, r.spec, r.compiled.?, active);
         var cuts: [1]grammar.Cut = undefined;

@@ -31,6 +31,7 @@ pub const Model = struct {
     draft_probabilities: bool = false, // the head gives each drafted node's chance of landing
     draft_streams: bool = false, // the head drafts every stream of a shared round in one batch
     head_trees: bool = false, // the head drafts trees of lanes (DraftRequest.lanes) and holds them
+    join_tail: bool = false, // a prompt in pieces leaves its last token for the next shared round's window (Backend.join)
     lane_costs: []const Cost = &.{}, // a lone stream's window ms by rows, up to its widest tree (timed at load)
 };
 
@@ -53,6 +54,9 @@ pub const Config = struct {
     fill_floor: f64 = 0.35, // the share of grafted rows a stream must keep to go on reading its chain back every round
     draft_streams: bool,
     head_trees: bool,
+    /// a prompt in pieces: its last token is the pending row of the stream's first round, drafted ahead and verified
+    /// in the round's shared window (Python's batcher `finals`), not a window of its own before the stream joins
+    join_tail: bool = false,
     head_lanes: u32 = 0, // a lone stream's lanes at most, the planner picking each round's (0: the depth rule's chain)
     head_depth: u32 = 16, // and their depth at most
     own_prices: bool = true, // the planner prices each pick from the stream's own measured rounds (seeded from the table)
@@ -112,6 +116,7 @@ pub const Config = struct {
             .node_probabilities = m.draft_probabilities,
             .draft_streams = m.draft_streams,
             .head_trees = m.head_trees,
+            .join_tail = m.join_tail,
             .depth_prior = depth_prior,
             .family_costs = family_costs,
             .shared_costs = try alloc.extendCosts(gpa, timed.items, batch_rows),

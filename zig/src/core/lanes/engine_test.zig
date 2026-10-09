@@ -181,3 +181,59 @@ test "a cycle in the answer does not refire or reclose" {
     for (plain[0].emitted) |token| close_count += @intFromBool(token == 90);
     try std.testing.expectEqual(@as(usize, 1), close_count);
 }
+
+/// The cases' prompts in pieces (Engine.beginStream / piece / finishStream), case i opened before round 2 i, the
+/// others decoding meanwhile; `join`: Config.join_tail (the fake counts its joins).
+fn runPieces(cases: []const Case, join: bool, joins: *usize) ![][]u32 {
+    var cfg = try model();
+    defer cfg.deinit(gpa);
+    cfg.join_tail = join;
+    var target: fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var clock: fake.FixedClock = .{};
+    var engine = Engine.init(gpa, &cfg, target.joinBackend(), clock.clock());
+    defer engine.deinit();
+    const streams = try gpa.alloc(sm.Stream, cases.len);
+    defer gpa.free(streams);
+    for (cases, streams) |c, *s| s.* = try sm.Stream.init(gpa, .{ .id = "s", .prompt = c.prompt, .max_new = c.max_new, .eos = &.{96}, .sampling = c.sampling, .drafts = c.drafts, .think_budget = c.think_budget, .think_close = &.{ 90, 91, 92 }, .think_end = 91 });
+    defer for (streams) |*s| s.deinit(gpa);
+    var opened: usize = 0;
+    var round: usize = 0;
+    while (opened < streams.len or engine.activeCount() > 0) : (round += 1) {
+        if (opened < streams.len and round == 2 * opened) {
+            const s = &streams[opened];
+            _ = try engine.beginStream(s);
+            if (s.prompt_len > 1) try engine.piece(s, 0, s.prompt_len - 1, false);
+            try engine.finishStream(s);
+            opened += 1;
+        }
+        if (engine.activeCount() > 0) try engine.step();
+    }
+    joins.* = target.joins;
+    const out = try gpa.alloc([]u32, cases.len);
+    for (out, streams) |*o, *s| o.* = try gpa.dupe(u32, s.emitted());
+    return out;
+}
+
+test "a prompt's last token joins its first round's shared window: the same tokens, greedy and sampled" {
+    const cases = [_]Case{
+        .{ .prompt = &.{ 3, 1, 4, 1, 5, 9, 2, 6 }, .max_new = 37 },
+        .{ .prompt = &.{ 2, 7, 1, 8, 2, 8 }, .max_new = 29, .sampling = .{ .seed = 5, .temperature = 0.8, .top_k = 7 } },
+        .{ .prompt = &.{4}, .max_new = 21 },
+        .{ .prompt = &.{ 1, 1, 2, 3, 5 }, .max_new = 25, .drafts = false },
+        .{ .prompt = &.{ 6, 6, 6, 1 }, .max_new = 30, .think_budget = 1 },
+    };
+    var j0: usize = 0;
+    var j1: usize = 0;
+    const off = try runPieces(&cases, false, &j0);
+    defer free(off);
+    const on = try runPieces(&cases, true, &j1);
+    defer free(on);
+    try std.testing.expectEqual(@as(usize, 0), j0);
+    try std.testing.expectEqual(@as(usize, 3), j1); // not the undrafted stream nor the budget cutting the first token
+    for (off, on) |a, b| try std.testing.expectEqualSlices(u32, a, b);
+    // and the whole prompts' tokens
+    const whole = try run(&cases);
+    defer free(whole);
+    for (whole, on) |a, b| try std.testing.expectEqualSlices(u32, a, b);
+}

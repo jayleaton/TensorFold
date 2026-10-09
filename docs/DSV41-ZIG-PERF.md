@@ -273,3 +273,57 @@ Build, for example:
 ```
 
 `glue_bench` needs `--fmad=false` (attn / mHC's flags). Use `sm_121a` for a Spark.
+
+## 7. Beating Python: round 3's phases, and the prompt tail join (2026-10-09, offline)
+
+### 7.1 Where round 3's 4-stream code gap is
+
+Source: round 3's phase reports, the code 4-stream cell (`zig-prof-20261008-133605`, phase deltas per cell). Zig's
+`window` (92.9 ms) is longer than Python's (87.4 ms), but the two phases don't hold the same work:
+- Zig's row window runs the previous round's deferred keep (ratio-2 carry, `op_rows_keep`), the row table and the
+  Engram staging before its launch (3.8 ms outside `candidates`).
+- Python times the same work as `commit` (2.1 ms a round), `prefetch` (0.6), `graph.stage` and `forward` (0.3), and
+  its speculative pass launch as `spec` (5.2).
+
+Per round, with everything counted:
+
+| | window | draft pass | commit + prefetch + spec | per round |
+| --- | ---: | ---: | ---: | ---: |
+| Python | 87.4 | 6.3 | 7.9 | **~101.6** |
+| Zig | 92.9 | 7.6 | 0.04 | **~100.5** |
+
+So Zig's decode round is already ~1 % faster than Python's in this cell. The cell's gap is **prefill**: 2,153 ms in
+30 calls against Python's 753 ms in 6 (per cell, the same 4 prompts). Two parts:
+1. Python runs several slots' pieces in one forward (GLM 0560). Zig ran each prompt's pieces alone. dsq-zig-loop-1
+   is porting this.
+2. Zig ran each prompt's last token as a 1-row window of its own, then a 1-slot drafter pass, before the stream joined
+   the rounds. Python's batcher runs a `finals` slot's last token as the pending row of the same round's shared
+   window, drafted (batch.py `_pieces` then `_decode`; rounds.py `finish_prompt` then `_windows`). That is 7.2 below.
+
+The 1-stream code cell shows the same: Zig's round (36.0 + 4.0 ms) is below Python's (35.8 + 3.9 + 0.7 commit + 0.9
+spec), and Zig's prefill per prompt is ~60 ms longer (the extra window and pass).
+
+### 7.2 TF_DSV41_TAIL_JOIN=1: a prompt's last token joins its first round
+
+With prompts in pieces (`TF_DSV41_PREFILL_PIECES=1`), `finishStream` no longer runs the prompt's last token alone:
+- `iface.Target.tail` (target.zig): the decoder replay and its taps to the drafter, the slot left at the last token's
+  position with no window pending.
+- `Engine.joined` (core/lanes): the stream's pending row is the prompt's last token at position `prompt_len - 1`;
+  the head drafts after it now (anchor = the last token, as Python's `fwd.draft(slot, pending, start)`), and the
+  stream's first round verifies it with the other streams' windows.
+- `LaneHost`: with the knob on, the round's finals open before its decode step, so a finished prompt decodes in the
+  same round (Python's `_plan`: `_pieces` then `_decode`).
+
+Bits: the reply's first token is that round's choice at the prompt's last row, keyed at the same position as before
+(`draws[0] = prompt_len`); rows are independent in a row window (batched == alone), so every reply is unchanged.
+Only the drafts differ (drafted after the last prompt token instead of after the first reply token), which moves
+acceptance, not tokens. Left on the old path: a request with a grammar (its first mask is staged on the prompt's last
+row), an undrafted stream, a first token forced by the thinking budget, whole-prompt admission (`PREFILL_PIECES=0`).
+
+Host gate: `engine_test` "a prompt's last token joins its first round's shared window" (greedy, keyed sampling, a
+1-token prompt, undrafted, budget-cut; joined == not joined == whole prompts, token for token).
+
+Expected: per prompt, one 1-row window and one 1-slot pass fewer (~40 ms on the Spark: a 1-row window ~36 ms, a pass
+~4 ms), less the joined rows' share of the shared window (~4 ms a drafted row up to 16 rows). Code 1 stream ~+0.5 %;
+the mix's 4 short streams and 4-stream code, where prefill is a larger share, +1.5-3 %; TTFT -30..-40 ms a request.
+Spark step: one A/B cell pair with `TF_DSV41_PREFILL_PIECES=1` plus `TF_DSV41_TAIL_JOIN=1`, replies vs Python 4/4.

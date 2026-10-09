@@ -75,7 +75,7 @@ pub const GpuTarget = struct {
         return .{ .ptr = t, .vtable = &vtable };
     }
 
-    const vtable: iface.Target.VTable = .{ .prefill = prefill, .window = window, .keep = keep, .taps = taps, .release = release, .admit = admit, .begin = begin, .piece = piece, .finish = finish };
+    const vtable: iface.Target.VTable = .{ .prefill = prefill, .window = window, .keep = keep, .taps = taps, .release = release, .admit = admit, .begin = begin, .piece = piece, .finish = finish, .tail = tail };
 
     fn admit(p: *anyopaque, slot: u32, max_new: u64) void {
         const t = self_(p);
@@ -211,6 +211,22 @@ pub const GpuTarget = struct {
         var out = [_][]u32{&one};
         try window(p, &.{.{ .slot = slot, .start = ids.len - 1, .tokens = ids[ids.len - 1 ..], .parents = null, .draws = &.{draw}, .sampling = sampling }}, &out);
         return one[0];
+    }
+
+    /// `finish` up to the last token (TF_DSV41_TAIL_JOIN): the decoder replay and its taps; the slot stays at the last
+    /// token's position with no window pending, which the next round's window (one slot or row mode) starts at.
+    fn tail(p: *anyopaque, slot: u32, ids: []const u32, sampling: ?lanes.Sampling, draw: u64) anyerror!?u32 {
+        _ = draw;
+        const t = self_(p);
+        try t.onSlot(slot);
+        if (ids.len == 0 or t.f.slot.pos != ids.len - 1) return error.NotAChain;
+        _ = try t.keyedOf(sampling); // refused here as `finish` would, not in the round
+        if (t.f.prefill_state.mode == .replay) {
+            t.f.prefill_state.taps_rows = 0;
+            try t.f.finishPrompt();
+            try t.handTaps(slot);
+        }
+        return null;
     }
 
     /// The releases held since the last round (`defer_release`) run now, slot by slot.

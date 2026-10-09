@@ -455,6 +455,13 @@ pub const LaneHost = struct {
             };
         }
         const t1 = std.Io.Clock.awake.now(h.io).toNanoseconds();
+        // a joined prompt's last token decodes in this round's window (Config.join_tail; Python's batcher: `finals`
+        // before `_decode`), so its stream opens first; otherwise its own window runs after the round
+        const join = h.core.cfg.join_tail;
+        if (join and h.finals.items.len > 0) {
+            did = true;
+            h.runFinals();
+        }
         if (h.core.activeCount() > 0) {
             did = true;
             h.core.step() catch |e| {
@@ -462,19 +469,9 @@ pub const LaneHost = struct {
                 return true;
             };
         }
-        for (h.finals.items) |key| {
+        if (!join and h.finals.items.len > 0) {
             did = true;
-            const job: *Job = @ptrFromInt(key);
-            if (job.stream.finished) continue;
-            h.core.finishStream(&job.stream) catch |e| {
-                if (e == error.Cancelled) {
-                    h.core.discard(&job.stream);
-                    h.remove(job);
-                    h.finish(job, .cancelled, "");
-                } else _ = h.drop(job, h.words(e));
-                continue;
-            };
-            h.prefilled(job, job.began);
+            h.runFinals();
         }
         const t2 = std.Io.Clock.awake.now(h.io).toNanoseconds();
         var i: usize = 0;
@@ -488,6 +485,23 @@ pub const LaneHost = struct {
         }
         rd.vtable.after(rd.ctx, seconds(t1 - t0), seconds(t2 - t1));
         return did;
+    }
+
+    /// The prompts whose rows are in: each stream's last row (Engine.finishStream), then it decodes with the rounds.
+    fn runFinals(h: *LaneHost) void {
+        for (h.finals.items) |key| {
+            const job: *Job = @ptrFromInt(key);
+            if (job.stream.finished) continue;
+            h.core.finishStream(&job.stream) catch |e| {
+                if (e == error.Cancelled) {
+                    h.core.discard(&job.stream);
+                    h.remove(job);
+                    h.finish(job, .cancelled, "");
+                } else _ = h.drop(job, h.words(e));
+                continue;
+            };
+            h.prefilled(job, job.began);
+        }
     }
 
     fn prefilled(h: *LaneHost, job: *Job, began: i96) void {

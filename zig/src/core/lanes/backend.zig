@@ -78,6 +78,10 @@ pub const Backend = struct {
         begin: ?*const fn (ptr: *anyopaque, s: *Stream) anyerror!Begun = null,
         piece: ?*const fn (ptr: *anyopaque, s: *Stream, start: u64, end: u64, save: bool) anyerror!void = null,
         finish: ?*const fn (ptr: *anyopaque, s: *Stream) anyerror!void = null,
+        /// `finish` without the prompt's last row (Config.join_tail): true when the backend left that token for the
+        /// stream's first round (pending at the prompt's last position, nothing drawn); false when it ran the row as
+        /// `finish` does (then `first`). null: `finish` only.
+        join: ?*const fn (ptr: *anyopaque, s: *Stream) anyerror!bool = null,
     };
 
     /// `begin`'s outcome: prompt tokens the stream's state holds (a restored prefix), and whether a damaged saved

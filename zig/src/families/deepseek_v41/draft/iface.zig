@@ -49,6 +49,11 @@ pub const Target = struct {
         begin: ?*const fn (ptr: *anyopaque, slot: u32, ids: []const u32) anyerror!Begun = null,
         piece: ?*const fn (ptr: *anyopaque, slot: u32, ids: []const u32, start: u64, end: u64, save: bool) anyerror!void = null,
         finish: ?*const fn (ptr: *anyopaque, slot: u32, ids: []const u32, sampling: ?lanes.Sampling, draw: u64) anyerror!u32 = null,
+        /// `finish` up to the prompt's last token (TF_DSV41_TAIL_JOIN): the decoder replay and its taps to the
+        /// drafter, the slot left at the last token's position with no window pending, so the reply's first window is
+        /// a round's shared one (Python's batcher `finals`). null from the call: done so; a choice: the target ran the
+        /// last row as `finish` (a grammar's first mask). null: `finish`.
+        tail: ?*const fn (ptr: *anyopaque, slot: u32, ids: []const u32, sampling: ?lanes.Sampling, draw: u64) anyerror!?u32 = null,
     };
 
     pub const Begun = struct { at: u64 = 0, damaged: bool = false };
@@ -68,6 +73,10 @@ pub const Target = struct {
     }
     pub fn finish(t: Target, slot: u32, ids: []const u32, sampling: ?lanes.Sampling, draw: u64) !u32 {
         return (t.vtable.finish orelse return error.NoPieces)(t.ptr, slot, ids, sampling, draw);
+    }
+    pub fn tail(t: Target, slot: u32, ids: []const u32, sampling: ?lanes.Sampling, draw: u64) !?u32 {
+        const f = t.vtable.tail orelse return try t.finish(slot, ids, sampling, draw);
+        return f(t.ptr, slot, ids, sampling, draw);
     }
 
     pub fn prefill(t: Target, slot: u32, ids: []const u32, sampling: ?lanes.Sampling, draw: u64) !u32 {

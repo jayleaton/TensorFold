@@ -40,6 +40,7 @@ pub const Fake = struct {
     prefill_hook_ctx: ?*anyopaque = null,
     refuse_sampled: bool = false, // prefill refuses a sampled stream with error.SamplingRefused
     pieces_run: usize = 0, // prompt pieces run (`pieceBackend`)
+    joins: usize = 0, // prompts whose last token joined a round (`joinBackend`)
 
     pub fn deinit(x: *Fake) void {
         var it = x.lanes.valueIterator();
@@ -61,6 +62,18 @@ pub const Fake = struct {
     /// The backend with prompts in pieces (begin / piece / finish) beside whole prompts.
     pub fn pieceBackend(x: *Fake) be.Backend {
         return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release, .begin = begin, .piece = piece, .finish = finish } };
+    }
+
+    /// `pieceBackend` whose prompts may leave their last token to the stream's first round (Config.join_tail).
+    pub fn joinBackend(x: *Fake) be.Backend {
+        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release, .begin = begin, .piece = piece, .finish = finish, .join = join } };
+    }
+
+    fn join(ptr: *anyopaque, s: *Stream) anyerror!bool {
+        const x = self(ptr);
+        if (x.lane(s).history.items.len + 1 != s.prompt_len) return error.PositionMismatch;
+        x.joins += 1;
+        return true;
     }
 
     fn begin(ptr: *anyopaque, s: *Stream) anyerror!be.Backend.Begun {
