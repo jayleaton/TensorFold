@@ -17,6 +17,7 @@ const x3gm3_bench = @import("deepseek_v41/x3gm3_bench.zig");
 const stream_rb_bench = @import("deepseek_v41/stream_rb_bench.zig");
 const scores_b_bench = @import("deepseek_v41/scores_b_bench.zig");
 const x3ld_epi_bench = @import("deepseek_v41/x3ld_epi_bench.zig");
+const topk_b_bench = @import("deepseek_v41/topk_b_bench.zig");
 
 const usage =
     \\usage: tf-dsv41-test <command> [fixture dir]
@@ -31,6 +32,8 @@ const usage =
     \\  mhc-probe [windows]  the 16-row mHC boundary under cache states, buffer layouts and a cross-stream dependency
     \\  stream-rb <aot dir> [--reps N]  _stream_rb2 / _rb4 against _stream (Triton AOT set): bits and time (synthetic)
     \\  scores-b <aot dir> [--reps N]   _scores_b against _scores (Triton AOT set): bits and time, mixed 131K / short rows
+    \\  topk-b <aot dir> [--reps N]     TF_DSV41_INDEX_BOUND's top-k twins (topk_b.cu, _dtopk_b) against topk_cuda.cu /
+    \\                                  _dtopk: every output byte and time, mixed 154K / short rows (fatbins + AOT set)
     \\  replay <dir>       one recorded Python extension call (dsv41_capture.py) re-issued and compared, storage by storage
     \\  all <fixtures>     every case directory under <fixtures> by its manifest's "kind"
     \\
@@ -79,6 +82,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "mhc-probe")) return mhc_probe.run(gpu, &k, if (rest.len > 0) rest[0] else null);
     if (std.mem.eql(u8, cmd, "mhc-alloc")) return mhc_alloc.run(gpu, &k, if (rest.len > 0) rest[0] else null);
     if (std.mem.eql(u8, cmd, "x3gm3-bench")) return x3gm3_bench.run(gpu, &k, if (rest.len > 0) rest[0] else null, if (rest.len > 1) rest[1] else null);
+    if (std.mem.eql(u8, cmd, "topk-b")) return topk_b_bench.run(gpu, &k, rest);
     if (std.mem.eql(u8, cmd, "x3ld-epi")) return x3ld_epi_bench.run(gpu, &k, if (rest.len > 0) rest[0] else null, if (rest.len > 1) rest[1] else null);
     if (std.mem.eql(u8, cmd, "replay")) {
         if (try replay_case.run(gpu, &k, try arg(rest, 0)) == .skipped) std.debug.print("SKIP no binding\n", .{});
