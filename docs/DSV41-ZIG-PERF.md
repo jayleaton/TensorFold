@@ -343,9 +343,26 @@ Spark step: one A/B cell pair with `TF_DSV41_PREFILL_PIECES=1` plus `TF_DSV41_TA
 
 A 4-stream round is ~107 ms; two in three of its windows have 17-48 rows (4 streams' drafts), past mhc_cuda's 16
 (`MAXR`), so their 81 sites run Python's Triton pair at 62 us each, against ~32 us for a 16-row mhc_cuda boundary.
-Python runs the same pair (it is prod's path), so this is a lead over Python, not parity. Zig's 16-row boundary is 6 us
-slower than Python's only when it shares the GPU with the L2 prefetch's `paced_kernel` (32.3 vs 25.9 us; alone 22.0 vs
-19.7): an L2PF pacing difference, not the kernel.
+Python runs the same pair (it is prod's path), so this is a lead over Python, not parity.
+
+**Zig's 16-row mhc_cuda boundary is slower than Python's, and not because of L2PF.** Zig 32.2 us against Python 25.9
+when the boundary overlaps L2PF's `paced_kernel`. That is ~95 % of the 16-row boundaries in both engines, at the same
+point inside the paced launch (it starts ~29 us after the paced launch, median, in both). The gap holds with nothing
+beside the boundary too: the window's first site (no post, no gathered partials, no concurrent kernel) is 26.0 against
+15.8 us, and the Engram block's site 19.0 against 15.1. Everything the scheduling could differ in is the same:
+- stream priority 0 everywhere in both;
+- the paced fork just before the exchange (G14 `at=after`), 2 CTAs x 32 threads, ~87 us, the same bytes;
+- the boundary right after the exchange, coef_kernel deferred, no other kernel concurrent, no long-running kernel
+  spanning any boundary;
+- the launch configuration (113 registers, 20,656 + R x 128 B shared memory, 100 KB carveout executed) and the spin
+  (8,000 cycles);
+- window buffers 256-byte aligned.
+
+The shift is uniform (deciles +3..+8 us), and coef_kernel is ~5 % slower too: the time is inside the kernels' memory
+accesses, not in their placement. Two small placement items: Zig's boundary starts 0.8-1.5 us after the exchange
+kernel ends, Python's 0.2 us (an extra dependency node after `tp_roce` in the window graph: the TP fabric's, ~0.1 ms
+a window). Next step on a Spark: Nsight Compute of `boundary_kernel` in both engines (L2 / DRAM sectors, sector
+misses by input), or the same with `TF_DSV41_L2PF=0` in both to confirm.
 
 ### 8.2 TF_DSV41_MHC_PFDEC=<rows> (block_wide.zig, default 0 = off): the Triton pair as two CUDA launches and the norm
 
