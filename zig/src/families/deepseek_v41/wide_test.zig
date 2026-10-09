@@ -26,6 +26,7 @@ const Config = @import("config.zig").Config;
 test {
     _ = @import("mhc_pfdec_test.zig");
     _ = @import("coef_late_test.zig");
+    _ = @import("ibound_test.zig");
     _ = @import("dev_arena_test.zig");
 }
 

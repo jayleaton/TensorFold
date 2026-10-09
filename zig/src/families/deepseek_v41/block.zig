@@ -95,6 +95,10 @@ pub const Options = struct {
     /// Zig-own row-blocked twin `_stream_rb<N>` (tools/zig/dsv41_triton: N rows a program, each row `score_tile`'s
     /// arithmetic: the same split buffers, the same selection)
     stream_rb: i64 = 0,
+    /// TF_DSV41_INDEX_BOUND (ours, prod_knobs.indexBound): a decode window's dense index scores as the Zig-own twin
+    /// `_scores_b` (tools/zig/dsv41_triton/dsv41_zig_triton/scores_b.py): a (row, key tile) past the row's own visible
+    /// keys stores `_scores`' -inf without its key loads and dot (a row window scores every row over the mix's bucket)
+    index_bound: bool = false,
     /// R1 (prod-perf1's decode knobs, docs DSV41-DECODE-R1.md; the same bits): attention split 4 with q's RoPE in the
     /// kernel (ATTN_SPLIT, ATTN_ROPE), mHC's parallel tail + deferred coefficients (MHC_TAIL, MHC_DEFER), the router's
     /// prune + kit rounding (RG_PRUNE, PRUNE_KIT), a bf16 MoE partial (MOE_BF16), q_norm folded into its consumers'
@@ -968,7 +972,7 @@ pub const Emitter = struct {
         const ID: i64 = e.cfg.index_dim;
         const cbs: i64 = e.cfg.candidate_block_size;
         const spg = try e.paging(ratio, false);
-        try e.triton("_scores", .{ rows, std.math.divCeil(i64, nk, 64) catch unreachable, 1 }, &.{
+        try e.triton(if (e.o.index_bound and cand == null) "_scores_b" else "_scores", .{ rows, std.math.divCeil(i64, nk, 64) catch unreachable, 1 }, &.{
             .{ .name = "QI", .arg = try e.view(qi.t.role, .bf16, &.{ rows, IH, ID }, &.{ IH * ID, ID, 1 }, a * IH * ID * 2) },
             .{ .name = "W", .arg = try e.view(iw.t.role, .bf16, &.{ rows, IH }, &.{ IH, 1 }, a * IH * 2) },
             .{ .name = "w_stride", .arg = .{ .i = IH } },               .{ .name = "IK", .arg = try e.indexKeys(src) },
