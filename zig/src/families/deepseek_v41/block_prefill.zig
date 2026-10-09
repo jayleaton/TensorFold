@@ -154,7 +154,10 @@ const Seg = struct {
             if (e.o.pf_overlap_site) e.br_mark = @intCast(p + 1);
         }
         defer e.br_side = false;
-        try e.glue("exchange_rows", &.{ send, into, .{ .i = r0 } });
+        // the piece's all-gather lands in "L.xrows" [world, rows, D] (a planned role: in the 4K workspace and its
+        // price), then each rank's rows are copied into `into`: the collective's own channels, no NCCL p2p state
+        const tmp = try e.buf("L.xrows", .{}, .bf16, &.{ e.o.world, rows, e.cfg.hidden });
+        try e.glue("exchange_rows", &.{ send, into, .{ .i = r0 }, tmp });
         if (last and e.o.pf_overlap_site) {
             s.pend = k;
             e.br_join = true;

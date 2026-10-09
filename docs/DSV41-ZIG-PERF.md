@@ -1810,6 +1810,36 @@ the two calibration lines on rank 0 (no `calibration: ... marks` error on rank 1
 replies unchanged (hashes); then a 1-rep bench against c13 (prose / code x4 and x1). A second boot with
 `TF_DSV41_CALIB=zig` must read the stored file (log `dsv41 draft costs: cached .../calib-zig-...json`).
 
+### 13.4a chain22 (kit 765b2a0f): X1 fell back to 2K; the exchange pieces now use no NCCL p2p
+
+| run | 32K | 131K | note |
+| --- | ---: | ---: | --- |
+| W1 (WS_SHARE, floor 3.5) | 2,667.8 | 2,433.1 | 2/2 allocations a rank, rank 1 min 4,006 MiB |
+| W1 set, floor 4.0 | 2,672.2 | 2,500.7 | 0 fallbacks, rank 1 min 4,196 MiB |
+| X1 (+ PF_OVERLAP=2) | 2,657.8 | 2,306.1 | **4 segments fell back to 2K** |
+
+PF_OVERLAP's planned buffers were already in the 4K workspace and its price: `planWorkspace` emits with the
+forward's options, so with pf_overlap. Its pieces are row views of the same roles. The one memory outside every
+plan and price was NCCL's. `exchange_rows` sent the peer rows with ncclSend / ncclRecv, a point-to-point operation:
+NCCL sets up p2p connections (and their buffers) lazily at the first one, apart from the all-gather's ring
+channels, and keeps them. At rank 1's 196-506 MiB of margin, that is enough to tip later prompts under the floor.
+
+Now (no knob: PF_OVERLAP is not in prod) `exchange_rows` all-gathers the piece into `L.xrows` [world, m, D] on the
+collective's own channels, the ones the whole exchange uses, then copies each rank's m rows to their place in the
+gathered buffer:
+- the same bytes;
+- no p2p state;
+- the scratch is a planned role, so under 4K it sits in the workspace and its price (40 MiB at k = 2);
+- the cost is one more D2D copy of the peer's rows (20 MiB a 2K piece) on the side stream.
+
+Host tests:
+- pfovl_test: every piece names `L.xrows` [2, m, D];
+- pf4k_test: under 4K it is `L.k4~xrows`, in the workspace;
+- the streams' shared roles are unchanged (the scratch is the side stream's alone).
+
+Rerun X1 / X2 with the kit at this commit. The "does not fit" lines give rank 1's MemAvailable; against W1's 4,196
+MiB minimum, they say whether anything else grew.
+
 ### 13.5 Is 32K behind 131K? (bench long cells against Python prod's best of 3)
 
 | run | 32K prompt tok/s | vs Python | 131K | vs Python |
