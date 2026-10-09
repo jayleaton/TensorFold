@@ -44,6 +44,7 @@ what replaced them. Plain prose, no lists or headings.""",
     """Write a 400-word essay on why windmills were built where they were, how their millers lived, and what replaced
 them. Plain prose, no lists or headings.""")
 PROMPTS = {"code": (CODE, *CODE_MORE), "prose": (PROSE, *PROSE_MORE)}
+SALT = ""  # --salt
 
 
 NO_DRAFT = False     # --no-draft: every request with "draft": false (both servers: the reply without DSpark)
@@ -110,7 +111,7 @@ def mean(xs: list) -> float | None:
 
 def cell(url: str, model: str, work: str, temp: float, streams: int, max_tokens: int) -> dict:
     res = [dict() for _ in range(streams)]
-    th = [threading.Thread(target=one, args=(url, model, PROMPTS[work][i % 4], temp, max_tokens, res[i]))
+    th = [threading.Thread(target=one, args=(url, model, SALT + PROMPTS[work][i % 4], temp, max_tokens, res[i]))
           for i in range(streams)]
     for t in th:
         t.start()
@@ -227,6 +228,7 @@ def main() -> int:
     ap.add_argument("--streams", default="1,4")
     ap.add_argument("--temps", default="0,0.7")
     ap.add_argument("--work", default="code,prose")
+    ap.add_argument("--salt", default="", help="text put before every cell prompt: new prompts of the same shape (cold-start studies)")
     ap.add_argument("--max-tokens", type=int, default=384)
     ap.add_argument("--reps", type=int, default=2)
     ap.add_argument("--out", default="")
@@ -234,8 +236,9 @@ def main() -> int:
     ap.add_argument("--long", default="", help="long-context lengths (tokens, comma separated): one stream each, T0")
     ap.add_argument("--no-draft", action="store_true", help='every request with "draft": false (drafts-off replies)')
     a = ap.parse_args()
-    global NO_DRAFT
+    global NO_DRAFT, SALT
     NO_DRAFT = a.no_draft
+    SALT = a.salt + "\n\n" if a.salt else ""
     if a.compare:
         compare(*a.compare)
         return 0
