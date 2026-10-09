@@ -113,6 +113,28 @@ pub fn roomAbove(floor_gib: f64) bool {
     return memAvailableAbove(buf[0..@intCast(n)], floor_gib);
 }
 
+/// MemAvailable in GiB (null where /proc/meminfo cannot be read): the prefill's handoff log.
+pub fn memAvailableGiB() ?f64 {
+    var buf: [4096]u8 = undefined;
+    const fd = std.c.open("/proc/meminfo", .{ .ACCMODE = .RDONLY });
+    if (fd < 0) return null;
+    defer _ = std.c.close(fd);
+    const n = std.c.read(fd, &buf, buf.len);
+    if (n <= 0) return null;
+    return memAvailableOf(buf[0..@intCast(n)]);
+}
+
+fn memAvailableOf(text: []const u8) ?f64 {
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "MemAvailable:")) continue;
+        var f = std.mem.tokenizeScalar(u8, line["MemAvailable:".len..], ' ');
+        const kb = std.fmt.parseInt(u64, f.next() orelse return null, 10) catch return null;
+        return @as(f64, @floatFromInt(kb)) / (1 << 20);
+    }
+    return null;
+}
+
 fn memAvailableAbove(text: []const u8, floor_gib: f64) bool {
     var it = std.mem.splitScalar(u8, text, '\n');
     while (it.next()) |line| {
@@ -293,6 +315,11 @@ test "graphs: emitted start puts the window's end at the bucket's end" {
     const s: Settings = .{};
     // a 5-row window in bucket 0: rows end at 2047, so end = start + n = 2048, NK = 2048 / ratio
     try std.testing.expectEqual(@as(i64, 2043), emitStart(5, 0, s, 1 << 20));
+}
+
+test "graphs: MemAvailable in GiB" {
+    try std.testing.expectEqual(@as(?f64, 6.0), memAvailableOf("MemTotal: 1 kB\nMemAvailable:   6291456 kB\n"));
+    try std.testing.expectEqual(@as(?f64, null), memAvailableOf("MemTotal: 1 kB\n"));
 }
 
 test "graphs: MemAvailable floor" {

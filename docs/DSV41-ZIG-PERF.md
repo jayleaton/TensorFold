@@ -1146,3 +1146,85 @@ no forward past 24 rows in the acceptance log when Python has none, and code x4 
 Also here: the phases report carries "engram" counters (row reader hits / waited / misses / reads / bytes / wait_ms,
 gate rounds / syncs / warm / failed; cumulative, a cell's are two snapshots' difference), for the cold rep 0
 question (section 10 of the sampled work).
+
+### 11.6 tbo_bench on dgx-01, and TBO with 4K (2026-10-09)
+
+`tbo_bench.sh --green` (kit ff16c8e2): `x3gm bits: PASS` at every cap. Per 2,048 rows of one layer's x3gm + dense set:
+
+| | ms / 2,048 rows | vs 2K serial |
+| --- | ---: | ---: |
+| 2K serial | 26.96 | |
+| 2K, best split (green contexts, x3gm 24 SMs) | 23.75 | -11.9 % |
+| 4K serial (one x3gm block) | 18.95 | -30 % |
+| 4K, best split (priority streams, x3gm uncapped) | 17.90 | -34 % |
+
+So the 4K block is the big term. The bench's -5.5 % at 4,096 rows is the overlap's gain on top of it: x3gm at 4,096
+rows already fills the GB10. Ranking by the bench: **4K + TBO > 4K > TBO at 2K**. P4b's end-to-end +7 % is well under
+the bench's x3gm + dense -30 %, which covers ~70 % of a segment and so predicts +20-25 %. Two candidates:
+- P4b ran while 4K's resident plan bytes had pushed the node into memory pressure (10.6);
+- something outside x3gm + dense grows at 4K.
+
+The rerun of 3e5c3756 separates them.
+
+**Changes (this commit):**
+- **TBO's pairs run in the prefill workspace too** (forward_prefill.wsPair). Before, B's private roles (its arena and
+  scratch, ~1.5 GiB at 2K) sat in the forward's resident plan: the P4b decode regression, for TBO. Now B's roles are
+  "k4~b~". A 2K pair's A keeps the forward's 2K roles; a 4K pair's A is "k4~" too. The pair's send / gathered buffers
+  are the workspace's while it runs. Host gate: a 2K or 4K pair names no role outside the workspace that the 2K plan
+  does not hold, at no more than its size, and no "b~" role outside it.
+- **TBO with TF_DSV41_PF_4K:** pairs of 4,096-row micro-batches (pairSplit at 4,096), each its 4K encoder program:
+  two CHUNK route launches and one x3gm block a MoE call (host gate: the main / side streams' calls == A's / B's 4K
+  programs).
+- `TF_DSV41_PF_TBO_GM_SMS` defaults to 0 (all SMs: the 4,096-row best). The engine has priority streams and grid caps,
+  not green contexts. Green contexts were the 2K best; at 4K the uncapped streams split wins, which is the case that
+  matters.
+- Memory: the workspace holds a 4K pair's two micro-batches (~2 x 2.6 GiB, from the 4K program's plan) while a long
+  prompt prefills, priced at 8,192 rows (kv_state); a 2K pair holds ~1.5 GiB. G19's adaptive rows still step a piece
+  down under pressure, and pairSplit halves a shorter rest.
+
+**128-member x3gm tiles at 4K** (`--tiles`, new). At 4,096 rows an expert averages 64 members, so G6's 64-member passes
+split about half the experts in two, and each such expert's trellis is fetched and decoded twice. x3gm.cu's NG 16
+tiles take 128 members a pass. The bench times x3gm v2 alone at GU2 / GU3 / GU4 / DN2 / DN3 / DN4 pairs against G6's
+GU1 / DN0, each on its own BM's plan, Y bit for bit against G6, and prints `TILES R=<rows>: best ...`. The PRO 6000's
+emulation (section 2.1) had them slower; it was compute-bound with unlimited DRAM, and the GB10 is DRAM-bound at
+4,096 rows. If a pair wins by more than a few %, the engine needs those gm2_kernel instances (Zig-own, in x3gm3.cu as
+v3's are; the same bits by construction and by the bench's check) and a tile knob. Not built until the Spark says so.
+
+### 11.7 Spark steps (T2, after the 3e5c3756 rerun)
+
+| step | what | pass |
+| --- | --- | --- |
+| T2-0 | `proto/tbo_bench.sh --tiles --rows 4096` (dgx-01, ~1 min, no model) | `x3gm bits: PASS`; the TILES line decides the tile work |
+| T2-1 | the all-on base + 4K (`TF_DSV41_PF_4K=1 TF_DSV41_PF_4K_MEMORY_OK=1 TF_DSV41_PREFILL_CHUNK=4096 TF_DSV41_PREFILL_ROWS=4096`) + `TF_DSV41_PF_TBO=1`, AOT fill-4k.env; `bench_http.py --long 32768,131072` + the 8 cells | boot log `prefill tbo: ... at most 0 SMs (0: all)` and `prefill 4K: workspace N MiB`; long replies == Python's (sha 30710c1d388d4cd7 / c5c36138ceaea475), T0 20/20; decode cells within noise of allon2b; `row graphs: ... 0 evicted, 0 eager`; worker MemAvailable minimum over 4 GiB; prompt tok/s against the 4K-alone rerun |
+| T2-1b (on a failure) | TBO without 4K (2K pairs), then 4K without TBO | names the part |
+
+### 10.7 The 131K decode loss after a 4K prompt (all-on run on kit ff16c8e2, 2026-10-09)
+
+3e5c3756 + 150f0c9f were exact, and every short decode cell was within ±0.6 % of base. Prompt speed: 32K 2,668, 131K
+2,462 tok/s (+6.2 %). 131K decode, the cell right after the 131K prompt, lost 12 %; 32K decode lost 1.6 %.
+
+The long cell's phases (bench-next-allon against bench-k860-base) show the same rounds and tokens / round (2.667) and
++2 ms a round: the window outside its launch 1.72 -> 2.74 ms, the GPU candidates +1, the Engram wait per call +2.3.
+That is graph churn again, smaller than P4b's.
+
+The cause is in the graph cache (cuda/graph_cache.zig). A miss under the memory floor on any rank evicts the least
+recent quarter and lowers the cap to what is left, and **nothing ever raised it again**. Holding the 2.5 GiB workspace
+for a long prompt, or MemAvailable lagging the free on the GB10's unified memory, is a dip. After it, every new key
+evicts an old one. 131K decode is the case that meets new keys (a new context bucket) right after the longest hold,
+so it lost the most.
+
+Fix: the next miss with room on every rank puts the cap back to `max`. The same bits; host tests show a dip followed
+by 12 new keys gives only the evictions the cap forces, and the replays after it hit. Logs added:
+- `graph cache: under the memory floor on this / another rank: cap A -> B (...)` when the floor bites;
+- `graph cache: room again on every rank: cap B -> 48` when it recovers;
+- `prefill 4K: workspace N MiB freed at the prompt's end (release k); MemAvailable X -> Y GiB`: the prefill-to-decode
+  handoff, which tells whether the free reaches MemAvailable (suspect 2).
+
+Spark check: the same all-on + 4K run. Pass:
+- 131K decode within noise of base;
+- the handoff line's MemAvailable after the free above TF_DSV41_GRAPH_FLOOR_GIB (5);
+- at most a transient `cap ->` warning followed by `room again`;
+- the server's stop line `row graphs: ... eager` against base's.
+
+If the MemAvailable after the free stays low (the driver keeps the pages), the next step is one workspace allocated
+at boot and held (priced in the boot check) instead of per prompt.

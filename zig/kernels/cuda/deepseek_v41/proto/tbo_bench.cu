@@ -14,7 +14,9 @@
 // Bits: gm2's items are claimed by ticket, so Y (fp32) must not depend on the grid: every capped / concurrent run's Y
 // is compared with the uncapped run's, word for word.
 //
-//   tbo_bench [--rows 2048,4096] [--k2 6] [--reps 5] [--green] [--sms 48,44,40,36,32,28,24] [--zipf 0]
+//   tbo_bench [--rows 2048,4096] [--k2 6] [--reps 5] [--green] [--tiles] [--sms 48,44,40,36,32,28,24] [--zipf 0]
+//   --tiles: x3gm v2 alone on every SM at x3gm.cu's 128-member tiles (GU2-4 / DN2-4, one pass an expert at ~64
+//   members) against G6's GU1 / DN0, Y bit for bit; "TILES R=..." lines
 #define DSV41_X3GM_NO_INSTANCES
 #include "../x3gm.cu"
 #include "../pfdense.cuh"
@@ -74,6 +76,23 @@ GmLaunch gm_make() {
     if (per < 1) { fprintf(stderr, "gm2 configuration does not fit an SM\n"); exit(2); }
     return {k, S2::THREADS, (int)S2::SMEM, per};
 }
+
+// --tiles: gm2_kernel at x3gm.cu's 128-member tiles (NG 16: BM 128) beside G6's (NG 8: BM 64). Tiles move data
+// only (x3gm.cu's header): the same Y bit for bit, which the run checks. per_sm 0: does not fit an SM (skipped)
+template <int MATS, int XM, int MTL, int NG, int KS, int NSA, int NGR>
+GmLaunch gm_try() {
+    using S2 = dsv41_x3gm::Smem2<MATS, XM, MTL, NG, KS, NSA, NGR>;
+    GmKern k = dsv41_x3gm::gm2_kernel<MATS, XM, MTL, NG, KS, NSA, NGR>;
+    if (cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)S2::SMEM) != cudaSuccess) {
+        cudaGetLastError();
+        return {k, S2::THREADS, (int)S2::SMEM, 0};
+    }
+    CK(cudaFuncSetAttribute(k, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+    int per = 0;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, k, S2::THREADS, S2::SMEM) != cudaSuccess) { cudaGetLastError(); per = 0; }
+    return {k, S2::THREADS, (int)S2::SMEM, per};
+}
+struct TilePair { const char* name; GmLaunch gu, dn; int bm_gu, bm_dn; };
 
 struct Plan { std::vector<int> pick, order, pe, poff, pcnt; int npass = 0; };
 
@@ -220,12 +239,13 @@ Green green_make(int want, int prio_lo, int prio_hi) {
 int main(int argc, char** argv) {
     std::vector<int> rows_list{2048, 4096}, caps{48, 44, 40, 36, 32, 28, 24};
     int k2 = 6, reps = 5;
-    bool green = false;
+    bool green = false, tiles = false;
     double zipf = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         const bool has = i + 1 < argc;
         if (a == "--green") green = true;
+        else if (a == "--tiles") tiles = true;
         else if (a == "--rows" && has) rows_list = parse_list(argv[++i]);
         else if (a == "--sms" && has) caps = parse_list(argv[++i]);
         else if (a == "--k2" && has) k2 = atoi(argv[++i]);
@@ -252,6 +272,20 @@ int main(int argc, char** argv) {
 
     const GmLaunch GU = gm_make<2, 2, GM_GU1>();          // gateup2, two rotated inputs (x3gm.tuned2: shx false -> 1)
     const GmLaunch DN = gm_make<1, 1, GM_DN0>();          // down2
+    std::vector<TilePair> tilepairs;
+    if (tiles) {
+        tilepairs = {
+            {"GU1/DN0 (G6, prod)", GU, DN, 64, 64},
+            {"GU2/DN0", gm_try<2, 2, GM_GU2>(), DN, 128, 64},
+            {"GU3/DN0", gm_try<2, 2, GM_GU3>(), DN, 128, 64},
+            {"GU4/DN0", gm_try<2, 2, GM_GU4>(), DN, 128, 64},
+            {"GU1/DN2", GU, gm_try<1, 1, GM_DN2>(), 64, 128},
+            {"GU1/DN3", GU, gm_try<1, 1, GM_DN3>(), 64, 128},
+            {"GU1/DN4", GU, gm_try<1, 1, GM_DN4>(), 64, 128},
+            {"GU2/DN2", gm_try<2, 2, GM_GU2>(), gm_try<1, 1, GM_DN2>(), 128, 128},
+            {"GU4/DN4", gm_try<2, 2, GM_GU4>(), gm_try<1, 1, GM_DN4>(), 128, 128},
+        };
+    }
     constexpr int BM = 8 * 8;                             // NG 8 for GU1 and DN0: 64-member passes
     const int RMAX = *std::max_element(rows_list.begin(), rows_list.end()), PMAX = RMAX * SLOTS;
 
@@ -497,6 +531,40 @@ int main(int argc, char** argv) {
                  best_mode == "green" ? " [host wall]" : "");
         best_lines.push_back(b);
         printf("%s\n", b);
+        // --tiles: x3gm alone (every SM) at each tile pair, its own plan per BM (the same picks), Y against G6's
+        if (tiles) {
+            const Plan p128 = route(R, zipf, 128, 1234 + R);
+            int *pe2 = dev(p128.pe), *poff2 = dev(p128.poff), *pcnt2 = dev(p128.pcnt);
+            int* np2 = dev(std::vector<int>{p128.npass});
+            printf("tiles R=%d (%d passes at BM 64, %d at BM 128):\n", R, pl.npass, p128.npass);
+            double t_ref = 0, best_t = 1e30; const char* best_n = "";
+            for (const TilePair& tp : tilepairs) {
+                if (tp.gu.per_sm == 0 || tp.dn.per_sm == 0) { printf("   %-20s does not fit an SM\n", tp.name); continue; }
+                dsv41_x3gm::Args g2 = ag, d2 = ad;
+                if (tp.bm_gu == 128) { g2.pe = pe2; g2.poff = poff2; g2.pcnt = pcnt2; g2.npass = np2; }
+                if (tp.bm_dn == 128) { d2.pe = pe2; d2.poff = poff2; d2.pcnt = pcnt2; d2.npass = np2; }
+                auto body = [&](cudaStream_t s) {
+                    CK(cudaMemsetAsync(ticket, 0, 8, s));
+                    dsv41_x3gm::rot_kernel<half, 2><<<(rot_items + 7) / 8, 256, 0, s>>>(x, D, pick, suh_g, suh_u, xg, xu, D,
+                                                                                       SLOTS, rot_items);
+                    tp.gu.k<<<sms * tp.gu.per_sm, tp.gu.threads, tp.gu.smem, s>>>(g2);
+                    tp.dn.k<<<sms * tp.dn.per_sm, tp.dn.threads, tp.dn.smem, s>>>(d2);
+                };
+                const double t = med1(body);
+                body(st);
+                check_bits(tp.name, sms);
+                if (t_ref == 0) t_ref = t;
+                if (t < best_t) { best_t = t; best_n = tp.name; }
+                printf("   %-20s %8.3f ms  (%+.1f %% vs G6)  %.3f ms / 1K rows\n", tp.name, t, 100.0 * (t - t_ref) / t_ref,
+                       1024.0 * t / R);
+            }
+            char tb[200];
+            snprintf(tb, sizeof tb, "TILES R=%d: best %s %.3f ms vs G6 %.3f ms (%+.1f %%)", R, best_n, best_t, t_ref,
+                     100.0 * (best_t - t_ref) / t_ref);
+            best_lines.push_back(tb);
+            printf("%s\n", tb);
+            for (int* q : {pe2, poff2, pcnt2, np2}) CK(cudaFree(q));
+        }
         for (int* p : {pick, order, pe, poff, pcnt, np}) CK(cudaFree(p));
     }
 
