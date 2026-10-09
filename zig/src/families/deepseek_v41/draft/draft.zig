@@ -16,6 +16,7 @@ pub const Lanes = lanes.Lanes;
 pub const twin = @import("twin.zig");
 pub const drive = @import("drive.zig");
 pub const branches = @import("branches.zig");
+pub const lookup = @import("lookup.zig");
 pub const calib_env = @import("calib_env.zig");
 pub const branches_oracle = @import("branches_oracle.zig");
 pub const spec = @import("spec.zig");
@@ -42,4 +43,6 @@ test {
     _ = @import("golden_test.zig");
     _ = spec;
     _ = @import("spec_test.zig");
+    _ = lookup;
+    _ = @import("lookup_test.zig");
 }

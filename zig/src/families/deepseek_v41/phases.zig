@@ -51,9 +51,13 @@ pub const Mode = enum { off, wall, sync };
 /// The stream the `sync` mode waits for.
 pub const Sync = struct { ctx: *anyopaque, run: *const fn (ctx: *anyopaque) anyerror!void };
 
+/// Counters beside the phases (an object without "ms", so gap.py's phase filter skips it): written into the report.
+pub const Extra = struct { ctx: *anyopaque, write: *const fn (ctx: *anyopaque, w: *std.Io.Writer) anyerror!void };
+
 pub const Phases = struct {
     mode: Mode,
     sync: ?Sync = null,
+    extra: ?Extra = null,
     ns: [count]u64 = @splat(0),
     n: [count]u64 = @splat(0),
     rounds: u64 = 0,
@@ -111,6 +115,7 @@ pub const Phases = struct {
             const ms = @as(f64, @floatFromInt(p.ns[i])) / 1e6;
             try w.print(", \"{s}\": {{\"ms\": {d:.2}, \"n\": {d}, \"ms_avg\": {d:.3}}}", .{ @tagName(@as(Name, @enumFromInt(i))), ms, p.n[i], ms / @as(f64, @floatFromInt(p.n[i])) });
         }
+        if (p.extra) |x| try x.write(x.ctx, w);
         try w.writeAll("}\n");
     }
 

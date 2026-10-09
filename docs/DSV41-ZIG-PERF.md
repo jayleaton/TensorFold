@@ -400,3 +400,37 @@ reads them; any difference turns batching off, and that round runs the per-slot 
 differing row. Expected: -0.6 ms a 4-slot round (`main_proj` 0.19-0.22 a slot, the weight streamed once instead of
 4 times), +0.5 % code x4 / the mix / prose x4, nothing at 1 stream; with the overlap on, the saving is partly
 already hidden (the ingests then sit beside the window's tail), so the two do not add fully.
+
+## 11. Copy drafts at 4 streams: Python's priced lookup plan (TF_DSV41_LOOKUP_PLAN=1, 2026-10-09, offline)
+
+The 2026-10-08 T0 x4 nsys pair (141.5 vs 145.55 tok/s, the same tokens a round): forwards of equal rows cost the
+same in both engines (24-row bucket 85.5 / 85.4 ms, 36-grid 114.2 / 113.0 ms), but Zig ran 7 forwards of 32-43 rows
+(141-181 ms) that Python never runs. The 10-09 acceptance logs (kits with the device chain) show what they are: three
+DSpark windows plus a 12-16-row copy window on the fourth slot (code x4: 14-37 such rounds a run, 15.5 rows, 4.9
+tokens kept, against ~3.7 for that slot's DSpark window; +27-67 ms a forward).
+
+Cause: Zig's copies are the lanes core's (`lanes.SuffixLookup` through `windows.copyProposal`): a match of
+`enter_match` (8) tokens copies up to 15 tokens, unpriced. Python (`deepseek_v41/cuda/lookup.py` `Planner`) prices
+every lookup: the match length's band gives p (prior 0.45 / 0.7 / 0.8 / 0.9 at 0 / 8 / 16 / 32 tokens, worth 2
+trials, decayed 0.85 a lookup round), `best_k` picks k >= 1 maximizing E(k) - rate x verify[k] against the
+request's own rate (its last 8 DSpark / serial rounds' tokens a modelled ms), and a lookup round runs only with a
+positive surplus (a 16+ band skipped 8 times is probed once).
+
+Port: `draft/lookup.zig` (the plan on glm5_next's `SuffixIndex`: n 3, 64 candidates, extend 64, the eos cut, the
+image virtual-id cut) as a priced lanes proposer: `Proposer.VTable.priced` makes `copyProposal` take its drafts as
+they are, and `round` gives it every non-forced round's rows and kept drafts (Python's `observe`; a stream not asked
+counts as serial). `LaneHost.proposers` makes one a request; the DSV4.1 serve engine installs it with
+TF_DSV41_LOOKUP_PLAN=1 (default off), pricing with the measured cost table (`policy.depth.costs`). Python's own knobs
+apply: TF_DSV41_LOOKUP (1), TF_DSV41_LOOKUP_MIN (4), TF_DSV41_MAX_ROWS (16). DSpark's skip stays Zig's.
+
+Gate: `lookup_test.zig` replays `fixtures/lookup-golden.json` (tools/lookup_golden.py on prod 8474f31's lookup.py:
+24 requests, 3,275 rounds, 465 lookup rounds; min match 3 / 4 / 6, max rows 8 / 12 / 16, the default and a measured
+table, eos tokens in the drafts) round for round, kind and drafts, then the same rounds through the proposer from a
+stream's context (a second ask in a round reads the decision back). Drafts never change a reply.
+
+Spark A/B: code / prose x4 T0 with TF_DSV41_LOOKUP_PLAN=1 against the same kit without it; pass = equal T0 hashes,
+no forward past 24 rows in the acceptance log when Python has none, and code x4 not slower.
+
+Also here: the phases report carries "engram" counters (row reader hits / waited / misses / reads / bytes / wait_ms,
+gate rounds / syncs / warm / failed; cumulative, a cell's are two snapshots' difference), for the cold rep 0
+question (section 10 of the sampled work).

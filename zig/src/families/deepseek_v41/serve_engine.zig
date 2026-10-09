@@ -17,6 +17,7 @@ const costs_mod = @import("draft/costs.zig");
 const tree = @import("draft/tree.zig");
 const calib_env = @import("draft/calib_env.zig");
 const spec = @import("draft/spec.zig");
+const lookup = @import("draft/lookup.zig");
 const m3 = @import("m3.zig");
 const ph = @import("phases.zig");
 const timed = @import("phases_timed.zig");
@@ -71,6 +72,8 @@ pub const Served = struct {
     gtarget: ?*grammar_gpu.GrammarTarget = null,
     /// TF_DSV41_PREFILL_PIECES=1 (sched_host.zig): prod's batcher plans the host's rounds
     sched: ?*sched_host.SchedHost = null,
+    /// TF_DSV41_LOOKUP_PLAN=1 (draft/lookup.zig): Python's priced lookup drafts for each request's copies
+    lookup: ?*lookup.Planner = null,
 
     /// Rank 0's engine over a loaded model (`drafts`: DSpark's pass, else serial windows through the same lanes).
     pub fn open(gpa: Allocator, io: std.Io, dir: []const u8, assets: []const u8, drafts: bool, context: ?i64) !*Served {
@@ -95,6 +98,7 @@ pub const Served = struct {
         if (s.phases) |x| {
             x.sync = .{ .ctx = m, .run = syncStream };
             m.f.phases = x;
+            x.extra = .{ .ctx = m, .write = writeEngram };
             s.tt = .{ .inner = tgt, .p = x, .gpa = gpa, .io = io };
             s.tpass = .{ .inner = pass, .p = x };
             tgt = s.tt.target();
@@ -145,6 +149,15 @@ pub const Served = struct {
                 std.log.info("dsv41 rounds: {s}", .{sh.describe(&buf)});
             }
         } else std.log.info("dsv41 rounds: whole prompts at admission (TF_DSV41_PREFILL_PIECES=1: prod's pieces between decode rounds)", .{});
+        s.lookup = null;
+        const ls = try lookup.Settings.fromEnv();
+        if (ls.plan) {
+            const pl = try gpa.create(lookup.Planner);
+            pl.* = lookup.Planner.init(ls, &s.x.policy.depth.costs, m.pass != null);
+            s.lookup = pl;
+            s.host.proposers = .{ .ctx = pl, .make = makeLookup, .free = freeLookup };
+            std.log.info("dsv41 lookup: Python's priced plan (min match {d}, up to {d} rows{s})", .{ ls.min_match, ls.max_rows, if (ls.lookup) "" else ", lookup off" });
+        }
         try s.host.start();
         if (s.gengine) |ge| ge.inner = s.host.engine();
         s.rec = Recorder.init(gpa, io, if (s.gengine) |ge| ge.engine() else s.host.engine());
@@ -172,10 +185,41 @@ pub const Served = struct {
         return s.rec.engine();
     }
 
+    /// The phases report's "engram" counters (cumulative; a cell's are the difference of two snapshots): the row
+    /// reader's records found cached (hits), found in flight (waited), read (misses), extents read and their bytes,
+    /// the engine's wait for them; the gate's rounds, GPU-side syncs and warm jobs. Python's boot line reports the same
+    /// as "rows N (cached, read)".
+    fn writeEngram(ctx: *anyopaque, w: *std.Io.Writer) anyerror!void {
+        const m: *model.Model = @ptrCast(@alignCast(ctx));
+        try w.writeAll(", \"engram\": {");
+        if (m.f.engram_rows) |r| {
+            const st = r.stats;
+            try w.print("\"hits\": {d}, \"waited\": {d}, \"misses\": {d}, \"issued\": {d}, \"reads\": {d}, \"bytes\": {d}, \"wait_ms\": {d:.2}", .{ st.hits, st.waited, st.misses, st.issued, st.reads, st.bytes, @as(f64, @floatFromInt(st.wait_ns)) / 1e6 });
+        } else try w.writeAll("\"rows\": null");
+        if (m.f.gate) |g| try w.print(", \"gate_rounds\": {d}, \"gate_syncs\": {d}, \"gate_warm\": {d}, \"gate_failed\": {d}", .{ g.stats.rounds, g.stats.syncs, g.stats.warm, g.stats.failed });
+        try w.writeAll("}");
+    }
+
+    fn makeLookup(ctx: *anyopaque, gpa: Allocator, prompt: []const u32, eos: []const u32) anyerror!lanes.proposer.Proposer {
+        const pl: *const lookup.Planner = @ptrCast(@alignCast(ctx));
+        const x = try gpa.create(lookup.Proposer);
+        errdefer gpa.destroy(x);
+        x.* = try lookup.Proposer.init(pl, gpa, prompt, eos);
+        return x.proposer();
+    }
+
+    fn freeLookup(_: *anyopaque, p: lanes.proposer.Proposer) void {
+        const x: *lookup.Proposer = @ptrCast(@alignCast(p.ptr));
+        const gpa = x.req.index.gpa;
+        x.deinit();
+        gpa.destroy(x);
+    }
+
     pub fn close(ctx: *anyopaque) void {
         const s: *Served = @ptrCast(@alignCast(ctx));
         const gpa = s.gpa;
         s.host.stop();
+        if (s.lookup) |pl| gpa.destroy(pl);
         if (s.sched) |sh| {
             s.m.gt.settleReleases();
             sh.deinit();
