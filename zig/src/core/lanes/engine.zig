@@ -138,6 +138,76 @@ pub const Engine = struct {
         return e.opened(s);
     }
 
+    /// A round's finished prompts (Config.join_tail): each as `finishStream`, but the joined ones' first drafts in one
+    /// backend call (Python's rounds.py `_windows`: one `fwd.draft` over every window of the round), not one pass a
+    /// prompt. `errs[i]`: stream i's failure (a failed shared draft fails every joined stream); a stream without one is
+    /// live (or ended, as `opened` leaves it).
+    pub fn finishStreams(e: *Engine, streams: []const *Stream, errs: []?anyerror) !void {
+        _ = e.arena.reset(.retain_capacity);
+        const a = e.arena.allocator();
+        var reqs: std.ArrayList(be.DraftRequest) = .empty;
+        var joins: std.ArrayList(usize) = .empty;
+        for (streams, errs, 0..) |s, *err, i| {
+            err.* = null;
+            const can = e.cfg.join_tail and e.cfg.family_mtp and s.drafts and s.prompt_len > 0 and s.force.items.len == 0 and !s.cutsNext();
+            const join = if (can) e.backend.vtable.join else null;
+            if (join) |j| {
+                const ok = j(e.backend.ptr, s) catch |x| {
+                    err.* = x;
+                    continue;
+                };
+                if (ok) {
+                    try reqs.append(a, e.joinRequest(s) catch |x| {
+                        err.* = x;
+                        continue;
+                    });
+                    try joins.append(a, i);
+                    continue;
+                }
+            } else {
+                const fin = e.backend.vtable.finish orelse return error.NoPieces;
+                fin(e.backend.ptr, s) catch |x| {
+                    err.* = x;
+                    continue;
+                };
+            }
+            e.opened(s) catch |x| {
+                err.* = x;
+            };
+        }
+        if (reqs.items.len == 0) return;
+        e.backend.draft(reqs.items) catch |x| {
+            for (joins.items) |i| errs[i] = x;
+            return;
+        };
+        for (reqs.items) |r| e.joinedDrafted(r) catch |x| {
+            for (joins.items) |i| if (streams[i] == r.stream) {
+                errs[i] = x;
+            };
+        };
+    }
+
+    /// A joined prompt's state and its first draft request (the last token pending at the prompt's last position).
+    fn joinRequest(e: *Engine, s: *Stream) !be.DraftRequest {
+        s.context.shrinkRetainingCapacity(s.prompt_len);
+        const last = s.context.items[s.prompt_len - 1];
+        s.cache_len = s.prompt_len - 1;
+        s.pending = last;
+        var who = win.who(s);
+        const d: u32 = @intCast(if (e.cfg.node_probabilities) try e.rule.headDepth(&who, null, win.probe(e)) else try e.rule.depth(who));
+        return .{ .stream = s, .follow = &.{}, .first = .{ .value = last }, .rows = null, .start = s.cache_len, .position = s.prompt_len, .depth = d };
+    }
+
+    /// After its first draft: the joined stream holds it and takes part from the next round.
+    fn joinedDrafted(e: *Engine, r: be.DraftRequest) !void {
+        const s = r.stream;
+        s.dropHeld(e.gpa);
+        s.next = .{ .count = r.depth };
+        try trail.event(e, &.{ f("ev", str("draft")), f("stream", str(s.id)), f("depth", int(r.depth)), f("position", int(r.position)), f("follow", .{ .u32s = &.{s.pending.?} }), f("rows", .null) });
+        try trail.resolve(e);
+        try e.live.append(e.gpa, s);
+    }
+
     /// A joined prompt (Backend.join): its last token is the stream's pending row at the prompt's last position, the
     /// head's drafts after it asked now, so the stream's first round verifies them with the round's other windows
     /// (Python's batcher: a `finals` slot decodes in the same round, its first window drafted). The reply's first
