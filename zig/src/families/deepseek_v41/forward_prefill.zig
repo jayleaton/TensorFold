@@ -65,6 +65,12 @@ pub const State = struct {
     /// options, buffer plan and arena stay the 2,048-row ones, so decode windows and the drafter are untouched
     k4: bool = false,
     k4ws: K4 = .{},
+    /// the current prompt call may use the workspace (4K segments, TBO pairs): every rank's MemAvailable leaves the
+    /// workspace above the hard floor (wsAgreed, one collective a call); false: this call runs 2,048-row segments, the
+    /// same bits (segmentation-invariant), never a failure. True until a call decides (the planner reads it at boot)
+    ws_ok: bool = true,
+    ws_fallbacks: u64 = 0,
+    agreement: ?graphs.Agreement = null,
     /// the next prompt piece's ids (Forward.prefillAhead, op 60: the round planner's next piece of this prompt, as
     /// Python's rounds._prefetch(ahead=prefetch.next_pieces)): this prompt call's last segment reads their Engram rows
     /// ahead, as a segment inside one call reads the next segment's (TF_DSV41_PREFETCH_AHEAD). Cleared by the call
@@ -84,6 +90,7 @@ pub const State = struct {
         if (s.masked) |*b| b.free();
         s.ids.deinit(gpa);
         s.next.deinit(gpa);
+        if (s.agreement) |*x| x.deinit();
     }
 };
 
@@ -259,7 +266,30 @@ pub const K4 = struct {
 
 /// The rows a prompt segment holds: 4,096 under TF_DSV41_PF_4K, else the forward's (the round planner's rows too).
 pub fn segmentRows(f: *const Forward) usize {
-    return if (f.prefill_state.k4) K4.rows else @intCast(f.opts.prefill_rows);
+    const st = &f.prefill_state;
+    return if (st.k4 and st.ws_ok) K4.rows else @intCast(f.opts.prefill_rows);
+}
+
+/// Whether this prompt call may use the workspace, on every rank alike: held already (a later piece of the prompt),
+/// or every rank's MemAvailable less the workspace clears the hard floor (one all-gathered flag, graphs.Agreement).
+/// No: the call runs 2,048-row segments (4K and 2K give the same bits), logged; nothing fails.
+fn wsAgreed(f: *Forward) !bool {
+    const st = &f.prefill_state;
+    const ws = &st.k4ws;
+    if (ws.buf != null) return true;
+    const pl = ws.plan orelse return false;
+    const bytes = planBytes(&pl);
+    const hard = wsFloorGiB();
+    const avail = graphs.memAvailableGiB();
+    const left = if (avail) |v| v - @as(f64, @floatFromInt(bytes)) / (1 << 30) else hard;
+    if (st.agreement == null) st.agreement = try graphs.Agreement.init(f.runner.d, f.comm, f.runner.stream);
+    const ok = try st.agreement.?.agree().all(st.agreement.?.agree().ctx, left >= hard);
+    if (!ok) {
+        st.ws_fallbacks += 1;
+        if (st.ws_fallbacks <= 4 or st.ws_fallbacks % 64 == 0)
+            log.warn("prefill workspace: {d} MiB does not fit on every rank (rank {d}: {d:.2} GiB MemAvailable leaves {d:.2}, floor {d:.1} GiB, TF_DSV41_PF_WS_FLOOR_GIB): this prompt piece runs 2,048-row segments (fallback {d})", .{ bytes >> 20, f.comm.rank(), avail orelse -1, left, hard, st.ws_fallbacks });
+    }
+    return ok;
 }
 
 /// The options a 4,096-row segment emits with: the forward's at 4,096 rows with x3gm one block a segment.
@@ -308,16 +338,7 @@ fn k4Acquire(f: *Forward) !void {
     if (ws.buf != null) return;
     const pl = ws.plan orelse return error.Unbound;
     const total = planBytes(&pl);
-    // on the GB10 the device allocates from host memory: an allocation past it is a kernel OOM kill, not an error
-    // (T2-1, rank 1 with TBO + 4K's 5 GiB). Refuse first, named, under the hard floor; fail-fast takes the ranks down
-    const hard = hardFloorGiB();
-    if (graphs.memAvailableGiB()) |avail| {
-        const left = avail - @as(f64, @floatFromInt(total)) / (1 << 30);
-        if (left < hard) {
-            log.err("prefill workspace: {d} MiB would leave {d:.2} GiB of {d:.2} GiB MemAvailable, under the hard floor {d:.1} GiB (TF_DSV41_FLOOR_HARD_GIB): lower TF_DSV41_POOL_TOKENS or drop TF_DSV41_PF_TBO / TF_DSV41_PF_4K", .{ total >> 20, left, avail, hard });
-            return error.OutOfMemory;
-        }
-    }
+    // the room was agreed first (wsAgreed): every rank fits the workspace above the hard floor
     const t0 = nowMs();
     const b = cuda.DeviceBuffer.alloc(f.runner.d, @max(total, 256)) catch |e| {
         log.err("prefill workspace: allocating {d} MiB failed ({t})", .{ total >> 20, e });
@@ -340,13 +361,20 @@ fn k4Acquire(f: *Forward) !void {
     // the allocation's cost a prompt (the GB10 maps host pages for it): outside the prefill profile's segments
     try f.runner.stream.synchronize();
     const ms = nowMs() - t0;
-    if (f.comm.rank() == 0 and (ws.allocs <= 4 or ws.allocs % 64 == 0)) log.info("prefill 4K: workspace {d} MiB allocated and zeroed in {d:.1} ms (prompt {d}), held while the prompt prefills", .{ total >> 20, ms, ws.allocs });
+    if (ws.allocs <= 4 or ws.allocs % 64 == 0) log.info("prefill 4K: rank {d}: workspace {d} MiB allocated and zeroed in {d:.1} ms (prompt {d}), held while the prompt prefills", .{ f.comm.rank(), total >> 20, ms, ws.allocs });
 }
 
 fn nowMs() f64 {
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &ts);
     return @as(f64, @floatFromInt(ts.sec)) * 1e3 + @as(f64, @floatFromInt(ts.nsec)) / 1e6;
+}
+
+/// TF_DSV41_PF_WS_FLOOR_GIB: the MemAvailable the workspace must leave on every rank, else the prompt piece runs
+/// 2,048-row segments; default TF_DSV41_FLOOR_HARD_GIB (4, the boot check's).
+fn wsFloorGiB() f64 {
+    const v = std.c.getenv("TF_DSV41_PF_WS_FLOOR_GIB") orelse return hardFloorGiB();
+    return std.fmt.parseFloat(f64, std.mem.span(v)) catch hardFloorGiB();
 }
 
 /// TF_DSV41_FLOOR_HARD_GIB (4, the boot check's).
@@ -363,11 +391,11 @@ fn k4Release(f: *Forward) !void {
     const before = graphs.memAvailableGiB();
     b.free();
     ws.buf = null;
-    // the prefill -> decode handoff: what the row graphs' memory floor sees right after the free (rank 0, the
-    // first prompts and every 64th after)
+    // the prefill -> decode handoff: what the row graphs' memory floor sees right after the free (every rank: rank 1
+    // is the tighter node on the Sparks; the first prompts and every 64th after)
     ws.releases += 1;
-    if (f.comm.rank() == 0 and (ws.releases <= 4 or ws.releases % 64 == 0))
-        log.info("prefill 4K: workspace {d} MiB freed at the prompt's end (release {d}); MemAvailable {d:.2} -> {d:.2} GiB", .{ ws.bytes >> 20, ws.releases, before orelse -1, graphs.memAvailableGiB() orelse -1 });
+    if (ws.releases <= 4 or ws.releases % 64 == 0)
+        log.info("prefill 4K: rank {d}: workspace {d} MiB freed at the prompt's end (release {d}); MemAvailable {d:.2} -> {d:.2} GiB", .{ f.comm.rank(), ws.bytes >> 20, ws.releases, before orelse -1, graphs.memAvailableGiB() orelse -1 });
     if (ws.send) |*x| x.free();
     if (ws.gathered) |*x| x.free();
     ws.send = null;
@@ -399,6 +427,9 @@ pub fn prompt(f: *Forward, ids_in: []const u32) !void {
     const ids = st.ids.items;
     st.taps_rows = 0;
     try ready(f);
+    // TF_DSV41_PF_4K / _PF_TBO: the workspace for this call, decided on every rank alike (else 2,048-row segments)
+    st.ws_ok = true;
+    if (st.k4 or (st.mode == .replay and f.opts.pf_tbo)) st.ws_ok = try wsAgreed(f);
     const seg: usize = segmentRows(f);
     defer st.next.clearRetainingCapacity();
     var at: usize = 0;
@@ -422,7 +453,7 @@ pub fn prompt(f: *Forward, ids_in: []const u32) !void {
 /// TF_DSV41_PF_TBO's split of the `left` prompt rows ahead: two whole segments, or what is left halved on the 16-row
 /// grid; null when TBO is off, the prompt is in full mode, or a half would be under tbo_min.
 fn pairOf(f: *const Forward, left: usize) ?[2]usize {
-    if (!f.opts.pf_tbo or f.prefill_state.mode != .replay) return null;
+    if (!f.opts.pf_tbo or f.prefill_state.mode != .replay or !f.prefill_state.ws_ok) return null;
     return pairSplit(segmentRows(f), left);
 }
 
@@ -539,7 +570,7 @@ fn segment(f: *Forward, ids: []const u32, head: bool) !void {
     const start = f.slot.pos;
     if (f.kv) |kx| try kx.reserve(start + n);
     // TF_DSV41_PF_4K: a segment past the forward's rows runs in the workspace (its own roles: block_prefill.ownCalls)
-    const big = st.k4 and n > f.opts.prefill_rows;
+    const big = st.k4 and st.ws_ok and n > f.opts.prefill_rows;
     const o = if (big) k4Options(vision_rows.segmentOptions(f, ids)) else vision_rows.segmentOptions(f, ids);
     const emitted = if (replay) block_prefill.emitReplay(a, f.cfg, f.widths, o, layers, n, @intCast(start), .encoder) else block_prefill.emitPrefill(a, f.cfg, f.widths, o, layers, n, @intCast(start), head);
     const plain = emitted catch |e| {
