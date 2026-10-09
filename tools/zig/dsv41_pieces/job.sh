@@ -46,6 +46,8 @@ same = sum(json.load(open(f"{ref}/p{p}/ref.json"))["tokens"] == json.load(open(f
 print(f"pieces: Python batched == alone, tokens: {same}/{len(ps)} (informational)")
 EOF
     fi
+    # the piece-at-a-time run's encoder shapes (one prompt a forward) are the alone reference's kernels
+    [[ -f "$alone/aot/aot.json" ]] && python3 -B "$Z/tools/zig/dsv41_aot_merge.py" "$ref/aot" "$alone/aot" >> "$out/summary.log" 2>&1
     rm -rf "$alone"
     for run in run one; do
         (( $(left) >= 3 )) || { echo "FAIL pieces: $(left) min left before pieces-$run" | tee -a "$out/summary.log"; return 1; }
