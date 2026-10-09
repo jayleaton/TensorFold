@@ -156,6 +156,8 @@ pub const Model = struct {
         else
             &.{};
         try m.session.open(&m.driver, m.tcfg, image);
+        // TF_DSV41_ARENA: every device buffer from here on (weights, forms, roles, scratch) carved from large chunks
+        _ = try @import("dev_arena.zig").install(gpa, &m.ctx, m.tcfg.rank);
         const comm = m.session.comm();
         const world: u32 = @intCast(comm.world());
         m.cfg = try Config.read(gpa, io, pack_dir);

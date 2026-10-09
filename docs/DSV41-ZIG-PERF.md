@@ -459,9 +459,26 @@ weight streamed once; needs the batched rows' bits proven equal to a slot's alon
 
 A 4-stream round is ~107 ms; two in three of its windows have 17-48 rows (4 streams' drafts), past mhc_cuda's 16
 (`MAXR`), so their 81 sites run Python's Triton pair at 62 us each, against ~32 us for a 16-row mhc_cuda boundary.
-Python runs the same pair (it is prod's path), so this is a lead over Python, not parity. Zig's 16-row boundary is 6 us
-slower than Python's only when it shares the GPU with the L2 prefetch's `paced_kernel` (32.3 vs 25.9 us; alone 22.0 vs
-19.7): an L2PF pacing difference, not the kernel.
+Python runs the same pair (it is prod's path), so this is a lead over Python, not parity.
+
+**Zig's 16-row mhc_cuda boundary is slower than Python's, and not because of L2PF.** Zig 32.2 us against Python 25.9
+when the boundary overlaps L2PF's `paced_kernel`. That is ~95 % of the 16-row boundaries in both engines, at the same
+point inside the paced launch (it starts ~29 us after the paced launch, median, in both). The gap holds with nothing
+beside the boundary too: the window's first site (no post, no gathered partials, no concurrent kernel) is 26.0 against
+15.8 us, and the Engram block's site 19.0 against 15.1. Everything the scheduling could differ in is the same:
+- stream priority 0 everywhere in both;
+- the paced fork just before the exchange (G14 `at=after`), 2 CTAs x 32 threads, ~87 us, the same bytes;
+- the boundary right after the exchange, coef_kernel deferred, no other kernel concurrent, no long-running kernel
+  spanning any boundary;
+- the launch configuration (113 registers, 20,656 + R x 128 B shared memory, 100 KB carveout executed) and the spin
+  (8,000 cycles);
+- window buffers 256-byte aligned.
+
+The shift is uniform (deciles +3..+8 us), and coef_kernel is ~5 % slower too: the time is inside the kernels' memory
+accesses, not in their placement. Two small placement items: Zig's boundary starts 0.8-1.5 us after the exchange
+kernel ends, Python's 0.2 us (an extra dependency node after `tp_roce` in the window graph: the TP fabric's, ~0.1 ms
+a window). Next step on a Spark: Nsight Compute of `boundary_kernel` in both engines (L2 / DRAM sectors, sector
+misses by input), or the same with `TF_DSV41_L2PF=0` in both to confirm.
 
 ### 8.2 TF_DSV41_MHC_PFDEC=<rows> (block_wide.zig, default 0 = off): the Triton pair as two CUDA launches and the norm
 
@@ -705,3 +722,59 @@ Left for after the Spark numbers:
 - `TF_DSV41_SPEC_NUCLEUS=1`: the speculative pass for nucleus rounds. Zig's host holds the exact choices when
   `speculate` runs, so the knob needs no `device_z` and is exact; T 0 gets that overlap today (T 0.7's `draft.pass`
   +0.15 ms and `engram.wait` +0.1 ms a round are its absence). Python leaves it off; pod step `spec-samp` covers it.
+
+### 8.5 TF_DSV41_ARENA: the device buffers from a few large chunks (default off)
+
+The suspect behind 8.1's gap: Zig gives each buffer its own `cuMemAlloc` (`cuda/memory.zig`), so the small ones the
+glue kernels read every launch (each layer's mHC `fn16` at 983 KB, norm weights, coefficients, router I/O, tables)
+each sit on pages of their own among the weights, while PyTorch's caching allocator carves them from 2 MiB and
+20 MiB+ segments. If GB10's unified memory pays for that spread (smaller pages, TLB misses on a cold launch), every
+small kernel pays it, not only mHC.
+
+`cuda/arena.zig` sits under `DeviceBuffer.alloc` / `free` when installed (`memory.setHook`):
+- requests up to 4 MiB are bumped, 512-byte aligned, from shared 64 MiB chunks (a freed range is reused for the same
+  rounded size); larger ones get a chunk of their own, rounded to the granularity;
+- backend `vmm` (`TF_DSV41_ARENA=1`): one reserved virtual range (2x the device's memory), physical chunks of the
+  device's recommended granularity (at least 2 MiB) mapped in order; `plain` (`TF_DSV41_ARENA=plain`, and the
+  fallback without VMM): one `cuMemAlloc` a chunk;
+- installed by `dev_arena.zig` right after the TP session opens (the fabric keeps its buffers) and before the
+  weights load, in the server (`model.zig`) and the M2b gate, on every rank.
+
+Only addresses change. Host gate: `dev_arena_test.zig` (every program kind emitted with and without the knob is the
+same call list, argument for argument) and the arena's unit tests (packing, alignment, reuse, large chunks,
+fallback, the hook).
+
+Spark micro-check (seconds, one GPU, prod stopped or on rank 1 between benches): `tf-dsv41-test mhc-alloc [windows]`
+times prod's 16-row boundary and its coef_kernel over 80 per-layer site buffers with a 512 MiB fill between launches,
+with the buffers per `cuMemAlloc`, in the plain arena and in the VMM arena. If per-buffer is ~26 us and the arenas
+~16 us, the theory holds and the knob goes into the next A/B; if all three match, the next suspects are the buffers'
+relative addresses (L2 slice aliasing between x, xout, the gathered rows and the partials) and the instruction side
+(the boundary's code cold after ~1 ms of other kernels in both engines, so less likely).
+
+### 8.6 The probe's answers, and the writer hunt (round 4's nsys)
+
+`mhc-alloc` (dgx-01): per-buffer 37.6, plain arena 36.6, VMM 38.6 us: allocation and page size are not it.
+`mhc-probe` (dgx-01, f86954d3), boundary / coef us: overhead 1.7; cold-write 36.6 / 10.2; cold-read 22.3 / 8.2;
+engine 19.5 / 8.2; warm 16.4 / 8.0; aligned2m, stagger, cross all 19.5 / 8.2. Dirty L2 lines cost the boundary
+~14 us; slice aliasing and the cross-stream dependency cost nothing.
+
+No Zig-only writer before a boundary in the traces:
+- the kernels between two consecutive boundaries, by name and grid, over ~5,000 intervals a capture, are the same
+  in both engines but for the exchange (Zig `tp_roce`, Python `gather_fast_kernel`) and Python's torch elementwise
+  launches;
+- memsets: 442 (Zig) / 492 (Python) in the whole capture, 64 B each near a window start; memcpys: none of Zig's within
+  150 us before a boundary (Python's DtoD copies put 6.5 MB there);
+- `tp_roce` is a port of `gather_fast_kernel` (G14): the same pinned host slots, the same release / acquire order.
+
+Two exchange facts that do differ:
+- **grid:** both engines size it one block per 16 KiB rounded to a power of two, capped at Python's
+  GLM53_TF_ROCE_BLOCKS (8) and Zig's `max_blocks` (16): a 16-row window's 160 KiB exchange runs on 16 blocks in Zig
+  and 8 in Python. The 16-row boundary is +6.3 us in Zig, the 12-row one (8 blocks in both) +4.4 us, so the grid is
+  at most part of it. `TF_TP_ROCE_BLOCKS` / `GLM53_TF_ROCE_BLOCKS` now set the cap (power of two, 1-16, default 16
+  = today; 8 = Python's).
+- **after a short exchange the boundary is slower:** Zig 32.4 / 31.0 / 31.1 us after exchanges of < 15 / 15-30 /
+  30-60 us, 26.2 / 25.1 after 60-200 / > 200 us; Python 24-26 whatever the exchange. Whatever slows Zig's boundary
+  drains while an exchange waits: consistent with memory traffic the exchange leaves in flight.
+
+Probe variants `sysmem` / `devmem` test the exchange's host traffic directly: 160 KiB written to pinned host memory and
+320 KiB read back from it by kernels just before the boundary, against the same on device memory.
