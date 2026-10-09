@@ -858,20 +858,19 @@ pub const Forward = struct {
         }
         if (std.mem.eql(u8, step, "exchange_rows")) {
             // TF_DSV41_PF_OVERLAP: rows [r0, r0 + m) of a bf16 partial into the gathered [world, n, D], where the
-            // whole exchange's all-gather puts them: this rank's copied, the peer's received (TP=2: one peer)
+            // whole exchange's all-gather puts them: an all-gather of the piece into "L.xrows" [world, m, D] (the
+            // collective's channels: no NCCL p2p connection, whose buffers no plan or price holds), then each rank's
+            // m rows copied to their place. The same bytes as the whole exchange's
             const send = c.args[0].arg.t;
             const into = c.args[1].arg.t;
             const r0: usize = @intCast(c.args[2].arg.i);
             const n: usize = @intCast(into.shape[1]);
             const m = numel(send) / D;
-            if (W != 2 or r0 + m > n) return error.BadGlue;
-            const me = f.comm.rank();
-            const src = try r.tensorAddr(send);
+            if (r0 + m > n or c.args.len < 4) return error.BadGlue;
+            const tmp = try r.tensorAddr(c.args[3].arg.t);
+            try f.comm.allGather(try r.tensorAddr(send), tmp, m * D, .bf16, s);
             const base = try r.tensorAddr(into);
-            for (0..W) |q| {
-                const dst = base + ((q * n + r0) * D) * 2;
-                if (q == me) try r.d.check(r.d.api.cuMemcpyDtoDAsync_v2(dst, src, m * D * 2, s), "cuMemcpyDtoDAsync") else try f.comm.exchange(src, dst, m * D, .bf16, @intCast(q), s);
-            }
+            for (0..W) |q| try r.d.check(r.d.api.cuMemcpyDtoDAsync_v2(base + ((q * n + r0) * D) * 2, tmp + q * m * D * 2, m * D * 2, s), "cuMemcpyDtoDAsync");
             return;
         }
         if (std.mem.eql(u8, step, "exchange_f32")) {

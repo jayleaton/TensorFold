@@ -261,6 +261,13 @@ fn planWithin(base: block.Options) !void {
         try p4.add(c4);
         if (base.pf_overlap > 1) {
             try testing.expect(count(c4, "glue.exchange_rows") > 0);
+            // the pieces' all-gather scratch is the workspace's (priced with it)
+            var xr = false;
+            for (c4) |c| if (std.mem.eql(u8, c.name, "glue.exchange_rows")) {
+                xr = true;
+                try testing.expectEqualStrings("L.k4~xrows", roleOf(c.args[3].arg));
+            };
+            try testing.expect(xr);
             const sh = try branches.shared(aa, c4);
             try testing.expectEqual(@as(usize, if (base.pf_overlap_site) 4 else 2), sh.len);
             // the partials (and the gathered buffers the site pieces read) both streams touch are the workspace's

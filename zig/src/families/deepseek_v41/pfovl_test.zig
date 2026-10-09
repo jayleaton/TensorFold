@@ -153,6 +153,10 @@ fn pieces(cs: []const calls.Call, n: i64, k: i64, D: i64) !void {
         try testing.expectEqual(@as(i64, 0), @mod(r0, 16));
         try testing.expectEqual(r0 * D * 2, send.offset);
         try testing.expectEqualSlices(i64, &.{ 2, n, D }, into.shape);
+        // the piece's all-gather scratch (no NCCL p2p): [world, m, D] of its own role
+        const tmp = c.args[3].arg.t;
+        try testing.expectEqualStrings("L.xrows", roleOf(c.args[3].arg));
+        try testing.expectEqualSlices(i64, &.{ 2, m, D }, tmp.shape);
         seen += 1;
         const last = @mod(seen, k) == 0;
         try testing.expectEqual(!last, c.side);
