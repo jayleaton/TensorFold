@@ -121,7 +121,7 @@ const Seg = struct {
     fn pieces(s: *const Seg) i64 {
         const e = s.e;
         const k = e.o.pf_overlap;
-        if (k < 2 or s.short or !e.o.branches or e.o.world != 2 or e.n < k * overlap_min) return 1;
+        if (k < 2 or s.short or !e.o.branches or e.o.pf_tbo or e.o.world != 2 or e.n < k * overlap_min) return 1;
         return k;
     }
 
@@ -1221,6 +1221,8 @@ const Seg = struct {
         }
         for (layers, 0..) |L, i| {
             if (i > 0) e.begin = .layer;
+            // TF_DSV41_PF_TBO: a layer's attention part starts here (the first's at the program's first call)
+            if (i > 0) if (e.marks) |m| try m.append(e.a, e.out.items.len);
             e.layer_ratio = e.cfg.compressRatio(L);
             if (s.part == .decoder and i == 0) {
                 // entered (forward._layers): the first block's attention site is the stash's
@@ -1238,6 +1240,7 @@ const Seg = struct {
             // TF_DSV41_PF_OVERLAP: the partial went out a piece at a time behind its producer
             if (!s.sent_attn) try e.glue("exchange", &.{ try e.buf("L.part", .{}, .bf16, &.{ n, D }), try s.recv("attn") });
             s.sent_attn = false;
+            if (e.marks) |m| try m.append(e.a, e.out.items.len); // its MoE part
             try s.site(L, "hc_ffn", .boundary);
             try s.moeBlock(L);
             if (s.short and i + 1 < layers.len) try e.prefetchX(layers[i + 1]);
@@ -1356,8 +1359,127 @@ pub fn emitPrefill(a: std.mem.Allocator, cfg: *const Config, w: *const block.Wid
 }
 
 fn emitPart(a: std.mem.Allocator, cfg: *const Config, w: *const block.Widths, o: block.Options, layers: []const u32, n: i64, start: i64, head: bool, part: Part) ![]calls.Call {
+    return emitMarked(a, cfg, w, o, layers, n, start, head, part, null);
+}
+
+/// TF_DSV41_PF_TBO: micro-batches of at least this many rows (smaller ones run alone: their GEMMs' waves and the
+/// interleave's joins cost more than the overlap hides)
+pub const tbo_min: i64 = 512;
+
+/// The persistent roles a segment uses as scratch (rewritten every segment, never read by the next): a micro-batch
+/// of a TF_DSV41_PF_TBO pair takes its own copy of each. Every other "s." role is the slot's state (the KV pool, SWA
+/// rings, ratio-2 carries, index keys, the CED stash) or a constant table, which both micro-batches share.
+const tbo_scratch = [_][]const u8{ "s.ex.", "s.pf.xh", "s.pf.w", "s.router.", "s.stage.", "s.attn." };
+
+/// Micro-batch B's name of a role: "w.x" -> "w.b~x", "L.x" -> "L.b~x" (the same scope), a scratch "s.x" -> "s.b~x";
+/// the slot's state and the constants keep theirs.
+pub fn tboRole(a: std.mem.Allocator, r: []const u8) ![]const u8 {
+    if (std.mem.startsWith(u8, r, "s.")) {
+        for (tbo_scratch) |p| if (std.mem.startsWith(u8, r, p)) return std.fmt.allocPrint(a, "s.b~{s}", .{r[2..]});
+        return r;
+    }
+    const dot = std.mem.indexOfScalar(u8, r, '.') orelse return std.fmt.allocPrint(a, "b~{s}", .{r});
+    return std.fmt.allocPrint(a, "{s}b~{s}", .{ r[0 .. dot + 1], r[dot + 1 ..] });
+}
+
+fn tboArg(a: std.mem.Allocator, x: Arg) !Arg {
+    return switch (x) {
+        .t => |t| if (t.role == .buf) .{ .t = .{ .role = .{ .buf = try tboRole(a, t.role.buf) }, .dt = t.dt, .shape = t.shape, .stride = t.stride, .offset = t.offset } } else x,
+        .opaque_table => |t| if (t.role == .buf) .{ .opaque_table = .{ .role = .{ .buf = try tboRole(a, t.role.buf) }, .dt = t.dt, .shape = t.shape, .stride = t.stride, .offset = t.offset } } else x,
+        .list => |l| blk: {
+            const out = try a.alloc(Arg, l.len);
+            for (l, out) |y, *z| z.* = try tboArg(a, y);
+            break :blk .{ .list = out };
+        },
+        else => x,
+    };
+}
+
+/// TF_DSV41_PF_TBO: two consecutive CED encoder segments as one program on two streams (two micro-batches; DeepSeek's
+/// two-batch overlap). A = rows [start, start + na), B = [start + na, start + na + nb), each its own segment's calls
+/// exactly as `emitReplay(.encoder)` emits them (so each row's arithmetic is a consecutive segment's: segmentation-
+/// invariant, as the 2,048-row path already relies on), B's on the branches' side stream with its own scratch
+/// (`tboRole`), half a layer behind A:
+///   A.attn(L), [fork] B.attn(L), A.moe(L), B.moe(L), A.attn(L + 1), [fork] B.attn(L + 1), ...
+/// so A's routed experts run beside B's attention (and its dense GEMMs), and B's beside A's next attention. B reads
+/// the slot's state of layer L (SWA ring rows, index keys and compressed rows in the pool, the ratio-2 carry) only
+/// after A's layer L wrote it: each B attention part is forked behind A's, and A hands its ratio-2 carry of a layer to
+/// the slot at the end of that layer's attention (glue copy_rows: the copy A's commit would have made), not at the
+/// pair's end. A writes no state of a layer B is still reading (a layer's state is its own roles); the one state both
+/// touch at once is a kv source's compressed rows, which A's later layers read up to A's positions while B's source
+/// layer appends rows past them (disjoint rows: the pair's boundary is even, so no ratio-2 pair straddles it). A's CED stash is
+/// left out (B's, of at least 128 rows, overwrites all of it). An Engram layer's A part joins B first when B ran an
+/// Engram step since (the Engram glue's gathered buffer and pinned stages are one set), and the program ends with a join (glue tbo_join), so the commit sees both.
+/// error.Unsupported: either part off the prefill path, a micro-batch under `tbo_min` rows, split KV, or images.
+pub fn emitTbo(a: std.mem.Allocator, cfg: *const Config, w: *const block.Widths, o: block.Options, layers: []const u32, na: i64, nb: i64, start: i64) ![]calls.Call {
+    if (!o.pf_tbo or !o.branches or na < tbo_min or nb < tbo_min or o.image_rows != 0) return error.Unsupported;
+    // B's first row starts a ratio-2 pair: its compressed rows begin after A's last (A's later layers read a kv
+    // source's compressed rows up to A's own positions while B's source layer appends past them)
+    if (@mod(start, 2) != 0 or @mod(na, 2) != 0) return error.Unsupported;
+    if (o.pool) |pl| if (pl.split) return error.Unsupported;
+    var ma: std.ArrayList(usize) = .empty;
+    var mb: std.ArrayList(usize) = .empty;
+    const pa = try emitMarked(a, cfg, w, o, layers, na, start, false, .encoder, &ma);
+    const pb = try emitMarked(a, cfg, w, o, layers, nb, start + na, false, .encoder, &mb);
+    if (ma.items.len != mb.items.len) return error.Unsupported;
+    // the phases: [0, m0), [m0, m1), ... alternating attention / MoE parts, the last the encoder's end (D's site + compressor)
+    const nph = ma.items.len + 1;
+    var out: std.ArrayList(calls.Call) = .empty;
+    var started = false; // B issued any call since the last join (its next part forks)
+    var b_engram = false; // B issued an Engram step since the last join (A's next Engram step joins it first)
+    for (0..nph) |k| {
+        const a0 = if (k == 0) 0 else ma.items[k - 1];
+        const a1 = if (k < ma.items.len) ma.items[k] else pa.len;
+        const b0 = if (k == 0) 0 else mb.items[k - 1];
+        const b1 = if (k < mb.items.len) mb.items[k] else pb.len;
+        const attn = k % 2 == 0;
+        const L = layers[k / 2];
+        // A's part on the main stream
+        const first_a = out.items.len;
+        for (pa[a0..a1]) |c| {
+            if (std.mem.eql(u8, c.name, "glue.ced_stash")) continue;
+            try out.append(a, c);
+        }
+        if (b_engram and attn and out.items.len > first_a) {
+            for (pa[a0..a1]) |c| if (std.mem.eql(u8, c.name, "glue.engram_rows")) {
+                out.items[first_a].join = true;
+                started = false;
+                b_engram = false;
+                break;
+            };
+        }
+        if (attn and cfg.isKvSource(L) and cfg.compressRatio(L) == 2) {
+            // the slot's ratio-2 carry: A's last projection row, as A's commit (forward_prefill.commitAt) would copy it
+            const row: i64 = 2 * @as(i64, cfg.head_dim);
+            const src: Arg = .{ .t = .{ .role = .{ .buf = try std.fmt.allocPrint(a, "w.L{d}.proj", .{L}) }, .dt = .f32, .shape = try a.dupe(i64, &.{ 1, row }), .stride = try a.dupe(i64, &.{ row, 1 }), .offset = (na - 1) * row * 4 } };
+            const dst: Arg = .{ .t = .{ .role = .{ .buf = try std.fmt.allocPrint(a, "s.L{d}.carry", .{L}) }, .dt = .f32, .shape = try a.dupe(i64, &.{ 1, row }), .stride = try a.dupe(i64, &.{ row, 1 }) } };
+            const args = try a.alloc(calls.Named, 2);
+            args[0] = .{ .arg = src };
+            args[1] = .{ .arg = dst };
+            try out.append(a, .{ .triton = false, .glue = true, .name = "glue.copy_rows", .args = args });
+        }
+        // B's part on the side stream, its attention parts forked behind A's
+        for (pb[b0..b1], 0..) |c, j| {
+            var x = c;
+            const args = try a.alloc(calls.Named, c.args.len);
+            for (c.args, args) |y, *z| z.* = .{ .name = y.name, .arg = try tboArg(a, y.arg) };
+            x.args = args;
+            x.side = true;
+            x.fork = j == 0 and (attn or !started);
+            x.join = false;
+            x.begin = .none;
+            try out.append(a, x);
+            started = true;
+            if (std.mem.eql(u8, c.name, "glue.engram_rows")) b_engram = true;
+        }
+    }
+    try out.append(a, .{ .triton = false, .glue = true, .name = "glue.tbo_join", .args = &.{}, .join = true });
+    return out.items;
+}
+
+fn emitMarked(a: std.mem.Allocator, cfg: *const Config, w: *const block.Widths, o: block.Options, layers: []const u32, n: i64, start: i64, head: bool, part: Part, marks: ?*std.ArrayList(usize)) ![]calls.Call {
     if (n < 1 or n > o.prefill_rows or n > rowsCap(o)) return error.Unsupported;
-    var e: E = .{ .a = a, .cfg = cfg, .w = w, .o = o, .n = n, .start = start };
+    var e: E = .{ .a = a, .cfg = cfg, .w = w, .o = o, .n = n, .start = start, .marks = marks };
     const W: i64 = cfg.window;
     // forward.staging: the slot's ring holds 2 x window rows; a longer segment goes through the staging ring
     const staged = n + W - 1 > 2 * W;

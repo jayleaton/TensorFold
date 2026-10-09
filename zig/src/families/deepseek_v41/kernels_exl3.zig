@@ -121,6 +121,10 @@ pub fn gm2Shape(mats: u32, xm: u32, t: [5]u32) GmShape {
     return .{ .threads = four.threads, .smem = smem };
 }
 
+/// TF_DSV41_PF_TBO_GM_SMS (prod_knobs.apply, under TF_DSV41_PF_TBO): the SMs x3gm's persistent grid covers at most;
+/// 0: every SM (the default, Python's grid)
+pub var gm_sms_cap: usize = 0;
+
 /// x3gm v3 (x3gm3.cu's gm3_kernel, ours): v2's items, chains and epilogue with the next item claimed and read ahead,
 /// LEAN's 32-bit window reads and 1-column-tile warps. Its variants, in x3gm3.cu's instance order.
 pub const V3 = struct { mats: u32, xm: u32, t: [5]u32, lean: u32 };
@@ -566,7 +570,10 @@ pub const Ops = struct {
         if (!ticket) b.ticket = 0;
         var a: cuda.Args = .{};
         a.add(b);
-        try go(g.f, o.s, .{ o.sms * g.per_sm, 1, 1 }, g.threads, g.smem, false, &a);
+        // TF_DSV41_PF_TBO_GM_SMS: the persistent CTAs on at most that many SMs (the rest for the other micro-batch's
+        // attention and dense GEMMs); which CTA runs an item changes no bit
+        const sms = if (gm_sms_cap > 0) @min(o.sms, gm_sms_cap) else o.sms;
+        try go(g.f, o.s, .{ sms * g.per_sm, 1, 1 }, g.threads, g.smem, false, &a);
     }
 
     /// dsv41_x3gm_gateup_cuda: Xd of every pass's members; `tables`: tg / tu are int64 pointer tables (ragged).

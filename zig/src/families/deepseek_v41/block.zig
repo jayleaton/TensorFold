@@ -80,6 +80,10 @@ pub const Options = struct {
     /// pieces, each sent on the branches' side stream while the main stream computes the next piece's producer (wo_a /
     /// wo_b, the shared expert); 0 / 1: one exchange after its producer (Python's order). Needs `branches` and TP=2
     pf_overlap: i64 = 0,
+    /// TF_DSV41_PF_TBO (block_prefill.emitTbo): a prompt's CED encoder segments two at a time, the second half a layer
+    /// behind the first on the branches' side stream, so one's routed experts (DRAM-bound) run beside the other's
+    /// attention and dense GEMMs (compute-bound). Needs `branches`; the exchange pieces (pf_overlap) are off under it
+    pf_tbo: bool = false,
     /// R1 (prod-perf1's decode knobs, docs DSV41-DECODE-R1.md; the same bits): attention split 4 with q's RoPE in the
     /// kernel (ATTN_SPLIT, ATTN_ROPE), mHC's parallel tail + deferred coefficients (MHC_TAIL, MHC_DEFER), the router's
     /// prune + kit rounding (RG_PRUNE, PRUNE_KIT), a bf16 MoE partial (MOE_BF16), q_norm folded into its consumers'
@@ -162,6 +166,8 @@ pub const Emitter = struct {
     /// a multi-segment prefill (block_prefill.emitMulti): the current segment's first row in the run's per-row roles
     /// (the selection's rows); 0 elsewhere
     row0: i64 = 0,
+    /// TF_DSV41_PF_TBO (block_prefill.emitTbo): the call indexes where each layer's attention part and MoE part start
+    marks: ?*std.ArrayList(usize) = null,
 
     pub fn fmt(e: *Emitter, comptime f: []const u8, args: anytype) ![]const u8 {
         return std.fmt.allocPrint(e.a, f, args);

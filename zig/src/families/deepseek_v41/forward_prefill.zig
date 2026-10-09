@@ -55,6 +55,10 @@ pub const State = struct {
     ahead: bool = false,
     /// long prompts' buffers (longpf.zig)
     long: longpf.State = .{},
+    /// TF_DSV41_PF_TBO: micro-batch B's own long-prompt buffers (its stream top-k merge grows its own), and the pair in
+    /// flight (the glue runs each micro-batch's steps with its own ids, window, Engram tail and MoE count)
+    long_b: longpf.State = .{},
+    tbo: ?*Pair = null,
     /// TF_DSV41_PREFILL (prod_knobs.apply): `.replay` = CED (ced.zig), segments are encoder passes and `finish` runs
     /// the decoder; `.full`: every layer over every row
     mode: prod_knobs.PrefillMode = .full,
@@ -96,6 +100,16 @@ pub fn plan(f: *Forward, p: *buffers.Plan, rows: u32) !void {
     const replay = f.prefill_state.mode == .replay;
     const runs = try block_prefill.planRuns(ra.allocator(), f.cfg, f.widths, vision_rows.planOptions(f), if (replay) try encoderLayers(f, layers) else layers, if (replay) try decoderLayers(f, layers) else null, rows, if (replay) .encoder else .whole);
     for (runs.items) |cs| try p.add(cs);
+    // TF_DSV41_PF_TBO: a pair of whole segments (B's own scratch roles), at 0 and at the last start a pair takes
+    if (replay and f.opts.pf_tbo and rows >= 2 * block_prefill.tbo_min) {
+        const enc = try encoderLayers(f, layers);
+        const top = @max(0, try lastStart(f, enc, rows, .encoder) - rows); // B at the last start a segment takes
+        for ([_]i64{ 0, top }) |start| {
+            var ta = std.heap.ArenaAllocator.init(f.gpa);
+            defer ta.deinit();
+            try p.add(try block_prefill.emitTbo(ta.allocator(), f.cfg, f.widths, vision_rows.planOptions(f), enc, rows, rows, start));
+        }
+    }
 }
 
 /// CED replay's programs (ced.zig): an encoder segment (the whole segment's roles up to the decoder's first layer, and
@@ -162,6 +176,18 @@ fn lastStart(f: *Forward, layers: []const u32, n: u32, part: block_prefill.Part)
     return lo;
 }
 
+/// TF_DSV41_PF_TBO: one micro-batch's host side of a pair in flight (what `segment` sets on the forward for its one
+/// segment): its ids, its window, the slot's Engram tail before its rows, its MoE calls seen.
+pub const Micro = struct {
+    ids: []const u32,
+    pending: @TypeOf(@as(fwd.Slot, undefined).pending),
+    tail: Tail,
+    moe: usize = 0,
+    layer: u32 = 0,
+};
+
+pub const Pair = struct { a: Micro, b: Micro };
+
 /// The prompt `ids` from the slot's position (forward.prefill: the leader has sent it to the followers).
 pub fn prompt(f: *Forward, ids_in: []const u32) !void {
     const st = &f.prefill_state;
@@ -178,11 +204,86 @@ pub fn prompt(f: *Forward, ids_in: []const u32) !void {
     const seg: usize = @intCast(f.opts.prefill_rows);
     var at: usize = 0;
     while (at < ids.len) {
+        // TF_DSV41_PF_TBO: two segments at a time (the second at least tbo_min rows), else one
+        if (pairOf(f, ids.len - at)) |pr| {
+            const n = pr[0] + pr[1];
+            if (st.ahead and at + n < ids.len) readAhead(f, ids, at, n, @min(seg, ids.len - at - n));
+            if (try segmentPair(f, ids[at .. at + pr[0]], ids[at + pr[0] .. at + n])) {
+                at += n;
+                continue;
+            }
+        }
         const n = @min(seg, ids.len - at);
         if (st.ahead and at + n < ids.len) readAhead(f, ids, at, n, @min(seg, ids.len - at - n));
         try segment(f, ids[at .. at + n], at + n == ids.len and st.mode == .full);
         at += n;
     }
+}
+
+/// TF_DSV41_PF_TBO's split of the `left` prompt rows ahead: two whole segments, or what is left halved on the 16-row
+/// grid; null when TBO is off, the prompt is in full mode, or a half would be under tbo_min.
+fn pairOf(f: *const Forward, left: usize) ?[2]usize {
+    if (!f.opts.pf_tbo or f.prefill_state.mode != .replay) return null;
+    return pairSplit(@intCast(f.opts.prefill_rows), left);
+}
+
+/// `pairOf`'s split of `left` rows at segments of `seg` rows (null: one segment at a time).
+pub fn pairSplit(seg: usize, left: usize) ?[2]usize {
+    const min: usize = @intCast(block_prefill.tbo_min);
+    if (left >= 2 * seg) return .{ seg, seg };
+    if (left < 2 * min) return null;
+    const na = @min(seg, (left / 2) / 16 * 16);
+    if (left - na > seg or na < min) return null;
+    return .{ na, left - na };
+}
+
+/// Two consecutive encoder segments as one two-stream program (block_prefill.emitTbo), committed once as the second
+/// would leave the slot: B's last rows' carries, the Engram tail and position after both, the stash's ids. false: the
+/// emitter refused the pair (the caller runs the segments one at a time).
+fn segmentPair(f: *Forward, ia: []const u32, ib: []const u32) !bool {
+    const st = &f.prefill_state;
+    var sa = std.heap.ArenaAllocator.init(f.gpa);
+    defer sa.deinit();
+    const a = sa.allocator();
+    const layers = try encoderLayers(f, try f.backbone(a));
+    const start = f.slot.pos;
+    const na: u32 = @intCast(ia.len);
+    const nb: u32 = @intCast(ib.len);
+    const o = vision_rows.segmentOptions(f, ia.ptr[0 .. na + nb]);
+    const cs = block_prefill.emitTbo(a, f.cfg, f.widths, o, layers, na, nb, @intCast(start)) catch |e| switch (e) {
+        error.Unsupported => return false,
+        else => return e,
+    };
+    if (f.kv) |kx| try kx.reserve(start + na + nb);
+    // the micro-batches' host sides: B's Engram tail is the slot's after A's ids (tailOf, as A's commit leaves it)
+    var pair: Pair = .{ .a = .{ .ids = ia, .pending = .{ .start = start, .n = na }, .tail = .{} }, .b = .{ .ids = ib, .pending = .{ .start = start + na, .n = nb }, .tail = .{} } };
+    pair.a.tail.len = f.slot.tail_len;
+    @memcpy(pair.a.tail.ids[0..pair.a.tail.len], f.slot.tail[0..f.slot.tail_len]);
+    if (f.engram) |h| {
+        var s2 = f.slot;
+        tailOf(&s2, ia, h.max_ngram - 1);
+        pair.b.tail.len = s2.tail_len;
+        @memcpy(pair.b.tail.ids[0..s2.tail_len], s2.tail[0..s2.tail_len]);
+    } else pair.b.tail = pair.a.tail;
+    f.ids = ia;
+    f.slot.pending = pair.a.pending;
+    st.tbo = &pair;
+    defer st.tbo = null;
+    errdefer f.slot.pending = null;
+    st.layers = layers;
+    st.moe = 0;
+    f.runner.glue = .{ .ctx = f, .run = glueFn };
+    try longpf.window(&st.long, f.gpa, f.runner, f.kv, start, cs);
+    // the commit: both micro-batches' rows as one segment, the carries from B's last rows (its roles: tboRole)
+    const both = ia.ptr[0 .. na + nb];
+    f.ids = both;
+    f.slot.pending = .{ .start = start, .n = na + nb };
+    try commitRoles(f, nb, 0, "b~", na + nb);
+    f.slot.ced.extend(start, both);
+    f.last_rows = 0;
+    st.taps_at = start;
+    st.taps_rows = 0;
+    return true;
 }
 
 /// prefetch.py's one segment ahead: the reads of the segment after `ids[at .. at + n]` (its `next` rows, with the
@@ -520,6 +621,12 @@ fn commit(f: *Forward, n: u32) !void {
 
 /// `commit` of a segment whose rows are rows [row0, row0 + n) of the run's projections.
 fn commitAt(f: *Forward, n: u32, row0: usize) !void {
+    return commitRoles(f, n, row0, "", n);
+}
+
+/// `commitAt` with the carries from rows of "w.<pre>L<i>.proj" (TF_DSV41_PF_TBO's B: "b~") whose last row is the
+/// `n`th; the slot advances by `adv` rows (f.ids' first `adv`).
+fn commitRoles(f: *Forward, n: u32, row0: usize, comptime pre: []const u8, adv: u32) !void {
     const p = f.slot.pending orelse return error.BadWindow;
     const r = f.runner;
     var nb: [64]u8 = undefined;
@@ -527,14 +634,14 @@ fn commitAt(f: *Forward, n: u32, row0: usize) !void {
     defer la.deinit();
     const row: usize = 4 * 2 * @as(usize, f.cfg.head_dim); // fp32 [kv | gate]
     for (try f.backbone(la.allocator())) |L| if (f.cfg.isKvSource(L) and f.cfg.compressRatio(L) == 2) {
-        const src = r.addressOf(try std.fmt.bufPrint(&nb, "w.L{d}.proj", .{L})) orelse return error.Unbound;
+        const src = r.addressOf(try std.fmt.bufPrint(&nb, "w." ++ pre ++ "L{d}.proj", .{L})) orelse return error.Unbound;
         const dst = r.addressOf(try std.fmt.bufPrint(&nb, "s.L{d}.carry", .{L})) orelse return error.Unbound;
         try copy(r, dst, src + (row0 + n - 1) * row, row);
     };
-    if (f.engram) |h| tailOf(&f.slot, f.ids[0..n], h.max_ngram - 1);
-    f.slot.pos = p.start + n;
+    if (f.engram) |h| tailOf(&f.slot, f.ids[0..adv], h.max_ngram - 1);
+    f.slot.pos = p.start + adv;
     f.slot.pending = null;
-    if (f.sess) |x| try x.commit(x.ptr, f.ids[0..n]);
+    if (f.sess) |x| try x.commit(x.ptr, f.ids[0..adv]);
 }
 
 /// Engram's tail after committing `ids`: (tail + ids)[-keep:].
@@ -637,6 +744,35 @@ fn ld(t: calls.Tensor) usize {
 fn glueFn(ctx: *anyopaque, r: *run.Runner, c: *const calls.Call) anyerror!void {
     const f: *Forward = @ptrCast(@alignCast(ctx));
     const st = &f.prefill_state;
+    const pr = st.tbo orelse return glueOne(ctx, r, c);
+    // TF_DSV41_PF_TBO: the step's micro-batch (B's are the side stream's) on the forward while it runs
+    const m = if (c.side) &pr.b else &pr.a;
+    const keep_ids = f.ids;
+    const keep_pending = f.slot.pending;
+    var keep_tail: Tail = .{ .len = f.slot.tail_len };
+    @memcpy(keep_tail.ids[0..keep_tail.len], f.slot.tail[0..f.slot.tail_len]);
+    f.ids = m.ids;
+    f.slot.pending = m.pending;
+    f.slot.tail_len = m.tail.len;
+    @memcpy(f.slot.tail[0..m.tail.len], m.tail.items());
+    st.moe = m.moe;
+    st.layer = m.layer;
+    if (c.side) std.mem.swap(longpf.State, &st.long, &st.long_b);
+    defer {
+        if (c.side) std.mem.swap(longpf.State, &st.long, &st.long_b);
+        m.moe = st.moe;
+        m.layer = st.layer;
+        f.ids = keep_ids;
+        f.slot.pending = keep_pending;
+        f.slot.tail_len = keep_tail.len;
+        @memcpy(f.slot.tail[0..keep_tail.len], keep_tail.items());
+    }
+    return glueOne(ctx, r, c);
+}
+
+fn glueOne(ctx: *anyopaque, r: *run.Runner, c: *const calls.Call) anyerror!void {
+    const f: *Forward = @ptrCast(@alignCast(ctx));
+    const st = &f.prefill_state;
     const step = c.name["glue.".len..];
     const k = r.kernels.others(r.stream);
     const x = c.args;
@@ -650,6 +786,10 @@ fn glueFn(ctx: *anyopaque, r: *run.Runner, c: *const calls.Call) anyerror!void {
         return copy(r, buf + bytesOf(carry), try r.tensorAddr(x[1].arg.t), bytesOf(x[1].arg.t));
     }
     if (eql(u8, step, "stream_merge")) return longpf.merge(&st.long, f.gpa, r, c);
+    // TF_DSV41_PF_TBO: A's ratio-2 carry into the slot at its layer's end, and the pair's closing join (Runner.issue
+    // made it: nothing to run)
+    if (eql(u8, step, "copy_rows")) return copy(r, try r.tensorAddr(x[1].arg.t), try r.tensorAddr(x[0].arg.t), bytesOf(x[0].arg.t));
+    if (eql(u8, step, "tbo_join")) return;
     if (eql(u8, step, "pf_seg")) return segGlue(f, r, c);
     if (eql(u8, step, "mpositions")) return runPositions(f, r, c);
     if (eql(u8, step, "ced_stash") or eql(u8, step, "ced_load")) return stashCopy(f, r, c, eql(u8, step, "ced_stash"));

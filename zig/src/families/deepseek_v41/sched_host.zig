@@ -49,6 +49,8 @@ pub const SchedHost = struct {
     pub fn settings(gt: *const target.GpuTarget) !sched.Settings {
         var s = try sched.Settings.fromEnv();
         s.rows = @intCast(gt.f.opts.prefill_rows);
+        // TF_DSV41_PF_TBO: a round's piece holds a pair of segments (forward_prefill.prompt runs them on two streams)
+        if (gt.f.opts.pf_tbo) s.rows *= 2;
         s.sessions = gt.sessions != null;
         if (flag("TF_DSV41_PIECES_FLOOR")) try s.withFloorFromEnv();
         return s;

@@ -180,6 +180,30 @@ pub fn pfOverlap(get: Get) !i64 {
     return if (v < 2) 0 else v;
 }
 
+/// TF_DSV41_PF_TBO (ours; 0 / 1, default 0): CED encoder segments two at a time on two streams (block_prefill.emitTbo).
+pub fn pfTbo(get: Get) !bool {
+    const raw = std.mem.trim(u8, get("TF_DSV41_PF_TBO") orelse "0", " ");
+    if (std.mem.eql(u8, raw, "0")) return false;
+    if (std.mem.eql(u8, raw, "1")) return true;
+    std.log.warn("TF_DSV41_PF_TBO={s}: 0 or 1", .{raw});
+    return error.BadKnob;
+}
+
+/// TF_DSV41_PF_TBO_GM_SMS (under TF_DSV41_PF_TBO): the SMs x3gm's persistent grid covers at most, 8-48 (default
+/// `tbo_gm_sms`: proto/tbo_bench.cu's split decides it on the Spark); 0: every SM.
+pub const tbo_gm_sms: u32 = 32;
+pub fn pfTboGmSms(get: Get) !u32 {
+    const raw = std.mem.trim(u8, get("TF_DSV41_PF_TBO_GM_SMS") orelse return tbo_gm_sms, " ");
+    const v = std.fmt.parseInt(u32, raw, 10) catch return badSms(raw);
+    if (v != 0 and (v < 8 or v > 48)) return badSms(raw);
+    return v;
+}
+
+fn badSms(raw: []const u8) error{BadKnob} {
+    std.log.warn("TF_DSV41_PF_TBO_GM_SMS={s}: 0 (every SM) or 8-48", .{raw});
+    return error.BadKnob;
+}
+
 /// TF_DSV41_PREFETCH_AHEAD (0 by default): the next prompt segment's Engram reads before this one runs.
 pub fn prefetchAhead(get: Get) bool {
     const v = get("TF_DSV41_PREFETCH_AHEAD") orelse return false;
@@ -291,10 +315,19 @@ pub fn apply(f: *@import("forward.zig").Forward, a: std.mem.Allocator, io: std.I
         return error.BadKnob;
     }
     f.prefill_state.mode = try prefillMode(&env);
+    f.opts.pf_tbo = try pfTbo(&env);
     // TF_DSV41_BRANCHES: the side stream exists before any capture
     if (f.branches == null) f.branches = try @import("branches.zig").install(f.gpa, f, rank);
     // TF_DSV41_PF_OVERLAP: the pieces' exchanges go on the branches' side stream (one peer: TP=2)
     f.opts.pf_overlap = try pfOverlap(&env);
+    // TF_DSV41_PF_TBO: the second micro-batch on the side stream, CED's encoder segments only; x3gm's grid capped
+    if (f.opts.pf_tbo) {
+        if (!f.opts.branches or f.prefill_state.mode != .replay) {
+            std.log.scoped(.dsv41).err("TF_DSV41_PF_TBO=1 needs TF_DSV41_BRANCHES=1 (its side stream) and TF_DSV41_PREFILL=replay", .{});
+            return error.BadKnob;
+        }
+        dk.exl3.gm_sms_cap = try pfTboGmSms(&env);
+    }
     if (f.opts.pf_overlap > 0 and (!f.opts.branches or f.opts.world != 2)) {
         std.log.scoped(.dsv41).err("TF_DSV41_PF_OVERLAP={d} needs TF_DSV41_BRANCHES=1 (its side stream) and TP=2 (world {d})", .{ f.opts.pf_overlap, f.opts.world });
         return error.BadKnob;
@@ -312,6 +345,7 @@ pub fn apply(f: *@import("forward.zig").Forward, a: std.mem.Allocator, io: std.I
     }
     if (rank != 0) return;
     const log = std.log.scoped(.dsv41);
+    if (f.opts.pf_tbo) log.info("prefill tbo: encoder segments two at a time on two streams, x3gm on at most {d} SMs (0: all){s}", .{ dk.exl3.gm_sms_cap, if (f.opts.pf_overlap > 0) "; TF_DSV41_PF_OVERLAP is off under it" else "" });
     if (f.opts.pf_overlap > 0) log.info("prefill overlap: a segment's exchanges in {d} row pieces on the side stream", .{f.opts.pf_overlap});
     log.info("prod knobs: pf_dense {s}, prefill rows {d}{s}, index budget {d} MiB, R1 {s}, prefetch ahead {s}, x3gm v2 {t}, prefill {t}", .{ if (f.opts.pfd != null) "fused" else "off", f.opts.prefill_rows, if (f.opts.pf4k) " (4K: one x3gm block a segment)" else "", f.opts.index_budget >> 20, if (f.opts.r1) "on" else "off", if (f.prefill_state.ahead) "on" else "off", f.opts.gm_v2, f.prefill_state.mode });
 }
