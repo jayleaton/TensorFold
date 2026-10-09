@@ -115,6 +115,13 @@ pub const Engine = struct {
         for (list) |p| try e.piece(p.stream, p.start, p.end, p.save);
     }
 
+    /// A round's finished prompts before their `finishStream` calls (Config.replay_runs, Backend.finals).
+    pub fn prepareFinals(e: *Engine, streams: []const *Stream) !void {
+        if (!e.cfg.replay_runs or streams.len < 2) return;
+        const run = e.backend.vtable.finals orelse return;
+        return run(e.backend.ptr, streams);
+    }
+
     /// A begun stream's prompt is in: its last row, its first token and first drafts; it takes part from the next
     /// round. A failure leaves the stream with the backend (the host discards it).
     pub fn finishStream(e: *Engine, s: *Stream) !void {

@@ -328,6 +328,87 @@ pub fn runnable(f: *Forward, segs: []const MultiSeg) !bool {
     return true;
 }
 
+/// One slot's decoder replay in a batched run (finishMulti): the replayed tail's first position and rows, and its
+/// first row in the run (its rows of "w.taps": the drafter's context, ced.handoff).
+pub const Replayed = struct { slot: u32, at: u64, rows: u32, row0: u32 };
+
+/// Whether a batched decoder replay takes `segs` (each a slot's prefilled tail from its R0), checked before the leader
+/// sends it (emitMulti's refusals: a tail of 32 rows or fewer, more rows than a prefill segment, an image, split KV).
+pub fn replayRunnable(f: *Forward, segs: []const MultiSeg) !bool {
+    if (f.pf_switch == null or f.prefill_state.mode != .replay or segs.len < 2 or segs.len > 16) return false;
+    var sa = std.heap.ArenaAllocator.init(f.gpa);
+    defer sa.deinit();
+    const a = sa.allocator();
+    const spans = try a.alloc(block_prefill.Span, segs.len);
+    var all: std.ArrayList(u32) = .empty;
+    for (segs, spans) |sg, *sp| {
+        sp.* = .{ .slot = sg.slot, .start = @intCast(sg.start), .n = @intCast(sg.ids.len) };
+        try all.appendSlice(a, sg.ids);
+    }
+    if (vision_rows.segmentOptions(f, all.items).image_rows != 0) return false;
+    _ = block_prefill.emitMulti(a, f.cfg, f.widths, f.opts, try decoderLayers(f, try f.backbone(a)), spans, .decoder) catch |e| switch (e) {
+        error.Unsupported => return false,
+        else => return e,
+    };
+    return true;
+}
+
+/// Several slots' CED decoder replays in one run (block_prefill.emitMulti `.decoder`; Python's rounds.py replays its
+/// finals a slot at a time): each slot's prefilled tail [R0, end) from its stash, the rows' launches over every tail,
+/// each tail's CSA2 steps on its slot. Nothing is committed: each slot stays at its prompt's last token, as `finish`
+/// leaves it. `out[j]`: slot j's tail and its rows of "w.taps". A tail batched is its one-slot replay row for row
+/// (emitMulti's row floor keeps every tail on the one-slot replay's kernel paths).
+pub fn finishMulti(f: *Forward, slots: []const u32, out: []Replayed) !void {
+    const st = &f.prefill_state;
+    const sw = f.pf_switch orelse return error.Unsupported;
+    if (st.mode != .replay or slots.len < 2 or slots.len > 16 or out.len < slots.len) return error.BadWindow;
+    var sa = std.heap.ArenaAllocator.init(f.gpa);
+    defer sa.deinit();
+    const a = sa.allocator();
+    const layers = try decoderLayers(f, try f.backbone(a));
+    const segs = try a.alloc(MultiSeg, slots.len);
+    const spans = try a.alloc(block_prefill.Span, slots.len);
+    const row0 = try a.alloc(usize, slots.len);
+    const tails = try a.alloc(Tail, slots.len);
+    var all: std.ArrayList(u32) = .empty;
+    for (slots, segs, spans, row0, tails) |slot, *sg, *sp, *r0, *t| {
+        try sw.run(sw.ctx, slot);
+        if (f.slot.pending != null) return error.BadWindow;
+        const end = f.slot.pos;
+        const tl = ced.tailOf(end);
+        if (tl.m == 0) return error.BadWindow;
+        if (!f.slot.ced.covers(tl.r0, end)) {
+            log.err("CED replay of [{d}, {d}), but the stash holds [{d}, {d})", .{ tl.r0, end, f.slot.ced.lo(), f.slot.ced.hi });
+            return error.StashGap;
+        }
+        const ids = try a.alloc(u32, tl.m);
+        f.slot.ced.tail(tl.r0, end, ids);
+        sg.* = .{ .slot = slot, .start = tl.r0, .ids = ids };
+        sp.* = .{ .slot = slot, .start = @intCast(tl.r0), .n = @intCast(tl.m) };
+        r0.* = all.items.len;
+        t.len = f.slot.tail_len;
+        @memcpy(t.ids[0..t.len], f.slot.tail[0..t.len]);
+        try all.appendSlice(a, ids);
+    }
+    const cs = try block_prefill.emitMulti(a, f.cfg, f.widths, vision_rows.segmentOptions(f, all.items), layers, spans, .decoder);
+    try ready(f);
+    var m: Multi = .{ .segs = segs, .row0 = row0, .tails = tails, .ids = all.items };
+    f.multi = &m;
+    defer f.multi = null;
+    try enterRun(f, &m);
+    st.layers = layers;
+    st.moe = 0;
+    st.taps_rows = 0;
+    f.runner.glue = .{ .ctx = f, .run = glueFn };
+    try longpf.window(&st.long, f.gpa, f.runner, f.kv, segs[0].start, cs);
+    for (segs, row0, out[0..slots.len]) |sg, r0, *o| {
+        try sw.run(sw.ctx, sg.slot);
+        f.slot.pending = null;
+        o.* = .{ .slot = sg.slot, .at = sg.start, .rows = @intCast(sg.ids.len), .row0 = @intCast(r0) };
+    }
+    f.last_rows = 0;
+}
+
 /// The glue's view of the whole run (Forward.multi): the first segment's slot, every row's ids, the run's rows pending.
 fn enterRun(f: *Forward, m: *const Multi) !void {
     const sw = f.pf_switch.?;
@@ -348,7 +429,10 @@ fn segGlue(f: *Forward, r: *run.Runner, c: *const calls.Call) !void {
     f.ids = sg.ids;
     f.slot.pending = .{ .start = sg.start, .n = @intCast(sg.ids.len) };
     const k = r.kernels.others(r.stream);
-    return k.positions(@intCast(sg.start), @intCast(sg.ids.len), try r.tensorAddr(c.args[1].arg.t), try r.tensorAddr(c.args[2].arg.t), try r.tensorAddr(c.args[3].arg.t));
+    const lo = try r.tensorAddr(c.args[3].arg.t);
+    try k.positions(@intCast(sg.start), @intCast(sg.ids.len), try r.tensorAddr(c.args[1].arg.t), try r.tensorAddr(c.args[2].arg.t), lo);
+    // a decoder replay: every row's window starts at the segment's first row (R0)
+    if (c.args[4].arg.b) try r.d.check(r.d.api.cuMemsetD32Async(lo, @bitCast(@as(i32, @intCast(sg.start))), sg.ids.len, r.stream.handle), "cuMemsetD32Async");
 }
 
 /// glue mpositions: every segment's positions into the run's "w.mpos64" (rope over the run's rows); the window starts

@@ -85,6 +85,9 @@ pub const Backend = struct {
         /// A round's pieces of several streams in one call (Config.piece_runs): the backend may run them as one forward
         /// (several slots' rows at once); a failure fails every stream of the call. null: `piece` a piece.
         pieces: ?*const fn (ptr: *anyopaque, list: []const Piece) anyerror!void = null,
+        /// Before a round's `finish` / `join` calls (Config.replay_runs): the backend may run work those streams' finishes
+        /// share in one go (the DSV4.1 target: their CED decoder replays in one forward). null: nothing.
+        finals: ?*const fn (ptr: *anyopaque, streams: []const *Stream) anyerror!void = null,
     };
 
     /// One stream's prompt rows [start, end) of a round (`save`: the prompt's snapshot right after them).

@@ -49,15 +49,20 @@ EOF
     # the piece-at-a-time run's encoder shapes (one prompt a forward) are the alone reference's kernels
     [[ -f "$alone/aot/aot.json" ]] && python3 -B "$Z/tools/zig/dsv41_aot_merge.py" "$ref/aot" "$alone/aot" >> "$out/summary.log" 2>&1
     rm -rf "$alone"
-    for run in run one; do
+    for run in run one replay; do
         (( $(left) >= 3 )) || { echo "FAIL pieces: $(left) min left before pieces-$run" | tee -a "$out/summary.log"; return 1; }
-        local runs=1
+        local runs=1 replays=0
         [[ $run == one ]] && runs=0
-        if ! (export "${gate_env[@]}" TF_DSV41_PIECE_RUNS=$runs SESS4_PORT=$(( 29791 + runs ))
+        [[ $run == replay ]] && replays=1
+        if ! (export "${gate_env[@]}" TF_DSV41_PIECE_RUNS=$runs TF_DSV41_REPLAY_RUNS=$replays SESS4_PORT=$(( 29791 + runs + 2 * replays ))
               step "pieces-$run" "${PIECES_MIN:-8}" bash "$Z/tools/zig/dsv41_sess4/ranks.sh" "$Z/bin/tf-dsv41-m1" "$LP" \
                   "$ref" "$out/$run" "${dirs[@]}"); then st=1; fi
         grep -h "PASS sess4\|FAIL sess4" "$out/$run/rank0.log" | sed "s/sess4/pieces/; s/^/$run: /" | tee -a "$out/summary.log"
-        if [[ $run == run ]] && ! grep -q "piece runs: " "$out/$run/rank0.log"; then
+        if [[ $run == replay ]] && ! grep -q "replay runs: " "$out/$run/rank0.log"; then
+            echo "FAIL pieces: the replay run's rank 0 log shows no batched decoder replay (replay runs)" | tee -a "$out/summary.log"
+            st=1
+        fi
+        if [[ $run != one ]] && ! grep -q "piece runs: " "$out/$run/rank0.log"; then
             echo "FAIL pieces: the run's rank 0 log shows no multi-segment run (piece runs)" | tee -a "$out/summary.log"
             st=1
         fi

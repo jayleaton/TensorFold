@@ -151,9 +151,11 @@ same = sum(json.load(open(f"{d}/ref-batched/p{p}/ref.json"))["tokens"] == json.l
 print(f"pieces: Python batched == alone, tokens: {same}/{len(ps)} (informational)")
 PYEOF
     refs=(); for p in $prompts; do refs+=("$P/ref-batched/p$p"); done
-    for runs in 1 0; do
+    # runs: 1 (pieces in one run), 0 (a piece at a time), 2 (pieces and the finals' decoder replays in one run each,
+    # TF_DSV41_REPLAY_RUNS=1: Python replays a slot at a time, so a batched replay must be each one-slot replay)
+    for runs in 1 0 2; do
         drop_caches
-        log "pieces: ours, TF_DSV41_PIECE_RUNS=$runs"
+        log "pieces: ours, TF_DSV41_PIECE_RUNS=$(( runs > 0 )) TF_DSV41_REPLAY_RUNS=$(( runs == 2 ))"
         t0=$(date +%s)
         if [[ "$RANK" == 0 ]]; then cmd="sess4 /model $P/ref-batched $P/zig-runs$runs ${refs[*]}"; else cmd="follow /model $P/ref-batched"; fi
         docker run "${ARGS[@]}" -e TF_TP_WORLD=2 -e TF_TP_RANK="$RANK" -e TF_TP_DEVICE=0 -e TF_TP_MASTER="$MASTER" \
@@ -161,13 +163,17 @@ PYEOF
             -e TF_TP_KERNEL_IMAGE=/kit/tp_mailbox.fatbin -e TF_DSV41_FAILFAST=0 -e TF_DSV41_ASSETS="$P/ref-batched" \
             -e TF_DSV41_SLOTS=4 -e TF_DSV41_POOL_TOKENS=$(( 4 * 4096 + 2048 )) -e TF_DSV41_CONTEXT=4096 -e TF_DSV41_PREFILL=replay \
             -e TF_DSV41_PROMPT_TAIL=verify -e TF_DSV41_OWN_PREFILL=1 -e TF_DSV41_DRAFTS=0 -e TF_DSV41_PREFILL_PIECES=1 \
-            -e TF_DSV41_SESSIONS=0 -e TF_DSV41_GRAPHS=1 -e TF_DSV41_PIECE_RUNS=$runs -e SESS4_TURNS=1 -e SESS4_STEPS="$psteps" \
+            -e TF_DSV41_SESSIONS=0 -e TF_DSV41_GRAPHS=1 -e TF_DSV41_PIECE_RUNS=$(( runs > 0 )) -e TF_DSV41_REPLAY_RUNS=$(( runs == 2 )) \
+            -e SESS4_TURNS=1 -e SESS4_STEPS="$psteps" \
             --name "dsv41-zig-pieces-r$RANK" \
             --entrypoint bash "$IMAGE" -c 'export TF_NCCL_LIB=$(python -c "import nvidia.nccl, os; print(os.path.join(os.path.dirname(nvidia.nccl.__file__), \"lib\", \"libnccl.so.2\"))" 2>/dev/null || echo libnccl.so.2); mkdir -p '"$P/zig-runs$runs"'; exec /kit/tf-dsv41-m1 '"$cmd" \
             > "$OUT/pieces/zig-runs$runs.log" 2>&1
         rc=$?; log "pieces: PIECE_RUNS=$runs rc $rc in $(( $(date +%s) - t0 )) s: $(grep -h '^PASS sess4\|^FAIL sess4' "$OUT/pieces/zig-runs$runs.log" | tail -1)"
-        if [[ "$RANK" == 0 && $runs == 1 ]] && ! grep -q "piece runs: " "$OUT/pieces/zig-runs$runs.log"; then
+        if [[ "$RANK" == 0 && $runs != 0 ]] && ! grep -q "piece runs: " "$OUT/pieces/zig-runs$runs.log"; then
             log "FAIL pieces: the PIECE_RUNS=1 run's log shows no multi-segment run (piece runs)"
+        fi
+        if [[ "$RANK" == 0 && $runs == 2 ]] && ! grep -q "replay runs: " "$OUT/pieces/zig-runs$runs.log"; then
+            log "FAIL pieces: the REPLAY_RUNS=1 run's log shows no batched decoder replay (replay runs)"
         fi
     done
     port=$((port + 20))

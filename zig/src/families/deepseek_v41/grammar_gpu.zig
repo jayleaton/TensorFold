@@ -427,7 +427,7 @@ pub const GrammarTarget = struct {
         return .{ .ptr = t, .vtable = &vtable };
     }
 
-    const vtable: iface.Target.VTable = .{ .prefill = prefill, .window = window, .keep = keep, .taps = taps, .release = release, .admit = admit, .begin = begin, .piece = piece, .finish = finish, .tail = tail, .pieces = pieces };
+    const vtable: iface.Target.VTable = .{ .prefill = prefill, .window = window, .keep = keep, .taps = taps, .release = release, .admit = admit, .begin = begin, .piece = piece, .finish = finish, .tail = tail, .pieces = pieces, .replays = replays };
 
     fn admit(p: *anyopaque, slot: u32, max_new: u64) void {
         self(p).inner.admit(slot, max_new);
@@ -448,6 +448,10 @@ pub const GrammarTarget = struct {
 
     fn piece(p: *anyopaque, slot: u32, ids: []const u32, start: u64, end: u64, save: bool) anyerror!void {
         return self(p).inner.piece(slot, ids, start, end, save);
+    }
+
+    fn replays(p: *anyopaque, list: []const iface.Target.Final) anyerror!void {
+        return self(p).inner.runReplays(list);
     }
 
     fn pieces(p: *anyopaque, list: []const iface.Target.Piece) anyerror!void {
