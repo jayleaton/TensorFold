@@ -33,6 +33,7 @@ const vision_rows = @import("vision_rows.zig");
 const fwd = @import("forward.zig");
 const eh = @import("engram_host.zig");
 const ced = @import("ced.zig");
+const graphs = @import("graphs.zig");
 const prod_knobs = @import("prod_knobs.zig");
 const Forward = fwd.Forward;
 
@@ -219,6 +220,7 @@ pub const K4 = struct {
     buf: ?cuda.DeviceBuffer = null,
     bytes: u64 = 0,
     allocs: u64 = 0,
+    releases: u64 = 0,
     /// the exchange's send buffer and Engram's gathered rows while a 4K segment runs (the glue grows them here): the
     /// forward's own, which decode graphs hold the addresses of, are never regrown by a 4K segment
     send: ?cuda.DeviceBuffer = null,
@@ -303,8 +305,14 @@ fn k4Release(f: *Forward) !void {
     const ws = &f.prefill_state.k4ws;
     var b = ws.buf orelse return;
     try f.runner.stream.synchronize();
+    const before = graphs.memAvailableGiB();
     b.free();
     ws.buf = null;
+    // the prefill -> decode handoff: what the row graphs' memory floor sees right after the free (rank 0, the
+    // first prompts and every 64th after)
+    ws.releases += 1;
+    if (f.comm.rank() == 0 and (ws.releases <= 4 or ws.releases % 64 == 0))
+        log.info("prefill 4K: workspace {d} MiB freed at the prompt's end (release {d}); MemAvailable {d:.2} -> {d:.2} GiB", .{ ws.bytes >> 20, ws.releases, before orelse -1, graphs.memAvailableGiB() orelse -1 });
     if (ws.send) |*x| x.free();
     if (ws.gathered) |*x| x.free();
     ws.send = null;
