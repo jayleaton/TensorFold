@@ -90,6 +90,12 @@ pub fn plan(f: *Forward, p: *buffers.Plan, rows: u32) !void {
         }
     }
     if (f.prefill_state.mode == .replay) try planReplay(f, p, rows, layers);
+    // the multi-segment runs (TF_DSV41_PIECE_RUNS / _REPLAY_RUNS): their own roles and their rows' at `rows`
+    var ra = std.heap.ArenaAllocator.init(f.gpa);
+    defer ra.deinit();
+    const replay = f.prefill_state.mode == .replay;
+    const runs = try block_prefill.planRuns(ra.allocator(), f.cfg, f.widths, vision_rows.planOptions(f), if (replay) try encoderLayers(f, layers) else layers, if (replay) try decoderLayers(f, layers) else null, rows, if (replay) .encoder else .whole);
+    for (runs.items) |cs| try p.add(cs);
 }
 
 /// CED replay's programs (ced.zig): an encoder segment (the whole segment's roles up to the decoder's first layer, and

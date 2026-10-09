@@ -41,6 +41,8 @@ pub const Fake = struct {
     refuse_sampled: bool = false, // prefill refuses a sampled stream with error.SamplingRefused
     pieces_run: usize = 0, // prompt pieces run (`pieceBackend`)
     joins: usize = 0, // prompts whose last token joined a round (`joinBackend`)
+    fail_runs: usize = 0, // the next this many `pieces` calls fail with error.Unbound (`runBackend`)
+    runs: usize = 0, // `pieces` calls that ran
 
     pub fn deinit(x: *Fake) void {
         var it = x.lanes.valueIterator();
@@ -67,6 +69,21 @@ pub const Fake = struct {
     /// `pieceBackend` whose prompts may leave their last token to the stream's first round (Config.join_tail).
     pub fn joinBackend(x: *Fake) be.Backend {
         return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release, .begin = begin, .piece = piece, .finish = finish, .join = join } };
+    }
+
+    /// `joinBackend` that takes a round's pieces in one call (Config.piece_runs): a piece at a time, or a failure.
+    pub fn runBackend(x: *Fake) be.Backend {
+        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release, .begin = begin, .piece = piece, .finish = finish, .join = join, .pieces = pieces } };
+    }
+
+    fn pieces(ptr: *anyopaque, list: []const be.Backend.Piece) anyerror!void {
+        const x = self(ptr);
+        if (x.fail_runs > 0) {
+            x.fail_runs -= 1;
+            return error.Unbound;
+        }
+        x.runs += 1;
+        for (list) |p| try piece(ptr, p.stream, p.start, p.end, p.save);
     }
 
     fn join(ptr: *anyopaque, s: *Stream) anyerror!bool {
