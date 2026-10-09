@@ -645,6 +645,8 @@ test "batched main_proj: the projection's launches do not depend on its rows but
                 else => {},
             };
         }
+    }
+}
 
 test "KV norm/store fuses DSpark ingest and multislot passes without touching other norms" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
