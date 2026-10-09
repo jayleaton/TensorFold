@@ -178,6 +178,12 @@ pub const Session = struct {
         s.comm().abort();
     }
 
+    /// A clean stop of every rank, announced by rank 0 (Forward.stop) before it closes: the followers end with no
+    /// fail-fast exit; elsewhere this rank's own hang-ups are expected. Without fail-fast: nothing.
+    pub fn announceStop(s: *Session) void {
+        if (s.fate) |*f| f.announceStop();
+    }
+
     /// This rank failed after `open`, before serving (a model's load, its assets, its buffers): the other ranks learn
     /// why and go down (fail-fast), and nothing of the session runs on once its owner frees it (the fate thread read a
     /// freed session: rank 1's segfault in fate.report, Spark 2026-10-09).
