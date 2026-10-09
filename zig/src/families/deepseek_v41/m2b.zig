@@ -64,6 +64,7 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, ref: []con
 
     var driver = try cuda.Driver.open();
     defer driver.close();
+    try @import("dev_arena.zig").applySchedule(&driver, @intCast(tcfg.device)); // TF_CUDA_SCHED
     var ctx = try cuda.Context.init(&driver, @intCast(tcfg.device));
     defer ctx.deinit();
     var stream = try cuda.Stream.init(&driver, true);

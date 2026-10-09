@@ -16,6 +16,25 @@ const log = std.log.scoped(.dsv41);
 
 pub const Mode = enum { off, vmm, plain };
 
+/// TF_CUDA_SCHED (unset: the driver's `auto`): how the host waits for the GPU (cuda.Context.Schedule). On GB10 the
+/// CPU and GPU share one power budget; a host spinning in cuEventSynchronize between rounds may cost the GPU clock
+/// that latency-bound kernels need. Host scheduling only, the same launches and bits.
+pub fn schedule(get: *const fn ([]const u8) ?[]const u8) !?cuda.Context.Schedule {
+    const raw = std.mem.trim(u8, get("TF_CUDA_SCHED") orelse return null, " \t");
+    if (raw.len == 0) return null;
+    return std.meta.stringToEnum(cuda.Context.Schedule, raw) orelse {
+        log.warn("TF_CUDA_SCHED={s}: expected auto, spin, yield or blocking", .{raw});
+        return error.BadKnob;
+    };
+}
+
+/// Sets TF_CUDA_SCHED on `ordinal`'s primary context; call before cuda.Context.init.
+pub fn applySchedule(d: *const cuda.Driver, ordinal: c_int) !void {
+    const s = try schedule(&env) orelse return;
+    try cuda.Context.setSchedule(d, ordinal, s);
+    log.info("cuda schedule: {t}", .{s});
+}
+
 pub fn mode(get: *const fn ([]const u8) ?[]const u8) !Mode {
     const raw = std.mem.trim(u8, get("TF_DSV41_ARENA") orelse return .off, " \t");
     if (raw.len == 0 or std.mem.eql(u8, raw, "0")) return .off;
@@ -58,6 +77,24 @@ pub fn install(gpa: std.mem.Allocator, ctx: *const cuda.Context, rank: u32) !?*I
     x.arena.install();
     if (rank == 0) log.info("device arena: {s}, {d} KiB granularity, shared chunks of {d} MiB for buffers up to {d} MiB", .{ be.name, be.granularity >> 10, x.arena.o.small_chunk >> 20, x.arena.o.small_max >> 20 });
     return x;
+}
+
+test "TF_CUDA_SCHED reader" {
+    const t = std.testing;
+    const F = struct {
+        var v: ?[]const u8 = null;
+        fn get(_: []const u8) ?[]const u8 {
+            return v;
+        }
+    };
+    F.v = null;
+    try t.expectEqual(@as(?cuda.Context.Schedule, null), try schedule(&F.get));
+    F.v = "blocking";
+    try t.expectEqual(@as(?cuda.Context.Schedule, .blocking), try schedule(&F.get));
+    F.v = " yield ";
+    try t.expectEqual(@as(?cuda.Context.Schedule, .yield), try schedule(&F.get));
+    F.v = "sleep";
+    try t.expectError(error.BadKnob, schedule(&F.get));
 }
 
 test "TF_DSV41_ARENA reader" {

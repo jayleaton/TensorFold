@@ -147,6 +147,7 @@ pub const Model = struct {
         const cwd = std.Io.Dir.cwd();
         m.tcfg = try tp.Config.fromEnv();
         m.driver = try cuda.Driver.open();
+        try @import("dev_arena.zig").applySchedule(&m.driver, @intCast(m.tcfg.device)); // TF_CUDA_SCHED
         m.ctx = try cuda.Context.init(&m.driver, @intCast(m.tcfg.device));
         m.stream = try cuda.Stream.init(&m.driver, true);
         m.kernels = try dk.Kernels.load(&m.ctx);
