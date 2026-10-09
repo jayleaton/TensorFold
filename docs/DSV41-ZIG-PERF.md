@@ -1374,3 +1374,58 @@ line were read cold (`issued`).
 TF_DSV41_ENGRAM_POLL=1 (with AIO, default off): a wait polls io_getevents with a zero timeout instead of sleeping in
 the kernel, up to 20 ms, then sleeps: the CPU spins only while a caller waits for reads in flight. Exact (the same
 completions); engram_rows_test's golden reads pass with it (mode aio_poll).
+
+### 10.10 chain11 (kit fd323c37): the workspace guard downed 4K; now a fallback, never a failure
+
+c96b9662's runtime guard refused the workspace on rank 1 (`2552 MiB would leave 3.87 GiB of 6.37 GiB`) and returned
+OutOfMemory, so fail-fast took both ranks down, in the 4K P5 boot and in the all-on run.
+
+**Fix:**
+- No failure for room. Each prompt call decides on every rank alike whether it may use the workspace:
+  forward_prefill.wsAgreed does one all-gathered flag (graphs.Agreement, the graph caches' collective) of
+  `MemAvailable - workspace >= TF_DSV41_PF_WS_FLOOR_GIB` (default: the hard floor, 4.0).
+- If any rank says no, the call runs 2,048-row segments, with the same bits (4K and 2K are segmentation-invariant).
+  It logs `prefill workspace: ... does not fit on every rank (rank r: ...): this prompt piece runs 2,048-row segments
+  (fallback k)` for the first 4 and every 64th.
+- A held workspace (a later piece of the same prompt) needs no new decision. TBO pairs need the agreement too.
+- Only a failed allocation after the agreement is still an error: it was agreed to fit.
+- The workspace lines now print on every rank, tagged.
+
+**The "1 GiB less headroom" is the ranks, not growth.** Kit fd323c37's boot check predicts 6.76-6.77 GiB worst on rank
+1 and 7.45-8.08 on rank 0 (P5's 2K and 4K boots). Rank 1's 6.37 GiB before the workspace is its own baseline. t21's
+4.95 / 5.10 GiB lows were rank 0's: the free line was rank 0's only. Rank 1 on t21 most likely dipped to ~3.9 GiB with
+the workspace held, unchecked, without harm.
+
+The changes between the kits (ca14bc81's counters, 0a080f59's ENGRAM_WARM default off, c96b9662) hold little
+resident memory. The read-ahead's batches are ~1 KiB a record, tens of MiB a layer. So at the default floor rank 1
+falls back on every prompt, and 4K would not run at all. Run 4K with `TF_DSV41_PF_WS_FLOOR_GIB=3.5` (t21's effective
+operating point) until the workspace shrinks.
+
+**Holding one workspace from boot is not viable:** 2.49 GiB at 1,790 B a token is ~1.49M pool tokens, more than the
+whole 1.40M pool. It would also sit under the row graphs' 5 GiB floor on rank 1.
+
+**The way to make 4K fit is a smaller workspace.** It holds the 4K program's whole window / layer arena (~2.0 GiB)
+plus its scratch (0.65). The forward's 2K arena (1.2 GiB) is idle while a 4K segment runs, and 2K prefill pieces
+already overwrite it between decode rounds. Laying the 4K roles that only prefill programs use over the forward
+arena's prefill-only roles would cut the workspace by up to ~1 GiB. It needs the plan's prefill-only role set, the
+forward and drafter state proven untouched (no cross-window "w." value under those ranges), and a device sync at the
+4K segment's start for side-stream readers. Not built yet.
+
+**2K profile at 131K** (P5, rank 0, ms per 1K prompt rows, 453 total, host 0.7):
+
+| call | ms | share |
+| --- | ---: | ---: |
+| x3gm (gate/up 77.5, down 52.7, rot 13.9, combine 13.6) | 157.7 | 35 % |
+| dense (pfdense 70.4, rot_in 15.6) | 86.0 | 19 % |
+| `_stream` (long-context top-k, 219 calls, ~36 ms each) | 52.8 | 12 % |
+| `_fused` (attention core) | 43.7 | 10 % |
+| mHC (site 27.2, finish 8.8) | 36.0 | 8 % |
+| exchanges | 28.7 | 6 % |
+| router | 16.8 | 4 % |
+
+So at 131K the long-context selection and attention (21 %) is the largest non-GEMM block.
+
+**Spark step P5b:** the 4K boot of P5 with `TF_DSV41_PF_WS_FLOOR_GIB=3.5`.
+- Pass: boot log `prefill 4K: rank 0/1: workspace ... allocated` on both ranks, no `does not fit`, exact replies.
+- Then `gap.py prefill-ab --a prof-2k-r<r>.json --b prof-4k-r<r>.json --labels 2K,4K`.
+- If a rank logs the fallback, the run still passes (2K bits); the profile then shows 2K.
