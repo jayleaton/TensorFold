@@ -571,9 +571,12 @@ pub const LaneHost = struct {
                     jobs[n] = job;
                     n += 1;
                 }
-                h.core.finishStreams(ss[0..n], errs[0..n]) catch |e| for (errs[0..n]) |*x| {
-                    x.* = e;
+                const joined = h.core.finishStreams(ss[0..n], errs[0..n]) catch |e| blk: {
+                    for (errs[0..n]) |*x| x.* = e;
+                    break :blk 0;
                 };
+                // TF_DSV41_JOIN_DRAFTS: a round's line when its finished prompts joined (their first drafts in one pass)
+                if (joined > 0) std.log.info("join drafts: {d} of {d} finished prompts drafted in one pass", .{ joined, n });
                 for (jobs[0..n], errs[0..n]) |job, x| {
                     if (x) |e| {
                         if (e == error.Cancelled) {

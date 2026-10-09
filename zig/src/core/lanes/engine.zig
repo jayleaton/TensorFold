@@ -141,8 +141,8 @@ pub const Engine = struct {
     /// A round's finished prompts (Config.join_tail): each as `finishStream`, but the joined ones' first drafts in one
     /// backend call (Python's rounds.py `_windows`: one `fwd.draft` over every window of the round), not one pass a
     /// prompt. `errs[i]`: stream i's failure (a failed shared draft fails every joined stream); a stream without one is
-    /// live (or ended, as `opened` leaves it).
-    pub fn finishStreams(e: *Engine, streams: []const *Stream, errs: []?anyerror) !void {
+    /// live (or ended, as `opened` leaves it). Returns the prompts joined (their first drafts in the one call).
+    pub fn finishStreams(e: *Engine, streams: []const *Stream, errs: []?anyerror) !usize {
         _ = e.arena.reset(.retain_capacity);
         const a = e.arena.allocator();
         var reqs: std.ArrayList(be.DraftRequest) = .empty;
@@ -175,16 +175,17 @@ pub const Engine = struct {
                 err.* = x;
             };
         }
-        if (reqs.items.len == 0) return;
+        if (reqs.items.len == 0) return 0;
         e.backend.draft(reqs.items) catch |x| {
             for (joins.items) |i| errs[i] = x;
-            return;
+            return 0;
         };
         for (reqs.items) |r| e.joinedDrafted(r) catch |x| {
             for (joins.items) |i| if (streams[i] == r.stream) {
                 errs[i] = x;
             };
         };
+        return reqs.items.len;
     }
 
     /// A joined prompt's state and its first draft request (the last token pending at the prompt's last position).
