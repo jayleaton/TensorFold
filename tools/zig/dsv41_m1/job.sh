@@ -344,7 +344,7 @@ if [[ "${M1_JOB:-m1}" == m2b ]]; then
         # M2B_LONGPF (long prompts past 4,096 keys), M2B_SPEC (SPEC_DRAFT early pass), M2B_GRAMMAR (structured output),
         # M2B_VISION (image input), M2B_KNOBS (prod engine knobs on the Zig side), M2B_SESS4 (sessions with several slots),
         # M2B_GM2PF (x3gm v2 on Zig's prefill: a v2 capture checked + replayed, v2 == v1, the prefill gate off / v2 timed)
-        for name in ${*:-longpf spec grammar vision knobs sess4 gm2pf}; do
+        for name in ${*:-longpf spec grammar vision knobs sess4 gm2pf pieces}; do
             knob=M2B_${name^^}
             [[ "${!knob:-0}" == 1 ]] || continue
             if [[ -f "$Z/tools/zig/dsv41_$name/job.sh" ]]; then

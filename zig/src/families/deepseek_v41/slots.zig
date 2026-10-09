@@ -63,6 +63,7 @@ pub const SlotSet = struct {
         const states = try gpa.alloc(fwd.Slot, n);
         @memset(states, .{});
         ss.* = .{ .gpa = gpa, .f = f, .n = n, .states = states };
+        f.pf_switch = .{ .ctx = ss, .run = viewFn };
         return ss;
     }
 
@@ -138,6 +139,23 @@ pub const SlotSet = struct {
         ss.f.slot = ss.states[s];
         try ss.point(s);
         ss.active = s;
+    }
+
+    /// Slot s's views and state current on this rank alone (no op_select: a multi-segment prefill run's segments,
+    /// which every rank runs in the same order; forward_prefill.promptMulti).
+    pub fn view(ss: *SlotSet, s: u32) !void {
+        if (s >= ss.n) return error.SlotRange;
+        try ss.swapIn(s);
+        if (ss.active == s) return;
+        ss.store();
+        ss.f.slot = ss.states[s];
+        try ss.point(s);
+        ss.active = s;
+    }
+
+    fn viewFn(ctx: *anyopaque, s: u32) anyerror!void {
+        const ss: *SlotSet = @ptrCast(@alignCast(ctx));
+        return ss.view(s);
     }
 
     /// The stacked bases again (row mode), the active slot's state kept.

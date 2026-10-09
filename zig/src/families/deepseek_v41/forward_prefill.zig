@@ -233,6 +233,135 @@ fn segment(f: *Forward, ids: []const u32, head: bool) !void {
     st.taps_rows = if (replay) 0 else n;
 }
 
+/// One segment of a multi-segment run: a slot's prompt ids from its position `start`.
+pub const MultiSeg = struct { slot: u32, start: u64, ids: []const u32 };
+
+/// An Engram tail (a slot's last ids before the run).
+pub const Tail = struct {
+    ids: [eh.max_ngram]u32 = undefined,
+    len: usize = 0,
+
+    pub fn items(t: *const Tail) []const u32 {
+        return t.ids[0..t.len];
+    }
+};
+
+/// The run in flight (Forward.multi): its segments, each one's first row in the run and its slot's Engram tail at
+/// the run's start, and every segment's ids in run order (the embedding's).
+pub const Multi = struct { segs: []const MultiSeg, row0: []const usize, tails: []const Tail, ids: []const u32 };
+
+/// Several slots' prompt segments in one run (block_prefill.emitMulti; Python's slots.prefill / replay.encode over
+/// prefill_runs: GLM 0560's one expert pass over every prefilling slot). Each segment starts at its slot's position;
+/// the rows' launches run over all segments, each segment's CSA2 steps on its own slot (glue pf_seg, Forward.pf_switch),
+/// then each slot commits its segment as `segment` would (carries from its last row, Engram tail, position, CED's
+/// stash ids). error.Unsupported: the caller runs the segments one at a time (a short segment, an image, split KV).
+pub fn promptMulti(f: *Forward, segs: []const MultiSeg) !void {
+    const st = &f.prefill_state;
+    const sw = f.pf_switch orelse return error.Unsupported;
+    if (segs.len == 0 or segs.len > 16) return error.BadWindow;
+    var sa = std.heap.ArenaAllocator.init(f.gpa);
+    defer sa.deinit();
+    const a = sa.allocator();
+    const replay = st.mode == .replay;
+    const layers = if (replay) try encoderLayers(f, try f.backbone(a)) else try f.backbone(a);
+    const spans = try a.alloc(block_prefill.Span, segs.len);
+    const row0 = try a.alloc(usize, segs.len);
+    const tails = try a.alloc(Tail, segs.len);
+    var all: std.ArrayList(u32) = .empty;
+    for (segs, spans, row0, tails) |sg, *sp, *r0, *t| {
+        try sw.run(sw.ctx, sg.slot);
+        if (f.slot.pending != null or f.slot.pos != sg.start or sg.ids.len == 0) return error.BadWindow;
+        if (sg.start + sg.ids.len > @as(u64, @intCast(f.opts.limit))) return error.BadWindow;
+        sp.* = .{ .slot = sg.slot, .start = @intCast(sg.start), .n = @intCast(sg.ids.len) };
+        r0.* = all.items.len;
+        t.len = f.slot.tail_len;
+        @memcpy(t.ids[0..t.len], f.slot.tail[0..t.len]);
+        try all.appendSlice(a, sg.ids);
+    }
+    if (vision_rows.segmentOptions(f, all.items).image_rows != 0) return error.Unsupported;
+    const cs = try block_prefill.emitMulti(a, f.cfg, f.widths, f.opts, layers, spans, if (replay) .encoder else .whole);
+    try ready(f);
+    // the pages of every segment's positions, before any launch (each on its slot's table)
+    for (segs) |sg| {
+        try sw.run(sw.ctx, sg.slot);
+        if (f.kv) |kx| try kx.reserve(sg.start + sg.ids.len);
+    }
+    var m: Multi = .{ .segs = segs, .row0 = row0, .tails = tails, .ids = all.items };
+    f.multi = &m;
+    defer f.multi = null;
+    try enterRun(f, &m);
+    st.layers = layers;
+    st.moe = 0;
+    st.taps_rows = 0;
+    f.runner.glue = .{ .ctx = f, .run = glueFn };
+    try longpf.window(&st.long, f.gpa, f.runner, f.kv, segs[0].start, cs);
+    // each slot keeps its segment (Python's keep(slot, n - 1) a segment, replay.encode's stash ids)
+    for (segs, row0) |sg, r0| {
+        try sw.run(sw.ctx, sg.slot);
+        f.ids = sg.ids;
+        f.slot.pending = .{ .start = sg.start, .n = @intCast(sg.ids.len) };
+        try commitAt(f, @intCast(sg.ids.len), r0);
+        if (replay) f.slot.ced.extend(sg.start, sg.ids);
+    }
+    f.last_rows = 0;
+}
+
+/// Whether a multi-segment run takes `segs` (promptMulti's refusals), checked before the leader sends it.
+pub fn runnable(f: *Forward, segs: []const MultiSeg) !bool {
+    if (f.pf_switch == null or segs.len < 2 or segs.len > 16) return false;
+    var sa = std.heap.ArenaAllocator.init(f.gpa);
+    defer sa.deinit();
+    const a = sa.allocator();
+    const replay = f.prefill_state.mode == .replay;
+    const layers = if (replay) try encoderLayers(f, try f.backbone(a)) else try f.backbone(a);
+    const spans = try a.alloc(block_prefill.Span, segs.len);
+    var all: std.ArrayList(u32) = .empty;
+    for (segs, spans) |sg, *sp| {
+        sp.* = .{ .slot = sg.slot, .start = @intCast(sg.start), .n = @intCast(sg.ids.len) };
+        try all.appendSlice(a, sg.ids);
+    }
+    if (vision_rows.segmentOptions(f, all.items).image_rows != 0) return false;
+    _ = block_prefill.emitMulti(a, f.cfg, f.widths, f.opts, layers, spans, if (replay) .encoder else .whole) catch |e| switch (e) {
+        error.Unsupported => return false,
+        else => return e,
+    };
+    return true;
+}
+
+/// The glue's view of the whole run (Forward.multi): the first segment's slot, every row's ids, the run's rows pending.
+fn enterRun(f: *Forward, m: *const Multi) !void {
+    const sw = f.pf_switch.?;
+    try sw.run(sw.ctx, m.segs[0].slot);
+    f.ids = m.ids;
+    f.slot.pending = .{ .start = m.segs[0].start, .n = @intCast(m.ids.len) };
+}
+
+/// glue pf_seg: segment j's slot current, its rows pending, its positions (`w.pos`, `w.pos64`, `w.lo`); -1: the run's
+/// view again (enterRun).
+fn segGlue(f: *Forward, r: *run.Runner, c: *const calls.Call) !void {
+    const m = f.multi orelse return error.BadGlue;
+    const j = c.args[0].arg.i;
+    if (j < 0) return enterRun(f, m);
+    const sg = m.segs[@intCast(j)];
+    const sw = f.pf_switch.?;
+    try sw.run(sw.ctx, sg.slot);
+    f.ids = sg.ids;
+    f.slot.pending = .{ .start = sg.start, .n = @intCast(sg.ids.len) };
+    const k = r.kernels.others(r.stream);
+    return k.positions(@intCast(sg.start), @intCast(sg.ids.len), try r.tensorAddr(c.args[1].arg.t), try r.tensorAddr(c.args[2].arg.t), try r.tensorAddr(c.args[3].arg.t));
+}
+
+/// glue mpositions: every segment's positions into the run's "w.mpos64" (rope over the run's rows); the window starts
+/// and the start word land in the scratch the segments' pf_seg rewrites.
+fn runPositions(f: *Forward, r: *run.Runner, c: *const calls.Call) !void {
+    const m = f.multi orelse return error.BadGlue;
+    const k = r.kernels.others(r.stream);
+    const mpos = try r.tensorAddr(c.args[0].arg.t);
+    const pos = r.addressOf("w.pos") orelse return error.Unbound;
+    const lo = r.addressOf("w.lo") orelse return error.Unbound;
+    for (m.segs, m.row0) |sg, r0| try k.positions(@intCast(sg.start), @intCast(sg.ids.len), pos, mpos + 8 * r0, lo);
+}
+
 /// CED's decoder replay (replay.finish; Forward.finishPrompt on every rank): layers D .. over the prompt's prefilled
 /// tail [R0, end) from the stash, end = the slot's position, every window from R0. Nothing is committed: the slot
 /// stays at `end`, the decoder's SWA rings hold [R0, end), and the prompt's last token is the next window's row.
@@ -296,6 +425,11 @@ fn stashCopy(f: *Forward, r: *run.Runner, c: *const calls.Call, store: bool) !vo
 
 /// Keep of all the pending segment's rows: the ratio-2 carries, the Engram tail, the position.
 fn commit(f: *Forward, n: u32) !void {
+    return commitAt(f, n, 0);
+}
+
+/// `commit` of a segment whose rows are rows [row0, row0 + n) of the run's projections.
+fn commitAt(f: *Forward, n: u32, row0: usize) !void {
     const p = f.slot.pending orelse return error.BadWindow;
     const r = f.runner;
     var nb: [64]u8 = undefined;
@@ -305,7 +439,7 @@ fn commit(f: *Forward, n: u32) !void {
     for (try f.backbone(la.allocator())) |L| if (f.cfg.isKvSource(L) and f.cfg.compressRatio(L) == 2) {
         const src = r.addressOf(try std.fmt.bufPrint(&nb, "w.L{d}.proj", .{L})) orelse return error.Unbound;
         const dst = r.addressOf(try std.fmt.bufPrint(&nb, "s.L{d}.carry", .{L})) orelse return error.Unbound;
-        try copy(r, dst, src + (n - 1) * row, row);
+        try copy(r, dst, src + (row0 + n - 1) * row, row);
     };
     if (f.engram) |h| tailOf(&f.slot, f.ids[0..n], h.max_ngram - 1);
     f.slot.pos = p.start + n;
@@ -426,6 +560,8 @@ fn glueFn(ctx: *anyopaque, r: *run.Runner, c: *const calls.Call) anyerror!void {
         return copy(r, buf + bytesOf(carry), try r.tensorAddr(x[1].arg.t), bytesOf(x[1].arg.t));
     }
     if (eql(u8, step, "stream_merge")) return longpf.merge(&st.long, f.gpa, r, c);
+    if (eql(u8, step, "pf_seg")) return segGlue(f, r, c);
+    if (eql(u8, step, "mpositions")) return runPositions(f, r, c);
     if (eql(u8, step, "ced_stash") or eql(u8, step, "ced_load")) return stashCopy(f, r, c, eql(u8, step, "ced_stash"));
     if (eql(u8, step, "zeros")) return zero(r, try r.tensorAddr(x[0].arg.t), bytesOf(x[0].arg.t));
     if (eql(u8, step, "image_keep")) return vision_rows.keep(f, r, c);

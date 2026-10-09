@@ -108,6 +108,13 @@ pub const Engine = struct {
         return run(e.backend.ptr, s, start, end, save);
     }
 
+    /// A round's pieces of several streams together (Config.piece_runs and Backend.pieces): one backend call; else a
+    /// piece at a time.
+    pub fn pieces(e: *Engine, list: []const be.Backend.Piece) !void {
+        if (e.cfg.piece_runs) if (e.backend.vtable.pieces) |run| return run(e.backend.ptr, list);
+        for (list) |p| try e.piece(p.stream, p.start, p.end, p.save);
+    }
+
     /// A begun stream's prompt is in: its last row, its first token and first drafts; it takes part from the next
     /// round. A failure leaves the stream with the backend (the host discards it).
     pub fn finishStream(e: *Engine, s: *Stream) !void {

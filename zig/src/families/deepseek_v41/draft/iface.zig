@@ -54,7 +54,13 @@ pub const Target = struct {
         /// a round's shared one (Python's batcher `finals`). null from the call: done so; a choice: the target ran the
         /// last row as `finish` (a grammar's first mask). null: `finish`.
         tail: ?*const fn (ptr: *anyopaque, slot: u32, ids: []const u32, sampling: ?lanes.Sampling, draw: u64) anyerror!?u32 = null,
+        /// A round's pieces of several slots (TF_DSV41_PIECE_RUNS): one forward over them where the target can, else
+        /// `piece` a piece. null: `piece` a piece.
+        pieces: ?*const fn (ptr: *anyopaque, list: []const Piece) anyerror!void = null,
     };
+
+    /// A slot's prompt `ids` (the whole prompt) rows [start, end) of a round; `save`: its snapshot right after them.
+    pub const Piece = struct { slot: u32, ids: []const u32, start: u64, end: u64, save: bool };
 
     pub const Begun = struct { at: u64 = 0, damaged: bool = false };
 
@@ -73,6 +79,10 @@ pub const Target = struct {
     }
     pub fn finish(t: Target, slot: u32, ids: []const u32, sampling: ?lanes.Sampling, draw: u64) !u32 {
         return (t.vtable.finish orelse return error.NoPieces)(t.ptr, slot, ids, sampling, draw);
+    }
+    pub fn runPieces(t: Target, list: []const Piece) !void {
+        if (t.vtable.pieces) |f| return f(t.ptr, list);
+        for (list) |p| try t.piece(p.slot, p.ids, p.start, p.end, p.save);
     }
     pub fn tail(t: Target, slot: u32, ids: []const u32, sampling: ?lanes.Sampling, draw: u64) !?u32 {
         const f = t.vtable.tail orelse return try t.finish(slot, ids, sampling, draw);

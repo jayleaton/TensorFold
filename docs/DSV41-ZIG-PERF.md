@@ -327,3 +327,58 @@ Expected: per prompt, one 1-row window and one 1-slot pass fewer (~40 ms on the 
 ~4 ms), less the joined rows' share of the shared window (~4 ms a drafted row up to 16 rows). Code 1 stream ~+0.5 %;
 the mix's 4 short streams and 4-stream code, where prefill is a larger share, +1.5-3 %; TTFT -30..-40 ms a request.
 Spark step: one A/B cell pair with `TF_DSV41_PREFILL_PIECES=1` plus `TF_DSV41_TAIL_JOIN=1`, replies vs Python 4/4.
+
+## 8. Several slots' prompt pieces in one run (TF_DSV41_PIECE_RUNS=1, 2026-10-09, offline)
+
+### 8.1 What round 3's timeline shows
+
+In the nsys timelines of the 4-stream code cell, every prefill launch group was counted by kind. The per-slot
+attention launches (`_fused`, `_kv_store`, `_scores`) repeat for every slot in a forward. The expert matmul
+(`gm2_kernel`) runs once per forward whatever the number of slots. A 20-layer half-pass is 20 attention launches and
+40 expert launches:
+
+| | half-passes (attention) | half-passes with their own expert launches |
+| --- | ---: | ---: |
+| Python | 14 | 12 |
+| Zig | 14 | 14 |
+
+Both engines ran the same pieces (the round planner's golden gate holds). Python ran two of them in another slot's
+forward: its batcher puts a round's pieces in one encoder run (slots.prefill_runs, GLM 0560), so their rows share
+the expert weight streams. Zig ran each piece alone: two more expert weight passes, ~91 ms of GPU time in the cell
+(690 against 599 ms of `gm2_kernel`), ~0.8 % of 4-stream code. The gain grows with longer prompts arriving together.
+
+### 8.2 The run
+
+`block_prefill.emitMulti` emits one program over several slots' segments (Python's forward._run over several
+contexts):
+- the embedding, every mHC site, every dense projection, the experts and the exchanges run over all the run's rows
+  (the segments' rows in order), exactly as a one-segment program of that many rows;
+- each segment's CSA2 steps (SWA store through its slot's or the staging ring, the kv source's compressor, the
+  indexer's selection, the fused core) run on its own slot, as blocks.attention's loop over its contexts. Glue
+  `pf_seg` switches the slot's views (slots.zig `SlotSet.view`, every rank alike, no plan-link message) and writes the
+  segment's positions and window starts. The core reads its rows of the run's q / kv / qi / weights / projections
+  (`Emitter.row0`) and writes its rows of each wo_a group's plane (`OR` = the run's rows);
+- rope over the run's rows reads every segment's positions (`w.mpos64`, glue `mpositions`); Engram's rows are each
+  segment's after its own slot's tail;
+- CED's encoder pass ends with the decoder's first layer's projection over every row, then each segment's compressor
+  and stash (blocks.compress_rows, replay.encode).
+
+`forward_prefill.promptMulti` runs it and commits each slot's segment (carries from its last row, Engram tail,
+position, the stash's ids). `Forward.prefillMulti` sends it to the followers (op 52). The target takes a round's
+pieces in one call (`iface.Target.pieces`, lanes `Backend.pieces`, `LaneHost` with `Config.piece_runs`) and runs them
+as one run in replay mode. It falls back to a piece at a time for a segment of 16 rows or fewer (the short segment's
+decode-kernel mix), an image, split KV, more rows than one 2,048-row prefill segment, and full mode (its drafter taps
+each piece).
+
+Host gate (`test-dsv41-knobs`, multi_test.zig):
+- a one-segment run is the one-segment program, launch for launch and tensor for tensor (full mode and CED's encoder);
+- a run of three segments at different positions and lengths (a staged 700-row segment at 4,000, a 100-row one at 0,
+  a 33-row one at 129): its per-row launches are an all-rows program's, in order; each segment's CSA2 steps are its
+  own program's, in order, at its rows of the run.
+
+GPU gate (pod, `M2B_PIECES=1`, tools/zig/dsv41_pieces/job.sh): Python's batched reference (dsv41_m2b_ref.py
+`--batched`: one encoder run over every prompt's piece), our ranks serving the prompts at once with the round planner
+and the run (TF_DSV41_PIECE_RUNS=1) against it, and with the run off. Not run yet.
+
+Expected: one expert weight pass saved per extra piece in a run, ~45 ms each on the Spark at bench prompt sizes; ~90 ms
+in round 3's 4-stream code cell (~0.8 %), more on the 4-short-stream mix and with longer prompts arriving together.

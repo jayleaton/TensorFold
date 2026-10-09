@@ -125,6 +125,11 @@ pub const Forward = struct {
     sess: ?Sess = null,
     /// a workstream's plan-link operations (docs 0a's ranges; slots.zig 16-19), run by a follower in the leader's order
     ext: ?Ext = null,
+    /// several live slots (slots.zig): a multi-segment prefill run's slot switch, on this rank only (every rank runs the
+    /// same run); null: one slot, no runs
+    pf_switch: ?PfSwitch = null,
+    /// the multi-segment prefill run in flight (forward_prefill.promptMulti; its glue reads it), null outside one
+    multi: ?*pf.Multi = null,
     /// the keyed sampler (sampling_gpu.zig): a follower runs rank 0's sampled choices too (their gathers pair up)
     sampler: ?Sampler = null,
     /// structured output (grammar_gpu.zig, TF_DSV41_GRAMMAR=1): staged grammar masks applied to "w.logits" before a
@@ -458,6 +463,30 @@ pub const Forward = struct {
     /// 48-51: dsq-zig-sess4-1 (sessions over several slots); 48: [op, need, n, spilled entry ids...] a request's admission
     const op_sess_admit: i64 = 48;
 
+    /// 52-55: dsq-zig-beat-1 (multi-segment prefill runs); 52: [op, segments, (slot, start, rows) a segment, ids...]
+    const op_pf_multi: i64 = 52;
+
+    /// A slot's views made current on this rank (slots.zig SlotSet.view), for a multi-segment run's segments.
+    pub const PfSwitch = struct { ctx: *anyopaque, run: *const fn (ctx: *anyopaque, slot: u32) anyerror!void };
+
+    /// Several slots' prompt segments in one run (forward_prefill.promptMulti, TF_DSV41_PIECE_RUNS): each segment's ids
+    /// from its slot's position, every slot's state then moved past its segment. The leader sends the run first.
+    pub fn prefillMulti(f: *Forward, segs: []const pf.MultiSeg) !void {
+        if (segs.len == 0) return;
+        f.gated = false;
+        if (f.leads()) {
+            var msg: std.ArrayList(i64) = .empty;
+            defer msg.deinit(f.gpa);
+            try msg.appendSlice(f.gpa, &.{ op_pf_multi, @intCast(segs.len) });
+            for (segs) |sg| try msg.appendSlice(f.gpa, &.{ sg.slot, @intCast(sg.start), @intCast(sg.ids.len) });
+            for (segs) |sg| for (sg.ids) |t| try msg.append(f.gpa, t);
+            try f.link.?.send(msg.items);
+        }
+        f.quiet = true;
+        defer f.quiet = false;
+        return pf.promptMulti(f, segs);
+    }
+
     /// CED (TF_DSV41_PREFILL=replay, ced.zig): the decoder replay over the prompt's prefilled tail, after its last
     /// prefill segment and before its first verify window (rounds.py `finish_prompt`), on every rank; full mode: nothing.
     pub fn finishPrompt(f: *Forward) !void {
@@ -623,6 +652,22 @@ pub const Forward = struct {
                     const x = f.sess orelse return error.BadPlan;
                     const run_ = x.admit orelse return error.BadPlan;
                     try run_(x.ptr, msg);
+                },
+                op_pf_multi => {
+                    const ns: usize = @intCast(msg[1]);
+                    if (ns == 0 or ns > 16 or msg.len < 2 + 3 * ns) return error.BadPlan;
+                    var segs: [16]pf.MultiSeg = undefined;
+                    prompt.clearRetainingCapacity();
+                    for (msg[2 + 3 * ns ..]) |t| try prompt.append(f.gpa, @intCast(t));
+                    var at: usize = 0;
+                    for (segs[0..ns], 0..) |*sg, j| {
+                        const n: usize = @intCast(msg[4 + 3 * j]);
+                        if (at + n > prompt.items.len) return error.BadPlan;
+                        sg.* = .{ .slot = @intCast(msg[2 + 3 * j]), .start = @intCast(msg[3 + 3 * j]), .ids = prompt.items[at .. at + n] };
+                        at += n;
+                    }
+                    if (at != prompt.items.len) return error.BadPlan;
+                    try f.prefillMulti(segs[0..ns]);
                 },
                 op_ced_finish => {
                     // the leader's slot ends where this one does, and both run replay (the same TF_DSV41_PREFILL)
@@ -798,7 +843,7 @@ pub const Forward = struct {
     fn engramRows(f: *Forward, r: *run.Runner, c: *const calls.Call) !void {
         const h = f.engram orelse return glueMissing("engram_rows (no Engram tables)");
         const L: u32 = @intCast(c.args[1].arg.i);
-        const n = f.ids.len;
+        const n = f.ids.len; // a multi-segment run: every segment's rows (fillEngramRows takes each with its slot's tail)
         const W = f.comm.world();
         const cols = f.engramCols(h); // this rank's columns of a row
         const bytes = 2 * n * cols;
@@ -842,6 +887,12 @@ pub const Forward = struct {
     fn fillEngramRows(f: *Forward, h: *const eh.Host, L: u32, out: []u16) !void {
         const tw = ph.start(f.phases, .@"engram.wait");
         defer tw.stop();
+        if (f.multi) |m| {
+            // a multi-segment run: each segment's rows after its own slot's tail, at its rows of the run
+            const cols = out.len / f.ids.len;
+            for (m.segs, m.row0, m.tails) |sg, r0, t| try h.windowRows(f.gpa, try f.engramSource(h), sg.ids, t.items(), L, f.comm.rank(), f.comm.world(), f.cfg.engram_head_dim, out[r0 * cols ..][0 .. sg.ids.len * cols]);
+            return;
+        }
         return h.windowRows(f.gpa, try f.engramSource(h), f.ids, f.slot.tail[0..f.slot.tail_len], L, f.comm.rank(), f.comm.world(), f.cfg.engram_head_dim, out);
     }
 

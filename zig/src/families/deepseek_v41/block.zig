@@ -151,6 +151,9 @@ pub const Emitter = struct {
     df_side: bool = false,
     df_join: bool = false,
     df_pending: bool = false,
+    /// a multi-segment prefill (block_prefill.emitMulti): the current segment's first row in the run's per-row roles
+    /// (the selection's rows); 0 elsewhere
+    row0: i64 = 0,
 
     pub fn fmt(e: *Emitter, comptime f: []const u8, args: anytype) ![]const u8 {
         return std.fmt.allocPrint(e.a, f, args);
@@ -632,7 +635,11 @@ pub const Emitter = struct {
 
     /// The window's index selection of layer `src` (reuse layers read the source's).
     fn selection(e: *Emitter, src: u32) ![2]Arg {
-        return .{ try e.buf("w.sel{d}", .{src}, .i32, &.{ e.n, e.cfg.index_topk }), try e.buf("w.cnt{d}", .{src}, .i32, &.{e.n}) };
+        const k: i64 = e.cfg.index_topk;
+        return .{
+            try e.view(.{ .buf = try e.fmt("w.sel{d}", .{src}) }, .i32, &.{ e.n, k }, &.{ k, 1 }, e.row0 * k * 4),
+            try e.view(.{ .buf = try e.fmt("w.cnt{d}", .{src}) }, .i32, &.{e.n}, &.{1}, e.row0 * 4),
+        };
     }
 
     /// attn_cuda's ticket words: a (row, head tile)'s ranks, 4 with R1's split kernel (MAX_SPLIT); the twins with

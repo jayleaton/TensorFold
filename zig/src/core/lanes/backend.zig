@@ -82,7 +82,13 @@ pub const Backend = struct {
         /// stream's first round (pending at the prompt's last position, nothing drawn); false when it ran the row as
         /// `finish` does (then `first`). null: `finish` only.
         join: ?*const fn (ptr: *anyopaque, s: *Stream) anyerror!bool = null,
+        /// A round's pieces of several streams in one call (Config.piece_runs): the backend may run them as one forward
+        /// (several slots' rows at once); a failure fails every stream of the call. null: `piece` a piece.
+        pieces: ?*const fn (ptr: *anyopaque, list: []const Piece) anyerror!void = null,
     };
+
+    /// One stream's prompt rows [start, end) of a round (`save`: the prompt's snapshot right after them).
+    pub const Piece = struct { stream: *Stream, start: u64, end: u64, save: bool };
 
     /// `begin`'s outcome: prompt tokens the stream's state holds (a restored prefix), and whether a damaged saved
     /// entry was dropped instead (the prompt then runs from 0).
