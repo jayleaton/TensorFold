@@ -158,7 +158,11 @@ def long_cell(url: str, model: str, n: int, max_tokens: int) -> dict:
 
 
 def compare(a_path: str, b_path: str) -> None:
-    a, b = json.load(open(a_path)), json.load(open(b_path))
+    try:
+        a, b = json.load(open(a_path)), json.load(open(b_path))
+    except (OSError, ValueError) as e:     # a part that did not run (zig-bench.sh PARTS): no table, not a crash
+        print(f"no comparison: {e}")
+        return
 
     def key(c):
         return (c["work"], c["temp"], c["streams"])
