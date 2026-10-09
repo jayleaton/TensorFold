@@ -676,6 +676,26 @@ const Seg = struct {
             const nk = @max(@divFloor(e.start + a + rows, ratio), 1);
             const ns = longpf.splits(nk);
             const buf = try e.buf("L.ix.stream", .{}, .i64, &.{ rows, ns, 2 * topk });
+            if (e.o.stream_rb == 2 or e.o.stream_rb == 4) {
+                // TF_DSV41_STREAM_RB: `_stream_rb<N>`, N rows a program (the same buffers, the same merge)
+                const rb = e.o.stream_rb;
+                try e.triton(if (rb == 2) "_stream_rb2" else "_stream_rb4", .{ cdiv(rows, rb), ns, 1 }, &.{
+                    .{ .name = "QI", .arg = try e.view(.{ .buf = "L.qi" }, .bf16, &.{ rows, IH, ID }, &.{ IH * ID, ID, 1 }, (e.row0 + a) * IH * ID * 2) },
+                    .{ .name = "W", .arg = try e.view(.{ .buf = "L.ix_w" }, .f32, &.{ rows, IH }, &.{ IH, 1 }, (e.row0 + a) * IH * 4) },
+                    .{ .name = "w_stride", .arg = .{ .i = IH } },           .{ .name = "IK", .arg = try indexKeys(e, src) },
+                    .{ .name = "POS", .arg = p },                           .{ .name = "R", .arg = .{ .i = rows } },
+                    .{ .name = "BUF", .arg = buf },                         .{ .name = "nsplit", .arg = .{ .i = ns } },
+                    .{ .name = "RATIO", .arg = .{ .i = ratio } },           .{ .name = "H", .arg = .{ .i = IH } },
+                    .{ .name = "D", .arg = .{ .i = ID } },                  .{ .name = "BP", .arg = .{ .i = 64 } },
+                    .{ .name = "WS", .arg = .{ .f = 1.0 / @sqrt(@as(f64, @floatFromInt(IH))) } },
+                    .{ .name = "SCALE", .arg = .{ .f = 1.0 / @sqrt(@as(f64, @floatFromInt(ID))) } },
+                    .{ .name = "SPLIT", .arg = .{ .i = longpf.split_keys } }, .{ .name = "K", .arg = .{ .i = topk } },
+                    .{ .name = "CAP", .arg = .{ .i = 2 * topk } },          .{ .name = "PT", .arg = spg.pt },
+                    .{ .name = "PSH", .arg = .{ .i = spg.psh } },           .{ .name = "KFP8", .arg = .{ .b = true } },
+                });
+                try e.glue("stream_merge", &.{ buf, try rowsOf(e, out, .i32, a, rows, topk), .{ .i = topk }, try e.buf("L.ix.keys", .{}, .i64, &.{ rows, ns * topk }) });
+                continue;
+            }
             try e.triton("_stream", .{ rows, ns, 1 }, &.{
                 .{ .name = "QI", .arg = try e.view(.{ .buf = "L.qi" }, .bf16, &.{ rows, IH, ID }, &.{ IH * ID, ID, 1 }, (e.row0 + a) * IH * ID * 2) },
                 .{ .name = "W", .arg = try e.view(.{ .buf = "L.ix_w" }, .f32, &.{ rows, IH }, &.{ IH, 1 }, (e.row0 + a) * IH * 4) },

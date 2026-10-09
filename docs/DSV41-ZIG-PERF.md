@@ -1429,3 +1429,67 @@ So at 131K the long-context selection and attention (21 %) is the largest non-GE
 - Pass: boot log `prefill 4K: rank 0/1: workspace ... allocated` on both ranks, no `does not fit`, exact replies.
 - Then `gap.py prefill-ab --a prof-2k-r<r>.json --b prof-4k-r<r>.json --labels 2K,4K`.
 - If a rank logs the fallback, the run still passes (2K bits); the profile then shows 2K.
+
+## 12. The long-context stream top-k, row-blocked (TF_DSV41_STREAM_RB, 2026-10-09, offline)
+
+### 12.1 What bounds `_stream`
+
+At 131K, P5's 2K profile puts `_stream` (csa2/stream_topk.py: the indexer's scores and top-512 of layers 2 / 8 / 14
+past 4,096 visible keys) at **52.8 ms per 1K rows, 12 % of prefill**: 219 calls of ~36 ms. A program is one (row, key
+split of 16,384) pair. Per 64-key tile it runs a serial chain:
+- the keys' L2 load (132 B a key: 128 e4m3 + an fp32 scale);
+- the fp8 dequant;
+- a [32 heads, 128] x [128, 64] `tl.dot`;
+- the weighted ReLU head sum across 8 warps;
+- the threshold count (a CTA reduction), the append scan, the store and a barrier.
+
+A ~2,048-row call at ~38K mean visible keys is 7.8e7 (row, key) pairs: **~55 SM cycles a pair**. Against that:
+- the tensor cores need ~9 cycles a pair (4,096 MAC at 478 MAC / SM / clock);
+- the key bytes ~2 (L2-resident: 38K keys x 132 B = 5 MB a layer);
+- the dequant and epilogue ~2-3.
+
+So `_stream` is bound by latency and issue, about 4x above its own compute. sm_121 AOT build: 116 registers, 16 KB
+shared, 2 CTAs (16 warps) an SM, so 2 rows in flight an SM, each re-loading and re-dequantising every key.
+
+### 12.2 `_stream_rb2` / `_stream_rb4` (tools/zig/dsv41_triton/dsv41_zig_triton/stream_rb.py)
+
+A Zig-own Triton twin of `_stream`'s positions mode with RB rows a program:
+- each 64-key tile is loaded and dequantised once for the RB rows, under the union of their visibility masks;
+- each row computes `score_tile`'s arithmetic on it: the same q, w and dot shape, and the same 8 warps, so the same
+  head-sum tree;
+- each row masks its invisible columns to -inf after the dot, as `score_tile` does (a dot output element depends on its
+  own column only);
+- each row has its own buffer, count and threshold, offering its keys tile by tile in the same order;
+- tiles past a row's visible end offer nothing.
+
+Keys are unique, so each row's split buffer is `_stream`'s **slot for slot**, and `merge` is unchanged.
+
+| kernel | regs | stack | CTAs / SM | rows in flight / SM |
+| --- | ---: | ---: | ---: | ---: |
+| `_stream` | 116 | 0 | 2 | 2 |
+| `_stream_rb2` | 128 | 16 B | 2 | 4 |
+| `_stream_rb4` | 176 | 0 | 1 | 4 |
+
+Expected: the key load and dequant per pair fall by RB, and twice the rows interleave their tile chains. That is
+1.5-2x on `_stream` for RB2, **+5-7 % prompt tok/s at 131K**, less at 32K, where `_stream` is a smaller share.
+
+**Exactness:**
+- *The GPU check decides.* tools/zig/dsv41_triton is compiled by triton_fill.py beside the served tree, with
+  `_stream`'s exact options rule. The kernels' bit identity rests on the same per-row expression compiling to the same
+  dot and reduction layout.
+- *The interpreter can't settle it:* the Triton interpreter mishandles bf16 here, and the reference `_stream` itself
+  misses torch's true top-k in the rows where the two disagree. It passes the ragged and multi-split cases where the
+  reference is right.
+
+**Wiring:**
+- `TF_DSV41_STREAM_RB=2|4` (default 0): the emitter swaps each positions-mode `_stream` for `_stream_rb<N>`. The grid
+  is ceil(rows / N) x splits, with the same buffers and merge.
+- Host test (streamrb_test.zig): every other call is unchanged; the tensors, constexprs and grids are as above.
+- aot-needs lists the twin's variants with the new sigs.
+
+### 12.3 Spark step S1 (~1 min, no model) and S2
+
+| step | what | pass |
+| --- | --- | --- |
+| S1 | kit fill with `TRITON_FILL_ENV=tools/zig/dsv41_m4/fill-rb.env` (and a second with TF_DSV41_STREAM_RB=4); `TF_DSV41_TEST=<tf-dsv41-test> AOT=<kit aot> bash zig/tests/cuda/deepseek_v41/stream_rb_job.sh <out>` | `bits rb2: PASS` and `bits rb4: PASS` at every (start, rows); `stream-rb: PASS`; the speedups |
+| S2 | all-on + `TF_DSV41_STREAM_RB=<the faster>`, `bench_http.py --long 32768,131072` | long replies == Python's (sha unchanged), T0 20/20; prompt tok/s against the same base |

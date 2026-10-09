@@ -14,6 +14,7 @@ const mhc_alloc = @import("deepseek_v41/mhc_alloc_bench.zig");
 const mhc_probe = @import("deepseek_v41/mhc_probe.zig");
 const replay_case = @import("deepseek_v41/replay.zig");
 const x3gm3_bench = @import("deepseek_v41/x3gm3_bench.zig");
+const stream_rb_bench = @import("deepseek_v41/stream_rb_bench.zig");
 
 const usage =
     \\usage: tf-dsv41-test <command> [fixture dir]
@@ -25,6 +26,7 @@ const usage =
     \\  x3gm3-bench [rows,..] [reps]  x3gm v3 against v2 at prod's prefill shapes: bits and time (synthetic data)
     \\  mhc-alloc [windows]  the 16-row mHC boundary's time with buffers per cuMemAlloc / arena / VMM (TF_DSV41_ARENA)
     \\  mhc-probe [windows]  the 16-row mHC boundary under cache states, buffer layouts and a cross-stream dependency
+    \\  stream-rb <aot dir> [--reps N]  _stream_rb2 / _rb4 against _stream (Triton AOT set): bits and time (synthetic)
     \\  replay <dir>       one recorded Python extension call (dsv41_capture.py) re-issued and compared, storage by storage
     \\  all <fixtures>     every case directory under <fixtures> by its manifest's "kind"
     \\
@@ -57,6 +59,8 @@ fn arg(rest: []const [:0]const u8, i: usize) ![]const u8 {
 }
 
 fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+    // Triton AOT kernels only: no fatbins needed
+    if (std.mem.eql(u8, cmd, "stream-rb")) return stream_rb_bench.run(gpu, rest);
     var k = try dsv41.Kernels.load(gpu.ctx);
     defer k.deinit();
     if (std.mem.eql(u8, cmd, "symbols")) {

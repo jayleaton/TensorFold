@@ -87,6 +87,10 @@ pub const Options = struct {
     /// behind the first on the branches' side stream, so one's routed experts (DRAM-bound) run beside the other's
     /// attention and dense GEMMs (compute-bound). Needs `branches`; the exchange pieces (pf_overlap) are off under it
     pf_tbo: bool = false,
+    /// TF_DSV41_STREAM_RB (2 / 4; 0 off): the long-context indexer's stream top-k (`_stream`, positions mode) as the
+    /// Zig-own row-blocked twin `_stream_rb<N>` (tools/zig/dsv41_triton: N rows a program, each row `score_tile`'s
+    /// arithmetic: the same split buffers, the same selection)
+    stream_rb: i64 = 0,
     /// R1 (prod-perf1's decode knobs, docs DSV41-DECODE-R1.md; the same bits): attention split 4 with q's RoPE in the
     /// kernel (ATTN_SPLIT, ATTN_ROPE), mHC's parallel tail + deferred coefficients (MHC_TAIL, MHC_DEFER), the router's
     /// prune + kit rounding (RG_PRUNE, PRUNE_KIT), a bf16 MoE partial (MOE_BF16), q_norm folded into its consumers'
