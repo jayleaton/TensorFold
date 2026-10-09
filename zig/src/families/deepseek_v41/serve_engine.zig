@@ -117,6 +117,7 @@ pub const Served = struct {
         s.x = try ln.Lanes.init(gpa, tgt, pass, s.costs, .{ .shape = m3.shapeOf(&m.f), .slots = m.slots, .siblings = trees.siblings, .sib_rows = trees.sib_rows, .dup = trees.dup, .depth = try calib_env.depthSettings(&calib_env.env), .spec = if (m.pass != null) try spec.Settings.fromEnv() else .{} });
         s.arena = std.heap.ArenaAllocator.init(gpa);
         s.cfg = try lanes.Config.init(gpa, try s.x.model(s.arena.allocator(), 64), 16, 15);
+        s.x.policy.depth.forward_rows = if (m.rows) |b| b.cap else 16;
         // drafts sized from the cost tables, not the wall clock: a request drafts (and so verifies) the same whatever the
         // load or the requests before it, so HTTP == CLI replay holds (TF_DSV41_DRAFT_TIMED=1: the measured pricing)
         s.cfg.timed = if (std.c.getenv("TF_DSV41_DRAFT_TIMED")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;

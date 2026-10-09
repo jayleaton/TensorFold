@@ -151,7 +151,8 @@ pub const Lanes = struct {
     }
 
     /// What the engine's Config reads of this model: 16 rows a slot, `batch_rows` a shared forward, the table's costs.
-    pub fn model(x: *const Lanes, arena: Allocator, batch_rows: u32) !lanes.Model {
+    pub fn model(x: *Lanes, arena: Allocator, batch_rows: u32) !lanes.Model {
+        x.policy.depth.forward_rows = batch_rows;
         const v = x.policy.depth.costs.verify;
         const window = try arena.alloc(lanes.config.Cost, @min(v.len, costs_mod.slot_rows));
         for (window, 0..) |*w, i| w.* = .{ .width = @intCast(i + 1), .ms = v[i] };

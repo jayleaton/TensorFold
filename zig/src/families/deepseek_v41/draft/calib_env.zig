@@ -148,6 +148,11 @@ pub fn pick(gpa: Allocator, io: std.Io, dir: []const u8, want: Shape) !?[]u8 {
 /// The depth's knobs as Python's depth.env_mode / env_skip and joint.env_mode / env_fair / env_host_ms / rows_cap.
 pub fn depthSettings(get: *const fn ([*:0]const u8) ?[]const u8) !depth.Settings {
     var s: depth.Settings = .{};
+    if (trimmed(get("TF_DSV41_CODE_ACCEPT"))) |v| s.code_accept = try flag(v, error.CodeAccept);
+    if (s.code_accept) if (trimmed(get("TF_DSV41_GRAPH_BUCKET"))) |v| {
+        s.context_bucket = try std.fmt.parseInt(u32, v, 10);
+        if (s.context_bucket == 0) return error.BadGraphBucket;
+    };
     const m = trimmed(get("TF_DSV41_DEPTH")) orelse "cost";
     s.mode = if (std.ascii.eqlIgnoreCase(m, "cost")) .cost else if (std.ascii.eqlIgnoreCase(m, "static")) .static else return error.DepthMode;
     if (trimmed(get("TF_DSV41_DRAFT_DEPTH"))) |v| {
