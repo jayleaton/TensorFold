@@ -132,6 +132,10 @@ test "code acceptance expansion preserves greedy and T0.7 keyed engine replies" 
             defer new_lone.deinit();
             try expectSerial(cases[0..1], new_lone, dims);
             try std.testing.expectEqualSlices(u32, old_lone.out[0], new_lone.out[0]);
+            try std.testing.expectEqual(@as(u64, 0), new_lone.expanded);
+            try std.testing.expectEqual(old_lone.drafted, new_lone.drafted);
+            try std.testing.expectEqual(old_lone.accepted, new_lone.accepted);
+            try std.testing.expectEqualSlices(u64, &old_lone.kept, &new_lone.kept);
         }
     }
     try std.testing.expect(expanded > 0); // token equality must exercise the changed policy

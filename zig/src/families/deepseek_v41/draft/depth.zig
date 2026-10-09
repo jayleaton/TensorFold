@@ -238,19 +238,18 @@ pub const Depth = struct {
 
     /// Keep every old depth as a floor. Prose/cold slots are frozen; any long-context ask preserves the whole round.
     fn expand(d: *Depth, asks: []const Ask, others: u64, other_windows: usize, ks: []usize) !void {
-        if (!d.set.code_accept or d.set.mode != .cost or d.set.joint == 2 or others != 0) return;
+        if (!d.set.code_accept or d.set.mode != .cost or d.set.joint == 2 or others != 0 or asks.len < 2) return;
         for (asks) |a| if (a.position > 4096) return;
         var baseline_rows: u64 = 0;
         for (ks) |k| baseline_rows += 1 + k;
-        const shared = asks.len > 1;
-        const bucket: ?u64 = if (shared) blk: {
+        const bucket: u64 = blk: {
             // These are rowtab.BUCKETS. Never enlarge the existing graph or turn one forward into two.
             for ([_]u64{ 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 24, 32, 48, 64 }) |r| {
                 if (r >= baseline_rows and r <= d.forward_rows) break :blk r;
             }
             return;
-        } else null;
-        if (baseline_rows >= @min(d.set.max_rows, bucket orelse d.forward_rows)) return;
+        };
+        if (baseline_rows >= @min(d.set.max_rows, bucket)) return;
         var any = false;
         for (asks, ks) |a, k| any = any or try d.expandable(a, k);
         if (!any) return; // cold/prose/full windows allocate no policy scratch
@@ -267,7 +266,7 @@ pub const Depth = struct {
         }
         const n = asks.len + other_windows;
         const fixed = d.costs.draft + d.costs.slot * @as(f64, @floatFromInt(n -| 1));
-        const added = try joint.expand(d.gpa, slots, others, d.costs, fixed, @min(d.set.max_rows, bucket orelse d.forward_rows), bucket, ks);
+        const added = try joint.expand(d.gpa, slots, others, d.costs, fixed, @min(d.set.max_rows, bucket), bucket, ks);
         if (added == 0) return;
         d.expanded_rounds += 1;
         d.expanded_rows += added;
@@ -280,8 +279,7 @@ pub const Depth = struct {
         const alone = (alone_in orelse (asks.len == 1 and other_windows == 0)) and asks.len == 1 and other_windows == 0;
         if (d.set.joint == 0 or d.set.mode == .static or alone or asks.len + other_windows <= 1) {
             for (asks, ks) |a, *k| k.* = try d.choose(a.slot, a.conf, a.most, alone, a.first);
-            // A skipped first draft needs its counterfactual record; leave zero-depth windows on the old policy.
-            if (alone and ks.len == 1 and ks[0] > 0) try d.expand(asks, others, other_windows, ks);
+            // Exact-row single windows have no paid padding to spend.
             return;
         }
         const two = d.set.joint == 2;
