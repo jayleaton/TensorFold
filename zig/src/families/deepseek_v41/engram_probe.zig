@@ -5,7 +5,8 @@
 //! 2. The device: O_DIRECT reads of one serving extent (a row's sectors: 512 or 1,024 B) at random rows, depth 1 / 8 /
 //!    32 / 64 (that many threads, each one read at a time): reads a second and each read's latency (p50 / p99 / max).
 //! 3. The serving read paths (engram_rows.Rows as the gate worker uses it): the reader threads (TF_DSV41_ENGRAM_QD,
-//!    prod's containers), native AIO (TF_DSV41_ENGRAM_AIO=1) and io_uring where allowed; batches of 1 / 32 / 128 / 256
+//!    prod's containers), native AIO (TF_DSV41_ENGRAM_AIO=1), AIO with polled waits (+ TF_DSV41_ENGRAM_POLL=1) and
+//!    io_uring where allowed; batches of 1 / 32 / 128 / 256
 //!    fresh random rows a layer, both layers issued then each layer's `rows` (the round job's order): the batch's wall
 //!    time.
 //! 4. The same at 128 and 256 with every core but two busy-spinning (the engine's cuEventSynchronize spin and its other
@@ -92,10 +93,15 @@ fn spinner(s: Spin) void {
     std.mem.doNotOptimizeAway(x);
 }
 
+var seed_calls: u64 = 0;
+
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 fn pool(gpa: std.mem.Allocator, rows: *er.Rows, shards: []const Shard, batch: usize, trials: usize, mode: []const u8, label: []const u8, w: *std.Io.Writer) !void {
-    var prng = std.Random.DefaultPrng.init(0xbeef + batch);
+    // fresh rows for every measurement (a seed a call): a batch size's second run must not re-read its first's rows,
+    // which the cache holds (the 2026-10-09 run's spinning lines were such cache hits)
+    seed_calls += 1;
+    var prng = std.Random.DefaultPrng.init(0xbeef + batch + seed_calls * 1_000_003);
     const rnd = prng.random();
     const idx = try gpa.alloc(i64, batch * shards.len);
     defer gpa.free(idx);
@@ -103,6 +109,7 @@ fn pool(gpa: std.mem.Allocator, rows: *er.Rows, shards: []const Shard, batch: us
     defer gpa.free(out);
     const times = try gpa.alloc(u64, trials);
     defer gpa.free(times);
+    const issued0 = rows.stats.issued;
     for (times) |*t| {
         for (shards, 0..) |s, li| for (idx[li * batch ..][0..batch]) |*x| {
             x.* = @intCast(rnd.intRangeLessThan(u64, s.lo, s.hi));
@@ -113,7 +120,11 @@ fn pool(gpa: std.mem.Allocator, rows: *er.Rows, shards: []const Shard, batch: us
         t.* = nowNs() - t0;
     }
     std.mem.sort(u64, times, {}, std.sort.asc(u64));
-    try w.print("{s}{s} {d:3} rows a layer x {d} layers: p50 {d:7.2} ms p90 {d:7.2} ms max {d:7.2} ms ({d} trials)\n", .{ mode, label, batch, shards.len, pct(times, 0.5) / 1e3, pct(times, 0.9) / 1e3, @as(f64, @floatFromInt(times[times.len - 1])) / 1e6, trials });
+    // cold reads: the rows `issue` had to start (neither cached nor in flight); fewer than asked = rows the cache
+    // already held (a small table's repeats; never on a node's 192M-row shards)
+    const asked = trials * batch * shards.len;
+    const issued = rows.stats.issued - issued0;
+    try w.print("{s}{s} {d:3} rows a layer x {d} layers: p50 {d:7.2} ms p90 {d:7.2} ms max {d:7.2} ms ({d} trials; {d} of {d} rows read cold{s})\n", .{ mode, label, batch, shards.len, pct(times, 0.5) / 1e3, pct(times, 0.9) / 1e3, @as(f64, @floatFromInt(times[times.len - 1])) / 1e6, trials, issued, asked, if (issued < asked) ": NOT all cold" else "" });
 }
 
 pub fn main(gpa: std.mem.Allocator, dir: []const u8, rank: u32, world: u32, w: *std.Io.Writer) !void {
@@ -130,12 +141,14 @@ pub fn main(gpa: std.mem.Allocator, dir: []const u8, rank: u32, world: u32, w: *
     // the serving read paths at the gate's cache size (fresh random rows: every batch a cold read): the reader
     // threads (prod's containers), native AIO (TF_DSV41_ENGRAM_AIO=1), io_uring where the process may use it
     const n = @max(1, (std.Thread.getCpuCount() catch 4) -| 2);
-    for ([_][]const u8{ "threads", "aio", "io_uring" }) |mode| {
+    for ([_][]const u8{ "threads", "aio", "aio-poll", "io_uring" }) |mode| {
+        const aio = std.mem.startsWith(u8, mode, "aio");
         _ = setenv("TF_DSV41_ENGRAM_URING", if (std.mem.eql(u8, mode, "io_uring")) "1" else "0", 1);
-        _ = setenv("TF_DSV41_ENGRAM_AIO", if (std.mem.eql(u8, mode, "aio")) "1" else "0", 1);
+        _ = setenv("TF_DSV41_ENGRAM_AIO", if (aio) "1" else "0", 1);
+        _ = setenv("TF_DSV41_ENGRAM_POLL", if (std.mem.eql(u8, mode, "aio-poll")) "1" else "0", 1);
         const rows = try er.Rows.open(gpa, dir, rank, world, &layers, 65536);
         defer rows.close();
-        const got: []const u8 = if (rows.ring != null) "io_uring" else if (rows.aio != null) "aio" else if (rows.pool) |_| "threads" else "serial";
+        const got: []const u8 = if (rows.ring != null) "io_uring" else if (rows.aio) |x| (if (x.poll) "aio-poll" else "aio") else if (rows.pool) |_| "threads" else "serial";
         if (!std.mem.eql(u8, got, mode)) {
             try w.print("{s}: not available here (the reader runs {s}): skipped\n", .{ mode, got });
             continue;

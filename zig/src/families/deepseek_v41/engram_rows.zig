@@ -188,6 +188,12 @@ const Pool = struct {
 const Aio = struct {
     ctx: u64 = 0,
     in_flight: u32 = 0,
+    /// TF_DSV41_ENGRAM_POLL=1: a wait polls the completions (io_getevents with a zero timeout) instead of sleeping in
+    /// the kernel, up to `poll_ns`, then sleeps: the waiting thread is awake when its reads land (no wake-up), and
+    /// the CPU spins only while a caller waits for reads in flight
+    poll: bool = false,
+
+    pub const poll_ns: u64 = 20 * std.time.ns_per_ms;
 
     pub const depth: u32 = 1024;
 
@@ -209,7 +215,7 @@ const Aio = struct {
     const Event = extern struct { data: u64, obj: u64, res: i64, res2: i64 };
 
     fn init() !Aio {
-        var a: Aio = .{};
+        var a: Aio = .{ .poll = pollEnv() };
         const rc = linux.syscall2(.io_setup, depth, @intFromPtr(&a.ctx));
         if (linux.errno(rc) != .SUCCESS) return error.AioRefused;
         return a;
@@ -219,6 +225,12 @@ const Aio = struct {
         _ = linux.syscall1(.io_destroy, a.ctx);
     }
 };
+
+/// TF_DSV41_ENGRAM_POLL: 0 (default) | 1 (with TF_DSV41_ENGRAM_AIO=1).
+pub fn pollEnv() bool {
+    const v = std.c.getenv("TF_DSV41_ENGRAM_POLL") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "1");
+}
 
 /// TF_DSV41_ENGRAM_AIO: 0 (default) | 1.
 pub fn aioEnv() bool {
@@ -277,7 +289,7 @@ pub const Rows = struct {
             if (aioEnv()) {
                 if (Aio.init()) |a| {
                     r.aio = a;
-                    std.log.scoped(.dsv41).info("engram: no io_uring ({t}); rows read by native AIO (TF_DSV41_ENGRAM_AIO, {d} in flight)", .{ e, Aio.depth });
+                    std.log.scoped(.dsv41).info("engram: no io_uring ({t}); rows read by native AIO (TF_DSV41_ENGRAM_AIO, {d} in flight), waits {s}", .{ e, Aio.depth, if (a.poll) "polled (TF_DSV41_ENGRAM_POLL)" else "asleep in the kernel" });
                     break :blk null;
                 } else |ae| std.log.scoped(.dsv41).warn("engram: TF_DSV41_ENGRAM_AIO=1 but io_setup failed ({t}): the reader threads", .{ae});
             }
@@ -612,8 +624,16 @@ pub const Rows = struct {
         const a = &r.aio.?;
         var evs: [64]Aio.Event = undefined;
         var need = @min(at_least, a.in_flight);
+        const zero: linux.timespec = .{ .sec = 0, .nsec = 0 };
+        const t0 = if (a.poll and need > 0) nowNs() else 0;
+        var polling = a.poll and need > 0;
         while (true) {
-            const rc = linux.syscall5(.io_getevents, a.ctx, need, evs.len, @intFromPtr(&evs), 0);
+            // polling: whatever has landed, at once; else the kernel's wait for `need`
+            if (polling and nowNs() - t0 > Aio.poll_ns) polling = false;
+            const rc = if (polling)
+                linux.syscall5(.io_getevents, a.ctx, 0, evs.len, @intFromPtr(&evs), @intFromPtr(&zero))
+            else
+                linux.syscall5(.io_getevents, a.ctx, need, evs.len, @intFromPtr(&evs), 0);
             switch (linux.errno(rc)) {
                 .SUCCESS => {},
                 .INTR => continue,
@@ -631,6 +651,7 @@ pub const Rows = struct {
             }
             need -|= @intCast(rc);
             if (need == 0) return;
+            if (polling and rc == 0) std.atomic.spinLoopHint();
         }
     }
 

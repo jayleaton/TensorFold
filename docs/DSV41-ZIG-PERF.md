@@ -490,3 +490,16 @@ the I/O call. GB10's numbers decide the fix.
 TF_DSV41_ENGRAM_AIO=1 (default off): the AIO reader in serving (falls back to the threads, logged, when io_setup is
 refused); TF_DSV41_ENGRAM_URING=0 forces a non-io_uring reader for A/Bs. Same extents into the same buffers:
 engram_rows_test's golden reads (Python ShardRows' SHA-256s) pass in every mode, AIO included.
+
+**GB10 numbers (results/zig-eprobe-20261009-130948, dgx-01).** Shards 2 x 192M rows, 47.21 GiB each, O_DIRECT. Device:
+depth 64 serves 270k (image) - 390k (host) reads a second at p50 125-200 us; depth 1 3-4k a second at 200-300 us. A
+2 x 256-row batch, p50: image threads 2.70 ms, image AIO 1.19 ms (in prod's containers io_uring is refused); host
+threads 2.00, AIO 1.61, io_uring 1.66. AIO halves the batch in the image and is close to the device's throughput
+(~512 reads at ~390k a second ~1.3 ms). The probe's "spinning cores" lines of that run were cache hits (each batch
+size re-read its idle run's rows: one seed a size; 0.05 ms for 2 x 128 rows is under one device read), so no
+wake-up conclusion follows from them; the probe now draws fresh rows each measurement and prints how many rows of each
+line were read cold (`issued`).
+
+TF_DSV41_ENGRAM_POLL=1 (with AIO, default off): a wait polls io_getevents with a zero timeout instead of sleeping in
+the kernel, up to 20 ms, then sleeps: the CPU spins only while a caller waits for reads in flight. Exact (the same
+completions); engram_rows_test's golden reads pass with it (mode aio_poll).
