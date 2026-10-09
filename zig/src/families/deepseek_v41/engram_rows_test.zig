@@ -83,13 +83,22 @@ test "engram rows: the bf16 table equals torch's dequant(...).to(bfloat16)" {
 }
 
 /// How a test reads: serially on the calling thread, by the reader threads (no io_uring), or by io_uring.
-const Mode = enum { sync, pool, uring };
-const modes = [_]Mode{ .sync, .pool, .uring };
+const Mode = enum { sync, pool, uring, aio };
+const modes = [_]Mode{ .sync, .pool, .uring, .aio };
 
 fn openRows(a: std.mem.Allocator, io: std.Io, tmp: *testing.TmpDir, mode: Mode) !*er.Rows {
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
     const r = try er.Rows.open(a, root, 0, 2, &.{1}, 4096);
+    if (mode == .aio) {
+        try r.startAio(); // TF_DSV41_ENGRAM_AIO's reader: native AIO, no threads
+        return r;
+    }
+    if (r.aio) |*x| { // TF_DSV41_ENGRAM_AIO=1 in the environment: the other modes without it
+        _ = x;
+        r.aio.?.deinit();
+        r.aio = null;
+    }
     if (mode != .uring) if (r.ring) |*g| {
         g.deinit();
         r.ring = null;
