@@ -11,6 +11,7 @@ const pipe = @import("sampling_pipe.zig");
 const Gpu = @import("sampling_dev.zig").Gpu;
 
 pub const Sampling = pipe.Sampling;
+pub const Seg = pipe.Pipe.Seg;
 pub const sampled = pipe.sampled;
 
 /// TF_DSV41_SAMPLING=1 (every rank alike): model.zig makes the sampler; unset, sampled requests are refused as before.
@@ -31,6 +32,9 @@ pub const GpuSampler = struct {
     pinned: ?cuda.HostBuffer = null,
     done: ?cuda.Event = null,
     chosen: ?cuda.DeviceBuffer = null,
+    /// TF_DSV41_SAMP_BATCH=1 (rank 0 decides; followers run what op 13 brings): a forward's nucleus segments in one
+    /// call (`chooseSegments`), as Python's one candidates gather + one statistics exchange a forward
+    batch: bool = false,
 
     const Cur = struct { row0: u32, s: Sampling, pos0: ?u64 };
 
@@ -43,7 +47,66 @@ pub const GpuSampler = struct {
         x.p = try pipe.Pipe.init(gpa, f.comm, f.cfg.vocab / W, try pipe.nucleusEnv());
         f.sampler = .{ .ptr = x, .follow = follow };
         x.p.after_gather = .{ .ctx = x, .run = afterGather };
+        x.batch = try batchEnv();
         return x;
+    }
+
+    /// TF_DSV41_SAMP_BATCH: 0 (default) | 1.
+    pub fn batchEnv() !bool {
+        const v = std.mem.span(std.c.getenv("TF_DSV41_SAMP_BATCH") orelse return false);
+        if (v.len == 0 or std.mem.eql(u8, v, "0")) return false;
+        if (std.mem.eql(u8, v, "1")) return true;
+        return error.BadSampBatch;
+    }
+
+    /// Whether `chooseSegments` takes a segment under `s` (sampling_pipe.Pipe.batchable, with the knob on).
+    pub fn batchable(x: *const GpuSampler, s: Sampling) bool {
+        return x.batch and x.p.batchable(s);
+    }
+
+    /// The most segments one op_sample_many carries.
+    pub const max_segments = 16;
+
+    /// Rank 0: several nucleus segments of "w.logits" in one call (op 13 first: [op, n, (row0, rows, T, top_k, top_p,
+    /// min_p) a segment]); no device start (nucleus rows have none).
+    pub fn chooseSegments(x: *GpuSampler, segs: []const pipe.Pipe.Seg) !void {
+        if (segs.len == 0 or segs.len > max_segments) return error.BadSegments;
+        var msg: [2 + 6 * max_segments]i64 = undefined;
+        msg[0] = fwd.Forward.op_sample_many;
+        msg[1] = @intCast(segs.len);
+        for (segs, 0..) |g, i| {
+            const o = opOf(g.row0, g.n, g.s);
+            @memcpy(msg[2 + 6 * i ..][0..6], o[1..7]);
+        }
+        try x.f.sendSample(msg[0 .. 2 + 6 * segs.len]);
+        try x.runSegments(segs);
+    }
+
+    fn runSegments(x: *GpuSampler, segs: []const pipe.Pipe.Seg) !void {
+        const f = x.f;
+        const lg = f.runner.addressOf("w.logits") orelse return error.Unbound;
+        if (f.grammar) |g| for (segs) |sg| try g.apply(g.ptr, sg.row0, sg.n);
+        x.cur = null; // no device start
+        try x.p.chooseSegments(x.gpu.device(), lg, segs);
+        if (x.p.whole_rows > 0) std.log.scoped(.dsv41).debug("sampling: {d} rows taken whole ({d} segments)", .{ x.p.whole_rows, segs.len });
+    }
+
+    /// A follower: op_sample_many's segments (tokens dropped).
+    fn followSegments(x: *GpuSampler, msg: []const i64) !void {
+        if (msg.len < 2) return error.BadPlan;
+        const ns: usize = @intCast(msg[1]);
+        if (ns == 0 or ns > max_segments or msg.len != 2 + 6 * ns) return error.BadPlan;
+        var segs: [max_segments]pipe.Pipe.Seg = undefined;
+        var outs: [64]u32 = undefined;
+        var used: usize = 0;
+        for (0..ns) |i| {
+            const w = msg[2 + 6 * i ..][0..6];
+            const n: u32 = @intCast(w[1]);
+            if (n == 0 or used + n > outs.len) return error.BadPlan;
+            segs[i] = .{ .row0 = @intCast(w[0]), .n = n, .s = .{ .seed = 0, .temperature = @bitCast(w[2]), .top_k = @intCast(w[3]), .top_p = @bitCast(w[4]), .min_p = @bitCast(w[5]) }, .out = outs[used..][0..n] };
+            used += n;
+        }
+        try x.runSegments(segs[0..ns]);
     }
 
     pub fn deinit(x: *GpuSampler) void {
@@ -95,6 +158,7 @@ pub const GpuSampler = struct {
     /// A follower: the leader's call from its message (tokens dropped; with 9 words its device choice too).
     fn follow(ptr: *anyopaque, msg: []const i64) anyerror!void {
         const x: *GpuSampler = @ptrCast(@alignCast(ptr));
+        if (msg[0] == fwd.Forward.op_sample_many) return x.followSegments(msg);
         if (msg.len != 7 and msg.len != 9) return error.BadPlan;
         const n: u32 = @intCast(msg[2]);
         const dev = msg.len == 9;

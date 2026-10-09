@@ -445,6 +445,9 @@ pub const Forward = struct {
     const op_ds_reset: i64 = 11;
     /// 12-15: dsq-zig-samp-1 (the keyed sampler); 12: [op, row0, n, T, top_k, top_p, min_p]
     pub const op_sample: i64 = 12;
+    /// 13: [op, n, (row0, rows, T, top_k, top_p, min_p) a segment] several nucleus segments in one call
+    /// (TF_DSV41_SAMP_BATCH, sampling_gpu.chooseSegments)
+    pub const op_sample_many: i64 = 13;
 
     /// The sampler's side of a follower (sampling_gpu.zig): rank 0's op_sample message, run on this rank.
     pub const Sampler = struct {
@@ -711,7 +714,7 @@ pub const Forward = struct {
                     f.prefetchEngram(@intCast(msg[2]), &.{@intCast(msg[1])});
                     try d.propose(d.ptr, @intCast(msg[1]), @intCast(msg[2]));
                 },
-                op_sample => {
+                op_sample, op_sample_many => {
                     const x = f.sampler orelse return error.BadPlan;
                     try x.follow(x.ptr, msg);
                 },

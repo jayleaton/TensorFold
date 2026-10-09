@@ -449,8 +449,24 @@ built before it still load). `tf-dsv41-samp` checks both kernels against the hos
 and prints each one's time a call at 1 / 5 / 16 rows.
 
 Left for after the Spark numbers:
-- One sampler call a forward (Python's one `cand_gather` + one statistics exchange): Zig still runs top-k, two
-  all-gathers and two blocking downloads a sampled segment (~0.2 ms each, an estimate, x4 only).
+- One sampler call a forward: built, `TF_DSV41_SAMP_BATCH=1` (default off; see below).
 - `TF_DSV41_SPEC_NUCLEUS=1`: the speculative pass for nucleus rounds. Zig's host holds the exact choices when
   `speculate` runs, so the knob needs no `device_z` and is exact; T 0 gets that overlap today (T 0.7's `draft.pass`
   +0.15 ms and `engram.wait` +0.1 ms a round are its absence). Python leaves it off; pod step `spec-samp` covers it.
+
+**One sampler call a forward (`TF_DSV41_SAMP_BATCH=1`, default off).** Per segment, Zig ran top-k, two all-gathers,
+two blocking downloads and an op_sample (~0.2 ms each call, an estimate, x4 only); Python runs one `cand_gather` and
+one statistics exchange a forward. With the knob, `Batch.targetWindow` hands a forward's nucleus segments (two or
+more) to `GpuSampler.chooseSegments` (plan-link op 13: [op, n, (row0, rows, T, top_k, top_p, min_p) a segment]):
+top-k over rows [first row0, last end), each segment's statistics at its own T, one gather of each, one download,
+then each row picked as before; whole-row fallbacks after every pick. Other sampled segments (top_k rows, which may
+start the speculative pass from the device choice) keep one call each.
+
+Exactness: nothing is reduced in another order. Only nucleus segments are batched, so every row asks the same
+candidate count (TF_DSV41_NUCLEUS); topk_keys is a CTA a row, pack a row, and both statistics kernels compute a row
+from its own columns and T alone (the split grid's chunks are a row's own, summed in chunk order). Each row's
+gathered candidates and statistics are therefore the bits of the one-segment call, and the host picks them with
+the same position-keyed draws. Host test (`test-dsv41-sampling`): three segments with different T / top_p / min_p
+/ seed, a row between them in no segment and two flat rows that take the whole-row fallback, on one and two ranks:
+batched == one call a segment (tokens and whole-row count), and every token == the keyed rule over its whole row.
+

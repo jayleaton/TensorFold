@@ -232,3 +232,97 @@ test "vs_choose's mirror == the pipeline's picks over top_k x top_p x min_p x te
     }
     try testing.expectEqual(@as(usize, 3 * 3 * 4 * 2 * 2 * 2 * n), rows);
 }
+
+const SegSpec = struct { row0: u32, n: u32, s: pipe.Sampling, positions: []const u64 };
+
+/// Several segments of one forward's rows (rows not in a segment are another window's, never picked).
+const Multi = struct {
+    logits: []const f32,
+    world: u32,
+    rows: usize,
+    segs: []const SegSpec,
+    batched: bool,
+    got: []u32,
+    whole: usize = 0,
+};
+
+fn multiBody(comm: tp.collective.Collective, me: u32, c: *Multi) anyerror!void {
+    const a = testing.allocator;
+    const vocab = c.logits.len / c.rows;
+    const V = vocab / c.world;
+    const mine = try a.alloc(f32, c.rows * V);
+    defer a.free(mine);
+    for (0..c.rows) |r| @memcpy(mine[r * V ..][0..V], c.logits[r * vocab + me * V ..][0..V]);
+    var dev: pipe.HostDevice = .{ .gpa = a };
+    defer dev.deinit();
+    var p = try pipe.Pipe.init(a, comm, @intCast(V), serve.sampling.nucleus_count);
+    defer p.deinit();
+    const lg: u64 = @intFromPtr(mine.ptr);
+    const out = try a.alloc(u32, c.rows);
+    defer a.free(out);
+    @memset(out, 0);
+    var whole: usize = 0;
+    if (c.batched) {
+        var segs: [8]pipe.Pipe.Seg = undefined;
+        for (c.segs, segs[0..c.segs.len]) |g, *x| {
+            try testing.expect(p.batchable(g.s));
+            x.* = .{ .row0 = g.row0, .n = g.n, .s = g.s, .positions = if (me == 0) g.positions else null, .out = out[g.row0..][0..g.n] };
+        }
+        try p.chooseSegments(dev.device(), lg, segs[0..c.segs.len]);
+        whole = p.whole_rows;
+    } else for (c.segs) |g| {
+        try p.choose(dev.device(), lg + 4 * @as(u64, g.row0) * V, g.n, g.s, if (me == 0) g.positions else null, out[g.row0..][0..g.n]);
+        whole += p.whole_rows;
+    }
+    if (me == 0) {
+        @memcpy(c.got, out);
+        c.whole = whole;
+    }
+}
+
+test "a forward's nucleus segments in one call (TF_DSV41_SAMP_BATCH) pick the tokens and keyed draws of one call a segment" {
+    const a = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(4113);
+    const rnd = prng.random();
+    const vocab = 4096;
+    const rows = 12;
+    const logits = try a.alloc(f32, rows * vocab);
+    defer a.free(logits);
+    for (0..rows) |r| for (0..vocab) |c| {
+        // rows 3 and 9 flat (their top-p mass needs more than the nucleus candidates: the whole-row fallback)
+        const x: f64 = if (r == 3 or r == 9) (if (c % 2 == 0) 0.25 else 0.0) else rnd.floatNorm(f64) * 3.0 + @as(f64, if (c == 13 * r + 5) 7 else 0);
+        logits[r * vocab + c] = @bitCast(@as(u32, @bitCast(@as(f32, @floatCast(x)))) & 0xFFFF_0000);
+    };
+    const T = pipe.Sampling;
+    const segs = [_]SegSpec{ // row 5 belongs to no segment (another window's row)
+        .{ .row0 = 0, .n = 5, .s = T{ .seed = 7, .temperature = 0.7, .top_k = 0, .top_p = 0.95 }, .positions = &.{ 40, 41, 42, 43, 44 } },
+        .{ .row0 = 6, .n = 2, .s = T{ .seed = 1 << 63 | 9, .temperature = 1.1, .top_k = 0, .top_p = 0.8, .min_p = 0.02 }, .positions = &.{ 900, 901 } },
+        .{ .row0 = 8, .n = 4, .s = T{ .seed = 7, .temperature = 0.5, .top_k = 0, .top_p = 0.9 }, .positions = &.{ 3, 4, 5, 6 } },
+    };
+    for ([_]u32{ 1, 2 }) |world| {
+        var got: [2][rows]u32 = undefined;
+        var whole: [2]usize = undefined;
+        for ([_]bool{ false, true }, 0..) |batched, i| {
+            var c: Multi = .{ .logits = logits, .world = world, .rows = rows, .segs = &segs, .batched = batched, .got = &got[i] };
+            try tp.host.run(world, &c, multiBody);
+            whole[i] = c.whole;
+        }
+        try testing.expectEqualSlices(u32, &got[0], &got[1]);
+        try testing.expectEqual(whole[0], whole[1]);
+        try testing.expect(whole[1] >= 2); // the flat rows took the fallback
+        // each row's token is the keyed rule over its whole row (exact_sampling.choose at its own position)
+        for (segs) |g| for (0..g.n) |j| {
+            const r = g.row0 + j;
+            const vals = try a.alloc(f64, vocab);
+            defer a.free(vals);
+            const ids = try a.alloc(u64, vocab);
+            defer a.free(ids);
+            for (vals, ids, logits[r * vocab ..][0..vocab], 0..) |*v, *id, x, c| {
+                v.* = x;
+                id.* = c;
+            }
+            const want = try @import("lanes").sampling.choose(a, vals, ids, g.positions[j], g.s);
+            try testing.expectEqual(@as(u32, @intCast(want)), got[1][r]);
+        };
+    }
+}
