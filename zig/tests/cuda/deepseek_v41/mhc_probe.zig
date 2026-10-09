@@ -10,10 +10,15 @@
 //!   aligned2m    engine, the window's buffers each at its own 2 MiB-aligned base (L2 slice aliasing)
 //!   stagger      engine, the buffers 1 MiB + k x 384 B apart
 //!   cross        engine, the partials written on another stream and joined by an event (the exchange's dependency)
+//!   sysmem       engine, then the exchange's host traffic: 160 KiB written to pinned host memory (the send slot)
+//!                and 320 KiB read back from it (the receive slot) by kernels just before the boundary
+//!   devmem       sysmem's two kernels on device memory instead (its control)
 //! Reading: compare lines, not absolutes. engine ~ cold-read: the exchange's fresh lines don't matter. aligned2m or
 //! stagger far from engine: the buffers' relative addresses matter (L2 slices): then match Python's layout. cross
 //! above engine: the dependency costs inside the kernel. engine ~ in-engine nsys (26 us Zig, 16 Python) after the
 //! overhead: the bench reproduces the engine; well below: the engine's slowness comes from outside the launch.
+//! sysmem well above devmem: touching pinned host memory (tp_roce's slots) slows the next kernel: the exchange is
+//! the writer; sysmem ~ devmem: the exchange's host traffic is not it.
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -61,6 +66,8 @@ const Bench = struct {
     stream: cuda.Stream,
     other: cuda.Stream,
     e: [3]cuda.Event,
+    host: cuda.HostBuffer, // pinned, mapped: the exchange's slots
+    dev2: cuda.DeviceBuffer, // the same bytes in device memory (sysmem's control)
 
     fn args(b: *const Bench, off: Off, s: *const Site, cur: u64) ops.mhc.Args {
         const p = b.win.ptr;
@@ -85,7 +92,7 @@ const Bench = struct {
     }
 
     /// One variant: `windows` x 80 timed launches after one untimed window. `name` overhead: the memset alone.
-    fn run(b: *Bench, name: []const u8, l: Layout, cache: Cache, cross: bool, windows: usize) !void {
+    fn run(b: *Bench, name: []const u8, l: Layout, cache: Cache, cross: bool, sys: ?bool, windows: usize) !void {
         const off = layout(l);
         try b.win.fill32(0x3f803f80, null); // bf16 1.0 streams / partials
         try b.sub(off.coef, 2 * R * 24 * 4).fill32(0x3e800000, null);
@@ -113,6 +120,12 @@ const Bench = struct {
                     try b.e[2].record(b.other);
                     try b.stream.wait(b.e[2]);
                 } else try gbuf.fill32(@intCast(si | 0x3f800000), b.stream.handle);
+            }
+            if (sys) |host| {
+                // the exchange's slot traffic: stage 160 KiB out (bf16 from fp32), read 320 KiB of fp32 back into g
+                const slot = if (host) try b.host.device() else b.dev2.ptr;
+                try o.castBf16(b.big.ptr, slot, W * R * D / 2);
+                try o.castBf16(slot + (512 << 10), gbuf.ptr, W * R * D / 2);
             }
             const a = b.args(off, s, @intCast(si % 2));
             try b.e[0].record(b.stream);
@@ -179,14 +192,22 @@ pub fn run(gpu: Gpu, k: *const dsv41.Kernels, windows_arg: ?[]const u8) !void {
     defer b.other.deinit();
     for (&b.e) |*e| e.* = try cuda.Event.init(d, true);
     defer for (&b.e) |*e| e.deinit();
+    b.host = try cuda.HostBuffer.allocMapped(d, 1 << 20);
+    @memset(b.host.bytes, 0);
+    defer b.host.free();
+    b.dev2 = try cuda.DeviceBuffer.alloc(d, 1 << 20);
+    defer b.dev2.free();
+    try b.dev2.fill32(0x3f800000, null);
 
-    try b.run("overhead", .@"packed", .cold_read, false, windows);
-    try b.run("cold-write", .@"packed", .cold_write, false, windows);
-    try b.run("cold-read", .@"packed", .cold_read, false, windows);
-    try b.run("engine", .@"packed", .engine, false, windows);
-    try b.run("warm", .@"packed", .warm, false, windows);
-    try b.run("aligned2m", .aligned2m, .engine, false, windows);
-    try b.run("stagger", .stagger, .engine, false, windows);
-    try b.run("cross", .@"packed", .engine, true, windows);
+    try b.run("overhead", .@"packed", .cold_read, false, null, windows);
+    try b.run("cold-write", .@"packed", .cold_write, false, null, windows);
+    try b.run("cold-read", .@"packed", .cold_read, false, null, windows);
+    try b.run("engine", .@"packed", .engine, false, null, windows);
+    try b.run("warm", .@"packed", .warm, false, null, windows);
+    try b.run("aligned2m", .aligned2m, .engine, false, null, windows);
+    try b.run("stagger", .stagger, .engine, false, null, windows);
+    try b.run("cross", .@"packed", .engine, true, null, windows);
+    try b.run("sysmem", .@"packed", .engine, false, true, windows);
+    try b.run("devmem", .@"packed", .engine, false, false, windows);
     check.pass("mhc-probe: {d} windows a variant", .{windows});
 }

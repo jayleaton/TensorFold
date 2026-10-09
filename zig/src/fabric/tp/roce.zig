@@ -69,6 +69,8 @@ pub const Options = struct {
     timeout_ns: u64 = 120 * std.time.ns_per_s,
     /// GLM53_TF_ROCE_FAST: tp_roce's `opts` word (config.roce_fast)
     fast: u32 = 0,
+    /// TF_TP_ROCE_BLOCKS: the largest grid (config.roce_blocks)
+    blocks: u32 = 16,
 };
 
 /// The shm wire: the peer's region is mapped here; a post copies the slot, then stores the flag (x86 / Arm stores
@@ -118,6 +120,8 @@ pub const Roce = struct {
     timeout_ns: u64,
     /// GLM53_TF_ROCE_FAST: the kernel's `opts` word
     fast: u32 = 0,
+    /// TF_TP_ROCE_BLOCKS: the largest grid
+    max_grid: u32 = 16,
     /// This rank's region (for shm: half of the mapping in `mapping`).
     region: []align(page) u8,
     mapping: []align(page) u8,
@@ -152,7 +156,7 @@ pub const Roce = struct {
         const len = regionBytes(slot);
         const r = try std.heap.page_allocator.create(Roce);
         errdefer std.heap.page_allocator.destroy(r);
-        r.* = .{ .me = b.rank, .slot_bytes = slot, .timeout_ns = o.timeout_ns, .fast = o.fast, .region = undefined, .mapping = undefined, .wire = undefined, .cpu = o.cpu };
+        r.* = .{ .me = b.rank, .slot_bytes = slot, .timeout_ns = o.timeout_ns, .fast = o.fast, .max_grid = o.blocks, .region = undefined, .mapping = undefined, .wire = undefined, .cpu = o.cpu };
         // 1. the regions and the wire, each rank alone; every rank learns whether all did
         const ok = r.openWire(b, o, len) catch |e| blk: {
             std.log.warn("[tensorfold] tp roce: rank {d} setup failed: {t}", .{ b.rank, e });
@@ -338,7 +342,7 @@ pub const Roce = struct {
             .lens = lens,
         };
         var params = [1]?*anyopaque{@ptrCast(&a)};
-        const blocks = @import("mailbox.zig").blocksFor(n);
+        const blocks = @min(@import("mailbox.zig").blocksFor(n), r.max_grid);
         d.check(d.api.cuLaunchKernel(r.func.?.handle, blocks, 1, 1, threads, 1, 1, 0, stream, &params, null), "cuLaunchKernel tp_roce") catch return error.BackendFailed;
     }
 

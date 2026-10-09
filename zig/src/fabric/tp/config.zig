@@ -49,6 +49,10 @@ pub const Config = struct {
     /// GLM53_TF_ROCE_FAST (roce.cu gather_fast_kernel) as tp_roce's `opts` word: bit 0 on, bits 8-15 pollers a flag
     /// (GLM53_TF_ROCE_POLLERS, 1-8), bits 16-31 their stagger (GLM53_TF_ROCE_STAGGER_NS, 150); local, not agreed
     roce_fast: u32 = 0,
+    /// TF_TP_ROCE_BLOCKS (GLM53_TF_ROCE_BLOCKS): the largest tp_roce grid, a power of two 1..16 (one block per 16 KiB
+    /// below it). 16 by default here; Python's roce.py default is 8, so a 16-row decode exchange (160 KiB) runs on 16
+    /// blocks in Zig and 8 in Python. Launch shape only: the same bytes land in the same places.
+    roce_blocks: u32 = 16,
     /// Pin the proxy thread (it busy-spins one core between exchanges).
     roce_cpu: ?u32 = null,
     /// `shm` runs the RoCE protocol on one host without RDMA (tests); `verbs` is the real wire.
@@ -88,6 +92,11 @@ pub const Config = struct {
             const pollers = try int(u32, get, alias(get, "TF_TP_ROCE_POLLERS", "GLM53_TF_ROCE_POLLERS"), 1, 1, 8);
             const stagger = try int(u32, get, alias(get, "TF_TP_ROCE_STAGGER_NS", "GLM53_TF_ROCE_STAGGER_NS"), 150, 0, 65535);
             c.roce_fast = 1 | (pollers << 8) | (stagger << 16);
+        }
+        c.roce_blocks = try int(u32, get, alias(get, "TF_TP_ROCE_BLOCKS", "GLM53_TF_ROCE_BLOCKS"), 16, 1, 16);
+        if (c.roce_blocks & (c.roce_blocks - 1) != 0) {
+            std.log.warn("TF_TP_ROCE_BLOCKS={d}: expected a power of two", .{c.roce_blocks});
+            return error.BadSetting;
         }
         if (get("TF_TP_ROCE_CPU")) |_| c.roce_cpu = try int(u32, get, "TF_TP_ROCE_CPU", 0, 0, 4095);
         if (get("TF_TP_ROCE_WIRE")) |w| c.roce_wire = std.meta.stringToEnum(@TypeOf(c.roce_wire), w) orelse {
@@ -237,6 +246,15 @@ test "prod.env's names: GLM53_TF_* where ours are unset, the plan link's spin an
     try std.testing.expectEqual(@as(u64, 200 * 1000), s.plan_spin_ns);
     try std.testing.expect(s.plan_pin == null);
     Fake.pairs = &.{.{ "TF_DSV41_PLAN_LINK", "udp" }};
+    try std.testing.expectError(error.BadSetting, Config.parse(&Fake.get));
+    // the RoCE grid cap: 16 unset, Python's name, ours over it, powers of two only
+    Fake.pairs = &.{};
+    try std.testing.expectEqual(@as(u32, 16), (try Config.parse(&Fake.get)).roce_blocks);
+    Fake.pairs = &.{.{ "GLM53_TF_ROCE_BLOCKS", "8" }};
+    try std.testing.expectEqual(@as(u32, 8), (try Config.parse(&Fake.get)).roce_blocks);
+    Fake.pairs = &.{ .{ "TF_TP_ROCE_BLOCKS", "4" }, .{ "GLM53_TF_ROCE_BLOCKS", "8" } };
+    try std.testing.expectEqual(@as(u32, 4), (try Config.parse(&Fake.get)).roce_blocks);
+    Fake.pairs = &.{.{ "TF_TP_ROCE_BLOCKS", "12" }};
     try std.testing.expectError(error.BadSetting, Config.parse(&Fake.get));
     Fake.pairs = &.{};
 }

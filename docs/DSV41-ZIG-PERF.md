@@ -435,3 +435,31 @@ with the buffers per `cuMemAlloc`, in the plain arena and in the VMM arena. If p
 ~16 us, the theory holds and the knob goes into the next A/B; if all three match, the next suspects are the buffers'
 relative addresses (L2 slice aliasing between x, xout, the gathered rows and the partials) and the instruction side
 (the boundary's code cold after ~1 ms of other kernels in both engines, so less likely).
+
+### 8.6 The probe's answers, and the writer hunt (round 4's nsys)
+
+`mhc-alloc` (dgx-01): per-buffer 37.6, plain arena 36.6, VMM 38.6 us: allocation and page size are not it.
+`mhc-probe` (dgx-01, f86954d3), boundary / coef us: overhead 1.7; cold-write 36.6 / 10.2; cold-read 22.3 / 8.2;
+engine 19.5 / 8.2; warm 16.4 / 8.0; aligned2m, stagger, cross all 19.5 / 8.2. Dirty L2 lines cost the boundary
+~14 us; slice aliasing and the cross-stream dependency cost nothing.
+
+No Zig-only writer before a boundary in the traces:
+- the kernels between two consecutive boundaries, by name and grid, over ~5,000 intervals a capture, are the same
+  in both engines but for the exchange (Zig `tp_roce`, Python `gather_fast_kernel`) and Python's torch elementwise
+  launches;
+- memsets: 442 (Zig) / 492 (Python) in the whole capture, 64 B each near a window start; memcpys: none of Zig's within
+  150 us before a boundary (Python's DtoD copies put 6.5 MB there);
+- `tp_roce` is a port of `gather_fast_kernel` (G14): the same pinned host slots, the same release / acquire order.
+
+Two exchange facts that do differ:
+- **grid:** both engines size it one block per 16 KiB rounded to a power of two, capped at Python's
+  GLM53_TF_ROCE_BLOCKS (8) and Zig's `max_blocks` (16): a 16-row window's 160 KiB exchange runs on 16 blocks in Zig
+  and 8 in Python. The 16-row boundary is +6.3 us in Zig, the 12-row one (8 blocks in both) +4.4 us, so the grid is
+  at most part of it. `TF_TP_ROCE_BLOCKS` / `GLM53_TF_ROCE_BLOCKS` now set the cap (power of two, 1-16, default 16
+  = today; 8 = Python's).
+- **after a short exchange the boundary is slower:** Zig 32.4 / 31.0 / 31.1 us after exchanges of < 15 / 15-30 /
+  30-60 us, 26.2 / 25.1 after 60-200 / > 200 us; Python 24-26 whatever the exchange. Whatever slows Zig's boundary
+  drains while an exchange waits: consistent with memory traffic the exchange leaves in flight.
+
+Probe variants `sysmem` / `devmem` test the exchange's host traffic directly: 160 KiB written to pinned host memory and
+320 KiB read back from it by kernels just before the boundary, against the same on device memory.
