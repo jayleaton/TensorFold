@@ -16,6 +16,7 @@
 //! graphs.Settings' (the graph cache keyed by (rows, context bucket), both ranks agreeing).
 
 const std = @import("std");
+const ph = @import("phases.zig");
 const cuda = @import("cuda");
 const kv = @import("kv");
 const calls = @import("calls.zig");
@@ -79,7 +80,19 @@ pub const Batch = struct {
     span: [2]usize = .{ 0, 0 },
     /// TF_DSV41_ROUND_GRAPH (round_graph.zig)
     rg: round_graph.Settings = .{},
-    stats: struct { windows: u64 = 0, rows: u64 = 0, padded: u64 = 0, split: u64 = 0 } = .{},
+    stats: struct {
+        windows: u64 = 0,
+        rows: u64 = 0,
+        padded: u64 = 0,
+        split: u64 = 0,
+        /// first uses of a key: its program emitted (`builds`, host ms) and its graph captured (`captures`, the
+        /// window's host ms including the capture's own run); `eager`: windows the cache ran without a graph
+        builds: u64 = 0,
+        build_ns: u64 = 0,
+        captures: u64 = 0,
+        capture_ns: u64 = 0,
+        eager: u64 = 0,
+    } = .{},
     /// the session store (model.zig): each slot's kept rows are its committed ids
     sess: ?*sessions_gpu.Sessions = null,
 
@@ -248,7 +261,18 @@ pub const Batch = struct {
                 if (sp[0] == sp[1]) continue;
                 b.span = sp;
                 const pk: graphs.Key = .{ .rows = key.rows, .ctx = key.ctx, .part = if (at == null) 0 else @intCast(pi + 1) };
+                const t0 = ph.nowNs();
                 const out = try g.cache.run(pk, r.stream, fp, .{ .ctx = b, .run = body });
+                switch (out) {
+                    .captured => {
+                        const ns = ph.nowNs() - t0;
+                        b.stats.captures += 1;
+                        b.stats.capture_ns += ns;
+                        if (graphLog()) std.log.scoped(.dsv41).info("row graphs: capture {d} ({d} rows, context bucket {d}, part {d}) in {d:.1} ms", .{ g.cache.stats.captured, pk.rows, pk.ctx, pk.part, @as(f64, @floatFromInt(ns)) / 1e6 });
+                    },
+                    .eager => b.stats.eager += 1,
+                    .replayed => {},
+                }
                 if (outcomeLog(out, g)) std.log.scoped(.dsv41).info("row graphs: capture {d} ({d} rows, context bucket {d}, part {d}), {d} replayed", .{ g.cache.stats.captured, pk.rows, pk.ctx, pk.part, g.cache.stats.replayed });
             }
             if (at != null) b.stats.split += 1;
@@ -267,6 +291,11 @@ pub const Batch = struct {
     /// The key's program: block.emit at R rows ending at the context bucket's end, in row mode.
     fn program(b: *Batch, key: graphs.Key, s: graphs.Settings) ![]const calls.Call {
         if (b.programs.get(key)) |cs| return cs;
+        const t0 = ph.nowNs();
+        defer {
+            b.stats.builds += 1;
+            b.stats.build_ns += ph.nowNs() - t0;
+        }
         const f = b.f;
         const a = f.arena.allocator();
         const start = graphs.emitStart(key.rows, key.ctx, s, @intCast(f.opts.limit));
@@ -677,6 +706,12 @@ pub const Table = struct {
 };
 
 const Stash = struct { layer: u32, buf: cuda.DeviceBuffer };
+
+/// TF_DSV41_GRAPH_LOG=1: every row-graph capture logged with its key and host ms (else the powers of two).
+fn graphLog() bool {
+    const v = std.c.getenv("TF_DSV41_GRAPH_LOG") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "1");
+}
 
 fn outcomeLog(out: graphs.gc.Outcome, g: *const Graphs) bool {
     return out == .captured and (g.cache.stats.captured & (g.cache.stats.captured - 1)) == 0;

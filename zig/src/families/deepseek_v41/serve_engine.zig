@@ -186,7 +186,7 @@ pub const Served = struct {
         return s.rec.engine();
     }
 
-    /// The phases report's "engram" counters (cumulative; a cell's are the difference of two snapshots): the row
+    /// The phases report's "engram" and "rowgraphs" counters (cumulative; a cell's are the difference of two snapshots): the row
     /// reader's records found cached (hits), found in flight (waited), read (misses), extents read and their bytes,
     /// the engine's wait for them; the gate's rounds, GPU-side syncs and warm jobs. Python's boot line reports the same
     /// as "rows N (cached, read)".
@@ -199,6 +199,11 @@ pub const Served = struct {
         } else try w.writeAll("\"rows\": null");
         if (m.f.gate) |g| try w.print(", \"gate_rounds\": {d}, \"gate_syncs\": {d}, \"gate_warm\": {d}, \"gate_failed\": {d}", .{ g.stats.rounds, g.stats.syncs, g.stats.warm, g.stats.failed });
         try w.writeAll("}");
+        // the row windows' first uses (batch.zig): programs emitted and graphs captured, their host ms
+        if (m.gt.rows) |b| {
+            const st = b.stats;
+            try w.print(", \"rowgraphs\": {{\"windows\": {d}, \"rows\": {d}, \"padded\": {d}, \"builds\": {d}, \"build_ms\": {d:.2}, \"captures\": {d}, \"capture_ms\": {d:.2}, \"eager\": {d}}}", .{ st.windows, st.rows, st.padded, st.builds, @as(f64, @floatFromInt(st.build_ns)) / 1e6, st.captures, @as(f64, @floatFromInt(st.capture_ns)) / 1e6, st.eager });
+        }
     }
 
     fn makeLookup(ctx: *anyopaque, gpa: Allocator, prompt: []const u32, eos: []const u32) anyerror!lanes.proposer.Proposer {
