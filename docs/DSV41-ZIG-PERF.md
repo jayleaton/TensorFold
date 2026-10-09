@@ -1609,3 +1609,131 @@ Expected on code x4: -4 to -6 ms a round (lanes_linear in 24-row windows ~40 % f
   match Python's 4/4.
 - **L3**: L2 plus `TF_DSV41_DRAFT_TIMED=1`. Depth then prices from the measured rounds rather than Python's stored
   table, which predates the cheaper 17-32-row windows.
+
+## 13. P5b's reading, and the exchange hidden at 4K (TF_DSV41_PF_OVERLAP_SITE, 2026-10-09, offline)
+
+### 13.1 What P5b says (dgx-01 / dgx-02, 131K, 154,644 encoder rows, 2K in 95 segments, 4K in 57)
+
+Per 1K encoder rows (rank 1, the critical rank): 450.9 -> 421.5 ms (-6.5 %). x3gm gate/up + down -28.9; every other
+family within ±2.2. The "+50 % non-GEMM a row at 4K" of T2-0 came from the broken runs.
+
+At 4K, ranked, with what bounds each:
+
+| family (4K) | ms / 1K | bound | exact lever |
+| --- | ---: | --- | --- |
+| x3gm gate/up2 + down2 (+ rot 13.8) | 100.9 | issue-bound: ~2x the trellis DRAM time, ~4x its mma time | 128-member tiles at 4K: -3.3 % of x3gm (T2-0); the rest needs a GB10 ablation of the kernel |
+| pfdense GEMMs (+ rot_in 15.4) | 69.5 | 55-78 TFLOP/s per shape (G17), flat per row from 2K to 4K | none cheap: every config gives the same bits and the table already picks per shape; a new kernel design |
+| `_stream` (indexer, long context) | 52.9 | per-tile latency | STREAM_RB (section 12, S1 recheck pending) |
+| `_fused` attention | 43.6 | ~4x its mma floor | none exact: each row has its own list and window tiles (the online softmax's tile order fixes the bits), nothing to share |
+| mHC sites + `_finish_k` | 35.3 | ~1.3x its DRAM floor (~27) | — |
+| **exchanges** (40 a segment + embed) | **30.7** | **CX7 at ~14 GB/s (NCCL), serialized on the compute stream** | **hide it: nothing computed changes** |
+| router, combine, small | ~35 | | |
+
+The exchange is the one family that can go to ~0 without changing a kernel: the bytes stay the same, only their
+timing moves. NCCL itself moves ~14 GB/s here and 11.7 GB/s at 4 MiB on the two-Spark gate (9.6 of
+E1E2-SPARK-WINDOW), against ~24 GB/s for the two CX7 functions; a faster wire would need large-message RoCE numbers
+first (our RoCE path stops at 256 KiB).
+
+`glue.embed` +4.4 ms / 1K at 4K is rank 0's alone (rank 1: 1.22 -> 1.10). It is the segment's first exchange, so on
+rank 0 it holds the wait for rank 1 to finish the previous segment: skew between ranks, not work.
+
+### 13.2 TF_DSV41_PF_OVERLAP at 4K, and the site in pieces
+
+PF_OVERLAP (10.4) lost at 2K because k = 4 made 512-row GEMMs. At 4K, k = 2 makes 2,048-row pieces: the 2K
+program's own GEMM shapes, and pfdense costs the same per row at 2K and 4K (P5b: 71.3 vs 69.5 ms / 1K). Host-gated:
+4K + PF_OVERLAP stays inside the 4K workspace (pf4k_test: its streams share only `L.k4~part` / `L.k4~moe16`).
+
+PF_OVERLAP still leaves each exchange's last piece exposed: it runs on the main stream after a join, before the next
+mixing site. **TF_DSV41_PF_OVERLAP_SITE=1** (default 0; needs PF_OVERLAP 2-8):
+- every exchange piece p goes on the side stream (forked after its producer piece) and records **mark p + 1**;
+- the next boundary site (mhc_pf.run + `_finish_k`) runs in the same row pieces. Piece p waits for mark p + 1 only
+  (`Call.wait`), and the last joins. So the site's piece p runs while exchange pieces p + 1 .. k are in flight;
+- a consumer that is not a boundary site (an Engram block's post, the head, the trace) joins first, as before. A program
+  ending on an exchange (no consumer) gets its last piece back on the main stream (`unpend`).
+
+Runner: the branches' side stream holds 8 mark events; `mark` records one after a side call, `wait` makes the main
+stream wait for it. `branches.shared` models the marks: after a wait, roles only the side calls up to that mark touched
+are no longer shared.
+
+**Bits.**
+- mhc_pf.run and `_finish_k` are row-wise: a row's streams (in place), its gathered rows, its coefficients, its
+  partials. No row reads another, and the instance is chosen by mode / fn / tap, not rows.
+- Each piece is >= 256 rows (pf_rows: mhc_pf as for the whole) and starts on the 16-row grid. So every view keeps
+  16-byte alignment, and `_finish_k`'s AOT variants are the whole site's (the full gate's aot-needs: SITE=1 lists
+  exactly SITE=0's variants).
+- The gathered buffer's rank stride comes from the view (`stride0(g)`).
+- The NCCL calls stay on one stream, in the same order on both ranks.
+
+**Host tests.**
+- pfovl_test: the reader.
+- pfovl_test, the emitter at 2,048 rows and at 4,096 (under 4K), k = 2 / 4:
+  - every call but the sites is PF_OVERLAP's program;
+  - each boundary site after an exchange is k mhc_pf.run + `_finish_k` pairs tiling the rows in order, piece p
+    waiting for mark p + 1 and the last joining;
+  - every exchange piece is side + fork + mark p + 1;
+  - the program's dangling last exchange is main + join;
+  - the streams share only the partials and the gathered buffers (at disjoint rows);
+  - without the pieces, the knob changes nothing.
+- pf4k_test: 4K + PF_OVERLAP (+ SITE) inside the workspace.
+
+**Expected at 4K, k = 2** (the 2K-row piece's exchange ~1.5 ms at 14 GB/s):
+- piece 1's exchange runs behind the second producer piece: wo_a + wo_b ~2.3 ms, or the shared expert + moe_sum
+  ~1.9 ms;
+- piece 2's exchange runs behind the site's first piece: mhc_pf + `_finish_k` over 2,048 rows, ~1.8 ms.
+
+Up to ~-27 of the 30.7 ms / 1K, less the NCCL kernels' SMs beside the GEMMs (2-4 of 48) and the site's DRAM beside
+the wire: **about -20..-25 ms / 1K, +5-6 % prompt tok/s**, the same per row at 32K and 131K.
+
+### 13.3 4K is not running in the all-on chain: the workspace misses by ~30 MB (TF_DSV41_PF_WS_SHARE)
+
+P5b's logs (results/zig-p5b-20261009-153148/logs):
+- `c18-allon`: **0 workspace allocations and >= 64 fallbacks on both ranks.** Every prompt piece ran 2,048-row
+  segments: rank 1 had 5.96 GiB MemAvailable, and the 2,552 MiB workspace would leave 3.47 against the 3.5 floor.
+- The P5b 4K run allocated once (prompt 1, 89 ms). The next prompt fell back: 5.81 GiB leaves 3.31.
+
+So the all-on set gets none of 4K's -6.5 % today.
+
+The workspace (prod-shape test config, 2,615 MiB) holds the 4K program's own copy of every window / layer role and of
+its scratch. Three of them are the same size at 4K as in the forward's plan:
+- `L.ix.stream`, 256 MiB (the index budget);
+- `L.ix.keys`, 128 MiB;
+- `s.pf.w`, 63 MiB.
+
+A 4K segment never runs beside another prefill program (TBO's pairs aside), each role is its own allocation or arena
+offset (buffers.zig: no aliasing), and the 2K segments use these roles the same way between the same programs.
+
+**TF_DSV41_PF_WS_SHARE=1** (default 0; with PF_4K and no TBO):
+- At boot (`forward_prefill.k4Trim`), every workspace role that the forward's plan holds at least as large moves out
+  of the workspace into `K4.keep`. The 4K segment's calls name those roles bare (`block_prefill.ownCallsKeep`).
+- The boot price (`workspaceBytes`) applies the same trim against the forward's prefill programs. Runtime trims
+  against the whole plan (decode roles too), so it can only share more than the price assumed.
+- Boot log: `prefill 4K: rank R: N roles shared with the forward (TF_DSV41_PF_WS_SHARE): workspace A -> B MiB`.
+
+Expected: ~-447 MiB, so ~2.1 GiB instead of 2.55. Rank 1 then leaves ~3.5-3.9 GiB at the MemAvailable P5b saw, which
+clears TF_DSV41_PF_WS_FLOOR_GIB=3.5 but not the default hard floor (4.0). Keep the 3.5 floor for 4K runs.
+
+Bits: the same calls on the same roles' contents. Only the addresses of three scratch roles move.
+
+Host test (pf4k_test `shared4k`):
+- the trim keeps the index stream / keys and pf.w, but not x3gm's z or q (twice the 2K size);
+- it saves >= 400 MiB;
+- the 4K program as run names only workspace roles (at no more than the trimmed plan's size) or forward roles (at no
+  less than the 2K plan's).
+
+The next room is a liveness-packed workspace: x3gm's z (480 MiB, MoE only) beside attention's q / o (attention
+only). It is not built, since it needs every role's write-before-read checked on the GPU.
+
+### 13.4 Spark steps (1 rep each, against the current all-on set with 4K)
+
+Run W1 first: X1-X3 measure against 4K, which needs W1 to run at all.
+
+| step | what | pass |
+| --- | --- | --- |
+| W1 (first) | all-on + `TF_DSV41_PF_WS_SHARE=1` (`TF_DSV41_PF_WS_FLOOR_GIB=3.5`), `bench_http.py --long 32768,131072` | boot log `3 roles shared ... workspace ~2552 -> ~2105 MiB`; `allocated and zeroed` once a long prompt and **no `does not fit` line** (or far fewer than c18's >= 64); long replies == Python's, T0 20/20; 32K / 131K prompt tok/s vs c18 (expect P5b's -6.5 % a row: +6-7 %) |
+| X0 | kit as built (the fill's fill-4k.env already lists PF_OVERLAP's pieces; SITE adds no variant) | compile.json `"failed": []` |
+| X1 | all-on + `TF_DSV41_PF_OVERLAP=2`, `bench_http.py --long 32768,131072` | long replies == Python's (sha unchanged), T0 20/20; prompt tok/s vs all-on |
+| X2 | X1 + `TF_DSV41_PF_OVERLAP_SITE=1` | the same; boot log `prefill overlap: ... 2 row pieces on the side stream, every piece; the next mixing site in the same pieces`; prompt tok/s vs X1 |
+| X3 (if X2 gains) | X2 with `TF_DSV41_PF_OVERLAP=4`, and with `=3` | as X2; picks k |
+| X4 (optional) | X2 with `TF_DSV41_PROFILE=1` at 131K, `gap.py prefill-ab` vs P5b's 4K profile | the exchange family on the main stream's critical path; wall per 1K rows |
+
+On a failure: X1 alone names PF_OVERLAP at 4K, X2 the site pieces.

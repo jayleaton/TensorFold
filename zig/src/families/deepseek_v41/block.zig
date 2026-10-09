@@ -90,6 +90,10 @@ pub const Options = struct {
     /// pieces, each sent on the branches' side stream while the main stream computes the next piece's producer (wo_a /
     /// wo_b, the shared expert); 0 / 1: one exchange after its producer (Python's order). Needs `branches` and TP=2
     pf_overlap: i64 = 0,
+    /// TF_DSV41_PF_OVERLAP_SITE (with pf_overlap): every exchange piece goes on the side stream (the last too), and the
+    /// next mixing site (a boundary's mhc_pf.run + `_finish_k`, row-wise) runs in the same row pieces, piece p after
+    /// exchange piece p only, so the site's early pieces hide the later pieces' exchanges
+    pf_overlap_site: bool = false,
     /// TF_DSV41_PF_TBO (block_prefill.emitTbo): a prompt's CED encoder segments two at a time, the second half a layer
     /// behind the first on the branches' side stream, so one's routed experts (DRAM-bound) run beside the other's
     /// attention and dense GEMMs (compute-bound). Needs `branches`; the exchange pieces (pf_overlap) are off under it
@@ -177,6 +181,8 @@ pub const Emitter = struct {
     br_side: bool = false,
     br_fork: bool = false,
     br_join: bool = false,
+    br_mark: u8 = 0,
+    br_wait: u8 = 0,
     /// TF_DSV41_MHC_DEFER: the next call is the coefficient launch / joins it; a coefficient launch not joined yet
     df_side: bool = false,
     df_join: bool = false,
@@ -232,8 +238,12 @@ pub const Emitter = struct {
         x.side = e.br_side;
         x.fork = e.br_fork;
         x.join = e.br_join;
+        x.mark = e.br_mark;
+        x.wait = e.br_wait;
         e.br_fork = false;
         e.br_join = false;
+        e.br_mark = 0;
+        e.br_wait = 0;
         x.defer_side = e.df_side;
         x.defer_join = e.df_join;
         e.df_side = false;

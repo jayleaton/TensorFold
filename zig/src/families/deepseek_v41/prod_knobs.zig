@@ -180,6 +180,17 @@ pub fn pfOverlap(get: Get) !i64 {
     return if (v < 2) 0 else v;
 }
 
+/// TF_DSV41_PF_OVERLAP_SITE (ours; 0 / 1, default 0; with TF_DSV41_PF_OVERLAP >= 2): every exchange piece on the side
+/// stream, and the next boundary mixing site in the same row pieces, each after its own exchange piece
+/// (block_prefill.zig `sitePieces`).
+pub fn pfOverlapSite(get: Get) !bool {
+    const raw = std.mem.trim(u8, get("TF_DSV41_PF_OVERLAP_SITE") orelse "0", " ");
+    if (std.mem.eql(u8, raw, "0")) return false;
+    if (std.mem.eql(u8, raw, "1")) return true;
+    std.log.warn("TF_DSV41_PF_OVERLAP_SITE={s}: 0 or 1", .{raw});
+    return error.BadKnob;
+}
+
 /// TF_DSV41_PF_TBO (ours; 0 / 1, default 0): CED encoder segments two at a time on two streams (block_prefill.emitTbo).
 pub fn pfTbo(get: Get) !bool {
     const raw = std.mem.trim(u8, get("TF_DSV41_PF_TBO") orelse "0", " ");
@@ -364,6 +375,11 @@ pub fn apply(f: *@import("forward.zig").Forward, a: std.mem.Allocator, io: std.I
     if (f.branches == null) f.branches = try @import("branches.zig").install(f.gpa, f, rank);
     // TF_DSV41_PF_OVERLAP: the pieces' exchanges go on the branches' side stream (one peer: TP=2)
     f.opts.pf_overlap = try pfOverlap(&env);
+    f.opts.pf_overlap_site = try pfOverlapSite(&env);
+    if (f.opts.pf_overlap_site and f.opts.pf_overlap < 2) {
+        std.log.scoped(.dsv41).err("TF_DSV41_PF_OVERLAP_SITE=1 needs TF_DSV41_PF_OVERLAP=2..8 (the pieces it overlaps)", .{});
+        return error.BadKnob;
+    }
     // TF_DSV41_PF_TBO: the second micro-batch on the side stream, CED's encoder segments only; x3gm's grid capped
     if (f.opts.pf_tbo) {
         if (!f.opts.branches or f.prefill_state.mode != .replay) {
@@ -393,7 +409,7 @@ pub fn apply(f: *@import("forward.zig").Forward, a: std.mem.Allocator, io: std.I
     log.info("router grouping/rotation fusion: {s}", .{if (f.opts.router_group_rot) "on" else "off"});
     if (f.opts.stream_rb > 0) log.info("stream top-k: {d} rows a program (_stream_rb{d})", .{ f.opts.stream_rb, f.opts.stream_rb });
     if (f.opts.pf_tbo) log.info("prefill tbo: encoder segments two at a time on two streams, x3gm on at most {d} SMs (0: all){s}", .{ dk.exl3.gm_sms_cap, if (f.opts.pf_overlap > 0) "; TF_DSV41_PF_OVERLAP is off under it" else "" });
-    if (f.opts.pf_overlap > 0) log.info("prefill overlap: a segment's exchanges in {d} row pieces on the side stream", .{f.opts.pf_overlap});
+    if (f.opts.pf_overlap > 0) log.info("prefill overlap: a segment's exchanges in {d} row pieces on the side stream{s}", .{ f.opts.pf_overlap, if (f.opts.pf_overlap_site) ", every piece; the next mixing site in the same pieces, each after its own" else "" });
     log.info("prod knobs: pf_dense {s}, prefill rows {d}{s}, index budget {d} MiB, R1 {s}, prefetch ahead {s}, x3gm v2 {t}, prefill {t}, mhc pfdec {d}", .{ if (f.opts.pfd != null) "fused" else "off", if (big) pf4k_rows else @as(u32, @intCast(f.opts.prefill_rows)), if (big) " (4K: one x3gm block a segment, in the prefill's own workspace)" else "", f.opts.index_budget >> 20, if (f.opts.r1) "on" else "off", if (f.prefill_state.ahead) "on" else "off", f.opts.gm_v2, f.prefill_state.mode, f.opts.mhc_pf_rows });
 }
 

@@ -169,3 +169,139 @@ fn pieces(cs: []const calls.Call, n: i64, k: i64, D: i64) !void {
         if (last) try testing.expectEqual(n, r0 + m);
     }
 }
+
+test "TF_DSV41_PF_OVERLAP_SITE: unset / 0 off, 1 on, anything else refused" {
+    Fake.pairs = &.{};
+    try testing.expect(!try pk.pfOverlapSite(&Fake.get));
+    Fake.pairs = &.{.{ "TF_DSV41_PF_OVERLAP_SITE", "1" }};
+    try testing.expect(try pk.pfOverlapSite(&Fake.get));
+    Fake.pairs = &.{.{ "TF_DSV41_PF_OVERLAP_SITE", "0" }};
+    try testing.expect(!try pk.pfOverlapSite(&Fake.get));
+    for ([_][]const u8{ "2", "on", "-1" }) |v| {
+        Fake.pairs = &.{.{ "TF_DSV41_PF_OVERLAP_SITE", v }};
+        try testing.expectError(error.BadKnob, pk.pfOverlapSite(&Fake.get));
+    }
+    Fake.pairs = &.{};
+}
+
+fn isSite(c: calls.Call) bool {
+    return std.mem.eql(u8, c.name, "tf_dsv41_mhc_pf_v1.run") or std.mem.eql(u8, c.name, "_finish_k");
+}
+
+test "TF_DSV41_PF_OVERLAP_SITE on the prefill emitter: every exchange piece on the side with its mark, the next boundary site in the same row pieces after its own piece, every other call unchanged" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const cfg: Config = .{};
+    const w = try widths(aa);
+    const layers = [_]u32{ 1, 2, 3 };
+    const D: i64 = cfg.hidden;
+    const base: block.Options = .{ .gm_v2 = .one, .branches = true, .limit = 1 << 16, .rope_rows = (1 << 16) + 2048 };
+    var big = base;
+    big.pf4k = true;
+    big.prefill_rows = 4096;
+    for ([_]Mode{ .{ .n = 2048, .o = base }, .{ .n = 4096, .o = big } }) |md| {
+        for ([_]i64{ 2, 4 }) |k| {
+            var ov_o = md.o;
+            ov_o.pf_overlap = k;
+            var on_o = ov_o;
+            on_o.pf_overlap_site = true;
+            const ov = try bp.emitPrefill(aa, &cfg, &w, ov_o, &layers, md.n, 0, false);
+            const on = try bp.emitPrefill(aa, &cfg, &w, on_o, &layers, md.n, 0, false);
+            // outside the sites and the exchanges' stream marks: the PF_OVERLAP program, call for call
+            var i: usize = 0;
+            var j: usize = 0;
+            while (true) {
+                while (i < ov.len and isSite(ov[i])) i += 1;
+                while (j < on.len and isSite(on[j])) j += 1;
+                if (i == ov.len or j == on.len) break;
+                try testing.expectEqualStrings(ov[i].name, on[j].name);
+                try testing.expectEqual(ov[i].args.len, on[j].args.len);
+                i += 1;
+                j += 1;
+            }
+            try testing.expectEqual(ov.len - i, on.len - j);
+            // every boundary site after an exchange (2 a layer but the first block's attention site) in k pieces
+            const sites: usize = 2 * layers.len - 1;
+            const kk: usize = @intCast(k);
+            try testing.expectEqual(count(ov, "tf_dsv41_mhc_pf_v1.run") + (kk - 1) * sites, count(on, "tf_dsv41_mhc_pf_v1.run"));
+            try testing.expectEqual(count(ov, "_finish_k") + (kk - 1) * sites, count(on, "_finish_k"));
+            try sitePieces(on, md.n, k, D);
+            // inside a fork region the streams share only the partials and the gathered buffers, at disjoint rows
+            const sh = try branches.shared(aa, on);
+            for (sh) |r| {
+                const okr = std.mem.eql(u8, r, "L.part") or std.mem.eql(u8, r, "L.moe16") or std.mem.eql(u8, r, "L.recv.attn") or std.mem.eql(u8, r, "L.recv.moe");
+                if (!okr) std.debug.print("shared role {s}\n", .{r});
+                try testing.expect(okr);
+            }
+            try testing.expectEqual(@as(usize, 4), sh.len);
+        }
+    }
+    // the knob needs the pieces: without PF_OVERLAP (or the side stream) the program is the knob-off one
+    var o = base;
+    o.pf_overlap_site = true;
+    const off = try bp.emitPrefill(aa, &cfg, &w, base, &layers, 2048, 0, false);
+    const same = try bp.emitPrefill(aa, &cfg, &w, o, &layers, 2048, 0, false);
+    try testing.expectEqual(off.len, same.len);
+    for (off, same) |x, y| {
+        try testing.expectEqualStrings(x.name, y.name);
+        try testing.expect(!y.side and y.mark == 0 and y.wait == 0);
+    }
+}
+
+/// Under TF_DSV41_PF_OVERLAP_SITE: exchange piece p of k is on the side stream (forked) with mark p + 1; the next site
+/// is k mhc_pf.run + `_finish_k` pairs over the same rows in order, piece p < k - 1 waiting for mark p + 1 and the last
+/// joining, each reading its own rows of the gathered buffer [2, n, D] and writing its rows of "w.out". The program's
+/// last exchange (no site after it) ends as without the knob: its last piece on the main stream, joined.
+fn sitePieces(cs: []const calls.Call, n: i64, k: i64, D: i64) !void {
+    var xp: i64 = 0; // exchange pieces seen in the current exchange
+    var sp: i64 = 0; // site pieces seen in the current site
+    var rows: [8][2]i64 = undefined;
+    var sites: usize = 0;
+    for (cs, 0..) |c, idx| {
+        if (std.mem.eql(u8, c.name, "glue.exchange_rows")) {
+            try testing.expectEqual(@as(i64, 0), sp);
+            const r0 = c.args[2].arg.i;
+            const m = c.args[0].arg.t.shape[0];
+            rows[@intCast(xp)] = .{ r0, m };
+            const tail = idx + 1 == cs.len;
+            if (tail and xp + 1 == k) {
+                try testing.expect(!c.side and !c.fork and c.join and c.mark == 0);
+            } else {
+                try testing.expect(c.side and c.fork and !c.join);
+                try testing.expectEqual(@as(u8, @intCast(xp + 1)), c.mark);
+            }
+            xp += 1;
+            if (xp == k) xp = 0;
+            continue;
+        }
+        try testing.expectEqual(@as(u8, 0), c.mark);
+        if (std.mem.eql(u8, c.name, "tf_dsv41_mhc_pf_v1.run")) {
+            const R = c.args[10].arg.i;
+            if (R == n) continue; // a whole site (the first block's)
+            const r = rows[@intCast(sp)];
+            try testing.expectEqual(r[1], R);
+            try testing.expectEqual(r[0] * 4 * D * 2, c.args[0].arg.t.offset);
+            const g = c.args[2].arg.t;
+            try testing.expectEqualSlices(i64, &.{ 2, r[1], D }, g.shape);
+            try testing.expectEqualSlices(i64, &.{ n * D, D, 1 }, g.stride);
+            try testing.expectEqual(r[0] * D * 2, g.offset);
+            const last = sp + 1 == k;
+            try testing.expectEqual(last, c.join);
+            try testing.expectEqual(@as(u8, if (last) 0 else @intCast(sp + 1)), c.wait);
+            const fin = cs[idx + 1];
+            try testing.expectEqualStrings("_finish_k", fin.name);
+            try testing.expectEqual(r[1], fin.grid[0]);
+            for (fin.args) |x| if (std.mem.eql(u8, x.name, "OUT")) try testing.expectEqual(r[0] * D * 2, x.arg.t.offset);
+            sp += 1;
+            if (sp == k) {
+                sp = 0;
+                sites += 1;
+            }
+            continue;
+        }
+        try testing.expect(c.wait == 0);
+    }
+    try testing.expectEqual(@as(i64, 0), sp);
+    try testing.expect(sites > 0);
+}
