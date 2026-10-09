@@ -23,7 +23,7 @@ const Fake = struct {
     }
 };
 
-test "TF_DSV41_PF_TBO and _GM_SMS: 0 / 1; 0 or 8-48 SMs, 32 by default; the pair split" {
+test "TF_DSV41_PF_TBO and _GM_SMS: 0 / 1; 0 or 8-48 SMs, 0 (every SM) by default; the pair split" {
     defer Fake.pairs = &.{};
     Fake.pairs = &.{};
     try testing.expect(!try pk.pfTbo(&Fake.get));
@@ -185,4 +185,85 @@ test "TF_DSV41_PF_TBO on the emitter: A's program on main, B's renamed on the si
     off = o;
     off.pf_tbo = false;
     try testing.expectError(error.Unsupported, bp.emitTbo(aa, &cfg, &w, off, &enc, 2048, 2048, 0));
+}
+
+const buffers = @import("buffers.zig");
+
+test "a TBO pair adds no byte to the forward's plan: 2K pairs keep A's roles and put B's in the workspace, 4K pairs put both there" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const cfg: Config = .{};
+    const w = try widths(aa);
+    var enc: [21]u32 = undefined;
+    for (&enc, 0..) |*l, i| l.* = @intCast(i);
+    const base: block.Options = .{ .gm_v2 = .one, .branches = true, .pf_tbo = true, .limit = 1 << 20, .rope_rows = (1 << 20) + 2048, .index_budget = 64 << 20, .taps = true };
+    var p2: buffers.Plan = .{ .a = aa };
+    for ([_]i64{ 0, (1 << 20) - 4096 - 1 }) |start| try p2.add(try bp.emitReplay(aa, &cfg, &w, base, &enc, 2048, start + 2048, .encoder));
+    for ([_]bool{ false, true }) |k4| {
+        const o = if (k4) fp.k4Options(base) else base;
+        const seg: i64 = if (k4) 4096 else 2048;
+        var pp: buffers.Plan = .{ .a = aa };
+        const pair = try fp.wsPair(aa, try bp.emitTbo(aa, &cfg, &w, o, &enc, seg, seg, 8192), k4);
+        try pp.add(pair);
+        var own: u64 = 0;
+        for (pp.sizes.keys(), pp.sizes.values()) |k, v| {
+            if (std.mem.indexOf(u8, k, fp.K4.tag) != null) {
+                own += v;
+                continue;
+            }
+            try testing.expect(std.mem.indexOf(u8, k, "b~") == null); // every B role is the workspace's
+            const b = p2.sizes.get(k) orelse {
+                std.debug.print("pair (4K {}) reads a role the 2K plan does not hold: {s}\n", .{ k4, k });
+                return error.TestUnexpectedResult;
+            };
+            if (v > b) std.debug.print("pair (4K {}) needs {s} at {d}, the 2K plan holds {d}\n", .{ k4, k, v, b });
+            try testing.expect(v <= b);
+            if (k4) for (bp.own_scratch) |sc| try testing.expect(!std.mem.startsWith(u8, k, sc));
+        }
+        // B's x3gm scratch in the workspace at its micro-batch's pairs; under 4K A's too
+        try testing.expect(pp.sizes.get("s.k4~b~ex.z").? >= @as(u64, @intCast(seg * 6 * 5120 * 4)));
+        try testing.expectEqual(k4, pp.sizes.contains("s.k4~ex.z"));
+        try testing.expect(own > 1 << 29);
+        // the same streams' structure as the plain pair (renaming moves no call)
+        for (pair) |c| if (std.mem.eql(u8, c.name, "glue.copy_rows")) try testing.expect(!c.side);
+    }
+}
+
+test "TF_DSV41_PF_TBO with TF_DSV41_PF_4K: 4,096-row micro-batches, each its 4K encoder program (route in two CHUNK launches, x3gm one block)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const cfg: Config = .{};
+    const w = try widths(aa);
+    var enc: [21]u32 = undefined;
+    for (&enc, 0..) |*l, i| l.* = @intCast(i);
+    const o = fp.k4Options(.{ .gm_v2 = .one, .branches = true, .pf_tbo = true, .limit = 1 << 16, .rope_rows = (1 << 16) + 2048 });
+    const pair = try bp.emitTbo(aa, &cfg, &w, o, &enc, 4096, 4096, 0);
+    const pa = try bp.emitReplay(aa, &cfg, &w, o, &enc, 4096, 0, .encoder);
+    const pb = try bp.emitReplay(aa, &cfg, &w, o, &enc, 4096, 4096, .encoder);
+    var ia: usize = 0;
+    var ib: usize = 0;
+    for (pair) |c| {
+        if (std.mem.eql(u8, c.name, "glue.copy_rows") or std.mem.eql(u8, c.name, "glue.tbo_join")) continue;
+        if (c.side) {
+            try sameCall(aa, pb[ib], c, true);
+            ib += 1;
+        } else {
+            while (std.mem.eql(u8, pa[ia].name, "glue.ced_stash")) ia += 1;
+            try sameCall(aa, pa[ia], c, false);
+            ia += 1;
+        }
+    }
+    try testing.expectEqual(pb.len, ib);
+    var gu: usize = 0;
+    var routes: usize = 0;
+    for (pair) |c| {
+        if (std.mem.eql(u8, c.name, "tf_dsv41_x3gm_v1.gateup2")) gu += 1;
+        if (std.mem.eql(u8, c.name, "tf_dsv41_router_gemv_v2.route")) routes += 1;
+    }
+    try testing.expectEqual(routes, 2 * gu); // two CHUNK launches a MoE call, one gateup2
+    // a 4K pair split from a short prompt rest
+    try testing.expectEqual([2]usize{ 4096, 4096 }, fp.pairSplit(4096, 8192).?);
+    try testing.expectEqual([2]usize{ 3008, 3008 }, fp.pairSplit(4096, 6016).?);
 }

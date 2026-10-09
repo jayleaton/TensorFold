@@ -8,7 +8,7 @@
 #     nvcr.io/nvidia/cuda:13.0.1-devel-ubuntu24.04 ./tbo_bench [--rows 2048,4096] [--k2 6] [--reps 5] [--green] \
 #     [--sms 48,44,40,36,32,28,24] [--zipf 0]
 #
-# e.g.  ./tbo_bench.sh --green          (check the Spark test-window lease first: ssh dgx01 test -f ~/ai/.test-window-lease)
+# e.g.  ./tbo_bench.sh --green --tiles          (check the Spark test-window lease first: ssh dgx01 test -f ~/ai/.test-window-lease)
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"           # the proto dir: includes are relative (../x3gm.cu, ../pfdense.cuh)
 IMAGE="${TBO_IMAGE:-nvcr.io/nvidia/cuda:13.0.1-devel-ubuntu24.04}"

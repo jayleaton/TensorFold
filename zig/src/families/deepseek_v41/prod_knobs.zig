@@ -189,9 +189,9 @@ pub fn pfTbo(get: Get) !bool {
     return error.BadKnob;
 }
 
-/// TF_DSV41_PF_TBO_GM_SMS (under TF_DSV41_PF_TBO): the SMs x3gm's persistent grid covers at most, 8-48 (default
-/// `tbo_gm_sms`: proto/tbo_bench.cu's split decides it on the Spark); 0: every SM.
-pub const tbo_gm_sms: u32 = 32;
+/// TF_DSV41_PF_TBO_GM_SMS (under TF_DSV41_PF_TBO): the SMs x3gm's persistent grid covers at most, 8-48; 0 (the
+/// default: proto/tbo_bench on dgx-01, 2026-10-09, best stream split at 4,096 rows uncapped): every SM.
+pub const tbo_gm_sms: u32 = 0;
 pub fn pfTboGmSms(get: Get) !u32 {
     const raw = std.mem.trim(u8, get("TF_DSV41_PF_TBO_GM_SMS") orelse return tbo_gm_sms, " ");
     const v = std.fmt.parseInt(u32, raw, 10) catch return badSms(raw);

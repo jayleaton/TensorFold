@@ -1376,7 +1376,13 @@ pub const own_scratch = [_][]const u8{ "s.ex.", "s.pf.xh", "s.pf.w", "s.router."
 /// "s.<tag>x"; the slot's state and the constants keep theirs.
 pub fn ownRole(a: std.mem.Allocator, r: []const u8, comptime tag: []const u8) ![]const u8 {
     if (std.mem.startsWith(u8, r, "s.")) {
-        for (own_scratch) |p| if (std.mem.startsWith(u8, r, p)) return std.fmt.allocPrint(a, "s." ++ tag ++ "{s}", .{r[2..]});
+        // a role already in a namespace ("s.b~ex.z") is scratch by its bare name
+        var bare = r[2..];
+        while (std.mem.indexOf(u8, bare, "~")) |i| {
+            if (std.mem.indexOfScalar(u8, bare[0..i], '.') != null) break;
+            bare = bare[i + 1 ..];
+        }
+        for (own_scratch) |p| if (std.mem.startsWith(u8, bare, p[2..])) return std.fmt.allocPrint(a, "s." ++ tag ++ "{s}", .{r[2..]});
         return r;
     }
     const dot = std.mem.indexOfScalar(u8, r, '.') orelse return std.fmt.allocPrint(a, tag ++ "{s}", .{r});
