@@ -55,6 +55,9 @@ pub const Options = struct {
     branch_rows: i64 = 64,
     /// TF_DSV41_MHC_DEFER (with R1): R1's coefficient launch tagged for the deferred stream, the next mHC call joins it
     mhc_defer: bool = false,
+    /// TF_DSV41_MHC_DEFER_AT=exchange (ours, with mhc_defer): each deferred launch issued at the next exchange
+    /// (calls.holdDeferred)
+    mhc_defer_hold: bool = false,
     /// TF_DSV41_MHC_PFDEC (ours, 0 = off): mixing mHC sites of windows of at least this many rows (1-64) as mhc_pf's site
     /// + the normed input + mhc_cuda's coef_kernel (block_wide.zig); the same bits as the path they replace
     mhc_pf_rows: i64 = 0,
@@ -1080,6 +1083,7 @@ pub const Emitter = struct {
 pub fn emit(a: std.mem.Allocator, cfg: *const Config, w: *const Widths, o: Options, layers: []const u32, n: i64, start: i64, head: bool) ![]calls.Call {
     var e: Emitter = .{ .a = a, .cfg = cfg, .w = w, .o = o, .n = n, .start = start };
     try e.window(layers, head);
+    if (o.mhc_defer_hold) calls.holdDeferred(e.out.items);
     return e.out.items;
 }
 

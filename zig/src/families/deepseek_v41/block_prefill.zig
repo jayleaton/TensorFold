@@ -1091,5 +1091,6 @@ fn emitPart(a: std.mem.Allocator, cfg: *const Config, w: *const block.Widths, o:
     if (ring < n + W - 1) return error.Unsupported; // attn_pf: the ring must hold the rows and their windows
     var s: Seg = .{ .e = &e, .staged = staged, .ring = ring, .short = n <= 16, .part = part };
     try s.run(layers, head);
+    if (o.mhc_defer_hold) calls.holdDeferred(e.out.items);
     return e.out.items;
 }
