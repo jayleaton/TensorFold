@@ -72,6 +72,10 @@ pub const Options = struct {
     taps: bool = false,
     /// rows a prefill segment holds at most (forward.pchunk): sizes the SWA staging ring (block_prefill.zig)
     prefill_rows: i64 = 2048,
+    /// TF_DSV41_PF_4K (G16 4K, pf4k.py): prefill segments up to 4,096 rows, x3gm's row block the whole segment (the
+    /// expert scratch holds it, as pf4k's arena: the trellis streams once a segment, not once a 2,048 rows), the router
+    /// in 2,048-row launches (router_gemv.CHUNK). Off: Python prod's 2,048 (a longer segment is refused)
+    pf4k: bool = false,
     /// R1 (prod-perf1's decode knobs, docs DSV41-DECODE-R1.md; the same bits): attention split 4 with q's RoPE in the
     /// kernel (ATTN_SPLIT, ATTN_ROPE), mHC's parallel tail + deferred coefficients (MHC_TAIL, MHC_DEFER), the router's
     /// prune + kit rounding (RG_PRUNE, PRUNE_KIT), a bf16 MoE partial (MOE_BF16), q_norm folded into its consumers'

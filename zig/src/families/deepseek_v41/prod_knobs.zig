@@ -126,20 +126,45 @@ pub fn pfDense(a: std.mem.Allocator, io: std.Io, get: Get) !?*const PfDense {
     return p;
 }
 
-/// A prompt segment's rows: min(TF_DSV41_PREFILL_CHUNK, TF_DSV41_PREFILL_ROWS), on the 16-row grid, 32-2,048; null
-/// when neither is set (the forward's default, 2,048).
-pub fn prefillRows(get: Get) !?u32 {
-    var rows: ?u32 = null;
-    for ([_][]const u8{ "TF_DSV41_PREFILL_CHUNK", "TF_DSV41_PREFILL_ROWS" }) |name| if (get(name)) |raw| {
-        const v = std.fmt.parseInt(u32, std.mem.trim(u8, raw, " "), 10) catch return badRows(name, raw);
-        if (v < 32 or v > 2048 or v % 16 != 0) return badRows(name, raw);
-        rows = if (rows) |r| @min(r, v) else v;
-    };
-    return rows;
+/// pf4k.TARGET: the only prefill segment above 2,048 rows (G16 4K)
+pub const pf4k_rows: u32 = 4096;
+
+/// TF_DSV41_PF_4K (pf4k.on / check: "0" or "1"): 4,096-row prefill segments, refused without
+/// TF_DSV41_PF_4K_MEMORY_OK=1 (a 4K segment holds about 0.66 GiB more on the worker than a 2K one, pf4k.terms). Unset
+/// or "0": off (Python prod's 2,048).
+pub fn pf4k(get: Get) !bool {
+    const raw = std.mem.trim(u8, get("TF_DSV41_PF_4K") orelse "0", " ");
+    if (std.mem.eql(u8, raw, "0")) return false;
+    if (!std.mem.eql(u8, raw, "1")) {
+        std.log.warn("TF_DSV41_PF_4K={s}: 0 or 1", .{raw});
+        return error.BadKnob;
+    }
+    const ok = std.mem.trim(u8, get("TF_DSV41_PF_4K_MEMORY_OK") orelse "", " ");
+    if (!std.mem.eql(u8, ok, "1")) {
+        std.log.warn("TF_DSV41_PF_4K=1: 4,096-row prefill segments hold about 0.66 GiB more worker memory than 2,048-row ones; set TF_DSV41_PF_4K_MEMORY_OK=1 to acknowledge", .{});
+        return error.BadKnob;
+    }
+    return true;
 }
 
-fn badRows(name: []const u8, raw: []const u8) error{BadKnob} {
-    std.log.warn("{s}={s}: expected a multiple of 16 in 32..2048", .{ name, raw });
+/// A prompt segment's rows: min(TF_DSV41_PREFILL_CHUNK, TF_DSV41_PREFILL_ROWS), on the 16-row grid, 32-2,048; null
+/// when neither is set (the forward's default, 2,048). Under TF_DSV41_PF_4K=1: 4,096 (pf4k.chunk; the forward's
+/// segment is also the round planner's rows, so an explicit CHUNK or ROWS other than 4,096 is refused rather than
+/// silently keeping 2,048-row segments).
+pub fn prefillRows(get: Get) !?u32 {
+    const big = try pf4k(get);
+    var rows: ?u32 = null;
+    for ([_][]const u8{ "TF_DSV41_PREFILL_CHUNK", "TF_DSV41_PREFILL_ROWS" }) |name| if (get(name)) |raw| {
+        const v = std.fmt.parseInt(u32, std.mem.trim(u8, raw, " "), 10) catch return badRows(name, raw, big);
+        if (big and v != pf4k_rows) return badRows(name, raw, big);
+        if (v < 32 or (v > 2048 and !big) or v % 16 != 0) return badRows(name, raw, big);
+        rows = if (rows) |r| @min(r, v) else v;
+    };
+    return if (big) pf4k_rows else rows;
+}
+
+fn badRows(name: []const u8, raw: []const u8, big: bool) error{BadKnob} {
+    if (big) std.log.warn("{s}={s}: TF_DSV41_PF_4K=1 means 4,096-row segments (unset it or set 4096)", .{ name, raw }) else std.log.warn("{s}={s}: expected a multiple of 16 in 32..2048", .{ name, raw });
     return error.BadKnob;
 }
 
@@ -246,6 +271,13 @@ pub fn apply(f: *@import("forward.zig").Forward, a: std.mem.Allocator, io: std.I
     if (try indexBudget(&env)) |b| f.opts.index_budget = b;
     f.prefill_state.ahead = prefetchAhead(&env);
     f.opts.gm_v2 = try @import("gm2pf.zig").mode(&env);
+    f.opts.pf4k = try pf4k(&env);
+    // x3gm v1 at 4K runs pf4k's tuning table (128-member passes past 48 members an expert), which the emitter does not
+    // take; v2 keeps G6's tiles at any rows (x3gm.tuned2), so 4K is v2's alone
+    if (f.opts.pf4k and f.opts.gm_v2 == .off) {
+        std.log.scoped(.dsv41).err("TF_DSV41_PF_4K=1 needs TF_DSV41_GM_V2=1 (or split): x3gm v1's 4K tiles are not on the Zig emitter", .{});
+        return error.BadKnob;
+    }
     f.prefill_state.mode = try prefillMode(&env);
     // TF_DSV41_BRANCHES: the side stream exists before any capture
     if (f.branches == null) f.branches = try @import("branches.zig").install(f.gpa, f, rank);
@@ -262,7 +294,7 @@ pub fn apply(f: *@import("forward.zig").Forward, a: std.mem.Allocator, io: std.I
     }
     if (rank != 0) return;
     const log = std.log.scoped(.dsv41);
-    log.info("prod knobs: pf_dense {s}, prefill rows {d}, index budget {d} MiB, R1 {s}, prefetch ahead {s}, x3gm v2 {t}, prefill {t}", .{ if (f.opts.pfd != null) "fused" else "off", f.opts.prefill_rows, f.opts.index_budget >> 20, if (f.opts.r1) "on" else "off", if (f.prefill_state.ahead) "on" else "off", f.opts.gm_v2, f.prefill_state.mode });
+    log.info("prod knobs: pf_dense {s}, prefill rows {d}{s}, index budget {d} MiB, R1 {s}, prefetch ahead {s}, x3gm v2 {t}, prefill {t}", .{ if (f.opts.pfd != null) "fused" else "off", f.opts.prefill_rows, if (f.opts.pf4k) " (4K: one x3gm block a segment)" else "", f.opts.index_budget >> 20, if (f.opts.r1) "on" else "off", if (f.prefill_state.ahead) "on" else "off", f.opts.gm_v2, f.prefill_state.mode });
 }
 
 pub fn env(name: []const u8) ?[]const u8 {

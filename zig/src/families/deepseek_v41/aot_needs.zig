@@ -205,6 +205,9 @@ pub const Served = struct {
         o.limit = try envInt("TF_DSV41_CONTEXT", o.limit);
         o.rope_rows = o.limit + 2048;
         if (try knobs.prefillRows(&knobs.env)) |r| o.prefill_rows = r;
+        // TF_DSV41_PF_4K: 4,096-row segments (their Triton variants at those rows), x3gm v2 as apply has it
+        o.pf4k = try knobs.pf4k(&knobs.env);
+        o.gm_v2 = try @import("gm2pf.zig").mode(&knobs.env);
         if (try knobs.indexBudget(&knobs.env)) |b| o.index_budget = b;
         const drafts = envOn("TF_DSV41_DRAFTS", true);
         o.taps = drafts;
