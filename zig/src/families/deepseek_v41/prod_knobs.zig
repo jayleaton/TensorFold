@@ -225,6 +225,15 @@ pub fn streamRb(get: Get) !i64 {
     return error.BadKnob;
 }
 
+/// TF_DSV41_INDEX_BOUND (ours, 0 by default): decode windows' dense index scores as `_scores_b` (block.Options.index_bound).
+pub fn indexBound(get: Get) !bool {
+    const raw = std.mem.trim(u8, get("TF_DSV41_INDEX_BOUND") orelse "0", " ");
+    if (std.mem.eql(u8, raw, "0")) return false;
+    if (std.mem.eql(u8, raw, "1")) return true;
+    std.log.warn("TF_DSV41_INDEX_BOUND={s}: 0 or 1", .{raw});
+    return error.BadKnob;
+}
+
 /// TF_DSV41_PREFETCH_AHEAD (0 by default): the next prompt segment's Engram reads before this one runs.
 pub fn prefetchAhead(get: Get) bool {
     const v = get("TF_DSV41_PREFETCH_AHEAD") orelse return false;
@@ -241,6 +250,16 @@ pub fn kvNormStore(get: Get) bool {
 pub fn routerGroupRot(get: Get) bool {
     const v = get("TF_DSV41_ROUTER_GROUP_ROT") orelse return false;
     return std.mem.eql(u8, std.mem.trim(u8, v, " "), "1");
+}
+
+/// TF_DSV41_X3LD_EPI (ours, no Python twin; unset / 0 off, 1 on, anything else refused): the decode MoE's expert
+/// epilogues in x3ld's tail (block.Options.x3ld_epi, x3ld_epi.cu).
+pub fn x3ldEpi(get: Get) !bool {
+    const raw = std.mem.trim(u8, get("TF_DSV41_X3LD_EPI") orelse "0", " ");
+    if (std.mem.eql(u8, raw, "0")) return false;
+    if (std.mem.eql(u8, raw, "1")) return true;
+    std.log.warn("TF_DSV41_X3LD_EPI={s}: 0 or 1", .{raw});
+    return error.BadKnob;
 }
 
 /// prod-perf1's decode R1 under Python's names (ATTN_SPLIT=4 and the seven switches at 1), or TF_DSV41_R1 (ours,
@@ -349,6 +368,7 @@ pub fn promptSplit(n: usize, tail: PromptTail) struct { prefill: usize, window: 
 pub fn apply(f: *@import("forward.zig").Forward, a: std.mem.Allocator, io: std.Io, rank: u32) !void {
     f.opts.kv_norm_store = kvNormStore(&env);
     f.opts.router_group_rot = routerGroupRot(&env);
+    f.opts.x3ld_epi = try x3ldEpi(&env);
     f.opts.pfd = try pfDense(a, io, &env);
     // TF_DSV41_PF_4K: the forward's own options (decode windows, the drafter, the buffer plan) keep 2,048-row
     // segments byte for byte; 4,096-row segments run in the prefill's own workspace (forward_prefill.K4)
@@ -371,6 +391,7 @@ pub fn apply(f: *@import("forward.zig").Forward, a: std.mem.Allocator, io: std.I
     }
     f.opts.pf_tbo = try pfTbo(&env);
     f.opts.stream_rb = try streamRb(&env);
+    f.opts.index_bound = try indexBound(&env);
     // TF_DSV41_BRANCHES: the side stream exists before any capture
     if (f.branches == null) f.branches = try @import("branches.zig").install(f.gpa, f, rank);
     // TF_DSV41_PF_OVERLAP: the pieces' exchanges go on the branches' side stream (one peer: TP=2)
@@ -407,6 +428,8 @@ pub fn apply(f: *@import("forward.zig").Forward, a: std.mem.Allocator, io: std.I
     const log = std.log.scoped(.dsv41);
     log.info("KV norm/store fusion: {s}", .{if (f.opts.kv_norm_store) "on" else "off"});
     log.info("router grouping/rotation fusion: {s}", .{if (f.opts.router_group_rot) "on" else "off"});
+    if (f.opts.index_bound) log.info("index bound: decode index scores stop at each row's own keys (_scores_b)", .{});
+    if (f.opts.x3ld_epi) log.info("x3ld epilogues: gateup_epilogue / down_combine fused into the decode expert streamer (TF_DSV41_X3LD_EPI)", .{});
     if (f.opts.stream_rb > 0) log.info("stream top-k: {d} rows a program (_stream_rb{d})", .{ f.opts.stream_rb, f.opts.stream_rb });
     if (f.opts.pf_tbo) log.info("prefill tbo: encoder segments two at a time on two streams, x3gm on at most {d} SMs (0: all){s}", .{ dk.exl3.gm_sms_cap, if (f.opts.pf_overlap > 0) "; TF_DSV41_PF_OVERLAP is off under it" else "" });
     if (f.opts.pf_overlap > 0) log.info("prefill overlap: a segment's exchanges in {d} row pieces on the side stream{s}", .{ f.opts.pf_overlap, if (f.opts.pf_overlap_site) ", every piece; the next mixing site in the same pieces, each after its own" else "" });

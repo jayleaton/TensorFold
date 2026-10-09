@@ -160,7 +160,7 @@ pub const Rewriter = struct {
     fn triton(w: *const Rewriter, c: calls.Call) !calls.Call {
         const args = @constCast(c.args);
         const writes = eq(c.name, "_kv_store") or eq(c.name, "_pool_norm") or eq(c.name, "_index_k");
-        const reads = eq(c.name, "_scores");
+        const reads = eq(c.name, "_scores") or eq(c.name, "_scores_b");
         if (eq(c.name, "_rope")) {
             const p = find(args, "POS") orelse return error.BadCall;
             args[p].arg = w.col(.pos);
