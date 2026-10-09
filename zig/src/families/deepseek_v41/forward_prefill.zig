@@ -865,6 +865,7 @@ pub fn finish(f: *Forward) !void {
 /// tensors' rows 0 .. n.
 fn stashCopy(f: *Forward, r: *run.Runner, c: *const calls.Call, store: bool) !void {
     const p = f.slot.pending orelse return error.BadGlue;
+    if (f.pf_stash) |h| try h.run(h.ctx); // the ring holds this slot's rows (slots.zig swaps it lazily)
     const x = c.args;
     if (x.len != 2 * ced.roles.len) return error.BadGlue;
     const k: u64 = @min(p.n, ced.ring);

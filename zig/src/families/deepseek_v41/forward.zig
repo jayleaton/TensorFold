@@ -133,6 +133,9 @@ pub const Forward = struct {
     /// several live slots (slots.zig): a multi-segment prefill run's slot switch, on this rank only (every rank runs the
     /// same run); null: one slot, no runs
     pf_switch: ?PfSwitch = null,
+    /// with `pf_switch`: the CED stash ring made the current slot's before a stash step reads or writes it (slots.zig
+    /// swaps it lazily: a run's slot switches leave it where it is)
+    pf_stash: ?PfStash = null,
     /// the multi-segment prefill run in flight (forward_prefill.promptMulti; its glue reads it), null outside one
     multi: ?*pf.Multi = null,
     /// the keyed sampler (sampling_gpu.zig): a follower runs rank 0's sampled choices too (their gathers pair up)
@@ -511,6 +514,7 @@ pub const Forward = struct {
 
     /// A slot's views made current on this rank (slots.zig SlotSet.view), for a multi-segment run's segments.
     pub const PfSwitch = struct { ctx: *anyopaque, run: *const fn (ctx: *anyopaque, slot: u32) anyerror!void };
+    pub const PfStash = struct { ctx: *anyopaque, run: *const fn (ctx: *anyopaque) anyerror!void };
 
     /// Several slots' prompt segments in one run (forward_prefill.promptMulti, TF_DSV41_PIECE_RUNS): each segment's ids
     /// from its slot's position, every slot's state then moved past its segment. The leader sends the run first.
