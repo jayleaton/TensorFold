@@ -205,6 +205,21 @@ pub const Forward = struct {
         return pf.plan(f, p, rows);
     }
 
+    /// The next prompt piece's ids, read ahead behind the coming `prefill` call's last segment (forward_prefill's
+    /// `next`; TF_DSV41_PREFETCH_AHEAD): every rank, [op, ids...]. I/O only: a wrong guess costs a read, never a bit.
+    pub fn prefillAhead(f: *Forward, next: []const u32) !void {
+        if (!f.prefill_state.ahead or next.len == 0) return;
+        if (f.leads()) {
+            const msg = try f.gpa.alloc(i64, 1 + next.len);
+            defer f.gpa.free(msg);
+            msg[0] = op_ahead;
+            for (next, msg[1..]) |t, *y| y.* = t;
+            try f.link.?.send(msg);
+        }
+        f.prefill_state.next.clearRetainingCapacity();
+        try f.prefill_state.next.appendSlice(f.gpa, next);
+    }
+
     /// The prompt `ids` from the slot's position (forward_prefill.zig): segments of opts.prefill_rows rows, each run
     /// then kept whole; a tail of at most 16 rows as decode windows. After it the position has moved by ids.len,
     /// nothing is pending, and "w.logits" holds `last_rows` rows (the caller's greedy(out[0..last_rows]), last row).
@@ -444,6 +459,8 @@ pub const Forward = struct {
     const op_ds_ingest: i64 = 5;
     const op_ds_propose: i64 = 6;
     const op_prefill: i64 = 7;
+    /// 60: [op, ids...] the next prompt piece's ids for the coming prefill's Engram read-ahead (prefillAhead)
+    const op_ahead: i64 = 60;
     const op_sess_save: i64 = 8;
     const op_sess_restore: i64 = 9;
     const op_release: i64 = 10;
@@ -655,6 +672,12 @@ pub const Forward = struct {
                     for (msg[3..]) |t| try prompt.append(f.gpa, @intCast(t));
                     if (prompt.items.len > total) return error.BadPlan;
                     if (prompt.items.len == total) try f.prefill(prompt.items);
+                },
+                op_ahead => {
+                    var nx: std.ArrayList(u32) = .empty;
+                    defer nx.deinit(f.gpa);
+                    for (msg[1..]) |t| try nx.append(f.gpa, @intCast(t));
+                    try f.prefillAhead(nx.items);
                 },
                 op_keep => try f.keep(@intCast(msg[1])),
                 op_release => try f.release(),

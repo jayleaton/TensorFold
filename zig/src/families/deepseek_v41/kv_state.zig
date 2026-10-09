@@ -49,6 +49,9 @@ pub const Options = struct {
     /// bytes the Zig plan holds resident that the measured terms (Python's) never held: the long-prompt stream
     /// scratch (prod_knobs.streamScratch); added to the boot growth
     resident: u64 = 0,
+    /// TF_DSV41_PF_4K / TF_DSV41_PF_TBO: the prefill workspace a long prompt allocates on top of everything above
+    /// (forward_prefill.workspaceBytes); the predicted worst MemAvailable minus it must clear the hard floor
+    workspace: u64 = 0,
 };
 
 /// TF_DSV41_POOL_TOKENS / TF_DSV41_KV_SPLIT / TF_DSV41_KV_SPLIT_UNION_MIB (null: no pool, the contiguous slot).
@@ -102,6 +105,17 @@ pub fn bootCheck(ctx: *const cuda.Context, cfg: *const Config, o: Options, rank:
         return error.PoolDoesNotFit;
     }
     std.log.info("kv: {s}", .{r.message(&buf)});
+    // the workspace on top of the worst serving point: the 4K / TBO path's transient the measured terms never held
+    if (o.workspace > 0) {
+        const ws = @as(f64, @floatFromInt(o.workspace)) / budget.GiB;
+        const left = r.worst - ws;
+        if (left < r.hard) {
+            std.log.err("kv: rank {d}: the prefill workspace ({d:.2} GiB, TF_DSV41_PF_4K / TF_DSV41_PF_TBO) on top of the predicted worst MemAvailable {d:.2} GiB leaves {d:.2} GiB, under the {d:.1} GiB hard floor (TF_DSV41_FLOOR_HARD_GIB): lower TF_DSV41_POOL_TOKENS by about {d:.0} tokens, or drop TF_DSV41_PF_TBO (4K alone holds half of 4K + TBO's)", .{ rank, ws, r.worst, left, r.hard, (r.hard - left) * budget.GiB / @max(1.0, r.bytes_a_token) });
+            return error.PoolDoesNotFit;
+        }
+        std.log.info("kv: rank {d}: prefill workspace {d:.2} GiB at a long prompt: worst MemAvailable {d:.2} GiB with it (hard floor {d:.1})", .{ rank, ws, left, r.hard });
+        if (left < target) std.log.warn("kv: memory: with the prefill workspace the floor {d:.2} GiB is under the {d} GiB target (TF_DSV41_FLOOR_GIB)", .{ left, target });
+    }
     if (r.worst < target) std.log.warn("kv: memory: floor {d:.2} GiB is under the {d} GiB target (TF_DSV41_FLOOR_GIB)", .{ r.worst, target });
 }
 
