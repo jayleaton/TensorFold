@@ -193,14 +193,21 @@ def mixwin_cell(url: str, model: str, n: int) -> dict:
     rates = [r.get("decode_tok_s") for r in res]
     lo = max((r["first"] for r in res if r.get("first")), default=0.0)
     hi = min((r["last"] for r in res if r.get("last")), default=0.0)
-    agg = live = None
+    agg = live = live_chunks = None
     if hi > lo and not errors:
         agg = round(sum(r["decode_tok_s"] * (hi - lo) for r in res if r.get("decode_tok_s")) / (hi - lo), 2)
-        inside = [t for t in res[0].get("times") or [] if lo <= t <= hi]
-        live = round((len(inside) - 1) / (inside[-1] - inside[0]), 2) if len(inside) > 1 and inside[-1] > inside[0] else None
+        # the long stream's TOKENS inside the all-live span: `times` holds one entry a content chunk (a chunk is one
+        # decode round's accepted tokens, ~3-4 with drafts), so chunks inside x the reply's tokens a chunk; counting
+        # the chunks alone gave rounds a second (~9.8 at x4), read as a near-stalled long stream
+        times0 = res[0].get("times") or []
+        inside = [t for t in times0 if lo <= t <= hi]
+        per_chunk = (res[0]["tokens"] - 1) / (len(times0) - 1) if len(times0) > 1 and res[0].get("tokens") else 1.0
+        ok = len(inside) > 1 and inside[-1] > inside[0]
+        live = round((len(inside) - 1) * per_chunk / (inside[-1] - inside[0]), 2) if ok else None
+        live_chunks = round((len(inside) - 1) / (inside[-1] - inside[0]), 2) if ok else None
     return {"work": f"mixwin-{n}", "temp": 0.0, "streams": 4, "per_stream": rates,
             "mean_tok_s": round(sum(x for x in rates if x) / max(1, len([x for x in rates if x])), 2),
-            "aggregate_tok_s": agg, "long_live_tok_s": live, "live_span_s": round(hi - lo, 3) if hi > lo else None,
+            "aggregate_tok_s": agg, "long_live_tok_s": live, "long_live_chunks_s": live_chunks, "live_span_s": round(hi - lo, 3) if hi > lo else None,
             "prompt_tokens": res[0].get("prompt_tokens"), "ttft_s": [r.get("ttft_s") for r in res],
             "tokens": [r.get("tokens") for r in res], "sha": [r.get("sha") for r in res], "tpr": [r.get("tpr") for r in res],
             "mean_tpr": mean([r.get("tpr") for r in res]), "failed_streams": len(errors), "errors": errors[:4], "rep": 0}
