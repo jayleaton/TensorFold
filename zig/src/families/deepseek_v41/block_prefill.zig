@@ -293,7 +293,13 @@ const Seg = struct {
         // the decoder replay's boundaries write the streams in place (replay.finish's Streams has no `alt`)
         if (s.short) return moe.mhcInto(e, L, which, mode, s.part == .decoder);
         const n = e.n;
-        if (pend > 1 and mode == .boundary and n >= pend * pf_rows and n > split_rows) return s.sitePieces(L, which, pend);
+        if (pend > 1 and mode == .boundary and n >= pend * pf_rows and n > split_rows) return s.sitePieces(L, which, pend, true);
+        // TF_DSV41_MHC_SITE_ROWS: the boundary in row pieces on the main stream, each piece's partials and normed
+        // input still in L2 when its `_finish_k` reads them
+        if (mode == .boundary and e.o.mhc_site_rows > 0 and n > e.o.mhc_site_rows) {
+            const k = cdiv(n, e.o.mhc_site_rows);
+            if (n >= k * pf_rows) return s.sitePieces(L, which, k, false);
+        }
         const D: i64 = e.cfg.hidden;
         const post = mode == .boundary;
         const x = try e.streams();
@@ -328,7 +334,8 @@ const Seg = struct {
     /// pieces run beside the later pieces' exchanges. mhc_pf.run and `_finish_k` are row-wise (a row's streams in place,
     /// its gathered rows, its coefficients, its partials; no row reads another, and each piece is >= 256 rows, so
     /// mhc_pf as for the whole): the site's calls over row views, every row the same bits.
-    fn sitePieces(s: *Seg, L: u32, which: []const u8, k: i64) !void {
+    /// `overlapped` false (TF_DSV41_MHC_SITE_ROWS): the pieces one after another on the main stream, no marks.
+    fn sitePieces(s: *Seg, L: u32, which: []const u8, k: i64, overlapped: bool) !void {
         const e = s.e;
         const n = e.n;
         const D: i64 = e.cfg.hidden;
@@ -343,14 +350,16 @@ const Seg = struct {
         const g = try gathered(e, which);
         const tap = try tapOf(e, L, which, .boundary);
         const nw = try e.weight("L{d}.{s}", .{ L, if (std.mem.eql(u8, which, "hc_attn")) "attn_norm" else "ffn_norm" }, .f32, &.{D});
-        e.br_join = false; // piece p waits for its own exchange piece; the last joins
+        if (overlapped) e.br_join = false; // piece p waits for its own exchange piece; the last joins
         defer e.n = n;
         var p: i64 = 0;
         while (p < k) : (p += 1) {
             const r = pieceAt(n, k, p);
             const m = r[1] - r[0];
             e.n = m;
-            if (p + 1 < k) e.br_wait = @intCast(p + 1) else e.br_join = true;
+            if (overlapped) {
+                if (p + 1 < k) e.br_wait = @intCast(p + 1) else e.br_join = true;
+            }
             const xr = try rowsOf(e, x, .bf16, r[0], m, 4 * D);
             const nx: [3]Arg = .{ try rowsOf(e, next[0], .f32, r[0], m, 4), try rowsOf(e, next[1], .f32, r[0], m, 4), try rowsOf(e, next[2], .f32, r[0], m, 16) };
             const pr = try e.view(part.t.role, .f32, &.{ m, 4, 40, 32 }, &.{ 4 * 40 * 32, 40 * 32, 32, 1 }, r[0] * 4 * 40 * 32 * 4);
@@ -738,10 +747,15 @@ const Seg = struct {
             const nk = @max(@divFloor(e.start + a + rows, ratio), 1);
             const ns = longpf.splits(nk);
             const buf = try e.buf("L.ix.stream", .{}, .i64, &.{ rows, ns, 2 * topk });
-            if (e.o.stream_rb == 2 or e.o.stream_rb == 4) {
-                // TF_DSV41_STREAM_RB: `_stream_rb<N>`, N rows a program (the same buffers, the same merge)
+            if (e.o.stream_rb == 1 or e.o.stream_rb == 2 or e.o.stream_rb == 4) {
+                // TF_DSV41_STREAM_RB: `_stream_pf` (1) or `_stream_rb<N>`, N rows a program (the same buffers, the
+                // same merge)
                 const rb = e.o.stream_rb;
-                try e.triton(if (rb == 2) "_stream_rb2" else "_stream_rb4", .{ cdiv(rows, rb), ns, 1 }, &.{
+                try e.triton(switch (rb) {
+                    1 => "_stream_pf",
+                    2 => "_stream_rb2",
+                    else => "_stream_rb4",
+                }, .{ cdiv(rows, rb), ns, 1 }, &.{
                     .{ .name = "QI", .arg = try e.view(.{ .buf = "L.qi" }, .bf16, &.{ rows, IH, ID }, &.{ IH * ID, ID, 1 }, (e.row0 + a) * IH * ID * 2) },
                     .{ .name = "W", .arg = try e.view(.{ .buf = "L.ix_w" }, .f32, &.{ rows, IH }, &.{ IH, 1 }, (e.row0 + a) * IH * 4) },
                     .{ .name = "w_stride", .arg = .{ .i = IH } },           .{ .name = "IK", .arg = try indexKeys(e, src) },

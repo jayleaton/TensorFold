@@ -322,3 +322,60 @@ fn shared4k(aa: std.mem.Allocator, p2: *const buffers.Plan, p4: *const buffers.P
         }
     }
 }
+
+test "TF_DSV41_GM_GU2: 0 / 1, and a 4,096-row segment's gate / up at GU2 over its own 128-member plan, down unchanged" {
+    Fake.pairs = &.{};
+    try testing.expect(!try pk.gmGu2(&Fake.get));
+    Fake.pairs = &.{.{ "TF_DSV41_GM_GU2", "1" }};
+    try testing.expect(try pk.gmGu2(&Fake.get));
+    Fake.pairs = &.{.{ "TF_DSV41_GM_GU2", "2" }};
+    try testing.expectError(error.BadKnob, pk.gmGu2(&Fake.get));
+    Fake.pairs = &.{};
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const cfg: Config = .{};
+    const w = try widths(aa);
+    const layers = [_]u32{ 1, 2, 3 };
+    const four: block.Options = .{ .gm_v2 = .one, .limit = 1 << 16, .rope_rows = (1 << 16) + 2048, .pf4k = true, .prefill_rows = 4096 };
+    var on_o = four;
+    on_o.gm_gu2 = true;
+    for ([_]i64{ 2048, 4096 }) |n| {
+        const off = try bp.emitPrefill(aa, &cfg, &w, four, &layers, n, 0, false);
+        const gu2 = try bp.emitPrefill(aa, &cfg, &w, on_o, &layers, n, 0, false);
+        if (n < 4096) { // a 2K segment: the knob changes nothing
+            try sameCalls(off, gu2, 1);
+            continue;
+        }
+        // one more plan a MoE call (gate / up's, 128-member passes), every other call the same in order
+        try testing.expectEqual(off.len + layers.len, gu2.len);
+        var i: usize = 0;
+        var gu: usize = 0;
+        var dn: usize = 0;
+        for (gu2, 0..) |c, j| {
+            if (std.mem.eql(u8, c.name, "glue.gm_plan") and c.args[8].arg.i == 128) {
+                // its roles: its own ("L.gm.h0.*"), the same picks
+                try testing.expect(std.mem.startsWith(u8, roleOf(c.args[1].arg), "L.gm.h0."));
+                try testing.expectEqualStrings(roleOf(off[i - 1].args[0].arg), roleOf(c.args[0].arg));
+                continue;
+            }
+            try testing.expectEqualStrings(off[i].name, c.name);
+            if (std.mem.eql(u8, c.name, "tf_dsv41_x3gm_v1.gateup2")) {
+                try testing.expectEqual(@as(i64, 2), c.args[18].arg.i); // GU2
+                try testing.expect(std.mem.startsWith(u8, roleOf(c.args[5].arg), "L.gm.h0.")); // its plan
+                try testing.expectEqualStrings("glue.gm_plan", gu2[j - 1].name);
+                gu += 1;
+            }
+            if (std.mem.eql(u8, c.name, "tf_dsv41_x3gm_v1.down2")) {
+                try testing.expectEqual(@as(i64, 0), c.args[13].arg.i); // DN0
+                try testing.expect(std.mem.startsWith(u8, roleOf(c.args[3].arg), "L.gm.g0.")); // the 64-member plan
+                for (c.args, off[i].args) |x, y| try testing.expectEqualDeep(y.arg, x.arg);
+                dn += 1;
+            }
+            i += 1;
+        }
+        try testing.expectEqual(off.len, i);
+        try testing.expectEqual(layers.len, gu);
+        try testing.expectEqual(layers.len, dn);
+    }
+}

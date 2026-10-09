@@ -18,10 +18,12 @@ const Fake = struct {
     }
 };
 
-test "TF_DSV41_STREAM_RB: 0 / 2 / 4" {
+test "TF_DSV41_STREAM_RB: 0 / 1 / 2 / 4" {
     defer Fake.pairs = &.{};
     Fake.pairs = &.{};
     try testing.expectEqual(@as(i64, 0), try pk.streamRb(&Fake.get));
+    Fake.pairs = &.{.{ "TF_DSV41_STREAM_RB", "1" }};
+    try testing.expectEqual(@as(i64, 1), try pk.streamRb(&Fake.get));
     Fake.pairs = &.{.{ "TF_DSV41_STREAM_RB", "2" }};
     try testing.expectEqual(@as(i64, 2), try pk.streamRb(&Fake.get));
     Fake.pairs = &.{.{ "TF_DSV41_STREAM_RB", "4" }};
@@ -51,12 +53,16 @@ test "TF_DSV41_STREAM_RB on the long-context prefill: _stream_rb<N> in place of 
         var streams: usize = 0;
         for (off) |c| streams += @intFromBool(std.mem.eql(u8, c.name, "_stream"));
         try testing.expect(streams > 0); // layers 2 / 8 / 14 past 4,096 keys
-        for ([_]i64{ 2, 4 }) |rb| {
+        for ([_]i64{ 1, 2, 4 }) |rb| {
             var o = base;
             o.stream_rb = rb;
             const on = try bp.emitReplay(aa, &cfg, &w, o, &enc, n, start, .encoder);
             try testing.expectEqual(off.len, on.len);
-            const want = if (rb == 2) "_stream_rb2" else "_stream_rb4";
+            const want = switch (rb) {
+                1 => "_stream_pf",
+                2 => "_stream_rb2",
+                else => "_stream_rb4",
+            };
             var seen: usize = 0;
             for (off, on) |x, y| {
                 if (!std.mem.eql(u8, x.name, "_stream")) {

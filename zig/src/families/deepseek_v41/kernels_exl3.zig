@@ -110,6 +110,8 @@ pub const GmShape = struct {
 
 /// x3gm v2 (gm2_kernel): the tiles it is built at (x3gm.py V2_GU / V2_DN).
 pub const v2_gu = [_]usize{ 0, 1 };
+/// gate / up's 128-member tile (gu_tiles[2], NG 16) that x3gm3.cu builds gm2_kernel at, two inputs only
+pub const gu2_cfg: usize = 2;
 pub const v2_dn = [_]usize{0};
 
 /// x3gm.cu Smem2<MATS, XM, tile>: one launch over every width of gm_k2s, so the widest width's dynamic shared memory;
@@ -328,6 +330,8 @@ pub const Functions = struct {
     gm_plan: cuda.Function,
     gm2_gu: [2][v2_gu.len]Gm, // [xm - 1][cfg]
     gm2_dn: Gm,
+    /// gm2_kernel at GU2 (128-member gate / up, two inputs): x3gm3.cu's instance (TF_DSV41_GM_GU2)
+    gm2_gu2: Gm,
     gm3: [v3_variants.len]Gm,
     epi: [3][epi_pds.len][ranges.len]cuda.Function, // [EpiKind][pd - 1][range]
 
@@ -366,6 +370,7 @@ pub const Functions = struct {
             f.gm2_gu[xm - 1][ci] = try gmResolve(x3gm, gm2GuSymbol(xm, c), gm2Shape(2, xm, gu_tiles[c]), optin);
         };
         f.gm2_dn = try gmResolve(x3gm, gm2DnSymbol(0), gm2Shape(1, 1, dn_tiles[0]), optin);
+        f.gm2_gu2 = try gmResolve(x3gm3, gm2GuSymbol(2, gu2_cfg), gm2Shape(2, 2, gu_tiles[gu2_cfg]), optin);
         inline for (v3_variants, 0..) |v, i| f.gm3[i] = try gmResolve(x3gm3, gm3Symbol(v), gm2Shape(v.mats, v.xm, v.t), optin);
         f.gm_plan = try x3gm_plan.function("_ZN15dsv41_x3gm_plan11plan_kernelEPKiiiiPiS2_S2_S2_S2_");
         f.gm_rot = .{ .{ try x3gm.function(gm_sym.rot_bf16_1), try x3gm.function(gm_sym.rot_bf16_2) }, .{ try x3gm.function(gm_sym.rot_f16_1), try x3gm.function(gm_sym.rot_f16_2) } };
@@ -689,7 +694,8 @@ pub const Ops = struct {
     /// dsv41_x3gm_gateup2_cuda (x3gm v2): Xd of every pass of every width in one launch; `k2e` int32 [E] the experts'
     /// gate widths (each in gm_k2s: gm2WidthsOk), `tables`: tg / tu are int64 pointer tables (ragged), else the stacks.
     pub fn gm2Gateup(o: Ops, xg: u64, xu: u64, tg: u64, tu: u64, k2e: u64, order: u64, pe: u64, poff: u64, pcnt: u64, npass: u64, ticket: u64, svh_g: u64, svh_u: u64, suh_d: u64, xd: u64, K: usize, N: usize, shx: bool, cfg: usize, use_ticket: bool, limit: f32, tables: bool) !void {
-        const ci = std.mem.indexOfScalar(usize, &v2_gu, cfg) orelse return error.Unsupported;
+        const gu2 = cfg == gu2_cfg and !shx;
+        const ci = std.mem.indexOfScalar(usize, &v2_gu, cfg) orelse if (gu2) 0 else return error.Unsupported;
         try gmCheck(.gu, cfg, K, N);
         var a: GmArgs = .{ .x0 = xg, .x1 = xu, .k2e = k2e, .order = order, .pe = pe, .poff = poff, .pcnt = pcnt, .npass = npass, .ticket = ticket, .sv0 = svh_g, .sv1 = svh_u, .sd = suh_d, .xd = xd, .K = int(K), .N = int(N), .limit = limit };
         if (tables) {
@@ -699,7 +705,7 @@ pub const Ops = struct {
             a.t0 = tg;
             a.t1 = tu;
         }
-        try o.gmLaunch(o.f.gm2_gu[if (shx) 0 else 1][ci], a, use_ticket);
+        try o.gmLaunch(if (gu2) o.f.gm2_gu2 else o.f.gm2_gu[if (shx) 0 else 1][ci], a, use_ticket);
     }
 
     /// dsv41_x3gm_down2_cuda (x3gm v2): Y of every pass of every width in one launch; `k2e` the experts' down widths.
@@ -805,6 +811,13 @@ test "x3gm v2 shapes and tuning" {
     try std.testing.expectEqual([2]usize{ 1, 0 }, gmTuned2(3, 2, false));
     try std.testing.expect(gm2WidthsOk(&.{ 3, 10, 6 }));
     try std.testing.expect(!gm2WidthsOk(&.{ 2, 6 }));
+}
+
+test "x3gm v2 at GU2 (TF_DSV41_GM_GU2, x3gm3.cu's instance): 512 threads, every width's ring in sm_121's opt-in memory" {
+    const s = gm2Shape(2, 2, gu_tiles[gu2_cfg]);
+    try std.testing.expectEqual(@as(u32, 512), s.threads);
+    try std.testing.expect(s.smem > 0 and s.smem + 4 * 8 * gu_tiles[gu2_cfg][1] + 4 <= gm_smem_max);
+    try std.testing.expectEqualStrings("_ZN10dsv41_x3gm10gm2_kernelILi2ELi2ELi1ELi16ELi2ELi4ELi4EEEvNS_4ArgsE", gm2GuSymbol(2, gu2_cfg));
 }
 
 test "x3gm shapes, fits and tuning as x3gm.py" {
