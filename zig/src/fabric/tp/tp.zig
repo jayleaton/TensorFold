@@ -178,6 +178,14 @@ pub const Session = struct {
         s.comm().abort();
     }
 
+    /// This rank failed after `open`, before serving (a model's load, its assets, its buffers): the other ranks learn
+    /// why and go down (fail-fast), and nothing of the session runs on once its owner frees it (the fate thread read a
+    /// freed session: rank 1's segfault in fate.report, Spark 2026-10-09).
+    pub fn bootFailed(s: *Session, err: anyerror) void {
+        if (s.fate) |*f| f.failBoot("boot", err);
+        s.close();
+    }
+
     /// A normal stop: every rank calls it (rank 0 first marks the stop as expected with `fate.expectStop`).
     pub fn close(s: *Session) void {
         if (s.fate) |*f| f.close();

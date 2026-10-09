@@ -23,6 +23,10 @@ const grace = 50 * std.time.ns_per_ms;
 
 /// Two connected ranks' fate channels (rank 0 first), started, with recorded exits and hooks.
 fn pair(fates: *[2]Fate) !void {
+    return pairAt(.{ &fates[0], &fates[1] });
+}
+
+fn pairAt(fates: [2]*Fate) !void {
     const l = try bootstrap.testListener();
     defer sock.close(l.fd);
     const deadline = sock.nowNs() + 5 * std.time.ns_per_s;
@@ -32,13 +36,13 @@ fn pair(fates: *[2]Fate) !void {
     var fds1: [fate.max_ranks]sock.Fd = @splat(-1);
     fds0[1] = b;
     fds1[0] = a;
-    for (fates, [2][fate.max_ranks]sock.Fd{ fds0, fds1 }, 0..) |*f, fds, r| {
+    for (fates, [2][fate.max_ranks]sock.Fd{ fds0, fds1 }, 0..) |f, fds, r| {
         f.* = Fate.init(.{ .world = 2, .rank = @intCast(r), .grace_ns = grace, .report_ns = 20 * std.time.ns_per_ms }, fds);
         f.exit_fn = recordExit;
         f.usable = fakeUsable;
         f.onFail(.{ .ctx = f, .call = hook });
     }
-    for (fates) |*f| try f.start();
+    for (fates) |f| try f.start();
 }
 
 fn fakeUsable() u64 {
@@ -106,4 +110,24 @@ test "a normal stop ends nobody" {
     fates[0].close();
     sock.sleepNs(2 * grace);
     try std.testing.expectEqual(@as(u32, 0), exits.load(.acquire));
+}
+
+test "a rank failing at boot ends both with its reason, and its channel is down before its owner frees it" {
+    // Spark 2026-10-09: a follower's boot failed after its session came up; its Model (the Fate inside) was freed with
+    // the fate thread running, which then read the freed Fate (segfault in report)
+    reset();
+    // rank 1's Fate where a Model keeps it: on the heap, its pages unmapped when freed (a stale read faults)
+    const pa = std.heap.page_allocator;
+    var f0: Fate = undefined;
+    const f1 = try pa.create(Fate);
+    try pairAt(.{ &f0, f1 });
+    defer f0.close();
+    sock.sleepNs(60 * std.time.ns_per_ms);
+    f1.failBoot("boot", error.RopeTooShort);
+    try std.testing.expect(f1.thread == null);
+    pa.destroy(f1);
+    _ = try waitExits(2);
+    // several report periods with rank 1's Fate gone: its thread would have reported from freed memory
+    sock.sleepNs(5 * 20 * std.time.ns_per_ms);
+    try std.testing.expect(std.mem.indexOf(u8, f0.reason(), "rank 1 failed in boot: RopeTooShort") != null);
 }

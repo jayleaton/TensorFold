@@ -159,6 +159,19 @@ pub const Model = struct {
         try m.session.open(&m.driver, m.tcfg, image);
         // TF_DSV41_ARENA: every device buffer from here on (weights, forms, roles, scratch) carved from large chunks
         _ = try @import("dev_arena.zig").install(gpa, &m.ctx, m.tcfg.rank);
+        // a failure from here to serving (assets, limits, buffers): every rank down with its reason, the session closed
+        // before `m` is freed (the fate thread read a freed session: Spark 2026-10-09)
+        m.boot(gpa, io, pack_dir, assets, o) catch |err| {
+            m.session.bootFailed(err);
+            return err;
+        };
+        return m;
+    }
+
+    /// `open` from the session up: the pack, weights, forward, buffers, assets and serving parts of this rank.
+    fn boot(m: *Model, gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, assets: []const u8, o: Options) !void {
+        const a = m.arena.allocator();
+        const cwd = std.Io.Dir.cwd();
         const comm = m.session.comm();
         const world: u32 = @intCast(comm.world());
         m.cfg = try Config.read(gpa, io, pack_dir);
@@ -335,7 +348,6 @@ pub const Model = struct {
         }
         try m.driver.check(m.driver.api.cuCtxSynchronize(), "cuCtxSynchronize");
         try comm.barrier();
-        return m;
     }
 
     /// Several live slots (slots.zig / batch.zig): the stacked roles' bases, the row runner, the followers' row ops;
