@@ -338,6 +338,14 @@ fn groupedArgs(c: Call, lo_i: usize) !exl3.Grouped {
 
 // tensorfold_exl3_experts_v1 (experts.cpp)
 fn expertsExt(o: exl3.Ops, func: []const u8, args: []const Arg, kwargs: []const Kw) !bool {
+    if (is(func, "group_rot_in")) {
+        const c: Call = .{ .args = args, .kwargs = kwargs, .names = &.{ "x", "x_stride", "pick", "suh0", "suh1", "out0", "out1", "rows", "K", "slots", "E", "uids", "ucount", "members" } };
+        const x = try c.tensor(0);
+        if (x.dtype != .bf16) return error.WrongArgument;
+        const members = try c.tensor(13);
+        try o.groupRotIn(x.ptr, try c.usz(1), try c.ptr(2), try c.ptr(3), try c.ptr(4), try c.ptr(5), try c.ptr(6), try c.ptr(11), try c.ptr(12), members.ptr, try c.usz(7), try c.usz(8), try c.usz(9), try c.usz(10), try dim(members, 1));
+        return true;
+    }
     if (is(func, "grouped")) {
         const c: Call = .{ .args = args, .kwargs = kwargs, .names = &(grouped_names ++ [_][]const u8{ "nt", "warps", "pf", "lo", "hi" }) };
         if (try c.int(16) != 2) return false; // cb 2 (mul1) instances only

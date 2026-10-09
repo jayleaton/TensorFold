@@ -149,6 +149,12 @@ pub fn prefetchAhead(get: Get) bool {
     return !std.mem.eql(u8, std.mem.trim(u8, v, " "), "0");
 }
 
+/// TF_DSV41_ROUTER_GROUP_ROT=1: histogram grouping + input rotation, default off until GPU/reply gates pass.
+pub fn routerGroupRot(get: Get) bool {
+    const v = get("TF_DSV41_ROUTER_GROUP_ROT") orelse return false;
+    return std.mem.eql(u8, std.mem.trim(u8, v, " "), "1");
+}
+
 /// prod-perf1's decode R1 under Python's names (ATTN_SPLIT=4 and the seven switches at 1), or TF_DSV41_R1 (ours,
 /// which wins): Zig runs R1 whole or not at all, so a partial set is logged and runs without it (R1 is the same bits).
 pub fn r1(get: Get) bool {
@@ -241,6 +247,7 @@ pub fn promptSplit(n: usize, tail: PromptTail) struct { prefill: usize, window: 
 /// dense prefill GEMM, the segment rows, the indexer's budget, the Engram read-ahead of the next segment, x3gm v2, the
 /// prefill mode (CED replay: the model's decoder layer checked). R1 is read where the forward is made (`r1`).
 pub fn apply(f: *@import("forward.zig").Forward, a: std.mem.Allocator, io: std.Io, rank: u32) !void {
+    f.opts.router_group_rot = routerGroupRot(&env);
     f.opts.pfd = try pfDense(a, io, &env);
     if (try prefillRows(&env)) |r| f.opts.prefill_rows = r;
     if (try indexBudget(&env)) |b| f.opts.index_budget = b;
@@ -262,6 +269,7 @@ pub fn apply(f: *@import("forward.zig").Forward, a: std.mem.Allocator, io: std.I
     }
     if (rank != 0) return;
     const log = std.log.scoped(.dsv41);
+    log.info("router grouping/rotation fusion: {s}", .{if (f.opts.router_group_rot) "on" else "off"});
     log.info("prod knobs: pf_dense {s}, prefill rows {d}, index budget {d} MiB, R1 {s}, prefetch ahead {s}, x3gm v2 {t}, prefill {t}", .{ if (f.opts.pfd != null) "fused" else "off", f.opts.prefill_rows, f.opts.index_budget >> 20, if (f.opts.r1) "on" else "off", if (f.prefill_state.ahead) "on" else "off", f.opts.gm_v2, f.prefill_state.mode });
 }
 

@@ -143,6 +143,22 @@ pub fn decodeChain(gpu: Gpu, k: *const dsv41.Kernels, dir: []const u8) !void {
     try same(gpu, fx, xg, "xg", "rot_in gate");
     try same(gpu, fx, xu, "xu", "rot_in up");
 
+    // Exercise the actual Zig ABI against the same Python fixture, including untouched invalid-pick rows.
+    if (input == .bf16 and R <= 64 and D == 5120 and slots <= 9 and E <= 512) {
+        const fg = try b.zeros(P * D * 2, 0);
+        const fu = try b.zeros(P * D * 2, 0);
+        const fi = try b.zeros(maxu * 4, 0);
+        const fc = try b.zeros(4, 0);
+        const fm = try b.zeros(maxu * R * 4, 0xff);
+        try o.groupRotIn(x.ptr, D, pick.ptr, suh_g.ptr, suh_u.ptr, fg.ptr, fu.ptr, fi.ptr, fc.ptr, fm.ptr, R, D, slots, E, R);
+        try stream.synchronize();
+        try same(gpu, fx, fi, "uids", "group_rot ids");
+        try same(gpu, fx, fc, "ucount", "group_rot count");
+        try same(gpu, fx, fm, "members", "group_rot members");
+        try same(gpu, fx, fg, "xg", "group_rot gate");
+        try same(gpu, fx, fu, "xu", "group_rot up");
+    }
+
     const lo_gu: u32 = @intCast(try fx.int("lo_gu"));
     const hi_gu: u32 = @intCast(try fx.int("hi_gu"));
     const lo_d: u32 = @intCast(try fx.int("lo_d"));

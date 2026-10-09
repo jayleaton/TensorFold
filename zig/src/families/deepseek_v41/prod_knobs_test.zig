@@ -24,6 +24,18 @@ const Fake = struct {
     }
 };
 
+test "router grouping/rotation fusion is explicitly opt-in" {
+    Fake.pairs = &.{};
+    try testing.expect(!pk.routerGroupRot(&Fake.get));
+    for ([_][]const u8{ "0", "false", "yes", "2", "" }) |value| {
+        Fake.pairs = &.{.{ "TF_DSV41_ROUTER_GROUP_ROT", value }};
+        try testing.expect(!pk.routerGroupRot(&Fake.get));
+    }
+    Fake.pairs = &.{.{ "TF_DSV41_ROUTER_GROUP_ROT", " 1 " }};
+    try testing.expect(pk.routerGroupRot(&Fake.get));
+    Fake.pairs = &.{};
+}
+
 test "pfdense.pick: the override, the table (its small config at few rows), the heuristic; stages must divide K" {
     const a = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
