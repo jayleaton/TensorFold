@@ -9,6 +9,14 @@
 //! - **propose**: the asks sorted by slot (Python's order), split into passes of at most `group` slots
 //!   (dspark_rows.groups); each pass one launch set over its slots' rows, then the host's candidates, the ranks'
 //!   gather and each slot's chain, as the one-slot pass does.
+//!
+//! Two default-off knobs move drafter work off the round's critical path, the same launches and bits:
+//! - TF_DSV41_DRAFT_CHAIN=1 (dspark_dev.Chain): the chain on the device, Python's own `_chain` after the round's passes.
+//! - TF_DSV41_DRAFT_OVERLAP=1: a device-started round's ingests (its window's taps rows into the rings; no
+//!   collective, and independent of the verify: spec.py ingests the whole window) run on their own stream from the
+//!   row window's taps mark (run.zig: recorded after the window's last taps write, inside its graph), beside the
+//!   window's last layer, head and pick instead of after them; the main stream joins them where it ran them before.
+//!   Their scratch roles are their own (dspark_emit.sideRoles), the rings and taps the ones the serial ingest uses.
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -24,6 +32,7 @@ const iface = @import("draft/iface.zig");
 const dspark = @import("draft/dspark.zig");
 const dsd = @import("dspark_dev.zig");
 const ph = @import("phases.zig");
+const rowtab = @import("rowtab.zig");
 
 pub const Error = error{ Slots, NotAPrefix, CandidateWidth, Unbound };
 
@@ -56,6 +65,9 @@ pub const SlotPass = struct {
     /// batch.zig's taps stash (base, bytes; 0, 0: none)
     stash: [2]u64,
     stats: struct { passes: u64 = 0, slots: u64 = 0 } = .{},
+    /// every proposal's (slot, drafts) folded in the order the lanes got them: two runs drafted alike iff equal
+    /// (mdraft's stats line; the GPU gate of TF_DSV41_DRAFT_OVERLAP / _CHAIN against the serial path)
+    digest: u64 = 0,
     /// TF_DSV41_DRAFT_GRAPHS (dspark_dev.zig): candidates on the device, each pass size graphed; null: the host step
     dev: ?*dsd.Dev = null,
     /// the group being issued: its first row in the round (the device step's region)
@@ -83,6 +95,10 @@ pub const SlotPass = struct {
     prev_pick: ?fwd.Forward.AfterPick = null,
     prev_sample: ?fwd.Forward.AfterSample = null,
     dstats: struct { device_starts: u64 = 0, device_dropped: u64 = 0 } = .{},
+    /// TF_DSV41_DRAFT_OVERLAP=1: the ingests' stream and its done event (the runner's taps mark is the start)
+    side: ?Side = null,
+
+    const Side = struct { stream: cuda.Stream, done: cuda.Event, mark: cuda.Event, rounds: u64 = 0, slots: u64 = 0, serial: u64 = 0 };
 
     const Begun = struct { n: usize, groups: [16][2]usize, ng: usize };
 
@@ -102,6 +118,8 @@ pub const SlotPass = struct {
     pub fn plan(a: std.mem.Allocator, f: *const fwd.Forward, p: *buffers.Plan, nslots: u32, group: u32) !void {
         const n: i64 = f.cfg.dspark_block;
         for (1..group + 1) |k| try p.add(try emit.emitPassSlots(a, f.cfg, f.widths, f.opts, n, @intCast(k), nslots));
+        // the overlapped ingests' own scratch, at a row window's most rows a slot
+        if (try overlapFromEnv()) try p.add(try emit.sideRoles(a, try emit.emitIngestAt(a, f.cfg, f.widths, f.opts, rowtab.seg_max, 0, .{ .ring_slots = nslots })));
     }
 
     /// On every rank after the one-slot pass and the row windows (`prev`: the forward's extension so far, slots').
@@ -164,15 +182,39 @@ pub const SlotPass = struct {
                     x.prev_sample = f.after_sample;
                     if (ko.vs_choose != null) f.after_sample = .{ .ctx = x, .run = afterSample };
                 }
+                if (try dsd.chainFromEnv()) {
+                    if (!hasVariant(r, "_chain")) {
+                        std.log.scoped(.dsv41).warn("draft chain: TF_DSV41_DRAFT_CHAIN=1, but the AOT set has no _chain (TRITON_FILL): the host's chain", .{});
+                    } else x.dev.?.chain = try dsd.Chain.init(gpa, r, n, nslots, c, f.cfg.hidden, one.conf != null);
+                }
+                if (try overlapFromEnv()) {
+                    if (x.bat == null) {
+                        std.log.scoped(.dsv41).warn("draft overlap: TF_DSV41_DRAFT_OVERLAP=1 needs the device-started round (TF_DSV41_GREEDY_GPU and the glue's ds_accept_rows): the serial ingests", .{});
+                    } else {
+                        var st = try cuda.Stream.initPriority(r.d, .highest);
+                        errdefer st.deinit();
+                        x.side = .{ .stream = st, .done = try cuda.Event.init(r.d, false), .mark = try cuda.Event.init(r.d, false) };
+                        r.taps_mark = .{ .ev = x.side.?.mark };
+                    }
+                }
             }
+        } else if (try overlapFromEnv() or try dsd.chainFromEnv()) {
+            std.log.scoped(.dsv41).warn("draft overlap / chain: they need TF_DSV41_DRAFT_GRAPHS' device path: off", .{});
         }
-        std.log.scoped(.dsv41).info("slot drafts: {d} slots, DSpark passes of up to {d} slots ({d} rows)", .{ nslots, group, R });
+        std.log.scoped(.dsv41).info("slot drafts: {d} slots, DSpark passes of up to {d} slots ({d} rows); chain on the {s}, ingests {s}", .{ nslots, group, R, if (x.dev != null and x.dev.?.chain != null) "device" else "host", if (x.side != null) "overlapped" else "serial" });
         return x;
     }
 
     pub fn deinit(x: *SlotPass) void {
         const gpa = x.gpa;
         x.f.ext = x.prev_ext;
+        if (x.side) |*sd| {
+            std.log.scoped(.dsv41).info("draft overlap: {d} rounds' ingests ({d} slots) on their own stream, {d} serial", .{ sd.rounds, sd.slots, sd.serial });
+            x.f.runner.taps_mark = null;
+            sd.stream.deinit();
+            sd.done.deinit();
+            sd.mark.deinit();
+        }
         if (x.bat != null) {
             x.f.after_pick = x.prev_pick;
             x.f.after_sample = x.prev_sample;
@@ -195,9 +237,30 @@ pub const SlotPass = struct {
         return .{ .ptr = x, .vtable = if (x.dev != null) &vtable_begin else &vtable };
     }
 
-    const vtable: iface.Pass.VTable = .{ .ingest = ingest, .propose = propose, .reset = reset, .markov = heads };
+    const vtable: iface.Pass.VTable = .{ .ingest = ingest, .propose = proposeFold, .reset = reset, .markov = heads };
     /// with the device path: the speculative pass too (draft/spec.zig), the whole round launched by `begin`
-    const vtable_begin: iface.Pass.VTable = .{ .ingest = ingest, .propose = propose, .reset = reset, .markov = heads, .begin = begin, .collect = collect, .arm = arm };
+    const vtable_begin: iface.Pass.VTable = .{ .ingest = ingest, .propose = proposeFold, .reset = reset, .markov = heads, .begin = begin, .collect = collectFold, .arm = arm };
+
+    fn proposeFold(p: *anyopaque, asks: []const iface.Ask, out: []iface.Proposal) anyerror!void {
+        try propose(p, asks, out);
+        self(p).fold(asks, out);
+    }
+
+    fn collectFold(p: *anyopaque, out: []iface.Proposal) anyerror!void {
+        const x = self(p);
+        const n = if (x.begun) |b| b.n else 0;
+        try collect(p, out);
+        x.fold(x.begun_asks[0..n], out);
+    }
+
+    fn fold(x: *SlotPass, asks: []const iface.Ask, out: []const iface.Proposal) void {
+        var h = std.hash.Wyhash.init(x.digest);
+        for (asks, out) |a, o| {
+            h.update(std.mem.asBytes(&a.slot));
+            h.update(std.mem.sliceAsBytes(o.drafts));
+        }
+        x.digest = h.final();
+    }
 
     /// The device path is on and past its checks.
     fn devReady(x: *const SlotPass) bool {
@@ -291,10 +354,16 @@ pub const SlotPass = struct {
         try ops.dsAcceptRows(dev + 8 * scr_picks, dev + 8 * scr_ids, dev + 8 * scr_segs, k, dev + 8 * scr_acc);
         try r.d.check(r.d.api.cuMemcpyDtoHAsync_v2(x.hscr.?.bytes.ptr + 8 * scr_acc, dev + 8 * scr_acc, 8 * 3 * k, r.stream.handle), "cuMemcpyDtoHAsync");
         try x.staged.?.record(r.stream);
-        // each slot's whole window into its rings (spec.py: rows past the commit lie past every later pass's context)
-        for (slots[0..k]) |sl| {
-            const pd = b.pend[sl].?;
-            try x.ingestAsync(sl, pd.start, .{ .src = 0, .skip = pd.a }, pd.n);
+        // each slot's whole window into its rings (spec.py: rows past the commit lie past every later pass's context):
+        // overlapped from the window's taps mark when this forward recorded it, else here in the stream
+        if (x.side != null and b.marked) {
+            try x.ingestSide(slots[0..k]);
+        } else {
+            for (slots[0..k]) |sl| {
+                const pd = b.pend[sl].?;
+                try x.ingestAsync(sl, pd.start, .{ .src = 0, .skip = pd.a }, pd.n);
+            }
+            if (x.side) |*sd| sd.serial += 1;
         }
         // the groups as devLaunchRound forms them (slots sorted, rows.groups), each staged on the device and launched
         var gs: [16][2]usize = undefined;
@@ -334,6 +403,31 @@ pub const SlotPass = struct {
             x.dl = .{ .k = k, .slots = undefined };
             @memcpy(x.dl.?.slots[0..k], slots[0..k]);
         }
+    }
+
+    /// TF_DSV41_DRAFT_OVERLAP: the slots' window rows into their rings on the side stream, from the runner's taps mark
+    /// (the last forward's taps final there); the main stream joins them here, where the serial ingests ran. Each the
+    /// serial ingest's program (emitIngestAt at the same slot, rows and taps rows) on its own scratch roles.
+    fn ingestSide(x: *SlotPass, slots: []const u32) !void {
+        const sd = &x.side.?;
+        const r = x.f.runner;
+        const b = x.bat.?;
+        try sd.stream.wait(sd.mark);
+        const pos_at = r.addressOf("w.ovl.w.ds.pos") orelse return error.Unbound;
+        var la = std.heap.ArenaAllocator.init(x.gpa);
+        defer la.deinit();
+        for (slots) |sl| {
+            const pd = b.pend[sl].?;
+            const pos: i32 = @intCast(pd.start);
+            try cuda.DeviceBuffer.uploadAsync(.{ .d = r.d, .ptr = pos_at, .len = 4 }, 0, std.mem.asBytes(&pos), sd.stream.handle);
+            const sl_: emit.Slots = .{ .ring_slots = x.nslots, .slot = sl, .taps_role = "w.taps" };
+            const cs = try emit.sideRoles(la.allocator(), try emit.emitIngestAt(la.allocator(), x.f.cfg, x.f.widths, x.f.opts, pd.n, pd.a, sl_));
+            try r.windowOn(sd.stream, cs);
+        }
+        try sd.done.record(sd.stream);
+        try r.stream.wait(sd.done);
+        sd.rounds += 1;
+        sd.slots += slots.len;
     }
 
     /// An ingest of a slot's rows on the device without draining the stream first (dspark_gpu.ingestAsync's form).
@@ -512,6 +606,8 @@ pub const SlotPass = struct {
         x.begun = bg;
         x.begun_dev = true;
         x.dstats.device_starts += 1;
+        // the chain after the round's passes (enqueued at the pick), the round's event re-recorded after it
+        if (try x.launchChain(asks)) try x.dev.?.mark();
         return true;
     }
 
@@ -559,8 +655,22 @@ pub const SlotPass = struct {
             }
             try d.settle();
         }
+        _ = try x.launchChain(asks);
         try d.mark();
         x.begun = b;
+    }
+
+    /// TF_DSV41_DRAFT_CHAIN: the round's chain on the device after its passes, the asks in the round's order
+    /// (`x.order`, sorted by slot); false: the host's chain at collect.
+    fn launchChain(x: *SlotPass, asks: []const iface.Ask) !bool {
+        const ch = (x.dev orelse return false).chain orelse return false;
+        var an: [16]u32 = undefined;
+        var ps: [16]dspark.Params = undefined;
+        for (x.order[0..asks.len], 0..) |i, j| {
+            an[j] = asks[i].anchor;
+            ps[j] = asks[i].params;
+        }
+        return ch.launch(x.f.runner, x.f.cfg, x.f.widths, x.f.opts, an[0..asks.len], ps[0..asks.len]);
     }
 
     /// The round's results: the event waited for, each group's candidates unpacked, each slot's chain.
@@ -576,6 +686,7 @@ pub const SlotPass = struct {
         const n: usize = x.f.cfg.dspark_block;
         const c: usize = x.f.comm.world() * x.one.k;
         const D: usize = x.f.cfg.hidden;
+        if (d.chain) |ch| if (ch.launched == b.n) return x.chainResults(ch, asks, out, b);
         for (b.groups[0..b.ng]) |g| {
             const at = g[0] * n;
             const R = (g[1] - g[0]) * n;
@@ -599,6 +710,56 @@ pub const SlotPass = struct {
             if (o.base) |t| {
                 if (t.len != cv.len) return error.CandidateWidth;
                 @memcpy(t, cv);
+            }
+        }
+    }
+
+    /// The device chain's drafts and confidences (round order) into each ask's proposal; a tree's candidates and base
+    /// logits (before the bias) from the gathered copy, as the host path gives them.
+    fn chainResults(x: *SlotPass, ch: *dsd.Chain, asks: []const iface.Ask, out: []iface.Proposal, b: Begun) !void {
+        const tc = ph.start(x.f.phases, .@"draft.chain");
+        defer tc.stop();
+        ch.launched = 0;
+        const n: usize = x.f.cfg.dspark_block;
+        const c: usize = x.f.comm.world() * x.one.k;
+        const res = ch.results();
+        var trees = false;
+        for (out) |o| trees = trees or o.cand != null or o.base != null;
+        // the first rounds: the host's chain over the same candidates too (the kernel agrees with it up to fp32
+        // summation order, so a near tie may differ; wiring, anchors or parameters gone wrong differ everywhere)
+        const checking = ch.stats.rounds <= dsd.Chain.check_rounds;
+        const D: usize = x.f.cfg.hidden;
+        if (trees or checking) for (b.groups[0..b.ng]) |g| {
+            const at = g[0] * n;
+            try x.dev.?.unpack((g[1] - g[0]) * n, at, x.f.cfg.vocab, x.cand[at * c ..], x.cval[at * c ..], if (checking and x.one.conf != null) x.hid[at * D ..] else null);
+        };
+        if (checking) {
+            var scratch = std.heap.ArenaAllocator.init(x.gpa);
+            defer scratch.deinit();
+            var drafts: [64]u32 = undefined;
+            var conf: [64]f32 = undefined;
+            for (x.order[0..b.n], 0..) |i, j| {
+                const a = asks[i];
+                try dspark.chain(scratch.allocator(), x.one.markov, x.cand[j * n * c ..][0 .. n * c], x.cval[j * n * c ..][0 .. n * c], c, a.anchor, a.params, if (x.one.conf != null) x.hid[j * n * D ..][0 .. n * D] else null, drafts[0..n], conf[0..n]);
+                for (drafts[0..n], res.draft[j * n ..][0..n]) |h, d| {
+                    ch.checked += 1;
+                    if (h != @as(u32, @intCast(d))) ch.differ += 1;
+                }
+            }
+            if (ch.stats.rounds == dsd.Chain.check_rounds) ch.verdict();
+        }
+        for (x.order[0..b.n], 0..) |i, j| {
+            const o = out[i];
+            if (o.drafts.len != n or o.conf.len != n) return error.CandidateWidth;
+            for (o.drafts, res.draft[j * n ..][0..n]) |*t, v| t.* = @intCast(v);
+            if (ch.conf) @memcpy(o.conf, res.conf[j * n ..][0..n]) else @memset(o.conf, 0.5);
+            if (o.cand) |t| {
+                if (t.len != n * c) return error.CandidateWidth;
+                @memcpy(t, x.cand[j * n * c ..][0 .. n * c]);
+            }
+            if (o.base) |t| {
+                if (t.len != n * c) return error.CandidateWidth;
+                @memcpy(t, x.cval[j * n * c ..][0 .. n * c]);
             }
         }
     }
@@ -791,3 +952,17 @@ pub const SlotPass = struct {
         try gpu.checkCandidates(x.cand[0 .. R * Wd * k], x.f.cfg.vocab); // the pass's rows (x.cand holds the most)
     }
 };
+
+/// TF_DSV41_DRAFT_OVERLAP: 1 = a device-started round's ingests overlapped with its window's tail, unset / 0 = serial.
+pub fn overlapFromEnv() !bool {
+    const v = std.mem.span(std.c.getenv("TF_DSV41_DRAFT_OVERLAP") orelse return false);
+    if (v.len == 0 or std.mem.eql(u8, v, "0")) return false;
+    if (std.mem.eql(u8, v, "1")) return true;
+    return error.BadDraftOverlap;
+}
+
+/// The engine's AOT set has some variant of Triton function `name`.
+fn hasVariant(r: *const run.Runner, name: []const u8) bool {
+    for (r.triton.variants) |v| if (std.mem.eql(u8, v.spec.@"fn", name)) return true;
+    return false;
+}

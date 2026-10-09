@@ -73,15 +73,17 @@ const Tally = struct {
     accepted: u64 = 0,
     passes: u64 = 0,
     pass_slots: u64 = 0,
+    /// the slot passes' drafts digest after the run (SlotPass.digest: every proposal so far, in order)
+    digest: u64 = 0,
 
     fn now(s: *const se.Served) Tally {
         const p = s.m.slot_pass;
-        return .{ .drafted = s.core.drafted, .accepted = s.core.accepted, .passes = if (p) |x| x.stats.passes else 0, .pass_slots = if (p) |x| x.stats.slots else 0 };
+        return .{ .drafted = s.core.drafted, .accepted = s.core.accepted, .passes = if (p) |x| x.stats.passes else 0, .pass_slots = if (p) |x| x.stats.slots else 0, .digest = if (p) |x| x.digest else 0 };
     }
 
     fn since(t: Tally, s: *const se.Served) Tally {
         const n = now(s);
-        return .{ .drafted = n.drafted - t.drafted, .accepted = n.accepted - t.accepted, .passes = n.passes - t.passes, .pass_slots = n.pass_slots - t.pass_slots };
+        return .{ .drafted = n.drafted - t.drafted, .accepted = n.accepted - t.accepted, .passes = n.passes - t.passes, .pass_slots = n.pass_slots - t.pass_slots, .digest = n.digest };
     }
 
     /// Each stream's first token comes from its prefill; every round after commits its accepted drafts + 1.
@@ -91,6 +93,7 @@ const Tally = struct {
         const tpr = if (rounds > 0) @as(f64, @floatFromInt(tokens - streams)) / @as(f64, @floatFromInt(rounds)) else 0;
         const spp = if (t.passes > 0) @as(f64, @floatFromInt(t.pass_slots)) / @as(f64, @floatFromInt(t.passes)) else 0;
         std.debug.print("mdraft stats {s}: tokens {d}, streams {d}, drafted {d}, accepted {d}, acceptance {d:.3}, stream rounds {d}, tokens/round {d:.3}, passes {d}, slots/pass {d:.2}, {d} ms\n", .{ name, tokens, streams, t.drafted, t.accepted, acc, rounds, tpr, t.passes, spp, @divTrunc(ms, 1_000_000) });
+        std.debug.print("mdraft drafts {s}: digest {x:0>16}\n", .{ name, t.digest });
     }
 };
 

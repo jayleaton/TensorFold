@@ -40,6 +40,12 @@ pub const Runner = struct {
     /// TF_DSV41_MHC_DEFER (branches.zig): the stream of the mHC coefficient launches tagged `defer_side`, joined by the
     /// next mHC call (`defer_join`, mhc.await_coefs)
     dfr: ?*Side = null,
+    /// TF_DSV41_DRAFT_OVERLAP (dspark_slots.zig): the event a row window records (an event record node in its graph)
+    /// right after its last call that writes "w.taps", the drafter's ingests on their own stream wait on it; `armed`
+    /// for the next window only (batch.zig sets it before the row window, eager or captured, and clears it after)
+    taps_mark: ?TapsMark = null,
+
+    pub const TapsMark = struct { ev: cuda.Event, armed: bool = false, recorded: u64 = 0 };
 
     /// l2pf.py's Prefetcher on the device: the side stream, the fork / join events, whether a fork is open.
     pub const Side = struct {
@@ -247,16 +253,52 @@ pub const Runner = struct {
     pub fn window(r: *Runner, cs: []const calls.Call) !void {
         if (syncEach()) return r.windowChecked(cs);
         errdefer r.dropForks(); // a failed window (or capture) leaves no fork for the next one to join
-        for (cs) |*c| try r.issue(c);
+        const mark = r.markAt(cs);
+        for (cs, 0..) |*c, i| {
+            try r.issue(c);
+            if (i == mark) try r.recordMark(c);
+        }
         try r.join();
     }
 
+    /// Issues `cs` on `stream` instead of the runner's (TF_DSV41_DRAFT_OVERLAP: the drafter's ingests beside a row
+    /// window): a drafter program has no branch, deferral or prefetch marks, and no glue step; the runner's stream is
+    /// this one while they issue. Nothing joins: the caller orders `stream` with its own events.
+    pub fn windowOn(r: *Runner, stream: cuda.Stream, cs: []const calls.Call) !void {
+        const main = r.stream;
+        r.stream = stream;
+        defer r.stream = main;
+        for (cs) |*c| {
+            if (c.side or c.fork or c.join or c.defer_side or c.defer_join or c.glue or std.mem.startsWith(u8, c.name, "tf_dsv41_l2p")) return error.NotASideProgram;
+            try r.issueOn(stream, c, r.scratch);
+        }
+    }
+
+    /// The index of the call after which an armed window records the taps mark (its last "w.taps" writer); null: not
+    /// armed, or no call writes taps. The arming lasts until its owner clears it (a capture that falls back to an
+    /// eager issue records again).
+    fn markAt(r: *Runner, cs: []const calls.Call) ?usize {
+        const m = r.taps_mark orelse return null;
+        if (!m.armed) return null;
+        return lastTaps(cs);
+    }
+
+    /// The mark after call `c`, on the stream `c` ran on (a branch's side stream when the emitter put it there).
+    fn recordMark(r: *Runner, c: *const calls.Call) !void {
+        const m = &r.taps_mark.?;
+        const s = if (c.side and r.br != null) r.br.?.stream else if (c.defer_side and r.dfr != null) r.dfr.?.stream else r.stream;
+        try m.ev.recordExternal(s);
+        m.recorded += 1;
+    }
+
     fn windowChecked(r: *Runner, cs: []const calls.Call) !void {
+        const mark = r.markAt(cs);
         for (cs, 0..) |*c, i| {
             r.issue(c) catch |e| {
                 std.log.err("sync-each: call {d}/{d} {s} failed to issue ({t})", .{ i, cs.len, c.name, e });
                 return e;
             };
+            if (i == mark) try r.recordMark(c);
             r.stream.synchronize() catch |e| {
                 std.log.err("sync-each: call {d}/{d} {s} faulted ({t})", .{ i, cs.len, c.name, e });
                 return e;
@@ -271,15 +313,30 @@ pub const Runner = struct {
         if (syncEach()) return r.windowChecked(cs);
         p.begin();
         errdefer r.dropForks();
-        for (cs) |*c| {
+        const mark = r.markAt(cs);
+        for (cs, 0..) |*c, i| {
             try p.before(r.stream, c);
             try r.issue(c);
+            if (i == mark) try r.recordMark(c);
             try p.after(r.stream);
         }
         try r.join();
         try p.end(r.stream);
     }
 };
+
+/// The last call of `cs` with a "w.taps" tensor argument (the boundary that writes the last DSpark target's taps);
+/// null when none does.
+pub fn lastTaps(cs: []const calls.Call) ?usize {
+    var at: ?usize = null;
+    for (cs, 0..) |c, i| for (c.args) |x| switch (x.arg) {
+        .t => |t| if (t.role == .buf and std.mem.eql(u8, t.role.buf, "w.taps")) {
+            at = i;
+        },
+        else => {},
+    };
+    return at;
+}
 
 var sync_each: ?bool = null;
 fn syncEach() bool {

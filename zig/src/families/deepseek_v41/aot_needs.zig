@@ -398,6 +398,11 @@ pub fn enumerate(gpa: std.mem.Allocator, n: *Needs, cfg: *const Config, w: *cons
         if (sv.slot_drafts) {
             var k: i64 = 1;
             while (k <= sv.group) : (k += 1) _ = try n.program(try dspark_emit.emitPassSlots(pb, cfg, w, sv.o, cfg.dspark_block, k, sv.slots));
+            // TF_DSV41_DRAFT_CHAIN's `_chain` (one variant whatever the slots: they are its grid), with and without the
+            // confidence head (Python passes cval for its tensors without it); WORLD x k candidates a row
+            const world: i64 = sv.o.world;
+            const c = world * @min(64, @divTrunc(128, world));
+            for ([_]bool{ true, false }) |conf| _ = try n.program(try dspark_emit.emitChain(pb, cfg, w, sv.o, cfg.dspark_block, sv.slots, c, conf));
         }
         try log.print("aot-needs: DSpark, {d} programs, {d} variants\n", .{ n.programs, n.keys.count() });
         try log.flush();

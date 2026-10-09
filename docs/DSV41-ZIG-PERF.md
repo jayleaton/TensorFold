@@ -382,3 +382,64 @@ and the run (TF_DSV41_PIECE_RUNS=1) against it, and with the run off. Not run ye
 
 Expected: one expert weight pass saved per extra piece in a run, ~45 ms each on the Spark at bench prompt sizes; ~90 ms
 in round 3's 4-stream code cell (~0.8 %), more on the 4-short-stream mix and with longer prompts arriving together.
+
+### 7.3 The drafter off the round's critical path: the chain on the device, the ingests overlapped (2026-10-09, offline)
+
+Source: the Spark nsys of 2026-10-08 (`zig-nsys-20261008-134407`, code 4 streams, one rank), 117 decode rounds,
+`tools/zig/dsv41_perf/nsys_draft.py`; the cell's phases (`bench-zign/phases`). Medians a round, in ms:
+
+| | ms | what |
+| --- | ---: | --- |
+| round | 105.6 | pick to pick |
+| window | 96.8 | of which 83 RoCE exchanges 3.26 (39 us each), GPU idle 0.50 |
+| ingest | 1.29 | 4 ingests (a slot each, no collective): `main_proj` 0.19-0.22 each (the same weight streamed 4 times), then 3 blocks' wkv / kv_norm / store; 0.18 of it GPU idle |
+| pass | 6.40 | the DSpark pass, its head 1.56, its exchanges 0.15 |
+| after the pass | 0.65 | GPU idle: the host's wait, unpack, chain (`draft.chain` 0.39 a pass), the lanes |
+| before the window | 0.66 | GPU idle: the deferred keep, the row table, the Engram staging (`engram.wait` 0.41 a window) |
+
+What of the drafter can leave the critical path:
+- **The chain** (0.39 ms a 4-slot pass, plus widening the head hidden, ~0.05): Python runs it on the device inside
+  its drafting graph (drafter.pass_fn: `dspark.chain`, the `_chain` Triton kernel).
+- **The ingests** (1.29 ms): they need only the window's taps (the boundaries entering layers 37-39), not its picks:
+  spec.py ingests every row of the window (rows past the commit lie past every later pass's context). Python runs
+  them after the pick too, one slot at a time. Their taps are final at layer 39's boundary, ~3 ms before the pick
+  (layer 39's attention, MoE and exchanges, the final norm, the head and its pick).
+- **Not the pass**: every row of it depends on the anchor (the bonus token) and the start (the accepted count).
+- **Not the Engram wait** (before the window): it waits for the rows of the next window's ids, which are the drafts,
+  so no drafter work is left to run then. The window's RoCE waits before layer 39 have no drafter work ready either.
+
+`TF_DSV41_DRAFT_CHAIN=1` (default off; needs the device path, TF_DSV41_DRAFT_GRAPHS): ds_out also lays the gathered
+candidates out as Python's cand / cval [rows, W k] (2 W strided device copies in gather_cols' order, inside the pass
+and its graph) and keeps the head hidden on the device; after the round's passes, Python's own `_chain` (the AOT set's
+cubin, `aot-needs` lists it for the fill; prod's set P capture has it) runs over every slot of the round at once, and
+only the drafts and confidences come back. The drafts are then Python's bit for bit, where the host chain agreed with
+them up to fp32 summation order. The first 8 rounds also chain on the host and count the differing drafts; past a
+quarter (a wiring fault, not a tie) the host chain takes over. Expected: -0.45 ms a 4-slot round, -0.1 a 1-slot round.
+
+`TF_DSV41_DRAFT_OVERLAP=1` (default off; needs the device-started round, TF_DSV41_GREEDY_GPU): a row window records an
+event after its last call that writes taps (`Runner.taps_mark`, an external event record node in its graph, so
+replays record it too; the row graphs' fingerprint holds the event). At the device start (`tryLaunch`, after the
+pick is enqueued) the round's ingests go to a high-priority side stream that waits on that event, and the main stream
+waits for them where it ran them before (before the passes). They are the serial ingests' programs, with their scratch
+roles renamed (`dspark_emit.sideRoles`: "L.kv", "L.ds.mp", ... are block.zig's too) and their own position slot; the
+rings and the taps are the same. Rounds whose forward recorded no mark (no taps call) keep the serial ingests.
+Expected: up to -1.2 ms a 4-slot round (less what the ingests' small launches take from layer 39's streaming), up
+to -0.35 a 1-slot round.
+
+| cell | Python | Zig round 4 | expected with both |
+| --- | ---: | ---: | ---: |
+| code x1 | 90.4 | 89.8 | 90.5-90.9 (+0.8-1.2 %) |
+| code x4 | 146.5 | 143.2 | 144.6-145.4 (+1.0-1.5 %) |
+| mix: 4 short streams | 141.6 | 133.1 | 134.4-135.1 (+1.0-1.5 %) |
+| prose x4 | 98.5 | 101.0 | 102.0-102.5 (+1.0-1.5 %) |
+| 131K | 53.7 | 67.0 | 67.4-67.6 (+0.6-0.9 %) |
+
+Host gates (`test-dsv41-mdraft`): the side ingest is the serial one on its own scratch; against prod row windows
+(R1, pool, taps, BRANCHES, MHC_DEFER; 5-24 rows) the mark exists, nothing after it touches taps, and the side ingest
+shares no role with the window but the taps and the rope table; `emitChain` is Python's captured launch (cap16:
+names, dtypes, shapes, strides, weights, constexprs); the strided copies equal the host's ungather; the staged
+inputs are `sampling_params`'. GPU steps (no pod: a pod's layer prefix has no DSpark target layers, so no taps and no
+mark): see the port doc's "NEXT SPARK WINDOW: the drafter off the critical path".
+
+Not done, worth it next: one `main_proj` over every slot's rows instead of one a slot (-0.6 ms a 4-slot round, the
+weight streamed once; needs the batched rows' bits proven equal to a slot's alone on the GPU, then also overlapped).
