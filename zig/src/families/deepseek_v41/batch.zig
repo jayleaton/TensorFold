@@ -71,6 +71,9 @@ pub const Batch = struct {
     n: u32 = 0,
     R: u32 = 0,
     current: []const calls.Call = &.{},
+    /// TF_DSV41_DRAFT_OVERLAP: the last window recorded the runner's taps mark (its program writes taps), so the
+    /// drafter's ingests of its rows may wait on that mark instead of the window's end
+    marked: bool = false,
     stats: struct { windows: u64 = 0, rows: u64 = 0, padded: u64 = 0 } = .{},
     /// the session store (model.zig): each slot's kept rows are its committed ids
     sess: ?*sessions_gpu.Sessions = null,
@@ -221,6 +224,16 @@ pub const Batch = struct {
         b.stats.rows += n;
         b.stats.padded += R - n;
         r.rows = R; // l2pf: the window's rows (with its padding, the graph's key) past 16 skip the prefetch sites
+        // the taps mark (dspark_slots.zig's overlapped ingests): armed for this window alone, eager or captured alike,
+        // so a key's graph holds the mark's node exactly when its program writes taps
+        b.marked = false;
+        if (r.taps_mark) |*m| {
+            m.armed = true;
+            b.marked = run.lastTaps(cs) != null;
+        }
+        defer if (r.taps_mark) |*m| {
+            m.armed = false;
+        };
         if (b.g) |*g| {
             const out = try g.cache.run(key, r.stream, b.fingerprint(), .{ .ctx = b, .run = body });
             if (outcomeLog(out, g)) std.log.scoped(.dsv41).info("row graphs: capture {d} ({d} rows, context bucket {d}), {d} replayed", .{ g.cache.stats.captured, key.rows, key.ctx, g.cache.stats.replayed });
@@ -550,6 +563,8 @@ pub const Batch = struct {
         for (b.stages.items) |st| h.update(std.mem.asBytes(&st.dev.ptr));
         for (b.ss.roles.values()) |st| h.update(std.mem.asBytes(&st.base));
         if (f.kv) |k| for (k.dev.tensors) |t| h.update(std.mem.asBytes(&t.ptr));
+        // the taps mark's event: a graph captured without it (or with another) records no mark, so it is dropped
+        if (r.taps_mark) |m| h.update(std.mem.asBytes(&m.ev.handle));
         return h.final();
     }
 };

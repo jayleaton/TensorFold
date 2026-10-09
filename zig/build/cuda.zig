@@ -300,6 +300,8 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, step: *std.Build.S
     mdraft.addImport("cuda", cuda);
     mdraft.addImport("dsv41_kernels", dsv41Kernels(b, host, .debug, cuda, &.{}));
     mdraft.addImport("tp", @import("tp.zig").module(b, host, .debug, cuda));
+    // the device chain's staging reads draft/dspark.zig's Params (the lanes core's Sampling)
+    mdraft.addImport("lanes", b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = host, .optimize = .debug, .link_libc = true }));
     const mdraft_run = b.addRunArtifact(b.addTest(.{ .root_module = mdraft }));
     b.step("test-dsv41-mdraft", "DeepSeek-V4.1 DSpark drafting over several slots on the real emitter, host only").dependOn(&mdraft_run.step);
     step.dependOn(&mdraft_run.step);

@@ -2274,6 +2274,36 @@ If P-1 fails while S4-1 passes, the pieces are the difference: rerun with `TF_DS
 If only that run passes, it is the swap. After P-1..P-4 pass, uncomment `TF_DSV41_PREFILL_PIECES=1` in zig-serve's
 `prod-zig.env` and make it the default (`Model.piecesEnv`).
 
+### The drafter off the critical path (`dsq-zig-draftovl-1`, offline; branch `dsv41-zig-draftovl`)
+
+Two default-off knobs, the same launches and drafts; measurement and expected gains in `DSV41-ZIG-PERF.md` 7.3.
+- `TF_DSV41_DRAFT_CHAIN=1` (`dspark_dev.Chain`, `dspark_emit.emitChain`): the chain on the device, Python's own
+  `_chain` (AOT) over the round's slots after their passes; only drafts and confidences come back. The first 8
+  rounds also chain on the host and count differing drafts (`draft chain on the device: N check drafts, M differ`);
+  past a quarter the host's chain takes over. Needs `_chain` in the served AOT set (set P captures have it;
+  `aot-needs` lists it for `TRITON_FILL=1`); without it the boot warns and keeps the host's chain.
+- `TF_DSV41_DRAFT_OVERLAP=1` (`dspark_slots.ingestSide`, `run.Runner.taps_mark`): the device-started round's
+  ingests on a side stream from the row window's taps mark (an event record node after the last taps write),
+  joined where they ran before. Needs `TF_DSV41_GREEDY_GPU=1` and the glue's `ds_accept_rows` (the device start).
+- No new kernel: the glue fatbin is unchanged. A pod cannot gate the overlap (its layer prefix has no DSpark target
+  layers: no taps, no mark, every round serial), so the GPU steps are the Spark's.
+
+#### NEXT SPARK WINDOW: the drafter off the critical path (not run; after D1-D2c)
+
+Check the lease first. Kit from this section's commit or later; prod-zig.env as served (DRAFT_GRAPHS=1, GREEDY_GPU=1,
+SPEC_DRAFT=1, 4 slots, slot drafts), every override on the `v2-rollback.sh zig` line.
+
+| step | what | time | PASS |
+|---|---|---|---|
+| O1 boot | + `TF_DSV41_DRAFT_OVERLAP=1 TF_DSV41_DRAFT_CHAIN=1` | ~10 min | rank 0: `slot drafts: 4 slots, ... chain on the device, ingests overlapped`; no `has no _chain` warning; after 8 rounds `draft chain on the device: N check drafts, M differ` with **M < 1 % of N**, no `from here on` line |
+| O2 overlap == serial | `bench_http.py --work code --temps 0 --streams 1,4 --reps 2` on a boot with `TF_DSV41_DRAFT_OVERLAP=1` alone, against the same cells with it 0 | ~25 min | **T0 replies equal**; **tokens/round equal** (equal drafts give equal acceptance); shutdown `draft overlap: N rounds' ingests ... S serial`, N > 90 % of the decode rounds |
+| O3 chain | O1's boot, the same cells | ~15 min | **T0 replies equal** to Python (4/4); tokens/round within 0.5 % of O2's off cells (near ties against the host chain only) |
+| O4 speed | O1's boot: code x1, code x4, the mix, prose x4 (`--compare` against Python's cells) | ~30 min | `draft.chain` ms_avg < 0.05 (was 0.39); code x4 > 144.5, code x1 > 90.4 (Python) |
+| O5 nsys (optional) | one code x4 cell under nsys; `tools/zig/dsv41_perf/nsys_draft.py` | ~10 min | `after_pass` median < 0.3 ms (was 0.65); the ingests' kernels on the side stream inside the window's last layer |
+
+On failure: replies differ in O2 (the overlap's ordering) or O3 (the chain's wiring): that knob 0, record the first
+differing reply and both ranks' logs. PASS: both knobs into prod-zig.env (zig-serve, commented until then).
+
 ### Spark window, 2026-10-07: outcome
 
 Prod was down 12:34-14:07 (93 min) and was restored on perf1 (`scripts/v2-rollback.sh perf1`: 17 x 23 -> 391,

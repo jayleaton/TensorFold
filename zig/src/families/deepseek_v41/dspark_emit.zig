@@ -26,6 +26,7 @@ const E = block.Emitter;
 const Arg = calls.Arg;
 const dense = dk.dense;
 const wide = @import("block_wide.zig");
+const buffers = @import("buffers.zig");
 
 /// The rows of one ring (a power of two holding the window and a block).
 pub fn ringRows(cfg: *const Config) i64 {
@@ -441,6 +442,102 @@ pub fn emitIngestAt(a: std.mem.Allocator, cfg: *const Config, w: *const block.Wi
     var e: E = .{ .a = a, .cfg = cfg, .w = w, .o = o, .n = n, .start = 0 };
     var d: Ds = .{ .e = &e, .st = .{ .n = n, .window = cfg.window }, .sl = sl };
     try d.ingest(skip);
+    return e.out.items;
+}
+
+/// TF_DSV41_DRAFT_OVERLAP (dspark_slots.zig): `cs` (an ingest) with every scratch role - a window or layer role but the
+/// taps - renamed "w.ovl.<role>", its own arena storage (buffers.zig: one offset a role name), so it can run on its
+/// own stream while a row window still uses the names it shares with block.zig ("L.kv", "L.kvn", ...). The rings,
+/// the weights and the taps keep their roles: the same kernels, arguments and launches, other scratch addresses.
+pub fn sideRoles(a: std.mem.Allocator, cs: []const calls.Call) ![]calls.Call {
+    const out = try a.dupe(calls.Call, cs);
+    for (out) |*c| {
+        const args = try a.dupe(calls.Named, c.args);
+        for (args) |*x| x.arg = try sideArg(a, x.arg);
+        c.args = args;
+    }
+    return out;
+}
+
+/// A role sideRoles renames.
+pub fn sideRole(role: []const u8) bool {
+    return buffers.scopeOf(role) != .persistent and !std.mem.eql(u8, role, "w.taps");
+}
+
+fn sideArg(a: std.mem.Allocator, x: Arg) !Arg {
+    return switch (x) {
+        .t => |t| .{ .t = try sideTensor(a, t) },
+        .opaque_table => |t| .{ .opaque_table = try sideTensor(a, t) },
+        .list => |items| blk: {
+            const l = try a.alloc(Arg, items.len);
+            for (items, l) |y, *z| z.* = try sideArg(a, y);
+            break :blk .{ .list = l };
+        },
+        else => x,
+    };
+}
+
+fn sideTensor(a: std.mem.Allocator, t: calls.Tensor) !calls.Tensor {
+    var u = t;
+    switch (t.role) {
+        .buf => |r| if (sideRole(r)) {
+            u.role = .{ .buf = try std.fmt.allocPrint(a, "w.ovl.{s}", .{r}) };
+        },
+        else => {},
+    }
+    return u;
+}
+
+/// The chain's roles (TF_DSV41_DRAFT_CHAIN, dspark_dev.zig binds them to its own buffers): Python's DraftInputs
+/// tensors the `_chain` kernel reads and writes, at the most slots a round has.
+pub const chain_roles = struct {
+    pub const cand = "s.ds.chain.cand";
+    pub const cval = "s.ds.chain.cval";
+    pub const hid = "s.ds.chain.hid";
+    pub const anchor = "s.ds.chain.anchor";
+    pub const ipar = "s.ds.chain.ipar";
+    pub const fpar = "s.ds.chain.fpar";
+    pub const draft = "s.ds.chain.draft";
+    pub const conf = "s.ds.chain.conf";
+    pub const scr = "s.ds.chain.scr";
+};
+
+/// Python's chain's constants (dspark.py: KP, CH, RB).
+pub const chain_kp = 128;
+pub const chain_ch = 16;
+pub const chain_rb = 32;
+
+/// TF_DSV41_DRAFT_CHAIN: Python's `dspark.chain` over `slots` slots of `n` rows (`_chain[(S,)]`, one program a slot),
+/// candidates `c` a row (WORLD x k: cand / cval [S, n, c] contiguous, c_stride = n_cand = c), with the confidence head
+/// when `conf` (hid bf16 [S, n, D], cw fp32 [D + rank], conf fp32 [S, n]); without it HID / CW / CONF are cval, as
+/// Python passes them. The kernel is Python's own (AOT), so its drafts are prod's bit for bit.
+pub fn emitChain(a: std.mem.Allocator, cfg: *const Config, w: *const block.Widths, o: block.Options, n: i64, slots: i64, c: i64, conf: bool) ![]calls.Call {
+    if (c > chain_kp) return error.CandidateWidth;
+    var e: E = .{ .a = a, .cfg = cfg, .w = w, .o = o, .n = slots * n, .start = 0 };
+    const S = slots;
+    const R: i64 = cfg.dspark_markov_rank;
+    const D: i64 = cfg.hidden;
+    const V: i64 = cfg.vocab;
+    const d: i64 = if (conf) D else 1024;
+    const r = chain_roles;
+    const cand = try e.buf(r.cand, .{}, .i32, &.{ S, n, c });
+    const cval = try e.buf(r.cval, .{}, .f32, &.{ S, n, c });
+    const hid = if (conf) try e.buf(r.hid, .{}, .bf16, &.{ S, n, D }) else cval;
+    const cw = if (conf) try e.weight("dspark.conf", .{}, .f32, &.{D + R}) else cval;
+    const cf = if (conf) try e.buf(r.conf, .{}, .f32, &.{ S, n }) else cval;
+    try e.triton("_chain", .{ S, 1, 1 }, &.{
+        .{ .name = "CAND", .arg = cand },                                                  .{ .name = "CVAL", .arg = cval },
+        .{ .name = "c_stride", .arg = .{ .i = c } },                                      .{ .name = "n_cand", .arg = .{ .i = c } },
+        .{ .name = "W1", .arg = try e.weight("dspark.markov.w1", .{}, .bf16, &.{ V, R }) }, .{ .name = "W2", .arg = try e.weight("dspark.markov.w2", .{}, .bf16, &.{ V, R }) },
+        .{ .name = "HID", .arg = hid },                                                    .{ .name = "CW", .arg = cw },
+        .{ .name = "ANCHOR", .arg = try e.buf(r.anchor, .{}, .i32, &.{S}) },              .{ .name = "IPAR", .arg = try e.buf(r.ipar, .{}, .i64, &.{ S, 4 }) },
+        .{ .name = "FPAR", .arg = try e.buf(r.fpar, .{}, .f32, &.{ S, 3 }) },             .{ .name = "DRAFT", .arg = try e.buf(r.draft, .{}, .i32, &.{ S, n }) },
+        .{ .name = "CONF", .arg = cf },                                                    .{ .name = "SCR", .arg = try e.buf(r.scr, .{}, .f64, &.{ S, 2, chain_kp }) },
+        .{ .name = "D", .arg = .{ .i = d } },                                              .{ .name = "N", .arg = .{ .i = n } },
+        .{ .name = "KP", .arg = .{ .i = chain_kp } },                                      .{ .name = "CH", .arg = .{ .i = chain_ch } },
+        .{ .name = "R", .arg = .{ .i = R } },                                              .{ .name = "RB", .arg = .{ .i = @max(16, @min(chain_rb, R)) } },
+        .{ .name = "HB", .arg = .{ .i = @intCast(std.math.gcd(@as(u64, @intCast(d)), 1024)) } }, .{ .name = "HAS_CONF", .arg = .{ .b = conf } },
+    });
     return e.out.items;
 }
 
