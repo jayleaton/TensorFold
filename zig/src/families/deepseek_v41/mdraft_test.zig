@@ -572,3 +572,78 @@ test "device chain: the staged inputs are Python's (sampling_params: ipar, ancho
     try testing.expectEqualSlices(i32, &.{ 11, 22 }, anchor);
     try testing.expectEqualSlices(f32, &.{ 1.0, 1.0, 0.0, 0.7, 0.95, 0.05 }, fpar);
 }
+
+// -------------------------------------------------------------------------------------------------------------------
+// TF_DSV41_DRAFT_BATCH_PROJ
+
+/// `y` is `x` but for "w.ds.mx" tensors (lists included: the fused wkv's inputs), read `by` bytes further.
+fn sameMoved(x: calls.Arg, y: calls.Arg, by: i64, moved: *usize) !void {
+    switch (x) {
+        .t => |t| if (t.role == .buf and std.mem.eql(u8, t.role.buf, "w.ds.mx")) {
+            try testing.expectEqual(t.offset + by, y.t.offset);
+            try testing.expectEqualSlices(i64, t.shape, y.t.shape);
+            try testing.expectEqualSlices(i64, t.stride, y.t.stride);
+            try testing.expect(@mod(y.t.offset, 16) == 0); // the slot's rows keep 16-byte alignment
+            moved.* += 1;
+        } else try testing.expect(equalArgs(x, y)),
+        .list => |items| {
+            try testing.expectEqual(items.len, y.list.len);
+            for (items, y.list) |p, q| try sameMoved(p, q, by, moved);
+        },
+        else => try testing.expect(equalArgs(x, y)),
+    }
+}
+
+test "batched main_proj: the projection then the blocks is the whole ingest; a slot's blocks read its rows of w.ds.mx" {
+    var fx: Fixture = .{ .arena = undefined };
+    try fx.init();
+    defer fx.arena.deinit();
+    const a = fx.arena.allocator();
+    const D: i64 = fx.cfg.hidden;
+    for ([_]i64{ 1, 5, 16 }) |n| for ([_]i64{ 0, 7 }) |skip| {
+        const sl: emit.Slots = .{ .ring_slots = 4, .slot = 1 };
+        const whole = try emit.emitIngestAt(a, &fx.cfg, &fx.w, fx.o, n, skip, sl);
+        const proj = try emit.emitIngestProj(a, &fx.cfg, &fx.w, fx.o, n, skip, "w.taps");
+        const blocks0 = try emit.emitIngestBlocks(a, &fx.cfg, &fx.w, fx.o, n, 0, sl);
+        try identical(whole, try std.mem.concat(a, calls.Call, &.{ proj, blocks0 }));
+        // at row r of a batched projection: the same calls, "w.ds.mx" read r rows further, nothing else moved
+        const r: i64 = 11;
+        const at = try emit.emitIngestBlocks(a, &fx.cfg, &fx.w, fx.o, n, r, sl);
+        try testing.expectEqual(blocks0.len, at.len);
+        var moved: usize = 0;
+        for (blocks0, at) |c, d| {
+            try testing.expectEqualStrings(c.name, d.name);
+            try testing.expectEqual(c.grid, d.grid);
+            for (c.args, d.args) |x, y| try sameMoved(x.arg, y.arg, r * D * 2, &moved);
+        }
+        try testing.expect(moved > 0);
+    };
+}
+
+test "batched main_proj: the projection's launches do not depend on its rows but for the row count" {
+    // linear.cu's row bits depend on the row alone given (K, N, SK, WK): dense.plan(K, N) and the strides take no
+    // row count, so the batched call runs the per-slot call's kernel, k ranges and sum order at more rows
+    var fx: Fixture = .{ .arena = undefined };
+    try fx.init();
+    defer fx.arena.deinit();
+    const a = fx.arena.allocator();
+    const one = try emit.emitIngestProj(a, &fx.cfg, &fx.w, fx.o, 1, 0, "w.taps");
+    for ([_]i64{ 2, 5, 16, 17, 20, 33, 64 }) |n| {
+        const many = try emit.emitIngestProj(a, &fx.cfg, &fx.w, fx.o, n, 3, "w.taps");
+        try testing.expectEqual(one.len, many.len);
+        for (one, many) |c, d| {
+            try testing.expectEqualStrings(c.name, d.name);
+            try testing.expectEqual(c.triton, d.triton);
+            for (c.args, d.args) |x, y| switch (x.arg) {
+                .i, .f, .b, .none => try testing.expect(equalArgs(x.arg, y.arg)),
+                .t => |t| {
+                    try testing.expect(t.dt == y.arg.t.dt);
+                    try testing.expectEqualSlices(i64, t.stride, y.arg.t.stride);
+                    // rows are the leading dimension; the rest (K, N, the weights) are the same
+                    if (t.shape.len > 1) try testing.expectEqualSlices(i64, t.shape[1..], y.arg.t.shape[1..]);
+                },
+                else => {},
+            };
+        }
+    }
+}
