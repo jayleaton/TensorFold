@@ -77,6 +77,8 @@ pub const Options = struct {
     /// prune + kit rounding (RG_PRUNE, PRUNE_KIT), a bf16 MoE partial (MOE_BF16), q_norm folded into its consumers'
     /// rot_in (RMS_FOLD)
     r1: bool = false,
+    /// TF_DSV41_ROUTER_GROUP_ROT: wide grouping and expert input rotation in one launch (default off).
+    router_group_rot: bool = false,
     /// R1 off, but the bindings of a twin that always takes R1's trailing arguments (the midprofile twin, dba6a1f+):
     /// each call R1 extends gets them at their off values (mHC spin -1 / defer 0, the attention's split 0 / rope 0, the
     /// route's empty prune list, `_prune`'s KIT false). The same launches; the check reads it from a capture's calls

@@ -468,6 +468,11 @@ def main() -> None:
     # decode / verify (x3ld): routed 2-3.5 bits + a 6-bit shared expert (E1 (2, 12)), 5-bit shared (2, 10), DSpark (8, 8)
     mixed_g = [4, 5, 6, 7, 4, 5, 6, 7, 4, 6, 5, 7, 12]
     mixed_d = [5, 4, 7, 6, 5, 4, 6, 7, 5, 4, 6, 7, 12]
+    # Wide decode glue: runs the actual Zig groupRotIn ABI at its production input width.
+    if want("experts_group_rot_r24"):
+        report["experts_group_rot_r24"] = experts_case(
+            out / "experts_group_rot_r24", torch.Generator().manual_seed(4142), R=24, slots=7, E=E, D=5120, I=I,
+            k2g=mixed_g, k2d=mixed_d, input_dtype=torch.bfloat16, limit=10.0, skip_every=2)
     for R in (1, 3, 16):
         report[f"experts_e1_r{R}"] = experts_case(out / f"experts_e1_r{R}", g, R=R, slots=7, E=E, D=D, I=I,
                                                   k2g=mixed_g, k2d=mixed_d, input_dtype=torch.bfloat16, limit=10.0,

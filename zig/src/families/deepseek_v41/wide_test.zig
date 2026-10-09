@@ -131,6 +131,49 @@ fn expectRouters(cs: []const calls.Call) !usize {
     return m;
 }
 
+test "router group/rotation fusion removes one wide call per MoE and keeps narrow R1 unchanged" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const w = try widths(a);
+    const cfg: Config = .{};
+    var backbone: [40]u32 = undefined;
+    for (&backbone, 0..) |*l, i| l.* = @intCast(i);
+    const off = prodOptions(1 << 20);
+    var on = off;
+    on.router_group_rot = true;
+    for ([_]i64{ 16, 17, 24, 32, 48, 64 }) |n| {
+        const plain = try block.emit(a, &cfg, &w, off, &backbone, n, 4080, true);
+        const fused = try block.emit(a, &cfg, &w, on, &backbone, n, 4080, true);
+        const removed: usize = if (n <= 16) 0 else cfg.layers;
+        try testing.expectEqual(plain.len - removed, fused.len);
+        var pi: usize = 0;
+        var combined: usize = 0;
+        for (fused) |c| {
+            if (std.mem.eql(u8, c.name, "tensorfold_exl3_experts_v1.group_rot_in")) {
+                const group = plain[pi];
+                const rot = plain[pi + 1];
+                try testing.expectEqualStrings("tensorfold_exl3_experts_v1.group", group.name);
+                try testing.expectEqualStrings("tensorfold_exl3_experts_v1.rot_in", rot.name);
+                try testing.expectEqual(@as(usize, 14), c.args.len);
+                for (rot.args, c.args[0..11]) |want, got| try testing.expectEqualDeep(want, got);
+                for (group.args[1..4], c.args[11..14]) |want, got| try testing.expectEqualDeep(want, got);
+                combined += 1;
+                pi += 2;
+            } else {
+                try testing.expectEqualDeep(plain[pi], c);
+                pi += 1;
+            }
+        }
+        try testing.expectEqual(removed, combined);
+        try testing.expectEqual(plain.len, pi);
+        const transformed = try rowmode.transform(a, fused, @intCast(n), .{ .slots = 4, .rmax = 64, .pts = on.pool.?.pts });
+        var retained: usize = 0;
+        for (transformed) |c| retained += @intFromBool(std.mem.eql(u8, c.name, "tensorfold_exl3_experts_v1.group_rot_in"));
+        try testing.expectEqual(combined, retained);
+    }
+}
+
 test "wide rows: decode windows of 17-64 rows take Python's > 16-row mHC and router path, and row mode takes them" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

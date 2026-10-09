@@ -302,6 +302,7 @@ pub const Functions = struct {
     grouped: [grouped_cfgs.len][upstream_ranges.len]cuda.Function,
     dequant: [15]cuda.Function, // K2 2..16
     group: cuda.Function,
+    group_rot: cuda.Function,
     rot_in: [2]cuda.Function, // bf16, fp16 input
     gateup_epilogue: cuda.Function,
     down_epilogue: cuda.Function,
@@ -317,7 +318,7 @@ pub const Functions = struct {
     gm3: [v3_variants.len]Gm,
 
     /// Resolves every instance (a wrong name fails here, not on a rare path) and opts x3gm into its shared memory.
-    pub fn resolve(experts: cuda.Module, x3ld: cuda.Module, x3pf: cuda.Module, x3gm: cuda.Module, x3gm_plan: cuda.Module, x3gm3: cuda.Module, optin: u32) !Functions {
+    pub fn resolve(experts: cuda.Module, x3ld: cuda.Module, x3pf: cuda.Module, x3gm: cuda.Module, x3gm_plan: cuda.Module, x3gm3: cuda.Module, router_glue: cuda.Module, optin: u32) !Functions {
         var f: Functions = undefined;
         inline for (ld_cfgs, 0..) |c, ci| inline for (ranges, 0..) |r, ri| {
             f.ld[0][ci][ri] = try x3ld.function(ldSymbol(c[0], c[1], r[0], r[1], 0));
@@ -331,6 +332,7 @@ pub const Functions = struct {
         };
         inline for (0..15) |i| f.dequant[i] = try experts.function(dequantSymbol(i + 2));
         f.group = try experts.function(up_sym.group);
+        f.group_rot = try router_glue.function("router_group_rot");
         f.rot_in = .{ try experts.function(up_sym.rot_in_bf16), try experts.function(up_sym.rot_in_f16) };
         f.gateup_epilogue = try experts.function(up_sym.gateup_epilogue);
         f.down_epilogue = try experts.function(up_sym.down_epilogue);
@@ -499,6 +501,18 @@ pub const Ops = struct {
         for ([_]u64{ pick, suh0, suh1, out0, out1 }) |v| a.add(v);
         for ([_]usize{ K, slots, E }) |v| a.add(int(v));
         try go(o.f.rot_in[@intFromEnum(input)], o.s, .{ rows * slots, K / 128, 2 }, 32, 0, false, &a);
+    }
+
+    /// Independent grouping/rotation CTAs share a launch, with no inter-CTA handoff. Invalid picks leave Xh untouched.
+    pub fn groupRotIn(o: Ops, x: u64, x_stride: usize, pick: u64, suh0: u64, suh1: u64, out0: u64, out1: u64, uids: u64, ucount: u64, members: u64, rows: usize, K: usize, slots: usize, E: usize, maxm: usize) !void {
+        if (rows < 1 or rows > 64 or K != 5120 or slots < 1 or slots > 9 or E < 1 or E > 512 or x_stride < K or maxm < 1) return error.Shape;
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(int(x_stride));
+        for ([_]u64{ pick, suh0, suh1, out0, out1, uids, ucount, members }) |v| a.add(v);
+        for ([_]usize{ rows, K, slots, E, maxm }) |v| a.add(int(v));
+        const tiles = rows * slots * (K / 128) * 2;
+        try go(o.f.group_rot, o.s, .{ 1 + (tiles + 31) / 32, 1, 1 }, 1024, 0, false, &a);
     }
 
     /// exl3x_gateup_epilogue_cuda: splits summed, rotated, * svh, SwiGLU (act_mode 0 bf16 roundings, 1 fp32), Xd.

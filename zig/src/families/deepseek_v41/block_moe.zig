@@ -209,16 +209,18 @@ pub fn moe(e: *E, L: u32) !void {
         }
         try e.glue("kit_weights", &.{ wts, try e.buf("L.wts16", .{}, .f32, &.{ n, slots }) });
     }
-    if (!grouped) try e.ext("tensorfold_exl3_experts_v1.group", &.{ pick, uids, ucount, members, .{ .i = n }, .{ .i = slots }, .{ .i = Et } });
+    const group_rot = !grouped and e.o.router_group_rot and n <= 64 and slots <= 9 and Et <= 512 and D == 5120;
+    if (!grouped and !group_rot) try e.ext("tensorfold_exl3_experts_v1.group", &.{ pick, uids, ucount, members, .{ .i = n }, .{ .i = slots }, .{ .i = Et } });
     const pre = try e.fmt("s.L{d}.ex", .{L});
     const xg = try e.buf("{s}.xg", .{sc}, .f16, &.{ rows * slots, D });
     const xu = try e.buf("{s}.xu", .{sc}, .f16, &.{ rows * slots, D });
     const xd = try e.buf("{s}.xd", .{sc}, .f16, &.{ rows * slots, I });
     const z = try e.buf("{s}.z", .{sc}, .f32, &.{rows * slots * @max(4 * 2 * I, D)});
-    try e.ext("tensorfold_exl3_experts_v1.rot_in", &.{
+    try e.ext(if (group_rot) "tensorfold_exl3_experts_v1.group_rot_in" else "tensorfold_exl3_experts_v1.rot_in", &.{
         x,  .{ .i = D }, pick, try e.buf("{s}.suh_g", .{pre}, .f16, &.{ Et, D }), try e.buf("{s}.suh_u", .{pre}, .f16, &.{ Et, D }),
         xg, xu,          .{ .i = n }, .{ .i = D }, .{ .i = slots }, .{ .i = Et },
     });
+    if (group_rot) try e.appendLast(&.{ uids, ucount, members });
     const r = e.w.experts.get(L) orelse return error.NoWidth;
     const gu = try block.k2Range(r[0][0], r[0][1]);
     const dn = try block.k2Range(r[1][0], r[1][1]);
