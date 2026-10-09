@@ -88,6 +88,12 @@ pub fn mhcDefer() bool {
     return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or std.ascii.eqlIgnoreCase(v, "false"));
 }
 
+/// TF_DSV41_COEF_LATE (ours, default off; needs MHC_DEFER): block.Options.coef_late.
+pub fn coefLate() bool {
+    const v = get("TF_DSV41_COEF_LATE") orelse return false;
+    return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or std.ascii.eqlIgnoreCase(v, "false"));
+}
+
 /// With TF_DSV41_BRANCHES and / or TF_DSV41_MHC_DEFER (R1) on: the emitter's options, the side streams (before any
 /// capture), the runner pointed at them. Null when both are off.
 pub fn install(gpa: std.mem.Allocator, f: *fwd.Forward, rank: u32) !?*Branches {
@@ -108,12 +114,14 @@ pub fn install(gpa: std.mem.Allocator, f: *fwd.Forward, rank: u32) !?*Branches {
     if (dfr) {
         b.deferred = try sideOf(r.d, .default); // mhc_cuda._side: torch's default priority
         f.opts.mhc_defer = true;
+        f.opts.coef_late = coefLate();
         r.dfr = &b.deferred.?;
     }
     if (rank == 0) {
         if (s.on and s.prio == .main) log.warn("branches: TF_DSV41_BRANCHES_PRIO=main raises the main stream, the model's own here: run as equal", .{});
         if (s.on) log.info("branches: the indexer / compressor on a side stream (priority {s}), windows <= {d} rows", .{ if (s.prio == .side) "highest" else "default", s.rows });
         if (dfr) log.info("mhc defer: R1's coefficient launches on their own stream, joined by the next mHC call", .{});
+        if (dfr and coefLate()) log.info("coef late: each deferred coefficient launch issued just before its sublayer's exchange", .{});
     }
     return b;
 }

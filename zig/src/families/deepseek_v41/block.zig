@@ -55,6 +55,10 @@ pub const Options = struct {
     branch_rows: i64 = 64,
     /// TF_DSV41_MHC_DEFER (with R1): R1's coefficient launch tagged for the deferred stream, the next mHC call joins it
     mhc_defer: bool = false,
+    /// TF_DSV41_COEF_LATE (ours, with MHC_DEFER; branches.zig): a deferred coefficient launch moves to just before the
+    /// sublayer's exchange (still before its join), so `coef_kernel` runs beside the exchange's wait instead of on top
+    /// of the one-wave router GEMV / first projection that follows its site; the same calls, arguments and data
+    coef_late: bool = false,
     /// TF_DSV41_MHC_PFDEC (ours, 0 = off): mixing mHC sites of windows of at least this many rows (1-64) as mhc_pf's site
     /// + the normed input + mhc_cuda's coef_kernel (block_wide.zig); the same bits as the path they replace
     mhc_pf_rows: i64 = 0,
@@ -174,6 +178,8 @@ pub const Emitter = struct {
     df_side: bool = false,
     df_join: bool = false,
     df_pending: bool = false,
+    /// TF_DSV41_COEF_LATE: the index of a deferred coefficient launch not joined yet (moved to the next exchange)
+    df_at: ?usize = null,
     /// a multi-segment prefill (block_prefill.emitMulti): the current segment's first row in the run's per-row roles
     /// (the selection's rows); 0 elsewhere
     row0: i64 = 0,
@@ -229,7 +235,27 @@ pub const Emitter = struct {
         x.defer_join = e.df_join;
         e.df_side = false;
         e.df_join = false;
+        if (e.o.coef_late and e.marks == null) try e.lateCoef(&x);
         try e.out.append(e.a, x);
+    }
+
+    /// TF_DSV41_COEF_LATE: a deferred coefficient launch (`coef_kernel`, read only by the next mHC call, which joins
+    /// it) leaves its place after the site and goes just before the next exchange of the same fork region: the main
+    /// calls between them touch none of its roles (L.mhc.part, the weights, the next coefficient set), so every launch
+    /// sees the same data. A join before any exchange leaves it where it was. The exchange's spin leaves the SMs the
+    /// one-wave router GEMV (or the first projection) would otherwise share with it.
+    fn lateCoef(e: *Emitter, x: *const calls.Call) !void {
+        if (x.defer_join) e.df_at = null;
+        if (x.defer_side) {
+            e.df_at = e.out.items.len;
+            return;
+        }
+        const at = e.df_at orelse return;
+        if (!(x.glue and std.mem.startsWith(u8, x.name, "glue.exchange"))) return;
+        e.df_at = null;
+        const c = e.out.orderedRemove(at);
+        std.debug.assert(c.defer_side and c.begin == .none);
+        try e.out.append(e.a, c);
     }
 
     /// Appends positional arguments to the last emitted call (R1's trailing arguments).
