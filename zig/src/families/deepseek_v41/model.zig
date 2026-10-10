@@ -25,6 +25,7 @@ const load = @import("load.zig");
 const prepared = @import("prepared.zig");
 const buffers = @import("buffers.zig");
 const forms = @import("forms.zig");
+const forms_inplace = @import("forms_inplace.zig");
 const run = @import("run.zig");
 const fwd = @import("forward.zig");
 const eh = @import("engram_host.zig");
@@ -236,8 +237,7 @@ pub const Model = struct {
                 return @as(f64, @floatFromInt(ns)) / 1e6;
             }
         }.of;
-        if (cache) |c| std.log.info("dsv41 load: weights {d:.0} ms ({d:.0} ms images, {d:.0} ms upload + digest), {d:.1} GiB; prepared {s}: {d} read ({d:.1} GiB in {d:.0} ms), {d} built, {d} written ({d:.0} ms)", .{ ms(std.Io.Clock.awake.now(io).toNanoseconds() - t_load), ms(t_build), ms(t_upload), @as(f64, @floatFromInt(m.weights.bytes)) / (1 << 30), c.root, c.stats.hits, @as(f64, @floatFromInt(c.stats.read_bytes)) / (1 << 30), ms(c.stats.read_ns), c.stats.misses, c.stats.written, ms(c.stats.write_ns) })
-        else std.log.info("dsv41 load: weights {d:.0} ms ({d:.0} ms images from the pack, {d:.0} ms upload + digest), {d:.1} GiB; TF_DSV41_PREPARED unset", .{ ms(std.Io.Clock.awake.now(io).toNanoseconds() - t_load), ms(t_build), ms(t_upload), @as(f64, @floatFromInt(m.weights.bytes)) / (1 << 30) });
+        if (cache) |c| std.log.info("dsv41 load: weights {d:.0} ms ({d:.0} ms images, {d:.0} ms upload + digest), {d:.1} GiB; prepared {s}: {d} read ({d:.1} GiB in {d:.0} ms), {d} built, {d} written ({d:.0} ms)", .{ ms(std.Io.Clock.awake.now(io).toNanoseconds() - t_load), ms(t_build), ms(t_upload), @as(f64, @floatFromInt(m.weights.bytes)) / (1 << 30), c.root, c.stats.hits, @as(f64, @floatFromInt(c.stats.read_bytes)) / (1 << 30), ms(c.stats.read_ns), c.stats.misses, c.stats.written, ms(c.stats.write_ns) }) else std.log.info("dsv41 load: weights {d:.0} ms ({d:.0} ms images from the pack, {d:.0} ms upload + digest), {d:.1} GiB; TF_DSV41_PREPARED unset", .{ ms(std.Io.Clock.awake.now(io).toNanoseconds() - t_load), ms(t_build), ms(t_upload), @as(f64, @floatFromInt(m.weights.bytes)) / (1 << 30) });
         tr.step("weights", cuda.usage(false));
         m.aot = try cuda.aot.Set.load(gpa, io, &m.driver, m.ctx.device, try std.fs.path.join(a, &.{ assets, "aot" }));
         m.widths = try m2a.widths(a, &m.weights, &m.pl);
@@ -286,6 +286,11 @@ pub const Model = struct {
         const group = if (slot_drafts) try dspark_rows.groupFromEnv(m.cfg.dspark_block) else 1;
         if (slot_drafts) try dspark_slots.SlotPass.plan(m.f.arena.allocator(), &m.f, &bp, m.slots, group);
         if (m.f.kv) |k| try k.bind(&m.runner, &bp);
+        // TF_DSV41_FORMS_INPLACE=1: the dense forms over their trellis (not a second copy), unless a program reads it
+        if (forms_inplace.enabled()) {
+            const ws = &m.f.prefill_state.k4ws.plan;
+            _ = try forms_inplace.bind(gpa, &m.runner, &m.weights, if (ws.*) |*w| &.{ &bp, w } else &.{&bp});
+        }
         tr.plan(bp.totals());
         try m.runner.bind(&bp);
         tr.step("buffer plan", cuda.usage(false));
