@@ -38,4 +38,5 @@ test {
     _ = @import("round_graph.zig");
     // dsq-zig-ops-1: prepared weight folders (TF_DSV41_PREPARED)
     _ = @import("prepared.zig");
+    _ = @import("boot_mem.zig");
 }

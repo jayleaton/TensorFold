@@ -28,6 +28,7 @@ const forms = @import("forms.zig");
 const run = @import("run.zig");
 const fwd = @import("forward.zig");
 const eh = @import("engram_host.zig");
+const boot_mem = @import("boot_mem.zig");
 const m2a = @import("m2a.zig");
 const target_mod = @import("target.zig");
 const dspark_emit = @import("dspark_emit.zig");
@@ -292,16 +293,19 @@ pub const Model = struct {
         // TF_DSV41_L2PF: the prefetch tables from the bound weights and forms (the expert tables above), every rank
         m.l2pf = try l2pf_mod.install(gpa, &m.f, &m.weights);
         // no size cap: prod's 1M limit + 2,048 rows is 538 MB (a 256 MiB cap failed every rank's load with StreamTooLong)
-        const rope = try cwd.readFileAlloc(io, try std.fs.path.join(a, &.{ assets, "rope.bin" }), a, .unlimited);
-        const half = (rope.len - 16) / 2;
-        // rope.bin must hold the limit's rows (f32 [rows, 64] a table): a shorter one would leave positions unrotated
         const want: usize = @intCast(m.f.opts.rope_rows * 64 * 4);
-        if (half < want) {
-            std.log.scoped(.dsv41).err("rope.bin holds {d} positions, the limit needs {d} (dsv41_rope_tables.py --rows)", .{ half / 256, want / 256 });
-            return error.RopeTooShort;
-        }
-        for ([_][]const u8{ "s.rope.main", "s.rope.comp" }, 0..) |role, i| if (m.runner.addressOf(role)) |p|
-            try cuda.DeviceBuffer.upload(.{ .d = &m.driver, .ptr = p, .len = want }, 0, rope[16 + i * half ..][0..want]);
+        const RopeSink = struct {
+            m: *Model,
+            pub fn table(s: @This(), i: usize, bytes: []const u8) !void {
+                const role = ([_][]const u8{ "s.rope.main", "s.rope.comp" })[i];
+                const p = s.m.runner.addressOf(role) orelse return;
+                try cuda.DeviceBuffer.upload(.{ .d = &s.m.driver, .ptr = p, .len = bytes.len }, 0, bytes);
+            }
+            pub fn done(s: @This()) !void {
+                try s.m.driver.check(s.m.driver.api.cuCtxSynchronize(), "cuCtxSynchronize");
+            }
+        };
+        try boot_mem.uploadRope(gpa, io, try std.fs.path.join(a, &.{ assets, "rope.bin" }), want, RopeSink{ .m = m });
         const ehb = try cwd.readFileAllocOptions(io, try std.fs.path.join(a, &.{ assets, "engram-host.bin" }), a, .limited(1 << 26), .@"4", null);
         m.host = try eh.Host.load(ehb, m.cfg.engram_heads, m.cfg.engram_pad, m.cfg.engram_vocab, &m.lbuf);
         m.f.engram = &m.host;
