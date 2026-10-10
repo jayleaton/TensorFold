@@ -21,13 +21,26 @@ const DeviceKernels = struct {
     pack_fn: cuda.Function,
     /// dedup_mark, _flags, _pack, _tok (null: a fatbin without them)
     dedup_fns: ?[4]cuda.Function = null,
+    /// hist_gather, hist_tok
+    hist_fns: ?[2]cuda.Function = null,
 
     fn grid(words: u64) u32 {
         return @intCast(@max(1, @min((words + 255) / 256, 4096)));
     }
 
     fn kernels(k: *DeviceKernels) split.Kernels {
-        return .{ .ptr = k, .vtable = &.{ .dense = dense, .gather = gather, .pack = pack, .dedup = dedup } };
+        return .{ .ptr = k, .vtable = &.{ .dense = dense, .gather = gather, .pack = pack, .dedup = dedup, .history = history } };
+    }
+
+    fn history(ptr: *anyopaque, a: split.HistArgs, stream: tp.collective.Stream) anyerror!void {
+        const k: *DeviceKernels = @ptrCast(@alignCast(ptr));
+        const fs = k.hist_fns orelse return error.Unsupported;
+        for (fs, [2]u64{ @as(u64, a.m) * (a.row_bytes / 8), @as(u64, a.rows) * a.k }) |f, w| {
+            if (w == 0) continue;
+            var args: cuda.Args = .{};
+            args.add(a);
+            try cuda.launch.launch(f, .{ .grid = .{ .x = grid(w) }, .block = .{ .x = 256 } }, .{ .d = k.d, .handle = stream }, &args);
+        }
     }
 
     fn dedup(ptr: *anyopaque, a: split.DedupArgs, stream: tp.collective.Stream) anyerror!void {
@@ -399,6 +412,76 @@ const Rank = struct {
         std.debug.print("exchange fam {d} R {d} (3 in 16 fresh): dedup {d:.1} us, dense {d:.1} us, packed {d:.1} us a call (packed moves {s})\n", .{ fi, R, us[0], us[1], us[2], if (xo.packs(@as(u64, n) * 584)) "lengths" else "whole strides" });
     }
 
+    /// A 4096-row segment's history union (rows by token == the pool's), timed vs unionOf's planned path.
+    fn historyVsPlanned(r: *Rank, rnd: std.Random, io: std.Io, fi: u32, si: u32, rank: u32) !void {
+        const K = 512;
+        const S = 4096;
+        const g, const n = .{ r.gpa, S * K };
+        const sel = try g.alloc(i32, n);
+        defer g.free(sel);
+        for (sel) |*t| t.* = if (rnd.uintLessThan(u32, 16) == 0) -1 else @intCast(rnd.uintLessThan(u32, r.rowsOf(fi, si)));
+        const v, const slot = .{ r.dp.view(fi, si), r.pool.slots.items[si] };
+        const psh: u32 = @intCast(v.psh);
+        const m = split.historyRows(slot.len, psh, 2);
+        var dsel = try cuda.DeviceBuffer.fromHost(r.d, std.mem.sliceAsBytes(sel));
+        defer dsel.free();
+        var tok = try cuda.DeviceBuffer.alloc(r.d, 4 * n);
+        defer tok.free();
+        const cap: u64 = 128 << 20;
+        var send = try cuda.DeviceBuffer.alloc(r.d, cap / 3);
+        defer send.free();
+        var recv = try cuda.DeviceBuffer.alloc(r.d, 2 * cap / 3);
+        defer recv.free();
+        const h: split.HistArgs = .{ .sel = dsel.ptr, .rows = S, .k = K, .table = v.pt, .pages = slot.len, .psh = psh, .rank = rank, .world = 2, .m = m, .row_bytes = 584, .base = v.cv, .send = send.ptr, .tok = tok.ptr };
+        try r.x.history(h, recv.ptr, r.stream.handle);
+        try r.stream.synchronize();
+        const ht = try g.alloc(i32, n);
+        defer g.free(ht);
+        try tok.download(0, std.mem.sliceAsBytes(ht)); // the tokens, then the rows behind them
+        const hr = try g.alloc(u8, 2 * m * 584);
+        defer g.free(hr);
+        try recv.download(0, hr);
+        for (sel, ht) |t, o| {
+            r.checks += 1;
+            if (t < 0) {
+                r.bad += @intFromBool(o != -1);
+                continue;
+            }
+            const row = std.mem.bytesAsSlice(u64, hr[@as(usize, @intCast(o)) * 584 ..][0..584]);
+            for (row, 0..) |w, j| r.bad += @intFromBool(w != word(fi, si, @intCast(t), j));
+        }
+        const table = try g.alloc(u32, slot.max_pages);
+        defer g.free(table);
+        var um: u32, var us: [2]f64 = .{ 0, undefined };
+        for (&us, 0..) |*u, path| {
+            const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
+            for (0..10) |_| {
+                if (path == 1) {
+                    try r.x.history(h, recv.ptr, r.stream.handle);
+                    continue;
+                }
+                try r.stream.synchronize();
+                try dsel.download(0, std.mem.sliceAsBytes(sel));
+                for (table, 0..) |*t, k| t.* = slot.localTableAt(@intCast(k));
+                var blocks: std.ArrayList(split.Block) = .empty;
+                defer {
+                    for (blocks.items) |*b| b.deinit(g);
+                    blocks.deinit(g);
+                }
+                try split.planUnion(g, .{ .sel = sel, .k = K, .table = table, .psh = psh, .world = 2, .rank = rank, .row_bytes = 584, .cap = cap }, &blocks);
+                const b = blocks.items[0];
+                um = b.m;
+                var phys = try cuda.DeviceBuffer.fromHost(r.d, std.mem.sliceAsBytes(b.phys));
+                defer phys.free();
+                try tok.upload(0, std.mem.sliceAsBytes(b.tokens));
+                try r.x.unionBlock(v.cv, 584, phys.ptr, b.m, send.ptr, recv.ptr, r.stream.handle);
+            }
+            try r.stream.synchronize();
+            u.* = @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t0)) / 10e6;
+        }
+        std.debug.print("prefill union fam {d} slot {d} ({d} pages, 4096 x 512): history {d:.2} ms ({d} rows an owner), planned {d:.2} ms ({d} rows an owner) a call\n", .{ fi, si, slot.len, us[1], m, us[0], um });
+    }
+
     fn unions(r: *Rank, rnd: std.Random, fi: u32, rank: u32) !u32 {
         const K = 512;
         const S = 256; // a prefill segment's rows
@@ -466,6 +549,7 @@ pub fn main(init: std.process.Init) !u8 {
         try module.function("_ZN13dsv41_kvsplit17dedup_pack_kernelENS_9DedupArgsE"),
         try module.function("_ZN13dsv41_kvsplit16dedup_tok_kernelENS_9DedupArgsE"),
     };
+    dk.hist_fns = .{ try module.function("_ZN13dsv41_kvsplit18hist_gather_kernelENS_8HistArgsE"), try module.function("_ZN13dsv41_kvsplit15hist_tok_kernelENS_8HistArgsE") };
     var stream = try cuda.Stream.init(&driver, true);
     defer stream.deinit();
     var pool = try sessions.Pool.init(gpa, .{ .families = &fams, .page = page }, 8192 * page, 2, cfg.rank);
@@ -502,6 +586,7 @@ pub fn main(init: std.process.Init) !u8 {
     for ([_]u32{ 0, 1 }) |fi| for ([_]u32{ 1, 4, 8, 24, 32 }) |R| try r.dedupVsDense(rnd, init.io, fi, R);
     var blocks: u32 = 0;
     for ([_]u32{ 0, 1 }) |fi| blocks += try r.unions(rnd, fi, cfg.rank);
+    for ([_][2]u32{ .{ 0, 1 }, .{ 0, 0 }, .{ 1, 1 } }) |c| try r.historyVsPlanned(rnd, init.io, c[0], c[1], cfg.rank); // fits the cap
     // the time of one dense exchange (pack + all-gather), graph-replayed, R = 16, K = 512
     const t0 = std.Io.Clock.awake.now(init.io).toNanoseconds();
     for (0..20) |_| try r.dense(rnd, 1, 16, false);
