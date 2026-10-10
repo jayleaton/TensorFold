@@ -19,6 +19,7 @@ const SubmitError = api.SubmitError;
 pub const Rounds = rounds.Rounds;
 pub const Proposers = rounds.Proposers;
 const rounds = @import("lane_rounds.zig");
+const lane_halt = @import("lane_halt.zig");
 
 pub const LaneHost = struct {
     gpa: Allocator,
@@ -34,6 +35,8 @@ pub const LaneHost = struct {
     admitted: std.ArrayList(*Job) = .empty,
     cancels: std.ArrayList(Id) = .empty,
     closing: bool = false,
+    /// `halt`'s reason: what is left finishes failed with it (null: a stop cancels what is left)
+    halt_reason: ?[]const u8 = null,
     thread: ?std.Thread = null,
     decoded: std.ArrayList(Mark) = .empty, // tokens a round landed, for the 2 s decode rate
     prefill_rate: f64 = 0,
@@ -111,7 +114,7 @@ pub const LaneHost = struct {
         h.thread = try std.Thread.spawn(.{ .stack_size = 16 << 20 }, run, .{h});
     }
 
-    /// Stops admitting, cancels what is left and joins the engine thread.
+    /// Stops admitting, cancels what is left and joins the engine thread (after `halt`: the thread is gone already).
     pub fn stop(h: *LaneHost) void {
         h.mutex.lockUncancelable(h.io);
         h.closing = true;
@@ -130,6 +133,9 @@ pub const LaneHost = struct {
         h.pieces.deinit(h.gpa);
         h.finals.deinit(h.gpa);
     }
+
+    /// A drain's deadline: the round in flight completes on every rank, so the ranks stop at the same boundary.
+    pub const halt = lane_halt.halt;
 
     pub fn engine(h: *LaneHost) Engine {
         return .{ .ctx = h, .vtable = &.{ .info = infoFn, .submit = submitFn, .cancel = cancelFn, .status = statusFn, .memory = memoryFn, .keepalive = keepaliveFn, .learn = learnFn } };
@@ -573,6 +579,7 @@ pub const LaneHost = struct {
     }
 
     pub fn closeAll(h: *LaneHost) void {
+        if (h.halt_reason) |reason| return lane_halt.haltAll(h, reason);
         h.lock();
         for (h.queued.items) |job| h.cancels.append(h.gpa, job.id) catch {};
         for (h.admitted.items) |job| h.cancels.append(h.gpa, job.id) catch {};
