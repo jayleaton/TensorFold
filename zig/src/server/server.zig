@@ -21,6 +21,8 @@ const log = @import("log.zig");
 const live = @import("live.zig");
 const slide_graph = @import("slide_graph.zig");
 const slide_lesson = @import("slide_lesson.zig");
+const family_mod = @import("family.zig");
+const spark = @import("spark.zig");
 const Value = json.Value;
 const Cx = errors.Cx;
 const Allocator = std.mem.Allocator;
@@ -55,6 +57,12 @@ pub const Config = struct {
     /// --slide-graph: the file holding the Sliding Weights fact graph; null keeps the graph in memory.
     slide_graph: ?[]const u8 = null,
     timeouts: http_conn.Timeouts = .{},
+    /// The checkpoint family's own chat rules (family.zig); null: the chat template path.
+    family: ?family_mod.Family = null,
+    /// The HTTP surface: TensorFold's, or the Spark servers' (spark.zig).
+    wire: spark.Wire = .tensorfold,
+    /// The Spark surface's knobs (request log, disconnect, health mode).
+    spark: spark.Settings = .{},
 };
 
 pub const Server = struct {
@@ -75,6 +83,11 @@ pub const Server = struct {
     think_close_end: ?u32 = null,
     metrics: metrics.Metrics,
     store: responses.Store,
+    family: ?family_mod.Family = null,
+    /// The Spark surface's /health bookkeeping and request log (``Config.wire`` spark).
+    health: ?*spark.Health = null,
+    reqlog: ?*spark.RequestLog = null,
+    created: i64 = 0,
     next_id: std.atomic.Value(u64) = .init(1),
     /// Connections open now; a stop waits for them before freeing what they read.
     open_connections: std.atomic.Value(u32) = .init(0),
@@ -89,7 +102,7 @@ pub const Server = struct {
     /// Reads what the template and tokenizer decide once: late system role, think markers, efforts, the forced close.
     pub fn init(gpa: Allocator, io: std.Io, engine: api.Engine, text: model_text.Text, config: Config, keys: ?*auth.Store) !*Server {
         const srv = try gpa.create(Server);
-        srv.* = .{ .gpa = gpa, .io = io, .engine = engine, .info = engine.info(), .text = text, .config = config, .keys = keys, .metrics = .{ .gpa = gpa }, .store = .{ .gpa = gpa }, .arena = .init(gpa), .slide = .init(gpa, io, config.slide_graph), .teacher = .init(gpa) };
+        srv.* = .{ .gpa = gpa, .io = io, .engine = engine, .info = engine.info(), .text = text, .config = config, .keys = keys, .metrics = .{ .gpa = gpa }, .store = .{ .gpa = gpa }, .arena = .init(gpa), .slide = .init(gpa, io, config.slide_graph), .teacher = .init(gpa), .family = config.family };
         if (config.keep_warm_s > 0) if (engine.keepaliveTarget()) |target| {
             srv.keepalive = api.keepalive.Keepalive.start(gpa, io, target, @as(i64, config.keep_warm_s) * std.time.ns_per_s) catch |e| blk: {
                 log.line("idle keepalive off: {s}", .{@errorName(e)});
@@ -97,6 +110,15 @@ pub const Server = struct {
             };
         };
         const a = srv.arena.allocator();
+        srv.created = std.Io.Clock.real.now(io).toSeconds();
+        if (config.wire == .spark) {
+            srv.health = try a.create(spark.Health);
+            srv.health.?.* = .init(gpa, io, config.spark);
+            if (config.spark.log) |l| {
+                srv.reqlog = try a.create(spark.RequestLog);
+                srv.reqlog.?.* = .init(gpa, io, l, .{ .user = text.tokenId("<|user|>"), .assistant = text.tokenId("<|assistant|>"), .observation = text.tokenId("<|observation|>") });
+            }
+        }
         srv.eos = try a.dupe(u32, text.eosIds());
         if (text.tokenId(reply_text.channel_markers.close) != null) srv.markers = reply_text.channel_markers;
         srv.effort_levels = try fields.effortLevels(a, text.templateSource());
@@ -117,6 +139,8 @@ pub const Server = struct {
     }
 
     pub fn deinit(srv: *Server) void {
+        if (srv.health) |h| h.deinit();
+        if (srv.reqlog) |l| l.deinit();
         if (srv.keepalive) |k| k.stop(); // before the engine's queue goes away
         srv.metrics.deinit();
         srv.arena.deinit();
@@ -137,7 +161,12 @@ pub const Server = struct {
         _ = temperature; // the request's own temperature field decides, as in the Python server
         const options = try json.newObject(cx.a);
         if (srv.config.default_sampling) |d| try merge(options, cx, try fields.parseNumbers(cx, d));
-        try merge(options, cx, try fields.parseNumbers(cx, f));
+        const asked = try fields.parseNumbers(cx, f);
+        // a family whose Python server ignores the request's min_p keeps the default's
+        if (srv.family) |fam| if (!fam.vt.reads_min_p) {
+            _ = asked.object.orderedRemove("min_p");
+        };
+        try merge(options, cx, asked);
         const temp = number(options.get("temperature")) orelse 0;
         if (temp <= 0) return null;
         const seed: u64 = if (options.get("seed")) |s| seedBits(s) else api.seedFor(prompt_ids, srv.config.seed_salt);
@@ -228,6 +257,7 @@ pub const Server = struct {
         var conn = http_conn.Conn.init(srv.gpa, accepted.fd, peer) catch return;
         defer conn.deinit();
         conn.timeouts = srv.config.timeouts;
+        conn.spark_wire = srv.config.wire == .spark;
         conn.auth_enabled = srv.keys != null and srv.keys.?.enabled();
         if (conn.auth_enabled) conn.hook = .{ .ctx = srv, .call = countReply };
         var arena: std.heap.ArenaAllocator = .init(srv.gpa);
