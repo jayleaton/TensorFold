@@ -6,6 +6,7 @@ pub const Error = @import("driver.zig").Error;
 pub const Context = @import("context.zig").Context;
 pub const DeviceBuffer = @import("memory.zig").DeviceBuffer;
 pub const HostBuffer = @import("memory.zig").HostBuffer;
+pub const memory = @import("memory.zig");
 pub const usage = @import("memory.zig").usage;
 pub const Usage = @import("memory.zig").Usage;
 pub const carveout = @import("carveout.zig");
@@ -27,6 +28,8 @@ pub const kernels = @import("kernels.zig");
 pub const fp8 = @import("fp8.zig");
 pub const segments = @import("segments.zig");
 pub const grouped = @import("grouped.zig");
+pub const graph_cache = @import("graph_cache.zig");
+pub const arena = @import("arena.zig");
 
 test {
     _ = @import("memory.zig");
@@ -37,4 +40,6 @@ test {
     _ = segments;
     _ = @import("fp8.zig");
     _ = carveout;
+    _ = graph_cache;
+    _ = arena;
 }
