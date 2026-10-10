@@ -109,6 +109,8 @@ pub const Model = struct {
     sessions: ?*sg.Sessions = null,
     /// live slots (TF_DSV41_SLOTS; > 1: stacked state and row-mode windows, batch.zig)
     slots: u32 = 1,
+    /// TF_DSV41_ARENA's sub-allocator (dev_arena.zig), for the process's lifetime
+    dev_arena: ?*@import("dev_arena.zig").Installed = null,
     /// the boot check's figures before the pool, for its measured end (kv_state.afterBoot)
     boot_check: ?kvs.Boot = null,
     slot_set: ?*slots_mod.SlotSet = null,
@@ -166,7 +168,7 @@ pub const Model = struct {
             &.{};
         try m.session.open(&m.driver, m.tcfg, image);
         // TF_DSV41_ARENA: every device buffer from here on (weights, forms, roles, scratch) carved from large chunks
-        _ = try @import("dev_arena.zig").install(gpa, &m.ctx, m.tcfg.rank);
+        m.dev_arena = try @import("dev_arena.zig").install(gpa, &m.ctx, m.tcfg.rank);
         // a failure from here to serving (assets, limits, buffers): every rank down with its reason, the session closed
         // before `m` is freed (the fate thread read a freed session: Spark 2026-10-09)
         m.boot(gpa, io, pack_dir, assets, o) catch |err| {
@@ -385,6 +387,7 @@ pub const Model = struct {
         try m.driver.check(m.driver.api.cuCtxSynchronize(), "cuCtxSynchronize");
         tr.step("end", cuda.usage(false));
         tr.trim();
+        if (m.dev_arena) |x| x.endBoot(m.tcfg.rank); // TF_DSV41_ARENA=pack: boot's buffers in, the rest as before
         // the boot check on the boot's own figures: what it took, the dip below idle, the hard floor
         if (m.boot_check) |b| try kvs.afterBoot(b);
         try comm.barrier();
