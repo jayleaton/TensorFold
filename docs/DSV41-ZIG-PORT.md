@@ -2097,6 +2097,30 @@ The kit is built from this section's commit or later, with the fill. Check the l
 7. Prod back on perf1 (`scripts/v2-rollback.sh perf1`). Keep `out/`, `triton-fill/`, the `sass` / `merge` output and
    both ranks' logs in the quant repo's results.
 
+### AOT guard, AOT trace and aot-needs' pool rule (R1, 2026-10-11)
+
+The vision gate's two prefill failures (`_rope`, then `_index_k` with `PSH 0`) were harness-only: `spark.sh prefill` /
+`generate` and m2b run without `TF_DSV41_POOL_TOKENS` (no paged pool: `Emitter.paging` gives `PSH 0`, `PT` none), while
+`aot-needs` always listed the pooled programs. A miss crashed both ranks: rank 0 mid-window, the follower's loop on any error.
+
+- **AOT guard** (`Runner.guard`, run.zig; default **on**, `TF_DSV41_AOT_GUARD=0` off): before a window issues any launch
+  (`window`, `windowOn`, `timedWindow`, longpf's prefill loop and its split blocks), every Triton call of it is resolved
+  against the AOT set (`missingIn`: each role's base 16-aligned, a tensor's offset its own: aot-needs' rule). A miss
+  returns `error.MissingTritonVariant` with nothing issued: rank 0's lane host drops that request (piece error) or fails
+  the round (step error), with the error's name as the message; `Forward.follow` takes the same error from the same
+  window as that operation's failure and goes on (any other error still ends the follower). Every rank runs the same
+  program and the probe reads no address, so every rank fails the same window before its first collective.
+- **Cost** (dev box, ReleaseFast, prod-zig.env's programs, a 1,432-variant set): a program seen before costs its key,
+  `programKey` (launch ints by class: == 1, % 16, fits 32 bits; constexprs, floats and flags by value; tensors by dtype
+  and offset alignment): **45 us** for a 1,136-call decode window, **386 us** for a 2,048-row prefill segment (822 Triton
+  calls); a new key costs the probe once: 3.2 ms (decode), 29 ms (prefill). Graphed decode windows probe at capture only
+  (replays issue no window); keys repeat across prompts, so the probe runs a handful of times a process.
+- **AOT trace** (`TF_DSV41_AOT_TRACE=<file>`, aot.zig `Trace`): one JSON line per distinct `Set.find` key (function,
+  arguments as `matches` reads them, constexprs) with the variant's hash or `"hit":null`; written on a key's first sight.
+- **aot-needs' pool** (`poolFromEnv`): the served engine's rule, `kv_state.optionsFromEnv` (no `TF_DSV41_POOL_TOKENS`:
+  no pool, the m2b / generate class, now enumerable); `TF_DSV41_NEEDS_POOL=1` / `0` forces it; split's `EARLY` and union
+  cap as the served pool has them. The host test `aot-needs: the pool is the serve path's` fails when the two diverge.
+
 ### The combined Spark window: prep (`dsq-zig-winprep-1`, offline, 2026-10-08)
 
 The quant repo's `results/zig-window-plan.md` runs every NEXT SPARK WINDOW section above as one window. It found six
