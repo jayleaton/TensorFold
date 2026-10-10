@@ -150,8 +150,8 @@ pub const Serve = struct {
     }
 };
 
-/// Zig's dip below boot-end idle (TF_DSV41_SERVE_DIP_GIB unset): 74ace4be's rank 1 measured 8.76 -> 5.53 (graphs too).
-pub const zig_dip_gib: f64 = 3.5;
+/// Zig's dip below idle (TF_DSV41_SERVE_DIP_GIB unset): 2 x 1M then 4 x 740K measured 2.48 (rank 1), 1.1 (rank 0).
+pub const zig_dip_gib: f64 = 3.0;
 
 /// Zig's terms before the pool: TF_DSV41_BOOT_GROWTH_GIB (unset 0: measured at boot's end), TF_DSV41_SERVE_DIP_GIB.
 pub fn zigFromEnv() !Serve {
@@ -491,11 +491,11 @@ test "the Zig check: measured at the end of boot, 2026-10-10's rank 1 passes, a 
     const terms: Serve = .{ .growth = 0, .dip = zig_dip_gib };
     const pre = serveCheck(k, .{ .rank = 1, .avail_gib = 14.94, .terms = terms }, spl, 2, 3_000_000);
     try std.testing.expect(pre.ok);
-    // after the boot: 96a3628f's rank 1 idle 8.70 - 3.5 dip = 5.20, over the 4.0 floor
+    // after the boot: 96a3628f's rank 1 idle 8.70 - 3.0 dip = 5.70, over the 4.0 floor
     const ok = afterBoot(14.94, pool, 8.70, zig_dip_gib, k.hard_gib, 3_000_000, per);
     try std.testing.expect(ok.ok);
     try std.testing.expectApproxEqAbs(@as(f64, 14.94 - pool - 8.70), ok.growth, 1e-9);
-    try std.testing.expectApproxEqAbs(@as(f64, 5.20), ok.worst, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 5.70), ok.worst, 1e-9);
     // the largest pool lands the worst point on the floor; 1 GiB more pool (1 GiB less idle) refuses
     const more = @as(u64, @intFromFloat(GiB / per));
     try std.testing.expect(ok.largest > 3_000_000);
