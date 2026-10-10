@@ -15,6 +15,13 @@
 //!   step for the rest of the run (logged), so a bad kernel costs a few drafts, never a reply or a hang.
 //! - **graphs**: graph_cache over the runner's stream, a key a pass size (slots), the addresses the pass bakes in
 //!   fingerprinted; TF_DSV41_DRAFT_GRAPHS_MAX (32, Python's), TF_DSV41_GRAPH_FLOOR_GIB (graphs.zig).
+//! - **the chain on the device** (TF_DSV41_DRAFT_CHAIN=1, `Chain`; default off: the host's chain): ds_out also lays
+//!   the gathered candidates out as Python's cand / cval [rows, W k] (2 W strided copies, gather_cols' order) and
+//!   keeps the head hidden on the device; after the round's passes Python's own `_chain` kernel (AOT, the same cubin
+//!   as prod's) runs over every slot of the round at once and only drafts and confidences come back. Python runs the
+//!   chain there too (drafter.pass_fn), so the drafts are prod's bit for bit, where the host chain agreed with them up
+//!   to fp32 summation order. The host's ~0.4 ms a 4-slot round (the chain and the hidden's widening) leaves the
+//!   round's critical path.
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -25,6 +32,7 @@ const graphs = @import("graphs.zig");
 const rows_mod = @import("dspark_rows.zig");
 const dspark = @import("draft/dspark.zig");
 const ph = @import("phases.zig");
+const emit = @import("dspark_emit.zig");
 
 pub const Mode = enum { host, device, graphs };
 
@@ -69,6 +77,8 @@ pub const Dev = struct {
     checked: u32 = 0,
     mismatches: u64 = 0,
     stats: struct { passes: u64 = 0, graphed: u64 = 0 } = .{},
+    /// TF_DSV41_DRAFT_CHAIN=1: the chain on the device (Chain); null: the host's
+    chain: ?*Chain = null,
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, comm: tp.collective.Collective, stream: cuda.Stream, want: Mode, k: usize, hidden: usize, rows_max: usize, conf: bool, region_bytes: usize, regions: usize) !*Dev {
         const x = try gpa.create(Dev);
@@ -100,7 +110,8 @@ pub const Dev = struct {
             .region_bytes = region_bytes,
             .regions = regions,
         };
-        x.cache = graphs.gc.Cache(u32).init(gpa, x.engine.engine(), .{ .on = true, .max = max, .min_keep = 2 });
+        const hold = if (std.c.getenv("TF_DSV41_GRAPH_FLOOR")) |v| std.mem.eql(u8, std.mem.span(v), "hold") else false;
+        x.cache = graphs.gc.Cache(u32).init(gpa, x.engine.engine(), .{ .on = true, .max = max, .min_keep = 2, .hold = hold });
         x.cache.agree = x.agreement.agree();
         x.cache.room = roomFn;
         if (std.c.getenv("TF_DSV41_GRAPH_FLOOR_GIB")) |v| floor_gib = std.fmt.parseFloat(f64, std.mem.span(v)) catch 5.0;
@@ -109,6 +120,7 @@ pub const Dev = struct {
     }
 
     pub fn deinit(x: *Dev) void {
+        if (x.chain) |ch| ch.deinit();
         const cs = x.cache.stats;
         std.log.scoped(.dsv41).info("draft graphs: {t}, {d} passes, {d} graphed; {d} captured, {d} replayed, {d} eager; {d} checked, {d} mismatched", .{ x.active, x.stats.passes, x.stats.graphed, cs.captured, cs.replayed, cs.eager, x.checked, x.mismatches });
         x.cache.deinit();
@@ -146,6 +158,7 @@ pub const Dev = struct {
         const dst = x.gathered.ptr + at * 2 * k * 4 * x.world;
         try ops.dsCandidates(try r.tensorAddr(logits_t), V, rows, V, k, @intCast(x.comm.rank() * V), send);
         try x.comm.allGather(send, dst, rows * 2 * k, .f32, r.stream.handle);
+        if (x.chain) |ch| try ch.layout(r, x.gathered.ptr, x.world, rows, k, at, try r.tensorAddr(hid_t));
         try r.d.check(r.d.api.cuMemcpyDtoHAsync_v2(x.host.bytes.ptr + at * 2 * k * 4 * x.world, dst, pk * x.world, r.stream.handle), "cuMemcpyDtoHAsync");
         if (x.conf) {
             const ho = x.rows_max * 2 * k * 4 * x.world + at * 2 * x.hidden;
@@ -248,7 +261,206 @@ pub const Dev = struct {
     pub fn words(x: *const Dev, out: []u64) usize {
         const w = [_]u64{ x.send.ptr, x.gathered.ptr, @intFromPtr(x.host.bytes.ptr), @intFromPtr(x.stage.bytes.ptr) };
         @memcpy(out[0..w.len], &w);
-        return w.len;
+        var m: usize = w.len;
+        if (x.chain) |ch| for (ch.bufs) |b| {
+            out[m] = b.ptr;
+            m += 1;
+        };
+        return m;
+    }
+};
+
+/// TF_DSV41_DRAFT_CHAIN: 1 = the chain on the device (with TF_DSV41_DRAFT_GRAPHS' device path), unset / 0 = the host's.
+pub fn chainFromEnv() !bool {
+    const v = std.mem.span(std.c.getenv("TF_DSV41_DRAFT_CHAIN") orelse return false);
+    if (v.len == 0 or std.mem.eql(u8, v, "0")) return false;
+    if (std.mem.eql(u8, v, "1")) return true;
+    return error.BadDraftChain;
+}
+
+/// One strided copy of ds_out's reorder (`Chain.layout`): `height` rows of `width` bytes, from `src` (bytes from the
+/// gathered buffer) at `src_pitch` to `dst` (bytes from cand / cval) at `dst_pitch`; `ids`: into cand, else cval.
+pub const Copy2D = struct { src: usize, src_pitch: usize, dst: usize, dst_pitch: usize, width: usize, height: usize, ids: bool };
+
+/// The gathered region at round row `at` ([W][rows][2 k] fp32: values, then ids as int bits) laid out as Python's
+/// cand / cval [rows, W k] (dspark_rows.ungather's order: rank w's k columns at w k): 2 W copies.
+pub fn reorder(world: usize, rows: usize, k: usize, at: usize, out: []Copy2D) []Copy2D {
+    const c = world * k;
+    const region = at * 2 * k * 4 * world;
+    for (0..world) |w| for (0..2) |half| {
+        const src = region + w * rows * 2 * k * 4 + half * k * 4;
+        out[2 * w + half] = .{ .src = src, .src_pitch = 2 * k * 4, .dst = (at * c + w * k) * 4, .dst_pitch = c * 4, .width = k * 4, .height = rows, .ids = half == 1 };
+    };
+    return out[0 .. 2 * world];
+}
+
+/// The chain on the device (TF_DSV41_DRAFT_CHAIN=1): Python's DraftInputs tensors `_chain` reads and writes, bound as
+/// dspark_emit.chain_roles (the round's rows: cand / cval / hid at the passes' rows; anchor, ipar, fpar, draft, conf,
+/// scr a slot), the args' and results' pinned staging, and each slot count's one-call program.
+pub const Chain = struct {
+    gpa: std.mem.Allocator,
+    d: *const cuda.Driver,
+    /// rows a slot (the block), the most slots a round, candidates a row (W k), the confidence head loaded
+    n: usize,
+    slots: usize,
+    c: usize,
+    hidden: usize,
+    conf: bool,
+    /// cand, cval, hid, anchor, ipar, fpar, draft, conf, scr (dspark_emit.chain_roles' order)
+    bufs: [9]cuda.DeviceBuffer,
+    /// pinned: ipar int64 [slots][4], anchor int32 [slots], fpar fp32 [slots][3]; then draft int32 [slots][n], conf
+    /// fp32 [slots][n]
+    host: cuda.HostBuffer,
+    arena: std.heap.ArenaAllocator,
+    programs: [16]?[]const calls.Call = @splat(null),
+    /// the slots of the round whose chain is in flight (0: none; the host chain runs)
+    launched: usize = 0,
+    /// a launch failed (no AOT variant, ...): the host's chain from then on
+    off: bool = false,
+    stats: struct { rounds: u64 = 0, slots: u64 = 0, failed: u64 = 0 } = .{},
+    /// the check rounds' drafts (dspark_slots.chainResults: the host's chain over the same candidates) and how many
+    /// differ from the device's
+    checked: u64 = 0,
+    differ: u64 = 0,
+
+    /// Rounds whose drafts are also chained on the host and compared (the device path's own check passes come first).
+    pub const check_rounds = 8;
+
+    /// After the check rounds: a near tie may differ (fp32 order), a wiring fault (anchors, parameters, the candidates'
+    /// layout) differs in most drafts: past a quarter the host's chain from here on (rank 0's alone: no agreement
+    /// needed, the followers read no drafts).
+    pub fn verdict(x: *Chain) void {
+        std.log.scoped(.dsv41).info("draft chain on the device: {d} check drafts, {d} differ from the host chain (fp32 order)", .{ x.checked, x.differ });
+        if (4 * x.differ > x.checked) {
+            x.off = true;
+            std.log.err("draft chain on the device: {d} of {d} check drafts differ from the host's: the host's chain from here on", .{ x.differ, x.checked });
+        }
+    }
+
+    const roles = [_][]const u8{ emit.chain_roles.cand, emit.chain_roles.cval, emit.chain_roles.hid, emit.chain_roles.anchor, emit.chain_roles.ipar, emit.chain_roles.fpar, emit.chain_roles.draft, emit.chain_roles.conf, emit.chain_roles.scr };
+
+    pub fn init(gpa: std.mem.Allocator, r: *run.Runner, n: usize, slots: usize, c: usize, hidden: usize, conf: bool) !*Chain {
+        if (c > emit.chain_kp or slots > 16) return error.Shape;
+        const x = try gpa.create(Chain);
+        errdefer gpa.destroy(x);
+        const rows = n * slots;
+        const sizes = [9]usize{ rows * c * 4, rows * c * 4, rows * hidden * 2, slots * 4, slots * 32, slots * 12, slots * n * 4, slots * n * 4, slots * 2 * emit.chain_kp * 8 };
+        var bufs: [9]cuda.DeviceBuffer = undefined;
+        var made: usize = 0;
+        errdefer for (bufs[0..made]) |*b| b.free();
+        for (&bufs, sizes) |*b, sz| {
+            b.* = try cuda.DeviceBuffer.alloc(r.d, @max(sz, 256));
+            try b.fill8(0, null);
+            made += 1;
+        }
+        x.* = .{ .gpa = gpa, .d = r.d, .n = n, .slots = slots, .c = c, .hidden = hidden, .conf = conf, .bufs = bufs, .host = try cuda.HostBuffer.alloc(r.d, hostBytes(n, slots)), .arena = std.heap.ArenaAllocator.init(gpa) };
+        for (roles, bufs) |role, b| try r.external(role, b.ptr);
+        return x;
+    }
+
+    fn hostBytes(n: usize, slots: usize) usize {
+        return slots * (32 + 4 + 12) + 2 * slots * n * 4;
+    }
+
+    pub fn deinit(x: *Chain) void {
+        if (x.stats.rounds + x.stats.failed > 0) std.log.scoped(.dsv41).info("draft chain on the device: {d} rounds, {d} slots, {d} failed launches", .{ x.stats.rounds, x.stats.slots, x.stats.failed });
+        for (&x.bufs) |*b| b.free();
+        x.host.free();
+        x.arena.deinit();
+        x.gpa.destroy(x);
+    }
+
+    /// ds_out's part (in the pass, graphable): the region at round row `at` as cand / cval rows, the head hidden
+    /// [rows, D] kept at the same rows.
+    pub fn layout(x: *Chain, r: *run.Runner, gathered: u64, world: usize, rows: usize, k: usize, at: usize, hid: u64) !void {
+        var cs: [32]Copy2D = undefined;
+        for (reorder(world, rows, k, at, &cs)) |cp| {
+            const p: cuda.abi.Memcpy2D = .{
+                .srcDevice = gathered + cp.src,
+                .srcPitch = cp.src_pitch,
+                .dstDevice = (if (cp.ids) x.bufs[0].ptr else x.bufs[1].ptr) + cp.dst,
+                .dstPitch = cp.dst_pitch,
+                .WidthInBytes = cp.width,
+                .Height = cp.height,
+            };
+            try r.d.check(r.d.api.cuMemcpy2DAsync_v2(&p, r.stream.handle), "cuMemcpy2DAsync");
+        }
+        if (x.conf) try r.d.check(r.d.api.cuMemcpyDtoDAsync_v2(x.bufs[2].ptr + at * x.hidden * 2, hid, rows * x.hidden * 2, r.stream.handle), "cuMemcpyDtoDAsync");
+    }
+
+    /// The `S`-slot program (dspark_emit.emitChain), emitted once.
+    /// The first slot count whose `_chain` launch the AOT set cannot serve (null: every one, 1..slots), probed at boot
+    /// (Runner.missingTriton): a kit fill without the variant would otherwise fall back to the host chain at the first
+    /// round, logged once among the serving lines.
+    pub fn probe(x: *Chain, r: *const run.Runner, cfg: anytype, w: anytype, o: anytype) !?usize {
+        for (1..x.slots + 1) |S| if (try r.missingTriton(try x.program(cfg, w, o, S)) != null) return S;
+        return null;
+    }
+
+    fn program(x: *Chain, cfg: anytype, w: anytype, o: anytype, S: usize) ![]const calls.Call {
+        if (x.programs[S - 1]) |p| return p;
+        const p = try emit.emitChain(x.arena.allocator(), cfg, w, o, @intCast(x.n), @intCast(S), @intCast(x.c), x.conf);
+        x.programs[S - 1] = p;
+        return p;
+    }
+
+    /// The round's chain after its passes, on the runner's stream: each slot's (anchor, keyed parameters) in the
+    /// round's (sorted) order staged, `_chain` over the `params.len` slots, drafts and confidences copied back. False:
+    /// not launched (off, or the launch failed: logged, the host chain from then on).
+    pub fn launch(x: *Chain, r: *run.Runner, cfg: anytype, w: anytype, o: anytype, anchors: []const u32, params: []const dspark.Params) !bool {
+        const S = anchors.len;
+        x.launched = 0;
+        if (x.off or S == 0) return false;
+        if (S > x.slots) return error.Slots;
+        const a = stageArgs(x.host.bytes, x.slots, anchors, params);
+        x.issue(r, cfg, w, o, S, a) catch |e| {
+            x.off = true;
+            x.stats.failed += 1;
+            std.log.err("draft chain on the device: the launch failed ({t}); the host's chain from here on", .{e});
+            return false;
+        };
+        x.launched = S;
+        x.stats.rounds += 1;
+        x.stats.slots += S;
+        return true;
+    }
+
+    fn issue(x: *Chain, r: *run.Runner, cfg: anytype, w: anytype, o: anytype, S: usize, a: Args) !void {
+        const s = r.stream.handle;
+        try cuda.DeviceBuffer.uploadAsync(x.bufs[4], 0, a.ipar, s);
+        try cuda.DeviceBuffer.uploadAsync(x.bufs[3], 0, a.anchor, s);
+        try cuda.DeviceBuffer.uploadAsync(x.bufs[5], 0, a.fpar, s);
+        try r.window(try x.program(cfg, w, o, S));
+        const res = x.results();
+        try r.d.check(r.d.api.cuMemcpyDtoHAsync_v2(@ptrCast(res.draft.ptr), x.bufs[6].ptr, 4 * S * x.n, s), "cuMemcpyDtoHAsync");
+        if (x.conf) try r.d.check(r.d.api.cuMemcpyDtoHAsync_v2(@ptrCast(res.conf.ptr), x.bufs[7].ptr, 4 * S * x.n, s), "cuMemcpyDtoHAsync");
+    }
+
+    pub const Args = struct { ipar: []const u8, anchor: []const u8, fpar: []const u8 };
+
+    /// Python's DraftInputs.stage of the chain's inputs (dspark.sampling_params): ipar (seed, POS0, top_k, sampled),
+    /// anchor, fpar (T, top_p, min_p) as fp32, a slot each in the round's order, into the pinned staging.
+    pub fn stageArgs(host: []u8, slots: usize, anchors: []const u32, params: []const dspark.Params) Args {
+        const S = anchors.len;
+        const ipar: []i64 = @alignCast(std.mem.bytesAsSlice(i64, host[0 .. slots * 32]));
+        const anchor: []i32 = @alignCast(std.mem.bytesAsSlice(i32, host[slots * 32 ..][0 .. slots * 4]));
+        const fpar: []f32 = @alignCast(std.mem.bytesAsSlice(f32, host[slots * 36 ..][0 .. slots * 12]));
+        for (anchors, params, 0..) |an, p, j| {
+            ipar[4 * j ..][0..4].* = .{ @bitCast(p.seed), @intCast(p.pos0), p.top_k, @intFromBool(p.sampled) };
+            anchor[j] = @intCast(an);
+            fpar[3 * j ..][0..3].* = .{ @floatCast(p.temperature), @floatCast(p.top_p), @floatCast(p.min_p) };
+        }
+        return .{ .ipar = std.mem.sliceAsBytes(ipar[0 .. 4 * S]), .anchor = std.mem.sliceAsBytes(anchor[0..S]), .fpar = std.mem.sliceAsBytes(fpar[0 .. 3 * S]) };
+    }
+
+    /// The pinned results (valid after the round's event): draft int32 [slots][n], conf fp32 [slots][n].
+    pub fn results(x: *const Chain) struct { draft: []i32, conf: []f32 } {
+        const base = x.slots * 48;
+        const m = x.slots * x.n;
+        return .{
+            .draft = @alignCast(std.mem.bytesAsSlice(i32, x.host.bytes[base..][0 .. 4 * m])),
+            .conf = @alignCast(std.mem.bytesAsSlice(f32, x.host.bytes[base + 4 * m ..][0 .. 4 * m])),
+        };
     }
 };
 

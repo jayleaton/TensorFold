@@ -40,6 +40,12 @@ pub const Runner = struct {
     /// TF_DSV41_MHC_DEFER (branches.zig): the stream of the mHC coefficient launches tagged `defer_side`, joined by the
     /// next mHC call (`defer_join`, mhc.await_coefs)
     dfr: ?*Side = null,
+    /// TF_DSV41_DRAFT_OVERLAP (dspark_slots.zig): the event a row window records (an event record node in its graph)
+    /// right after its last call that writes "w.taps", the drafter's ingests on their own stream wait on it; `armed`
+    /// for the next window only (batch.zig sets it before the row window, eager or captured, and clears it after)
+    taps_mark: ?TapsMark = null,
+
+    pub const TapsMark = struct { ev: cuda.Event, armed: bool = false, recorded: u64 = 0 };
 
     /// l2pf.py's Prefetcher on the device: the side stream, the fork / join events, whether a fork is open.
     pub const Side = struct {
@@ -51,7 +57,12 @@ pub const Runner = struct {
         open: bool = false,
         launches: u64 = 0,
         skipped_rows: u64 = 0,
+        /// TF_DSV41_PF_OVERLAP_SITE (the branches' side only): a call's `mark` m records marks[m - 1] on this stream,
+        /// a call's `wait` m makes the main stream wait for it
+        marks: [max_marks]?cuda.Event = @splat(null),
     };
+
+    pub const max_marks = 8;
 
     pub const Glue = struct {
         ctx: *anyopaque,
@@ -121,6 +132,26 @@ pub const Runner = struct {
         };
     }
 
+    /// The first Triton call of `cs` the AOT set has no variant for (its function's name), null when every one has:
+    /// a program's launches resolved without issuing them (a boot-time probe), every tensor taken 16-aligned as the
+    /// runner's buffers are.
+    pub fn missingTriton(r: *const Runner, cs: []const calls.Call) !?[]const u8 {
+        var arena = std.heap.ArenaAllocator.init(r.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        for (cs) |*c| if (c.triton) {
+            var mine: std.ArrayList(cuda.aot.Spec) = .empty;
+            for (r.triton.variants) |v| if (std.mem.eql(u8, v.spec.@"fn", c.name)) try mine.append(a, v.spec);
+            const sp = tc.split(a, c, mine.items, .{ .ctx = @constCast(r), .of = alignedAddr }) catch return c.name;
+            _ = r.triton.find(c.name, sp.args, sp.consts) catch return c.name; // error.MissingTritonVariant
+        };
+        return null;
+    }
+
+    fn alignedAddr(_: *anyopaque, _: calls.Tensor) anyerror!u64 {
+        return 1 << 20;
+    }
+
     fn addrOf(ctx: *anyopaque, t: calls.Tensor) anyerror!u64 {
         const r: *const Runner = @ptrCast(@alignCast(ctx));
         return r.tensorAddr(t);
@@ -147,6 +178,11 @@ pub const Runner = struct {
     pub fn issue(r: *Runner, c: *const calls.Call) !void {
         if (r.br) |b| {
             if (c.join) try r.joinBranch();
+            if (c.wait > 0) {
+                // the main stream after the side's work up to mark `wait` only (the fork stays open)
+                if (!b.open) return error.BranchNotForked;
+                try r.stream.wait(b.marks[c.wait - 1] orelse return error.NoBranchMark);
+            }
             if (c.fork) {
                 try b.fork.record(r.stream);
                 try b.stream.wait(b.fork);
@@ -159,7 +195,9 @@ pub const Runner = struct {
                 const main = r.stream;
                 r.stream = b.stream;
                 defer r.stream = main;
-                return r.issueOn(b.stream, c, r.scratch);
+                try r.issueOn(b.stream, c, r.scratch);
+                if (c.mark > 0) try (b.marks[c.mark - 1] orelse return error.NoBranchMark).record(b.stream);
+                return;
             }
         }
         if (r.dfr) |d| {
@@ -253,16 +291,56 @@ pub const Runner = struct {
     pub fn window(r: *Runner, cs: []const calls.Call) !void {
         if (syncEach()) return r.windowChecked(cs);
         errdefer r.dropForks(); // a failed window (or capture) leaves no fork for the next one to join
-        for (cs) |*c| try r.issue(c);
+        const mark = r.markAt(cs);
+        for (cs, 0..) |*c, i| {
+            try r.issue(c);
+            if (i == mark) try r.recordMark(c);
+        }
         try r.join();
     }
 
+    /// Issues `cs` on `stream` instead of the runner's (TF_DSV41_DRAFT_OVERLAP: the drafter's ingests beside a row
+    /// window): a drafter program has no branch, deferral or prefetch marks, and no glue step; the runner's stream is
+    /// this one while they issue. Nothing joins: the caller orders `stream` with its own events.
+    pub fn windowOn(r: *Runner, stream: cuda.Stream, cs: []const calls.Call) !void {
+        const main = r.stream;
+        r.stream = stream;
+        defer r.stream = main;
+        for (cs) |*c| {
+            if (c.side or c.fork or c.join or c.defer_side or c.defer_join or c.glue or std.mem.startsWith(u8, c.name, "tf_dsv41_l2p")) return error.NotASideProgram;
+            try r.issueOn(stream, c, r.scratch);
+        }
+    }
+
+    /// The index of the call after which an armed window records the taps mark (its last "w.taps" writer); null: not
+    /// armed, or no call writes taps. The arming lasts until its owner clears it (a capture that falls back to an
+    /// eager issue records again).
+    fn markAt(r: *Runner, cs: []const calls.Call) ?usize {
+        const m = r.taps_mark orelse return null;
+        if (!m.armed) return null;
+        return lastTaps(cs);
+    }
+
+    /// The mark after call `c`, on the stream `c` ran on (a branch's side stream when the emitter put it there). In a
+    /// capture it is an external record node (each launch of the graph records it at that point); an eager window (a
+    /// capture that fell back, or a key the row graphs had no room for under TF_DSV41_GRAPH_FLOOR_GIB) records it as a
+    /// plain record at the same point: CU_EVENT_RECORD_EXTERNAL is invalid outside a capture (cuEventRecordWithFlags:
+    /// CUDA_ERROR_ILLEGAL_STATE, Spark P4 2026-10-09: the first eager row window with TF_DSV41_DRAFT_OVERLAP=1).
+    fn recordMark(r: *Runner, c: *const calls.Call) !void {
+        const m = &r.taps_mark.?;
+        const s = if (c.side and r.br != null) r.br.?.stream else if (c.defer_side and r.dfr != null) r.dfr.?.stream else r.stream;
+        if (try cuda.graph.captureStatus(s) != .none) try m.ev.recordExternal(s) else try m.ev.record(s);
+        m.recorded += 1;
+    }
+
     fn windowChecked(r: *Runner, cs: []const calls.Call) !void {
+        const mark = r.markAt(cs);
         for (cs, 0..) |*c, i| {
             r.issue(c) catch |e| {
                 std.log.err("sync-each: call {d}/{d} {s} failed to issue ({t})", .{ i, cs.len, c.name, e });
                 return e;
             };
+            if (i == mark) try r.recordMark(c);
             r.stream.synchronize() catch |e| {
                 std.log.err("sync-each: call {d}/{d} {s} faulted ({t})", .{ i, cs.len, c.name, e });
                 return e;
@@ -277,15 +355,30 @@ pub const Runner = struct {
         if (syncEach()) return r.windowChecked(cs);
         p.begin();
         errdefer r.dropForks();
-        for (cs) |*c| {
+        const mark = r.markAt(cs);
+        for (cs, 0..) |*c, i| {
             try p.before(r.stream, c);
             try r.issue(c);
+            if (i == mark) try r.recordMark(c);
             try p.after(r.stream);
         }
         try r.join();
         try p.end(r.stream);
     }
 };
+
+/// The last call of `cs` with a "w.taps" tensor argument (the boundary that writes the last DSpark target's taps);
+/// null when none does.
+pub fn lastTaps(cs: []const calls.Call) ?usize {
+    var at: ?usize = null;
+    for (cs, 0..) |c, i| for (c.args) |x| switch (x.arg) {
+        .t => |t| if (t.role == .buf and std.mem.eql(u8, t.role.buf, "w.taps")) {
+            at = i;
+        },
+        else => {},
+    };
+    return at;
+}
 
 var sync_each: ?bool = null;
 fn syncEach() bool {

@@ -496,6 +496,7 @@ pub const Engine = struct {
             path = try accept.acceptPath(a, tokens, parents, sampled);
             for (path[1..]) |r| try committed.append(a, tokens[r]);
             try committed.append(a, sampled[path[path.len - 1]]);
+            if (s.proposer) |pr| pr.round(@intCast(rows), @intCast(path.len - 1));
             if (rows > 1) {
                 const kept = path.len - 1;
                 e.drafted += rows - 1;

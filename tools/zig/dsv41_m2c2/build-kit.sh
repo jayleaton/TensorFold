@@ -22,7 +22,10 @@ rm -rf "$KIT" && mkdir -p "$KIT/tools/zig/dsv41_m1" && KIT=$(cd "$KIT" && pwd)
 cd "$TREE"
 bash "$HERE/kit-fatbins.sh" "$KIT/fatbins"
 zig build -Dtarget=aarch64-linux-gnu -Dfatbins="$KIT/fatbins" -Dsm=121 -Doptimize=ReleaseSafe -j4 --prefix "$KIT/.build" install
-cp "$KIT/.build/bin/tf-dsv41-m1" "$KIT/.build/bin/tensorfold-dsv41" "$KIT/" && rm -rf "$KIT/.build"
+cp "$KIT/.build/bin/tf-dsv41-m1" "$KIT/.build/bin/tensorfold-dsv41" "$KIT/"
+# the kernel exactness runner (zig/tests/cuda/deepseek_v41/job.sh: TF_DSV41_TEST) for bit gates on the Sparks
+if [[ -x "$KIT/.build/bin/tf-dsv41-test" ]]; then cp "$KIT/.build/bin/tf-dsv41-test" "$KIT/"; fi
+rm -rf "$KIT/.build"
 cp "$KIT/fatbins/tp_mailbox.fatbin" "$KIT/tp_mailbox.fatbin"      # TF_TP_KERNEL_IMAGE=/kit/tp_mailbox.fatbin
 cp tools/zig/dsv41_m2b_ref.py tools/zig/dsv41_m1_capture.py tools/zig/triton_aot_manifest.py tools/zig/dsv41_engram_host.py \
     tools/zig/dsv41_aot_merge.py tools/zig/dsv41_m5_kv.py "$KIT/tools/zig/"

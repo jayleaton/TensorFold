@@ -50,12 +50,21 @@ pub const Rounds = struct {
     };
 };
 
+/// Makes and frees a request's copy proposer (`prompt` and `eos` outlive it).
+pub const Proposers = struct {
+    ctx: *anyopaque,
+    make: *const fn (ctx: *anyopaque, gpa: Allocator, prompt: []const u32, eos: []const u32) anyerror!lanes.proposer.Proposer,
+    free: *const fn (ctx: *anyopaque, p: lanes.proposer.Proposer) void,
+};
+
 pub const LaneHost = struct {
     gpa: Allocator,
     io: std.Io,
     core: *lanes.Engine,
     info_: Info,
     min_match: i64 = 4,
+    /// A family's own copy proposer for each request (null: lanes.SuffixLookup at `min_match`)
+    proposers: ?Proposers = null,
     mutex: std.Io.Mutex = .init,
     wake: std.Io.Condition = .init,
     queued: std.ArrayList(*Job) = .empty,
@@ -94,6 +103,8 @@ pub const LaneHost = struct {
         sink: Sink,
         stream: lanes.Stream = undefined,
         proposer: lanes.SuffixLookup = undefined,
+        /// the family's proposer (LaneHost.proposers), in place of `proposer`
+        custom: ?lanes.proposer.Proposer = null,
         delivered: usize = 0,
         started: bool = false,
         prefill_sent: bool = false, // a lone driver's prefilled event went out
@@ -268,7 +279,7 @@ pub const LaneHost = struct {
         emit(job, .{ .finished = .{ .reason = reason, .stats = stats, .message = message } });
         if (job.started) {
             s.deinit(h.gpa);
-            job.proposer.deinit();
+            h.freeProposer(job);
         }
         h.gpa.destroy(job);
     }
@@ -347,6 +358,11 @@ pub const LaneHost = struct {
     }
 
     /// An admitted job's stream (its kept prefix looked up, its drafter): false when it failed (the job is finished).
+    fn freeProposer(h: *LaneHost, job: *Job) void {
+        if (job.custom) |c| h.proposers.?.free(h.proposers.?.ctx, c) else job.proposer.deinit();
+        job.custom = null;
+    }
+
     fn openStream(h: *LaneHost, job: *Job) bool {
         const r = job.request;
         var reuse: lanes.stream.Reuse = .{};
@@ -357,7 +373,9 @@ pub const LaneHost = struct {
             job.marks = l.marks;
             reuse = .{ .saved = if (l.entry) |e| e.saved else null, .at = if (l.entry) |e| e.at else 0, .marks = l.marks, .hook = .{ .ptr = job, .at = Job.kept } };
         } else |_| {};
-        job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch return !h.drop(job, "the drafter could not start");
+        if (h.proposers) |ps| {
+            job.custom = ps.make(ps.ctx, h.gpa, r.prompt, r.eos) catch return !h.drop(job, "the drafter could not start");
+        } else job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch return !h.drop(job, "the drafter could not start");
         job.stream = lanes.Stream.init(h.gpa, .{
             .id = "request",
             .prompt = r.prompt,
@@ -365,7 +383,7 @@ pub const LaneHost = struct {
             .eos = r.eos,
             .sampling = r.sampling,
             .drafts = r.drafts,
-            .proposer = job.proposer.proposer(),
+            .proposer = job.custom orelse job.proposer.proposer(),
             .stop_check = if (r.stop) |s| .{ .ptr = s.ctx, .check = s.check } else null,
             .cancel_check = .{ .ptr = job, .check = cancelled },
             .think_budget = r.think_budget,
@@ -375,7 +393,7 @@ pub const LaneHost = struct {
             .chunks = r.chunks,
             .reuse = reuse,
         }) catch {
-            job.proposer.deinit();
+            h.freeProposer(job);
             return !h.drop(job, "out of memory");
         };
         job.started = true;

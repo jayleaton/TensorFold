@@ -13,7 +13,9 @@
 //!   drops every graph; they are captured again on use.
 //! - Cap: at most `max` graphs; a capture past it first evicts the least recently launched. Under the caller's memory
 //!   floor (`room` false on any rank) the least recent quarter is evicted, the cap drops to what is left (never below
-//!   `min_keep`) and the step runs eagerly.
+//!   `min_keep`) and the step runs eagerly. The next miss with room on every rank puts the cap back to `max`: a memory
+//!   dip (a long prompt's prefill workspace held, then freed) must not leave the cache short-capped for good, which
+//!   turns every later new key into an eviction and a capture.
 //! - A capture that fails on any rank turns graphs off for the rest of the run, every rank alike.
 //!
 //! No CUDA here: capture / launch / free go through `Engine` (`cudaEngine` for the driver), so the policy runs in
@@ -53,6 +55,10 @@ pub const Settings = struct {
     max: u32 = 48,
     /// under the memory floor the cache evicts down to this many, then stops capturing
     min_keep: u32 = 8,
+    /// under the memory floor a miss runs eagerly and nothing else changes: no eviction, the cap kept (the held
+    /// graphs are kernel parameters, not activations; evicting them frees next to nothing and turns their later
+    /// steps into eager ones while the dip lasts)
+    hold: bool = false,
 };
 
 pub const Outcome = enum { replayed, captured, eager };
@@ -75,7 +81,7 @@ pub fn Cache(comptime Key: type) type {
         /// a capture failed on some rank: eager from here on
         failed: bool = false,
         /// counters for logs and gates
-        stats: struct { replayed: u64 = 0, captured: u64 = 0, eager: u64 = 0, evicted: u64 = 0, dropped: u64 = 0 } = .{},
+        stats: struct { replayed: u64 = 0, captured: u64 = 0, eager: u64 = 0, evicted: u64 = 0, dropped: u64 = 0, floor_hits: u64 = 0 } = .{},
 
         pub fn init(gpa: std.mem.Allocator, engine: Engine, settings: Settings) Self {
             return .{ .gpa = gpa, .engine = engine, .settings = settings, .cap = settings.max };
@@ -138,12 +144,24 @@ pub fn Cache(comptime Key: type) type {
             // a miss: room on every rank, else shed the least recent quarter and lower the cap (once below it, eager)
             const room_here = if (c.room) |f| f() else true;
             if (!try c.agreed(room_here and c.cap > 0)) {
+                if (c.settings.hold) {
+                    if (c.stats.floor_hits == 0) std.log.warn("graph cache: under the memory floor on {s} rank: this key eager, {d} graphs held (TF_DSV41_GRAPH_FLOOR=hold)", .{ if (room_here) "another" else "this", c.entries.count() });
+                    c.stats.floor_hits += 1;
+                    return c.eager(stream, body);
+                }
                 if (c.entries.count() > c.settings.min_keep) {
                     const drop = @max(1, c.entries.count() / 4);
                     for (0..drop) |_| if (c.entries.count() > c.settings.min_keep) c.evictOldest();
                 }
+                const was = c.cap;
                 c.cap = @intCast(@max(c.entries.count(), c.settings.min_keep));
+                c.stats.floor_hits += 1;
+                if (c.cap != was) std.log.warn("graph cache: under the memory floor on {s} rank: cap {d} -> {d} ({d} held, {d} evicted, {d} eager so far)", .{ if (room_here) "another" else "this", was, c.cap, c.entries.count(), c.stats.evicted, c.stats.eager + 1 });
                 return c.eager(stream, body);
+            }
+            if (c.cap < c.settings.max) {
+                std.log.info("graph cache: room again on every rank: cap {d} -> {d}", .{ c.cap, c.settings.max });
+                c.cap = c.settings.max;
             }
             while (c.entries.count() >= c.cap) c.evictOldest();
             const exec = c.engine.capture(c.engine.ctx, stream, body) catch |err| blk: {
@@ -345,8 +363,52 @@ test "graph cache: below the memory floor the least recent quarter goes, the cap
     try std.testing.expectEqual(@as(u32, 6), c.cap);
     try std.testing.expect(!c.has(0) and !c.has(1) and c.has(7));
     room_flag = true;
-    try std.testing.expectEqual(Outcome.captured, try c.run(100, no_stream, 7, r.body())); // evicts one to stay at 6
-    try std.testing.expectEqual(@as(usize, 6), c.count());
+    // room again: the cap is back to max, the miss captures without evicting
+    try std.testing.expectEqual(Outcome.captured, try c.run(100, no_stream, 7, r.body()));
+    try std.testing.expectEqual(@as(usize, 7), c.count());
+    try std.testing.expectEqual(@as(u32, 48), c.cap);
+    try std.testing.expect(c.has(7) and c.has(2));
+    try std.testing.expectEqual(@as(u64, 1), c.stats.floor_hits);
+}
+
+test "graph cache: a dip under the floor does not leave later keys churning once memory is back" {
+    var f: Fake = .{};
+    var r: Ran = .{};
+    var c = Cache(u32).init(std.testing.allocator, f.engine(), .{ .max = 16, .min_keep = 2 });
+    c.room = roomFn;
+    defer c.deinit();
+    room_flag = true;
+    for (0..12) |k| _ = try c.run(@intCast(k), no_stream, 7, r.body());
+    room_flag = false; // a long prompt's workspace held
+    _ = try c.run(200, no_stream, 7, r.body());
+    room_flag = true; // freed: the decode after it meets 12 new keys (a new context bucket), then replays them
+    const before = c.stats.evicted;
+    for (0..12) |k| _ = try c.run(@intCast(300 + k), no_stream, 7, r.body());
+    for (0..12) |k| try std.testing.expectEqual(Outcome.replayed, try c.run(@intCast(300 + k), no_stream, 7, r.body()));
+    try std.testing.expectEqual(@as(u32, 16), c.cap);
+    // only what the cap of 16 forces: 9 left after the dip + 12 new = 21 -> 5 evictions, none during the replays
+    try std.testing.expectEqual(before + 5, c.stats.evicted);
+}
+
+test "graph cache: hold - below the floor a miss runs eagerly, nothing is evicted, the held keys replay" {
+    var f: Fake = .{};
+    var r: Ran = .{};
+    var c = Cache(u32).init(std.testing.allocator, f.engine(), .{ .max = 48, .min_keep = 2, .hold = true });
+    c.room = roomFn;
+    defer c.deinit();
+    room_flag = true;
+    for (0..8) |k| _ = try c.run(@intCast(k), no_stream, 7, r.body());
+    room_flag = false;
+    try std.testing.expectEqual(Outcome.eager, try c.run(100, no_stream, 7, r.body()));
+    try std.testing.expectEqual(Outcome.eager, try c.run(101, no_stream, 7, r.body()));
+    try std.testing.expectEqual(@as(usize, 8), c.count());
+    try std.testing.expectEqual(@as(u32, 48), c.cap);
+    for (0..8) |k| try std.testing.expectEqual(Outcome.replayed, try c.run(@intCast(k), no_stream, 7, r.body()));
+    try std.testing.expectEqual(@as(u64, 0), c.stats.evicted);
+    try std.testing.expectEqual(@as(u64, 2), c.stats.floor_hits);
+    room_flag = true;
+    try std.testing.expectEqual(Outcome.captured, try c.run(100, no_stream, 7, r.body()));
+    try std.testing.expectEqual(@as(usize, 9), c.count());
 }
 
 test "graph cache: off runs every step eagerly" {

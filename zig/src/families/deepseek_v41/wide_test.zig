@@ -22,6 +22,15 @@ const rowmode = @import("rowmode.zig");
 const dspark_emit = @import("dspark_emit.zig");
 const Config = @import("config.zig").Config;
 
+// TF_DSV41_MHC_PFDEC on the same emitters
+test {
+    _ = @import("mhc_pfdec_test.zig");
+    _ = @import("coef_late_test.zig");
+    _ = @import("ibound_test.zig");
+    _ = @import("dev_arena_test.zig");
+    _ = @import("x3ld_epi_test.zig");
+}
+
 fn widths(a: std.mem.Allocator) !block.Widths {
     var w: block.Widths = .{};
     try check.parseDense(a, &w, @embedFile("fixtures/q28v2-dense-k2.txt"));
@@ -131,6 +140,49 @@ fn expectRouters(cs: []const calls.Call) !usize {
     return m;
 }
 
+test "router group/rotation fusion removes one wide call per MoE and keeps narrow R1 unchanged" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const w = try widths(a);
+    const cfg: Config = .{};
+    var backbone: [40]u32 = undefined;
+    for (&backbone, 0..) |*l, i| l.* = @intCast(i);
+    const off = prodOptions(1 << 20);
+    var on = off;
+    on.router_group_rot = true;
+    for ([_]i64{ 16, 17, 24, 32, 48, 64 }) |n| {
+        const plain = try block.emit(a, &cfg, &w, off, &backbone, n, 4080, true);
+        const fused = try block.emit(a, &cfg, &w, on, &backbone, n, 4080, true);
+        const removed: usize = if (n <= 16) 0 else cfg.layers;
+        try testing.expectEqual(plain.len - removed, fused.len);
+        var pi: usize = 0;
+        var combined: usize = 0;
+        for (fused) |c| {
+            if (std.mem.eql(u8, c.name, "tensorfold_exl3_experts_v1.group_rot_in")) {
+                const group = plain[pi];
+                const rot = plain[pi + 1];
+                try testing.expectEqualStrings("tensorfold_exl3_experts_v1.group", group.name);
+                try testing.expectEqualStrings("tensorfold_exl3_experts_v1.rot_in", rot.name);
+                try testing.expectEqual(@as(usize, 14), c.args.len);
+                for (rot.args, c.args[0..11]) |want, got| try testing.expectEqualDeep(want, got);
+                for (group.args[1..4], c.args[11..14]) |want, got| try testing.expectEqualDeep(want, got);
+                combined += 1;
+                pi += 2;
+            } else {
+                try testing.expectEqualDeep(plain[pi], c);
+                pi += 1;
+            }
+        }
+        try testing.expectEqual(removed, combined);
+        try testing.expectEqual(plain.len, pi);
+        const transformed = try rowmode.transform(a, fused, @intCast(n), .{ .slots = 4, .rmax = 64, .pts = on.pool.?.pts });
+        var retained: usize = 0;
+        for (transformed) |c| retained += @intFromBool(std.mem.eql(u8, c.name, "tensorfold_exl3_experts_v1.group_rot_in"));
+        try testing.expectEqual(combined, retained);
+    }
+}
+
 test "wide rows: decode windows of 17-64 rows take Python's > 16-row mHC and router path, and row mode takes them" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -210,4 +262,38 @@ test "wide rows: a 4-slot DSpark pass (20 rows) as Python's drafter at pad_slots
     }
     try testing.expectEqual(sites.items.len, k);
     try testing.expectEqual(cfg.mtp_layers, try expectRouters(cs));
+}
+
+test "KV norm/store removes only R1 SWA producers and row mode binds slot writes" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const w = try widths(a);
+    const cfg: Config = .{};
+    var backbone: [40]u32 = undefined;
+    for (&backbone, 0..) |*l, i| l.* = @intCast(i);
+    const off = prodOptions(1 << 20);
+    var on = off;
+    on.kv_norm_store = true;
+    for ([_]i64{ 1, 2, 16, 17, 24, 64 }) |n| {
+        const plain = try block.emit(a, &cfg, &w, off, &backbone, n, 4080, true);
+        const fused = try block.emit(a, &cfg, &w, on, &backbone, n, 4080, true);
+        try @import("kv_glue_emit_test.zig").compare(plain, fused, cfg.layers);
+        const transformed = try rowmode.transform(a, fused, @intCast(n), .{ .slots = 4, .rmax = 64, .pts = on.pool.?.pts });
+        var count: usize = 0;
+        for (transformed) |c| if (std.mem.eql(u8, c.name, "tf_dsv41_kv_glue_v1.norm_store")) {
+            try testing.expect(c.args[14].arg.b);
+            try testing.expectEqual(@as(i64, n), c.args[5].arg.t.shape[0]);
+            try testing.expectEqual(@as(i64, @intCast(@import("rowtab.zig").colOffset(.pos, 64))), c.args[5].arg.t.offset);
+            try testing.expectEqual(@as(i64, @intCast(@import("rowtab.zig").colOffset(.wslot, 64))), c.args[6].arg.t.offset);
+            try testing.expectEqual(@as(i64, 4 * 2 * cfg.window), c.args[3].arg.t.shape[0]);
+            count += 1;
+        };
+        try testing.expectEqual(@as(usize, cfg.layers), count);
+    }
+    var legacy = off;
+    legacy.r1 = false;
+    var legacy_on = legacy;
+    legacy_on.kv_norm_store = true;
+    try testing.expectEqualDeep(try block.emit(a, &cfg, &w, legacy, &backbone, 1, 4080, true), try block.emit(a, &cfg, &w, legacy_on, &backbone, 1, 4080, true));
 }

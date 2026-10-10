@@ -16,7 +16,9 @@ const drive = @import("draft/drive.zig");
 const costs_mod = @import("draft/costs.zig");
 const tree = @import("draft/tree.zig");
 const calib_env = @import("draft/calib_env.zig");
+const calib_gpu = @import("calib_gpu.zig");
 const spec = @import("draft/spec.zig");
+const lookup = @import("draft/lookup.zig");
 const m3 = @import("m3.zig");
 const ph = @import("phases.zig");
 const timed = @import("phases_timed.zig");
@@ -71,6 +73,8 @@ pub const Served = struct {
     gtarget: ?*grammar_gpu.GrammarTarget = null,
     /// TF_DSV41_PREFILL_PIECES=1 (sched_host.zig): prod's batcher plans the host's rounds
     sched: ?*sched_host.SchedHost = null,
+    /// TF_DSV41_LOOKUP_PLAN=1 (draft/lookup.zig): Python's priced lookup drafts for each request's copies
+    lookup: ?*lookup.Planner = null,
 
     /// Rank 0's engine over a loaded model (`drafts`: DSpark's pass, else serial windows through the same lanes).
     pub fn open(gpa: Allocator, io: std.Io, dir: []const u8, assets: []const u8, drafts: bool, context: ?i64) !*Served {
@@ -84,9 +88,22 @@ pub const Served = struct {
         s.m = m;
         s.nd = .{};
         // draft pricing: prod's cached calibration (TF_DSV41_CALIB / _CALIB_DIR / _CALIB_FILE: Python's calib-*.json,
-        // shared as rank 0 shares it) and Python's depth knobs; without an entry for this engine, today's defaults
-        const cal = try calib_env.load(gpa, io, calib_env.Knobs.fromEnv(), .{ .slots = m.slots, .world = m.f.comm.world(), .dspark = m.pass != null, .context = @intCast(@min(context orelse m.f.opts.limit, m.f.opts.limit)) }, 64);
+        // shared as rank 0 shares it) and Python's depth knobs; without an entry for this engine, today's defaults.
+        // TF_DSV41_CALIB=measure (or zig without a stored Zig table): this engine's own windows timed now, on every
+        // rank (calib_gpu.zig), and stored as calib-zig-<shape>.json
+        const knobs = calib_env.Knobs.fromEnv();
+        const want: calib_env.Shape = .{ .slots = m.slots, .world = m.f.comm.world(), .dspark = m.pass != null, .context = @intCast(@min(context orelse m.f.opts.limit, m.f.opts.limit)) };
+        var cal = try calib_env.load(gpa, io, knobs, want, 64);
         defer if (cal.path) |p| gpa.free(p);
+        if (cal.source == .measure) {
+            errdefer cal.costs.deinit(gpa);
+            const got = try calib_gpu.boot(gpa, io, m, dir, knobs, want);
+            cal.costs.deinit(gpa);
+            cal.costs = got.costs;
+            cal.source = .measured;
+            if (cal.path) |p| gpa.free(p);
+            cal.path = got.path;
+        }
         s.costs = cal.costs;
         std.log.info("dsv41 draft costs: {t}{s}{s}, verify 1 / 16 rows {d:.3} / {d:.3} ms, pass {d:.3} ms", .{ cal.source, if (cal.path != null) " " else "", cal.path orelse "", s.costs.windowMs(1), s.costs.windowMs(16), s.costs.draft });
         var pass = m.draftPass() orelse s.nd.pass();
@@ -95,6 +112,7 @@ pub const Served = struct {
         if (s.phases) |x| {
             x.sync = .{ .ctx = m, .run = syncStream };
             m.f.phases = x;
+            x.extra = .{ .ctx = m, .write = writeEngram };
             s.tt = .{ .inner = tgt, .p = x, .gpa = gpa, .io = io };
             s.tpass = .{ .inner = pass, .p = x };
             tgt = s.tt.target();
@@ -117,6 +135,7 @@ pub const Served = struct {
         s.x = try ln.Lanes.init(gpa, tgt, pass, s.costs, .{ .shape = m3.shapeOf(&m.f), .slots = m.slots, .siblings = trees.siblings, .sib_rows = trees.sib_rows, .dup = trees.dup, .depth = try calib_env.depthSettings(&calib_env.env), .spec = if (m.pass != null) try spec.Settings.fromEnv() else .{} });
         s.arena = std.heap.ArenaAllocator.init(gpa);
         s.cfg = try lanes.Config.init(gpa, try s.x.model(s.arena.allocator(), 64), 16, 15);
+        s.x.policy.depth.forward_rows = if (m.rows) |b| b.cap else 16;
         // drafts sized from the cost tables, not the wall clock: a request drafts (and so verifies) the same whatever the
         // load or the requests before it, so HTTP == CLI replay holds (TF_DSV41_DRAFT_TIMED=1: the measured pricing)
         s.cfg.timed = if (std.c.getenv("TF_DSV41_DRAFT_TIMED")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
@@ -145,6 +164,15 @@ pub const Served = struct {
                 std.log.info("dsv41 rounds: {s}", .{sh.describe(&buf)});
             }
         } else std.log.info("dsv41 rounds: whole prompts at admission (TF_DSV41_PREFILL_PIECES=1: prod's pieces between decode rounds)", .{});
+        s.lookup = null;
+        const ls = try lookup.Settings.fromEnv();
+        if (ls.plan) {
+            const pl = try gpa.create(lookup.Planner);
+            pl.* = lookup.Planner.init(ls, &s.x.policy.depth.costs, m.pass != null);
+            s.lookup = pl;
+            s.host.proposers = .{ .ctx = pl, .make = makeLookup, .free = freeLookup };
+            std.log.info("dsv41 lookup: Python's priced plan (min match {d}, up to {d} rows{s})", .{ ls.min_match, ls.max_rows, if (ls.lookup) "" else ", lookup off" });
+        }
         try s.host.start();
         if (s.gengine) |ge| ge.inner = s.host.engine();
         s.rec = Recorder.init(gpa, io, if (s.gengine) |ge| ge.engine() else s.host.engine());
@@ -172,10 +200,46 @@ pub const Served = struct {
         return s.rec.engine();
     }
 
+    /// The phases report's "engram" and "rowgraphs" counters (cumulative; a cell's are the difference of two snapshots): the row
+    /// reader's records found cached (hits), found in flight (waited), read (misses), extents read and their bytes,
+    /// the engine's wait for them; the gate's rounds, GPU-side syncs and warm jobs. Python's boot line reports the same
+    /// as "rows N (cached, read)".
+    fn writeEngram(ctx: *anyopaque, w: *std.Io.Writer) anyerror!void {
+        const m: *model.Model = @ptrCast(@alignCast(ctx));
+        try w.writeAll(", \"engram\": {");
+        if (m.f.engram_rows) |r| {
+            const st = r.stats;
+            try w.print("\"hits\": {d}, \"waited\": {d}, \"misses\": {d}, \"issued\": {d}, \"reads\": {d}, \"bytes\": {d}, \"wait_ms\": {d:.2}", .{ st.hits, st.waited, st.misses, st.issued, st.reads, st.bytes, @as(f64, @floatFromInt(st.wait_ns)) / 1e6 });
+        } else try w.writeAll("\"rows\": null");
+        if (m.f.gate) |g| try w.print(", \"gate_rounds\": {d}, \"gate_syncs\": {d}, \"gate_warm\": {d}, \"gate_failed\": {d}", .{ g.stats.rounds, g.stats.syncs, g.stats.warm, g.stats.failed });
+        try w.writeAll("}");
+        // the row windows' first uses (batch.zig): programs emitted and graphs captured, their host ms
+        if (m.gt.rows) |b| {
+            const st = b.stats;
+            try w.print(", \"rowgraphs\": {{\"windows\": {d}, \"rows\": {d}, \"padded\": {d}, \"builds\": {d}, \"build_ms\": {d:.2}, \"captures\": {d}, \"capture_ms\": {d:.2}, \"eager\": {d}, \"prep_ms\": {d:.2}, \"stage_ms\": {d:.2}, \"launch_ms\": {d:.2}, \"keep_ms\": {d:.2}}}", .{ st.windows, st.rows, st.padded, st.builds, @as(f64, @floatFromInt(st.build_ns)) / 1e6, st.captures, @as(f64, @floatFromInt(st.capture_ns)) / 1e6, st.eager, @as(f64, @floatFromInt(st.prep_ns)) / 1e6, @as(f64, @floatFromInt(st.stage_ns)) / 1e6, @as(f64, @floatFromInt(st.launch_ns)) / 1e6, @as(f64, @floatFromInt(st.keep_ns)) / 1e6 });
+        }
+    }
+
+    fn makeLookup(ctx: *anyopaque, gpa: Allocator, prompt: []const u32, eos: []const u32) anyerror!lanes.proposer.Proposer {
+        const pl: *const lookup.Planner = @ptrCast(@alignCast(ctx));
+        const x = try gpa.create(lookup.Proposer);
+        errdefer gpa.destroy(x);
+        x.* = try lookup.Proposer.init(pl, gpa, prompt, eos);
+        return x.proposer();
+    }
+
+    fn freeLookup(_: *anyopaque, p: lanes.proposer.Proposer) void {
+        const x: *lookup.Proposer = @ptrCast(@alignCast(p.ptr));
+        const gpa = x.req.index.gpa;
+        x.deinit();
+        gpa.destroy(x);
+    }
+
     pub fn close(ctx: *anyopaque) void {
         const s: *Served = @ptrCast(@alignCast(ctx));
         const gpa = s.gpa;
         s.host.stop();
+        if (s.lookup) |pl| gpa.destroy(pl);
         if (s.sched) |sh| {
             s.m.gt.settleReleases();
             sh.deinit();

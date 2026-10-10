@@ -15,6 +15,10 @@ const Config = @import("config.zig").Config;
 test {
     _ = @import("ced_test.zig");
     _ = @import("multi_test.zig");
+    _ = @import("pf4k_test.zig");
+    _ = @import("pfovl_test.zig");
+    _ = @import("pftbo_test.zig");
+    _ = @import("streamrb_test.zig");
 }
 
 const Fake = struct {
@@ -24,6 +28,18 @@ const Fake = struct {
         return null;
     }
 };
+
+test "router grouping/rotation fusion is explicitly opt-in" {
+    Fake.pairs = &.{};
+    try testing.expect(!pk.routerGroupRot(&Fake.get));
+    for ([_][]const u8{ "0", "false", "yes", "2", "" }) |value| {
+        Fake.pairs = &.{.{ "TF_DSV41_ROUTER_GROUP_ROT", value }};
+        try testing.expect(!pk.routerGroupRot(&Fake.get));
+    }
+    Fake.pairs = &.{.{ "TF_DSV41_ROUTER_GROUP_ROT", " 1 " }};
+    try testing.expect(pk.routerGroupRot(&Fake.get));
+    Fake.pairs = &.{};
+}
 
 test "pfdense.pick: the override, the table (its small config at few rows), the heuristic; stages must divide K" {
     const a = testing.allocator;
@@ -221,4 +237,19 @@ test "the stream top-k's resident scratch for the boot check: none under the thr
         most = @max(most, n);
     };
     try testing.expectEqual(pk.streamScratch(&cfg, 1 << 20, 2048), most);
+}
+
+test "KV producer norm/store fusion is separately opt-in" {
+    Fake.pairs = &.{};
+    try testing.expect(!pk.kvNormStore(&Fake.get));
+    for ([_][]const u8{ "0", "false", "yes", "2", "" }) |value| {
+        Fake.pairs = &.{.{ "TF_DSV41_KV_NORM_STORE", value }};
+        try testing.expect(!pk.kvNormStore(&Fake.get));
+    }
+    Fake.pairs = &.{.{ "TF_DSV41_ROUTER_GROUP_ROT", "1" }};
+    try testing.expect(!pk.kvNormStore(&Fake.get));
+    Fake.pairs = &.{.{ "TF_DSV41_KV_NORM_STORE", " 1 " }};
+    try testing.expect(pk.kvNormStore(&Fake.get));
+    try testing.expect(!pk.routerGroupRot(&Fake.get));
+    Fake.pairs = &.{};
 }

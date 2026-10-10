@@ -103,6 +103,7 @@ Five agents work on `dsv41-zig` at once toward one combined pod gate and one Spa
   - 40–43: `dsq-zig-mdraft-1` (40 `op_ingest`, 41 `op_propose`, 42 `op_reset`: `dspark_rows.zig`; 28–31 are `dsq-zig-grammar-1`'s `op_grammar`).
   - 44–47: `dsq-zig-ced-1` (44 `op_ced_finish` `[op, end]`: `Forward.finishPrompt`; 45 `op_sess_prompt`: a replay-mode prompt snapshot, `sessions_gpu.savePrompt`).
   - 48–51: `dsq-zig-sess4-1` (48 `op_sess_admit` `[op, need, n, spilled entry ids...]`: a request's pool admission, `sessions_gpu.admit`).
+  - 64–67: `dsq-zig-calib` (64 `op_calib_mark` `[op]`: every rank syncs its device and reads its clock around a timed run; 65 `op_calib_gather` `[op, n]`: the ranks' n samples all-gathered; `Forward.calibMark` / `calibGather`, `calib_gpu.zig`, TF_DSV41_CALIB=measure). 52–53 (`op_pf_multi`, `op_ced_multi`), 56 (`op_engram_warm`) and 60 (`op_ahead`) are also taken.
 - **Defaults.** Every new behaviour is behind a knob or a new code path, and defaults to today's. With every new knob off, the gates `check cap24-*/cap15/cap18/cap22` and `dcheck cap16` still give 0 mismatches. Run `tf-dsv41-m1 m5-emit cap18` before committing a change to an emitter.
 - **Pool vs contiguous.** A slot's KV is either the contiguous roles (`s.L<i>.comp.*`, `s.L<i>.ik`) or the pool (`block.Options.pool`, the `s.kv.*` roles). New code must work with both, or refuse the other by name.
 - **Collectives.** Leader and followers make the same collective calls in the same order. Anything rank 0 decides (sampling draws, tree shapes, slot admission) travels on the plan link before the work that depends on it.
@@ -2273,6 +2274,44 @@ fast boot ~375 s).
 If P-1 fails while S4-1 passes, the pieces are the difference: rerun with `TF_DSV41_SLOTS=1` (the stash swap off).
 If only that run passes, it is the swap. After P-1..P-4 pass, uncomment `TF_DSV41_PREFILL_PIECES=1` in zig-serve's
 `prod-zig.env` and make it the default (`Model.piecesEnv`).
+
+### The drafter off the critical path (`dsq-zig-draftovl-1`, offline; branch `dsv41-zig-draftovl`)
+
+Two default-off knobs, the same launches and drafts; measurement and expected gains in `DSV41-ZIG-PERF.md` 7.3.
+- `TF_DSV41_DRAFT_CHAIN=1` (`dspark_dev.Chain`, `dspark_emit.emitChain`): the chain on the device, Python's own
+  `_chain` (AOT) over the round's slots after their passes; only drafts and confidences come back. The first 8
+  rounds also chain on the host and count differing drafts (`draft chain on the device: N check drafts, M differ`);
+  past a quarter the host's chain takes over. Needs `_chain` in the served AOT set (set P captures have it;
+  `aot-needs` lists it for `TRITON_FILL=1`); without it the boot warns and keeps the host's chain.
+- `TF_DSV41_DRAFT_OVERLAP=1` (`dspark_slots.ingestSide`, `run.Runner.taps_mark`): the device-started round's
+  ingests on a side stream from the row window's taps mark (an event record node after the last taps write),
+  joined where they ran before. Needs `TF_DSV41_GREEDY_GPU=1` and the glue's `ds_accept_rows` (the device start).
+- `TF_DSV41_DRAFT_BATCH_PROJ=1|check` (`dspark_slots.projRound`, `dspark_emit.emitIngestProj` / `emitIngestBlocks`):
+  one `main_proj` + `main_norm` over the round's slots' rows, then each slot's blocks; exact by construction
+  (linear.cu's row bits do not depend on the row count, DSV41-ZIG-PERF.md 7.3), `check` compares the first 8 rounds'
+  rows with each slot's projection alone on the device and falls back on any difference.
+- No new kernel: the glue fatbin is unchanged. A pod cannot gate the overlap (its layer prefix has no DSpark target
+  layers: no taps, no mark, every round serial), so the GPU steps are the Spark's.
+
+#### NEXT SPARK WINDOW: the drafter off the critical path (not run; after D1-D2c)
+
+Check the lease first. Kit from this section's commit or later; prod-zig.env as served (DRAFT_GRAPHS=1, GREEDY_GPU=1,
+SPEC_DRAFT=1, 4 slots, slot drafts), every override on the `v2-rollback.sh zig` line.
+
+| step | what | time | PASS |
+|---|---|---|---|
+| O1 boot | + `TF_DSV41_DRAFT_OVERLAP=1 TF_DSV41_DRAFT_CHAIN=1` | ~10 min | rank 0: `slot drafts: 4 slots, ... chain on the device, ingests overlapped`; no `has no _chain` warning; after 8 rounds `draft chain on the device: N check drafts, M differ` with **M < 1 % of N**, no `from here on` line |
+| O2 overlap == serial | `bench_http.py --work code --temps 0 --streams 1,4 --reps 2` on a boot with `TF_DSV41_DRAFT_OVERLAP=1` alone, against the same cells with it 0 | ~25 min | **T0 replies equal**; **tokens/round equal** (equal drafts give equal acceptance); shutdown `draft overlap: N rounds' ingests ... S serial`, N > 90 % of the decode rounds |
+| O3 chain | O1's boot, the same cells | ~15 min | **T0 replies equal** to Python (4/4); tokens/round within 0.5 % of O2's off cells (near ties against the host chain only) |
+| O4 speed | O1's boot: code x1, code x4, the mix, prose x4 (`--compare` against Python's cells) | ~30 min | `draft.chain` ms_avg < 0.05 (was 0.39); code x4 > 144.5, code x1 > 90.4 (Python) |
+| O6 batched main_proj, checked | a boot with `TF_DSV41_DRAFT_BATCH_PROJ=check` (alone), then one with `TF_DSV41_DRAFT_BATCH_PROJ=check TF_DSV41_DRAFT_OVERLAP=1` (the side stream's scratch); one code x4 T0 cell each (`--streams 4 --reps 1`) | ~25 min | both ranks log **`draft batched main_proj: 8 check rounds, N rows equal to their slot's projection alone, bit for bit`**; no `differ from their slot's projection` line; shutdown `... 0 of N check rows differ` |
+| O7 batched main_proj, speed | `TF_DSV41_DRAFT_BATCH_PROJ=1` against 0 (O1's other knobs as decided), code x4 and the mix, T0 | ~20 min | **T0 replies equal**; tokens/round equal (the same rings, so the same drafts); `draft.wait` / the round ~0.6 ms lower at 4 streams without the overlap, less with it |
+| O5 nsys (optional) | one code x4 cell under nsys; `tools/zig/dsv41_perf/nsys_draft.py` | ~10 min | `after_pass` median < 0.3 ms (was 0.65); the ingests' kernels on the side stream inside the window's last layer |
+
+On failure: replies differ in O2 (the overlap's ordering) or O3 (the chain's wiring): that knob 0, record the first
+differing reply and both ranks' logs. A `differ` line in O6 means a row's projection depends on the batch: keep
+`TF_DSV41_DRAFT_BATCH_PROJ=0` and record the line (the check already fell back, so no reply or ring was affected). PASS:
+the passing knobs into prod-zig.env (zig-serve, commented until then).
 
 ### Spark window, 2026-10-07: outcome
 

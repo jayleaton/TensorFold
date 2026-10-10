@@ -75,6 +75,12 @@ pub const Event = struct {
         try self.d.check(self.d.api.cuEventRecord(self.handle, stream.handle), "cuEventRecord");
     }
 
+    /// A record that a stream capture keeps as an event record node (abi.event_record_external): a stream outside the
+    /// graph that waits on the event after the graph's launch waits for that point of the launch.
+    pub fn recordExternal(self: Event, stream: Stream) Error!void {
+        try self.d.check(self.d.api.cuEventRecordWithFlags(self.handle, stream.handle, abi.event_record_external), "cuEventRecordWithFlags");
+    }
+
     pub fn synchronize(self: Event) Error!void {
         try self.d.check(self.d.api.cuEventSynchronize(self.handle), "cuEventSynchronize");
     }

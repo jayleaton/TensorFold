@@ -13,6 +13,13 @@
 //!   - `_finish_k`: COEF with the layer's base / scale and the next coefficients at a mixing site, off at `final`;
 //!     BLOCK gcd(1024, D), UNROLL (TF_DSV41_MHC_UNROLL 1), NORM_FIRST (TF_DSV41_MHC_FIN2 1).
 //!   MHC_DEFER has nothing to defer (no mhc_cuda coefficient launch in such a window), MHC_TAIL nothing to tail.
+//! - **TF_DSV41_MHC_PFDEC=<rows>** (ours, default 0 = off; `mhc`'s `pf` branch, `pfOn`): a mixing site of a window of at least <rows>
+//!   rows (1-64) as mhc_pf's `site_kernel` (G16's prefill site: the same operations as `_site`, checked bit for bit
+//!   against Triton, any row count, in place safe), then the normed input alone (`_finish_k` without COEF: the
+//!   final's instance) and the next coefficients as mhc_cuda's `coef_kernel` (R1: `_finish_k`'s chains and Sinkhorn,
+//!   a CTA a row), on the deferred stream with MHC_DEFER. Every output is the bits of the Triton pair (or of
+//!   mhc_cuda's boundary at <= 16 rows); finals and Engram's post-only keep their path. Round 4's 24-row windows:
+//!   `_site` 49.5 + `_finish_k` 12.7 us a site, 80 a window.
 //! - **router** (`router_gemv.config` / `row_tile`): past 16 rows the prefill configuration (8 warps, 2 experts a
 //!   warp; TF_DSV41_RG_NARROW is a <= 16-row kernel) and a row tile of 16: `routerCfg` (block_moe.moe).
 //! Everything else in a decode window is row-agnostic up to 64 rows (attn_cuda MAX_ROWS 64, dtopk 64, the dense /
@@ -22,6 +29,7 @@
 const std = @import("std");
 const calls = @import("calls.zig");
 const block = @import("block.zig");
+const moe = @import("block_moe.zig");
 const E = block.Emitter;
 const Arg = calls.Arg;
 
@@ -43,11 +51,14 @@ fn coefs(e: *E, set: u1) ![3]Arg {
 }
 
 /// One mHC site of layer L (`which`: hc_attn / hc_ffn) or the final norm (L null; `norm`: its weight's name, "norm"
-/// by default, DSpark's "dspark.norm"), for a window of more than 16 rows. `in_place`: a boundary without the second
+/// by default, DSpark's "dspark.norm"), for a window of more than 16 rows (or PFDEC's, `pfOn`). `in_place`: a boundary without the second
 /// streams buffer (CED's decoder replay). `tap`: DSpark's tap view at a boundary entering a target layer (or null).
 pub fn mhc(e: *E, layer: ?u32, which: []const u8, mode: Mode, in_place: bool, norm: ?[]const u8, tap: ?Arg) !void {
     const n = e.n;
-    if (n <= cuda_rows or n > max_rows) return error.WideRows;
+    const pf = pfOn(e, mode);
+    if ((n <= cuda_rows and !pf) or n > max_rows) return error.WideRows;
+    // PFDEC's deferred coefficients (MHC_DEFER): this site reads them (a no-op without a pending launch)
+    moe.awaitCoefs(e);
     const D: i64 = e.cfg.hidden;
     const hm: i64 = e.cfg.hc_mult;
     const post = mode == .boundary or mode == .final;
@@ -64,6 +75,33 @@ pub fn mhc(e: *E, layer: ?u32, which: []const u8, mode: Mode, in_place: bool, no
     const collapse: i64 = if (mode == .site1) 1 else 2;
     const pre: ?Arg = if (collapse == 2) prev[0] else null;
     const fnw: ?Arg = if (mix) try e.buf("s.L{d}.{s}.fn16", .{ layer.?, which }, .bf16, &.{ 6 * hm, hm * D }) else null;
+    if (pf) {
+        const L = layer.?;
+        try e.ext("tf_dsv41_mhc_pf_v1.run", &.{
+            x,                           if (post) xout else try e.empty(.bf16),
+            g orelse try e.empty(.bf16), if (post) prev[1] else try e.empty(.f32),
+            if (post) prev[2] else try e.empty(.f32), pre orelse try e.empty(.f32),
+            fnw.?,                       part,
+            c,                           tap orelse try e.empty(.bf16),
+            .{ .i = n },                 .{ .i = @intFromEnum(mode) },
+        });
+        try finishK(e, null, part, c, try normOf(e, layer, which, norm));
+        if (e.o.mhc_defer) {
+            e.df_side = true; // MHC_DEFER: on the deferred stream, the next mHC call joins it
+            e.df_pending = true;
+        }
+        try e.ext("tf_dsv41_mhc_cuda_v1.coef", &.{
+            part,                                                           try e.weight("L{d}.{s}.base", .{ L, which }, .f32, &.{6 * hm}),
+            try e.weight("L{d}.{s}.scale", .{ L, which }, .f32, &.{3}), next[0],
+            next[1],                                                        next[2],
+            .{ .i = n },                                                    .{ .f = E.dec(e.cfg.eps) },
+            .{ .f = E.dec(e.cfg.hc_eps) },                                  .{ .f = E.dec(e.cfg.hc_post_alpha) },
+            .{ .i = e.cfg.hc_sinkhorn_iters },
+        });
+        e.coef = 1 - e.coef;
+        if (spare) e.cur = 1 - e.cur;
+        return;
+    }
     const split = mix and n <= split_rows and !(post and !spare);
     try e.triton("_site", .{ std.math.divCeil(i64, n, 16) catch unreachable, 40, if (split) 4 else 1 }, &.{
         .{ .name = "X", .arg = x },                                    .{ .name = "x_stride", .arg = .{ .i = hm * D } },
@@ -79,16 +117,38 @@ pub fn mhc(e: *E, layer: ?u32, which: []const u8, mode: Mode, in_place: bool, no
         .{ .name = "COLLAPSE", .arg = .{ .i = collapse } },           .{ .name = "MIX", .arg = .{ .b = mix } },
         .{ .name = "TAP_ON", .arg = .{ .b = tap != null } },           .{ .name = "SPLIT", .arg = .{ .b = split } },
     });
-    const nw = if (layer) |L|
-        try e.weight("L{d}.{s}", .{ L, if (std.mem.eql(u8, which, "hc_attn")) "attn_norm" else "ffn_norm" }, .f32, &.{D})
-    else
-        try e.weight("{s}", .{norm orelse "norm"}, .f32, &.{D});
+    try finishK(e, if (mix) .{ layer.?, which, next } else null, part, c, try normOf(e, layer, which, norm));
+    if (mix) e.coef = 1 - e.coef;
+    if (spare) e.cur = 1 - e.cur;
+}
+
+/// TF_DSV41_MHC_PFDEC: this window's mixing sites take mhc_pf + `coef_kernel` (`mhc`'s `pf` branch), at any row
+/// count from the knob's to 64 (block_moe.mhcInto sends a <= 16-row window here then).
+pub fn pfOn(e: *const E, mode: anytype) bool {
+    const m = e.o.mhc_pf_rows;
+    return m > 0 and e.n >= m and e.n <= max_rows and @intFromEnum(mode) != @intFromEnum(Mode.final);
+}
+
+/// A site's (or the final's) norm weight: the layer's attn / ffn norm, the model's (or `norm`'s) at the final.
+fn normOf(e: *E, layer: ?u32, which: []const u8, norm: ?[]const u8) !Arg {
+    const D: i64 = e.cfg.hidden;
+    if (layer) |L| return e.weight("L{d}.{s}", .{ L, if (std.mem.eql(u8, which, "hc_attn")) "attn_norm" else "ffn_norm" }, .f32, &.{D});
+    return e.weight("{s}", .{norm orelse "norm"}, .f32, &.{D});
+}
+
+/// mhc._finish's `_finish_k`: with `coef` (layer, which, the next coefficients) the next site's coefficients too, else
+/// the normed input alone (a final; PFDEC's sites).
+fn finishK(e: *E, coef: ?struct { u32, []const u8, [3]Arg }, part: Arg, c: Arg, nw: Arg) !void {
+    const n = e.n;
+    const D: i64 = e.cfg.hidden;
+    const hm: i64 = e.cfg.hc_mult;
+    const mix = coef != null;
     try e.triton("_finish_k", .{ n, 1, 1 }, &.{
         .{ .name = "PART", .arg = part },
-        .{ .name = "BASE", .arg = if (mix) try e.weight("L{d}.{s}.base", .{ layer.?, which }, .f32, &.{6 * hm}) else part },
-        .{ .name = "SCALE", .arg = if (mix) try e.weight("L{d}.{s}.scale", .{ layer.?, which }, .f32, &.{3}) else part },
-        .{ .name = "PRE", .arg = if (mix) next[0] else part },         .{ .name = "POST", .arg = if (mix) next[1] else part },
-        .{ .name = "COMB", .arg = if (mix) next[2] else part },        .{ .name = "C", .arg = c },
+        .{ .name = "BASE", .arg = if (coef) |k| try e.weight("L{d}.{s}.base", .{ k[0], k[1] }, .f32, &.{6 * hm}) else part },
+        .{ .name = "SCALE", .arg = if (coef) |k| try e.weight("L{d}.{s}.scale", .{ k[0], k[1] }, .f32, &.{3}) else part },
+        .{ .name = "PRE", .arg = if (coef) |k| k[2][0] else part },    .{ .name = "POST", .arg = if (coef) |k| k[2][1] else part },
+        .{ .name = "COMB", .arg = if (coef) |k| k[2][2] else part },   .{ .name = "C", .arg = c },
         .{ .name = "NW", .arg = nw },
         .{ .name = "OUT", .arg = try e.buf("w.out", .{}, .bf16, &.{ n, D }) },
         .{ .name = "eps", .arg = .{ .f = E.dec(e.cfg.eps) } },        .{ .name = "hc_eps", .arg = .{ .f = E.dec(e.cfg.hc_eps) } },
@@ -98,8 +158,6 @@ pub fn mhc(e: *E, layer: ?u32, which: []const u8, mode: Mode, in_place: bool, no
         .{ .name = "BLOCK", .arg = .{ .i = @intCast(std.math.gcd(@as(u64, 1024), @as(u64, @intCast(D)))) } },
         .{ .name = "UNROLL", .arg = .{ .b = true } },                  .{ .name = "NORM_FIRST", .arg = .{ .b = true } },
     });
-    if (mix) e.coef = 1 - e.coef;
-    if (spare) e.cur = 1 - e.cur;
 }
 
 /// block_moe.mhcInto's call for a window of more than 16 rows (`mode`: block_moe.Mode), with its DSpark tap: the

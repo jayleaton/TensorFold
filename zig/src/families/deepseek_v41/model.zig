@@ -81,6 +81,8 @@ pub fn ownPrefillEnv() bool {
 
 pub const Model = struct {
     gpa: std.mem.Allocator,
+    /// TF_DSV41_PROFILE's writer at close (the served stop: SIGTERM / SIGINT -> serve_engine deinit -> close)
+    io: std.Io,
     arena: std.heap.ArenaAllocator,
     tcfg: tp.Config,
     driver: cuda.Driver,
@@ -130,6 +132,7 @@ pub const Model = struct {
         const m = try gpa.create(Model);
         errdefer gpa.destroy(m);
         m.gpa = gpa;
+        m.io = io;
         // gpa.create applies no field defaults: the parts made only with drafts, KV, several slots or sampling start
         // null here, or close() frees garbage when they are off (TF_DSV41_DRAFTS=0 and the rest)
         m.pass = null;
@@ -147,6 +150,7 @@ pub const Model = struct {
         const cwd = std.Io.Dir.cwd();
         m.tcfg = try tp.Config.fromEnv();
         m.driver = try cuda.Driver.open();
+        try @import("dev_arena.zig").applySchedule(&m.driver, @intCast(m.tcfg.device)); // TF_CUDA_SCHED
         m.ctx = try cuda.Context.init(&m.driver, @intCast(m.tcfg.device));
         m.stream = try cuda.Stream.init(&m.driver, true);
         m.kernels = try dk.Kernels.load(&m.ctx);
@@ -156,6 +160,8 @@ pub const Model = struct {
         else
             &.{};
         try m.session.open(&m.driver, m.tcfg, image);
+        // TF_DSV41_ARENA: every device buffer from here on (weights, forms, roles, scratch) carved from large chunks
+        _ = try @import("dev_arena.zig").install(gpa, &m.ctx, m.tcfg.rank);
         // a failure from here to serving (assets, limits, buffers): every rank down with its reason, the session closed
         // before `m` is freed (the fate thread read a freed session: Spark 2026-10-09)
         m.boot(gpa, io, pack_dir, assets, o) catch |err| {
@@ -232,6 +238,9 @@ pub const Model = struct {
         m.aot = try cuda.aot.Set.load(gpa, io, &m.driver, m.ctx.device, try std.fs.path.join(a, &.{ assets, "aot" }));
         m.widths = try m2a.widths(a, &m.weights, &m.pl);
         m.runner = .{ .gpa = gpa, .d = &m.driver, .stream = m.stream, .kernels = &m.kernels, .triton = &m.aot, .weights = &m.weights };
+        // TF_DSV41_PROFILE=<file>: the served engine's eager windows and prefill segments timed (profile.zig), the JSON
+        // written at close (before, only tf-dsv41-m1's gates set it: a served run wrote nothing)
+        m.runner.prof = try @import("profile.zig").Profile.fromEnv(gpa, &m.driver);
         const topp: ?f64 = if (std.c.getenv("TF_DSV41_EXPERT_TOPP")) |v| try std.fmt.parseFloat(f64, std.mem.span(v)) else null;
         // TF_DSV41_R1=1, or prod.env's eight R1 knobs by their Python names (prod_knobs.r1)
         const r1 = @import("prod_knobs.zig").r1(&@import("prod_knobs.zig").env);
@@ -249,6 +258,8 @@ pub const Model = struct {
             ko.slots = m.slots;
             // the long-prompt stream scratch the buffer plan will hold (Python's measured terms have none)
             ko.resident = @import("prod_knobs.zig").streamScratch(&m.cfg, m.f.opts.limit, m.f.opts.prefill_rows);
+            // TF_DSV41_PF_4K / _PF_TBO: the prefill workspace a long prompt allocates, priced on top of the worst point
+            if (o.own_prefill) ko.workspace = try @import("forward_prefill.zig").workspaceBytes(&m.f, @intCast(m.f.opts.prefill_rows));
             try kvs.bootCheck(&m.ctx, &m.cfg, ko, m.tcfg.rank, world);
             m.f.kv = try kvs.Kv.init(gpa, &m.driver, &m.ctx, &m.cfg, ko, &m.runner, comm);
             m.f.opts.pool = m.f.kv.?.options();
@@ -360,6 +371,7 @@ pub const Model = struct {
         m.f.ext = m.rows.?.ext();
         m.f.graphs_read = true;
         m.gt.rows = m.rows;
+        m.gt.engram_warm = try target_mod.GpuTarget.engramWarmEnv();
     }
 
     fn setDsValid(ctx: *anyopaque, slot: u32, valid: u64) void {
@@ -386,6 +398,11 @@ pub const Model = struct {
 
     pub fn close(m: *Model) void {
         const gpa = m.gpa;
+        // the profile first, while the driver and its events are alive
+        if (m.runner.prof) |p| {
+            m.runner.prof = null;
+            p.close(m.io);
+        }
         if (m.slot_pass) |x| x.deinit();
         if (m.rows) |b| b.deinit();
         if (m.slot_set) |ss| ss.deinit();

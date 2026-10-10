@@ -26,6 +26,7 @@ const E = block.Emitter;
 const Arg = calls.Arg;
 const dense = dk.dense;
 const wide = @import("block_wide.zig");
+const buffers = @import("buffers.zig");
 
 /// The rows of one ring (a power of two holding the window and a block).
 pub fn ringRows(cfg: *const Config) i64 {
@@ -196,6 +197,13 @@ const Ds = struct {
         });
     }
 
+    fn normStore(d: *Ds, kv: Arg, L: u32, rows: bool) !void {
+        const r = try d.ring(L, !rows);
+        try d.e.normStore(kv, try d.e.weight("L{d}.attn.kv_norm", .{L}, .f32, &.{d.cfg().head_dim}), r[0], r[1],
+            if (rows) try d.i64s(d.st.positions(), &.{d.e.n}) else try d.e.buf("w.ds.pos", .{}, .i32, &.{1}),
+            if (rows) try d.i64s(d.st.writeRows(), &.{d.e.n}) else .none, ringRows(d.cfg()), rows);
+    }
+
     /// main_proj: upstream rot_in + linear with split K (its workspace "L.ds.z"), [n, 3 D] -> [n, D].
     fn mainProj(d: *Ds, x: Arg, y: Arg) !void {
         const e = d.e;
@@ -218,15 +226,29 @@ const Ds = struct {
 
     /// One ingest: `n` committed rows' taps (from row `skip` of "w.taps") into every block's ring.
     fn ingest(d: *Ds, skip: i64) !void {
+        try d.ingestProj(skip);
+        try d.ingestBlocks(0);
+    }
+
+    /// An ingest's first half: main_proj and main_norm of `n` taps rows (from row `skip`) into "w.ds.mx" rows [0, n).
+    fn ingestProj(d: *Ds, skip: i64) !void {
         const e = d.e;
         const D: i64 = d.cfg().hidden;
-        const hd: i64 = d.cfg().head_dim;
         const T: i64 = @as(i64, @intCast(d.cfg().dspark_targets.items().len)) * D;
         const taps = try e.view(.{ .buf = d.sl.taps_role }, .bf16, &.{ e.n, T }, &.{ T, 1 }, skip * T * 2);
         const mp = try e.buf("L.ds.mp", .{}, .bf16, &.{ e.n, D });
         const mx = try e.buf("w.ds.mx", .{}, .bf16, &.{ e.n, D });
         try d.mainProj(taps, mp);
         try d.rms(mp, try e.weight("dspark.main_norm", .{}, .f32, &.{D}), mx, D);
+    }
+
+    /// An ingest's second half: each block's wkv, kv_norm and store of `n` rows of "w.ds.mx" from row `mx_row` into
+    /// slot `sl.slot`'s rings at "w.ds.pos".
+    fn ingestBlocks(d: *Ds, mx_row: i64) !void {
+        const e = d.e;
+        const D: i64 = d.cfg().hidden;
+        const hd: i64 = d.cfg().head_dim;
+        const mx = try e.view(.{ .buf = "w.ds.mx" }, .bf16, &.{ e.n, D }, &.{ D, 1 }, mx_row * D * 2);
         var bs: [8]u32 = undefined;
         for (blocks(d.cfg(), &bs), 0..) |L, i| {
             if (i > 0) e.begin = .layer;
@@ -234,8 +256,12 @@ const Ds = struct {
             const kv = try e.buf("L.kv", .{}, .bf16, &.{ e.n, hd });
             const kvn = try e.buf("L.kvn", .{}, .bf16, &.{ e.n, hd });
             try e.fused("x", &.{.{ .w = try e.fmt("L{d}.attn.wkv", .{L}), .x = mx, .y = kv, .k = @intCast(D), .n = @intCast(hd) }});
-            try d.rms(kv, try e.weight("L{d}.attn.kv_norm", .{L}, .f32, &.{hd}), kvn, hd);
-            try d.store(kvn, L, false);
+            if (e.kvNormStoreOn()) {
+                try d.normStore(kv, L, false);
+            } else {
+                try d.rms(kv, try e.weight("L{d}.attn.kv_norm", .{L}, .f32, &.{hd}), kvn, hd);
+                try d.store(kvn, L, false);
+            }
         }
     }
 
@@ -252,6 +278,11 @@ const Ds = struct {
     /// exchanged partials `recv`, then `_finish_k` the next coefficients and the normed sublayer input).
     fn site(d: *Ds, L: u32, which: []const u8, recv: []const u8) !void {
         const e = d.e;
+        // MHC_DEFER: block 0's site (mhc_cuda, <= 16 rows) may have left its coefficients on the deferred stream;
+        // they are this boundary's post and pre (Python's mhc.boundary: await_coefs(prev) first)
+        moe.awaitCoefs(e);
+        // TF_DSV41_MHC_PFDEC: mhc_pf in place (a CTA reads only what it writes) + coef_kernel (block_wide.zig)
+        if (wide.pfOn(e, wide.Mode.boundary)) return wide.mhc(e, L, which, .boundary, true, null, null);
         const n = e.n;
         const D: i64 = d.cfg().hidden;
         const x = try e.streams();
@@ -311,7 +342,7 @@ const Ds = struct {
         const qn = try e.buf("L.qn", .{}, .bf16, &.{ n, cf.q_lora });
         const kvn = try e.buf("L.kvn", .{}, .bf16, &.{ n, hd });
         try d.rms(qa, try e.weight("L{d}.attn.q_norm", .{L}, .f32, &.{cf.q_lora}), qn, cf.q_lora);
-        try d.rms(kv, try e.weight("L{d}.attn.kv_norm", .{L}, .f32, &.{hd}), kvn, hd);
+        if (!e.kvNormStoreOn()) try d.rms(kv, try e.weight("L{d}.attn.kv_norm", .{L}, .f32, &.{hd}), kvn, hd);
         const q = try e.buf("L.q", .{}, .bf16, &.{ n, H * hd });
         try e.fused("q", &.{.{ .w = try e.fmt("L{d}.attn.wq_b", .{L}), .x = qn, .y = q, .k = cf.q_lora, .n = @intCast(H * hd) }});
         // table.apply(q.to(fp32)): the cast is torch's (glue), the rotation copies into bf16
@@ -329,7 +360,7 @@ const Ds = struct {
             .{ .name = "INV", .arg = .{ .b = false } },                .{ .name = "COPY", .arg = .{ .b = true } },
             .{ .name = "PDL", .arg = .{ .b = false } },
         });
-        try d.store(kvn, L, true);
+        if (e.kvNormStoreOn()) try d.normStore(kv, L, true) else try d.store(kvn, L, true);
         const r = try d.ring(L, false);
         const W: i64 = cf.window;
         const rows_scr = n * 5 * H;
@@ -378,6 +409,7 @@ const Ds = struct {
         const b0 = try e.empty(.bf16);
         const x = try e.streams();
         const prev = try d.coefs(e.coef);
+        moe.awaitCoefs(e); // mhc.final: await_coefs(prev)
         try e.ext("tf_dsv41_mhc_cuda_v1.run", &.{
             x,                                                                x,
             try e.buf("w.recv.moe", .{}, .bf16, &.{ e.o.world, n, D }),       prev[1],
@@ -436,6 +468,26 @@ pub fn emitIngest(a: std.mem.Allocator, cfg: *const Config, w: *const block.Widt
     return emitIngestAt(a, cfg, w, o, n, skip, .{});
 }
 
+/// TF_DSV41_DRAFT_BATCH_PROJ (dspark_slots.zig): main_proj and main_norm of `n` taps rows from row `skip` of
+/// `taps_role` into "w.ds.mx" rows [0, n): one call over every slot of a round instead of one a slot. linear.cu's
+/// bits of a row depend on that row alone (its k ranges fixed by (K, N): dense.plan takes no row count; mma keeps
+/// rows apart; warp and split sums in a fixed order), so a row's projection is its slot's alone, bit for bit.
+pub fn emitIngestProj(a: std.mem.Allocator, cfg: *const Config, w: *const block.Widths, o: block.Options, n: i64, skip: i64, taps_role: []const u8) ![]calls.Call {
+    var e: E = .{ .a = a, .cfg = cfg, .w = w, .o = o, .n = n, .start = 0 };
+    var d: Ds = .{ .e = &e, .st = .{ .n = n, .window = cfg.window }, .sl = .{ .taps_role = taps_role } };
+    try d.ingestProj(skip);
+    return e.out.items;
+}
+
+/// The rest of a slot's ingest after emitIngestProj: `n` rows of "w.ds.mx" from row `mx_row` through every block
+/// into slot `sl.slot`'s rings. emitIngestProj(n, skip) ++ emitIngestBlocks(n, 0) is emitIngestAt(n, skip).
+pub fn emitIngestBlocks(a: std.mem.Allocator, cfg: *const Config, w: *const block.Widths, o: block.Options, n: i64, mx_row: i64, sl: Slots) ![]calls.Call {
+    var e: E = .{ .a = a, .cfg = cfg, .w = w, .o = o, .n = n, .start = 0, .begin = .none };
+    var d: Ds = .{ .e = &e, .st = .{ .n = n, .window = cfg.window }, .sl = sl };
+    try d.ingestBlocks(mx_row);
+    return e.out.items;
+}
+
 /// An ingest of `n` rows from row `skip` of `sl.taps_role` into slot `sl.slot`'s rings.
 pub fn emitIngestAt(a: std.mem.Allocator, cfg: *const Config, w: *const block.Widths, o: block.Options, n: i64, skip: i64, sl: Slots) ![]calls.Call {
     var e: E = .{ .a = a, .cfg = cfg, .w = w, .o = o, .n = n, .start = 0 };
@@ -444,11 +496,114 @@ pub fn emitIngestAt(a: std.mem.Allocator, cfg: *const Config, w: *const block.Wi
     return e.out.items;
 }
 
+/// TF_DSV41_DRAFT_OVERLAP (dspark_slots.zig): `cs` (an ingest) with every scratch role - a window or layer role but the
+/// taps - renamed "w.ovl.<role>", its own arena storage (buffers.zig: one offset a role name), so it can run on its
+/// own stream while a row window still uses the names it shares with block.zig ("L.kv", "L.kvn", ...). The rings,
+/// the weights and the taps keep their roles: the same kernels, arguments and launches, other scratch addresses.
+pub fn sideRoles(a: std.mem.Allocator, cs: []const calls.Call) ![]calls.Call {
+    return renameRoles(a, cs, "w.ovl.");
+}
+
+/// `cs` with every role sideRole names renamed `prefix` ++ role (sideRoles; TF_DSV41_DRAFT_BATCH_PROJ=check's
+/// one-slot projections beside the batched one: "w.chk.").
+pub fn renameRoles(a: std.mem.Allocator, cs: []const calls.Call, prefix: []const u8) ![]calls.Call {
+    const out = try a.dupe(calls.Call, cs);
+    for (out) |*c| {
+        const args = try a.dupe(calls.Named, c.args);
+        for (args) |*x| x.arg = try sideArg(a, x.arg, prefix);
+        c.args = args;
+    }
+    return out;
+}
+
+/// A role sideRoles renames.
+pub fn sideRole(role: []const u8) bool {
+    return buffers.scopeOf(role) != .persistent and !std.mem.eql(u8, role, "w.taps");
+}
+
+fn sideArg(a: std.mem.Allocator, x: Arg, prefix: []const u8) !Arg {
+    return switch (x) {
+        .t => |t| .{ .t = try sideTensor(a, t, prefix) },
+        .opaque_table => |t| .{ .opaque_table = try sideTensor(a, t, prefix) },
+        .list => |items| blk: {
+            const l = try a.alloc(Arg, items.len);
+            for (items, l) |y, *z| z.* = try sideArg(a, y, prefix);
+            break :blk .{ .list = l };
+        },
+        else => x,
+    };
+}
+
+fn sideTensor(a: std.mem.Allocator, t: calls.Tensor, prefix: []const u8) !calls.Tensor {
+    var u = t;
+    switch (t.role) {
+        .buf => |r| if (sideRole(r)) {
+            u.role = .{ .buf = try std.fmt.allocPrint(a, "{s}{s}", .{ prefix, r }) };
+        },
+        else => {},
+    }
+    return u;
+}
+
+/// The chain's roles (TF_DSV41_DRAFT_CHAIN, dspark_dev.zig binds them to its own buffers): Python's DraftInputs
+/// tensors the `_chain` kernel reads and writes, at the most slots a round has.
+pub const chain_roles = struct {
+    pub const cand = "s.ds.chain.cand";
+    pub const cval = "s.ds.chain.cval";
+    pub const hid = "s.ds.chain.hid";
+    pub const anchor = "s.ds.chain.anchor";
+    pub const ipar = "s.ds.chain.ipar";
+    pub const fpar = "s.ds.chain.fpar";
+    pub const draft = "s.ds.chain.draft";
+    pub const conf = "s.ds.chain.conf";
+    pub const scr = "s.ds.chain.scr";
+};
+
+/// Python's chain's constants (dspark.py: KP, CH, RB).
+pub const chain_kp = 128;
+pub const chain_ch = 16;
+pub const chain_rb = 32;
+
+/// TF_DSV41_DRAFT_CHAIN: Python's `dspark.chain` over `slots` slots of `n` rows (`_chain[(S,)]`, one program a slot),
+/// candidates `c` a row (WORLD x k: cand / cval [S, n, c] contiguous, c_stride = n_cand = c), with the confidence head
+/// when `conf` (hid bf16 [S, n, D], cw fp32 [D + rank], conf fp32 [S, n]); without it HID / CW / CONF are cval, as
+/// Python passes them. The kernel is Python's own (AOT), so its drafts are prod's bit for bit.
+pub fn emitChain(a: std.mem.Allocator, cfg: *const Config, w: *const block.Widths, o: block.Options, n: i64, slots: i64, c: i64, conf: bool) ![]calls.Call {
+    if (c > chain_kp) return error.CandidateWidth;
+    var e: E = .{ .a = a, .cfg = cfg, .w = w, .o = o, .n = slots * n, .start = 0 };
+    const S = slots;
+    const R: i64 = cfg.dspark_markov_rank;
+    const D: i64 = cfg.hidden;
+    const V: i64 = cfg.vocab;
+    const d: i64 = if (conf) D else 1024;
+    const r = chain_roles;
+    const cand = try e.buf(r.cand, .{}, .i32, &.{ S, n, c });
+    const cval = try e.buf(r.cval, .{}, .f32, &.{ S, n, c });
+    const hid = if (conf) try e.buf(r.hid, .{}, .bf16, &.{ S, n, D }) else cval;
+    const cw = if (conf) try e.weight("dspark.conf", .{}, .f32, &.{D + R}) else cval;
+    const cf = if (conf) try e.buf(r.conf, .{}, .f32, &.{ S, n }) else cval;
+    try e.triton("_chain", .{ S, 1, 1 }, &.{
+        .{ .name = "CAND", .arg = cand },                                                  .{ .name = "CVAL", .arg = cval },
+        .{ .name = "c_stride", .arg = .{ .i = c } },                                      .{ .name = "n_cand", .arg = .{ .i = c } },
+        .{ .name = "W1", .arg = try e.weight("dspark.markov.w1", .{}, .bf16, &.{ V, R }) }, .{ .name = "W2", .arg = try e.weight("dspark.markov.w2", .{}, .bf16, &.{ V, R }) },
+        .{ .name = "HID", .arg = hid },                                                    .{ .name = "CW", .arg = cw },
+        .{ .name = "ANCHOR", .arg = try e.buf(r.anchor, .{}, .i32, &.{S}) },              .{ .name = "IPAR", .arg = try e.buf(r.ipar, .{}, .i64, &.{ S, 4 }) },
+        .{ .name = "FPAR", .arg = try e.buf(r.fpar, .{}, .f32, &.{ S, 3 }) },             .{ .name = "DRAFT", .arg = try e.buf(r.draft, .{}, .i32, &.{ S, n }) },
+        .{ .name = "CONF", .arg = cf },                                                    .{ .name = "SCR", .arg = try e.buf(r.scr, .{}, .f64, &.{ S, 2, chain_kp }) },
+        .{ .name = "D", .arg = .{ .i = d } },                                              .{ .name = "N", .arg = .{ .i = n } },
+        .{ .name = "KP", .arg = .{ .i = chain_kp } },                                      .{ .name = "CH", .arg = .{ .i = chain_ch } },
+        .{ .name = "R", .arg = .{ .i = R } },                                              .{ .name = "RB", .arg = .{ .i = @max(16, @min(chain_rb, R)) } },
+        .{ .name = "HB", .arg = .{ .i = @intCast(std.math.gcd(@as(u64, @intCast(d)), 1024)) } }, .{ .name = "HAS_CONF", .arg = .{ .b = conf } },
+    });
+    return e.out.items;
+}
+
 /// A pass of `n` rows (the block: dspark_block).
 pub fn emitPass(a: std.mem.Allocator, cfg: *const Config, w: *const block.Widths, o: block.Options, n: i64) ![]calls.Call {
     var e: E = .{ .a = a, .cfg = cfg, .w = w, .o = o, .n = n, .start = 0 };
     var d: Ds = .{ .e = &e, .st = .{ .n = n, .window = cfg.window } };
     try d.pass();
+    if (o.holdsDeferred(e.n)) calls.holdDeferred(e.out.items);
     return e.out.items;
 }
 
@@ -458,6 +613,7 @@ pub fn emitPassSlots(a: std.mem.Allocator, cfg: *const Config, w: *const block.W
     var e: E = .{ .a = a, .cfg = cfg, .w = w, .o = o, .n = slots * n, .start = 0 };
     var d: Ds = .{ .e = &e, .st = .{ .n = n, .window = cfg.window, .lay = Layout.of(slots, n, cfg.window) }, .sl = .{ .ring_slots = ring_slots } };
     try d.pass();
+    if (o.holdsDeferred(e.n)) calls.holdDeferred(e.out.items);
     return e.out.items;
 }
 

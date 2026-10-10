@@ -34,6 +34,7 @@ const Run = struct {
     joint: u64,
     kept: [16]u64, // drafts kept by position (depth.Stats)
     widest: usize, // the most rows one forward held
+    expanded: u64,
     spec: spec_mod.Stats = .{}, // the speculative pass's counts (Setup.spec)
 
     fn deinit(r: Run) void {
@@ -89,7 +90,7 @@ fn run(cases: []const Case, setup: Setup) !Run {
     const spec_stats: spec_mod.Stats = if (x.spec) |sp| sp.stats else .{};
     const out = try gpa.alloc([]u32, cases.len);
     for (out, streams) |*o, *s| o.* = try gpa.dupe(u32, s.emitted());
-    return .{ .out = out, .drafted = e.drafted, .accepted = e.accepted, .zero = x.policy.depth.stats.zero, .trees = x.policy.trees, .sib_wins = x.policy.sib_wins, .joint = x.policy.depth.stats.joint[0], .kept = x.policy.depth.stats.kept, .widest = t.widest, .spec = spec_stats };
+    return .{ .out = out, .drafted = e.drafted, .accepted = e.accepted, .zero = x.policy.depth.stats.zero, .trees = x.policy.trees, .sib_wins = x.policy.sib_wins, .joint = x.policy.depth.stats.joint[0], .kept = x.policy.depth.stats.kept, .widest = t.widest, .expanded = x.policy.depth.expanded_rounds, .spec = spec_stats };
 }
 
 /// The twin's own serial decode of a case (no lanes at all).
@@ -112,6 +113,46 @@ const p2 = [_]u32{ 2, 7, 1, 8, 2, 8, 1, 8, 2, 8, 4, 5, 9, 0, 4, 5 };
 const p3 = [_]u32{ 10, 20, 30, 40, 10, 20, 30, 40, 10, 20, 30 };
 const hot: lanes.Sampling = .{ .seed = 11, .temperature = 0.8, .top_k = 0, .top_p = 0.9 };
 const warm: lanes.Sampling = .{ .seed = 5, .temperature = 1.0, .top_k = 20, .top_p = 0.95, .min_p = 0.02 };
+
+test "code acceptance expansion preserves greedy and T0.7 keyed engine replies" {
+    var expanded: u64 = 0;
+    for ([_]twin.Dims{ .{}, .{ .bigram = 8.0, .head = 0.08 } }) |dims| {
+        for ([_]?lanes.Sampling{ null, .{ .seed = 11, .temperature = 0.7, .top_p = 0.9 } }) |s| {
+            const cases = [_]Case{ .{ .prompt = &p1, .sampling = s, .max_new = 160 }, .{ .prompt = &p2, .sampling = s, .max_new = 130 }, .{ .prompt = &p3, .sampling = s, .max_new = 150 }, .{ .prompt = &p2, .sampling = s, .max_new = 140 } };
+            const old = try run(&cases, .{ .dims = dims });
+            defer old.deinit();
+            const new = try run(&cases, .{ .dims = dims, .depth = .{ .code_accept = true } });
+            defer new.deinit();
+            try expectSerial(&cases, new, dims);
+            for (old.out, new.out) |a, b| try std.testing.expectEqualSlices(u32, a, b);
+            expanded += new.expanded;
+            const old_lone = try run(cases[0..1], .{ .dims = dims, .slots = 1 });
+            defer old_lone.deinit();
+            const new_lone = try run(cases[0..1], .{ .dims = dims, .slots = 1, .depth = .{ .code_accept = true } });
+            defer new_lone.deinit();
+            try expectSerial(cases[0..1], new_lone, dims);
+            try std.testing.expectEqualSlices(u32, old_lone.out[0], new_lone.out[0]);
+            try std.testing.expectEqual(@as(u64, 0), new_lone.expanded);
+            try std.testing.expectEqual(old_lone.drafted, new_lone.drafted);
+            try std.testing.expectEqual(old_lone.accepted, new_lone.accepted);
+            try std.testing.expectEqualSlices(u64, &old_lone.kept, &new_lone.kept);
+        }
+    }
+    try std.testing.expect(expanded > 0); // token equality must exercise the changed policy
+}
+
+test "low acceptance engine streams keep the old policy" {
+    const dims: twin.Dims = .{ .bigram = 0.2, .head = 1.0 };
+    const cases = [_]Case{ .{ .prompt = &p1, .max_new = 80 }, .{ .prompt = &p2, .max_new = 80, .sampling = .{ .seed = 7, .temperature = 0.7 } } };
+    const old = try run(&cases, .{ .dims = dims });
+    defer old.deinit();
+    const new = try run(&cases, .{ .dims = dims, .depth = .{ .code_accept = true } });
+    defer new.deinit();
+    try std.testing.expectEqual(@as(u64, 0), new.expanded);
+    try std.testing.expectEqual(old.drafted, new.drafted);
+    for (old.out, new.out) |a, b| try std.testing.expectEqualSlices(u32, a, b);
+    try expectSerial(&cases, new, dims);
+}
 
 test "drafted rounds commit the serial decode, greedy and keyed sampling" {
     for ([_]?lanes.Sampling{ null, hot, warm }) |s| {

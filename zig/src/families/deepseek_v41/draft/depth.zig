@@ -22,6 +22,8 @@ pub const Settings = struct {
     fair: f64 = joint.fair,
     host_ms: f64 = joint.host_ms,
     max_rows: u64 = 64,
+    code_accept: bool = false, // TF_DSV41_CODE_ACCEPT: expand high-acceptance short-context chains
+    context_bucket: u64 = 2048, // TF_DSV41_GRAPH_BUCKET; short contexts only use its linear buckets
 };
 
 /// [E(0) .. E(len)]: tokens a round verifying k drafts commits on average, into `out` (len + 1).
@@ -108,6 +110,9 @@ pub const Depth = struct {
     slots: std.ArrayList(?Slot) = .empty,
     acc: std.ArrayList(Acc) = .empty, // the open round's commits, in commit order
     agg: [costs_rows + 1]Ring = @splat(.{}), // by windows in a round: recent (tokens, modelled ms)
+    expanded_rounds: u64 = 0,
+    expanded_rows: u64 = 0,
+    forward_rows: u64 = 16, // Lanes.model supplies the real forward cap, not the allocator's graph limit
 
     const costs_rows = 64;
 
@@ -217,7 +222,56 @@ pub const Depth = struct {
         return st.rounds.sums().tokens / @as(f64, @floatFromInt(st.rounds.len));
     }
 
-    pub const Ask = struct { slot: u32, conf: []const f64, most: usize, first: ?u32 = null };
+    pub const Ask = struct { slot: u32, conf: []const f64, most: usize, first: ?u32 = null, position: u64 = std.math.maxInt(u64) };
+
+    fn eligible(d: *Depth, a: Ask) !bool {
+        const st = try d.state(a.slot);
+        return a.position <= 4096 and st.rounds.len >= 4 and (try d.tpr(a.slot)).? >= 3.0;
+    }
+
+    fn expandable(d: *Depth, a: Ask, k: usize) !bool {
+        const top = @min(@min(@min(a.most, a.conf.len), d.set.cap), slot_rows - 1);
+        // Keep context graph keys stable. Past the linear buckets leave the old policy in charge.
+        return top > k and d.set.context_bucket > 0 and a.position + top < 16 * d.set.context_bucket and
+            (a.position + k) / d.set.context_bucket == (a.position + top) / d.set.context_bucket and try d.eligible(a);
+    }
+
+    /// Keep every old depth as a floor. Prose/cold slots are frozen; any long-context ask preserves the whole round.
+    fn expand(d: *Depth, asks: []const Ask, others: u64, other_windows: usize, ks: []usize) !void {
+        if (!d.set.code_accept or d.set.mode != .cost or d.set.joint == 2 or others != 0 or asks.len < 2) return;
+        for (asks) |a| if (a.position > 4096) return;
+        var baseline_rows: u64 = 0;
+        for (ks) |k| baseline_rows += 1 + k;
+        const bucket: u64 = blk: {
+            // These are rowtab.BUCKETS. Never enlarge the existing graph or turn one forward into two.
+            for ([_]u64{ 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 24, 32, 48, 64 }) |r| {
+                if (r >= baseline_rows and r <= d.forward_rows) break :blk r;
+            }
+            return;
+        };
+        if (baseline_rows >= @min(d.set.max_rows, bucket)) return;
+        var any = false;
+        for (asks, ks) |a, k| any = any or try d.expandable(a, k);
+        if (!any) return; // cold/prose/full windows allocate no policy scratch
+        const slots = try d.gpa.alloc(joint.Slot, asks.len);
+        defer d.gpa.free(slots);
+        const qs = try d.gpa.alloc([slot_rows]f64, asks.len);
+        defer d.gpa.free(qs);
+        for (asks, ks, slots, qs) |a, k, *s, *q| {
+            const top_available = @min(@min(@min(a.most, a.conf.len), d.set.cap), slot_rows - 1);
+            const active = try d.expandable(a, k);
+            const top = if (active) top_available else k;
+            for (a.conf[0..top], q[0..top], 0..) |p, *out, j| out.* = d.cal.q(j, p);
+            s.* = .{ .qs = q[0..top], .least = k, .top = top };
+        }
+        const n = asks.len + other_windows;
+        const fixed = d.costs.draft + d.costs.slot * @as(f64, @floatFromInt(n -| 1));
+        const added = try joint.expand(d.gpa, slots, others, d.costs, fixed, @min(d.set.max_rows, bucket), bucket, ks);
+        if (added == 0) return;
+        d.expanded_rounds += 1;
+        d.expanded_rows += added;
+        for (asks, ks) |a, k| (try d.state(a.slot)).use(a.conf[0..k]);
+    }
 
     /// Every DSpark slot's k of one round, together; `others`: rows of the round's other windows. Writes `ks`.
     pub fn chooseJoint(d: *Depth, asks: []const Ask, others: u64, other_windows: usize, alone_in: ?bool, ks: []usize) !void {
@@ -225,6 +279,7 @@ pub const Depth = struct {
         const alone = (alone_in orelse (asks.len == 1 and other_windows == 0)) and asks.len == 1 and other_windows == 0;
         if (d.set.joint == 0 or d.set.mode == .static or alone or asks.len + other_windows <= 1) {
             for (asks, ks) |a, *k| k.* = try d.choose(a.slot, a.conf, a.most, alone, a.first);
+            // Exact-row single windows have no paid padding to spend.
             return;
         }
         const two = d.set.joint == 2;
@@ -255,6 +310,7 @@ pub const Depth = struct {
             for (slots, w) |*s, x| s.weight = x;
         }
         _ = try joint.allocate(d.gpa, slots, others, d.costs, r, d.set.max_rows, ks);
+        try d.expand(asks, others, other_windows, ks);
         var rows: u64 = others;
         var drafts: u64 = 0;
         var zero: u64 = 0;
@@ -352,4 +408,44 @@ test "a lone window skips a weak first draft and keeps a strong chain" {
     try std.testing.expect(d.cal.kept[0] == 1.0 and d.stats.zero == 1);
     try std.testing.expectEqual(@as(usize, 1), try d.choose(0, &.{ 0.05, 0.05, 0.05, 0.05, 0.05 }, 5, false, 7));
     try std.testing.expectEqual(@as(usize, 5), try d.choose(1, &.{ 0.99, 0.99, 0.99, 0.99, 0.99 }, 5, true, 7));
+}
+
+test "high acceptance fills paid padding and preserves cold, prose, context and forward limits" {
+    const gpa = std.testing.allocator;
+    var verify: [64]f64 = undefined;
+    for (&verify, 0..) |*v, i| v.* = 20 + 3 * @as(f64, @floatFromInt(i));
+    const asks = [_]Depth.Ask{
+        .{ .slot = 0, .conf = &.{ 0.95, 0.95, 0.95, 0.95, 0.95 }, .most = 5, .position = 100 },
+        .{ .slot = 1, .conf = &.{ 0.95, 0.95, 0.95, 0.95, 0.95 }, .most = 5, .position = 100 },
+        .{ .slot = 2, .conf = &.{ 0.95, 0.95, 0.95, 0.95, 0.95 }, .most = 5, .position = 100 },
+        .{ .slot = 3, .conf = &.{ 0.95, 0.95, 0.95, 0.95, 0.95 }, .most = 5, .position = 100 },
+    };
+    for (0..7) |case| {
+        var d = try Depth.init(gpa, .{ .verify = &verify, .draft = 4 }, 5, .{ .code_accept = true });
+        defer d.deinit();
+        d.forward_rows = if (case == 1) 16 else 64;
+        if (case == 2) d.set.max_rows = 20;
+        var input = asks;
+        if (case == 3) input[0].position = 4097;
+        if (case == 4) for (&input) |*a| {
+            a.position = 2043;
+        };
+        for (0..4) |slot| {
+            const st = try d.state(@intCast(slot));
+            for (0..(if (case == 5) @as(usize, 3) else 4)) |_| st.rounds.push(.{ .tokens = if (case == 6) 2 else 4, .ms = 40 });
+        }
+        var ks = [_]usize{ 4, 3, 3, 3 }; // 17 real rows, already paying for a 24-row graph
+        try d.expand(&input, 0, 0, &ks);
+        var rows: usize = 4;
+        for (ks) |k| rows += k;
+        if (case == 0) {
+            try std.testing.expectEqualSlices(usize, &.{ 5, 5, 5, 5 }, &ks);
+            try std.testing.expectEqual(@as(u64, 7), d.expanded_rows);
+        } else if (case == 2) {
+            try std.testing.expectEqual(@as(usize, 20), rows);
+        } else {
+            try std.testing.expectEqualSlices(usize, &.{ 4, 3, 3, 3 }, &ks);
+            try std.testing.expectEqual(@as(u64, 0), d.expanded_rounds);
+        }
+    }
 }

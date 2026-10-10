@@ -454,6 +454,92 @@ def glue_case(out: Path, g) -> dict:
     return {"rows": n}
 
 
+def mhcdec_case(out: Path, g, *, R: int, mode: str, tap: bool = False, in_place: bool = False) -> dict:
+    """An mHC site of a decode window on Python's decode path with mhc_cuda and mhc_pf off (Triton: `_site_dec` at
+    <= 16 rows split, `_site` above, then `_finish_k`): TF_DSV41_MHC_PFDEC's reference (mhc_pf's site_kernel + the
+    normed input + mhc_cuda's coef_kernel must give every output's bits). D = 5,120 (both kernels' constant), bf16
+    `fn` and partials (prod), 2 ranks; streams with -0.0 and large values."""
+    from tensorfold.families.deepseek_v41.cuda import mhc
+    D, W = 5120, 2
+    bf, f32 = torch.bfloat16, torch.float32
+    x = torch.randn(R, 4 * D, generator=g) * 2
+    x[0, :4] = torch.tensor([-0.0, 0.0, 3.0e4, -2.5e-30])
+    x = x.to(bf).to(DEV)
+    gathered = (torch.randn(W, R, D, generator=g) * 0.5).to(bf).to(DEV)
+    sig = lambda t: torch.sigmoid(t)
+    ppre = (sig(torch.randn(R, 4, generator=g)) + 1e-6).to(f32).to(DEV)
+    ppost = (2 * sig(torch.randn(R, 4, generator=g))).to(f32).to(DEV)
+    pcomb = torch.softmax(torch.randn(R, 4, 4, generator=g), -1).reshape(R, 16).to(f32).to(DEV)
+    fn = (torch.randn(24, 4 * D, generator=g) * 0.02).to(bf).to(DEV)
+    base = (torch.randn(24, generator=g) * 0.5).to(f32).to(DEV)
+    scale = (torch.rand(3, generator=g) + 0.05).to(f32).to(DEV)
+    nw = (1 + 0.1 * torch.randn(D, generator=g)).to(f32).to(DEV)
+    xout0 = torch.full((R, 4 * D), -7.0, dtype=bf, device=DEV)
+    taps0 = torch.full((R, 3 * D), 5.0, dtype=bf, device=DEV)       # DSpark's tap buffer: column block 1 is this site's
+    out_ = torch.full((R, D), -3.0, dtype=bf, device=DEV)
+    scratch = mhc.Scratch(R, DEV)
+    scratch.part.fill_(0.0)
+    coefs = mhc.Coefs(R, DEV)
+    prev = mhc.Coefs(R, DEV, pre=ppre.clone(), post=ppost.clone(), comb=pcomb.clone())
+    hc = mhc.Hc(fn, base, scale)
+    xs = x.clone()
+    xout = xs if in_place else xout0.clone()
+    taps = taps0.clone()
+    saved = {k: os.environ.get(k) for k in ("TF_DSV41_MHC_CUDA", "TF_DSV41_MHC_PF")}
+    os.environ["TF_DSV41_MHC_CUDA"] = "0"
+    os.environ["TF_DSV41_MHC_PF"] = "0"
+    try:
+        if mode == "boundary":
+            mhc.boundary(xs, xout, gathered, prev, hc, nw, out_, coefs, scratch, taps[:, D:2 * D] if tap else None)
+        else:
+            mhc.site(xs, hc, nw, out_, coefs, scratch, ppre if mode == "site2" else None)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    torch.cuda.synchronize()
+    arrays = {"x": x, "xout0": xout0, "g": gathered, "ppre": ppre, "ppost": ppost, "pcomb": pcomb, "fn": fn,
+              "base": base, "scale": scale, "nw": nw, "taps0": taps0, "out0": torch.full((R, D), -3.0, dtype=bf),
+              "xs": xs, "xout": xout, "taps": taps, "part": scratch.part, "c": scratch.c, "out": out_,
+              "npre": coefs.pre, "npost": coefs.post, "ncomb": coefs.comb}
+    save(out, {"kind": "mhcdec", "R": R, "D": D, "W": W, "mode": mhc_mode[mode], "tap": int(tap),
+               "in_place": int(in_place), "eps": mhc.EPS, "hc_eps": mhc.HC_EPS, "post_alpha": mhc.POST_ALPHA,
+               "iters": mhc.ITERS}, arrays)
+    return {"rows": R, "mode": mode, "tap": tap, "in_place": in_place}
+
+
+mhc_mode = {"boundary": 0, "site1": 1, "site2": 2}
+
+def kv_norm_store_case(out: Path, rows: bool) -> dict:
+    from tensorfold.families.deepseek_v41.cuda import rmsnorm
+    from tensorfold.families.deepseek_v41.cuda.csa2 import compress
+    g = torch.Generator().manual_seed(4143)
+    n, ring = 24, 256
+    x = torch.randn(n, 512, generator=g).to(torch.bfloat16).to(DEV)
+    x[0].zero_()
+    w = (torch.randn(512, generator=g) * 0.3 + 1).to(DEV)
+    angles = torch.randn(1024, 32, generator=g).to(DEV)
+    cs = torch.cat((angles.cos(), angles.sin()), dim=1).contiguous()
+    pos = ((torch.arange(n, device=DEV) * 7 + 251).to(torch.int64) if rows
+           else torch.tensor([251], dtype=torch.int32, device=DEV))
+    sl = (torch.arange(n, device=DEV) % 3).to(torch.int64)
+    sl[::5] = -1
+    v = torch.full((3 * ring + 1, 576), 0xa5, dtype=torch.uint8, device=DEV)
+    scales = torch.full((3 * ring + 1, 8), 0xa5, dtype=torch.uint8, device=DEV)
+    norm = torch.empty_like(x)
+    rmsnorm._rms[(n,)](x, 512, w, norm, 512, 512, 1.0 / 512.0, 1e-20,
+                       BK=512, HAS_W=True, NARROW=True, PDL=False, num_warps=4, **rmsnorm.LAUNCH)
+    compress._kv_store[(n,)](norm, 512, cs, 64, v, scales, 576, 8, pos,
+                            RATIO=0, RING=ring, PT=None, PSH=0, SL=sl if rows else None,
+                            PTS=0, ROWS=rows, PDL=False, num_warps=4)
+    torch.cuda.synchronize()
+    save(out, {"kind": "kvglue", "n": n, "ring": ring, "rows": int(rows), "eps": 1e-20},
+         {"x": x, "w": w, "cs": cs, "pos": pos, "sl": sl, "norm": norm, "v": v, "s": scales})
+    return {"rows": n, "row_mode": rows}
+
+
 def want(name: str) -> bool:
     """TF_DSV41_ORACLE_ONLY: a regex of the case names to write (unset: every case)."""
     pat = os.environ.get("TF_DSV41_ORACLE_ONLY")
@@ -463,11 +549,21 @@ def want(name: str) -> bool:
 def main() -> None:
     out = Path(sys.argv[1]) / "fixtures"
     g = torch.Generator().manual_seed(4141)
+    # Independent generators leave every existing fixture's random sequence unchanged.
     report = {}
+    for rows in (False, True):
+        name = "kv_norm_store_rows" if rows else "kv_norm_store_scalar"
+        if want(name):
+            report[name] = kv_norm_store_case(out / name, rows)
     D, I, E = 1024, 512, 13
     # decode / verify (x3ld): routed 2-3.5 bits + a 6-bit shared expert (E1 (2, 12)), 5-bit shared (2, 10), DSpark (8, 8)
     mixed_g = [4, 5, 6, 7, 4, 5, 6, 7, 4, 6, 5, 7, 12]
     mixed_d = [5, 4, 7, 6, 5, 4, 6, 7, 5, 4, 6, 7, 12]
+    # Wide decode glue: runs the actual Zig groupRotIn ABI at its production input width.
+    if want("experts_group_rot_r24"):
+        report["experts_group_rot_r24"] = experts_case(
+            out / "experts_group_rot_r24", torch.Generator().manual_seed(4142), R=24, slots=7, E=E, D=5120, I=I,
+            k2g=mixed_g, k2d=mixed_d, input_dtype=torch.bfloat16, limit=10.0, skip_every=2)
     for R in (1, 3, 16):
         report[f"experts_e1_r{R}"] = experts_case(out / f"experts_e1_r{R}", g, R=R, slots=7, E=E, D=D, I=I,
                                                   k2g=mixed_g, k2d=mixed_d, input_dtype=torch.bfloat16, limit=10.0,
@@ -524,6 +620,15 @@ def main() -> None:
     if want("pointwise"): report["pointwise"] = pointwise_case(out / "pointwise", g)
     if want("glue"): report["glue"] = glue_case(out / "glue", g)
     if want("pfglue"): report["pfglue"] = pfglue_case(out / "pfglue", g)
+    # TF_DSV41_MHC_PFDEC: mHC sites of decode windows (1-64 rows) on Python's Triton decode path
+    for R, mode, tap, ip in ((1, "boundary", True, False), (5, "boundary", True, False), (16, "boundary", True, False),
+                             (17, "boundary", True, False), (20, "boundary", False, False), (24, "boundary", True, False),
+                             (32, "boundary", True, False), (33, "boundary", True, True), (48, "boundary", False, True),
+                             (64, "boundary", True, True), (5, "boundary", False, True), (20, "boundary", False, True),
+                             (5, "site1", False, False), (24, "site1", False, False), (5, "site2", False, False),
+                             (24, "site2", False, False)):
+        name = f"mhcdec_{mode}_r{R}{'_tap' if tap else ''}{'_inplace' if ip else ''}"
+        if want(name): report[name] = mhcdec_case(out / name, g, R=R, mode=mode, tap=tap, in_place=ip)
     (out.parent / "oracle.json").write_text(json.dumps({"device": torch.cuda.get_device_name(0), **report}, indent=1))
     print(json.dumps(report, indent=1))
 

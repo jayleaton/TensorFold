@@ -29,7 +29,8 @@ pub fn mhc(e: *E, layer: ?u32, which: []const u8, mode: Mode) !void {
 /// decoder replay, replay.finish's Streams has no `alt`).
 pub fn mhcInto(e: *E, layer: ?u32, which: []const u8, mode: Mode, in_place: bool) !void {
     // past mhc_cuda's 16 rows (TF_DSV41_ROWS_CAP past 16): Python's Triton `_site` + `_finish_k` (block_wide.zig)
-    if (e.n > wide.cuda_rows) return wide.decode(e, layer, which, mode, in_place);
+    // TF_DSV41_MHC_PFDEC: a mixing site of the knob's rows or more, mhc_pf + coef_kernel (block_wide.zig)
+    if (e.n > wide.cuda_rows or wide.pfOn(e, mode)) return wide.decode(e, layer, which, mode, in_place);
     const n = e.n;
     const D: i64 = e.cfg.hidden;
     const post = mode == .boundary or mode == .final;
@@ -107,7 +108,7 @@ pub fn mhcInto(e: *E, layer: ?u32, which: []const u8, mode: Mode, in_place: bool
 }
 
 /// mhc.await_coefs: an mHC call reads the coefficients a deferred launch wrote: the main stream joins it first.
-fn awaitCoefs(e: *E) void {
+pub fn awaitCoefs(e: *E) void {
     if (!e.df_pending) return;
     e.df_pending = false;
     e.df_join = true;
@@ -209,23 +210,61 @@ pub fn moe(e: *E, L: u32) !void {
         }
         try e.glue("kit_weights", &.{ wts, try e.buf("L.wts16", .{}, .f32, &.{ n, slots }) });
     }
-    if (!grouped) try e.ext("tensorfold_exl3_experts_v1.group", &.{ pick, uids, ucount, members, .{ .i = n }, .{ .i = slots }, .{ .i = Et } });
+    const group_rot = !grouped and e.o.router_group_rot and n <= 64 and slots <= 9 and Et <= 512 and D == 5120;
+    if (!grouped and !group_rot) try e.ext("tensorfold_exl3_experts_v1.group", &.{ pick, uids, ucount, members, .{ .i = n }, .{ .i = slots }, .{ .i = Et } });
     const pre = try e.fmt("s.L{d}.ex", .{L});
     const xg = try e.buf("{s}.xg", .{sc}, .f16, &.{ rows * slots, D });
     const xu = try e.buf("{s}.xu", .{sc}, .f16, &.{ rows * slots, D });
     const xd = try e.buf("{s}.xd", .{sc}, .f16, &.{ rows * slots, I });
     const z = try e.buf("{s}.z", .{sc}, .f32, &.{rows * slots * @max(4 * 2 * I, D)});
-    try e.ext("tensorfold_exl3_experts_v1.rot_in", &.{
+    try e.ext(if (group_rot) "tensorfold_exl3_experts_v1.group_rot_in" else "tensorfold_exl3_experts_v1.rot_in", &.{
         x,  .{ .i = D }, pick, try e.buf("{s}.suh_g", .{pre}, .f16, &.{ Et, D }), try e.buf("{s}.suh_u", .{pre}, .f16, &.{ Et, D }),
         xg, xu,          .{ .i = n }, .{ .i = D }, .{ .i = slots }, .{ .i = Et },
     });
+    if (group_rot) try e.appendLast(&.{ uids, ucount, members });
     const r = e.w.experts.get(L) orelse return error.NoWidth;
     const gu = try block.k2Range(r[0][0], r[0][1]);
     const dn = try block.k2Range(r[1][0], r[1][1]);
+    const svh_g = try e.buf("{s}.svh_g", .{pre}, .f16, &.{ Et, I });
+    const svh_u = try e.buf("{s}.svh_u", .{pre}, .f16, &.{ Et, I });
+    const suh_d = try e.buf("{s}.suh_d", .{pre}, .f16, &.{ Et, I });
+    const tp_g = try e.buf("{s}.tp_g", .{pre}, .i64, &.{Et});
+    const tp_u = try e.buf("{s}.tp_u", .{pre}, .i64, &.{Et});
+    const k2_g = try e.buf("{s}.k2_g", .{pre}, .i32, &.{Et});
+    const k2_u = try e.buf("{s}.k2_u", .{pre}, .i32, &.{Et});
+    const tp_d = try e.buf("{s}.tp_d", .{pre}, .i64, &.{Et});
+    const k2_d = try e.buf("{s}.k2_d", .{pre}, .i32, &.{Et});
+    const svh_d = try e.buf("{s}.svh_d", .{pre}, .f16, &.{ Et, D });
+    const y = try e.buf("{s}.y", .{sc}, .f32, &.{ rows * slots, D });
+    // after a prune, kit_weights' fp16 rounding (a pointwise op the forward runs) gives new weights
+    const cw = if (!fold) try e.buf("L.wts16", .{}, .f32, &.{ n, slots }) else wts;
+    const out = try e.buf("L.moe", .{}, if (e.o.r1 and backbone) .bf16 else .f32, &.{ n, D });
+    const limit: Arg = .{ .f = E.dec(e.cfg.swiglu_limit) };
+    if (e.o.x3ld_epi) {
+        // TF_DSV41_X3LD_EPI (x3ld_epi.cu): the same x3ld work with gateup_epilogue / down_combine in its tail behind a
+        // last-arrival ticket; the same inputs and outputs (Z, Xd; y, L.moe), the same bits. The ticket words: gate/up
+        // one an (expert, member tile, 128 columns), down one a (row, 128 columns), both zero between launches.
+        const mt = std.math.divCeil(i64, n, 16) catch unreachable;
+        const ticket = try e.buf("{s}.epi", .{sc}, .i32, &.{@max(P * mt * @divExact(I, 128), n * @divExact(D, 128))});
+        try e.ext("tf_dsv41_x3ld_epi_v1.gateup", &.{
+            xg,              xu,              tp_g,              tp_u,              k2_g,        k2_u,        uids,   ucount,
+            members,         z,               .{ .i = 2 },       .{ .i = D },       .{ .i = I }, .{ .i = P }, .{ .i = 4 },
+            .{ .i = slots }, .{ .i = 2 },     .{ .i = 8 },       .{ .i = 1 },       .{ .i = gu[0] },          .{ .i = gu[1] },
+            pick,            svh_g,           svh_u,             suh_d,             xd,          .{ .i = Et }, limit,
+            .{ .i = 1 },     ticket,
+        });
+        try e.ext("tf_dsv41_x3ld_epi_v1.down", &.{
+            xd,              xd,              tp_d,              tp_d,              k2_d,        k2_d,        uids,   ucount,
+            members,         z,               .{ .i = 1 },       .{ .i = I },       .{ .i = D }, .{ .i = P }, .{ .i = 1 },
+            .{ .i = slots }, .{ .i = 2 },     .{ .i = 8 },       .{ .i = 1 },       .{ .i = dn[0] },          .{ .i = dn[1] },
+            pick,            svh_d,           y,                 cw,                out,         .{ .i = Et }, ticket,
+        });
+        return;
+    }
     try e.ext("tf_dsv41_x3ld_v1.grouped", &.{
         xg,                                                  xu,
-        try e.buf("{s}.tp_g", .{pre}, .i64, &.{Et}),        try e.buf("{s}.tp_u", .{pre}, .i64, &.{Et}),
-        try e.buf("{s}.k2_g", .{pre}, .i32, &.{Et}),        try e.buf("{s}.k2_u", .{pre}, .i32, &.{Et}),
+        tp_g,                                                tp_u,
+        k2_g,                                                k2_u,
         uids,                                                ucount,
         members,                                             z,
         .{ .i = 2 },                                         .{ .i = D },
@@ -238,15 +277,13 @@ pub fn moe(e: *E, L: u32) !void {
     });
     try e.ext("tensorfold_exl3_experts_v1.gateup_epilogue", &.{
         z,                                                pick,
-        try e.buf("{s}.svh_g", .{pre}, .f16, &.{ Et, I }), try e.buf("{s}.svh_u", .{pre}, .f16, &.{ Et, I }),
-        try e.buf("{s}.suh_d", .{pre}, .f16, &.{ Et, I }), xd,
+        svh_g,                                            svh_u,
+        suh_d,                                            xd,
         .{ .i = n },                                      .{ .i = P },
         .{ .i = I },                                      .{ .i = 4 },
         .{ .i = slots },                                  .{ .i = Et },
-        .{ .f = E.dec(e.cfg.swiglu_limit) },              .{ .i = 1 },
+        limit,                                            .{ .i = 1 },
     });
-    const tp_d = try e.buf("{s}.tp_d", .{pre}, .i64, &.{Et});
-    const k2_d = try e.buf("{s}.k2_d", .{pre}, .i32, &.{Et});
     try e.ext("tf_dsv41_x3ld_v1.grouped", &.{
         xd,          xd,          tp_d,        tp_d,        k2_d,        k2_d,            uids,            ucount,
         members,     z,           .{ .i = 1 }, .{ .i = I }, .{ .i = D }, .{ .i = P },     .{ .i = 1 },     .{ .i = slots },
@@ -254,9 +291,8 @@ pub fn moe(e: *E, L: u32) !void {
     });
     try e.ext("tensorfold_exl3_experts_v1.down_combine", &.{
         z,                                                pick,
-        try e.buf("{s}.svh_d", .{pre}, .f16, &.{ Et, D }), try e.buf("{s}.y", .{sc}, .f32, &.{ rows * slots, D }),
-        // after a prune, kit_weights' fp16 rounding (a pointwise op the forward runs) gives new weights
-        if (!fold) try e.buf("L.wts16", .{}, .f32, &.{ n, slots }) else wts, try e.buf("L.moe", .{}, if (e.o.r1 and backbone) .bf16 else .f32, &.{ n, D }),
+        svh_d,                                            y,
+        cw,                                               out,
         .{ .i = n },                                      .{ .i = P },
         .{ .i = D },                                      .{ .i = 1 },
         .{ .i = slots },                                  .{ .i = Et },

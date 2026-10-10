@@ -182,6 +182,62 @@ const Pool = struct {
     }
 };
 
+/// Linux native AIO (TF_DSV41_ENGRAM_AIO=1): a batch's extents in one io_submit, reaped with io_getevents on the
+/// thread that waits for them; no reader threads to wake. Docker's default seccomp profile allows these syscalls
+/// (it refuses io_uring_setup). Reads O_DIRECT shards asynchronously; a buffered shard's reads complete at submit.
+const Aio = struct {
+    ctx: u64 = 0,
+    in_flight: u32 = 0,
+    /// TF_DSV41_ENGRAM_POLL=1: a wait polls the completions (io_getevents with a zero timeout) instead of sleeping in
+    /// the kernel, up to `poll_ns`, then sleeps: the waiting thread is awake when its reads land (no wake-up), and
+    /// the CPU spins only while a caller waits for reads in flight
+    poll: bool = false,
+
+    pub const poll_ns: u64 = 20 * std.time.ns_per_ms;
+
+    pub const depth: u32 = 1024;
+
+    const Iocb = extern struct {
+        data: u64,
+        key: u32 = 0,
+        rw_flags: i32 = 0,
+        opcode: u16 = 0, // IOCB_CMD_PREAD
+        reqprio: i16 = 0,
+        fildes: u32,
+        buf: u64,
+        nbytes: u64,
+        offset: i64,
+        reserved2: u64 = 0,
+        flags: u32 = 0,
+        resfd: u32 = 0,
+    };
+
+    const Event = extern struct { data: u64, obj: u64, res: i64, res2: i64 };
+
+    fn init() !Aio {
+        var a: Aio = .{ .poll = pollEnv() };
+        const rc = linux.syscall2(.io_setup, depth, @intFromPtr(&a.ctx));
+        if (linux.errno(rc) != .SUCCESS) return error.AioRefused;
+        return a;
+    }
+
+    pub fn deinit(a: *Aio) void {
+        _ = linux.syscall1(.io_destroy, a.ctx);
+    }
+};
+
+/// TF_DSV41_ENGRAM_POLL: 0 (default) | 1 (with TF_DSV41_ENGRAM_AIO=1).
+pub fn pollEnv() bool {
+    const v = std.c.getenv("TF_DSV41_ENGRAM_POLL") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "1");
+}
+
+/// TF_DSV41_ENGRAM_AIO: 0 (default) | 1.
+pub fn aioEnv() bool {
+    const v = std.c.getenv("TF_DSV41_ENGRAM_AIO") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "1");
+}
+
 /// TF_DSV41_ENGRAM_QD: the reader threads without io_uring (Python engram_native's knob, default 64; 0: none).
 pub fn poolThreads() u32 {
     const v = std.c.getenv("TF_DSV41_ENGRAM_QD") orelse return 64;
@@ -194,6 +250,8 @@ pub const Rows = struct {
     ring: ?linux.IoUring,
     /// no io_uring: the reader threads (null: serial reads on the engine thread)
     pool: ?*Pool = null,
+    /// no io_uring, TF_DSV41_ENGRAM_AIO=1: native AIO (in place of the pool)
+    aio: ?Aio = null,
     batches: std.ArrayList(Batch) = .empty,
     lut: *[65536]u16,
     cap: u32,
@@ -225,7 +283,16 @@ pub const Rows = struct {
             made += 1;
             if (t.h.layer != l) return error.BadEngramShard;
         }
-        r.ring = linux.IoUring.init(256, 0) catch |e| blk: {
+        // TF_DSV41_ENGRAM_URING=0: the reader threads even where io_uring works (a container that allows it, A/B)
+        const uring_off = if (std.c.getenv("TF_DSV41_ENGRAM_URING")) |v| std.mem.eql(u8, std.mem.span(v), "0") else false;
+        r.ring = (if (uring_off) error.PermissionDenied else linux.IoUring.init(256, 0)) catch |e| blk: {
+            if (aioEnv()) {
+                if (Aio.init()) |a| {
+                    r.aio = a;
+                    std.log.scoped(.dsv41).info("engram: no io_uring ({t}); rows read by native AIO (TF_DSV41_ENGRAM_AIO, {d} in flight), waits {s}", .{ e, Aio.depth, if (a.poll) "polled (TF_DSV41_ENGRAM_POLL)" else "asleep in the kernel" });
+                    break :blk null;
+                } else |ae| std.log.scoped(.dsv41).warn("engram: TF_DSV41_ENGRAM_AIO=1 but io_setup failed ({t}): the reader threads", .{ae});
+            }
             const n = poolThreads();
             if (n > 0) {
                 try r.startPool(n);
@@ -234,6 +301,14 @@ pub const Rows = struct {
             break :blk null;
         };
         return r;
+    }
+
+    /// Native AIO in place of io_uring or the pool (tests, the probe): every read async through one context.
+    pub fn startAio(r: *Rows) !void {
+        if (r.ring) |*g| g.deinit();
+        r.ring = null;
+        r.stopPool();
+        if (r.aio == null) r.aio = try Aio.init();
     }
 
     /// The reader threads (no io_uring): `n` workers waiting for extents.
@@ -277,6 +352,7 @@ pub const Rows = struct {
     /// A reader thread: extents off the queue until `stop` (the queue drained first).
     fn worker(r: *Rows) void {
         const p = r.pool.?;
+        var iso = @import("cpu_isolate.zig").Isolate.init(); // TF_DSV41_PIN_ISOLATE: off the pinned plan thread's CPU
         while (true) {
             p.lock();
             while (p.head == p.jobs.items.len and !p.stop) _ = std.c.pthread_cond_wait(&p.work, &p.mu);
@@ -291,6 +367,7 @@ pub const Rows = struct {
                 p.head = 0;
             }
             p.unlock();
+            iso.apply();
             const ok = if (readAt(j.fd, j.size, j.direct, j.buf, j.off)) true else |_| false;
             p.lock();
             const b = &r.batches.items[j.bi];
@@ -353,6 +430,7 @@ pub const Rows = struct {
         r.settle(null);
         r.stopPool();
         if (r.ring) |*g| g.deinit();
+        if (r.aio) |*a| a.deinit();
         for (r.tables) |*t| r.closeTable(t);
         r.gpa.free(r.tables);
         r.batches.deinit(r.gpa);
@@ -469,6 +547,8 @@ pub const Rows = struct {
                 bp.left += 1;
             }
             _ = try g.submit();
+        } else if (r.aio != null) {
+            try r.aioSubmit(bi, t);
         } else {
             for (bp.ext) |e| try r.readExtent(t, bp.buf[e.at..][0..@intCast(e.len)], e.off);
         }
@@ -512,8 +592,74 @@ pub const Rows = struct {
         return readAt(t.fd, t.size, t.direct, buf, off);
     }
 
+    /// Batch `bi`'s extents on the AIO context (all of them, reaping finished reads while the context is full).
+    fn aioSubmit(r: *Rows, bi: u32, t: *const Table) !void {
+        const a = &r.aio.?;
+        const bp = &r.batches.items[bi];
+        var cbs: [64]Aio.Iocb = undefined;
+        var ptrs: [64]*Aio.Iocb = undefined;
+        var k: usize = 0;
+        while (k < bp.ext.len) {
+            if (a.in_flight == Aio.depth) try r.reap(1);
+            const n = @min(bp.ext.len - k, cbs.len, Aio.depth - a.in_flight);
+            for (cbs[0..n], ptrs[0..n], bp.ext[k..][0..n], 0..) |*cb, *pp, e, j| {
+                cb.* = .{ .data = @as(u64, bi) << 32 | (k + j), .fildes = @intCast(t.fd), .buf = @intFromPtr(bp.buf[e.at..].ptr), .nbytes = e.len, .offset = @intCast(e.off) };
+                pp.* = cb;
+            }
+            const rc = linux.syscall3(.io_submit, a.ctx, n, @intFromPtr(&ptrs));
+            switch (linux.errno(rc)) {
+                .SUCCESS => {},
+                .AGAIN, .INTR => {
+                    try r.reap(if (a.in_flight > 0) 1 else 0);
+                    continue;
+                },
+                else => return error.EngramReadFailed,
+            }
+            bp.left += @intCast(rc);
+            a.in_flight += @intCast(rc);
+            k += rc;
+        }
+    }
+
+    /// Takes finished AIO reads (waiting for at least `at_least`).
+    fn aioReap(r: *Rows, at_least: u32) !void {
+        const a = &r.aio.?;
+        var evs: [64]Aio.Event = undefined;
+        var need = @min(at_least, a.in_flight);
+        const zero: linux.timespec = .{ .sec = 0, .nsec = 0 };
+        const t0 = if (a.poll and need > 0) nowNs() else 0;
+        var polling = a.poll and need > 0;
+        while (true) {
+            // polling: whatever has landed, at once; else the kernel's wait for `need`
+            if (polling and nowNs() - t0 > Aio.poll_ns) polling = false;
+            const rc = if (polling)
+                linux.syscall5(.io_getevents, a.ctx, 0, evs.len, @intFromPtr(&evs), @intFromPtr(&zero))
+            else
+                linux.syscall5(.io_getevents, a.ctx, need, evs.len, @intFromPtr(&evs), 0);
+            switch (linux.errno(rc)) {
+                .SUCCESS => {},
+                .INTR => continue,
+                else => return error.EngramReadFailed,
+            }
+            for (evs[0..rc]) |ev| {
+                const b = &r.batches.items[@intCast(ev.data >> 32)];
+                const e = b.ext[@intCast(ev.data & 0xFFFF_FFFF)];
+                const t = &r.tables[b.table];
+                const want = @min(e.len, t.size - e.off);
+                if (ev.res < 0 or @as(u64, @intCast(ev.res)) < want) b.failed = true;
+                if (!t.direct) _ = linux.fadvise(t.fd, @intCast(e.off), @intCast(e.len), linux.POSIX_FADV.DONTNEED);
+                b.left -= 1;
+                a.in_flight -= 1;
+            }
+            need -|= @intCast(rc);
+            if (need == 0) return;
+            if (polling and rc == 0) std.atomic.spinLoopHint();
+        }
+    }
+
     /// Takes finished reads off the ring (waiting for at least `at_least`).
     fn reap(r: *Rows, at_least: u32) !void {
+        if (r.aio != null) return r.aioReap(at_least);
         const g = &(r.ring orelse return);
         var cqes: [64]linux.io_uring_cqe = undefined;
         var need = at_least;

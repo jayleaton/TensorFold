@@ -9,7 +9,7 @@
 //! allocations; the empty role is address 0).
 //!
 //! The served config is the environment the engine reads (TF_DSV41_CONTEXT, TF_DSV41_SLOTS, TF_DSV41_ROWS_CAP,
-//! TF_DSV41_PREFILL_ROWS, TF_DSV41_INDEX_BUDGET_MIB, R1's knobs, TF_TP_WORLD, TF_DSV41_KV_SPLIT, TF_DSV41_DRAFTS,
+//! TF_DSV41_PREFILL_ROWS, TF_DSV41_INDEX_BUDGET_MIB, R1's knobs, TF_DSV41_MHC_PFDEC, TF_TP_WORLD, TF_DSV41_KV_SPLIT, TF_DSV41_DRAFTS,
 //! TF_DSV41_SLOT_DRAFTS / TF_DSV41_SLOT_DRAFT_GROUP, the graph buckets), with the release config and the q28-v2 widths (the served pack's).
 //! Its programs:
 //! - one-slot decode windows of 1 .. max(16, block + 1) rows: eager at every end position (the scan below), and graphed
@@ -215,7 +215,19 @@ pub const Served = struct {
         o.limit = try envInt("TF_DSV41_CONTEXT", o.limit);
         o.rope_rows = o.limit + 2048;
         if (try knobs.prefillRows(&knobs.env)) |r| o.prefill_rows = r;
+        // TF_DSV41_PF_4K: 4,096-row segments (their Triton variants at those rows), x3gm v2 as apply has it
+        o.pf4k = try knobs.pf4k(&knobs.env);
+        o.gm_v2 = try @import("gm2pf.zig").mode(&knobs.env);
+        // TF_DSV41_PF_OVERLAP: its pieces' projections (their own row counts) where the side stream is on
+        o.pf_overlap = try knobs.pfOverlap(&knobs.env);
+        o.pf_overlap_site = o.pf_overlap > 0 and try knobs.pfOverlapSite(&knobs.env); // the site pieces' `_finish_k`
+        o.stream_rb = try knobs.streamRb(&knobs.env); // TF_DSV41_STREAM_RB: the twin's variants
+        o.index_bound = try knobs.indexBound(&knobs.env); // TF_DSV41_INDEX_BOUND: `_scores_b`'s and `_dtopk_b`'s variants
+        o.mhc_site_rows = try knobs.mhcSiteRows(&knobs.env); // the site pieces' `_finish_k` rows
+        if (o.pf_overlap > 0) o.branches = (try @import("branches.zig").settings()).on;
         if (try knobs.indexBudget(&knobs.env)) |b| o.index_budget = b;
+        // TF_DSV41_MHC_PFDEC: its norm is `_finish_k` without COEF at the windows it covers
+        o.mhc_pf_rows = try knobs.mhcPfRows(&knobs.env);
         const drafts = envOn("TF_DSV41_DRAFTS", true);
         o.taps = drafts;
         const pages = @divExact(o.limit, block.Pool.page);
@@ -493,6 +505,17 @@ pub fn enumerate(gpa: std.mem.Allocator, n: *Needs, cfg: *const Config, w: *cons
         if (sv.slot_drafts) {
             var k: i64 = 1;
             while (k <= sv.group) : (k += 1) _ = try n.program(try dspark_emit.emitPassSlots(pb, cfg, w, sv.o, cfg.dspark_block, k, sv.slots));
+            // TF_DSV41_DRAFT_CHAIN's `_chain` (one variant whatever the slots: they are its grid), with and without the
+            // confidence head (Python passes cval for its tensors without it); WORLD x k candidates a row
+            const world: i64 = sv.o.world;
+            const c = world * @min(64, @divTrunc(128, world));
+            for ([_]bool{ true, false }) |conf| _ = try n.program(try dspark_emit.emitChain(pb, cfg, w, sv.o, cfg.dspark_block, sv.slots, c, conf));
+            try log.print("aot-needs: DSpark chain (TF_DSV41_DRAFT_CHAIN), N {d}, KP {d}, {d} candidates, with and without the confidence head\n", .{ cfg.dspark_block, dspark_emit.chain_kp, c });
+        } else if (try @import("dspark_dev.zig").chainFromEnv()) {
+            // the served config would boot without its chain (dspark_slots refuses it): a fill env that drifted
+            try log.print("aot-needs: TF_DSV41_DRAFT_CHAIN=1 without slot drafts (TF_DSV41_SLOTS > 1, TF_DSV41_SLOT_DRAFTS=1, row mode): no _chain variant listed\n", .{});
+            try log.flush();
+            return error.ChainWithoutSlotDrafts;
         }
         try log.print("aot-needs: DSpark, {d} programs, {d} variants\n", .{ n.programs, n.keys.count() });
         try log.flush();

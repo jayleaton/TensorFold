@@ -19,6 +19,8 @@ test {
     _ = rowtab;
     _ = rowmode;
     _ = @import("aot_needs.zig");
+    _ = @import("batch.zig"); // TF_DSV41_WIN_PROF's timer
+    _ = @import("cpu_isolate.zig"); // TF_DSV41_PIN_ISOLATE
 }
 
 const S: u32 = 4;
@@ -497,4 +499,56 @@ test "rowtab at 1M: four slots' windows at the limit's end, padded, within the l
     const s: graphs.Settings = .{};
     const ctx = graphs.bucketOf(rowtab.lastPos(&mix), s.bucket, s.grow);
     try testing.expectEqual(limit - 1, graphs.bucketEnd(ctx, s.bucket, limit, s.grow));
+}
+
+test "TF_DSV41_ROUND_GRAPH=split on the served row window: head + tail = the window, no side or deferred fork open at the boundary, the head ~ its layers" {
+    const round_graph = @import("round_graph.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const w = try widths(a);
+    const cfg: Config = .{};
+    var backbone: [40]u32 = undefined;
+    for (&backbone, 0..) |*l, i| l.* = @intCast(i);
+    for ([_]bool{ false, true }) |r1| for ([_]bool{ false, true }) |br| for ([_]u32{ 1, 5, 16 }) |R| {
+        var o: block.Options = .{ .limit = 8192, .r1 = r1, .expert_topp = 0.85, .branches = br, .mhc_defer = br and r1 };
+        o.pool = poolOf(o.limit, false);
+        const pts = o.pool.?.pts;
+        const s: graphs.Settings = .{};
+        const ctx = graphs.bucketOf(5000, s.bucket, s.grow);
+        const one = try block.emit(a, &cfg, &w, o, &backbone, R, graphs.emitStart(R, ctx, s, @intCast(o.limit)), true);
+        const rows = try rowmode.transform(a, one, R, .{ .slots = S, .rmax = rmax, .pts = pts });
+        var layer_at: [41]usize = undefined; // each layer's first call (layer 0: the window's)
+        var nl: usize = 1;
+        layer_at[0] = 0;
+        for (rows, 0..) |c, i| if (c.begin == .layer) {
+            layer_at[nl] = i;
+            nl += 1;
+        };
+        try testing.expectEqual(@as(usize, 40), nl);
+        for ([_]u32{ 1, 2, 7 }) |head| {
+            const at = round_graph.splitAt(rows, head) orelse return error.NoSplit;
+            // past the head's layers' calls, before the next layer's end: a few calls into layer `head` at most
+            try testing.expect(at >= layer_at[head] and at < layer_at[head + 1]);
+            // the runner's fork state before `at` (runner.issue): neither the side nor the deferred stream open
+            var side = false;
+            var dfr = false;
+            var sides: usize = 0;
+            for (rows[0..at]) |c| {
+                if (c.join) side = false;
+                if (c.fork) side = true;
+                if (c.defer_join) dfr = false;
+                if (c.defer_side) dfr = true;
+                if (c.side) sides += 1;
+            }
+            try testing.expect(!side and !dfr);
+            // the tail's first side launch comes after a fork of its own (runner.issue refuses a side call unforked)
+            for (rows[at..]) |c| {
+                if (c.fork) break;
+                try testing.expect(!c.side);
+            }
+            if (br) try testing.expect(sides > 0);
+        }
+        try testing.expectEqual(@as(?usize, null), round_graph.splitAt(rows, 40));
+    };
 }

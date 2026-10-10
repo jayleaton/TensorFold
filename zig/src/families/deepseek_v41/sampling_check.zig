@@ -2,8 +2,9 @@
 //! Rows of bf16-valued logits as a rank's vocabulary slice (64,640 columns: Gaussian, peaked, coarse ties, flat):
 //!
 //! - candidates (topk_keys.cu + sampling.cu's pack) at k 9 / 28 / 520 / 1024: bit-equal to the host's packed rows;
-//! - nucleus statistics at T 0.6 / 1.0 / 1.3: the max bit-equal, the sum within 1e-12 relative (its order is not
-//!   torch's; ``nucleus.GUARD`` absorbs it);
+//! - nucleus statistics at T 0.6 / 1.0 / 1.3, both kernels (stats_kernel's CTA a row and the split launches over every
+//!   SM): the max bit-equal, the sum within 1e-12 relative (its order is not torch's; ``nucleus.GUARD`` absorbs it);
+//!   then each one's time a call at 1 / 5 / 16 rows (a sampled segment's statistics, TF_DSV41_SAMP_STATS);
 //! - the picks (``serve/sampling.zig``) from the device's candidates and statistics equal the host's, for top-p,
 //!   top-k and min-p samplings at many positions.
 //!
@@ -85,23 +86,32 @@ pub fn main(init: std.process.Init) !u8 {
     // statistics: max bit-equal, sum within 1e-12 relative
     var picker = try smp.Picker.init(gpa, C);
     defer picker.deinit();
+    const split = gpu.fns.split != null;
+    if (!split) {
+        bad += 1;
+        std.debug.print("stats: the fatbin has no split kernels (dsv41_sampling_stats_*)\n", .{});
+    }
     for ([_]f64{ 0.6, 1.0, 1.3 }) |t| {
         const d_st = try dev.vtable.scratch(dev.ptr, 2, 16 * n);
         const h_st = try ref.vtable.scratch(ref.ptr, 2, 16 * n);
-        try dev.vtable.stats(dev.ptr, d_lg.ptr, n, C, t, d_st);
         try ref.vtable.stats(ref.ptr, h_lg, n, C, t, h_st);
-        var got: [2 * n]f64 = undefined;
-        try dev.vtable.download(dev.ptr, d_st, std.mem.sliceAsBytes(&got));
         const want = @as([*]const f64, @ptrFromInt(h_st))[0 .. 2 * n];
-        var worst: f64 = 0;
-        var max_ok = true;
-        for (0..n) |r| {
-            max_ok = max_ok and got[2 * r] == want[2 * r];
-            worst = @max(worst, @abs(got[2 * r + 1] - want[2 * r + 1]) / want[2 * r + 1]);
+        var got: [2 * n]f64 = undefined;
+        for ([_]bool{ false, true }) |mode| {
+            if (mode and !split) continue;
+            gpu.split = mode; // the split run last: the picks below read its statistics
+            try dev.vtable.stats(dev.ptr, d_lg.ptr, n, C, t, d_st);
+            try dev.vtable.download(dev.ptr, d_st, std.mem.sliceAsBytes(&got));
+            var worst: f64 = 0;
+            var max_ok = true;
+            for (0..n) |r| {
+                max_ok = max_ok and got[2 * r] == want[2 * r];
+                worst = @max(worst, @abs(got[2 * r + 1] - want[2 * r + 1]) / want[2 * r + 1]);
+            }
+            const ok = max_ok and worst <= 1e-12;
+            bad += @intFromBool(!ok);
+            std.debug.print("stats {s} T {d}: max {s}, sum worst relative {e} ({s})\n", .{ if (mode) "split" else "row", t, if (max_ok) "bit-equal" else "DIFFERS", worst, if (ok) "ok" else "FAIL" });
         }
-        const ok = max_ok and worst <= 1e-12;
-        bad += @intFromBool(!ok);
-        std.debug.print("stats T {d}: max {s}, sum worst relative {e} ({s})\n", .{ t, if (max_ok) "bit-equal" else "DIFFERS", worst, if (ok) "ok" else "FAIL" });
 
         // the picks from the device's candidates + statistics == the host's (512 candidates, one rank)
         const k = 512;
@@ -137,6 +147,28 @@ pub fn main(init: std.process.Init) !u8 {
         bad += picks - same;
         std.debug.print("picks T {d}: {d}/{d} equal\n", .{ t, same, picks });
     }
+    try timeStats(&driver, stream, &gpu, dev, d_lg.ptr);
     std.debug.print("{s} tf-dsv41-samp: {d} checks failed\n", .{ if (bad == 0) "PASS" else "FAIL", bad });
     return if (bad == 0) 0 else 1;
+}
+
+/// Each statistics kernel's device time a call (timing events around `reps` calls) at a segment's row counts.
+fn timeStats(driver: *const cuda.Driver, stream: cuda.Stream, gpu: *Gpu, dev: pipe.Device, lg: u64) !void {
+    const reps = 50;
+    var e0 = try cuda.Event.init(driver, true);
+    defer e0.deinit();
+    var e1 = try cuda.Event.init(driver, true);
+    defer e1.deinit();
+    const out = try dev.vtable.scratch(dev.ptr, 2, 16 * n);
+    for ([_]usize{ 1, 5, 16 }) |rows_| for ([_]bool{ false, true }) |mode| {
+        if (mode and gpu.fns.split == null) continue;
+        gpu.split = mode;
+        try dev.vtable.stats(dev.ptr, lg, rows_, C, 0.7, out); // warm (scratch, module)
+        try e0.record(stream);
+        for (0..reps) |_| try dev.vtable.stats(dev.ptr, lg, rows_, C, 0.7, out);
+        try e1.record(stream);
+        try e1.synchronize();
+        const ms = try cuda.Event.elapsedMs(e0, e1);
+        std.debug.print("stats time {s} rows {d}: {d:.1} us a call\n", .{ if (mode) "split" else "row", rows_, 1000.0 * ms / reps });
+    };
 }

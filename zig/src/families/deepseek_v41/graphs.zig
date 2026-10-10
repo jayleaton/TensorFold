@@ -38,6 +38,9 @@ pub const Settings = struct {
     grow: f64 = 1.25,
     rows_max: u32 = 64,
     floor_gib: f64 = 5.0,
+    /// TF_DSV41_GRAPH_FLOOR=hold (default `shed`): under the floor a miss runs eagerly, the held graphs stay
+    /// (graph_cache.Settings.hold)
+    floor_hold: bool = false,
 
     pub fn fromEnv() !Settings {
         return fromEnvOr(false);
@@ -53,6 +56,10 @@ pub const Settings = struct {
         if (std.c.getenv("TF_DSV41_GRAPH_BUCKET_GROW")) |v| s.grow = try std.fmt.parseFloat(f64, std.mem.span(v));
         if (std.c.getenv("TF_DSV41_GRAPH_ROWS_MAX")) |v| s.rows_max = try std.fmt.parseInt(u32, std.mem.span(v), 10);
         if (std.c.getenv("TF_DSV41_GRAPH_FLOOR_GIB")) |v| s.floor_gib = try std.fmt.parseFloat(f64, std.mem.span(v));
+        if (std.c.getenv("TF_DSV41_GRAPH_FLOOR")) |v| {
+            const m = std.mem.span(v);
+            if (std.mem.eql(u8, m, "hold")) s.floor_hold = true else if (!(m.len == 0 or std.mem.eql(u8, m, "shed"))) return error.BadGraphFloor;
+        }
         if (s.bucket == 0) return error.BadGraphBucket;
         return s;
     }
@@ -85,7 +92,8 @@ pub fn bucketEnd(b: u32, size: u64, limit: u64, grow: f64) u64 {
     return @min(endOf(b, size, grow) - 1, limit - 1);
 }
 
-pub const Key = struct { rows: u32, ctx: u32 };
+/// `part`: 0 a whole window; 1 / 2 its head / tail graph (TF_DSV41_ROUND_GRAPH=split, round_graph.zig)
+pub const Key = struct { rows: u32, ctx: u32, part: u8 = 0 };
 
 pub const Cache = gc.Cache(Key);
 
@@ -110,6 +118,28 @@ pub fn roomAbove(floor_gib: f64) bool {
     const n = std.c.read(fd, &buf, buf.len);
     if (n <= 0) return true;
     return memAvailableAbove(buf[0..@intCast(n)], floor_gib);
+}
+
+/// MemAvailable in GiB (null where /proc/meminfo cannot be read): the prefill's handoff log.
+pub fn memAvailableGiB() ?f64 {
+    var buf: [4096]u8 = undefined;
+    const fd = std.c.open("/proc/meminfo", .{ .ACCMODE = .RDONLY });
+    if (fd < 0) return null;
+    defer _ = std.c.close(fd);
+    const n = std.c.read(fd, &buf, buf.len);
+    if (n <= 0) return null;
+    return memAvailableOf(buf[0..@intCast(n)]);
+}
+
+fn memAvailableOf(text: []const u8) ?f64 {
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "MemAvailable:")) continue;
+        var f = std.mem.tokenizeScalar(u8, line["MemAvailable:".len..], ' ');
+        const kb = std.fmt.parseInt(u64, f.next() orelse return null, 10) catch return null;
+        return @as(f64, @floatFromInt(kb)) / (1 << 20);
+    }
+    return null;
 }
 
 fn memAvailableAbove(text: []const u8, floor_gib: f64) bool {
@@ -292,6 +322,11 @@ test "graphs: emitted start puts the window's end at the bucket's end" {
     const s: Settings = .{};
     // a 5-row window in bucket 0: rows end at 2047, so end = start + n = 2048, NK = 2048 / ratio
     try std.testing.expectEqual(@as(i64, 2043), emitStart(5, 0, s, 1 << 20));
+}
+
+test "graphs: MemAvailable in GiB" {
+    try std.testing.expectEqual(@as(?f64, 6.0), memAvailableOf("MemTotal: 1 kB\nMemAvailable:   6291456 kB\n"));
+    try std.testing.expectEqual(@as(?f64, null), memAvailableOf("MemTotal: 1 kB\n"));
 }
 
 test "graphs: MemAvailable floor" {

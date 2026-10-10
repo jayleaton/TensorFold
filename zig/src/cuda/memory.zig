@@ -49,15 +49,38 @@ fn lockCounts() void {
     while (!counts_mutex.tryLock()) std.Thread.yield() catch {};
 }
 
+/// A sub-allocator under DeviceBuffer (arena.zig): `alloc` gives an address or null (then cuMemAlloc as before),
+/// `free` is true when the address was its own.
+pub const Hook = struct {
+    ctx: *anyopaque,
+    alloc: *const fn (ctx: *anyopaque, len: usize) ?abi.DevicePtr,
+    free: *const fn (ctx: *anyopaque, p: abi.DevicePtr) bool,
+};
+
+var alloc_hook: ?Hook = null;
+
+/// Installs (or with null removes) the sub-allocator; set once at boot, before the buffers it should hold.
+pub fn setHook(h: ?Hook) void {
+    alloc_hook = h;
+}
+
+pub fn currentHook() ?Hook {
+    return alloc_hook;
+}
+
 pub const DeviceBuffer = struct {
     d: *const Driver,
     ptr: abi.DevicePtr,
     len: usize,
 
-    /// `len` bytes, 256-byte aligned by the driver; zero bytes allocate nothing and hold address 0.
+    /// `len` bytes, 256-byte aligned by the driver (512 from an installed arena); zero bytes allocate nothing and
+    /// hold address 0.
     pub fn alloc(d: *const Driver, len: usize) Error!DeviceBuffer {
         var p: abi.DevicePtr = 0;
-        if (len > 0) try d.check(d.api.cuMemAlloc_v2(&p, len), "cuMemAlloc");
+        if (len > 0) {
+            if (alloc_hook) |h| p = h.alloc(h.ctx, len) orelse 0;
+            if (p == 0) try d.check(d.api.cuMemAlloc_v2(&p, len), "cuMemAlloc");
+        }
         held(&device_bytes, len);
         return .{ .d = d, .ptr = p, .len = len };
     }
@@ -71,7 +94,10 @@ pub const DeviceBuffer = struct {
     }
 
     pub fn free(self: *DeviceBuffer) void {
-        if (self.ptr != 0) _ = self.d.api.cuMemFree_v2(self.ptr);
+        if (self.ptr != 0) {
+            const mine = if (alloc_hook) |h| h.free(h.ctx, self.ptr) else false;
+            if (!mine) _ = self.d.api.cuMemFree_v2(self.ptr);
+        }
         freed(&device_bytes, self.len);
         self.* = undefined;
     }

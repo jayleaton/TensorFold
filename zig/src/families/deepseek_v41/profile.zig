@@ -32,6 +32,10 @@ pub const Profile = struct {
         windows: u64 = 0,
         wall_ns: u64 = 0,
         gpu_ns: u64 = 0,
+        /// prompt rows the encoder / full segments covered, and the CED decoder replays' (forward_prefill: the
+        /// per-1K-row split of gap.py prefill-ab)
+        rows: u64 = 0,
+        tail_rows: u64 = 0,
     };
 
     pub const Total = struct { calls: u64 = 0, ns: u64 = 0 };
@@ -60,6 +64,11 @@ pub const Profile = struct {
     pub fn beginPrefill(p: *Profile) void {
         p.begin();
         p.prefill = true;
+    }
+
+    /// The rows the last prefill window covered (`tail`: a CED decoder replay's).
+    pub fn prefillRows(p: *Profile, rows: u64, tail: bool) void {
+        if (tail) p.pf.tail_rows += rows else p.pf.rows += rows;
     }
 
     /// Before a call: its start event on the stream.
@@ -107,10 +116,12 @@ pub const Profile = struct {
         defer w.deinit();
         w.writer.print("{{\"windows\": {d}, \"wall_ms\": {d:.3}, \"gpu_ms\": {d:.3}, \"calls\": {{", .{ p.windows, @as(f64, @floatFromInt(p.wall_ns)) / 1e6, @as(f64, @floatFromInt(p.gpu_ns)) / 1e6 }) catch {};
         for (p.totals.keys(), p.totals.values(), 0..) |k, v, i| w.writer.print("{s}\"{s}\": {{\"calls\": {d}, \"ms\": {d:.4}}}", .{ if (i == 0) "" else ", ", k, v.calls, @as(f64, @floatFromInt(v.ns)) / 1e6 }) catch {};
-        w.writer.print("}}, \"prefill\": {{\"segments\": {d}, \"wall_ms\": {d:.3}, \"gpu_ms\": {d:.3}, \"calls\": {{", .{ p.pf.windows, @as(f64, @floatFromInt(p.pf.wall_ns)) / 1e6, @as(f64, @floatFromInt(p.pf.gpu_ns)) / 1e6 }) catch {};
+        w.writer.print("}}, \"prefill\": {{\"segments\": {d}, \"rows\": {d}, \"tail_rows\": {d}, \"wall_ms\": {d:.3}, \"gpu_ms\": {d:.3}, \"calls\": {{", .{ p.pf.windows, p.pf.rows, p.pf.tail_rows, @as(f64, @floatFromInt(p.pf.wall_ns)) / 1e6, @as(f64, @floatFromInt(p.pf.gpu_ns)) / 1e6 }) catch {};
         for (p.pf.calls.keys(), p.pf.calls.values(), 0..) |k, v, i| w.writer.print("{s}\"{s}\": {{\"calls\": {d}, \"ms\": {d:.4}}}", .{ if (i == 0) "" else ", ", k, v.calls, @as(f64, @floatFromInt(v.ns)) / 1e6 }) catch {};
         w.writer.print("}}}}}}\n", .{}) catch {};
-        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p.path, .data = w.written() }) catch |e| std.log.err("profile: {s} not written ({t})", .{ p.path, e });
+        if (std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p.path, .data = w.written() })) |_| {
+            std.log.info("profile: {s} written ({d} windows, {d} prefill segments)", .{ p.path, p.windows, p.pf.windows });
+        } else |e| std.log.err("profile: {s} not written ({t})", .{ p.path, e });
         for (p.events.items) |*e| e.deinit();
         p.events.deinit(p.gpa);
         p.open.deinit(p.gpa);

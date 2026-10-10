@@ -26,12 +26,14 @@ const cuda = @import("cuda");
 const calls = @import("calls.zig");
 const buffers = @import("buffers.zig");
 const run = @import("run.zig");
+const block = @import("block.zig");
 const block_prefill = @import("block_prefill.zig");
 const longpf = @import("longpf.zig");
 const vision_rows = @import("vision_rows.zig");
 const fwd = @import("forward.zig");
 const eh = @import("engram_host.zig");
 const ced = @import("ced.zig");
+const graphs = @import("graphs.zig");
 const prod_knobs = @import("prod_knobs.zig");
 const Forward = fwd.Forward;
 
@@ -55,6 +57,24 @@ pub const State = struct {
     ahead: bool = false,
     /// long prompts' buffers (longpf.zig)
     long: longpf.State = .{},
+    /// TF_DSV41_PF_TBO: micro-batch B's own long-prompt buffers (its stream top-k merge grows its own), and the pair in
+    /// flight (the glue runs each micro-batch's steps with its own ids, window, Engram tail and MoE count)
+    long_b: longpf.State = .{},
+    tbo: ?*Pair = null,
+    /// TF_DSV41_PF_4K (prod_knobs.apply): 4,096-row segments in the prefill's own workspace (`K4`); the forward's
+    /// options, buffer plan and arena stay the 2,048-row ones, so decode windows and the drafter are untouched
+    k4: bool = false,
+    k4ws: K4 = .{},
+    /// the current prompt call may use the workspace (4K segments, TBO pairs): every rank's MemAvailable leaves the
+    /// workspace above the hard floor (wsAgreed, one collective a call); false: this call runs 2,048-row segments, the
+    /// same bits (segmentation-invariant), never a failure. True until a call decides (the planner reads it at boot)
+    ws_ok: bool = true,
+    ws_fallbacks: u64 = 0,
+    agreement: ?graphs.Agreement = null,
+    /// the next prompt piece's ids (Forward.prefillAhead, op 60: the round planner's next piece of this prompt, as
+    /// Python's rounds._prefetch(ahead=prefetch.next_pieces)): this prompt call's last segment reads their Engram rows
+    /// ahead, as a segment inside one call reads the next segment's (TF_DSV41_PREFETCH_AHEAD). Cleared by the call
+    next: std.ArrayList(u32) = .empty,
     /// TF_DSV41_PREFILL (prod_knobs.apply): `.replay` = CED (ced.zig), segments are encoder passes and `finish` runs
     /// the decoder; `.full`: every layer over every row
     mode: prod_knobs.PrefillMode = .full,
@@ -69,6 +89,11 @@ pub const State = struct {
         s.long.deinit(gpa);
         if (s.masked) |*b| b.free();
         s.ids.deinit(gpa);
+        s.next.deinit(gpa);
+        if (s.agreement) |*x| x.deinit();
+        var it = s.k4ws.keep.keyIterator();
+        while (it.next()) |k| gpa.free(k.*);
+        s.k4ws.keep.deinit(gpa);
     }
 };
 
@@ -80,6 +105,23 @@ pub fn plan(f: *Forward, p: *buffers.Plan, rows: u32) !void {
     var la = std.heap.ArenaAllocator.init(f.gpa);
     defer la.deinit();
     const layers = try f.backbone(la.allocator());
+    try planPrograms(f, p, rows, layers);
+    if (f.prefill_state.k4 or (f.prefill_state.mode == .replay and f.opts.pf_tbo)) {
+        const ws = &f.prefill_state.k4ws;
+        if (ws.plan == null) {
+            ws.plan = .{ .a = f.gpa };
+            try planWorkspace(f, &ws.plan.?, rows, layers);
+            if (keepsShared(f)) {
+                const before = planBytes(&ws.plan.?);
+                try k4Trim(f.gpa, &ws.plan.?, p, &ws.keep);
+                log.info("prefill 4K: rank {d}: {d} roles shared with the forward (TF_DSV41_PF_WS_SHARE): workspace {d} -> {d} MiB", .{ f.comm.rank(), ws.keep.count(), before >> 20, planBytes(&ws.plan.?) >> 20 });
+            }
+        }
+    }
+}
+
+/// The forward's prefill programs at `rows` (`plan` without the workspace).
+fn planPrograms(f: *Forward, p: *buffers.Plan, rows: u32, layers: []const u32) !void {
     const sizes = [_]u32{ rows, 17, 16 };
     for (sizes[if (rows > 17) 0 else 1..]) |n| {
         const top = try lastStart(f, layers, n, .whole);
@@ -96,6 +138,103 @@ pub fn plan(f: *Forward, p: *buffers.Plan, rows: u32) !void {
     const replay = f.prefill_state.mode == .replay;
     const runs = try block_prefill.planRuns(ra.allocator(), f.cfg, f.widths, vision_rows.planOptions(f), if (replay) try encoderLayers(f, layers) else layers, if (replay) try decoderLayers(f, layers) else null, rows, if (replay) .encoder else .whole);
     for (runs.items) |cs| try p.add(cs);
+}
+
+/// TF_DSV41_PF_WS_SHARE=1 (default 0) with TF_DSV41_PF_4K alone (no TBO pair, whose micro-batches run at once): a 4K
+/// segment runs by itself, so a role its
+/// program names that the forward's plan already holds at least as large stays the forward's (`K4.keep`, at boot)
+/// instead of a second copy in the workspace (the index stream / keys budget, the pf.w scratch: ~0.44 GiB). Each
+/// role is its own allocation or arena offset (buffers.zig), and the 2K segments use those roles the same way
+/// between the same programs, so nothing changes but where the 4K segment's bytes live.
+fn keepsShared(f: *const Forward) bool {
+    return f.prefill_state.k4 and !f.opts.pf_tbo and envOn("TF_DSV41_PF_WS_SHARE");
+}
+
+fn envOn(name: [:0]const u8) bool {
+    const v = std.mem.span(std.c.getenv(name) orelse return false);
+    return std.mem.eql(u8, v, "1");
+}
+
+/// Moves the workspace roles (`wp`, in the namespace) that `forward` holds at least as large into `keep` (their bare
+/// names): the 4K program then names the forward's role, and the workspace no longer sizes it.
+pub fn k4Trim(gpa: std.mem.Allocator, wp: *buffers.Plan, forward: *const buffers.Plan, keep: *block_prefill.Keep) !void {
+    var i: usize = 0;
+    while (i < wp.sizes.count()) {
+        const k = wp.sizes.keys()[i];
+        const v = wp.sizes.values()[i];
+        const at = std.mem.indexOf(u8, k, K4.tag) orelse {
+            i += 1;
+            continue;
+        };
+        const bare = try std.mem.concat(gpa, u8, &.{ k[0..at], k[at + K4.tag.len ..] });
+        const have = forward.sizes.get(bare) orelse 0;
+        if (have < v or keep.contains(bare)) {
+            gpa.free(bare);
+            if (have >= v) wp.sizes.orderedRemoveAt(i) else i += 1;
+            continue;
+        }
+        try keep.put(gpa, bare, {});
+        wp.sizes.orderedRemoveAt(i);
+    }
+}
+
+/// The workspace's programs (nothing of them in the forward's plan): TF_DSV41_PF_4K's 4,096-row encoder segment in
+/// its namespace, and TF_DSV41_PF_TBO's pair of whole segments (wsPair; 4,096-row micro-batches under 4K), each at
+/// 0 and at its last start.
+fn planWorkspace(f: *Forward, wp: *buffers.Plan, rows: u32, layers: []const u32) !void {
+    const replay = f.prefill_state.mode == .replay;
+    if (f.prefill_state.k4) {
+        const enc = try encoderLayers(f, layers);
+        const o4 = k4Options(vision_rows.planOptions(f));
+        const top4 = try lastStartWith(f, o4, enc, K4.rows, .encoder);
+        for ([_]i64{ 0, top4 }) |start| {
+            var ka = std.heap.ArenaAllocator.init(f.gpa);
+            defer ka.deinit();
+            const cs = try block_prefill.emitReplay(ka.allocator(), f.cfg, f.widths, o4, enc, K4.rows, start, .encoder);
+            try wp.add(try block_prefill.ownCalls(ka.allocator(), cs, K4.tag));
+        }
+    }
+    if (replay and f.opts.pf_tbo and rows >= 2 * block_prefill.tbo_min) {
+        const enc = try encoderLayers(f, layers);
+        const k4 = f.prefill_state.k4;
+        const op = if (k4) k4Options(vision_rows.planOptions(f)) else vision_rows.planOptions(f);
+        const seg: u32 = if (k4) K4.rows else rows;
+        const top = @max(0, try lastStartWith(f, op, enc, seg, .encoder) - seg); // B at the last start a segment takes
+        for ([_]i64{ 0, top }) |start| {
+            var ta = std.heap.ArenaAllocator.init(f.gpa);
+            defer ta.deinit();
+            const cs = try block_prefill.emitTbo(ta.allocator(), f.cfg, f.widths, op, enc, seg, seg, start);
+            try wp.add(try wsPair(ta.allocator(), cs, k4));
+        }
+    }
+}
+
+/// The bytes the workspace allocates at a long prompt (its roles in the namespace, 256-aligned as k4Acquire lays them
+/// out); 0 when neither TF_DSV41_PF_4K nor TF_DSV41_PF_TBO is on. Sized before the KV pool (kv_state.bootCheck prices it).
+pub fn workspaceBytes(f: *Forward, rows: u32) !u64 {
+    if (!(f.prefill_state.k4 or (f.prefill_state.mode == .replay and f.opts.pf_tbo))) return 0;
+    var la = std.heap.ArenaAllocator.init(f.gpa);
+    defer la.deinit();
+    var wp: buffers.Plan = .{ .a = la.allocator() };
+    const layers = try f.backbone(la.allocator());
+    try planWorkspace(f, &wp, rows, layers);
+    if (keepsShared(f)) {
+        // the same trim `plan` makes: the roles the forward's prefill programs hold already
+        var fp: buffers.Plan = .{ .a = la.allocator() };
+        try planPrograms(f, &fp, rows, layers);
+        var keep: block_prefill.Keep = .empty;
+        try k4Trim(la.allocator(), &wp, &fp, &keep);
+    }
+    return planBytes(&wp);
+}
+
+fn planBytes(wp: *const buffers.Plan) u64 {
+    var total: u64 = 0;
+    for (wp.sizes.keys(), wp.sizes.values()) |k, v| {
+        if (std.mem.indexOf(u8, k, K4.tag) == null) continue;
+        total += std.mem.alignForward(u64, v, 256);
+    }
+    return total;
 }
 
 /// CED replay's programs (ced.zig): an encoder segment (the whole segment's roles up to the decoder's first layer, and
@@ -133,10 +272,10 @@ fn decoderLayers(f: *Forward, layers: []const u32) ![]const u32 {
 }
 
 /// Whether an `n`-row segment (`part` of it) at `start` is on the prefill path (block_prefill's emitter takes it).
-fn emits(f: *Forward, layers: []const u32, n: u32, start: i64, part: block_prefill.Part) !bool {
+fn emits(f: *Forward, o: block.Options, layers: []const u32, n: u32, start: i64, part: block_prefill.Part) !bool {
     var ea = std.heap.ArenaAllocator.init(f.gpa);
     defer ea.deinit();
-    _ = block_prefill.emitReplay(ea.allocator(), f.cfg, f.widths, f.opts, layers, n, start, part) catch |e| switch (e) {
+    _ = block_prefill.emitReplay(ea.allocator(), f.cfg, f.widths, o, layers, n, start, part) catch |e| switch (e) {
         error.Unsupported => return false,
         else => return e,
     };
@@ -146,21 +285,196 @@ fn emits(f: *Forward, layers: []const u32, n: u32, start: i64, part: block_prefi
 /// The last start an `n`-row segment emits at (the stream top-k's threshold moves with the segment's end). The decoder
 /// pass ends a row before the prompt's last token: its last start is one lower.
 fn lastStart(f: *Forward, layers: []const u32, n: u32, part: block_prefill.Part) !i64 {
-    var hi: i64 = f.opts.limit - n - @intFromBool(part == .decoder);
+    return lastStartWith(f, f.opts, layers, n, part);
+}
+
+/// `lastStart` with options `o` (TF_DSV41_PF_4K's segments: k4Options).
+fn lastStartWith(f: *Forward, o: block.Options, layers: []const u32, n: u32, part: block_prefill.Part) !i64 {
+    var hi: i64 = o.limit - n - @intFromBool(part == .decoder);
     if (hi < 0) return error.BadWindow;
-    if (try emits(f, layers, n, hi, part)) return hi;
-    if (!try emits(f, layers, n, 0, part)) {
+    if (try emits(f, o, layers, n, hi, part)) return hi;
+    if (!try emits(f, o, layers, n, 0, part)) {
         log.warn("prefill: a {d}-row segment is not on the prefill path at any position (block_prefill: Unsupported)", .{n});
         return error.Unsupported;
     }
     var lo: i64 = 0;
     while (hi - lo > 1) {
         const mid = lo + @divFloor(hi - lo, 2);
-        if (try emits(f, layers, n, mid, part)) lo = mid else hi = mid;
+        if (try emits(f, o, layers, n, mid, part)) lo = mid else hi = mid;
     }
     log.info("prefill: {d}-row segments emit up to start {d}", .{ n, lo });
     return lo;
 }
+
+/// TF_DSV41_PF_4K's workspace: every role a 4,096-row segment's program names in its own namespace ("k4~":
+/// block_prefill.ownRole; the slot's state and the constants are the forward's), sized by its own plan at boot and
+/// allocated at a prompt's first 4K segment, released at the prompt's CED finish. Nothing of it is resident while no
+/// long prompt prefills: the 4K path adds no byte to the forward's plan, decode's graphs keep their room.
+pub const K4 = struct {
+    pub const rows: u32 = prod_knobs.pf4k_rows;
+    pub const tag = "k4~";
+    plan: ?buffers.Plan = null,
+    /// the bare roles a 4K segment shares with the forward (k4Trim under TF_DSV41_PF_WS_SHARE=1; else none)
+    keep: block_prefill.Keep = .empty,
+    buf: ?cuda.DeviceBuffer = null,
+    bytes: u64 = 0,
+    allocs: u64 = 0,
+    releases: u64 = 0,
+    /// the exchange's send buffer and Engram's gathered rows while a 4K segment runs (the glue grows them here): the
+    /// forward's own, which decode graphs hold the addresses of, are never regrown by a 4K segment
+    send: ?cuda.DeviceBuffer = null,
+    gathered: ?cuda.DeviceBuffer = null,
+};
+
+/// The rows a prompt segment holds: 4,096 under TF_DSV41_PF_4K, else the forward's (the round planner's rows too).
+pub fn segmentRows(f: *const Forward) usize {
+    const st = &f.prefill_state;
+    return if (st.k4 and st.ws_ok) K4.rows else @intCast(f.opts.prefill_rows);
+}
+
+/// Whether this prompt call may use the workspace, on every rank alike: held already (a later piece of the prompt),
+/// or every rank's MemAvailable less the workspace clears the hard floor (one all-gathered flag, graphs.Agreement).
+/// No: the call runs 2,048-row segments (4K and 2K give the same bits), logged; nothing fails.
+fn wsAgreed(f: *Forward) !bool {
+    const st = &f.prefill_state;
+    const ws = &st.k4ws;
+    if (ws.buf != null) return true;
+    const pl = ws.plan orelse return false;
+    const bytes = planBytes(&pl);
+    const hard = wsFloorGiB();
+    const avail = graphs.memAvailableGiB();
+    const left = if (avail) |v| v - @as(f64, @floatFromInt(bytes)) / (1 << 30) else hard;
+    if (st.agreement == null) st.agreement = try graphs.Agreement.init(f.runner.d, f.comm, f.runner.stream);
+    const ok = try st.agreement.?.agree().all(st.agreement.?.agree().ctx, left >= hard);
+    if (!ok) {
+        st.ws_fallbacks += 1;
+        if (st.ws_fallbacks <= 4 or st.ws_fallbacks % 64 == 0)
+            log.warn("prefill workspace: {d} MiB does not fit on every rank (rank {d}: {d:.2} GiB MemAvailable leaves {d:.2}, floor {d:.1} GiB, TF_DSV41_PF_WS_FLOOR_GIB): this prompt piece runs 2,048-row segments (fallback {d})", .{ bytes >> 20, f.comm.rank(), avail orelse -1, left, hard, st.ws_fallbacks });
+    }
+    return ok;
+}
+
+/// The options a 4,096-row segment emits with: the forward's at 4,096 rows with x3gm one block a segment.
+pub fn k4Options(o: block.Options) block.Options {
+    var x = o;
+    x.prefill_rows = K4.rows;
+    x.pf4k = true;
+    return x;
+}
+
+/// A TF_DSV41_PF_TBO pair's calls with their private roles in the workspace: B's ("b~", its own scratch and
+/// arena) always, A's too when the pair's micro-batches are 4,096 rows (`all`: the forward's 2K roles cannot hold
+/// them). A 2K pair's A keeps the forward's roles (sized for it). So a pair adds no byte to the forward's plan either.
+pub fn wsPair(a: std.mem.Allocator, cs: []const calls.Call, all: bool) ![]calls.Call {
+    if (all) return block_prefill.ownCalls(a, cs, K4.tag);
+    const out = try a.alloc(calls.Call, cs.len);
+    for (cs, out) |c, *x| {
+        x.* = c;
+        const args = try a.alloc(calls.Named, c.args.len);
+        for (c.args, args) |y, *z| z.* = .{ .name = y.name, .arg = try wsArg(a, y.arg) };
+        x.args = args;
+    }
+    return out;
+}
+
+fn wsArg(a: std.mem.Allocator, x: calls.Arg) !calls.Arg {
+    switch (x) {
+        .t, .opaque_table => |t| {
+            if (t.role != .buf or std.mem.indexOf(u8, t.role.buf, "b~") == null) return x;
+            var u = t;
+            u.role = .{ .buf = try block_prefill.ownRole(a, t.role.buf, K4.tag) };
+            return if (x == .t) .{ .t = u } else .{ .opaque_table = u };
+        },
+        .list => |l| {
+            const o = try a.alloc(calls.Arg, l.len);
+            for (l, o) |y, *z| z.* = try wsArg(a, y);
+            return .{ .list = o };
+        },
+        else => return x,
+    }
+}
+
+/// The workspace's roles bound to one fresh zeroed allocation (the first 4K segment of a prompt).
+fn k4Acquire(f: *Forward) !void {
+    const ws = &f.prefill_state.k4ws;
+    if (ws.buf != null) return;
+    const pl = ws.plan orelse return error.Unbound;
+    const total = planBytes(&pl);
+    // the room was agreed first (wsAgreed): every rank fits the workspace above the hard floor
+    const t0 = nowMs();
+    const b = cuda.DeviceBuffer.alloc(f.runner.d, @max(total, 256)) catch |e| {
+        log.err("prefill workspace: allocating {d} MiB failed ({t})", .{ total >> 20, e });
+        return e;
+    };
+    errdefer {
+        var x = b;
+        x.free();
+    }
+    try b.fill8(0, null);
+    var at: u64 = 0;
+    for (pl.sizes.keys(), pl.sizes.values()) |k, v| {
+        if (std.mem.indexOf(u8, k, K4.tag) == null) continue;
+        try f.runner.external(k, b.ptr + at);
+        at += std.mem.alignForward(u64, v, 256);
+    }
+    ws.buf = b;
+    ws.bytes = total;
+    ws.allocs += 1;
+    // the allocation's cost a prompt (the GB10 maps host pages for it): outside the prefill profile's segments
+    try f.runner.stream.synchronize();
+    const ms = nowMs() - t0;
+    if (ws.allocs <= 4 or ws.allocs % 64 == 0) log.info("prefill 4K: rank {d}: workspace {d} MiB allocated and zeroed in {d:.1} ms (prompt {d}), held while the prompt prefills", .{ f.comm.rank(), total >> 20, ms, ws.allocs });
+}
+
+fn nowMs() f64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(f64, @floatFromInt(ts.sec)) * 1e3 + @as(f64, @floatFromInt(ts.nsec)) / 1e6;
+}
+
+/// TF_DSV41_PF_WS_FLOOR_GIB: the MemAvailable the workspace must leave on every rank, else the prompt piece runs
+/// 2,048-row segments; default TF_DSV41_FLOOR_HARD_GIB (4, the boot check's).
+fn wsFloorGiB() f64 {
+    const v = std.c.getenv("TF_DSV41_PF_WS_FLOOR_GIB") orelse return hardFloorGiB();
+    return std.fmt.parseFloat(f64, std.mem.span(v)) catch hardFloorGiB();
+}
+
+/// TF_DSV41_FLOOR_HARD_GIB (4, the boot check's).
+fn hardFloorGiB() f64 {
+    const v = std.c.getenv("TF_DSV41_FLOOR_HARD_GIB") orelse return 4.0;
+    return std.fmt.parseFloat(f64, std.mem.span(v)) catch 4.0;
+}
+
+/// The workspace back (a prompt's CED finish: no 4K segment runs until the next prompt's first).
+fn k4Release(f: *Forward) !void {
+    const ws = &f.prefill_state.k4ws;
+    var b = ws.buf orelse return;
+    try f.runner.stream.synchronize();
+    const before = graphs.memAvailableGiB();
+    b.free();
+    ws.buf = null;
+    // the prefill -> decode handoff: what the row graphs' memory floor sees right after the free (every rank: rank 1
+    // is the tighter node on the Sparks; the first prompts and every 64th after)
+    ws.releases += 1;
+    if (ws.releases <= 4 or ws.releases % 64 == 0)
+        log.info("prefill 4K: rank {d}: workspace {d} MiB freed at the prompt's end (release {d}); MemAvailable {d:.2} -> {d:.2} GiB", .{ f.comm.rank(), ws.bytes >> 20, ws.releases, before orelse -1, graphs.memAvailableGiB() orelse -1 });
+    if (ws.send) |*x| x.free();
+    if (ws.gathered) |*x| x.free();
+    ws.send = null;
+    ws.gathered = null;
+}
+
+/// TF_DSV41_PF_TBO: one micro-batch's host side of a pair in flight (what `segment` sets on the forward for its one
+/// segment): its ids, its window, the slot's Engram tail before its rows, its MoE calls seen.
+pub const Micro = struct {
+    ids: []const u32,
+    pending: @TypeOf(@as(fwd.Slot, undefined).pending),
+    tail: Tail,
+    moe: usize = 0,
+    layer: u32 = 0,
+};
+
+pub const Pair = struct { a: Micro, b: Micro };
 
 /// The prompt `ids` from the slot's position (forward.prefill: the leader has sent it to the followers).
 pub fn prompt(f: *Forward, ids_in: []const u32) !void {
@@ -175,21 +489,121 @@ pub fn prompt(f: *Forward, ids_in: []const u32) !void {
     const ids = st.ids.items;
     st.taps_rows = 0;
     try ready(f);
-    const seg: usize = @intCast(f.opts.prefill_rows);
+    // TF_DSV41_PF_4K / _PF_TBO: the workspace for this call, decided on every rank alike (else 2,048-row segments)
+    st.ws_ok = true;
+    if (st.k4 or (st.mode == .replay and f.opts.pf_tbo)) st.ws_ok = try wsAgreed(f);
+    const seg: usize = segmentRows(f);
+    defer st.next.clearRetainingCapacity();
     var at: usize = 0;
     while (at < ids.len) {
+        // TF_DSV41_PF_TBO: two segments at a time (the second at least tbo_min rows), else one
+        if (pairOf(f, ids.len - at)) |pr| {
+            const n = pr[0] + pr[1];
+            if (st.ahead) ahead(f, ids, at, n, seg);
+            if (try segmentPair(f, ids[at .. at + pr[0]], ids[at + pr[0] .. at + n])) {
+                at += n;
+                continue;
+            }
+        }
         const n = @min(seg, ids.len - at);
-        if (st.ahead and at + n < ids.len) readAhead(f, ids, at, n, @min(seg, ids.len - at - n));
+        if (st.ahead) ahead(f, ids, at, n, seg);
         try segment(f, ids[at .. at + n], at + n == ids.len and st.mode == .full);
         at += n;
     }
+}
+
+/// TF_DSV41_PF_TBO's split of the `left` prompt rows ahead: two whole segments, or what is left halved on the 16-row
+/// grid; null when TBO is off, the prompt is in full mode, or a half would be under tbo_min.
+fn pairOf(f: *const Forward, left: usize) ?[2]usize {
+    if (!f.opts.pf_tbo or f.prefill_state.mode != .replay or !f.prefill_state.ws_ok) return null;
+    return pairSplit(segmentRows(f), left);
+}
+
+/// `pairOf`'s split of `left` rows at segments of `seg` rows (null: one segment at a time).
+pub fn pairSplit(seg: usize, left: usize) ?[2]usize {
+    const min: usize = @intCast(block_prefill.tbo_min);
+    if (left >= 2 * seg) return .{ seg, seg };
+    if (left < 2 * min) return null;
+    const na = @min(seg, (left / 2) / 16 * 16);
+    if (left - na > seg or na < min) return null;
+    return .{ na, left - na };
+}
+
+/// Two consecutive encoder segments as one two-stream program (block_prefill.emitTbo), committed once as the second
+/// would leave the slot: B's last rows' carries, the Engram tail and position after both, the stash's ids. false: the
+/// emitter refused the pair (the caller runs the segments one at a time).
+fn segmentPair(f: *Forward, ia: []const u32, ib: []const u32) !bool {
+    const st = &f.prefill_state;
+    var sa = std.heap.ArenaAllocator.init(f.gpa);
+    defer sa.deinit();
+    const a = sa.allocator();
+    const layers = try encoderLayers(f, try f.backbone(a));
+    const start = f.slot.pos;
+    const na: u32 = @intCast(ia.len);
+    const nb: u32 = @intCast(ib.len);
+    // under TF_DSV41_PF_4K a micro-batch past the forward's rows is a 4K one (both in the workspace: wsPair)
+    const big = st.k4 and @max(na, nb) > f.opts.prefill_rows;
+    const o0 = vision_rows.segmentOptions(f, ia.ptr[0 .. na + nb]);
+    const o = if (big) k4Options(o0) else o0;
+    const plain = block_prefill.emitTbo(a, f.cfg, f.widths, o, layers, na, nb, @intCast(start)) catch |e| switch (e) {
+        error.Unsupported => return false,
+        else => return e,
+    };
+    const cs = try wsPair(a, plain, big);
+    try k4Acquire(f);
+    if (f.kv) |kx| try kx.reserve(start + na + nb);
+    // the micro-batches' host sides: B's Engram tail is the slot's after A's ids (tailOf, as A's commit leaves it)
+    var pair: Pair = .{ .a = .{ .ids = ia, .pending = .{ .start = start, .n = na }, .tail = .{} }, .b = .{ .ids = ib, .pending = .{ .start = start + na, .n = nb }, .tail = .{} } };
+    pair.a.tail.len = f.slot.tail_len;
+    @memcpy(pair.a.tail.ids[0..pair.a.tail.len], f.slot.tail[0..f.slot.tail_len]);
+    if (f.engram) |h| {
+        var s2 = f.slot;
+        tailOf(&s2, ia, h.max_ngram - 1);
+        pair.b.tail.len = s2.tail_len;
+        @memcpy(pair.b.tail.ids[0..s2.tail_len], s2.tail[0..s2.tail_len]);
+    } else pair.b.tail = pair.a.tail;
+    f.ids = ia;
+    f.slot.pending = pair.a.pending;
+    st.tbo = &pair;
+    defer st.tbo = null;
+    errdefer f.slot.pending = null;
+    st.layers = layers;
+    st.moe = 0;
+    f.runner.glue = .{ .ctx = f, .run = glueFn };
+    // the pair's send / gathered buffers are the workspace's while it runs (as a 4K segment's)
+    std.mem.swap(?cuda.DeviceBuffer, &f.send, &st.k4ws.send);
+    std.mem.swap(?cuda.DeviceBuffer, &f.gathered, &st.k4ws.gathered);
+    defer {
+        std.mem.swap(?cuda.DeviceBuffer, &f.send, &st.k4ws.send);
+        std.mem.swap(?cuda.DeviceBuffer, &f.gathered, &st.k4ws.gathered);
+    }
+    try longpf.window(&st.long, f.gpa, f.runner, f.kv, start, cs);
+    if (f.runner.prof) |pr| pr.prefillRows(@intCast(na + nb), false);
+    // the commit: both micro-batches' rows as one segment, the carries from B's last rows (its roles in the workspace)
+    const both = ia.ptr[0 .. na + nb];
+    f.ids = both;
+    f.slot.pending = .{ .start = start, .n = na + nb };
+    try commitRoles(f, nb, 0, K4.tag ++ "b~", na + nb);
+    f.slot.ced.extend(start, both);
+    f.last_rows = 0;
+    st.taps_at = start;
+    st.taps_rows = 0;
+    return true;
 }
 
 /// prefetch.py's one segment ahead: the reads of the segment after `ids[at .. at + n]` (its `next` rows, with the
 /// lookback they will see: the slot's tail and this segment's ids) start before this segment runs, so they are in
 /// flight while it does; its glue then waits for them (engram_rows keeps an unread bulk batch). A wrong guess costs a
 /// read, never a bit: the rows are the table's whatever the path.
-fn readAhead(f: *Forward, ids: []const u32, at: usize, n: usize, next: usize) void {
+/// The read-ahead of the rows after segment ids[at .. at + n]: the call's next segment, or past the call's last
+/// segment the next piece's (`next`, op 60).
+fn ahead(f: *Forward, ids: []const u32, at: usize, n: usize, seg: usize) void {
+    const st = &f.prefill_state;
+    if (at + n < ids.len) return readAhead(f, ids, at, n, ids[at + n .. at + n + @min(seg, ids.len - at - n)]);
+    if (st.next.items.len > 0) readAhead(f, ids, at, n, st.next.items);
+}
+
+fn readAhead(f: *Forward, ids: []const u32, at: usize, n: usize, next: []const u32) void {
     const h = f.engram orelse return;
     if (!f.engram_prefetch) return;
     const src = (f.engramSource(h) catch return) orelse return;
@@ -202,7 +616,7 @@ fn readAhead(f: *Forward, ids: []const u32, at: usize, n: usize, next: usize) vo
         @memcpy(buf[old .. old + n], ids[at..b]);
         break :blk buf[0 .. old + n];
     };
-    h.prefetch(f.gpa, src, ids[b .. b + next], lb, f.comm.rank(), f.comm.world());
+    h.prefetch(f.gpa, src, next, lb, f.comm.rank(), f.comm.world());
 }
 
 /// One segment at the slot's position, run eagerly, then committed.
@@ -217,12 +631,16 @@ fn segment(f: *Forward, ids: []const u32, head: bool) !void {
     const layers = if (replay) try encoderLayers(f, try f.backbone(a)) else try f.backbone(a);
     const start = f.slot.pos;
     if (f.kv) |kx| try kx.reserve(start + n);
-    const o = vision_rows.segmentOptions(f, ids);
+    // TF_DSV41_PF_4K: a segment past the forward's rows runs in the workspace (its own roles: block_prefill.ownCalls)
+    const big = st.k4 and st.ws_ok and n > f.opts.prefill_rows;
+    const o = if (big) k4Options(vision_rows.segmentOptions(f, ids)) else vision_rows.segmentOptions(f, ids);
     const emitted = if (replay) block_prefill.emitReplay(a, f.cfg, f.widths, o, layers, n, @intCast(start), .encoder) else block_prefill.emitPrefill(a, f.cfg, f.widths, o, layers, n, @intCast(start), head);
-    const cs = emitted catch |e| {
+    const plain = emitted catch |e| {
         if (e == error.Unsupported) log.warn("prefill: the {d}-row segment at {d} is not on the prefill path (block_prefill: Unsupported)", .{ n, start });
         return e;
     };
+    const cs = if (big) try block_prefill.ownCallsKeep(a, plain, K4.tag, &st.k4ws.keep) else plain;
+    if (big) try k4Acquire(f);
     // the glue reads the ids (embedding, Engram) and the pending window (positions)
     f.ids = ids;
     f.slot.pending = .{ .start = start, .n = n };
@@ -230,8 +648,18 @@ fn segment(f: *Forward, ids: []const u32, head: bool) !void {
     st.layers = layers;
     st.moe = 0;
     f.runner.glue = .{ .ctx = f, .run = glueFn };
+    // TF_DSV41_PF_4K: the segment's send / gathered buffers are the workspace's while it runs
+    if (big) {
+        std.mem.swap(?cuda.DeviceBuffer, &f.send, &st.k4ws.send);
+        std.mem.swap(?cuda.DeviceBuffer, &f.gathered, &st.k4ws.gathered);
+    }
+    defer if (big) {
+        std.mem.swap(?cuda.DeviceBuffer, &f.send, &st.k4ws.send);
+        std.mem.swap(?cuda.DeviceBuffer, &f.gathered, &st.k4ws.gathered);
+    };
     try longpf.window(&st.long, f.gpa, f.runner, f.kv, start, cs);
-    try commit(f, n);
+    if (f.runner.prof) |pr| pr.prefillRows(@intCast(n), false);
+    if (big) try commitRoles(f, n, 0, K4.tag, n) else try commit(f, n);
     // replay.encode: the stash's ids follow its rows (a segment that does not continue it starts it over)
     if (replay) f.slot.ced.extend(start, ids);
     f.last_rows = if (replay) 0 else n;
@@ -301,6 +729,7 @@ pub fn promptMulti(f: *Forward, segs: []const MultiSeg) !void {
     st.taps_rows = 0;
     f.runner.glue = .{ .ctx = f, .run = glueFn };
     try longpf.window(&st.long, f.gpa, f.runner, f.kv, segs[0].start, cs);
+    if (f.runner.prof) |pr| pr.prefillRows(@intCast(all.items.len), false);
     // each slot keeps its segment (Python's keep(slot, n - 1) a segment, replay.encode's stash ids)
     for (segs, row0) |sg, r0| {
         try sw.run(sw.ctx, sg.slot);
@@ -407,12 +836,14 @@ pub fn finishMulti(f: *Forward, slots: []const u32, out: []Replayed) !void {
     st.taps_rows = 0;
     f.runner.glue = .{ .ctx = f, .run = glueFn };
     try longpf.window(&st.long, f.gpa, f.runner, f.kv, segs[0].start, cs);
+    if (f.runner.prof) |pr| pr.prefillRows(@intCast(m.ids.len), true);
     for (segs, row0, out[0..slots.len]) |sg, r0, *o| {
         try sw.run(sw.ctx, sg.slot);
         f.slot.pending = null;
         o.* = .{ .slot = sg.slot, .at = sg.start, .rows = @intCast(sg.ids.len), .row0 = @intCast(r0) };
     }
     f.last_rows = 0;
+    try k4Release(f); // TF_DSV41_PF_4K: these prompts are prefilled
 }
 
 /// The glue's view of the whole run (Forward.multi): the first segment's slot, every row's ids, the run's rows pending.
@@ -482,7 +913,10 @@ pub fn finish(f: *Forward) !void {
     st.moe = 0;
     f.runner.glue = .{ .ctx = f, .run = glueFn };
     try longpf.window(&st.long, f.gpa, f.runner, f.kv, t.r0, cs);
+    if (f.runner.prof) |pr| pr.prefillRows(@intCast(t.m), true);
     f.last_rows = 0;
+    // TF_DSV41_PF_4K: the prompt is prefilled, its workspace goes back
+    try k4Release(f);
     // the drafter's context rows: the tail's taps (replay.finish's, which slots.finish_prompt hands to `replayed`)
     st.taps_at = t.r0;
     st.taps_rows = t.m;
@@ -521,6 +955,12 @@ fn commit(f: *Forward, n: u32) !void {
 
 /// `commit` of a segment whose rows are rows [row0, row0 + n) of the run's projections.
 fn commitAt(f: *Forward, n: u32, row0: usize) !void {
+    return commitRoles(f, n, row0, "", n);
+}
+
+/// `commitAt` with the carries from rows of "w.<pre>L<i>.proj" (TF_DSV41_PF_TBO's B: "b~") whose last row is the
+/// `n`th; the slot advances by `adv` rows (f.ids' first `adv`).
+fn commitRoles(f: *Forward, n: u32, row0: usize, comptime pre: []const u8, adv: u32) !void {
     const p = f.slot.pending orelse return error.BadWindow;
     const r = f.runner;
     var nb: [64]u8 = undefined;
@@ -528,14 +968,15 @@ fn commitAt(f: *Forward, n: u32, row0: usize) !void {
     defer la.deinit();
     const row: usize = 4 * 2 * @as(usize, f.cfg.head_dim); // fp32 [kv | gate]
     for (try f.backbone(la.allocator())) |L| if (f.cfg.isKvSource(L) and f.cfg.compressRatio(L) == 2) {
-        const src = r.addressOf(try std.fmt.bufPrint(&nb, "w.L{d}.proj", .{L})) orelse return error.Unbound;
+        // a role the 4K segment shares with the forward (K4.keep) is under its bare name
+        const src = r.addressOf(try std.fmt.bufPrint(&nb, "w." ++ pre ++ "L{d}.proj", .{L})) orelse r.addressOf(try std.fmt.bufPrint(&nb, "w.L{d}.proj", .{L})) orelse return error.Unbound;
         const dst = r.addressOf(try std.fmt.bufPrint(&nb, "s.L{d}.carry", .{L})) orelse return error.Unbound;
         try copy(r, dst, src + (row0 + n - 1) * row, row);
     };
-    if (f.engram) |h| tailOf(&f.slot, f.ids[0..n], h.max_ngram - 1);
-    f.slot.pos = p.start + n;
+    if (f.engram) |h| tailOf(&f.slot, f.ids[0..adv], h.max_ngram - 1);
+    f.slot.pos = p.start + adv;
     f.slot.pending = null;
-    if (f.sess) |x| try x.commit(x.ptr, f.ids[0..n]);
+    if (f.sess) |x| try x.commit(x.ptr, f.ids[0..adv]);
 }
 
 /// Engram's tail after committing `ids`: (tail + ids)[-keep:].
@@ -638,6 +1079,35 @@ fn ld(t: calls.Tensor) usize {
 fn glueFn(ctx: *anyopaque, r: *run.Runner, c: *const calls.Call) anyerror!void {
     const f: *Forward = @ptrCast(@alignCast(ctx));
     const st = &f.prefill_state;
+    const pr = st.tbo orelse return glueOne(ctx, r, c);
+    // TF_DSV41_PF_TBO: the step's micro-batch (B's are the side stream's) on the forward while it runs
+    const m = if (c.side) &pr.b else &pr.a;
+    const keep_ids = f.ids;
+    const keep_pending = f.slot.pending;
+    var keep_tail: Tail = .{ .len = f.slot.tail_len };
+    @memcpy(keep_tail.ids[0..keep_tail.len], f.slot.tail[0..f.slot.tail_len]);
+    f.ids = m.ids;
+    f.slot.pending = m.pending;
+    f.slot.tail_len = m.tail.len;
+    @memcpy(f.slot.tail[0..m.tail.len], m.tail.items());
+    st.moe = m.moe;
+    st.layer = m.layer;
+    if (c.side) std.mem.swap(longpf.State, &st.long, &st.long_b);
+    defer {
+        if (c.side) std.mem.swap(longpf.State, &st.long, &st.long_b);
+        m.moe = st.moe;
+        m.layer = st.layer;
+        f.ids = keep_ids;
+        f.slot.pending = keep_pending;
+        f.slot.tail_len = keep_tail.len;
+        @memcpy(f.slot.tail[0..keep_tail.len], keep_tail.items());
+    }
+    return glueOne(ctx, r, c);
+}
+
+fn glueOne(ctx: *anyopaque, r: *run.Runner, c: *const calls.Call) anyerror!void {
+    const f: *Forward = @ptrCast(@alignCast(ctx));
+    const st = &f.prefill_state;
     const step = c.name["glue.".len..];
     const k = r.kernels.others(r.stream);
     const x = c.args;
@@ -651,6 +1121,10 @@ fn glueFn(ctx: *anyopaque, r: *run.Runner, c: *const calls.Call) anyerror!void {
         return copy(r, buf + bytesOf(carry), try r.tensorAddr(x[1].arg.t), bytesOf(x[1].arg.t));
     }
     if (eql(u8, step, "stream_merge")) return longpf.merge(&st.long, f.gpa, r, c);
+    // TF_DSV41_PF_TBO: A's ratio-2 carry into the slot at its layer's end, and the pair's closing join (Runner.issue
+    // made it: nothing to run)
+    if (eql(u8, step, "copy_rows")) return copy(r, try r.tensorAddr(x[1].arg.t), try r.tensorAddr(x[0].arg.t), bytesOf(x[0].arg.t));
+    if (eql(u8, step, "tbo_join")) return;
     if (eql(u8, step, "pf_seg")) return segGlue(f, r, c);
     if (eql(u8, step, "mpositions")) return runPositions(f, r, c);
     if (eql(u8, step, "ced_stash") or eql(u8, step, "ced_load")) return stashCopy(f, r, c, eql(u8, step, "ced_stash"));

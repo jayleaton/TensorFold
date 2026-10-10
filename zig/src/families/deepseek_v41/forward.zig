@@ -16,6 +16,7 @@ const Config = @import("config.zig").Config;
 const eh = @import("engram_host.zig");
 const vision_rows = @import("vision_rows.zig");
 const graphs = @import("graphs.zig");
+const round_graph = @import("round_graph.zig");
 const pf = @import("forward_prefill.zig");
 const kvs = @import("kv_state.zig");
 const er = @import("engram_rows.zig");
@@ -95,6 +96,8 @@ pub const Forward = struct {
     /// engram_rows steps launch the gate kernel instead of copying staged rows
     gate: ?*egate.Gate = null,
     gated: bool = false,
+    /// TF_DSV41_ROUND_GRAPH's `gate`: recorded after each gated window, the gate's arm waits for it (not the stream)
+    gated_end: ?cuda.Event = null,
     /// TF_DSV41_BRANCHES / TF_DSV41_MHC_DEFER (branches.zig): the runner's side streams, owned here
     branches: ?*@import("branches.zig").Branches = null,
     /// TF_DSV41_PHASES (phases.zig): the window path's timers
@@ -140,6 +143,9 @@ pub const Forward = struct {
     /// structured output (grammar_gpu.zig, TF_DSV41_GRAMMAR=1): staged grammar masks applied to "w.logits" before a
     /// pick reads them; a follower runs rank 0's op_grammar messages
     grammar: ?Grammar = null,
+    /// TF_DSV41_CALIB=measure (calib_gpu.zig): a follower's clock at each op_calib_mark (after a device sync), until the
+    /// leader's op_calib_gather pairs them up into this rank's samples
+    calib_marks: std.ArrayList(u64) = .empty,
 
     pub fn init(gpa: std.mem.Allocator, cfg: *const Config, widths: *const block.Widths, opts: block.Options, runner: *run.Runner, comm: tp.collective.Collective) Forward {
         return .{ .gpa = gpa, .cfg = cfg, .widths = widths, .opts = opts, .runner = runner, .comm = comm, .arena = std.heap.ArenaAllocator.init(gpa) };
@@ -156,6 +162,7 @@ pub const Forward = struct {
         if (f.gathered) |*b| b.free();
         for (&f.rows_stage) |*x| x.deinit();
         f.prefill_state.deinit(f.gpa);
+        f.calib_marks.deinit(f.gpa);
         if (f.gate) |x| x.close();
         if (f.engram_rows) |x| x.close();
         if (f.branches) |b| {
@@ -168,6 +175,7 @@ pub const Forward = struct {
         if (f.pick_dev) |*b| b.free();
         if (f.greedy_dev) |*b| b.free();
         if (f.pick_done) |*e| e.deinit();
+        if (f.gated_end) |*e| e.deinit();
         f.programs.deinit(f.gpa);
         f.ids_own.deinit(f.gpa);
         f.arena.deinit();
@@ -204,6 +212,21 @@ pub const Forward = struct {
     /// Shared roles take the larger size; the decode roles stay.
     pub fn planPrefill(f: *Forward, p: *buffers.Plan, rows: u32) !void {
         return pf.plan(f, p, rows);
+    }
+
+    /// The next prompt piece's ids, read ahead behind the coming `prefill` call's last segment (forward_prefill's
+    /// `next`; TF_DSV41_PREFETCH_AHEAD): every rank, [op, ids...]. I/O only: a wrong guess costs a read, never a bit.
+    pub fn prefillAhead(f: *Forward, next: []const u32) !void {
+        if (!f.prefill_state.ahead or next.len == 0) return;
+        if (f.leads()) {
+            const msg = try f.gpa.alloc(i64, 1 + next.len);
+            defer f.gpa.free(msg);
+            msg[0] = op_ahead;
+            for (next, msg[1..]) |t, *y| y.* = t;
+            try f.link.?.send(msg);
+        }
+        f.prefill_state.next.clearRetainingCapacity();
+        try f.prefill_state.next.appendSlice(f.gpa, next);
     }
 
     /// The prompt `ids` from the slot's position (forward_prefill.zig): segments of opts.prefill_rows rows, each run
@@ -256,7 +279,7 @@ pub const Forward = struct {
         const tf = ph.start(f.phases, .forward);
         defer tf.stop();
         f.runner.rows = @intCast(ids.len); // l2pf: wider windows skip the prefetch sites
-        if (try f.graphedWindow(ids)) return;
+        if (try f.graphedWindow(ids)) return f.gatedEnd();
         // the gate (its worker reads every layer at once) or every layer's reads in flight while the calls are emitted
         f.gated = try f.armEngram(&.{.{ .ids = ids, .tail = f.slot.tail[0..f.slot.tail_len] }}, @intCast(ids.len));
         if (!f.gated) f.issueEngram(ids, f.slot.tail[0..f.slot.tail_len]);
@@ -268,6 +291,7 @@ pub const Forward = struct {
         f.slot.pending = .{ .start = f.slot.pos, .n = @intCast(ids.len) };
         f.runner.glue = .{ .ctx = f, .run = glueFn };
         try f.runner.timedWindow(cs);
+        try f.gatedEnd();
     }
 
     /// Greedy choices of the last window's rows (Python's forward.greedy): each rank's max a row (the lowest column on
@@ -444,12 +468,17 @@ pub const Forward = struct {
     const op_ds_ingest: i64 = 5;
     const op_ds_propose: i64 = 6;
     const op_prefill: i64 = 7;
+    /// 60: [op, ids...] the next prompt piece's ids for the coming prefill's Engram read-ahead (prefillAhead)
+    const op_ahead: i64 = 60;
     const op_sess_save: i64 = 8;
     const op_sess_restore: i64 = 9;
     const op_release: i64 = 10;
     const op_ds_reset: i64 = 11;
     /// 12-15: dsq-zig-samp-1 (the keyed sampler); 12: [op, row0, n, T, top_k, top_p, min_p]
     pub const op_sample: i64 = 12;
+    /// 13: [op, n, (row0, rows, T, top_k, top_p, min_p, seed, pos0) a segment] several keyed segments in one call
+    /// (TF_DSV41_SAMP_BATCH, sampling_gpu.chooseSegments)
+    pub const op_sample_many: i64 = 13;
 
     /// The sampler's side of a follower (sampling_gpu.zig): rank 0's op_sample message, run on this rank.
     pub const Sampler = struct {
@@ -544,6 +573,61 @@ pub const Forward = struct {
         /// a request's pool admission (op_sess_admit's message): the leader's spills evicted, its pages reserved
         admit: ?*const fn (ptr: *anyopaque, msg: []const i64) anyerror!void = null,
     };
+
+    /// 64-67: dsq-zig-calib (TF_DSV41_CALIB=measure, calib_gpu.zig). 64: [op] every rank synchronizes its device and
+    /// reads its clock (a timed run's start or end); 65: [op, n] every rank's n samples (the marks paired up, ns)
+    /// all-gathered, so rank 0 takes the slower rank's statistic an entry (Python calib's gather_max)
+    pub const op_calib_mark: i64 = 64;
+    pub const op_calib_gather: i64 = 65;
+
+    /// A timed run's start or end on every rank (Python's sync(); perf_counter()): the leader sends the mark, then
+    /// this rank's device (every stream) is synchronized and its monotonic clock read.
+    pub fn calibMark(f: *Forward) !u64 {
+        if (f.leads()) try f.link.?.send(&.{op_calib_mark});
+        const d = f.runner.d;
+        try d.check(d.api.cuCtxSynchronize(), "cuCtxSynchronize");
+        return ph.nowNs();
+    }
+
+    /// Every rank's samples (`mine`, ns, one a timed run) into `all` [world][mine.len], rank-major; the leader sends
+    /// the count first. A follower whose marks do not pair up into as many samples sends -1s (the leader refuses).
+    pub fn calibGather(f: *Forward, mine: []const i64, all: []i64) !void {
+        const w: usize = f.comm.world();
+        if (all.len != w * mine.len) return error.BadWindow;
+        if (f.leads()) try f.link.?.send(&.{ op_calib_gather, @intCast(mine.len) });
+        if (w == 1 or mine.len == 0) return @memcpy(all[0..mine.len], mine);
+        const d = f.runner.d;
+        const bytes = 8 * mine.len;
+        var dev = try cuda.DeviceBuffer.alloc(d, bytes * (w + 1));
+        defer dev.free();
+        var host = try cuda.HostBuffer.alloc(d, bytes * (w + 1));
+        defer host.free();
+        const h = host.slice(i64);
+        @memcpy(h[0..mine.len], mine);
+        const st = f.runner.stream;
+        try dev.uploadAsync(0, std.mem.sliceAsBytes(h[0..mine.len]), st.handle);
+        try f.comm.allGather(dev.ptr, dev.ptr + bytes, mine.len, .i64, st.handle);
+        try dev.downloadAsync(bytes, std.mem.sliceAsBytes(h[mine.len .. mine.len * (w + 1)]), st.handle);
+        try st.synchronize();
+        @memcpy(all, h[mine.len .. mine.len * (w + 1)]);
+    }
+
+    /// A follower's op_calib_gather: its marks paired up (end - start) as its samples, gathered with the leader's.
+    fn followCalib(f: *Forward, n: usize) !void {
+        defer f.calib_marks.clearRetainingCapacity();
+        const mine = try f.gpa.alloc(i64, n);
+        defer f.gpa.free(mine);
+        const marks = f.calib_marks.items;
+        if (marks.len == 2 * n) {
+            for (mine, 0..) |*x, k| x.* = @intCast(marks[2 * k + 1] - marks[2 * k]);
+        } else {
+            std.log.scoped(.dsv41).err("calibration: {d} marks on this rank for {d} timed runs; sending none", .{ marks.len, n });
+            @memset(mine, -1);
+        }
+        const all = try f.gpa.alloc(i64, n * f.comm.world());
+        defer f.gpa.free(all);
+        try f.calibGather(mine, all);
+    }
 
     /// Drops the pending window on every rank without committing a row (draft/branches.zig: a tree's chain whose branch
     /// lost; the next chain rewrites its positions before any read, as a rejected draft's).
@@ -656,9 +740,24 @@ pub const Forward = struct {
                     if (prompt.items.len > total) return error.BadPlan;
                     if (prompt.items.len == total) try f.prefill(prompt.items);
                 },
+                op_ahead => {
+                    var nx: std.ArrayList(u32) = .empty;
+                    defer nx.deinit(f.gpa);
+                    for (msg[1..]) |t| try nx.append(f.gpa, @intCast(t));
+                    try f.prefillAhead(nx.items);
+                },
                 op_keep => try f.keep(@intCast(msg[1])),
                 op_release => try f.release(),
                 op_tree_drop => try f.drop(),
+                op_calib_mark => {
+                    const d = f.runner.d;
+                    try d.check(d.api.cuCtxSynchronize(), "cuCtxSynchronize");
+                    try f.calib_marks.append(f.gpa, ph.nowNs());
+                },
+                op_calib_gather => {
+                    if (msg.len != 2 or msg[1] < 0) return error.BadPlan;
+                    try f.followCalib(@intCast(msg[1]));
+                },
                 op_stop => return,
                 op_sess_save => {
                     const x = f.sess orelse return error.BadPlan;
@@ -719,7 +818,7 @@ pub const Forward = struct {
                     f.prefetchEngram(@intCast(msg[2]), &.{@intCast(msg[1])});
                     try d.propose(d.ptr, @intCast(msg[1]), @intCast(msg[2]));
                 },
-                op_sample => {
+                op_sample, op_sample_many => {
                     const x = f.sampler orelse return error.BadPlan;
                     try x.follow(x.ptr, msg);
                 },
@@ -841,6 +940,23 @@ pub const Forward = struct {
             const send = c.args[0].arg.t;
             return f.comm.allGather(try r.tensorAddr(send), try r.tensorAddr(c.args[1].arg.t), numel(send), .bf16, s);
         }
+        if (std.mem.eql(u8, step, "exchange_rows")) {
+            // TF_DSV41_PF_OVERLAP: rows [r0, r0 + m) of a bf16 partial into the gathered [world, n, D], where the
+            // whole exchange's all-gather puts them: an all-gather of the piece into "L.xrows" [world, m, D] (the
+            // collective's channels: no NCCL p2p connection, whose buffers no plan or price holds), then each rank's
+            // m rows copied to their place. The same bytes as the whole exchange's
+            const send = c.args[0].arg.t;
+            const into = c.args[1].arg.t;
+            const r0: usize = @intCast(c.args[2].arg.i);
+            const n: usize = @intCast(into.shape[1]);
+            const m = numel(send) / D;
+            if (r0 + m > n or c.args.len < 4) return error.BadGlue;
+            const tmp = try r.tensorAddr(c.args[3].arg.t);
+            try f.comm.allGather(try r.tensorAddr(send), tmp, m * D, .bf16, s);
+            const base = try r.tensorAddr(into);
+            for (0..W) |q| try r.d.check(r.d.api.cuMemcpyDtoDAsync_v2(base + ((q * n + r0) * D) * 2, tmp + q * m * D * 2, m * D * 2, s), "cuMemcpyDtoDAsync");
+            return;
+        }
         if (std.mem.eql(u8, step, "exchange_f32")) {
             // the MoE's fp32 partial rounded to bf16, then gathered
             const part = c.args[0].arg.t;
@@ -947,7 +1063,7 @@ pub const Forward = struct {
                     var layers: std.ArrayList(u32) = .empty;
                     for (try f.backbone(la.allocator())) |L| if (std.mem.indexOfScalar(u32, h.layer_ids, L) != null) try layers.append(la.allocator(), L);
                     const g = try egate.Gate.open(std.heap.c_allocator, f.runner.d, h, x.source(), layers.items, f.comm.rank(), f.comm.world(), f.cfg.engram_head_dim, s);
-                    g.sync = .{ .ctx = f.runner, .run = syncRunner };
+                    g.sync = if ((try round_graph.current()).gate) .{ .ctx = f, .run = syncGatedEnd } else .{ .ctx = f.runner, .run = syncRunner };
                     f.gate = g;
                 } else std.log.scoped(.dsv41).warn("engram gate off: no packed table (TF_DSV41_ENGRAM_DIR)", .{});
             }
@@ -958,6 +1074,17 @@ pub const Forward = struct {
 
     /// TF_DSV41_ENGRAM_GATE: arms the gate for a window over `items` (`fill`: its rows with a bucket's padding); false
     /// when the gate is off or the window is too wide (the old path stages its rows).
+    /// TF_DSV41_PIN_ISOLATE: the plan thread's pinned CPU (TF_DSV41_PLAN_PIN, once pinned) for the worker threads to
+    /// keep off (cpu_isolate.zig); an atomic load and store, before each window's Engram arm.
+    pub fn publishPin(_: *Forward) void {
+        const iso = @import("cpu_isolate.zig");
+        const c = tp.planlink.pinned_cpu.load(.acquire);
+        if (c >= 0 and iso.reserved.load(.monotonic) != c) {
+            iso.reserved.store(c, .release);
+            if (iso.fromEnv()) std.log.scoped(.dsv41).info("pin isolate: the Engram reader and gate threads keep off CPU {d} (the pinned plan thread's)", .{c});
+        }
+    }
+
     pub fn armEngram(f: *Forward, items: []const egate.Item, fill: u32) !bool {
         const h = f.engram orelse return false;
         _ = try f.engramSource(h); // the table and the gate open on the first Engram window
@@ -972,6 +1099,21 @@ pub const Forward = struct {
     fn syncRunner(ctx: *anyopaque) anyerror!void {
         const r: *run.Runner = @ptrCast(@alignCast(ctx));
         try r.stream.synchronize();
+    }
+
+    /// TF_DSV41_ROUND_GRAPH's `gate`: the gate's arm waits for the last gated window's end, not for everything queued
+    /// since (a keep's carries, a row table: the GPU drained before the window's launch).
+    fn syncGatedEnd(ctx: *anyopaque) anyerror!void {
+        const f: *Forward = @ptrCast(@alignCast(ctx));
+        if (f.gated_end) |e| return e.synchronize();
+        try f.runner.stream.synchronize();
+    }
+
+    /// After a window's launches (one-slot or row): a gated window's end recorded for the next arm (`syncGatedEnd`).
+    pub fn gatedEnd(f: *Forward) !void {
+        if (!f.gated or f.gate == null or !(try round_graph.current()).gate) return;
+        if (f.gated_end == null) f.gated_end = try cuda.Event.init(f.runner.d, false);
+        try f.gated_end.?.record(f.runner.stream);
     }
 
     /// The armed round's errors (a failed read, a GPU wait past the timeout); nothing when no window was gated.
@@ -1077,7 +1219,20 @@ pub const Forward = struct {
         r.glue = .{ .ctx = f, .run = glueFn };
         g.current = cs;
         const t0 = ph.nowNs();
-        const outcome = try g.cache.run(key, r.stream, f.fingerprint(g), .{ .ctx = f, .run = graphBody });
+        const fp = f.fingerprint(g);
+        // TF_DSV41_ROUND_GRAPH=split: the head's graph, then the tail's, launched while the GPU runs the head
+        const at = if (g.split) |rg| round_graph.splitAt(cs, rg.head) else null;
+        var outcome: graphs.gc.Outcome = .replayed;
+        if (at) |i| {
+            g.span = .{ 0, i };
+            const o1 = try g.cache.run(.{ .rows = key.rows, .ctx = key.ctx, .part = 1 }, r.stream, fp, .{ .ctx = f, .run = graphBody });
+            g.span = .{ i, cs.len };
+            outcome = try g.cache.run(.{ .rows = key.rows, .ctx = key.ctx, .part = 2 }, r.stream, fp, .{ .ctx = f, .run = graphBody });
+            if (o1 == .captured) outcome = .captured;
+        } else {
+            g.span = .{ 0, cs.len };
+            outcome = try g.cache.run(key, r.stream, fp, .{ .ctx = f, .run = graphBody });
+        }
         if (f.phases) |x| x.add(if (outcome == .captured) .@"graph.capture" else .@"graph.replay", ph.nowNs() - t0);
         if (outcome == .captured and g.cache.stats.captured == 1)
             std.log.scoped(.dsv41).info("graphs: first capture ({d} rows, context bucket {d})", .{ key.rows, key.ctx });
@@ -1087,7 +1242,8 @@ pub const Forward = struct {
     fn graphBody(ctx: *anyopaque, stream: cuda.Stream) anyerror!void {
         const f: *Forward = @ptrCast(@alignCast(ctx));
         _ = stream; // the runner's stream: the one the cache captures
-        try f.runner.window(f.graphed.?.current);
+        const g = f.graphed.?;
+        try f.runner.window(g.current[g.span[0]..g.span[1]]);
     }
 
     /// The addresses a graphed window bakes in beyond the runner's bound roles: any change drops every graph.
@@ -1126,6 +1282,9 @@ pub const Graphed = struct {
     stages: std.ArrayList(graphs.EngramStage) = .empty,
     programs: std.AutoHashMapUnmanaged(graphs.Key, []const calls.Call) = .empty,
     current: []const calls.Call = &.{},
+    /// the calls of `current` the graph body issues (TF_DSV41_ROUND_GRAPH's `split`: the head's, then the tail's)
+    span: [2]usize = .{ 0, 0 },
+    split: ?round_graph.Settings = null,
     active: bool = false,
 
     fn init(g: *Graphed, f: *Forward, s: graphs.Settings) !void {
@@ -1143,7 +1302,10 @@ pub const Graphed = struct {
         errdefer g.agreement.deinit();
         g.statics = try graphs.Statics.init(r.d, rows);
         errdefer g.statics.deinit();
-        g.cache = graphs.Cache.init(f.gpa, g.engine.engine(), .{ .on = true, .max = s.max });
+        const rg = try round_graph.current();
+        if (rg.split) g.split = rg;
+        // `split`: a window's head and tail graphs in one cache of twice the cap (a head is ~1/43 of a window)
+        g.cache = graphs.Cache.init(f.gpa, g.engine.engine(), .{ .on = true, .max = if (rg.split) 2 * s.max else s.max, .hold = s.floor_hold });
         g.cache.agree = g.agreement.agree();
         g.cache.room = roomFn;
         room_floor = s.floor_gib;

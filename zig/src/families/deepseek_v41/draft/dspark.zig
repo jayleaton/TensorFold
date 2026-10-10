@@ -102,18 +102,73 @@ pub const Markov = struct {
 
     /// sigmoid(w_conf . [h ; markov_w1[prev]]).
     pub fn confidence(m: Markov, hid: []const f32, prev: u32) f32 {
+        if (m.conf == null) return 0.5;
+        var acc: [1]f32 = undefined;
+        m.hidDots(hid, 1, &acc);
+        return m.confidenceAfter(acc[0], hid.len, prev);
+    }
+
+    /// The hidden part of each of `rows` rows' confidence sum (hid [rows][d], d = hid.len / rows): w_conf[0..d] . h,
+    /// each row's sum in index order. The rows run in vector lanes, each lane its own row's sequential sum: the same
+    /// f32 products and additions as one row at a time (no contraction: Zig's strict float mode), so the same bits.
+    pub fn hidDots(m: Markov, hid: []const f32, rows: usize, out: []f32) void {
+        const cw = m.conf.?;
+        const d = hid.len / rows;
+        var r0: usize = 0;
+        while (r0 < rows) : (r0 += vlanes) {
+            const nr = @min(vlanes, rows - r0);
+            var acc: V = @splat(0.0);
+            var col: [vlanes][*]const f32 = undefined;
+            for (0..vlanes) |j| col[j] = hid[(r0 + @min(j, nr - 1)) * d ..].ptr;
+            for (0..d) |t| {
+                var h: V = undefined;
+                inline for (0..vlanes) |j| h[j] = col[j][t];
+                acc += h * @as(V, @splat(cw[t]));
+            }
+            const sums: [vlanes]f32 = acc;
+            for (0..nr) |j| out[r0 + j] = sums[j];
+        }
+    }
+
+    /// A confidence from its hidden part (`hidDots`): the Markov part after `prev` added in order, then the sigmoid.
+    pub fn confidenceAfter(m: Markov, hid_part: f32, d: usize, prev: u32) f32 {
         const cw = m.conf orelse return 0.5;
-        var acc: f32 = 0.0;
-        for (hid, cw[0..hid.len]) |h, w| acc += h * w;
+        var acc = hid_part;
         const me = m.w1[@as(usize, prev) * m.rank ..][0..m.rank];
-        for (me, cw[hid.len..][0..m.rank]) |x, w| acc += bf16(x) * w;
+        for (me, cw[d..][0..m.rank]) |x, w| acc += bf16(x) * w;
         return @floatCast(1.0 / (1.0 + exp(-@as(f64, acc))));
     }
 };
 
-/// z over a row's live candidates: base + the Markov bias after `prev` (-inf where id < 0).
+/// Vector lanes of the chain's sums: each lane one candidate's (or row's) sum in its own sequential order.
+const vlanes = 8;
+const V = @Vector(vlanes, f32);
+
+/// z over a row's live candidates: base + the Markov bias after `prev` (-inf where id < 0). The candidates run in
+/// vector lanes, each lane its own candidate's sum over the rank in index order (Markov.bias's order; the bf16
+/// products are exact in f32): the bits of one candidate at a time, without its add-latency chain.
 pub fn markovZ(m: Markov, ids: []const i32, base: []const f32, prev: u32, z: []f32) void {
-    for (ids, base, z) |id, b, *o| o.* = if (id < 0) -std.math.inf(f32) else b + m.bias(prev, @intCast(id));
+    const a = m.w1[@as(usize, prev) * m.rank ..][0..m.rank];
+    var c0: usize = 0;
+    while (c0 < ids.len) : (c0 += vlanes) {
+        const nc = @min(vlanes, ids.len - c0);
+        var row: [vlanes][*]const u16 = undefined;
+        for (0..vlanes) |j| {
+            const id = if (j < nc) ids[c0 + j] else -1;
+            row[j] = if (id < 0) a.ptr else m.w2[@as(usize, @intCast(id)) * m.rank ..].ptr; // dead lanes: any row
+        }
+        var acc: V = @splat(0.0);
+        for (a, 0..) |x, r| {
+            var b: V = undefined;
+            inline for (0..vlanes) |j| b[j] = bf16(row[j][r]);
+            acc += @as(V, @splat(bf16(x))) * b;
+        }
+        const sums: [vlanes]f32 = acc;
+        for (0..nc) |j| {
+            const id = ids[c0 + j];
+            z[c0 + j] = if (id < 0) -std.math.inf(f32) else base[c0 + j] + sums[j];
+        }
+    }
 }
 
 /// The first of (value desc, id asc) among live candidates.
@@ -148,12 +203,16 @@ pub fn chain(scratch: Allocator, m: Markov, ids: []const i32, base: []const f32,
     const z = try scratch.alloc(f32, c);
     defer scratch.free(z);
     const d = if (hid) |h| h.len / drafts.len else 0;
+    // every row's hidden part of its confidence at once (it does not depend on the chain)
+    const hp = try scratch.alloc(f32, drafts.len);
+    defer scratch.free(hp);
+    if (hid != null and m.conf != null) m.hidDots(hid.?[0 .. d * drafts.len], drafts.len, hp);
     var prev = anchor;
     for (drafts, conf, 0..) |*t, *q, i| {
         const row_ids = ids[i * c ..][0..c];
         markovZ(m, row_ids, base[i * c ..][0..c], prev, z);
         const tok = (try pick(scratch, row_ids, z, params.pos0 + i, params.sampling())) orelse prev;
-        q.* = if (hid) |h| m.confidence(h[i * d ..][0..d], prev) else 0.5;
+        q.* = if (hid != null) m.confidenceAfter(hp[i], d, prev) else 0.5;
         t.* = tok;
         prev = tok;
     }

@@ -9,6 +9,7 @@ const calib = @import("calib.zig");
 const tree = @import("tree.zig");
 const Costs = @import("costs.zig").Costs;
 const ln = @import("lanes.zig");
+const acclog = @import("acclog.zig");
 
 pub const Policy = struct {
     gpa: Allocator,
@@ -37,6 +38,38 @@ pub const Policy = struct {
     }
 
     fn choose(ptr: *anyopaque, windows: []const lt.Window, alone: bool, arena: Allocator, out: []lt.Choice) anyerror!void {
+        try chooseRows(ptr, windows, alone, arena, out);
+        if (std.c.getenv("TF_DSV41_ACCEPT_LOG") != null) try logRound(self(ptr), windows, arena);
+    }
+
+    /// TF_DSV41_ACCEPT_LOG: the round's windows and each drafted slot's raw / calibrated confidences and chosen depth
+    /// (the main chain's drafts this round's window verifies), whichever path chose them.
+    fn logRound(p: *Policy, windows: []const lt.Window, arena: Allocator) !void {
+        const x = p.owner;
+        var total: u64 = 0;
+        var others: u64 = 0;
+        var la: std.ArrayList(acclog.Ask) = .empty;
+        for (windows) |w| {
+            total += w.rows;
+            const st = x.state(w.stream);
+            if (!w.drafted or st == null or st.?.n == 0) {
+                others += w.rows;
+                continue;
+            }
+            const s = st.?;
+            var k: usize = 0;
+            if (s.shown_set) for (s.shown.items) |n| {
+                k += @intFromBool(n < s.n);
+            };
+            const main = @min(s.n, w.rows - 1);
+            const q = try arena.alloc(f64, main);
+            for (s.conf[0..main], q, 0..) |c, *v, j| v.* = p.depth.cal.q(j, c);
+            try la.append(arena, .{ .slot = s.slot, .start = s.start, .most = main, .k = k, .conf = s.conf[0..main], .q = q });
+        }
+        acclog.choose(windows.len, total, others, la.items);
+    }
+
+    fn chooseRows(ptr: *anyopaque, windows: []const lt.Window, alone: bool, arena: Allocator, out: []lt.Choice) anyerror!void {
         const p = self(ptr);
         const x = p.owner;
         var asks: std.ArrayList(depth.Depth.Ask) = .empty;
@@ -52,7 +85,7 @@ pub const Policy = struct {
             }
             const main = @min(st.?.n, w.rows - 1);
             const conf = try arena.dupe(f64, st.?.conf[0..main]);
-            try asks.append(arena, .{ .slot = st.?.slot, .conf = conf, .most = main, .first = st.?.held[0] });
+            try asks.append(arena, .{ .slot = st.?.slot, .conf = conf, .most = main, .first = st.?.held[0], .position = st.?.start });
             try at.append(arena, i);
         }
         if (asks.items.len == 0) return;
@@ -130,6 +163,7 @@ pub const Policy = struct {
         const p = self(ptr);
         const st = p.owner.state(c.stream) orelse return;
         defer st.shown_set = false;
+        acclog.commit(st.slot, c.rows, c.path.len, c.drafted, c.stream.finished, c.stream.emitted().len, c.stream.max_new);
         if (!st.shown_set or !c.drafted) {
             try p.depth.record(st.slot, c.rows, c.path.len, null);
             p.depth.bonus(st.slot, c.bonus);
