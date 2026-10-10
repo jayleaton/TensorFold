@@ -67,7 +67,7 @@ pub fn optionsFromEnv(capacity: u64, world: u32) !?Options {
 }
 
 /// The boot check's figures for the measured check at the end of boot (`afterBoot`).
-pub const Boot = struct { rank: u32, at_check: f64, pool_gib: f64, pool_tokens: u64, bytes_a_token: f64, dip: f64, hard: f64, target: f64, workspace: u64 };
+pub const Boot = struct { rank: u32, at_check: f64, pool_gib: f64, pool_tokens: u64, bytes_a_token: f64, reserve: f64, dip: f64, hard: f64, target: f64, workspace: u64 };
 
 /// Before the pool (GB10): refuses a pool that cannot fit at all; growth is measured at boot's end (null: not GB10).
 pub fn bootCheck(ctx: *const cuda.Context, cfg: *const Config, o: Options, rank: u32, world: u32) !?Boot {
@@ -98,16 +98,16 @@ pub fn bootCheck(ctx: *const cuda.Context, cfg: *const Config, o: Options, rank:
         return error.PoolDoesNotFit;
     }
     std.log.info("kv: before the pool: {s}; the boot's growth is measured at its end", .{r.message(&buf)});
-    return .{ .rank = rank, .at_check = r.avail_gib, .pool_gib = r.pool_gib, .pool_tokens = o.tokens, .bytes_a_token = r.bytes_a_token, .dip = terms.dip, .hard = r.hard, .target = target, .workspace = o.workspace };
+    return .{ .rank = rank, .at_check = r.avail_gib, .pool_gib = r.pool_gib, .pool_tokens = o.tokens, .bytes_a_token = r.bytes_a_token, .reserve = try budget.reserveFromEnv(), .dip = terms.dip, .hard = r.hard, .target = target, .workspace = o.workspace };
 }
 
 /// At boot's end: idle - dip >= the hard floor or the pool is refused; a 4K workspace past it warns (wsAgreed).
 pub fn afterBoot(b: Boot) !void {
     const budget = kv.budget;
     const idle = @as(f64, @floatFromInt((try budget.meminfo()).available)) / budget.GiB;
-    const x = budget.afterBoot(b.at_check, b.pool_gib, idle, b.dip, b.hard, b.pool_tokens, b.bytes_a_token);
-    const msg = "kv: rank {d}: boot growth {d:.2} GiB measured (MemAvailable {d:.2} at the check - pool {d:.2} - {d:.2} now); worst serving point {d:.2} GiB (dip {d:.2}, TF_DSV41_SERVE_DIP_GIB; hard floor {d:.1})";
-    const args = .{ b.rank, x.growth, b.at_check, b.pool_gib, idle, x.worst, b.dip, b.hard };
+    const x = budget.afterBoot(b.at_check, b.pool_gib, idle, b.reserve, b.dip, b.hard, b.pool_tokens, b.bytes_a_token);
+    const msg = "kv: rank {d}: boot growth {d:.2} GiB measured (MemAvailable {d:.2} at the check - pool {d:.2} - {d:.2} now); worst serving point {d:.2} GiB (post-boot reserve {d:.2}, TF_DSV41_POST_BOOT_GIB; dip {d:.2}, TF_DSV41_SERVE_DIP_GIB; hard floor {d:.1})";
+    const args = .{ b.rank, x.growth, b.at_check, b.pool_gib, idle, x.worst, b.reserve, b.dip, b.hard };
     if (!x.ok) {
         std.log.err(msg ++ ": the pool does not fit; the largest that does: TF_DSV41_POOL_TOKENS={d}", args ++ .{x.largest});
         return error.PoolDoesNotFit;
