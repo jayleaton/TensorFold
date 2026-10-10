@@ -158,11 +158,11 @@ const Table = struct {
         return s;
     }
 
-    /// std's tombstones never clear: rehash at a quarter, or churn leaves no free slot and each miss probes the map.
+    /// std's tombstones never clear: rehash before they take half the slots no key holds (a free slot stays per 10).
     fn drop(t: *Table, x: u64) void {
         if (!t.map.remove(x)) return;
         t.dead += 1;
-        if (@as(u64, t.dead) * 4 < t.map.capacity()) return;
+        if (@as(u64, t.dead) * 2 < t.map.capacity() - t.map.count()) return;
         t.map.rehash(std.hash_map.AutoContext(u64){});
         t.dead = 0;
     }
