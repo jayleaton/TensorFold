@@ -782,7 +782,8 @@ pub const Stream = struct {
                     s.resume_at = @max(s.resume_at, found.again); // a header still arriving is read again
                     return;
                 };
-                var o: Open = .{ .m = m, .end = .{}, .nxt = .{}, .param_pos = m.m.end, .call = .{ .id = try s.ids.make(s.ids.ctx, a, s.done.items.len), .name = m.name } };
+                // names are copied: ``text`` is the caller's growing buffer, gone by a later feed
+                var o: Open = .{ .m = m, .end = .{}, .nxt = .{}, .param_pos = m.m.end, .call = .{ .id = try s.ids.make(s.ids.ctx, a, s.done.items.len), .name = try a.dupe(u8, m.name) } };
                 o.end.reset(m.m.end);
                 o.nxt.reset(m.m.end);
                 s.open = o;
@@ -825,6 +826,8 @@ pub const Stream = struct {
                     o.param_pos = @max(o.param_pos, found.again);
                     return;
                 };
+                // its closing tag may come in a later feed, from a reallocated ``text``: the key is copied now
+                o.pending.?.name = try a.dupe(u8, o.pending.?.name);
                 o.close_scan = o.pending.?.end;
             }
             const h = o.pending.?;
@@ -885,4 +888,44 @@ test "a thinking reply with two calls, streamed in pieces and parsed whole, give
     try std.testing.expectEqualStrings("Sure.", content.items);
     try std.testing.expectEqualStrings("{\"city\":\"Paris\",\"days\":3}", args[0].items);
     try std.testing.expectEqualStrings("{\"tags\":[\"a\",[1]]}", args[1].items);
+}
+
+test "streamed keys and call names outlive the text they were read from (each feed a new buffer, the old one freed)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tools_json = (try json.parseText(a,
+        \\[{"type":"function","function":{"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer"}}}}}]
+    )).ok;
+    const tools = try Tools.init(a, tools_json.array);
+    // a long value: its parameter's closing tag arrives many feeds after the head that named it
+    const text = "ok</think><｜DSML｜ calls>\n<｜DSML｜ invoke name=\"bash\">\n<｜DSML｜ parameter name=\"command\" string=\"true\">grep -n 'pub fn stdout' /home/user/.local/opt/zig/lib/std/Io/File.zig | head -40</｜DSML｜ parameter>\n" ++
+        "<｜DSML｜ parameter name=\"timeout\" string=\"false\">30</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+    var s = Stream.init(a, true, tools, .{});
+    var out: std.ArrayList(Delta) = .empty;
+    var prev: ?[]u8 = null;
+    var i: usize = 0;
+    while (i < text.len) {
+        i = @min(text.len, i + 3);
+        while (i < text.len and text[i] & 0xC0 == 0x80) i += 1;
+        // the server's text grows by reallocation: the bytes a feed saw are freed (and poisoned) before the next
+        const buf = try std.testing.allocator.dupe(u8, text[0..i]);
+        if (prev) |p| {
+            @memset(p, 0xAA);
+            std.testing.allocator.free(p);
+        }
+        prev = buf;
+        try s.feed(buf, false, &out);
+    }
+    try s.finish(prev.?, &out);
+    std.testing.allocator.free(prev.?);
+    var args: std.ArrayList(u8) = .empty;
+    var name: []const u8 = "";
+    for (out.items) |d| switch (d) {
+        .call => |c| name = c.name,
+        .arguments => |g| try args.appendSlice(a, g.text),
+        else => {},
+    };
+    try std.testing.expectEqualStrings("bash", name);
+    try std.testing.expectEqualStrings("{\"command\":\"grep -n 'pub fn stdout' /home/user/.local/opt/zig/lib/std/Io/File.zig | head -40\",\"timeout\":30}", args.items);
 }
