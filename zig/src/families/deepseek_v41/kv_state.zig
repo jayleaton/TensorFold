@@ -19,7 +19,7 @@
 //!   and longpf.zig runs the segment's attention in those row blocks, each block's rows exchanged right before it
 //!   (Python's _attend_blocks), for the index layer and its reuse layers alike.
 //!
-//! Not here yet: row mode (several live slots in one window).
+//! Row mode (several slots in one window): the dense exchange reads the stacked split table (batch.zig `exchange`).
 
 const std = @import("std");
 const cuda = @import("cuda");
