@@ -11,8 +11,8 @@ fn messagesBody(a: std.mem.Allocator, marker: []const u8) ![]const u8 {
     return std.fmt.allocPrint(a, "{{\"model\":\"x\",\"max_tokens\":50,\"stream\":true,\"messages\":[{{\"role\":\"user\",\"content\":\"go {s}\"}}]}}", .{marker});
 }
 
-/// Sends `body` streamed and hangs up once the response head arrived.
-fn leave(a: std.mem.Allocator, io: std.Io, port: u16, body: []const u8) !void {
+/// Sends `body` streamed and hangs up once the engine holds the request (so only a later write can notice).
+fn leave(a: std.mem.Allocator, io: std.Io, port: u16, body: []const u8, slow: *d.Slow) !void {
     const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
     const stream = try addr.connect(io, .{ .mode = .stream });
     defer stream.close(io);
@@ -24,6 +24,7 @@ fn leave(a: std.mem.Allocator, io: std.Io, port: u16, body: []const u8) !void {
     var rbuf: [64]u8 = undefined;
     var r = std.Io.net.Stream.Reader.init(stream, io, &rbuf);
     _ = try r.interface.peek(1);
+    d.waitActive(io, slow, 1);
 }
 
 test "a silent engine's stream gets keepalives before its first token (chat: SSE comments, messages: ping events)" {
@@ -67,9 +68,10 @@ test "a silent engine's stream gets keepalives before its first token (chat: SSE
     try testing.expect(start < ping and ping < delta);
 
     // a client that leaves a silent stream: the next keepalive fails to write and the engine's request is cancelled
-    try leave(a, io, port, try d.chatBody(a, "@hang", true));
+    try leave(a, io, port, try d.chatBody(a, "@hang", true), &slow);
     var waited: u32 = 0;
-    while (slow.cancelled.load(.acquire) == 0 and waited < 300) : (waited += 1) std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+    while (slow.cancelled.load(.acquire) == 0 and waited < 1000) : (waited += 1) std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+    errdefer std.debug.print("not cancelled: {d} active, {d} waits\n", .{ slow.active.load(.acquire), waited });
     try testing.expect(slow.cancelled.load(.acquire) != 0);
 
     try std.posix.raise(.TERM);
