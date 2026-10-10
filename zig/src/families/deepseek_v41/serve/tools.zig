@@ -839,7 +839,9 @@ pub const Stream = struct {
             o.param_pos = c.end;
             if (o.seen.contains(h.name)) continue;
             try o.seen.put(a, h.name, {});
-            try o.call.args.append(a, .{ .key = h.name, .value = try paramValue(a, t[h.end..c.start], h.string, s.tools.prop(o.call.name, h.name)) });
+            // the value is copied too: the call is kept (Stream.calls) and serialized again at the reply's end, when
+            // ``text`` is long gone; a string value would otherwise be a slice of it
+            try o.call.args.append(a, .{ .key = h.name, .value = try paramValue(a, try a.dupe(u8, t[h.end..c.start]), h.string, s.tools.prop(o.call.name, h.name)) });
         }
     }
 
@@ -928,4 +930,7 @@ test "streamed keys and call names outlive the text they were read from (each fe
     };
     try std.testing.expectEqualStrings("bash", name);
     try std.testing.expectEqualStrings("{\"command\":\"grep -n 'pub fn stdout' /home/user/.local/opt/zig/lib/std/Io/File.zig | head -40\",\"timeout\":30}", args.items);
+    // the kept call (the reply's end serializes it again, every buffer freed by then): its values are copies too
+    try std.testing.expectEqual(@as(usize, 1), s.calls.items.len);
+    try std.testing.expectEqualStrings("{\"command\":\"grep -n 'pub fn stdout' /home/user/.local/opt/zig/lib/std/Io/File.zig | head -40\",\"timeout\":30}", try s.calls.items[0].arguments(a));
 }
