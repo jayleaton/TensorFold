@@ -146,6 +146,9 @@ pub const Kv = struct {
     blocks: std.ArrayList(kv.split.Block) = .empty,
     block_phys: std.ArrayList(u32) = .empty,
     union_at: struct { comp: u64 = 0, send: u64 = 0, recv: u64 = 0 } = .{},
+    /// a union's pinned staging: the selection read back, the tokens and rows sent up (reused after the next drain)
+    pin_sel: ?cuda.HostBuffer = null,
+    pin_up: ?cuda.HostBuffer = null,
 
     pub const Stats = struct { dense: u64 = 0, unions: u64 = 0, union_rows_max: u64 = 0, bytes: u64 = 0 };
 
@@ -177,6 +180,8 @@ pub const Kv = struct {
         k.block_phys.deinit(k.gpa);
         if (k.phys) |*b| b.free();
         if (k.lens) |*b| b.free();
+        if (k.pin_sel) |*b| b.free();
+        if (k.pin_up) |*b| b.free();
         k.dev.deinit();
         k.pool.deinit();
         k.gpa.free(k.slots);
@@ -267,8 +272,18 @@ pub const Kv = struct {
         const rows: u32 = @intCast(a.sel.shape[0]);
         const kk: u32 = @intCast(a.sel.shape[1]);
         const da: kv.split.DenseArgs = .{
-            .sel = try r.tensorAddr(a.sel), .rows = rows, .k = kk, .table = a.table, .pts = 0, .rslot = 0, .psh = a.psh,
-            .base = a.comp, .row_bytes = block.Pool.row_bytes, .world = k.world, .send = a.send, .tok = a.tok,
+            .sel = try r.tensorAddr(a.sel),
+            .rows = rows,
+            .k = kk,
+            .table = a.table,
+            .pts = 0,
+            .rslot = 0,
+            .psh = a.psh,
+            .base = a.comp,
+            .row_bytes = block.Pool.row_bytes,
+            .world = k.world,
+            .send = a.send,
+            .tok = a.tok,
         };
         const bytes = @as(usize, rows) * kk * block.Pool.row_bytes;
         // packed where the compact mode and the transport take it (the same answer on every rank), else dense
@@ -283,9 +298,9 @@ pub const Kv = struct {
         const a = try args(r, c);
         const n: usize = @intCast(a.sel.shape[0]);
         const kk: u32 = @intCast(a.sel.shape[1]);
-        const sel = try k.gpa.alloc(i32, n * kk);
-        defer k.gpa.free(sel);
+        // the drain also ends the last union's async uploads, so its pinned staging is free again
         try r.stream.synchronize();
+        const sel = (try pinned(r.d, &k.pin_sel, n * kk * 4)).slice(i32)[0 .. n * kk];
         try cuda.DeviceBuffer.download(.{ .d = r.d, .ptr = try r.tensorAddr(a.sel), .len = sel.len * 4 }, 0, std.mem.sliceAsBytes(sel));
         const table = try k.gpa.alloc(u32, k.slot.max_pages);
         defer k.gpa.free(table);
@@ -302,12 +317,24 @@ pub const Kv = struct {
             if (k.phys) |*p| p.free();
             k.phys = try cuda.DeviceBuffer.alloc(r.d, @max(4 * b.phys.len, 256));
         }
-        try cuda.DeviceBuffer.upload(k.phys.?, 0, std.mem.sliceAsBytes(b.phys));
-        try cuda.DeviceBuffer.upload(.{ .d = r.d, .ptr = a.tok, .len = 4 * b.tokens.len }, 0, std.mem.sliceAsBytes(b.tokens));
+        const up = (try pinned(r.d, &k.pin_up, 4 * (b.phys.len + b.tokens.len))).slice(u32);
+        @memcpy(up[0..b.phys.len], b.phys);
+        @memcpy(up[b.phys.len..][0..b.tokens.len], std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(b.tokens)));
+        try cuda.DeviceBuffer.uploadAsync(k.phys.?, 0, std.mem.sliceAsBytes(up[0..b.phys.len]), r.stream.handle);
+        try cuda.DeviceBuffer.uploadAsync(.{ .d = r.d, .ptr = a.tok, .len = 4 * b.tokens.len }, 0, std.mem.sliceAsBytes(up[b.phys.len..][0..b.tokens.len]), r.stream.handle);
         try k.x.unionBlock(a.comp, block.Pool.row_bytes, k.phys.?.ptr, b.m, a.send, a.recv, r.stream.handle);
         k.stats.unions += 1;
         k.stats.union_rows_max = @max(k.stats.union_rows_max, @as(u64, b.m) * k.world);
         k.stats.bytes += @as(u64, b.m) * block.Pool.row_bytes * k.world;
+    }
+
+    /// A pinned staging buffer of at least `len` bytes (grown, never shrunk).
+    fn pinned(d: *const cuda.Driver, b: *?cuda.HostBuffer, len: usize) !cuda.HostBuffer {
+        if (b.*) |x| if (x.bytes.len >= len) return x;
+        if (b.*) |*x| x.free();
+        b.* = null;
+        b.* = try cuda.HostBuffer.alloc(d, @max(len, 256));
+        return b.*.?;
     }
 
     fn dropBlocks(k: *Kv) void {
