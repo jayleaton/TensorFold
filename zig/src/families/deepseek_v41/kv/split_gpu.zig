@@ -13,81 +13,7 @@ const sessions = @import("sessions");
 const split = @import("split.zig");
 const DevicePool = @import("device.zig").DevicePool;
 
-/// The kvsplit kernels (zig/kernels/cuda/deepseek_v41/kvsplit.cu) behind split.Kernels.
-const DeviceKernels = struct {
-    d: *const cuda.Driver,
-    dense_fn: cuda.Function,
-    gather_fn: cuda.Function,
-    pack_fn: cuda.Function,
-    /// dedup_mark, _flags, _pack, _tok (null: a fatbin without them)
-    dedup_fns: ?[4]cuda.Function = null,
-    /// hist_gather, hist_tok
-    hist_fns: ?[2]cuda.Function = null,
-
-    fn grid(words: u64) u32 {
-        return @intCast(@max(1, @min((words + 255) / 256, 4096)));
-    }
-
-    fn kernels(k: *DeviceKernels) split.Kernels {
-        return .{ .ptr = k, .vtable = &.{ .dense = dense, .gather = gather, .pack = pack, .dedup = dedup, .history = history } };
-    }
-
-    fn history(ptr: *anyopaque, a: split.HistArgs, stream: tp.collective.Stream) anyerror!void {
-        const k: *DeviceKernels = @ptrCast(@alignCast(ptr));
-        const fs = k.hist_fns orelse return error.Unsupported;
-        for (fs, [2]u64{ @as(u64, a.m) * (a.row_bytes / 8), @as(u64, a.rows) * a.k }) |f, w| {
-            if (w == 0) continue;
-            var args: cuda.Args = .{};
-            args.add(a);
-            try cuda.launch.launch(f, .{ .grid = .{ .x = grid(w) }, .block = .{ .x = 256 } }, .{ .d = k.d, .handle = stream }, &args);
-        }
-    }
-
-    fn dedup(ptr: *anyopaque, a: split.DedupArgs, stream: tp.collective.Stream) anyerror!void {
-        const k: *DeviceKernels = @ptrCast(@alignCast(ptr));
-        const fs = k.dedup_fns orelse return error.Unsupported;
-        const n = @as(u64, a.p.rows) * a.p.k;
-        if (n == 0) return;
-        const b: u32 = @intCast((n + 255) / 256);
-        for (fs, [4]u32{ grid(n), b, b, grid(n) }) |f, g| {
-            var args: cuda.Args = .{};
-            args.add(a);
-            try cuda.launch.launch(f, .{ .grid = .{ .x = g }, .block = .{ .x = 256 } }, .{ .d = k.d, .handle = stream }, &args);
-        }
-    }
-
-    fn dense(ptr: *anyopaque, a: split.DenseArgs, stream: tp.collective.Stream) anyerror!void {
-        const k: *DeviceKernels = @ptrCast(@alignCast(ptr));
-        const words = @as(u64, a.rows) * a.k * (a.row_bytes / 8);
-        if (words == 0) return;
-        var args: cuda.Args = .{};
-        args.add(a);
-        try cuda.launch.launch(k.dense_fn, .{ .grid = .{ .x = grid(words) }, .block = .{ .x = 256 } }, .{ .d = k.d, .handle = stream }, &args);
-    }
-
-    /// pack_kernel: one block of 256 threads a 256 entries (the kernel's kPackThreads), any world <= 8.
-    fn pack(ptr: *anyopaque, a: split.PackArgs, stream: tp.collective.Stream) anyerror!void {
-        const k: *DeviceKernels = @ptrCast(@alignCast(ptr));
-        const n = @as(u64, a.rows) * a.k;
-        if (n == 0) return;
-        var args: cuda.Args = .{};
-        args.add(a);
-        try cuda.launch.launch(k.pack_fn, .{ .grid = .{ .x = @intCast((n + 255) / 256) }, .block = .{ .x = 256 } }, .{ .d = k.d, .handle = stream }, &args);
-    }
-
-    fn gather(ptr: *anyopaque, base: u64, rb: u32, phys: u64, n: u32, send: u64, stream: tp.collective.Stream) anyerror!void {
-        const k: *DeviceKernels = @ptrCast(@alignCast(ptr));
-        const words = @as(u64, n) * (rb / 8);
-        if (words == 0) return;
-        var args: cuda.Args = .{};
-        args.add(base);
-        args.add(rb);
-        args.add(phys);
-        args.add(n);
-        args.add(send);
-        try cuda.launch.launch(k.gather_fn, .{ .grid = .{ .x = grid(words) }, .block = .{ .x = 256 } }, .{ .d = k.d, .handle = stream }, &args);
-    }
-};
+const DeviceKernels = @import("split_gpu_kernels.zig").DeviceKernels;
 
 /// The replicated pool's row t of slot s in family f, byte i (8-byte words, so a whole row is filled fast).
 fn word(f: u64, s: u64, t: u64, i: u64) u64 {
@@ -114,6 +40,20 @@ const Rank = struct {
     bad: u64 = 0,
     checks: u64 = 0,
     shown: u32 = 0,
+    blocks: u32 = 0,
+    /// each section's mismatches and checks a family (`run`)
+    tally: [std.enums.values(Section).len][2][2]u64 = std.mem.zeroes([std.enums.values(Section).len][2][2]u64),
+
+    const Section = enum { dense_eager, dense_graph, packed_vs_dense, dedup, unions, history };
+
+    /// One section's call; its mismatches and checks land in the tally under (section, family).
+    fn run(r: *Rank, sec: Section, fi: u32, comptime f: anytype, args: anytype) !void {
+        const b0, const c0 = .{ r.bad, r.checks };
+        _ = try @call(.auto, f, .{r} ++ args);
+        const t = &r.tally[@intFromEnum(sec)][fi];
+        t[0] += r.bad - b0;
+        t[1] += r.checks - c0;
+    }
 
     fn rowsOf(r: *const Rank, fi: usize, s: usize) u32 {
         return @intCast(r.lens[s] / fams[fi].ratio);
@@ -319,7 +259,9 @@ const Rank = struct {
         var scratch = try cuda.DeviceBuffer.alloc(r.d, 4 * (map_rows + 2 * n + (n + 255) / 256 * split.max_world));
         defer scratch.free();
         try scratch.fill32(std.math.maxInt(i32), null);
-        var xd = try split.Exchange.init(r.comm, r.x.kernels, .on);
+        // by lengths where every rank takes them (RoCE), else forced (NCCL): never silently dense
+        const on = try split.Exchange.init(r.comm, r.x.kernels, .on);
+        var xd = if (on.packs(@as(u64, n) * 584)) on else try split.Exchange.init(r.comm, r.x.kernels, .force);
         xd.dedup = .{ .map = scratch.ptr, .map_rows = map_rows, .first = scratch.ptr + 4 * map_rows, .place = scratch.ptr + 4 * (map_rows + n), .bcnt = scratch.ptr + 4 * (map_rows + 2 * n), .entries = n, .slots = 3 };
         const xo = try split.Exchange.init(r.comm, r.x.kernels, .on);
         const sel = try g.alloc(i32, n);
@@ -395,7 +337,7 @@ const Rank = struct {
             defer g.free(map);
             try scratch.download(0, std.mem.sliceAsBytes(map));
             for (map) |m| r.bad += @intFromBool(m != std.math.maxInt(i32));
-            if (round == 1) std.debug.print("dedup fam {d} R {d}: {d} + {d} unique rows of {d} entries\n", .{ fi, R, unique[0], unique[1], n });
+            if (round == 1) std.debug.print("dedup fam {d} R {d}: {d} + {d} unique rows of {d} entries ({s})\n", .{ fi, R, unique[0], unique[1], n, @tagName(xd.compact) });
         }
         r.verifyLike(rnd, fi, R, K, 3, sel, rslot);
         try dsel.upload(0, std.mem.sliceAsBytes(sel));
@@ -482,7 +424,7 @@ const Rank = struct {
         std.debug.print("prefill union fam {d} slot {d} ({d} pages, 4096 x 512): history {d:.2} ms ({d} rows an owner), planned {d:.2} ms ({d} rows an owner) a call\n", .{ fi, si, slot.len, us[1], m, us[0], um });
     }
 
-    fn unions(r: *Rank, rnd: std.Random, fi: u32, rank: u32) !u32 {
+    fn unions(r: *Rank, rnd: std.Random, fi: u32, rank: u32) !void {
         const K = 512;
         const S = 256; // a prefill segment's rows
         const g = r.gpa;
@@ -518,26 +460,32 @@ const Rank = struct {
                 for (row, 0..) |w, j| r.bad += @intFromBool(w != word(fi, 2, @intCast(t), j));
             }
         }
-        return @intCast(blocks.items.len);
+        r.blocks += @intCast(blocks.items.len);
     }
 };
 
+/// TP_FATBIN (else TF_TP_KERNEL_IMAGE): tp opens RoCE / mailbox as prod does; without it NCCL only.
 pub fn main(init: std.process.Init) !u8 {
     const gpa = init.gpa;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len < 2) {
-        std.debug.print("usage: tf-kv-split-test KVSPLIT_FATBIN (tp's TF_TP_* settings)\n", .{});
+        std.debug.print("usage: tf-kv-split-test KVSPLIT_FATBIN [TP_FATBIN] (tp's TF_TP_* settings; TP_FATBIN: RoCE / mailbox)\n", .{});
         return 2;
     }
     const image = try std.Io.Dir.cwd().readFileAlloc(init.io, args[1], gpa, .limited(64 << 20));
     defer gpa.free(image);
+    // TP_FATBIN, else TF_TP_KERNEL_IMAGE (the kits' variable), else none (NCCL only)
+    const tp_path: ?[]const u8 = if (args.len > 2) args[2] else if (std.c.getenv("TF_TP_KERNEL_IMAGE")) |v| std.mem.span(v) else null;
+    const tp_image: []align(16) u8 = if (tp_path) |p| try std.Io.Dir.cwd().readFileAllocOptions(init.io, p, gpa, .limited(16 << 20), comptime .fromByteUnits(16), null) else &.{};
+    defer gpa.free(tp_image);
     const cfg = try tp.Config.fromEnv();
     var driver = try cuda.Driver.open();
     defer driver.close();
     var ctx = try cuda.Context.init(&driver, @intCast(cfg.device));
     defer ctx.deinit();
     var s: tp.Session = undefined;
-    try s.open(&driver, cfg, "");
+    try s.open(&driver, cfg, tp_image);
+    std.debug.print("rank {d}: tp backend {t}\n", .{ cfg.rank, s.comm().kind() });
     var open = true;
     defer if (open) s.close();
     var module = try cuda.Module.load(&driver, image);
@@ -579,19 +527,26 @@ pub fn main(init: std.process.Init) !u8 {
     var prng = std.Random.DefaultPrng.init(20261006);
     const rnd = prng.random();
     for ([_]u32{ 0, 1 }) |fi| for ([_]u32{ 1, 6, 16 }) |R| {
-        try r.dense(rnd, fi, R, false);
-        try r.dense(rnd, fi, R, true);
+        try r.run(.dense_eager, fi, Rank.dense, .{ rnd, fi, R, false });
+        try r.run(.dense_graph, fi, Rank.dense, .{ rnd, fi, R, true });
     };
-    for ([_]u32{ 0, 1 }) |fi| for ([_]u32{ 1, 6, 16, 64 }) |R| try r.packedVsDense(rnd, fi, R);
-    for ([_]u32{ 0, 1 }) |fi| for ([_]u32{ 1, 4, 8, 24, 32 }) |R| try r.dedupVsDense(rnd, init.io, fi, R);
+    for ([_]u32{ 0, 1 }) |fi| for ([_]u32{ 1, 6, 16, 64 }) |R| try r.run(.packed_vs_dense, fi, Rank.packedVsDense, .{ rnd, fi, R });
+    for ([_]u32{ 0, 1 }) |fi| for ([_]u32{ 1, 4, 8, 24, 32 }) |R| try r.run(.dedup, fi, Rank.dedupVsDense, .{ rnd, init.io, fi, R });
     var blocks: u32 = 0;
-    for ([_]u32{ 0, 1 }) |fi| blocks += try r.unions(rnd, fi, cfg.rank);
-    for ([_][2]u32{ .{ 0, 1 }, .{ 0, 0 }, .{ 1, 1 } }) |c| try r.historyVsPlanned(rnd, init.io, c[0], c[1], cfg.rank); // fits the cap
+    for ([_]u32{ 0, 1 }) |fi| {
+        const b0 = r.blocks;
+        try r.run(.unions, fi, Rank.unions, .{ rnd, fi, cfg.rank });
+        blocks += r.blocks - b0;
+    }
+    for ([_][2]u32{ .{ 0, 1 }, .{ 0, 0 }, .{ 1, 1 } }) |c| try r.run(.history, c[0], Rank.historyVsPlanned, .{ rnd, init.io, c[0], c[1], cfg.rank }); // fits the cap
     // the time of one dense exchange (pack + all-gather), graph-replayed, R = 16, K = 512
     const t0 = std.Io.Clock.awake.now(init.io).toNanoseconds();
     for (0..20) |_| try r.dense(rnd, 1, 16, false);
     const dt = @as(f64, @floatFromInt(std.Io.Clock.awake.now(init.io).toNanoseconds() - t0)) / 20e6;
     std.debug.print("rank {d}: {d} entries checked over dense (R 1/6/16, eager + 3 graph replays, ratio 2 and 1), packed vs dense (R 1/6/16/64, eager + 3 graph replays) and {d} union blocks; mismatches {d}; {d:.2} ms a dense round trip incl. host checks\n{s}\n", .{ cfg.rank, r.checks, blocks, r.bad, dt, if (r.bad == 0) "PASS" else "FAIL" });
+    for (r.tally, 0..) |t, si| for (t, 0..) |fam, fi| if (fam[1] > 0) {
+        std.debug.print("rank {d}: section {s} fam {d} (ratio {d}): mismatches {d} of {d} checks\n", .{ cfg.rank, @tagName(@as(Rank.Section, @enumFromInt(si))), fi, fams[fi].ratio, fam[0], fam[1] });
+    };
     // both ranks finish, then close the session (its fate channel) at once, before the slower teardown below
     try r.comm.barrier();
     s.close();
