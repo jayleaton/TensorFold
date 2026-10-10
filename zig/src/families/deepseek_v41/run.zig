@@ -143,9 +143,7 @@ pub const Runner = struct {
         };
     }
 
-    /// The first Triton call of `cs` the AOT set has no variant for (its function's name), null when every one has:
-    /// a program's launches resolved without issuing them (a boot-time probe), each role's base taken 16-aligned as
-    /// the runner's buffers are (alignedOf).
+    /// The first Triton call of `cs` with no AOT variant (its function name), else null; launches nothing (alignedOf).
     pub fn missingTriton(r: *const Runner, cs: []const calls.Call) !?[]const u8 {
         return missingIn(r.gpa, r.triton, cs);
     }
