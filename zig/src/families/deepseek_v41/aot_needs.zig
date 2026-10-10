@@ -205,6 +205,9 @@ pub const Served = struct {
     /// TF_DSV41_PIECE_RUNS / TF_DSV41_REPLAY_RUNS (several slots, replay): the multi-segment runs' programs too
     runs: bool = false,
     replay_runs: bool = false,
+    /// TF_DSV41_IMAGES=native: image segments (Engram's keep); TF_DSV41_BIAS_VL set: their MoE in two calls
+    images: bool = false,
+    image_bias: bool = false,
 
     /// The engine's knobs as model.zig / prod_knobs.zig read them (the dense prefill's table and image paths aside:
     /// PF_DENSE's fused kernel is CUDA, so the `_gemm` variants it replaces are listed too).
@@ -247,6 +250,8 @@ pub const Served = struct {
             .replay = try knobs.prefillMode(&knobs.env) == .replay,
             .runs = slots > 1 and envOn("TF_DSV41_PIECE_RUNS", false) and try knobs.prefillMode(&knobs.env) == .replay,
             .replay_runs = slots > 1 and envOn("TF_DSV41_REPLAY_RUNS", false) and try knobs.prefillMode(&knobs.env) == .replay,
+            .images = if (std.c.getenv("TF_DSV41_IMAGES")) |v| std.mem.eql(u8, std.mem.trim(u8, std.mem.span(v), " "), "native") else false,
+            .image_bias = if (std.c.getenv("TF_DSV41_BIAS_VL")) |v| std.mem.trim(u8, std.mem.span(v), " ").len > 0 else false,
         };
     }
 };
@@ -456,6 +461,7 @@ pub fn enumerate(gpa: std.mem.Allocator, n: *Needs, cfg: *const Config, w: *cons
             try log.print("aot-needs: piece runs, {d} programs, {d} variants\n", .{ n.programs, n.keys.count() });
             try log.flush();
         }
+        if (sv.images) try images(gpa, n, cfg, w, sv, layers, starts.items, log);
     }
     // CED replay's decoder pass (ced.tailOf): a prompt of n > 128 tokens replays 127 rows ending at n - 1 (the scan),
     // a shorter one its n - 1 rows from 0
@@ -522,6 +528,46 @@ pub fn enumerate(gpa: std.mem.Allocator, n: *Needs, cfg: *const Config, w: *cons
     }
 }
 
+/// TF_DSV41_IMAGES=native: image segments at every row count as the plan sizes them, CED's decoder, sampled splits.
+fn images(gpa: std.mem.Allocator, n: *Needs, cfg: *const Config, w: *const block.Widths, sv: Served, layers: []const u32, starts: []const i64, log: *std.Io.Writer) !void {
+    var o = sv.o;
+    o.image_keep = true;
+    if (sv.image_bias) o.image_rows = -1;
+    const P = sv.o.prefill_rows;
+    for (starts) |s0| {
+        var rows: i64 = 1;
+        while (rows <= P and s0 + rows <= sv.o.limit) : (rows += 1) {
+            var pa = std.heap.ArenaAllocator.init(gpa);
+            defer pa.deinit();
+            _ = try n.program(try block_prefill.emitPrefill(pa.allocator(), cfg, w, o, layers, rows, s0, true));
+        }
+    }
+    if (sv.replay) {
+        const dec = layers[try ced.decoderStart(cfg)..];
+        var m: i64 = 1;
+        while (m <= ced.keep) : (m += 1) {
+            var pa = std.heap.ArenaAllocator.init(gpa);
+            defer pa.deinit();
+            _ = try n.program(try block_prefill.emitReplay(pa.allocator(), cfg, w, o, dec, m, 0, .decoder));
+        }
+        const c: Ctx = .{ .cfg = cfg, .w = w, .o = o, .layers = dec, .rows = ced.keep };
+        try scan(n, .{ .ctx = &c, .emit = decoderAt }, ced.keep, sv.o.limit - 1);
+    }
+    const listed = n.keys.count();
+    try log.print("aot-needs: images (bias {}), {d} programs, {d} variants\n", .{ sv.image_bias, n.programs, listed });
+    if (sv.image_bias) {
+        for ([_]i64{ 17, 64, 1000, P }) |R| for ([_]i64{ 1, @divTrunc(R, 2), R - 1 }) |ni| {
+            var pa = std.heap.ArenaAllocator.init(gpa);
+            defer pa.deinit();
+            var x = o;
+            x.image_rows = ni;
+            _ = try n.program(try block_prefill.emitPrefill(pa.allocator(), cfg, w, x, layers, R, starts[0], true));
+        };
+        try log.print("aot-needs: images, sampled image / text splits: {d} variants past the plan's\n", .{n.keys.count() - listed});
+    }
+    try log.flush();
+}
+
 /// `tf-dsv41-m1 aot-needs SIGS OUT`.
 pub fn main(gpa: std.mem.Allocator, io: std.Io, sigs_path: []const u8, out_path: []const u8, log: *std.Io.Writer) !void {
     const cwd = std.Io.Dir.cwd();
@@ -585,10 +631,10 @@ test "aot-needs: a launch reduces to Triton's specialization (constexprs, == 1, 
     const a = arena.allocator();
     const t = calls.Tensor{ .role = .{ .buf = "w.x" }, .dt = .bf16, .shape = &.{4}, .stride = &.{1}, .offset = 8 };
     const c: calls.Call = .{ .triton = true, .name = "_k", .args = &.{
-        .{ .name = "X", .arg = .{ .t = t } },     .{ .name = "Y", .arg = .{ .t = .{ .role = .{ .buf = "w.y" }, .dt = .f32, .shape = &.{4}, .stride = &.{1}, .offset = 0 } } },
-        .{ .name = "N", .arg = .{ .i = 1 } },     .{ .name = "M", .arg = .{ .i = 32 } },
+        .{ .name = "X", .arg = .{ .t = t } },       .{ .name = "Y", .arg = .{ .t = .{ .role = .{ .buf = "w.y" }, .dt = .f32, .shape = &.{4}, .stride = &.{1}, .offset = 0 } } },
+        .{ .name = "N", .arg = .{ .i = 1 } },       .{ .name = "M", .arg = .{ .i = 32 } },
         .{ .name = "S", .arg = .{ .i = 1 << 33 } }, .{ .name = "F", .arg = .{ .f = 0.5 } },
-        .{ .name = "P", .arg = .none },           .{ .name = "K", .arg = .{ .i = 7 } },
+        .{ .name = "P", .arg = .none },             .{ .name = "K", .arg = .{ .i = 7 } },
         .{ .name = "E", .arg = .{ .f = 0.125 } },
     } };
     const key = try n.reduce(a, &c);
