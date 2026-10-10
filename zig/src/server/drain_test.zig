@@ -150,11 +150,12 @@ pub const Background = struct {
     io: std.Io,
     port: u16,
     body: []const u8,
+    path: []const u8 = "/v1/chat/completions",
     reply: ?Reply = null,
     failed: bool = false,
 
     fn run(b: *Background) void {
-        b.reply = request(b.a, b.io, b.port, "POST", "/v1/chat/completions", b.body) catch {
+        b.reply = request(b.a, b.io, b.port, "POST", b.path, b.body) catch {
             b.failed = true;
             return;
         };
@@ -215,7 +216,7 @@ test "SIGTERM drains: 503 + Retry-After and /health draining while a reply finis
         var x: Served = .{};
         const t = try start(gpa, io, &env, &slow, ds, &x);
         const port = listen_port.load(.acquire);
-        var bg: Background = .{ .a = a, .io = io, .port = port, .body = try chatBody(a, "@short", true) };
+        var bg: Background = .{ .a = a, .io = io, .port = port, .body = try chatBody(a, "@wait", true) }; // ~1 s: the checks run inside the drain
         const bt = try std.Thread.spawn(.{}, Background.run, .{&bg});
         waitActive(io, &slow, 1);
         try std.posix.raise(.TERM);
@@ -256,12 +257,15 @@ test "SIGTERM drains: 503 + Retry-After and /health draining while a reply finis
         const port = listen_port.load(.acquire);
         var streamed: Background = .{ .a = a, .io = io, .port = port, .body = try chatBody(a, "@long", true) };
         var whole: Background = .{ .a = a, .io = io, .port = port, .body = try chatBody(a, "@long", false) };
+        var msgs: Background = .{ .a = a, .io = io, .port = port, .path = "/v1/messages", .body = "{\"model\":\"x\",\"max_tokens\":4000,\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"go @long\"}]}" };
         const st = try std.Thread.spawn(.{}, Background.run, .{&streamed});
         const wt = try std.Thread.spawn(.{}, Background.run, .{&whole});
-        waitActive(io, &slow, 2);
+        const mt = try std.Thread.spawn(.{}, Background.run, .{&msgs});
+        waitActive(io, &slow, 3);
         try std.posix.raise(.TERM);
         st.join();
         wt.join();
+        mt.join();
         t.join();
         try testing.expectEqual(@as(u8, 0), x.code);
         try testing.expectEqual(@as(u32, 1), slow.halts);
@@ -270,11 +274,12 @@ test "SIGTERM drains: 503 + Retry-After and /health draining while a reply finis
         try testing.expectEqualStrings(routes.restarting, slow.reason);
         const sb = streamed.reply.?.body;
         try testing.expectEqual(@as(u16, 200), streamed.reply.?.status);
-        try testing.expect(std.mem.indexOf(u8, sb, "\"type\": \"server_error\"") != null);
-        try testing.expect(std.mem.indexOf(u8, sb, routes.restarting) != null);
-        try testing.expect(std.mem.indexOf(u8, sb, "data: [DONE]") != null);
-        try testing.expect(whole.reply.?.status >= 500);
-        try testing.expect(std.mem.indexOf(u8, whole.reply.?.body, routes.restarting) != null);
+        // the 503's own code and type, in Python's in-stream error event shape, then [DONE]
+        try testing.expect(std.mem.indexOf(u8, sb, "data: {\"error\": {\"message\": \"" ++ routes.restarting ++ "\", \"type\": \"server_error\", \"code\": \"server_restarting\"}}\n\ndata: [DONE]") != null);
+        try testing.expect(std.mem.indexOf(u8, sb, "RuntimeError") == null);
+        try testing.expectEqual(@as(u16, 503), whole.reply.?.status);
+        try testing.expect(std.mem.indexOf(u8, whole.reply.?.body, "\"code\": \"server_restarting\"") != null);
+        try testing.expect(std.mem.indexOf(u8, msgs.reply.?.body, "event: error\ndata: {\"type\": \"error\", \"error\": {\"type\": \"overloaded_error\", \"message\": \"" ++ routes.restarting) != null);
     }
 }
 
