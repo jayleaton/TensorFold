@@ -64,7 +64,7 @@ pub const SchedHost = struct {
     }
 
     pub fn rounds(h: *SchedHost) api.Rounds {
-        return .{ .ctx = h, .vtable = &.{ .begin_admit = beginAdmit, .admit = admit, .admitted = admitted, .arm = arm, .began = began, .plan = plan, .left = left, .after = after } };
+        return .{ .ctx = h, .vtable = &.{ .begin_admit = beginAdmit, .admit = admit, .admitted = admitted, .arm = arm, .began = began, .plan = plan, .left = left, .after = after, .leaving = leaving } };
     }
 
     pub fn describe(h: *const SchedHost, buf: []u8) []const u8 {
@@ -204,6 +204,10 @@ pub const SchedHost = struct {
         for (h.pieces.items) |x| try pieces.append(h.gpa, .{ .key = x.key, .start = x.start, .end = x.end, .save = x.save, .run = x.run });
         try finals.appendSlice(h.gpa, h.finals.items);
         h.logPrefill();
+    }
+
+    fn leaving(ctx: *anyopaque, key: usize) ?u64 {
+        return self(ctx).p.leaving(key);
     }
 
     fn left(ctx: *anyopaque, key: usize) void {
