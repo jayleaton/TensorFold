@@ -74,6 +74,10 @@ pub fn Cache(comptime Key: type) type {
         agree: ?Agree = null,
         /// false when this rank is below its memory floor (MemAvailable); null: always room
         room: ?*const fn () bool = null,
+        /// MemAvailable now in GiB, to log each capture's measured cost (null: not measured)
+        meter: ?*const fn () ?f64 = null,
+        /// the cache's name in its log lines
+        name: []const u8 = "graphs",
         entries: std.AutoArrayHashMapUnmanaged(Key, Entry) = .empty,
         cap: u32,
         tick: u64 = 0,
@@ -81,7 +85,7 @@ pub fn Cache(comptime Key: type) type {
         /// a capture failed on some rank: eager from here on
         failed: bool = false,
         /// counters for logs and gates
-        stats: struct { replayed: u64 = 0, captured: u64 = 0, eager: u64 = 0, evicted: u64 = 0, dropped: u64 = 0, floor_hits: u64 = 0 } = .{},
+        stats: struct { replayed: u64 = 0, captured: u64 = 0, eager: u64 = 0, evicted: u64 = 0, dropped: u64 = 0, floor_hits: u64 = 0, capture_mib: f64 = 0 } = .{},
 
         pub fn init(gpa: std.mem.Allocator, engine: Engine, settings: Settings) Self {
             return .{ .gpa = gpa, .engine = engine, .settings = settings, .cap = settings.max };
@@ -164,6 +168,7 @@ pub fn Cache(comptime Key: type) type {
                 c.cap = c.settings.max;
             }
             while (c.entries.count() >= c.cap) c.evictOldest();
+            const before = if (c.meter) |m| m() else null;
             const exec = c.engine.capture(c.engine.ctx, stream, body) catch |err| blk: {
                 // the only trace of why graphs went off (the step then runs eagerly, which may fail the same way)
                 std.log.warn("graph capture failed: {s} (key {any}, {d} graphs held)", .{ @errorName(err), key, c.entries.count() });
@@ -178,6 +183,11 @@ pub fn Cache(comptime Key: type) type {
             try c.entries.put(c.gpa, key, .{ .exec = exec.?, .used = c.tick });
             try c.engine.launch(c.engine.ctx, exec.?, stream);
             c.stats.captured += 1;
+            // what a graph really costs this rank (the room rule prices it)
+            if (before) |b| if (c.meter.?()) |a| {
+                c.stats.capture_mib = (b - a) * 1024;
+                std.log.info("graph cache {s}: captured, {d} held: MemAvailable {d:.2} -> {d:.2} GiB ({d:.0} MiB)", .{ c.name, c.entries.count(), b, a, c.stats.capture_mib });
+            };
             return .captured;
         }
     };
