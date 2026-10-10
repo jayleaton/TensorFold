@@ -26,6 +26,7 @@ const prepared = @import("prepared.zig");
 const buffers = @import("buffers.zig");
 const forms = @import("forms.zig");
 const forms_inplace = @import("forms_inplace.zig");
+const ex_stacks = @import("ex_stacks.zig");
 const longpf = @import("longpf.zig");
 const run = @import("run.zig");
 const fwd = @import("forward.zig");
@@ -295,6 +296,8 @@ pub const Model = struct {
         if (longpf.lazyEnv()) if (bp.sizes.fetchOrderedRemove(longpf.lazy_role)) |kv| {
             m.f.prefill_state.long.lazy = .{ .bytes = kv.value };
         };
+        // TF_DSV41_EX_STACKS=1: the experts' suh / svh stacks read where the weights hold them (no second copy)
+        if (ex_stacks.enabled()) _ = try ex_stacks.bind(&m.runner, &m.weights, &bp);
         // TF_DSV41_FORMS_INPLACE=1: the dense forms over their trellis (not a second copy), unless a program reads it
         if (forms_inplace.enabled()) {
             const ws = &m.f.prefill_state.k4ws.plan;
