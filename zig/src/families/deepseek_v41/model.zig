@@ -26,6 +26,7 @@ const prepared = @import("prepared.zig");
 const buffers = @import("buffers.zig");
 const forms = @import("forms.zig");
 const forms_inplace = @import("forms_inplace.zig");
+const longpf = @import("longpf.zig");
 const run = @import("run.zig");
 const fwd = @import("forward.zig");
 const eh = @import("engram_host.zig");
@@ -263,7 +264,7 @@ pub const Model = struct {
             var ko = ko_;
             ko.slots = m.slots;
             // the long-prompt stream scratch the buffer plan will hold (Python's measured terms have none)
-            ko.resident = @import("prod_knobs.zig").streamScratch(&m.cfg, m.f.opts.limit, m.f.opts.prefill_rows);
+            ko.resident = if (longpf.lazyEnv()) 0 else @import("prod_knobs.zig").streamScratch(&m.cfg, m.f.opts.limit, m.f.opts.prefill_rows);
             // TF_DSV41_PF_4K / _PF_TBO: the prefill workspace a long prompt allocates, priced on top of the worst point
             if (o.own_prefill) ko.workspace = try @import("forward_prefill.zig").workspaceBytes(&m.f, @intCast(m.f.opts.prefill_rows));
             tr.step("forward", cuda.usage(false));
@@ -288,6 +289,10 @@ pub const Model = struct {
         const group = if (slot_drafts) try dspark_rows.groupFromEnv(m.cfg.dspark_block) else 1;
         if (slot_drafts) try dspark_slots.SlotPass.plan(m.f.arena.allocator(), &m.f, &bp, m.slots, group);
         if (m.f.kv) |k| try k.bind(&m.runner, &bp);
+        // TF_DSV41_STREAM_LAZY: the stream top-k's scratch out of the plan, allocated by the prompts that stream
+        if (longpf.lazyEnv()) if (bp.sizes.fetchOrderedRemove(longpf.lazy_role)) |kv| {
+            m.f.prefill_state.long.lazy = .{ .bytes = kv.value };
+        };
         // TF_DSV41_FORMS_INPLACE=1: the dense forms over their trellis (not a second copy), unless a program reads it
         if (forms_inplace.enabled()) {
             const ws = &m.f.prefill_state.k4ws.plan;
