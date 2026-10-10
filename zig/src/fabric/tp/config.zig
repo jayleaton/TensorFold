@@ -135,6 +135,11 @@ pub const Config = struct {
         return parse(&envGet);
     }
 
+    /// The RoCE region's slot, every RoCE post's ceiling: the small exchanges' cap or the variable-length strides'.
+    pub fn roceSlotBytes(c: Config) usize {
+        return @max(c.mailbox_max_bytes, c.roce_var_bytes);
+    }
+
     /// The settings both ranks must share (everything but rank, device and timeouts), as bytes to compare.
     pub fn digest(c: Config) [32]u8 {
         var h = std.crypto.hash.sha2.Sha256.init(.{});

@@ -51,6 +51,16 @@ pub const Small = union(enum) {
     }
 };
 
+/// Whether an exchange of `n` bytes a rank takes the small path (`fits`: the small transport's slot holds it).
+pub fn smallRoute(max_bytes: usize, n: usize, fits: bool) bool {
+    return n <= max_bytes and fits;
+}
+
+/// Whether a variable-length gather of `n`-byte strides takes RoCE (`fits`: its slot holds it, device side up).
+pub fn varRoute(max_bytes: usize, var_max_bytes: usize, n: usize, fits: bool) bool {
+    return n > 0 and n <= @max(max_bytes, var_max_bytes) and fits;
+}
+
 pub const Hybrid = struct {
     small: Small,
     nccl: *Nccl,
@@ -92,7 +102,7 @@ pub const Hybrid = struct {
     }
 
     fn routed(h: *const Hybrid, n: usize) bool {
-        return n <= h.max_bytes and h.small.fits(n);
+        return smallRoute(h.max_bytes, n, h.small.fits(n));
     }
 
     fn rankOf(ptr: *anyopaque) u32 {
@@ -127,7 +137,7 @@ pub const Hybrid = struct {
     pub fn varFits(ptr: *anyopaque, n: usize) bool {
         const h = self_(ptr);
         return switch (h.small) {
-            .roce => |p| n > 0 and n <= @max(h.max_bytes, h.var_max_bytes) and p.fits(n) and p.d != null,
+            .roce => |p| varRoute(h.max_bytes, h.var_max_bytes, n, p.fits(n) and p.d != null),
             .mailbox => false,
         };
     }

@@ -71,6 +71,16 @@ pub const Options = struct {
     fast: u32 = 0,
     /// TF_TP_ROCE_BLOCKS: the largest grid (config.roce_blocks)
     blocks: u32 = 16,
+    /// The shm wire's stripes, as HCAs (the Sparks stripe over 2): its posts take the verbs wire's stripes and guard.
+    shm_stripes: u32 = 1,
+    /// Tests: sees every shm post's stripes before the copy.
+    tap: ?*PostTap = null,
+};
+
+/// A test's view of each post (shm wire): slot, padded bytes and the stripes the wire is about to move.
+pub const PostTap = struct {
+    ctx: *anyopaque,
+    seen: *const fn (ctx: *anyopaque, l: rv.Layout, slot: u32, padded: u32, s: []const rv.Stripe) void,
 };
 
 /// The shm wire: the peer's region is mapped here; a post copies the slot, then stores the flag (x86 / Arm stores
@@ -79,12 +89,19 @@ const ShmWire = struct {
     peer: []u8,
     local: []u8,
     slot_bytes: usize,
+    stripes: u32 = 1,
+    tap: ?*PostTap = null,
 
-    fn post(w: *ShmWire, slot: u32, seq: u32, padded: u32) void {
-        const recv = send_off + 2 * w.slot_bytes;
-        @memcpy(w.peer[recv + slot * w.slot_bytes ..][0..padded], w.local[send_off + slot * w.slot_bytes ..][0..padded]);
-        const flag: *std.atomic.Value(u32) = @ptrCast(@alignCast(w.peer[flag_off + slot * 2 * flag_stride ..].ptr));
-        flag.store(seq, .release);
+    fn post(w: *ShmWire, slot: u32, seq: u32, padded: u32) !void {
+        const l: rv.Layout = .{ .send = send_off, .recv = send_off + 2 * w.slot_bytes, .flags = flag_off, .slot = w.slot_bytes, .len = w.local.len };
+        var plan: [rv.max_hcas]rv.Stripe = undefined;
+        try rv.stripes(l, w.stripes, slot, padded, &plan);
+        if (w.tap) |t| t.seen(t.ctx, l, slot, padded, plan[0..w.stripes]);
+        for (plan[0..w.stripes]) |s| {
+            @memcpy(w.peer[s.remote..][0..s.len], w.local[s.local..][0..s.len]);
+            const flag: *std.atomic.Value(u32) = @ptrCast(@alignCast(w.peer[s.flag..].ptr));
+            flag.store(seq, .release);
+        }
     }
 };
 
@@ -95,7 +112,7 @@ const Wire = union(WireKind) {
     fn post(w: *Wire, slot: u32, seq: u32, padded: u32) !void {
         switch (w.*) {
             .verbs => |*v| try v.post(slot, seq, padded),
-            .shm => |*s| s.post(slot, seq, padded),
+            .shm => |*s| try s.post(slot, seq, padded),
         }
     }
 
@@ -109,7 +126,7 @@ const Wire = union(WireKind) {
     fn hcas(w: *const Wire) u32 {
         return switch (w.*) {
             .verbs => |v| v.n_hca,
-            .shm => 1,
+            .shm => |s| s.stripes,
         };
     }
 };
@@ -208,7 +225,7 @@ pub const Roce = struct {
             .shm => {
                 r.mapping = try sharedPair(b, len);
                 r.region = @alignCast(r.mapping[r.me * len ..][0..len]);
-                r.wire = .{ .shm = .{ .peer = r.mapping[(1 - r.me) * len ..][0..len], .local = r.region, .slot_bytes = r.slot_bytes } };
+                r.wire = .{ .shm = .{ .peer = r.mapping[(1 - r.me) * len ..][0..len], .local = r.region, .slot_bytes = r.slot_bytes, .stripes = o.shm_stripes, .tap = o.tap } };
             },
         }
         return true;
