@@ -1,5 +1,8 @@
 # The Zig engine on the two DGX Sparks, overnight: everything gated, in order
 
+**Source line:** every kit builds from `dsv41-zig` (the only prod source line since 2026-10-10, converged on kit
+7e018254); `COMMIT` must name a `dsv41-zig` commit. Topic branches land on `dsv41-zig` before any kit uses them.
+
 One overnight window, the whole model at TP=2 over RoCE. It runs everything gated on the pods so far, in this order:
 1. **Correctness:** M2c-2 and the prefill gate on the whole model, then the served path (HTTP == CLI).
 2. **Speed against prod:** 1 slot, 4 slots, and 4 slots with drafts (prod's shape).
