@@ -1962,3 +1962,65 @@ reproduced in CUDA (section 12's lesson), and is not built.
 **Spark step M1:** W1's all-on set + `TF_DSV41_MHC_SITE_ROWS=512`, then `=1024`, with `bench_http.py --long
 32768,131072`. Pass: long replies == Python's, T0 20/20; prompt tok/s against W1 (or against X2 with
 PF_OVERLAP_SITE, whose own site pieces take precedence).
+
+## 16. Prefill knobs measured and not kept (chain25/26, kit 12b1b2c3, 1 rep)
+
+### 16.1 M1: TF_DSV41_MHC_SITE_ROWS
+
+32K / 131K prompt tok/s: base 2,657.9 / 2,495.0; at 512 rows 2,659.1 / 2,492.0; at 1024 rows 2,654.0 / 2,485.5.
+Hashes were equal, and 4K ran with 0 fallbacks. On the GB10, the partials' L2 round trip does not pay back against
+the pieces' extra launches. TF_DSV41_MHC_SITE_ROWS stays off.
+
+### 16.2 x3gm 128-member tiles: TF_DSV41_GM_GU2 (and GM_DN2)
+
+GM_DN2 was parked unlanded under tag archive/dsv41-zig-prefill.
+
+**G2 (chain25, kit 12b1b2c3): GM_GU2 served 1.0 % slower.** 32K / 131K prompt 2,632.1 / 2,469.3 against 2,657.9 /
+2,495.0 (1 rep). GU2 was active in 4K segments, with 0 fallbacks and equal hashes. Why the bench's -3.6 % does not
+transfer:
+- **Not the extra plan.** P5b's profile has `glue.gm_plan` at 0.08 ms a call (91.96 ms / 1,140), against GU2's ~0.9
+  ms a layer. No memset or host step is added: the plan is one launch on the same stream.
+- **The bench's shape is not the served one.** tbo_bench --tiles runs uniform routing (`--zipf 0`) at one width
+  (`--k2 6`, 3 bits): 25.5 ms a layer. Served 4K x3gm is 13.4 ms a layer (gateup2 8.04 + down2 5.33 ms, P5b):
+  - routing is the router's real skewed picks;
+  - widths are the q28-v2 pack's ragged 2.8 bpw.
+
+  At those shapes, -1 % of prompt at x3gm's ~25 % share means GU2 runs ~4 % slower, not 3.6 % faster. Likely
+  causes:
+  - 128-member passes make fewer, larger items, so the persistent grid's tail balances worse under skew;
+  - at 2-3 bits the decode is cheap, and the 16-warp MTL-1 tile loses its edge over GU1.
+
+Verdict: the GU2 bench gain does not transfer to served routing and widths. GM_GU2 and GM_DN2 stay off, and G2b is
+not worth a slot. Before any tile work at 4K, rerun the tile bench at the served shapes:
+`tbo_bench --rows 4096 --tiles --zipf 0.8 --k2 4` (and `--k2 5`), ~1 min each, no model. Build only a pair that
+wins there.
+
+**Tile bench at served shapes (Spark, `tbo_bench --rows 4096 --tiles --zipf 0.8`): confirms G2.** Bits pass at
+every cap, and every 128-member pair is slower than G6 under skewed routing.
+
+| pair | k2 4 (G6 21.366 ms) | k2 5 (G6 23.721 ms) |
+| --- | ---: | ---: |
+| GU2 / DN0 | +5.8 % | +5.4 % |
+| GU1 / DN2 | +5.5 % | +0.9 % |
+| GU2 / DN2 | +11.2 % | +3.4 % |
+| GU4 / DN4 | +12.8 % | +11.8 % |
+
+GM_GU2 / GM_DN2 stay off. G6's 64-member tiles are the right ones at served routing.
+
+### 16.3 X2 at floor 3.5 (chain25/26): the exchange overlap loses with 4K active
+
+PF_OVERLAP=2 + PF_OVERLAP_SITE=1, 4K active (0 fallbacks, 0 cap lines, rank 1 min 3,820 MiB, hashes equal):
+- prompt 32K / 131K 2,625.4 / 2,458.1 against 2,657.9 / 2,495.0 (-1.2 / -1.5 %);
+- decode +1.9 / +1.5 %, noise-level.
+
+Not kept.
+
+Cause: 13.2's model counted the exchange's profiled 30.7 ms / 1K as wire time that the overlap could hide.
+- That span is mostly waiting for the peer rank (skew; see `glue.embed`, rank 0's 7.85 against rank 1's 1.10 ms /
+  1K). Hiding a wait does not shorten the critical path.
+- The pieces put NCCL's channel CTAs and the per-piece copies on the highest-priority side stream, beside x3gm and
+  the GEMMs. Those are issue-bound on 48 SMs, so they lose SMs (TBO's contention again).
+- The site pieces add 2 (k - 1) launches a site.
+
+PF_OVERLAP / PF_OVERLAP_SITE stay off. A real exchange lever needs rank 1's skew removed first (the audit's rank-1
+pacing finding), not overlap.
