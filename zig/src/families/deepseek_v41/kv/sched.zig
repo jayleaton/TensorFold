@@ -624,4 +624,5 @@ test "a round whose last piece rounds up past the budget left ends the round (ba
 
 test {
     _ = @import("sched_test.zig");
+    _ = @import("sched_crash_test.zig");
 }
