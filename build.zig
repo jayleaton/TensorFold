@@ -6,6 +6,7 @@ const qwen27_build = @import("zig/build/qwen27.zig");
 const hip_build = @import("zig/build/hip.zig");
 const tp_build = @import("zig/build/tp.zig");
 const sessions_build = @import("zig/build/sessions.zig");
+const grammar_build = @import("zig/build/grammar.zig");
 
 comptime {
     const required = std.mem.trim(u8, @embedFile(".zig-version"), "\r\n");
@@ -151,6 +152,7 @@ pub fn build(b: *std.Build) void {
     hip_build.steps(b, target, test_step);
     tp_build.add(b, target, optimize, test_step);
     sessions_build.add(b, test_step);
+    grammar_build.add(b, test_step);
 }
 
 /// `zig build native -Dcpu=apple_m1`: tensorfold-native with the Metal engines for the Python package's bundle (a native M5 build traps on M1-M4).
