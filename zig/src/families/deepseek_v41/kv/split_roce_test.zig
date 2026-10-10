@@ -26,6 +26,12 @@ fn prodEnv(name: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Prod's settings plus chunked gathers: strides past 1 MiB, up to 20 MiB, go RoCE as <= 1 MiB ops.
+fn chunkEnv(name: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, name, "TF_TP_ROCE_CHUNKED_KB")) return "20480";
+    return prodEnv(name);
+}
+
 /// The 10-10 21:13 test's settings: prod's plus TF_TP_ROCE_VAR_KB=10240 (boot must refuse it).
 fn varEnv(name: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, name, "TF_TP_ROCE_VAR_KB")) return "10240";
@@ -67,6 +73,7 @@ const Routed = struct {
     roce_ops: u64 = 0,
     nccl_ops: u64 = 0,
     big_roce: u64 = 0,
+    chunked: u64 = 0,
 
     fn self_(p: *anyopaque) *Routed {
         return @ptrCast(@alignCast(p));
@@ -96,9 +103,13 @@ const Routed = struct {
         const out: [*]u8 = @ptrFromInt(r);
         h.r.hostGather(in[0..n], out[0 .. 2 * n]) catch return error.BackendFailed;
     }
+    fn single(h: *Routed, n: usize) bool {
+        return hybrid.varRoute(h.cfg.mailbox_max_bytes, h.cfg.roce_var_bytes, n, h.r.fits(n));
+    }
     fn varFits(p: *anyopaque, n: usize) bool {
         const h = self_(p);
-        return hybrid.varRoute(h.cfg.mailbox_max_bytes, h.cfg.roce_var_bytes, n, h.r.fits(n));
+        const one = h.single(n);
+        return one or hybrid.chunkRoute(h.cfg.roce_chunked_bytes, n, one, h.r.chunk_abi);
     }
     fn varAgreed(p: *anyopaque) tp.collective.Error!bool {
         return varFits(p, 16);
@@ -107,10 +118,15 @@ const Routed = struct {
         const h = self_(p);
         const n = stride * t.size();
         if (!varFits(p, n)) return allGather(p, s, r, stride, t, st);
-        h.took(n);
         const l: [*]const i32 = @ptrFromInt(lens);
         const in: [*]const u8 = @ptrFromInt(s);
         const out: [*]u8 = @ptrFromInt(r);
+        if (!h.single(n)) {
+            h.roce_ops += 1;
+            h.chunked += 1;
+            return h.r.hostGatherVChunked(in[0..n], out[0 .. 2 * n], .{ @intCast(l[0]), @intCast(l[1]) }) catch error.BackendFailed;
+        }
+        h.took(n);
         h.r.hostGatherV(in[0..n], out[0 .. 2 * n], .{ @intCast(l[0]), @intCast(l[1]) }) catch return error.BackendFailed;
     }
     fn exchange(p: *anyopaque, s: u64, r: u64, n: usize, t: tp.DType, peer: u32, st: tp.collective.Stream) tp.collective.Error!void {
@@ -152,6 +168,7 @@ const Ctx = struct {
     seen: [2]Seen = undefined,
     big_roce: [2]u64 = .{ 0, 0 },
     roce_ops: [2]u64 = .{ 0, 0 },
+    chunked: [2]u64 = .{ 0, 0 },
 };
 
 fn rank(comm: tp.Collective, me: u32, ctx: *Ctx) anyerror!void {
@@ -165,6 +182,9 @@ fn rank(comm: tp.Collective, me: u32, ctx: *Ctx) anyerror!void {
     var tap: roce.PostTap = .{ .ctx = &ctx.seen[me], .seen = Seen.seen };
     const r = try roce.Roce.init(null, &b, "", .{ .wire = .shm, .shm_stripes = 2, .tap = &tap, .max_bytes = cfg.roceSlotBytes(), .timeout_ns = 20 * std.time.ns_per_s });
     defer r.deinit();
+    // no chunked op without the ABI marker; the host side then moves `RoceArgs.chunk` ops as the kernel does
+    try testing.expectError(error.Unsupported, r.allGatherVChunked(1 << 12, 1 << 24, 2 << 20, 1 << 12, null));
+    r.chunk_abi = cfg.roce_chunked_bytes > 0;
     var routed: Routed = .{ .nccl = comm, .r = r, .cfg = cfg };
     const c = routed.iface();
 
@@ -213,6 +233,8 @@ fn rank(comm: tp.Collective, me: u32, ctx: *Ctx) anyerror!void {
         defer gpa.free(recv);
         const tok = try gpa.alloc(i32, n);
         defer gpa.free(tok);
+        const got = try gpa.alloc(u8, n * rb);
+        defer gpa.free(got);
         var lens: [split.max_world]i32 = @splat(-7);
         const psh: u32 = std.math.log2_int(u32, page / f.ratio);
         const da: split.DenseArgs = .{ .sel = @intFromPtr(sel.ptr), .rows = R, .k = K, .table = @intFromPtr(&tables), .pts = pts, .rslot = @intFromPtr(rslot.ptr), .psh = psh, .base = @intFromPtr(host.tensors[fi].ptr), .row_bytes = rb, .world = 2, .send = @intFromPtr(send.ptr), .tok = @intFromPtr(tok.ptr) };
@@ -222,10 +244,13 @@ fn rank(comm: tp.Collective, me: u32, ctx: *Ctx) anyerror!void {
             for (sel, tok, 0..) |t, o, i| {
                 if (t < 0) continue;
                 const s: usize = @intCast(rslot[i / K]);
-                for (recv[@as(usize, @intCast(o)) * rb ..][0..rb], 0..) |byte, j| if (byte != value(fi, s, @intCast(t), j)) {
+                const row = recv[@as(usize, @intCast(o)) * rb ..][0..rb];
+                for (row, 0..) |byte, j| if (byte != value(fi, s, @intCast(t), j)) {
                     std.debug.print("fam {d} R {d} pass {d}: entry {d} wrong\n", .{ fi, R, pass, i });
                     return error.TestUnexpectedResult;
                 };
+                // the window's (packed, chunked past 1 MiB) row byte-identical to the dense (NCCL) gather's
+                if (pass == 0) @memcpy(got[i * rb ..][0..rb], row) else try testing.expectEqualSlices(u8, got[i * rb ..][0..rb], row);
             }
         }
     };
@@ -253,6 +278,7 @@ fn rank(comm: tp.Collective, me: u32, ctx: *Ctx) anyerror!void {
     try b.agree("done", "split roce test end");
     ctx.big_roce[me] = routed.big_roce;
     ctx.roce_ops[me] = routed.roce_ops;
+    ctx.chunked[me] = routed.chunked;
 }
 
 fn runAt(get: *const fn ([]const u8) ?[]const u8) !Ctx {
@@ -268,6 +294,24 @@ test "prod's settings: every split exchange's RoCE post fits the 1 MiB slot and 
     for (ctx.seen, ctx.big_roce, ctx.roce_ops) |s, big, ops| {
         try testing.expectEqual(@as(u64, 1 << 20), s.slot);
         try testing.expect(ops > 0 and s.posts >= ops);
+        try testing.expectEqual(@as(u64, 0), s.outside);
+        try testing.expect(s.max_padded <= 1 << 20);
+        try testing.expectEqual(@as(u64, 0), big);
+    }
+}
+
+test "TF_TP_ROCE_CHUNKED_KB: strides past 1 MiB go RoCE as <= 1 MiB writes, byte-identical to the dense gather" {
+    // one op's strides stay single; off (0), past the bound or without the kernel's ABI marker: NCCL
+    try testing.expect(!hybrid.chunkRoute(20 << 20, 2 << 20, true, true));
+    try testing.expect(!hybrid.chunkRoute(0, 2 << 20, false, true));
+    try testing.expect(!hybrid.chunkRoute(20 << 20, (20 << 20) + 1, false, true));
+    try testing.expect(!hybrid.chunkRoute(20 << 20, 2 << 20, false, false));
+    try testing.expect(hybrid.chunkRoute(20 << 20, 20 << 20, false, true));
+    const ctx = try runAt(chunkEnv);
+    for (ctx.seen, ctx.big_roce, ctx.chunked) |s, big, chunked| {
+        try testing.expectEqual(@as(u64, 1 << 20), s.slot);
+        // R 4..64 windows of both families (fam 1 R 32: the 10-10 run's 9,568,256 B stride; R 64: 19,136,512 B)
+        try testing.expectEqual(@as(u64, 10), chunked);
         try testing.expectEqual(@as(u64, 0), s.outside);
         try testing.expect(s.max_padded <= 1 << 20);
         try testing.expectEqual(@as(u64, 0), big);

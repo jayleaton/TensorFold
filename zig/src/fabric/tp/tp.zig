@@ -93,7 +93,12 @@ pub const Session = struct {
         const opts: roce.Options = .{ .wire = if (cfg.roce_wire == .shm) .shm else .verbs, .hcas = specs[0..n_specs], .traffic_class = cfg.roce_tc, .cpu = cfg.roce_cpu, .max_bytes = cfg.roceSlotBytes(), .timeout_ns = cfg.mailbox_timeout_ns, .fast = cfg.roce_fast, .blocks = cfg.roce_blocks };
         const r = roce.Roce.init(d, b, image, opts) catch |e| return s.roceFallback(e);
         s.roce = r;
-        s.route = .{ .small = .{ .roce = r }, .nccl = &s.nccl, .max_bytes = cfg.mailbox_max_bytes, .var_max_bytes = cfg.roce_var_bytes };
+        if (cfg.roce_chunked_bytes > 0 and !r.chunk_abi) {
+            std.log.warn("TF_TP_ROCE_CHUNKED_KB={d}: the tp_roce kernel image has no chunked ABI (tp_roce_chunk_abi); refusing to start", .{cfg.roce_chunked_bytes / 1024});
+            r.deinit();
+            return error.ChunkAbiMissing;
+        }
+        s.route = .{ .small = .{ .roce = r }, .nccl = &s.nccl, .max_bytes = cfg.mailbox_max_bytes, .var_max_bytes = cfg.roce_var_bytes, .chunked_bytes = cfg.roce_chunked_bytes };
         const good = probe(s, d) catch false;
         var blobs: [bootstrap.max_ranks][]const u8 = undefined;
         var buf: [bootstrap.max_ranks]u8 = undefined;
@@ -213,6 +218,7 @@ test {
     _ = roce_verbs;
     _ = planlink;
     _ = @import("roce_test.zig");
+    _ = @import("roce_inflight_test.zig");
     _ = @import("host_test.zig");
     _ = @import("fate_test.zig");
 }
