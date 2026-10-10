@@ -109,12 +109,13 @@ pub fn bootCheck(ctx: *const cuda.Context, cfg: *const Config, o: Options, rank:
     if (o.workspace > 0) {
         const ws = @as(f64, @floatFromInt(o.workspace)) / budget.GiB;
         const left = r.worst - ws;
+        // a prompt takes the workspace only when every rank agrees it fits (forward_prefill.wsAgreed)
         if (left < r.hard) {
-            std.log.err("kv: rank {d}: the prefill workspace ({d:.2} GiB, TF_DSV41_PF_4K / TF_DSV41_PF_TBO) on top of the predicted worst MemAvailable {d:.2} GiB leaves {d:.2} GiB, under the {d:.1} GiB hard floor (TF_DSV41_FLOOR_HARD_GIB): lower TF_DSV41_POOL_TOKENS by about {d:.0} tokens, or drop TF_DSV41_PF_TBO (4K alone holds half of 4K + TBO's)", .{ rank, ws, r.worst, left, r.hard, (r.hard - left) * budget.GiB / @max(1.0, r.bytes_a_token) });
-            return error.PoolDoesNotFit;
+            std.log.warn("kv: rank {d}: the prefill workspace ({d:.2} GiB, TF_DSV41_PF_4K / TF_DSV41_PF_TBO) on top of the predicted worst MemAvailable {d:.2} GiB leaves {d:.2} GiB, under the {d:.1} GiB hard floor: long prompts at that point run 2,048-row segments (about {d:.0} fewer TF_DSV41_POOL_TOKENS keep 4K)", .{ rank, ws, r.worst, left, r.hard, (r.hard - left) * budget.GiB / @max(1.0, r.bytes_a_token) });
+        } else {
+            std.log.info("kv: rank {d}: prefill workspace {d:.2} GiB at a long prompt: worst MemAvailable {d:.2} GiB with it (hard floor {d:.1})", .{ rank, ws, left, r.hard });
+            if (left < target) std.log.warn("kv: memory: with the prefill workspace the floor {d:.2} GiB is under the {d} GiB target (TF_DSV41_FLOOR_GIB)", .{ left, target });
         }
-        std.log.info("kv: rank {d}: prefill workspace {d:.2} GiB at a long prompt: worst MemAvailable {d:.2} GiB with it (hard floor {d:.1})", .{ rank, ws, left, r.hard });
-        if (left < target) std.log.warn("kv: memory: with the prefill workspace the floor {d:.2} GiB is under the {d} GiB target (TF_DSV41_FLOOR_GIB)", .{ left, target });
     }
     if (r.worst < target) std.log.warn("kv: memory: floor {d:.2} GiB is under the {d} GiB target (TF_DSV41_FLOOR_GIB)", .{ r.worst, target });
 }
