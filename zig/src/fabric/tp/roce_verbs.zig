@@ -11,7 +11,10 @@ const flag_stride = 128;
 const link_ethernet = 2;
 const record_magic: u32 = 0x5446_5244 + 2; // roce.cpp's "TFRD", bumped: this record's layout is the Zig engine's
 
-pub const Error = error{ NoHca, VerbsFailed, PostFailed, Completion, BadRecord, OutOfRegion };
+pub const Error = error{ NoHca, VerbsFailed, PostFailed, Completion, BadRecord, OutOfRegion, WriteTooLarge };
+
+/// The largest RDMA write a post may make, whatever the slot (10-10: a ~9.6 MB post faulted the HCA); never raised.
+pub const max_write: u32 = 1 << 20;
 
 /// Both ranks' region layout (roce.zig's): byte offsets and the registered length every post must stay inside.
 pub const Layout = struct { send: u64, recv: u64, flags: u64, slot: u64, len: u64 };
@@ -22,6 +25,7 @@ pub const Stripe = struct { local: u64, remote: u64, len: u32, flag: u64 };
 /// Slot `slot`'s first `padded` bytes striped over `n_hca` HCAs; error.OutOfRegion before any verb past a slot or MR.
 pub fn stripes(l: Layout, n_hca: u32, slot: u32, padded: u32, out: *[max_hcas]Stripe) Error!void {
     if (n_hca == 0 or n_hca > max_hcas or slot > 1) return error.OutOfRegion;
+    if (padded > max_write) return error.WriteTooLarge;
     if (padded == 0 or padded % 16 != 0 or padded > l.slot) return error.OutOfRegion;
     const packs = padded / 16;
     var offset: u64 = 0;

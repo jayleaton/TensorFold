@@ -15,6 +15,9 @@ pub const Fallback = enum { nccl, @"error" };
 
 pub const Error = error{BadSetting};
 
+/// RoCE's per-write cap (roce_verbs.max_write): a setting whose slot or post would pass it fails boot, never clamped.
+pub const max_rdma_write: usize = @import("roce_verbs.zig").max_write;
+
 /// TF_DSV41_PLAN_PIN: the CPU the plan threads pin to at their first plan (auto: the highest cpu_capacity).
 pub const PlanPin = union(enum) { auto, cpu: u32 };
 
@@ -83,6 +86,10 @@ pub const Config = struct {
         };
         c.mailbox_max_bytes = 1024 * try int(usize, get, alias(get, "TF_TP_MAILBOX_MAX_KB", "GLM53_TF_ROCE_MAX_KB"), 256, 4, 16 * 1024);
         c.roce_var_bytes = 1024 * try int(usize, get, "TF_TP_ROCE_VAR_KB", 0, 0, 32 * 1024);
+        if (c.roceSlotBytes() > max_rdma_write) {
+            std.log.warn("TF_TP_MAILBOX_MAX_KB / GLM53_TF_ROCE_MAX_KB = {d} KiB, TF_TP_ROCE_VAR_KB = {d} KiB: an RDMA write is capped at {d} KiB; refusing to start", .{ c.mailbox_max_bytes / 1024, c.roce_var_bytes / 1024, max_rdma_write / 1024 });
+            return error.BadSetting;
+        }
         c.mailbox_timeout_ns = try seconds(get, "TF_TP_MAILBOX_TIMEOUT_S", 120, 0.001, 86400);
         if (get("TF_DSV41_FAILFAST")) |v| c.failfast = !(std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "off"));
         c.grace_ns = try seconds(get, "TF_DSV41_FAILFAST_GRACE_S", 1.0, 0, 60);
@@ -237,10 +244,19 @@ test "bad settings are refused and the digest ignores the rank" {
     var v = a;
     v.roce_var_bytes = 10 << 20;
     try std.testing.expect(!std.mem.eql(u8, &a.digest(), &v.digest()));
-    Fake.pairs = &.{ .{ "TF_COMM_BACKEND", "roce" }, .{ "TF_TP_ROCE_VAR_KB", "10240" } };
-    try std.testing.expectEqual(@as(usize, 10 << 20), (try Config.parse(&Fake.get)).roce_var_bytes);
+    Fake.pairs = &.{ .{ "TF_COMM_BACKEND", "roce" }, .{ "TF_TP_ROCE_VAR_KB", "1024" } };
+    try std.testing.expectEqual(@as(usize, 1 << 20), (try Config.parse(&Fake.get)).roce_var_bytes);
     Fake.pairs = &.{.{ "TF_TP_ROCE_VAR_KB", "65536" }};
     try std.testing.expectError(error.BadSetting, Config.parse(&Fake.get));
+}
+
+test "boot refuses any setting that asks for an RDMA write past 1 MiB" {
+    for ([_][2][]const u8{ .{ "TF_TP_ROCE_VAR_KB", "10240" }, .{ "TF_TP_ROCE_VAR_KB", "1025" }, .{ "GLM53_TF_ROCE_MAX_KB", "2048" }, .{ "TF_TP_MAILBOX_MAX_KB", "1028" } }) |kv| {
+        Fake.pairs = &.{ .{ "TF_COMM_BACKEND", "roce" }, kv };
+        try std.testing.expectError(error.BadSetting, Config.parse(&Fake.get));
+    }
+    Fake.pairs = &.{ .{ "TF_COMM_BACKEND", "roce" }, .{ "GLM53_TF_ROCE_MAX_KB", "1024" }, .{ "TF_TP_ROCE_VAR_KB", "1024" } };
+    try std.testing.expectEqual(@as(usize, 1 << 20), (try Config.parse(&Fake.get)).roceSlotBytes());
 }
 
 test "prod.env's names: GLM53_TF_* where ours are unset, the plan link's spin and pin" {

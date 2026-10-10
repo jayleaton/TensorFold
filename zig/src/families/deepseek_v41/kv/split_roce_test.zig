@@ -26,7 +26,7 @@ fn prodEnv(name: []const u8) ?[]const u8 {
     return null;
 }
 
-/// The 10-10 21:13 test's settings: prod's plus TF_TP_ROCE_VAR_KB=10240.
+/// The 10-10 21:13 test's settings: prod's plus TF_TP_ROCE_VAR_KB=10240 (boot must refuse it).
 fn varEnv(name: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, name, "TF_TP_ROCE_VAR_KB")) return "10240";
     return prodEnv(name);
@@ -274,36 +274,49 @@ test "prod's settings: every split exchange's RoCE post fits the 1 MiB slot and 
     }
 }
 
-test "TF_TP_ROCE_VAR_KB=10240: packed strides up to 10 MiB post on RoCE (prod never does), still inside the MR" {
-    const ctx = try runAt(varEnv);
-    for (ctx.seen, ctx.big_roce) |s, big| {
-        try testing.expectEqual(@as(u64, 10240 << 10), s.slot);
-        try testing.expectEqual(@as(u64, 0), s.outside);
-        try testing.expect(big > 0 and s.max_padded > 1 << 20);
+test "TF_TP_ROCE_VAR_KB=10240 (the 10-10 run's setting) fails boot; a RoCE slot past the write cap is refused too" {
+    try testing.expectError(error.BadSetting, tp.Config.parse(varEnv));
+    const l = try tp.bootstrap.testListener();
+    defer tp.sock.close(l.fd);
+    var ctx: Big = .{ .port = l.port, .lfd = l.fd };
+    try tp.host.run(2, &ctx, bigSlot);
+    for (ctx.errs) |e| try testing.expectEqual(@as(?anyerror, error.WriteTooLarge), e);
+}
+
+const Big = struct { port: u16, lfd: tp.sock.Fd, errs: [2]?anyerror = .{ null, null } };
+
+fn bigSlot(_: tp.Collective, me: u32, ctx: *Big) anyerror!void {
+    var b = if (me == 0) try tp.Bootstrap.acceptOn(ctx.lfd, 2, 10 * std.time.ns_per_s) else try tp.Bootstrap.open(.{ .world = 2, .rank = 1, .link_port = ctx.port, .connect_timeout_ns = 10 * std.time.ns_per_s });
+    defer b.close();
+    if (roce.Roce.init(null, &b, "", .{ .wire = .shm, .max_bytes = (1 << 20) + 4096 })) |r| r.deinit() else |e| {
+        ctx.errs[me] = e;
     }
 }
 
-test "the RoCE post guard: the 10-10 failing shape fits; an oversize, misaligned or foreign-slot post is refused before a verb" {
-    const var_slot: u64 = 10240 << 10;
-    const l: rv.Layout = .{ .send = 8192, .recv = 8192 + 2 * var_slot, .flags = 4096, .slot = var_slot, .len = roce.Roce.regionBytes(var_slot) };
+test "the RoCE post guard: no write past 1 MiB whatever the slot; oversize, misaligned or foreign-slot posts refused before a verb" {
+    const big_slot: u64 = 10240 << 10;
+    const l: rv.Layout = .{ .send = 8192, .recv = 8192 + 2 * big_slot, .flags = 4096, .slot = big_slot, .len = roce.Roce.regionBytes(big_slot) };
     var out: [rv.max_hcas]rv.Stripe = undefined;
-    // fam 1, R 32: a 9,568,256 B stride; the most a rank packs is the whole stride
-    try rv.stripes(l, 2, 1, 32 * K * rb, &out);
-    try testing.expectEqual(@as(u64, l.send + var_slot), out[0].local);
-    try testing.expectEqual(@as(u32, 32 * K * rb / 2), out[1].len);
-    try testing.expectEqual(l.recv + var_slot + 32 * K * rb, out[1].remote + out[1].len);
-    try testing.expectError(error.OutOfRegion, rv.stripes(l, 2, 1, @intCast(var_slot + 16), &out));
-    // slot 0 past its end stays inside the MR but writes slot 1: only the slot bounds refuse it
-    try testing.expectError(error.OutOfRegion, rv.stripes(l, 2, 0, @intCast(var_slot + 16), &out));
-    try testing.expectError(error.OutOfRegion, rv.stripes(l, 2, 0, 24, &out));
-    try testing.expectError(error.OutOfRegion, rv.stripes(l, 2, 2, 16, &out));
-    try testing.expectError(error.OutOfRegion, rv.stripes(l, 3, 0, 16, &out));
-    // a layout whose registered length is short of its slots: every post refused, not posted past the MR
-    var short = l;
+    // fam 1, R 32's 9,568,256 B stride (the 10-10 fault) and 1 MiB + 16: refused although the slot holds them
+    try testing.expectError(error.WriteTooLarge, rv.stripes(l, 2, 1, 32 * K * rb, &out));
+    try testing.expectError(error.WriteTooLarge, rv.stripes(l, 2, 0, (1 << 20) + 16, &out));
+    try rv.stripes(l, 2, 1, 1 << 20, &out);
+    try testing.expectEqual(@as(u64, l.send + big_slot), out[0].local);
+    try testing.expectEqual(l.recv + big_slot + (1 << 20), out[1].remote + out[1].len);
+    // a 512 KiB slot: slot 0 past its end stays inside the MR but writes slot 1; only the slot bounds refuse it
+    const s5: u64 = 512 << 10;
+    const m: rv.Layout = .{ .send = 8192, .recv = 8192 + 2 * s5, .flags = 4096, .slot = s5, .len = roce.Roce.regionBytes(s5) };
+    try testing.expectError(error.OutOfRegion, rv.stripes(m, 2, 0, @intCast(s5 + 16), &out));
+    try testing.expectError(error.OutOfRegion, rv.stripes(m, 2, 1, @intCast(s5 + 16), &out));
+    try testing.expectError(error.OutOfRegion, rv.stripes(m, 2, 0, 24, &out));
+    try testing.expectError(error.OutOfRegion, rv.stripes(m, 2, 2, 16, &out));
+    try testing.expectError(error.OutOfRegion, rv.stripes(m, 3, 0, 16, &out));
+    // a layout whose registered length is short of its slots: the post refused, not posted past the MR
+    var short = m;
     short.len -= 16;
-    try testing.expectError(error.OutOfRegion, rv.stripes(short, 2, 1, @intCast(var_slot), &out));
+    try testing.expectError(error.OutOfRegion, rv.stripes(short, 2, 1, @intCast(s5), &out));
     // a peer whose slot or region differs is refused at connect
-    const mine: rv.Record = .{ .n_hca = 1, .slot_bytes = var_slot, .region_len = l.len };
+    const mine: rv.Record = .{ .n_hca = 1, .slot_bytes = s5, .region_len = m.len };
     var peer = mine;
     peer.slot_bytes = 1 << 20;
     try testing.expectError(error.BadRecord, rv.VerbsWire.pairing(mine, peer));

@@ -169,6 +169,7 @@ pub const Roce = struct {
     /// `error.RoceUnavailable` (the setup is collective, as in roce.py); `image` empty: host-only (no kernel).
     pub fn init(d: ?*const cuda.Driver, b: *Bootstrap, image: []const u8, o: Options) !*Roce {
         if (b.world != 2) return error.Unsupported;
+        if (o.max_bytes > rv.max_write) return error.WriteTooLarge; // a slot no post could fill in one write
         const slot = std.mem.alignForward(usize, o.max_bytes, 4096);
         const len = regionBytes(slot);
         const r = try std.heap.page_allocator.create(Roce);
