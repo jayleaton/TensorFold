@@ -653,6 +653,7 @@ The Zig server answers as prod's Python server does. Prod's DeepSeek app (`deeps
 | `/tokenize` | `count`, `max_model_len`, `tokens`, `token_strs: null` | no `token_strs` | = prod |
 | Request log | `reqlog.py` (blake2b-64, prefix fields, rotation) | upstream's body log | = prod (`TF_DSV41_REQUEST_LOG`, `GLM53_TF_REQUEST_LOG_*`) |
 | Disconnect | `TF_DSV41_DISCONNECT` (socket check every round) | always on | = prod (`0`: a failed write only) |
+| Stop (SIGTERM / SIGINT) | exits | closes the listener, exits after 2 s | drains: new generation requests 503 + `Retry-After: 30` (`code: server_restarting`; Anthropic `overloaded_error`), `/health` 503 `"status": "draining"`; in-progress requests finish for up to `TF_DSV41_DRAIN_S` / `GLM53_TF_DRAIN_S` (20 s; a second signal cuts it short); then the rounds stop at a round boundary, what is left ends `server restarting` (a stream's `server_error` event and `[DONE]`), the followers get op_stop and the fate STOP (exit 0, not 70). The watchdog reads one draining tick as one bad tick (heals only after `WATCH_FAILS` in a row); the drain ends in exit 0 |
 | Startup | greedy warning (public PR #14); `serving: N slot(s)` | neither | both |
 | Concurrency, admission | batcher, 4 slots | LaneHost; `TF_DSV41_SLOTS` (slots-1) | engine-side, not the server's |
 | Grammar (`response_format` enforced, `tool_choice` required / named) | xgrammar | none | `dsq-zig-grammar-1` |
