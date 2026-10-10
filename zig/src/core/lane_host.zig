@@ -16,12 +16,18 @@ const Reason = api.Reason;
 const Stats = api.Stats;
 const SubmitError = api.SubmitError;
 
+pub const Rounds = rounds.Rounds;
+pub const Proposers = rounds.Proposers;
+const rounds = @import("lane_rounds.zig");
+
 pub const LaneHost = struct {
     gpa: Allocator,
     io: std.Io,
     core: *lanes.Engine,
     info_: Info,
     min_match: i64 = 4,
+    /// A family's own copy proposer for each request (null: lanes.SuffixLookup at `min_match`)
+    proposers: ?Proposers = null,
     mutex: std.Io.Mutex = .init,
     wake: std.Io.Condition = .init,
     queued: std.ArrayList(*Job) = .empty,
@@ -44,21 +50,32 @@ pub const LaneHost = struct {
     learner: ?api.Learner = null, // the family's Sliding Weights learner; null: learn requests are refused
     lessons: std.ArrayList(Lesson) = .empty, // learn requests waiting for an idle engine
     lesson_open: bool = false, // the learner holds a begun job (engine thread only)
+    /// Runs first on the engine thread: a backend whose API state is per thread (a CUDA context) binds it there.
+    on_thread: ?ThreadInit = null,
+    /// a family's round planner (prompts in pieces between decode rounds); null: whole prompts at admission
+    rounds: ?Rounds = null,
+    pieces: std.ArrayList(Rounds.Piece) = .empty,
+    finals: std.ArrayList(usize) = .empty,
+
+    pub const ThreadInit = struct { ctx: *anyopaque, run: *const fn (ctx: *anyopaque) anyerror!void };
 
     const Mark = struct { at: i96, tokens: u64 };
     const Lesson = struct { request: *const api.LearnRequest, sink: api.LearnSink };
     const window_ns: i96 = 2 * std.time.ns_per_s;
 
-    const Job = struct {
+    pub const Job = struct {
         host: *LaneHost,
         id: Id,
         request: *const Request,
         sink: Sink,
         stream: lanes.Stream = undefined,
         proposer: lanes.SuffixLookup = undefined,
+        /// the family's proposer (LaneHost.proposers), in place of `proposer`
+        custom: ?lanes.proposer.Proposer = null,
         delivered: usize = 0,
         started: bool = false,
         prefill_sent: bool = false, // a lone driver's prefilled event went out
+        submitted: i96 = 0,
         began: i96 = 0,
         prefilled: ?i96 = null,
         entry: ?*pc.Entry = null, // the kept state the backend restores, until its prompt pass reports
@@ -90,6 +107,7 @@ pub const LaneHost = struct {
     }
 
     pub fn start(h: *LaneHost) !void {
+        if (h.rounds != null and !h.core.backend.pieces()) return error.PiecesUnsupported; // a drafter wrapper runs whole prompts
         h.thread = try std.Thread.spawn(.{ .stack_size = 16 << 20 }, run, .{h});
     }
 
@@ -109,6 +127,8 @@ pub const LaneHost = struct {
         h.cancels.deinit(h.gpa);
         h.decoded.deinit(h.gpa);
         h.live_tokens.deinit(h.gpa);
+        h.pieces.deinit(h.gpa);
+        h.finals.deinit(h.gpa);
     }
 
     pub fn engine(h: *LaneHost) Engine {
@@ -126,13 +146,13 @@ pub const LaneHost = struct {
     }
 
     /// Learning runs only when nothing else waits: no stream, queued request or cancel (called under the lock).
-    fn learnable(h: *const LaneHost) bool {
+    pub fn learnable(h: *const LaneHost) bool {
         const work = h.lesson_open or h.lessons.items.len > 0;
         return h.learner != null and work and h.queued.items.len == 0 and h.admitted.items.len == 0 and h.cancels.items.len == 0;
     }
 
     /// One unit of learning: open the next lesson if none is open, then step it; moved weights drop every kept prompt.
-    fn learnStep(h: *LaneHost) void {
+    pub fn learnStep(h: *LaneHost) void {
         const learner = h.learner.?;
         if (!h.lesson_open) {
             h.lock();
@@ -165,7 +185,7 @@ pub const LaneHost = struct {
     fn submitFn(ctx: *anyopaque, id: Id, request: *const Request, sink: Sink) SubmitError!void {
         const h = self(ctx);
         const job = h.gpa.create(Job) catch return error.Busy;
-        job.* = .{ .host = h, .id = id, .request = request, .sink = sink };
+        job.* = .{ .host = h, .id = id, .request = request, .sink = sink, .submitted = std.Io.Clock.awake.now(h.io).toNanoseconds() };
         h.mutex.lockUncancelable(h.io);
         defer h.mutex.unlock(h.io);
         if (h.closing) {
@@ -243,7 +263,7 @@ pub const LaneHost = struct {
     }
 
     /// Sends a stream's new tokens; true once it has finished (its job freed).
-    fn deliver(h: *LaneHost, job: *Job) bool {
+    pub fn deliver(h: *LaneHost, job: *Job) bool {
         h.send(job);
         if (!job.stream.finished) return false;
         const reason: Reason = switch (job.stream.reason) {
@@ -256,7 +276,8 @@ pub const LaneHost = struct {
         return true;
     }
 
-    fn finish(h: *LaneHost, job: *Job, reason: Reason, message: []const u8) void {
+    pub fn finish(h: *LaneHost, job: *Job, reason: Reason, message: []const u8) void {
+        if (h.rounds) |rd| rd.vtable.left(rd.ctx, @intFromPtr(job));
         job.reported();
         h.gpa.free(job.marks);
         const s = &job.stream;
@@ -264,7 +285,7 @@ pub const LaneHost = struct {
         emit(job, .{ .finished = .{ .reason = reason, .stats = stats, .message = message } });
         if (job.started) {
             s.deinit(h.gpa);
-            job.proposer.deinit();
+            h.freeProposer(job);
         }
         h.gpa.destroy(job);
     }
@@ -284,7 +305,7 @@ pub const LaneHost = struct {
     }
 
     /// Cancels queued and admitted jobs named since the last round.
-    fn takeCancels(h: *LaneHost) void {
+    pub fn takeCancels(h: *LaneHost) void {
         h.mutex.lockUncancelable(h.io);
         const ids = h.gpa.dupe(Id, h.cancels.items) catch &.{};
         h.cancels.clearRetainingCapacity();
@@ -311,11 +332,11 @@ pub const LaneHost = struct {
         h.gpa.free(ids);
     }
 
-    fn lock(h: *LaneHost) void {
+    pub fn lock(h: *LaneHost) void {
         h.mutex.lockUncancelable(h.io);
     }
 
-    fn unlock(h: *LaneHost) void {
+    pub fn unlock(h: *LaneHost) void {
         h.mutex.unlock(h.io);
     }
 
@@ -333,6 +354,22 @@ pub const LaneHost = struct {
             return true;
         };
         h.unlock();
+        if (!h.openStream(job)) return true;
+        const began = job.began;
+        if (h.loneFits(job)) return h.runLone(job, began);
+        h.core.addStream(&job.stream) catch |e| return if (e == error.Cancelled) h.cancel(job) else h.drop(job, h.words(e));
+        h.prefilled(job, began);
+        if (h.deliver(job)) h.remove(job);
+        return true;
+    }
+
+    /// An admitted job's stream (its kept prefix looked up, its drafter): false when it failed (the job is finished).
+    fn freeProposer(h: *LaneHost, job: *Job) void {
+        if (job.custom) |c| h.proposers.?.free(h.proposers.?.ctx, c) else job.proposer.deinit();
+        job.custom = null;
+    }
+
+    pub fn openStream(h: *LaneHost, job: *Job) bool {
         const r = job.request;
         var reuse: lanes.stream.Reuse = .{};
         // the entry stays alive until the backend restores it: nothing keeps between here and this stream's own pass
@@ -342,7 +379,9 @@ pub const LaneHost = struct {
             job.marks = l.marks;
             reuse = .{ .saved = if (l.entry) |e| e.saved else null, .at = if (l.entry) |e| e.at else 0, .marks = l.marks, .hook = .{ .ptr = job, .at = Job.kept } };
         } else |_| {};
-        job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch return h.drop(job, "the drafter could not start");
+        if (h.proposers) |ps| {
+            job.custom = ps.make(ps.ctx, h.gpa, r.prompt, r.eos) catch return !h.drop(job, "the drafter could not start");
+        } else job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch return !h.drop(job, "the drafter could not start");
         job.stream = lanes.Stream.init(h.gpa, .{
             .id = "request",
             .prompt = r.prompt,
@@ -350,7 +389,7 @@ pub const LaneHost = struct {
             .eos = r.eos,
             .sampling = r.sampling,
             .drafts = r.drafts,
-            .proposer = job.proposer.proposer(),
+            .proposer = job.custom orelse job.proposer.proposer(),
             .stop_check = if (r.stop) |s| .{ .ptr = s.ctx, .check = s.check } else null,
             .cancel_check = .{ .ptr = job, .check = cancelled },
             .think_budget = r.think_budget,
@@ -361,20 +400,15 @@ pub const LaneHost = struct {
             .chunks = r.chunks,
             .reuse = reuse,
         }) catch {
-            job.proposer.deinit();
-            return h.drop(job, "out of memory");
+            h.freeProposer(job);
+            return !h.drop(job, "out of memory");
         };
         job.started = true;
-        const began = std.Io.Clock.awake.now(h.io).toNanoseconds();
-        job.began = began;
-        if (h.loneFits(job)) return h.runLone(job, began);
-        h.core.addStream(&job.stream) catch |e| return if (e == error.Cancelled) h.cancel(job) else h.drop(job, h.words(e));
-        h.prefilled(job, began);
-        if (h.deliver(job)) h.remove(job);
+        job.began = std.Io.Clock.awake.now(h.io).toNanoseconds();
         return true;
     }
 
-    fn prefilled(h: *LaneHost, job: *Job, began: i96) void {
+    pub fn prefilled(h: *LaneHost, job: *Job, began: i96) void {
         const done = std.Io.Clock.awake.now(h.io).toNanoseconds();
         h.lock();
         if (done > began) h.prefill_rate = @as(f64, @floatFromInt(job.request.prompt.len - job.stream.cached)) / (@as(f64, @floatFromInt(done - began)) / 1e9);
@@ -438,12 +472,12 @@ pub const LaneHost = struct {
         return true;
     }
 
-    fn words(h: *const LaneHost, e: anyerror) []const u8 {
+    pub fn words(h: *const LaneHost, e: anyerror) []const u8 {
         const x = h.explain orelse return @errorName(e);
         return x.text(x.ctx, e) orelse @errorName(e);
     }
 
-    fn drop(h: *LaneHost, job: *Job, message: []const u8) bool {
+    pub fn drop(h: *LaneHost, job: *Job, message: []const u8) bool {
         h.remove(job);
         if (job.started and !job.stream.finished) h.core.discard(&job.stream);
         h.finish(job, .failed, message);
@@ -457,7 +491,7 @@ pub const LaneHost = struct {
         return true;
     }
 
-    fn remove(h: *LaneHost, job: *Job) void {
+    pub fn remove(h: *LaneHost, job: *Job) void {
         h.lock();
         defer h.unlock();
         for (h.admitted.items, 0..) |j, i| if (j == job) {
@@ -466,7 +500,7 @@ pub const LaneHost = struct {
         };
     }
 
-    fn noteLive(h: *LaneHost) void {
+    pub fn noteLive(h: *LaneHost) void {
         h.lock();
         defer h.unlock();
         h.live_tokens.clearRetainingCapacity();
@@ -478,6 +512,8 @@ pub const LaneHost = struct {
     }
 
     fn run(h: *LaneHost) void {
+        if (h.on_thread) |t| t.run(t.ctx) catch |e| std.log.err("lane host: the engine thread's init failed ({t})", .{e});
+        if (h.rounds) |rd| return rounds.run(h, rd);
         while (true) {
             h.takeCancels();
             while (h.admitOne()) {}
@@ -523,7 +559,8 @@ pub const LaneHost = struct {
     }
 
     /// A failed round ends every stream it held, with the backend's error.
-    fn failAll(h: *LaneHost, message: []const u8) void {
+    pub fn failAll(h: *LaneHost, message: []const u8) void {
+        std.log.err("lane host: a round failed ({s}): every admitted stream fails", .{message});
         h.lock();
         const jobs = h.gpa.dupe(*Job, h.admitted.items) catch &.{};
         h.admitted.clearRetainingCapacity();
@@ -535,7 +572,7 @@ pub const LaneHost = struct {
         h.gpa.free(jobs);
     }
 
-    fn closeAll(h: *LaneHost) void {
+    pub fn closeAll(h: *LaneHost) void {
         h.lock();
         for (h.queued.items) |job| h.cancels.append(h.gpa, job.id) catch {};
         for (h.admitted.items) |job| h.cancels.append(h.gpa, job.id) catch {};
@@ -546,4 +583,5 @@ pub const LaneHost = struct {
 
 test {
     _ = @import("lane_host_test.zig");
+    _ = @import("lane_rounds_test.zig");
 }

@@ -201,7 +201,7 @@ test "a lane host serves the core's own tokens, in order, and cancels between ro
 }
 
 /// A learner that takes `total` steps over a lesson, then reports it learned in that many.
-const FakeLearner = struct {
+pub const FakeLearner = struct {
     sink: ?api.LearnSink = null,
     steps: u32 = 0,
     total: u32 = 3,
@@ -210,11 +210,11 @@ const FakeLearner = struct {
     fn emit(l: *FakeLearner, event: api.LearnEvent) void {
         l.sink.?.event(l.sink.?.ctx, &event);
     }
-    fn begin(ctx: *anyopaque, request: *const api.LearnRequest, sink: api.LearnSink) anyerror!void {
+    pub fn begin(ctx: *anyopaque, request: *const api.LearnRequest, sink: api.LearnSink) anyerror!void {
         const l: *FakeLearner = @ptrCast(@alignCast(ctx));
         l.* = .{ .sink = sink, .total = l.total, .examples = request.train.len };
     }
-    fn step(ctx: *anyopaque) api.Learner.Step {
+    pub fn step(ctx: *anyopaque) api.Learner.Step {
         const l: *FakeLearner = @ptrCast(@alignCast(ctx));
         l.steps += 1;
         if (l.steps < l.total) return .{ .done = false, .changed = false };
@@ -222,20 +222,20 @@ const FakeLearner = struct {
         l.emit(.{ .done = .{} });
         return .{ .done = true, .changed = true };
     }
-    fn abort(ctx: *anyopaque) void {
+    pub fn abort(ctx: *anyopaque) void {
         const l: *FakeLearner = @ptrCast(@alignCast(ctx));
         l.emit(.{ .done = .{ .message = "aborted" } });
     }
 };
 
 /// Learn events as tags, read on the test's thread once `done` arrives.
-const LearnBox = struct {
+pub const LearnBox = struct {
     mutex: std.Io.Mutex = .init,
     tags: std.ArrayList(std.meta.Tag(api.LearnEvent)) = .empty,
     steps: u32 = 0,
     done: bool = false,
 
-    fn sink(b: *LearnBox) api.LearnSink {
+    pub fn sink(b: *LearnBox) api.LearnSink {
         return .{ .ctx = b, .event = event };
     }
     fn event(ctx: *anyopaque, e: *const api.LearnEvent) void {
@@ -246,7 +246,7 @@ const LearnBox = struct {
         if (e.* == .learned) b.steps = e.learned.steps;
         if (e.* == .done) b.done = true;
     }
-    fn wait(b: *LearnBox) void {
+    pub fn wait(b: *LearnBox) void {
         while (true) {
             b.mutex.lockUncancelable(std.testing.io);
             const d = b.done;
@@ -311,4 +311,102 @@ test "a learn request steps while the engine idles, its events in order; a host 
         if (d) |r| break try std.testing.expectEqual(Reason.length, r);
         std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
     }
+}
+
+test "a failed piece fails its request alone: its final of the same round does not run, the host keeps serving" {
+    // a job dropped for a failed piece must leave the round's finals: `drop` frees it, runFinals must not read it
+    const gpa = std.testing.allocator;
+    var costs: [16]lanes.config.Cost = undefined;
+    for (&costs, 1..) |*c, w| c.* = .{ .width = @intCast(w), .ms = 5.0 + 0.8 * @as(f64, @floatFromInt(w)) };
+    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 16, .gpu_tokens = true, .mtp = true, .speculate = true, .speculate_early = false, .drafts = 4, .window_costs = &costs, .mtp_step_ms = 0.5, .hidden_rows = true, .batch_rows = 32, .max_streams = 8, .draft_streams = true, .join_tail = true }, 16, 15);
+    defer cfg.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa, .fail_pieces = 1 };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.joinBackend(), clock.clock());
+    defer core.deinit();
+    // jobs on the page allocator: a freed job is unmapped, so reading one faults (the testing allocator hides it)
+    const pa = std.heap.page_allocator;
+    var host = LaneHost.init(pa, std.testing.io, &core, .{ .lanes = 4 });
+    // every admitted prompt's rows in one piece and its final in the same round (as for short prompts)
+    const Plan = struct {
+        const Seq = struct { key: usize, n: u64, done: bool = false };
+        seqs: std.ArrayList(Seq) = .empty,
+        fn self(ctx: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(ctx));
+        }
+        fn beginAdmit(_: *anyopaque) void {}
+        fn admit(ctx: *anyopaque, ask: api.Rounds.Ask, _: *[]const u8) api.Rounds.Verdict {
+            self(ctx).seqs.append(gpa, .{ .key = ask.key, .n = ask.prompt.len }) catch return .refuse;
+            return .admit;
+        }
+        fn admitted(_: *anyopaque) anyerror!void {}
+        fn arm(_: *anyopaque, _: usize) void {}
+        fn began(_: *anyopaque, _: usize, _: bool) void {}
+        fn plan(ctx: *anyopaque, pieces: *std.ArrayList(api.Rounds.Piece), finals: *std.ArrayList(usize)) anyerror!void {
+            pieces.clearRetainingCapacity();
+            finals.clearRetainingCapacity();
+            for (self(ctx).seqs.items) |*x| if (!x.done) {
+                // the host's lists: its allocator (it frees them)
+                try pieces.append(pa, .{ .key = x.key, .start = 0, .end = x.n - 1, .save = false });
+                try finals.append(pa, x.key);
+                x.done = true;
+            };
+        }
+        fn left(ctx: *anyopaque, key: usize) void {
+            const p = self(ctx);
+            for (p.seqs.items, 0..) |x, i| if (x.key == key) {
+                _ = p.seqs.orderedRemove(i);
+                return;
+            };
+        }
+        fn after(_: *anyopaque, _: f64, _: f64) void {}
+    };
+    var pl: Plan = .{};
+    defer pl.seqs.deinit(gpa);
+    host.rounds = .{ .ctx = &pl, .vtable = &.{ .begin_admit = Plan.beginAdmit, .admit = Plan.admit, .admitted = Plan.admitted, .arm = Plan.arm, .began = Plan.began, .plan = Plan.plan, .left = Plan.left, .after = Plan.after } };
+    const Box = struct {
+        mutex: std.Io.Mutex = .init,
+        tokens: usize = 0,
+        done: ?Reason = null,
+        fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
+            const b: *@This() = @ptrCast(@alignCast(ctx));
+            b.mutex.lockUncancelable(std.testing.io);
+            defer b.mutex.unlock(std.testing.io);
+            switch (e.*) {
+                .tokens => |t| b.tokens += t.len,
+                .finished => |f| b.done = f.reason,
+                else => {},
+            }
+        }
+        fn wait(b: *@This()) Reason {
+            while (true) {
+                b.mutex.lockUncancelable(std.testing.io);
+                const d = b.done;
+                b.mutex.unlock(std.testing.io);
+                if (d) |r| return r;
+                std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+            }
+        }
+    };
+    const p1 = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6 };
+    const p2 = [_]u32{ 2, 7, 1, 8, 2, 8 };
+    var b1: Box = .{};
+    var b2: Box = .{};
+    var b3: Box = .{};
+    const r1: Request = .{ .prompt = &p1, .max_tokens = 12 };
+    const r2: Request = .{ .prompt = &p2, .max_tokens = 12 };
+    const e = host.engine();
+    // both admitted before the host's first round: the first piece fails, the second's request is served
+    try e.submit(1, &r1, .{ .ctx = &b1, .event = Box.event });
+    try e.submit(2, &r2, .{ .ctx = &b2, .event = Box.event });
+    try host.start();
+    defer host.stop();
+    try std.testing.expectEqual(Reason.failed, b1.wait());
+    try std.testing.expectEqual(Reason.length, b2.wait());
+    try std.testing.expectEqual(@as(usize, 12), b2.tokens);
+    // the host serves the next request
+    try e.submit(3, &r1, .{ .ctx = &b3, .event = Box.event });
+    try std.testing.expectEqual(Reason.length, b3.wait());
+    try std.testing.expectEqual(@as(usize, 12), b3.tokens);
 }
