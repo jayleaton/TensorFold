@@ -25,6 +25,14 @@ pub fn hasImage(ids: []const u32) bool {
     return false;
 }
 
+/// A decode or graphed window never carries image ids: only the prompt's segments fill their rows (refused loudly).
+pub fn checkWindow(ids: []const u32) !void {
+    for (ids, 0..) |t, i| if (isVid(t)) {
+        log.warn("images: a window of {d} rows holds an image position at row {d}; refused", .{ ids.len, i });
+        return error.ImageInWindow;
+    };
+}
+
 const Loc = struct { img: *const held.HeldImage, idx: u32, refs: u32 };
 const Span = struct { buf: cuda.DeviceBuffer, stamp: u64 };
 

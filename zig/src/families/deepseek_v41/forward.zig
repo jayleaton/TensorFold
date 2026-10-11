@@ -266,6 +266,8 @@ pub const Forward = struct {
         }
         const ids = f.ids_own.items;
         if (ids.len == 0 or f.slot.pending != null) return error.BadWindow;
+        // no embed of a window fills image rows (graphed: never; eager: no keep or bias), so image ids fail here
+        try vision_rows.checkWindow(ids);
         // the pool's pages for the window's positions, their table entries up before the launches (every rank alike)
         if (f.kv) |kx| try kx.reserve(f.slot.pos + ids.len);
         if (f.leads()) {

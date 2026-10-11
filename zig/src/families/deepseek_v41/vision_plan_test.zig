@@ -7,6 +7,7 @@ const block_prefill = @import("block_prefill.zig");
 const buffers = @import("buffers.zig");
 const check = @import("m1_check.zig");
 const vision_plan = @import("vision_plan.zig");
+const vision_rows = @import("vision_rows.zig");
 const Config = @import("config.zig").Config;
 
 // the failing gate request's prompt rows (vgate-r1p request 4: one image and its text)
@@ -68,4 +69,11 @@ test "a plan sized with images on holds every role of an image segment at any sp
             try testing.expect(have >= size);
         }
     }
+}
+
+test "a window holding an image position is refused; text and the last vocabulary id pass" {
+    try vision_rows.checkWindow(&.{ 1, 2, 3 });
+    try vision_rows.checkWindow(&.{vision_rows.VBASE - 1});
+    try testing.expectError(error.ImageInWindow, vision_rows.checkWindow(&.{ 5, vision_rows.VBASE }));
+    try testing.expectError(error.ImageInWindow, vision_rows.checkWindow(&.{vision_rows.VBASE + 196}));
 }
