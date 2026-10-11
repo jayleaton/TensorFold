@@ -320,7 +320,16 @@ pub const Roce = struct {
             .shm => true,
         };
         const gpu = if (r.d) |d| d.api.cuCtxSynchronize() == cuda.abi.success else true;
+        var line: [384]u8 = undefined;
+        std.log.info("[tensorfold] tp roce: rank {d} quiesced ({s}): {s}; GPU sync {s}", .{ r.me, if (wire) "drained" else "NOT drained", r.report(&line), if (gpu) "done" else "FAILED" });
         return wire and gpu;
+    }
+
+    fn report(r: *const Roce, buf: []u8) []const u8 {
+        return switch (r.wire) {
+            .verbs => |*v| v.report(buf),
+            .shm => "shm wire",
+        };
     }
 
     fn word(r: *const Roce, i: usize) *std.atomic.Value(u32) {
@@ -339,9 +348,31 @@ pub const Roce = struct {
     /// The HCAs stop: nothing of this rank's goes out and none of the peer's writes lands while the ranks go down.
     fn halt(r: *Roce) void {
         switch (r.wire) {
-            .verbs => |*v| _ = v.halt(),
+            .verbs => |*v| {
+                const ok = v.halt();
+                var line: [384]u8 = undefined;
+                std.log.warn("[tensorfold] tp roce: rank {d} halted{s}: {s}", .{ r.me, if (ok) "" else " (a QP refused ERR)", v.report(&line) });
+            },
             .shm => {},
         }
+    }
+
+    /// Every post of this rank's completed (shm: nothing is ever in flight).
+    pub fn linkIdle(r: *const Roce) bool {
+        return switch (r.wire) {
+            .verbs => |*v| v.idle(),
+            .shm => true,
+        };
+    }
+
+    /// Each HCA's posts and completions (tf-tp-test's idle check).
+    pub fn describeLink(r: *const Roce, buf: []u8) []const u8 {
+        return r.report(buf);
+    }
+
+    /// tf-tp-test's `failfast RANK transport`: the proxy's failure path (`fail`), here with no op in flight.
+    pub fn inject(r: *Roce) void {
+        r.fail("failure injected by tf-tp-test (no RDMA fault)", .{});
     }
 
     /// The transport failed or was aborted: a device may still write to its region.
@@ -424,6 +455,7 @@ pub const Roce = struct {
     /// `allGatherBytes` of n-byte strides where rank r stages and posts only lens[r] bytes (device int32 [2], the same on both
     /// ranks; padded to 16, at least 16: the proxy posts no empty op) and the peer copies lens[r] of them to out + r x n.
     pub fn allGatherV(r: *Roce, s: DevicePtr, o: DevicePtr, n: usize, lens: DevicePtr, stream: collective.Stream) Error!void {
+        if (n > r.slot_bytes) return error.Unsupported; // one op: past a slot is allGatherVChunked's
         if (lens == 0) return error.Invalid;
         return r.launch(.gather, s, o, n, lens, stream);
     }
