@@ -365,3 +365,37 @@ test "the RoCE post guard: no write past 1 MiB whatever the slot; oversize, misa
     peer.slot_bytes = 1 << 20;
     try testing.expectError(error.BadRecord, rv.VerbsWire.pairing(mine, peer));
 }
+
+const Keep = struct { port: u16, lfd: tp.sock.Fd, fail: bool, region: [2]usize = .{ 0, 0 }, len: usize = 0 };
+
+fn keepRank(_: tp.Collective, me: u32, ctx: *Keep) anyerror!void {
+    var b = if (me == 0) try tp.Bootstrap.acceptOn(ctx.lfd, 2, 10 * std.time.ns_per_s) else try tp.Bootstrap.open(.{ .world = 2, .rank = 1, .link_port = ctx.port, .connect_timeout_ns = 10 * std.time.ns_per_s });
+    defer b.close();
+    const r = try roce.Roce.init(null, &b, "", .{ .wire = .shm, .max_bytes = 1 << 20 });
+    ctx.region[me] = @intFromPtr(r.mapping.ptr);
+    ctx.len = r.mapping.len;
+    try b.agree("open", "keep test open");
+    if (ctx.fail and me == 1) r.abort();
+    r.deinit();
+}
+
+/// Whether [at, at + len) is still mapped in this process.
+fn mapped(at: usize, len: usize) bool {
+    var vec: [4096]u8 = undefined;
+    const rc = std.os.linux.mincore(@ptrFromInt(at), @min(len, 4096 * 4096), &vec);
+    return std.os.linux.errno(rc) == .SUCCESS;
+}
+
+test "deinit frees a healthy transport's region and keeps a failed one's registered and mapped until exit" {
+    inline for (.{ false, true }) |fail| {
+        const l = try tp.bootstrap.testListener();
+        defer tp.sock.close(l.fd);
+        var ctx: Keep = .{ .port = l.port, .lfd = l.fd, .fail = fail };
+        const kept0 = roce.Roce.kept.load(.monotonic);
+        try tp.host.run(2, &ctx, keepRank);
+        const kept = roce.Roce.kept.load(.monotonic) - kept0;
+        try testing.expectEqual(@as(u32, if (fail) 1 else 0), kept);
+        try testing.expectEqual(fail, mapped(ctx.region[1], ctx.len));
+        try testing.expect(!mapped(ctx.region[0], ctx.len));
+    }
+}

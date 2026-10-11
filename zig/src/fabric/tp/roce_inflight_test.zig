@@ -135,3 +135,101 @@ test "chunked posts: at most 2 MiB in flight over both HCAs and no write past 1 
         try std.testing.expectEqual(Fake.max_inflight, w.peak.load(.monotonic));
     }
 }
+
+const Halts = struct {
+    var halted: [2]bool = .{ false, false };
+    var flushed_before_halt: u32 = 0;
+    var flushes: u32 = 0;
+
+    fn modifyQp(qp: *abi.Qp, attr: *abi.QpAttr, mask: c_int) callconv(.c) c_int {
+        if (attr.qp_state == abi.qps_err and mask == abi.mask.state) halted[qp.qp_num] = true;
+        return 0;
+    }
+
+    /// No request completes on its own; a halted QP flushes what it holds (error status, as the HCA reports it).
+    fn pollCq(cq: *abi.Cq, _: c_int, wc: [*]abi.Wc) callconv(.c) c_int {
+        const q = cq.handle;
+        if (Fake.len[q] == 0 or !halted[q]) return 0;
+        if (!halted[0] or !halted[1]) flushed_before_halt += 1;
+        Fake.inflight -= Fake.queue[q][Fake.head[q]];
+        Fake.head[q] = (Fake.head[q] + 1) % 512;
+        Fake.len[q] -= 1;
+        flushes += 1;
+        wc[0] = std.mem.zeroes(abi.Wc);
+        wc[0].status = 5; // IBV_WC_WR_FLUSH_ERR
+        return 1;
+    }
+};
+
+test "a failed transport: the QPs go to error and every posted write is flushed before teardown; abort halts" {
+    const region = try std.testing.allocator.alignedAlloc(u8, .fromByteUnits(4096), Roce.regionBytes(slot));
+    defer std.testing.allocator.free(region);
+    Fake.region = region;
+    Fake.reset(1);
+    Halts.halted = .{ false, false };
+    Halts.flushed_before_halt = 0;
+    Halts.flushes = 0;
+    var hw: Hw = .{};
+    var w = hw.wire(region);
+    w.v.api.ibv_modify_qp = Halts.modifyQp;
+    for (&hw.ctx) |*c| c.ops.poll_cq = Halts.pollCq;
+    // two 1 MiB ops posted, neither completed: 2 MiB in flight at the HCAs
+    try w.post(1, 1, slot);
+    try w.post(0, 2, slot);
+    try std.testing.expectEqual(@as(u64, 2 * slot), w.inflight());
+    try std.testing.expect(w.quiesce(std.time.ns_per_s));
+    try std.testing.expect(Halts.halted[0] and Halts.halted[1]);
+    try std.testing.expectEqual(@as(u32, 0), Halts.flushed_before_halt);
+    try std.testing.expectEqual(@as(u32, 4), Halts.flushes);
+    try std.testing.expectEqual(@as(u64, 0), w.inflight());
+    try std.testing.expectEqual(@as(u64, 0), Fake.inflight);
+    // Roce.abort (the fate hook) halts the HCAs too
+    Halts.halted = .{ false, false };
+    @memset(region, 0);
+    var r: Roce = .{ .me = 0, .slot_bytes = slot, .timeout_ns = 1, .region = region, .mapping = region, .wire = .{ .verbs = w }, .cpu = null };
+    r.abort();
+    try std.testing.expect(Halts.halted[0] and Halts.halted[1]);
+    try std.testing.expect(r.failed());
+}
+
+test "a QP whose inline capacity cannot take the 4-byte flag post is refused" {
+    try std.testing.expect(!rv.inlineFits(.{ .max_send_wr = 1, .max_recv_wr = 1, .max_send_sge = 1, .max_recv_sge = 1, .max_inline_data = 3 }));
+    try std.testing.expect(rv.inlineFits(.{ .max_send_wr = 1, .max_recv_wr = 1, .max_send_sge = 1, .max_recv_sge = 1, .max_inline_data = 4 }));
+}
+
+/// /proc/self/smaps' VmFlags of the mapping that starts at `at`.
+fn vmFlags(at: usize, buf: []u8) ![]const u8 {
+    const fd = std.c.open("/proc/self/smaps", .{});
+    if (fd < 0) return error.NoSmaps;
+    defer _ = std.c.close(fd);
+    var n: usize = 0;
+    while (n < buf.len) {
+        const got = std.c.read(fd, buf[n..].ptr, buf.len - n);
+        if (got <= 0) break;
+        n += @intCast(got);
+    }
+    var head: [32]u8 = undefined;
+    const want = try std.fmt.bufPrint(&head, "{x}-", .{at});
+    var lines = std.mem.splitScalar(u8, buf[0..n], '\n');
+    var inside = false;
+    while (lines.next()) |l| {
+        if (std.mem.startsWith(u8, l, want)) inside = true;
+        if (inside and std.mem.startsWith(u8, l, "VmFlags:")) return l;
+    }
+    return error.NotFound;
+}
+
+test "the region is DONTFORK and NOHUGEPAGE before registration" {
+    const len = Roce.regionBytes(slot);
+    const m = try std.posix.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    defer std.posix.munmap(m);
+    const buf = try std.testing.allocator.alloc(u8, 4 << 20);
+    defer std.testing.allocator.free(buf);
+    // smaps: dc = MADV_DONTFORK, nh = MADV_NOHUGEPAGE
+    const before = try vmFlags(@intFromPtr(m.ptr), buf);
+    try std.testing.expect(std.mem.indexOf(u8, before, " dc") == null and std.mem.indexOf(u8, before, " nh") == null);
+    try rv.prepareRegion(m);
+    const flags = try vmFlags(@intFromPtr(m.ptr), buf);
+    try std.testing.expect(std.mem.indexOf(u8, flags, " dc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, flags, " nh") != null);
+}
