@@ -475,7 +475,7 @@ fn named(ps: []const []const u8, name: []const u8) bool {
 }
 
 fn hashArg(h: *std.hash.Wyhash, x: calls.Arg) void {
-    h.update(&.{@intFromEnum(std.meta.activeTag(x))});
+    h.update(&.{@backingInt(std.meta.activeTag(x))});
     switch (x) {
         .t, .opaque_table => |t| {
             h.update(@tagName(t.dt));

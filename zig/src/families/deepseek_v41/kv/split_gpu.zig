@@ -50,7 +50,7 @@ const Rank = struct {
     fn run(r: *Rank, sec: Section, fi: u32, comptime f: anytype, args: anytype) !void {
         const b0, const c0 = .{ r.bad, r.checks };
         _ = try @call(.auto, f, .{r} ++ args);
-        const t = &r.tally[@intFromEnum(sec)][fi];
+        const t = &r.tally[@backingInt(sec)][fi];
         t[0] += r.bad - b0;
         t[1] += r.checks - c0;
     }
@@ -545,7 +545,7 @@ pub fn main(init: std.process.Init) !u8 {
     const dt = @as(f64, @floatFromInt(std.Io.Clock.awake.now(init.io).toNanoseconds() - t0)) / 20e6;
     std.debug.print("rank {d}: {d} entries checked over dense (R 1/6/16, eager + 3 graph replays, ratio 2 and 1), packed vs dense (R 1/6/16/64, eager + 3 graph replays) and {d} union blocks; mismatches {d}; {d:.2} ms a dense round trip incl. host checks\n{s}\n", .{ cfg.rank, r.checks, blocks, r.bad, dt, if (r.bad == 0) "PASS" else "FAIL" });
     for (r.tally, 0..) |t, si| for (t, 0..) |fam, fi| if (fam[1] > 0) {
-        std.debug.print("rank {d}: section {s} fam {d} (ratio {d}): mismatches {d} of {d} checks\n", .{ cfg.rank, @tagName(@as(Rank.Section, @enumFromInt(si))), fi, fams[fi].ratio, fam[0], fam[1] });
+        std.debug.print("rank {d}: section {s} fam {d} (ratio {d}): mismatches {d} of {d} checks\n", .{ cfg.rank, @tagName(@as(Rank.Section, @fromBackingInt(@intCast(si)))), fi, fams[fi].ratio, fam[0], fam[1] });
     };
     // both ranks finish, then close the session (its fate channel) at once, before the slower teardown below
     try r.comm.barrier();
