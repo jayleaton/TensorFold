@@ -30,6 +30,7 @@ pub fn read(ctx: *anyopaque, out: *api.Status, stream_tokens: []u32) void {
         .generation_tokens = h.live_generated,
     };
     fillTotals(h, out);
+    @import("lane_host_watch.zig").fill(h, out, now);
 }
 
 /// A job whose prompt pass has not reported yet is filling; the engine thread publishes that with `fill_on`.

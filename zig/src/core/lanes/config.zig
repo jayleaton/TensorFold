@@ -39,6 +39,8 @@ pub const Model = struct {
     piece_runs: bool = false, // a round's pieces go to the backend in one call (Backend.pieces: one forward over them)
     join_drafts: bool = false, // with join_tail: a round's joined prompts' first drafts in one call (Engine.finishStreams)
     replay_runs: bool = false, // a round's finals go to the backend together first (Backend.finals)
+    head_first: bool = false, // with draft_probabilities: every first draft sized by the head's reach, any prompt path
+    first_tree: bool = true, // a tree head's first drafts become host tokens (Backend.tree); false: a count until round 1
     lane_costs: []const Cost = &.{}, // a lone stream's window ms by rows, up to its widest tree (timed at load)
     lone_copies: bool = true, // a lone stream proposes copies (false: only streams in shared rounds do)
 };
@@ -71,6 +73,8 @@ pub const Config = struct {
     join_drafts: bool = false,
     /// a round's finished prompts to the backend together before their finishes (Backend.finals)
     replay_runs: bool = false,
+    head_first: bool = false, // Model.head_first
+    first_tree: bool = true, // Model.first_tree
     head_lanes: u32 = 0, // a lone stream's lanes at most, the planner picking each round's (0: the depth rule's chain)
     head_depth: u32 = 16, // and their depth at most
     own_prices: bool = true, // the planner prices each pick from the stream's own measured rounds (seeded from the table)
@@ -140,6 +144,8 @@ pub const Config = struct {
             .piece_runs = m.piece_runs,
             .join_drafts = m.join_drafts,
             .replay_runs = m.replay_runs,
+            .head_first = m.head_first,
+            .first_tree = m.first_tree,
             .depth_prior = depth_prior,
             .family_costs = family_costs,
             .shared_costs = try alloc.extendCosts(gpa, timed.items, batch_rows),

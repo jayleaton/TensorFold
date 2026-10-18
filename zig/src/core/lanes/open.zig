@@ -85,7 +85,7 @@ fn openedCommitted(e: *Engine, s: *Stream, reach: Reach, hook: ?be.Committed) !v
         try e.backend.draft(&.{.{ .stream = s, .follow = &.{}, .first = feed, .rows = null, .start = s.prompt_len, .position = position + 1, .depth = d }});
         s.dropHeld(e.gpa);
         s.next = .{ .count = d };
-        if (e.backend.vtable.tree) |tree| if (try tree(e.backend.ptr, s, e.gpa)) |held| {
+        if (e.cfg.first_tree) if (e.backend.vtable.tree) |tree| if (try tree(e.backend.ptr, s, e.gpa)) |held| {
             s.next = held; // a tree head's first drafts as host tokens, as every later round's
         };
     } else if (e.cfg.pipelined and s.logprobs == null and s.grammar == null) {
@@ -113,7 +113,7 @@ fn openedCommitted(e: *Engine, s: *Stream, reach: Reach, hook: ?be.Committed) !v
 /// The first drafts' depth for `reach`.
 pub fn firstDepth(e: *Engine, s: *Stream, reach: Reach) !u32 {
     var who = win.who(s);
-    if (reach == .head and e.cfg.node_probabilities) return @intCast(try e.rule.headDepth(&who, null, win.probe(e)));
+    if ((reach == .head or e.cfg.head_first) and e.cfg.node_probabilities) return @intCast(try e.rule.headDepth(&who, null, win.probe(e)));
     return @intCast(try e.rule.depth(who));
 }
 

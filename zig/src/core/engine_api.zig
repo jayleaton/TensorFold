@@ -39,8 +39,9 @@ pub const CallGate = struct {
 
 /// response_format and the guided_* fields: every token keeps the reply inside this grammar.
 pub const Structure = struct {
-    kind: enum { json, json_schema, regex, choice, grammar, structural_tag },
+    kind: enum { json, json_schema, regex, choice, grammar, structural_tag, tools },
     /// The schema (JSON text), regex, choices (a JSON array), EBNF or structural tag; empty for any JSON object.
+    /// ``tools``: the tool calls held to their schemas (``{"tools", "tool_choice", "parallel_tool_calls"}``).
     text: []const u8 = "",
     /// With thinking on, the grammar starts after this token.
     after: ?u32 = null,
@@ -96,6 +97,8 @@ pub const Request = struct {
     images: []const Image = &.{},
     /// The prompt as the prompt cache matches it (each image's placeholders by its content); empty: ``prompt``.
     cache_key: []const u32 = &.{},
+    /// A family's own prepared images (DeepSeek-V4.1 ``vision/held.zig``, rank 0), held by the server until ``finished``.
+    held_images: ?*const anyopaque = null,
 
     /// The prompt as the prompt cache matches it: an image request's placeholders stand for their images.
     pub fn cacheKey(r: *const Request) []const u32 {
@@ -139,6 +142,8 @@ pub const Stats = struct {
     loop_period: ?u32 = null,
     /// Prompt prefill duration measured by the engine host, in seconds.
     prefill_seconds: ?f64 = null,
+    /// Decode duration (prefill's end to the last token) measured by the engine host; null: the server measures it.
+    decode_seconds: ?f64 = null,
     /// The drafter's own counters as a JSON object, or empty.
     telemetry_json: []const u8 = "",
 };
@@ -325,6 +330,9 @@ pub const MemorySource = struct {
 
 pub const HealthSource = @import("engine_status.zig").HealthSource;
 pub const Status = @import("engine_status.zig").Status;
+pub const PaceStatus = @import("engine_status.zig").PaceStatus;
+pub const GraphStatus = @import("engine_status.zig").GraphStatus;
+pub const GraphsSource = @import("engine_status.zig").GraphsSource;
 
 pub const SubmitError = error{ Closed, Busy, InvalidSpans, Stale }; // Stale: a learner's put-back has not reached the device
 

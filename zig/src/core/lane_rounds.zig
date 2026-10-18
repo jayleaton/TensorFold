@@ -37,6 +37,8 @@ pub const Rounds = struct {
         left: *const fn (ctx: *anyopaque, key: usize) void,
         /// After the round: the pieces' seconds and the decode round's (finals included).
         after: *const fn (ctx: *anyopaque, piece_s: f64, decode_s: f64) void,
+        /// A request cancelled mid-prompt: the row its finished prefix is kept at (a save-only piece), or null.
+        leaving: ?*const fn (ctx: *anyopaque, key: usize) ?u64 = null,
     };
 };
 
@@ -148,12 +150,15 @@ fn round(h: *LaneHost, rd: Rounds) bool {
         did = true;
         runFinals(h);
     }
+    var step_ns: i96 = 0;
     if (h.core.activeCount() > 0) {
         did = true;
+        const s0 = std.Io.Clock.awake.now(h.io).toNanoseconds();
         h.core.step() catch |e| {
             ends.failAll(h, @errorName(e));
             return true;
         };
+        step_ns = std.Io.Clock.awake.now(h.io).toNanoseconds() - s0;
     }
     if (!join and h.finals.items.len > 0) {
         did = true;
@@ -167,6 +172,13 @@ fn round(h: *LaneHost, rd: Rounds) bool {
         i += 1;
     }
     rd.vtable.after(rd.ctx, seconds(t1 - t0), seconds(t2 - t1));
+    if (did) {
+        var rows: u64 = 0;
+        for (h.pieces.items) |piece| if (piece.run) {
+            rows += piece.end - piece.start;
+        };
+        @import("lane_host_watch.zig").round(h, t2, rows, seconds(t1 - t0), seconds(step_ns));
+    }
     return did;
 }
 

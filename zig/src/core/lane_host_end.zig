@@ -2,6 +2,7 @@
 const std = @import("std");
 const fill = @import("lane_host_fill.zig");
 const lane_halt = @import("lane_halt.zig");
+const watch = @import("lane_host_watch.zig");
 const LaneHost = @import("lane_host.zig").LaneHost;
 const Job = LaneHost.Job;
 
@@ -14,6 +15,8 @@ pub fn takeCancels(h: *LaneHost) void {
     defer ids.deinit(h.gpa);
     for (ids.items) |id| {
         var found: ?*Job = null;
+        // a prompt left mid-prefill keeps its finished prefix first, unlocked: only this thread changes `admitted`
+        for (h.admitted.items) |job| if (job.id == id and job.started and !job.stream.finished) watch.keepLeaving(h, job);
         // the status reader walks `admitted` under this lock: the removal joins the walk's critical section
         h.lock();
         for (h.queued.items, 0..) |job, i| if (job.id == id) {

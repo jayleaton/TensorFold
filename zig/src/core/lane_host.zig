@@ -74,9 +74,9 @@ pub const LaneHost = struct {
     rounds: ?Rounds = null,
     pieces: std.ArrayList(Rounds.Piece) = .empty,
     finals: std.ArrayList(usize) = .empty,
+    watch: @import("lane_host_watch.zig").Watch = .{}, // the rounds' pace and the backend's graph caches for /health
 
     pub const ThreadInit = struct { ctx: *anyopaque, run: *const fn (ctx: *anyopaque) anyerror!void };
-
     const Lesson = struct { request: *const api.LearnRequest, sink: api.LearnSink };
 
     pub const Job = struct {
@@ -580,7 +580,7 @@ pub const LaneHost = struct {
                 continue;
             }
             h.unlock();
-            h.core.step() catch |e| {
+            @import("lane_host_watch.zig").step(h) catch |e| {
                 ends.failAll(h, @errorName(e));
                 continue;
             };
