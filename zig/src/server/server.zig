@@ -22,6 +22,8 @@ const live = @import("live.zig");
 const slide_graph = @import("slide_graph.zig");
 const slide_lesson = @import("slide_lesson.zig");
 const cortheon = @import("cortheon/cortheon.zig");
+const family_mod = @import("family.zig");
+const spark = @import("spark.zig");
 const Value = json.Value;
 const Cx = errors.Cx;
 const Allocator = std.mem.Allocator;
@@ -73,6 +75,12 @@ pub const Config = struct {
     identity: Identity = .{},
     /// The process environment GET /v1/benchmark/manifest reads (rank count, revision, the hardware probe); null: none.
     environ: ?*const std.process.Environ.Map = null,
+    /// The checkpoint family's own chat rules (DeepSeek-V4.1); null: the chat template path.
+    family: ?family_mod.Family = null,
+    /// The HTTP surface: upstream TensorFold's, or the Spark servers' (spark.zig: GLM / DeepSeek-V4.1 prod).
+    wire: spark.Wire = .tensorfold,
+    /// The Spark surface's knobs (request log, disconnect, health mode).
+    spark: spark.Settings = .{},
 };
 
 pub const Server = struct {
@@ -94,9 +102,18 @@ pub const Server = struct {
     think_close_end: ?u32 = null,
     metrics: metrics.Metrics,
     store: responses.Store,
+    family: ?family_mod.Family = null,
+    /// The Spark surface's /health bookkeeping and request log (``Config.wire`` spark).
+    health: ?*spark.Health = null,
+    reqlog: ?*spark.RequestLog = null,
+    created: i64 = 0,
     next_id: std.atomic.Value(u64) = .init(1),
     /// Connections open now; a stop waits for them before freeing what they read.
     open_connections: std.atomic.Value(u32) = .init(0),
+    /// A stop is draining (serve.zig): new generation requests get 503 with Retry-After, /health answers "draining"
+    draining: std.atomic.Value(bool) = .init(false),
+    /// Generation requests in progress (routes.post), what a drain waits for; counted before `draining` is read
+    generating: std.atomic.Value(u32) = .init(0),
     /// The idle keepalive on the engine's queue, armed by --keep-warm; null when off or not Metal.
     keepalive: ?*api.keepalive.Keepalive = null,
     preparing: std.atomic.Value(i64) = .init(0),
@@ -119,7 +136,7 @@ pub const Server = struct {
     /// Reads what the template and tokenizer decide once: late system role, think markers, efforts, the forced close.
     pub fn init(gpa: Allocator, io: std.Io, engine: api.Engine, text: model_text.Text, config: Config, keys: ?*auth.Store) !*Server {
         const srv = try gpa.create(Server);
-        srv.* = .{ .gpa = gpa, .io = io, .engine = engine, .info = engine.info(), .text = text, .config = config, .keys = keys, .metrics = .{ .gpa = gpa }, .store = .{ .gpa = gpa }, .arena = .init(gpa), .slide = .init(gpa, io, config.slide_graph), .teacher = .init(gpa) };
+        srv.* = .{ .gpa = gpa, .io = io, .engine = engine, .info = engine.info(), .text = text, .config = config, .keys = keys, .metrics = .{ .gpa = gpa }, .store = .{ .gpa = gpa }, .arena = .init(gpa), .slide = .init(gpa, io, config.slide_graph), .teacher = .init(gpa), .family = config.family };
         errdefer srv.deinit(); // a later step's failure stops the keepalive before the caller closes the engine
         if (!srv.info.text_generation) {
             if (config.cortheon) return error.CortheonRequiresTextGeneration;
@@ -133,6 +150,15 @@ pub const Server = struct {
             };
         };
         const a = srv.arena.allocator();
+        srv.created = std.Io.Clock.real.now(io).toSeconds();
+        if (config.wire == .spark) {
+            srv.health = try a.create(spark.Health);
+            srv.health.?.* = .init(gpa, io, config.spark);
+            if (config.spark.log) |l| {
+                srv.reqlog = try a.create(spark.RequestLog);
+                srv.reqlog.?.* = .init(gpa, io, l, .{ .user = text.tokenId("<|user|>"), .assistant = text.tokenId("<|assistant|>"), .observation = text.tokenId("<|observation|>") });
+            }
+        }
         srv.eos = try a.dupe(u32, text.eosIds());
         if (text.tokenId(reply_text.channel_markers.close) != null) srv.markers = reply_text.channel_markers;
         const source = text.templateSource();
@@ -156,6 +182,8 @@ pub const Server = struct {
     }
 
     pub fn deinit(srv: *Server) void {
+        if (srv.health) |h| h.deinit();
+        if (srv.reqlog) |l| l.deinit();
         if (srv.keepalive) |k| k.stop(); // before the engine's queue goes away
         if (srv.grammars) |g| g.close();
         srv.metrics.deinit();
@@ -179,7 +207,12 @@ pub const Server = struct {
         const options = try json.newObject(cx.a);
         const defaults = if (srv.config.default_sampling) |d| try fields.parseNumbers(cx, d) else null;
         if (defaults) |d| try merge(options, cx, d);
-        try merge(options, cx, try fields.parseNumbers(cx, f));
+        const asked = try fields.parseNumbers(cx, f);
+        // a family whose Python server ignores the request's min_p keeps the default's
+        if (srv.family) |fam| if (!fam.vt.reads_min_p) {
+            _ = asked.object.orderedRemove("min_p");
+        };
+        try merge(options, cx, asked);
         const temp = number(options.get("temperature")) orelse 0;
         if (temp <= 0) return null;
         if (srv.info.greedy_only) return cx.refuse(if ((if (defaults) |d| number(d.get("temperature")) else null) orelse 0 > 0)
@@ -212,8 +245,13 @@ pub const Server = struct {
         }
         if (try grammar.spec(cx, f)) |s| {
             if (!srv.info.structures) return cx.refuse("structured output (response_format and the guided_* fields) is not supported by this engine yet");
-            request.structure = try srv.compiledStructure(cx, s.kind, s.text, s.field, thinking);
-        }
+            // a family's engine compiles its own grammars (DeepSeek-V4.1: core/grammar); else the server's compiler checks it
+            if (srv.family != null and s.kind == .structural_tag) return cx.fail(.request, "{s}: structural tags are not served by this model's grammar engine", .{s.field});
+            request.structure = if (srv.family != null) .{ .kind = s.kind, .text = s.text, .after = if (thinking) srv.text.tokenId(srv.markers.close) else null } else try srv.compiledStructure(cx, s.kind, s.text, s.field, thinking);
+        } else if (f.get("tools_grammar")) |t| if (srv.info.structures and t == .string) {
+            // the output format wins over strict tools; beside a required call it was refused (grammar.refusal)
+            request.structure = .{ .kind = .tools, .text = t.string, .after = if (thinking) srv.text.tokenId(srv.markers.close) else null };
+        };
     }
 
     /// A request's grammar, compiled once here (a 400 with xgrammar's reason when it cannot be enforced).
@@ -284,6 +322,7 @@ pub const Server = struct {
         var conn = http_conn.Conn.init(srv.gpa, accepted.fd, peer) catch return;
         defer conn.deinit();
         conn.timeouts = srv.config.timeouts;
+        conn.spark_wire = srv.config.wire == .spark;
         conn.auth_enabled = srv.keys != null and srv.keys.?.enabled();
         if (conn.auth_enabled) conn.hook = .{ .ctx = srv, .call = countReply };
         var arena: std.heap.ArenaAllocator = .init(srv.gpa);

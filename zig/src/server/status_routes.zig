@@ -5,13 +5,74 @@ const json = @import("json");
 const live = @import("live.zig");
 const routes = @import("routes.zig");
 const manifest = @import("benchmark_manifest.zig");
+const spark = @import("spark.zig");
 const Server = @import("server.zig").Server;
 const Conn = @import("http_conn.zig").Conn;
 const Value = json.Value;
 const Allocator = std.mem.Allocator;
 
+/// /health's queue, graph caches and round pace: what a stuck engine shows before it is called stalled.
+fn queueFields(a: Allocator, o: *json.Object, st: api.Status) Allocator.Error!void {
+    try o.put(a, "queued", try json.intValue(a, st.waiting));
+    try o.put(a, "oldest_queued_s", .{ .float = spark.round(st.oldest_queued_s, 1) });
+    if (st.graph_caches > 0) {
+        const g = try json.newObject(a);
+        for (st.graphs[0..st.graph_caches]) |c| {
+            const y = try json.newObject(a);
+            try y.put(a, "held", try json.intValue(a, c.held));
+            try y.put(a, "captured", try json.intValue(a, c.captured));
+            try y.put(a, "replayed", try json.intValue(a, c.replayed));
+            try y.put(a, "eager", try json.intValue(a, c.eager));
+            try y.put(a, "floor_hits", try json.intValue(a, c.floor_hits));
+            try y.put(a, "under_floor", .{ .bool = c.under_floor });
+            try g.put(a, c.name, .{ .object = y });
+        }
+        try o.put(a, "graphs", .{ .object = g });
+    }
+    const p = st.pace orelse return;
+    const x = try json.newObject(a);
+    try x.put(a, "last_age_s", if (p.last_round_age_s) |v| .{ .float = spark.round(v, 1) } else .null);
+    try x.put(a, "last_s", .{ .float = spark.round(p.last_round_s, 3) });
+    try x.put(a, "decode_s", .{ .float = spark.round(p.decode_s, 4) });
+    try x.put(a, "decode_base_s", .{ .float = spark.round(p.decode_base_s, 4) });
+    try x.put(a, "prefill_rows_s", .{ .float = spark.round(p.prefill_rows_s, 1) });
+    try x.put(a, "prefill_base_rows_s", .{ .float = spark.round(p.prefill_base_rows_s, 1) });
+    try x.put(a, "slow_s", .{ .float = spark.round(p.slow_s, 1) });
+    try o.put(a, "rounds", .{ .object = x });
+}
+
 /// With keys on, health names nothing about the model.
 pub fn health(srv: *Server, conn: *Conn, a: Allocator) !void {
+    // draining: the engine is not asked, it may be stopping
+    const drain = srv.draining.load(.seq_cst);
+    if (srv.health) |h| {
+        // the Spark surface: ok / fatal / stalled and the live totals (503 in strict mode once the engine failed)
+        var streams: ?spark.Streams = null;
+        var st: api.Status = .{};
+        if (!drain) {
+            srv.engine.status(&st, &.{});
+            const lanes = srv.info.lanes;
+            if (lanes > 1) streams = .{ .decoding = st.running -| st.waiting, .prefilling = st.waiting, .max = lanes };
+        }
+        const r = try h.status(a, streams, srv.info.context_window);
+        if (!drain) {
+            try queueFields(a, r.body.object, st);
+            const inflight = if (r.body.object.get("inflight")) |v| @as(usize, @intCast(v.int64() orelse 0)) else 0;
+            if (try h.stuck(a, st, inflight)) |why| {
+                // the watchdog's restart signal: the engine is stuck, not merely busy
+                try r.body.object.put(a, "ok", .{ .bool = false });
+                try r.body.object.put(a, "status", .{ .string = "stalled" });
+                try r.body.object.put(a, "stall_reason", .{ .string = why });
+                return routes.sendValue(conn, a, 503, r.body);
+            }
+            return routes.sendValue(conn, a, r.code, r.body);
+        }
+        try r.body.object.put(a, "ok", .{ .bool = false });
+        try r.body.object.put(a, "status", .{ .string = "draining" });
+        try r.body.object.put(a, "requests_in_progress", try json.intValue(a, srv.generating.load(.seq_cst)));
+        return routes.sendDraining(conn, try json.stringify(a, r.body, .{}));
+    }
+    if (drain) return routes.sendDraining(conn, try std.fmt.allocPrint(a, "{{\"status\": \"draining\", \"requests_in_progress\": {d}}}", .{srv.generating.load(.seq_cst)}));
     var status: api.Status = .{};
     srv.engine.status(&status, &.{});
     if (!status.healthy) return conn.sendJson(503, "{\"status\": \"unavailable\"}");
@@ -60,6 +121,7 @@ pub fn manifestRoute(srv: *Server, conn: *Conn, a: Allocator) !void {
 }
 
 pub fn models(srv: *Server, conn: *Conn, a: Allocator) !void {
+    if (srv.config.wire == .spark) return routes.sendValue(conn, a, 200, try spark.models(a, srv.config.model_ids, srv.config.served_name, srv.created, srv.info.context_window));
     const created = std.Io.Clock.real.now(srv.io).toSeconds();
     const data = try a.alloc(Value, srv.config.model_ids.len);
     const thinks = srv.thinking_switch or srv.effort_levels.len > 0 or srv.think_close.len > 0;
@@ -114,10 +176,10 @@ fn reasoningValue(
 /// Prometheus text, version 0.0.4.
 pub fn metrics(srv: *Server, conn: *Conn, a: Allocator) void {
     var out: std.Io.Writer.Allocating = .init(a);
-    srv.metrics.render(srv.io, &out.writer, srv.engine, srv.info.context_window) catch return;
+    if (srv.health) |h| h.metrics(&out.writer, srv.config.served_name) catch return else srv.metrics.render(srv.io, &out.writer, srv.engine, srv.info.context_window) catch return;
     const body = out.written();
     conn.startResponse(200, null) catch return;
-    conn.addHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8") catch return;
+    conn.addHeader("Content-Type", if (srv.health != null) "text/plain; version=0.0.4" else "text/plain; version=0.0.4; charset=utf-8") catch return;
     var len: [24]u8 = undefined;
     conn.addHeader("Content-Length", std.fmt.bufPrint(&len, "{d}", .{body.len}) catch return) catch return;
     conn.finish(body) catch {};
@@ -294,4 +356,25 @@ test "stats snapshot's memory carries a configured limit and omits none" {
     const without = try statsSnapshot(arena.allocator(), .{}, .{ .active = 5, .peak = 9 }, 0, 0, 0, 0, 0);
     // no limit configured: the key stays out
     try std.testing.expect(without.object.get("memory").?.object.get("limit") == null);
+}
+
+test "health: each graph cache's counts and floor state, by name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var st: api.Status = .{ .graph_caches = 2 };
+    st.graphs[0] = .{ .name = "decode windows", .held = 40, .captured = 41, .replayed = 9000, .eager = 3, .floor_hits = 3, .under_floor = true };
+    st.graphs[1] = .{ .name = "row graphs", .held = 12, .captured = 12, .replayed = 800 };
+    const o = try json.newObject(a);
+    try queueFields(a, o, st);
+    const g = o.get("graphs").?.object;
+    const d = g.get("decode windows").?.object;
+    try std.testing.expectEqual(@as(?i64, 40), d.get("held").?.int64());
+    try std.testing.expectEqual(@as(?i64, 3), d.get("eager").?.int64());
+    try std.testing.expect(d.get("under_floor").?.bool);
+    try std.testing.expect(!g.get("row graphs").?.object.get("under_floor").?.bool);
+    // an engine without graph caches shows none
+    const none = try json.newObject(a);
+    try queueFields(a, none, .{});
+    try std.testing.expect(!none.contains("graphs"));
 }

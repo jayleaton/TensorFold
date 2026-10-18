@@ -13,6 +13,9 @@ const slide_key = @import("slide_key.zig");
 const api = @import("engine_api");
 const recall_open = @import("recall_open.zig");
 const benchmark = @import("benchmark.zig");
+const deepseek = @import("deepseek.zig");
+const model_text = @import("model_text.zig");
+const family = @import("family.zig");
 const checkpoint_cli = @import("checkpoint_cli");
 
 const usage_line = "usage: tensorfold serve [-h] [--host HOST] [--port PORT] [--name NAME] [--chat-template FILE]" ++
@@ -112,31 +115,53 @@ pub fn main(init: std.process.Init) !u8 {
         if (!try engines.follow(a, gpa, io, dir, model_type, args, &problem)) return fail(problem);
         return 0;
     }
+    // DeepSeek-V4.1 has its own tokenizer, encoding and reply rules; every other family reads its chat template
+    var ds: ?*deepseek.DeepSeek = null;
+    defer if (ds) |d| d.deinit(true);
+    if (std.mem.eql(u8, model_type, deepseek.model_type)) {
+        if (args.recall) return fail("--recall needs a chat-template model's tokenizer; DeepSeek-V4.1 serves its own");
+        if (args.chat_template != null) return fail("--chat-template: DeepSeek-V4.1 renders its own encoding, not a template");
+        const options = deepseek.Options.fromEnv(init.environ_map, &problem) catch return fail(problem);
+        ds = deepseek.DeepSeek.load(gpa, io, dir, options, &problem) catch return fail(problem);
+    }
     var text_arena: std.heap.ArenaAllocator = .init(gpa); // the text's problem, written on its own thread
     defer text_arena.deinit();
     var text_problem: []const u8 = "";
-    const up = startup.both(io, loadText, .{ gpa, io, dir, args.chat_template, text_arena.allocator(), &text_problem }, engines.open, .{ a, gpa, io, dir, model_type, args, &problem }) catch |e| {
-        if (text_problem.len > 0) return fail(text_problem);
-        if (problem.len > 0) return fail(problem); // an engine that failed after saying why
-        return e;
-    } orelse return fail(problem);
-    defer up.text.deinit();
+    var hf: ?*hf_text.HfText = null;
+    defer if (hf) |t| t.deinit();
+    var opened: engines.Opened = undefined;
+    if (ds == null) {
+        const up = startup.both(io, loadText, .{ gpa, io, dir, args.chat_template, text_arena.allocator(), &text_problem }, engines.open, .{ a, gpa, io, dir, model_type, args, &problem }) catch |e| {
+            if (text_problem.len > 0) return fail(text_problem);
+            if (problem.len > 0) return fail(problem); // an engine that failed after saying why
+            return e;
+        } orelse return fail(problem);
+        hf = up.text;
+        opened = up.engine;
+    } else opened = try engines.open(a, gpa, io, dir, model_type, args, &problem) orelse return fail(problem);
+    const text = if (ds) |d| d.text() else hf.?.text();
+    const fam: ?family.Family = if (ds) |d| d.family_() else null;
     var record: ?*@import("engine_api").recall_store.Store = null;
     defer if (record) |r| r.close(); // after the engine below has stopped reading it
-    defer up.engine.close(up.engine.ctx);
+    var closer: Closer = .{ .opened = opened };
+    defer closer.closeOnce();
     const served = hub.servedName(args.name, args.model, dir);
     problem = "";
-    record = recall_open.open(gpa, io, a, args, up.text, served, &problem) catch |e| {
+    if (hf) |t| record = recall_open.open(gpa, io, a, args, t, served, &problem) catch |e| {
         return if (problem.len > 0) fail(problem) else e;
     };
-    if (record) |r| if (!up.engine.engine.attachRecall(r)) return fail(not_lanes);
+    if (record) |r| if (!opened.engine.attachRecall(r)) return fail(not_lanes);
     return serve.run(gpa, io, args, .{
-        .engine = up.engine.engine,
-        .text = up.text.text(),
+        .stop = .{ .ctx = &closer, .halt = if (opened.halt != null) Closer.halt else null, .close = Closer.close },
+        .engine = opened.engine,
+        .text = text,
+        .family = fam,
         .served = served,
         .recall = record,
         .model_dir = dir,
-        .sampling = try sampling(a, io, dir, args),
+        .sampling = try sampling(a, io, dir, args, fam != null),
+        // DeepSeek-V4.1's Python app is the Spark server's: the same HTTP surface (TENSORFOLD_WIRE overrides)
+        .wire = wire(init.environ_map, fam != null) orelse return fail("TENSORFOLD_WIRE: expected spark or tensorfold"),
         .environ = init.environ_map,
         .started = started,
         .identity = engines.identity(a, args),
@@ -158,6 +183,34 @@ fn loadText(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, template: ?[]co
     };
 }
 
+/// Closes once: serve.run closes the engine before freeing the server, main's defer covers paths that end before it.
+const Closer = struct {
+    opened: engines.Opened,
+    closed: bool = false,
+
+    fn closeOnce(c: *Closer) void {
+        if (c.closed) return;
+        c.closed = true;
+        c.opened.close(c.opened.ctx);
+    }
+
+    fn close(ctx: *anyopaque) void {
+        closeOnce(@ptrCast(@alignCast(ctx)));
+    }
+
+    fn halt(ctx: *anyopaque, reason: []const u8) void {
+        const c: *Closer = @ptrCast(@alignCast(ctx));
+        if (c.opened.halt) |h| h(c.opened.ctx, reason);
+    }
+};
+
+fn wire(env: ?*const std.process.Environ.Map, family_default: bool) ?@import("spark.zig").Wire {
+    const raw = if (env) |m| m.get("TENSORFOLD_WIRE") else null;
+    const t = std.mem.trim(u8, raw orelse "", " \t");
+    if (t.len == 0) return if (family_default) .spark else .tensorfold;
+    return std.meta.stringToEnum(@import("spark.zig").Wire, t);
+}
+
 fn fail(message: []const u8) u8 {
     std.debug.print("tensorfold: {s}\n", .{message});
     return 1;
@@ -172,8 +225,13 @@ fn modelType(a: std.mem.Allocator, io: std.Io, dir: []const u8, problem: *[]cons
 }
 
 /// generation_config.json's sampling (``do_sample`` false is greedy), then the serve flags over it.
-fn sampling(a: std.mem.Allocator, io: std.Io, dir: []const u8, args: cli.Args) !?json.Value {
+fn sampling(a: std.mem.Allocator, io: std.Io, dir: []const u8, args: cli.Args, python_defaults: bool) !?json.Value {
     const out = try json.newObject(a);
+    if (python_defaults) { // the Spark server's own defaults under the checkpoint's and the flags (DeepSeek-V4.1)
+        try out.put(a, "temperature", .{ .float = 1.0 });
+        try out.put(a, "top_k", .{ .int = "20" });
+        try out.put(a, "top_p", .{ .float = 0.95 });
+    }
     const path = try std.fs.path.join(a, &.{ dir, "generation_config.json" });
     if (std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20))) |bytes| {
         if ((try json.parse(a, bytes)) == .ok) {

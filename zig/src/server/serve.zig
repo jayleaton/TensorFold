@@ -11,13 +11,26 @@ const listener_mod = @import("listener.zig");
 const model_text = @import("model_text.zig");
 const server_mod = @import("server.zig");
 const recall_routes = @import("recall_routes.zig");
+const routes = @import("routes.zig");
 const Allocator = std.mem.Allocator;
 const posix = platform.posix;
 
 var stop_requested: std.atomic.Value(bool) = .init(false);
+/// The signal that asked for the stop (0: none yet), for the shutdown line
+var stop_signal: std.atomic.Value(i32) = .init(0);
+/// Stop signals so far: a second one cuts the drain short
+var stop_count: std.atomic.Value(u32) = .init(0);
 
-fn onStop(_: posix.SIG) callconv(.c) void {
+fn onStop(sig: posix.SIG) callconv(.c) void {
+    stop_signal.store(@intCast(@backingInt(sig)), .release);
+    _ = stop_count.fetchAdd(1, .acq_rel);
     stop_requested.store(true, .release);
+}
+
+fn signalName(sig: i32) []const u8 {
+    if (sig == @backingInt(posix.SIG.TERM)) return "SIGTERM";
+    if (sig == @backingInt(posix.SIG.INT)) return "SIGINT";
+    return "a stop signal";
 }
 
 /// SIGTERM and SIGINT stop the server cleanly; SIGHUP rereads the key file; SIGPIPE is ignored, as Python ignores it.
@@ -81,6 +94,19 @@ pub const Setup = struct {
     on_listen: ?*const fn (port: u16) void = null,
     /// Recall's record, attached to the engine already (--recall); null: off.
     recall: ?*api.recall_store.Store = null,
+    /// The checkpoint family's own chat rules (DeepSeek-V4.1), or null.
+    family: ?@import("family.zig").Family = null,
+    /// The HTTP surface (spark.zig): a family whose Python app is the Spark server's answers as it does.
+    wire: @import("spark.zig").Wire = .tensorfold,
+    /// Run by `run` so the engine stops before the server is freed; null: the caller closes it after `run`.
+    stop: ?EngineStop = null,
+};
+
+/// `halt` (optional) ends the rounds at a boundary at the drain's deadline, so `close` never meets a running round.
+pub const EngineStop = struct {
+    ctx: *anyopaque,
+    halt: ?*const fn (ctx: *anyopaque, reason: []const u8) void = null,
+    close: *const fn (ctx: *anyopaque) void,
 };
 
 fn env(s: Setup, name: []const u8) ?[]const u8 {
@@ -90,6 +116,9 @@ fn env(s: Setup, name: []const u8) ?[]const u8 {
 
 /// Serves until a stop signal; the process exit status.
 pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
+    stop_requested.store(false, .release);
+    stop_count.store(0, .release);
+    stop_signal.store(0, .release);
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -112,6 +141,10 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         std.debug.print("tensorfold: TENSORFOLD_SEED_SALT={s}: an integer\n", .{t});
         return 1;
     } else 0;
+    const spark_settings = @import("spark.zig").Settings.fromEnv(s.environ, &problem) catch {
+        std.debug.print("tensorfold: {s}\n", .{problem});
+        return 1;
+    };
     const config: server_mod.Config = .{
         .served_name = s.served,
         .model_dir = s.model_dir,
@@ -128,6 +161,9 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         .seed_salt = salt,
         .request_log = env(s, "TENSORFOLD_REQUEST_LOG"),
         .dashboard = args.dashboard,
+        .family = s.family,
+        .wire = s.wire,
+        .spark = spark_settings,
         .compact_at = if (args.compact_auto) .{ .auto = {} } else if (args.compact_fraction) |f| .{ .fraction = f } else null,
         .compact_keep = args.compact_keep,
         .compact_memory = args.compact_memory,
@@ -170,6 +206,10 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         s.served,                                                   args.host,                                                                                   port,   shownSampling(a, s.sampling),
         if (args.no_drafts or srv.info.plain_only) "off" else "on", if (window > 0) std.fmt.bufPrint(&window_text, "{d}", .{window}) catch "?" else "unlimited", loaded,
     });
+    if (greedy(s.sampling))
+        log.line("WARNING: default sampling is greedy (temperature <= 0) - a client that omits `temperature` decodes greedily, which on a long agentic turn can loop in reasoning and return empty content", .{});
+    // the Spark ops scripts read this line for the slot count (scripts/serve.sh check_slots)
+    if (s.wire == .spark) log.line("serving: {d} slot(s) x {d} tokens; wire spark; health {t}; request log {s}; disconnect {s}", .{ srv.info.lanes, window, spark_settings.health, if (spark_settings.log) |l| l.path else "off", if (spark_settings.disconnect) "on" else "off" });
     if (args.thinking and std.mem.indexOf(u8, s.text.templateSource(), "enable_thinking") != null)
         log.line("thinking on (the chat template's default): replies reason in reasoning_content before the answer in content, and max_tokens counts both. --no-thinking turns it off; a request can send chat_template_kwargs {{\"enable_thinking\": false}}", .{});
     if (s.recall) |r| recall_routes.line(r);
@@ -178,15 +218,51 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
     var ticker: live.Ticker = .{ .engine = s.engine };
     const drawing = live.wanted(io, if (env(s, "TENSORFOLD_NO_LIVE")) |v| std.mem.eql(u8, v, "1") else false);
     if (drawing) ticker.start();
-    const accept = std.Thread.spawn(.{}, server_mod.Server.serve, .{ srv, lis, &stop_requested }) catch return 1;
+    // the listener stays open through the drain: new requests get 503 + Retry-After, /health "draining"
+    var accept_stop: std.atomic.Value(bool) = .init(false);
+    const accept = std.Thread.spawn(.{}, server_mod.Server.serve, .{ srv, lis, &accept_stop }) catch return 1;
+    while (!stop_requested.load(.acquire)) std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
+    drain(srv, io, s.stop, spark_settings.drain_s);
+    accept_stop.store(true, .release);
     accept.join();
     lis.close();
     if (drawing) ticker.finish();
+    if (srv.keepalive) |k| { // its ticks reach the engine's queue: it stops before the engine does
+        k.stop();
+        srv.keepalive = null;
+    }
+    s.engine.drain(); // kept states waiting for disk are written (under the engine's deadline) before the process ends
+    // the engine stops while nothing runs on it: no round meets a CUDA driver torn down by the exit
+    if (s.stop) |st| st.close(st.ctx);
     var waited: u32 = 0;
     while (srv.open_connections.load(.acquire) > 0 and waited < 40) : (waited += 1) std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
-    s.engine.drain(); // kept states waiting for disk are written (under the engine's deadline) before the process ends
-    if (srv.open_connections.load(.acquire) > 0) std.process.exit(0); // replies still open: end without freeing what they read
+    if (srv.open_connections.load(.acquire) > 0) {
+        log.line("shutting down: exiting with {d} idle connection(s) still open", .{srv.open_connections.load(.acquire)});
+        std.process.exit(0); // connections still open: end without freeing what they read
+    }
+    log.line("shutting down: stopped", .{});
     return 0;
+}
+
+/// Work in progress gets `drain_s` to finish (new work 503s) before the rest is halted; a second signal cuts it short.
+fn drain(srv: *server_mod.Server, io: std.Io, stop: ?EngineStop, drain_s: f64) void {
+    srv.draining.store(true, .seq_cst);
+    const signals = stop_count.load(.acquire);
+    log.line("shutting down ({s}): draining: new requests get 503; {d} request(s) in progress may finish within {d:.1} s", .{ signalName(stop_signal.load(.acquire)), srv.generating.load(.seq_cst), drain_s });
+    const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
+    const deadline = t0 + @as(i96, @intFromFloat(drain_s * 1e9));
+    while (srv.generating.load(.seq_cst) > 0 and std.Io.Clock.awake.now(io).toNanoseconds() < deadline and stop_count.load(.acquire) == signals)
+        std.Io.sleep(io, .fromMilliseconds(20), .awake) catch {};
+    const left = srv.generating.load(.seq_cst);
+    if (left == 0) {
+        log.line("shutting down: drained", .{});
+        return;
+    }
+    const cut = if (stop_count.load(.acquire) != signals) "a second stop signal" else "the drain deadline (TF_DSV41_DRAIN_S)";
+    log.line("shutting down: {s}: {d} request(s) still in progress end \"{s}\" at the next round boundary", .{ cut, left, routes.restarting });
+    if (stop) |st| if (st.halt) |h| h(st.ctx, routes.restarting);
+    var waited: u32 = 0;
+    while (srv.generating.load(.seq_cst) > 0 and waited < 100) : (waited += 1) std.Io.sleep(io, .fromMilliseconds(20), .awake) catch {};
 }
 
 /// ``--host`` as an address: an IP literal, else a name the resolver knows (localhost first).
@@ -194,6 +270,17 @@ fn resolve(io: std.Io, host: []const u8, port: u16) ?std.Io.net.IpAddress {
     if (std.Io.net.IpAddress.parse(host, port)) |ip| return ip else |_| {}
     if (std.ascii.eqlIgnoreCase(host, "localhost")) return .{ .ip4 = .loopback(port) };
     return std.Io.net.IpAddress.resolve(io, host, port) catch null;
+}
+
+/// Whether requests that name no temperature decode greedily (public PR #14's startup warning).
+fn greedy(sampling: ?json.Value) bool {
+    const v = sampling orelse return true;
+    const t = v.get("temperature") orelse return true;
+    return switch (t) {
+        .float => |f| f <= 0,
+        .int => |i| (std.fmt.parseFloat(f64, i) catch 0) <= 0,
+        else => true,
+    };
 }
 
 /// The serving line's sampling: greedy, or each default as ``name value``.

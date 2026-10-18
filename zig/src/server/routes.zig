@@ -30,6 +30,8 @@ pub fn dispatch(srv: *Server, conn: *Conn, a: Allocator) void {
     if (std.mem.eql(u8, m, "POST")) return post(srv, conn, a);
     if (std.mem.eql(u8, m, "DELETE")) {
         const route = auth.routePath(conn.path);
+        // the Spark wire serves the routes its Python server has: these upstream ones are its 404s there
+        if (conn.spark_wire) return responses.delete(srv, conn, a, responses.route(route));
         if (std.mem.eql(u8, route, "/v1/slide/graph")) return slide.forget(srv, conn, a);
         if (std.mem.startsWith(u8, route, fact_path)) return slide_forget.route(srv, conn, a, route[fact_path.len..]);
         if (std.mem.eql(u8, route, recall.path)) return recall.empty(srv, conn, a);
@@ -47,6 +49,7 @@ pub fn sendValue(conn: *Conn, a: Allocator, code: u16, payload: json.Value) void
 }
 
 pub fn unknown(conn: *Conn, a: Allocator) void {
+    if (conn.spark_wire) return conn.sendJson(404, "{\"error\": \"not found\"}"); // the Spark servers' 404
     const message = std.fmt.allocPrint(a, "unknown path {s}", .{conn.requestPath(a)}) catch return;
     const body = std.fmt.allocPrint(a, "{{\"error\": {{\"message\": {s}}}}}", .{json.quote(a, message, .{}) catch return}) catch return;
     conn.sendJson(404, body);
@@ -54,20 +57,32 @@ pub fn unknown(conn: *Conn, a: Allocator) void {
 
 fn get(srv: *Server, conn: *Conn, a: Allocator) void {
     const route = auth.routePath(conn.path);
-    if (std.mem.eql(u8, route, "/memory") or std.mem.eql(u8, route, "/v1/memory"))
-        return memory.get(srv, conn, a) catch {};
+    if (!conn.spark_wire) if (upstreamGet(srv, conn, a, route)) return; // the Spark wire's 404s, as its Python server
     if (responses.route(route)) |rid| if (rid.len > 0) return responses.get(srv, conn, a, rid);
     if (std.mem.eql(u8, route, "/metrics") or std.mem.eql(u8, route, "/v1/metrics")) return status.metrics(srv, conn, a);
     if (std.mem.eql(u8, route, "/dashboard")) return status.dashboard(srv, conn, a);
     if (std.mem.eql(u8, route, "/stats")) return status.stats(srv, conn, a);
-    if (std.mem.eql(u8, route, "/slide")) return slide.view(srv, conn, a);
-    if (std.mem.startsWith(u8, route, "/slide/")) return slide.script(srv, conn, a, route["/slide/".len..]);
-    if (std.mem.eql(u8, route, "/v1/slide/graph")) return slide.graph(srv, conn, a);
-    if (std.mem.eql(u8, route, recall.path)) return recall.get(srv, conn, a);
-    if (std.mem.eql(u8, route, "/v1/benchmark/manifest")) return status.manifestRoute(srv, conn, a) catch {};
     if (route.len == 0 or std.mem.eql(u8, route, "/health")) return status.health(srv, conn, a) catch {};
     if (std.mem.endsWith(u8, route, "/models")) return status.models(srv, conn, a) catch {};
     unknown(conn, a);
+}
+
+/// The GET routes the Spark wire does not serve: memory, slide, Recall, the benchmark manifest; false: none matched.
+fn upstreamGet(srv: *Server, conn: *Conn, a: Allocator, route: []const u8) bool {
+    if (std.mem.eql(u8, route, "/memory") or std.mem.eql(u8, route, "/v1/memory")) {
+        memory.get(srv, conn, a) catch {};
+    } else if (std.mem.eql(u8, route, "/slide")) {
+        slide.view(srv, conn, a);
+    } else if (std.mem.startsWith(u8, route, "/slide/")) {
+        slide.script(srv, conn, a, route["/slide/".len..]);
+    } else if (std.mem.eql(u8, route, "/v1/slide/graph")) {
+        slide.graph(srv, conn, a);
+    } else if (std.mem.eql(u8, route, recall.path)) {
+        recall.get(srv, conn, a);
+    } else if (std.mem.eql(u8, route, "/v1/benchmark/manifest")) {
+        status.manifestRoute(srv, conn, a) catch {};
+    } else return false;
+    return true;
 }
 
 /// A refused route's body is read and dropped, so it cannot reach the next request on this connection.
@@ -75,21 +90,82 @@ fn discardBody(conn: *Conn, a: Allocator) void {
     _ = http_body.read(conn, a, http_body.limit) catch {};
 }
 
+/// Upstream's POST routes beside generation; each reaches the engine, so a drain counts and refuses it too.
+const Other = enum {
+    speech,
+    learn,
+    resume_imprint,
+    load_imprint,
+    systemone,
+
+    fn of(route: []const u8) ?Other {
+        if (std.mem.eql(u8, route, "/v1/audio/speech")) return .speech;
+        if (std.mem.eql(u8, route, "/v1/slide/learn")) return .learn;
+        if (std.mem.eql(u8, route, "/v1/imprint/resume")) return .resume_imprint;
+        if (std.mem.eql(u8, route, "/v1/imprint/load")) return .load_imprint;
+        if (std.mem.endsWith(u8, route, "/systemone")) return .systemone;
+        return null;
+    }
+};
+
 fn post(srv: *Server, conn: *Conn, a: Allocator) void {
     const route = auth.routePath(conn.path);
-    if (std.mem.eql(u8, route, "/v1/audio/speech")) return speech.post(srv, conn, a) catch {};
-    if (std.mem.eql(u8, route, "/v1/slide/learn")) return slide.learn(srv, conn, a);
-    if (std.mem.eql(u8, route, "/v1/imprint/resume")) return imprint.post(srv, conn, a, .where);
-    if (std.mem.eql(u8, route, "/v1/imprint/load")) return imprint.post(srv, conn, a, .load);
-    if (std.mem.endsWith(u8, route, "/decisions")) return decisions.post(srv, conn, a);
-    if (std.mem.endsWith(u8, route, "/systemone")) return systemone.post(srv, conn, a);
-    if (anthropic.route(conn.path)) return anthropic.post(srv, conn, a);
-    if (responses.route(route)) |rid| if (rid.len == 0) return responses.post(srv, conn, a);
     for (tokens.paths) |r| if (std.mem.eql(u8, route, r)) return tokens.post(srv, conn, a, std.mem.endsWith(u8, route, "/detokenize"));
+    const is_anthropic = anthropic.route(conn.path);
+    const is_responses = if (responses.route(route)) |rid| rid.len == 0 else false;
+    const is_decisions = std.mem.endsWith(u8, route, "/decisions");
     const is_chat = std.mem.endsWith(u8, route, "/chat/completions");
-    if (!is_chat and !std.mem.endsWith(u8, route, "/completions")) {
+    // upstream's other engine routes (speech, slide learning, imprints, System One): the Spark wire's 404s
+    const other: ?Other = if (conn.spark_wire) null else Other.of(route);
+    if (other == null and !is_anthropic and !is_responses and !is_decisions and !is_chat and !std.mem.endsWith(u8, route, "/completions")) {
         discardBody(conn, a);
         return unknown(conn, a);
     }
+    // counted before the drain flag is read: a stop that sees no request in progress sees every later one refused
+    _ = srv.generating.fetchAdd(1, .seq_cst);
+    defer _ = srv.generating.fetchSub(1, .seq_cst);
+    if (@import("builtin").is_test) if (counted_hook) |h| h();
+    if (srv.draining.load(.seq_cst)) {
+        discardBody(conn, a);
+        return draining(conn, is_anthropic);
+    }
+    if (other) |o| return switch (o) {
+        .speech => speech.post(srv, conn, a) catch {},
+        .learn => slide.learn(srv, conn, a),
+        .resume_imprint => imprint.post(srv, conn, a, .where),
+        .load_imprint => imprint.post(srv, conn, a, .load),
+        .systemone => systemone.post(srv, conn, a),
+    };
+    if (is_decisions) return decisions.post(srv, conn, a);
+    if (is_anthropic) return anthropic.post(srv, conn, a);
+    if (is_responses) return responses.post(srv, conn, a);
     openai.post(srv, conn, a, is_chat);
+}
+
+/// Tests only: the gap between a request's count and its drain check, where a stop must still see it counted.
+pub var counted_hook: ?*const fn () void = null;
+
+/// Seconds a refused client is told to wait while the server drains for a restart (Retry-After).
+pub const retry_after_s = 30;
+pub const restarting = @import("errors.zig").restarting;
+
+/// A request that arrives while a stop drains: 503, Retry-After, the API's own error shape; the connection closes.
+pub fn draining(conn: *Conn, anthropic_shape: bool) void {
+    const body = if (anthropic_shape)
+        "{\"type\": \"error\", \"error\": {\"type\": \"overloaded_error\", \"message\": \"" ++ restarting ++ "\"}}"
+    else
+        "{\"error\": {\"message\": \"" ++ restarting ++ "\", \"type\": \"server_error\", \"param\": null, \"code\": \"server_restarting\"}}";
+    sendDraining(conn, body);
+}
+
+/// 503 with Retry-After and Connection: close, `body` as JSON.
+pub fn sendDraining(conn: *Conn, body: []const u8) void {
+    conn.close = true;
+    conn.startResponse(503, null) catch return;
+    conn.addHeader("Content-Type", "application/json") catch return;
+    conn.addHeader("Retry-After", std.fmt.comptimePrint("{d}", .{retry_after_s})) catch return;
+    var len: [24]u8 = undefined;
+    conn.addHeader("Content-Length", std.fmt.bufPrint(&len, "{d}", .{body.len}) catch unreachable) catch return;
+    conn.addHeader("Connection", "close") catch return;
+    conn.finish(body) catch {};
 }

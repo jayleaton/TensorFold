@@ -18,6 +18,8 @@ const http_body = @import("http_body.zig");
 const routes = @import("routes.zig");
 const warm = @import("warm.zig");
 const cortheon = @import("cortheon/cortheon.zig");
+const spark = @import("spark.zig");
+const pyrepr = @import("pyrepr.zig");
 const Server = @import("server.zig").Server;
 const Conn = @import("http_conn.zig").Conn;
 const Value = json.Value;
@@ -36,18 +38,24 @@ pub const Out = struct {
         event: *const fn (ctx: *anyopaque, payload: ?Value) error{Closed}!void,
         /// A whole JSON reply.
         reply: *const fn (ctx: *anyopaque, status: u16, payload: Value) void,
+        /// Bytes that keep a silent stream alive (an SSE comment, or the API's ping); null: none.
+        keepalive: ?*const fn (ctx: *anyopaque) error{Closed}!void = null,
     };
 };
 
 /// POST /v1/chat/completions or /v1/completions, read from the client and answered to it.
 pub fn post(srv: *Server, conn: *Conn, a: Allocator, is_chat: bool) void {
     var cx: Cx = .{ .a = a };
+    const spark_wire = srv.config.wire == .spark;
     const body = http_body.readJson(conn, &cx) catch {
+        if (spark_wire) return routes.sendValue(conn, a, if (cx.kind == .capacity) 503 else 400, spark.errorBody(a, if (cx.kind == .other) "the request body is not JSON" else cx.message, "invalid_request_error", null, null) catch return);
         const err = errorBody(a, &cx, if (is_chat) "messages" else "prompt") catch return;
         return routes.sendValue(conn, a, cx.status(), wrapError(a, err) catch return);
     };
+    if (spark_wire and body != .object) return routes.sendValue(conn, a, 400, spark.errorBody(a, "the request body must be a JSON object", "invalid_request_error", null, null) catch return);
     var client: ClientOut = .{ .conn = conn, .a = a };
-    run(srv, a, client.out(), .{ .conn = conn }, is_chat, body);
+    // GLM53_TF_DISCONNECT / TF_DSV41_DISCONNECT=0: only a failed streamed write stops a request
+    run(srv, a, client.out(), .{ .conn = conn, .on = !spark_wire or srv.config.spark.disconnect }, is_chat, body);
 }
 
 /// A chat reply written straight to the client.
@@ -56,7 +64,7 @@ const ClientOut = struct {
     a: Allocator,
 
     fn out(c: *ClientOut) Out {
-        return .{ .ctx = c, .vt = &.{ .open = open, .event = event, .reply = reply } };
+        return .{ .ctx = c, .vt = &.{ .open = open, .event = event, .reply = reply, .keepalive = keepalive } };
     }
 
     fn open(ctx: *anyopaque, _: usize) error{Closed}!void {
@@ -73,13 +81,32 @@ const ClientOut = struct {
         const c: *ClientOut = @ptrCast(@alignCast(ctx));
         routes.sendValue(c.conn, c.a, status, payload);
     }
+
+    fn keepalive(ctx: *anyopaque) error{Closed}!void {
+        const c: *ClientOut = @ptrCast(@alignCast(ctx));
+        return sse.comment(c.conn);
+    }
 };
 
 /// Whether the client has gone, read between rounds (Python's socket_cancellation).
 pub const Gone = struct {
     conn: *Conn,
+    on: bool = true,
+    /// The stream a keepalive goes to once it has been silent `every_ns` (0: never)
+    out: ?Out = null,
+    every_ns: i96 = 0,
     pub fn check(g: Gone) bool {
+        if (!g.on) return false;
         return g.conn.peerGone();
+    }
+
+    /// A keepalive if the stream has been silent long enough; a failed write means the client left.
+    pub fn beat(g: Gone, silent_ns: i96) error{Closed}!bool {
+        const o = g.out orelse return false;
+        const send = o.vt.keepalive orelse return false;
+        if (g.every_ns <= 0 or silent_ns < g.every_ns) return false;
+        try send(o.ctx);
+        return true;
     }
 };
 
@@ -88,6 +115,11 @@ pub fn errorBody(a: Allocator, cx: *const Cx, param: ?[]const u8) Allocator.Erro
     const o = try json.newObject(a);
     try o.put(a, "message", .{ .string = cx.message });
     if (cx.kind == .other or cx.kind == .server) return .{ .object = o };
+    if (cx.kind == .restarting) {
+        try o.put(a, "type", .{ .string = "server_error" });
+        try o.put(a, "code", .{ .string = "server_restarting" });
+        return .{ .object = o };
+    }
     try o.put(a, "type", .{ .string = "invalid_request_error" });
     if (cx.kind == .context_length) {
         try o.put(a, "param", if (param) |p| .{ .string = p } else .null);
@@ -104,6 +136,7 @@ pub fn wrapError(a: Allocator, body: Value) Allocator.Error!Value {
 
 /// The id a reply names: the one asked for when this endpoint answers to it, else the served name.
 pub fn replyModel(srv: *const Server, body: Value) []const u8 {
+    if (srv.config.wire == .spark) return srv.config.served_name; // the Spark servers name the served model always
     if (body.get("model")) |m| if (m == .string) for (srv.config.model_ids) |known| if (std.mem.eql(u8, known, m.string)) return m.string;
     return srv.config.served_name;
 }
@@ -124,17 +157,25 @@ pub fn chatInput(srv: *Server, cx: *Cx, raw: Value) errors.Refused!chat.Input {
 /// Everything checked before a reply starts (a refusal here is a 400 with no stream opened).
 fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
     const body = try fields.parseNumbers(cx, raw);
-    try fields.validateModalities(cx, body);
+    // the Spark servers ignore these fields (and log requests their own way)
+    if (srv.config.wire != .spark) try fields.validateModalities(cx, body);
     // rows need each token's exact bytes: a tokenizer whose decoding depends on context (null) can't give them
-    const asked = if (is_chat) json.truthyField(body, "logprobs") else body.field("logprobs") != null;
+    const asked = srv.config.wire != .spark and (if (is_chat) json.truthyField(body, "logprobs") else body.field("logprobs") != null);
     const exact_bytes = asked and srv.info.logprobs and (srv.text.tokenBytes(cx.a, 0) catch return error.OutOfMemory) != null;
-    const logprobs = if (is_chat) try fields.probabilityOptions(cx, body, exact_bytes) else try fields.legacyLogprobs(cx, body, exact_bytes);
-    if (srv.config.request_log) |path| request_log.append(cx.a, path, body);
-    var input: chat.Input = .{ .fields = undefined };
-    if (is_chat) {
+    const logprobs = if (srv.config.wire == .spark) null else if (is_chat) try fields.probabilityOptions(cx, body, exact_bytes) else try fields.legacyLogprobs(cx, body, exact_bytes);
+    if (srv.config.wire != .spark) if (srv.config.request_log) |path| request_log.append(cx.a, path, body);
+    var input: chat.Input = .{ .fields = undefined, .body = body };
+    if (srv.family) |fam| if (is_chat) {
+        // a family renders the client's messages and tools itself (its encoding reads OpenAI's shapes)
+        const m = body.get("messages") orelse Value.null;
+        if (m != .array or m.array.len == 0) return cx.refuse("messages must be a non-empty list");
+        input.messages = m;
+        input.tools = try fam.tools(cx, body);
+    };
+    if (is_chat and srv.family == null) {
         input.messages = try messages.normalizeWith(cx, body.get("messages"), "system", srv.needs_user_after_tool, .of(srv.info.vision));
         input.tools = try tool_specs.active(cx, body.get("tools"), body.get("tool_choice"));
-    } else if (body.get("messages")) |m| if (m == .array and m.array.len > 0) {
+    } else if (!is_chat) if (body.get("messages")) |m| if (m == .array and m.array.len > 0) {
         input.messages = try messages.normalizeWith(cx, m, "system", srv.needs_user_after_tool, .of(srv.info.vision));
     };
     if (!is_chat and input.messages.array.len == 0) input.prompt = try legacyPrompt(srv, cx, body.get("prompt"));
@@ -152,14 +193,19 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
     const sampling = try json.newObject(cx.a);
     for ([_][]const u8{ "temperature", "top_p", "top_k", "min_p", "seed", "priority", "draft", "thinking_budget", "ignore_eos", "stop" } ++ grammar.fields) |k| if (body.get(k)) |v| try sampling.put(cx.a, k, v);
     try grammar.refusal(cx, body);
-    if (input.tools.len > 0 and try tool_specs.choiceRequiresCall(cx.a, body.get("tool_choice"))) try sampling.put(cx.a, "tool_call_required", .{ .bool = true });
-    if (body.field("parallel_tool_calls")) |p| if (p == .bool and !p.bool) try sampling.put(cx.a, "tool_call_single", .{ .bool = true });
-    const thinking = try fields.thinkingFields(cx, body, srv.effort_levels);
+    // a family's engine with structured output (DeepSeek-V4.1, TF_DSV41_GRAMMAR=1): tool calls held to their schemas
+    if (srv.family != null and srv.info.structures) if (try grammar.toolSpec(cx, body, grammar.toolGrammarEnv())) |t| try sampling.put(cx.a, "tools_grammar", .{ .string = t });
+    if (srv.family == null and input.tools.len > 0 and try tool_specs.choiceRequiresCall(cx.a, body.get("tool_choice"))) try sampling.put(cx.a, "tool_call_required", .{ .bool = true });
+    if (srv.family == null) if (body.field("parallel_tool_calls")) |p| if (p == .bool and !p.bool) try sampling.put(cx.a, "tool_call_single", .{ .bool = true });
+    const thinking: fields.Thinking = if (srv.family) |fam| blk: {
+        const t = try fam.thinking(cx, body);
+        break :blk .{ .enable = t.enable, .effort = t.effort };
+    } else try fields.thinkingFields(cx, body, srv.effort_levels);
     if (thinking.effort) |e| try sampling.put(cx.a, "reasoning_effort", .{ .string = e });
     if (thinking.enable) |on| try sampling.put(cx.a, "enable_thinking", .{ .bool = on });
     input.fields = .{ .object = sampling };
     const streamed = if (body.get("stream")) |s| s.truthy() else false;
-    input.prompt_logprobs = try fields.promptLogprobs(cx, body, !is_chat, streamed, srv.info.prompt_logprobs);
+    input.prompt_logprobs = if (srv.config.wire == .spark) null else try fields.promptLogprobs(cx, body, !is_chat, streamed, srv.info.prompt_logprobs);
     if (logprobs != null) {
         // 0.6.6's set: the rows describe the plain reply text, so nothing may reshape it
         var structured = false;
@@ -172,6 +218,7 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
     if (body.field("parallel_tool_calls")) |p| {
         if (p != .bool) return cx.refuse("parallel_tool_calls must be a boolean");
         policy.single = !p.bool;
+        input.single_call = policy.single;
     }
     const options = body.get("stream_options");
     return .{
@@ -229,11 +276,22 @@ fn promptText(srv: *Server, cx: *Cx, p: Value) errors.Refused![]const u8 {
 /// The chat or completion reply to ``raw`` (already decoded), written to ``out``.
 pub fn run(srv: *Server, a: Allocator, out: Out, gone: Gone, is_chat: bool, raw: Value) void {
     const field: []const u8 = if (is_chat) "messages" else "prompt";
-    const id = ids.make(a, if (is_chat) "chatcmpl-" else "cmpl-", 32) catch return;
+    const spark_wire = srv.config.wire == .spark;
+    const id = ids.make(a, if (is_chat) "chatcmpl-" else "cmpl-", if (spark_wire) spark.id_digits else 32) catch return;
     var cx: Cx = .{ .a = a };
+    if (spark_wire) {
+        // ``App.check`` before anything renders, then strict health's refusal after a fatal engine error
+        const problem = sparkCheck(srv, &cx, is_chat, raw) catch return;
+        if (problem) |message| {
+            logRefused(id, message.text);
+            return out.vt.reply(out.ctx, 400, spark.errorBody(a, message.text, "invalid_request_error", null, message.param) catch return);
+        }
+        if (srv.health.?.reject(a)) |why| return out.vt.reply(out.ctx, 503, spark.errorBody(a, why, "server_error", null, null) catch return);
+    }
     var p = plan(srv, &cx, is_chat, raw) catch |e| {
         if (e == error.OutOfMemory) cx.message = "out of memory";
         logRefused(id, cx.message);
+        if (spark_wire) return out.vt.reply(out.ctx, cx.status(), sparkError(a, &cx, field) catch return);
         const body = (if (cx.kind == .other) errorOther(a, cx.message) else errorBody(a, &cx, field)) catch return;
         out.vt.reply(out.ctx, cx.status(), wrapError(a, body) catch return);
         return;
@@ -242,6 +300,34 @@ pub fn run(srv: *Server, a: Allocator, out: Out, gone: Gone, is_chat: bool, raw:
     const turn = cortheon.begin(srv, a, raw, id, is_chat, &p.input);
     var r: Run = .{ .srv = srv, .a = a, .out = out, .is_chat = is_chat, .plan = p, .id = id, .created = std.Io.Clock.real.now(srv.io).toSeconds(), .turn = turn };
     if (p.stream) r.stream(gone, field) else r.whole(gone, field);
+}
+
+const Problem = struct { text: []const u8, param: ?[]const u8 = null };
+
+/// The Spark server's ``App.check`` on a raw body: the first field it cannot use, or null.
+fn sparkCheck(srv: *Server, cx: *Cx, is_chat: bool, body: Value) Allocator.Error!?Problem {
+    const a = cx.a;
+    if (body.get("messages")) |m| if (m != .array) return .{ .text = "messages must be a list" };
+    if (spark.stopProblem(body)) |t| return .{ .text = t };
+    if (body.get("chat_template_kwargs")) |k| if (k != .null and k != .object) return .{ .text = "chat_template_kwargs must be a JSON object or null" };
+    if (try spark.numbersProblem(a, body)) |t| return .{ .text = t };
+    if (!is_chat) if (body.get("prompt")) |p| if (p == .array) if (try spark.tokenIdsProblem(a, p.array, srv.text.vocabSize())) |t| return .{ .text = t, .param = "prompt" };
+    if (body.field("n")) |n| {
+        const one = (n == .int and std.mem.eql(u8, n.int, "1")) or (n == .float and n.float == 1) or (n == .bool and n.bool);
+        if (!one) return .{ .text = try std.fmt.allocPrint(a, "n must be 1 on this server (got {s}): it returns one choice a request", .{try pyrepr.repr(a, n)}) };
+    }
+    if (body.field("tf_knobs") != null) return .{ .text = "this model's CUDA engine has no per-request knobs (tf_knobs)" };
+    return null;
+}
+
+/// A refusal in the Spark server's shape: the context limit with its code and param, 503 / 500 as server errors.
+fn sparkError(a: Allocator, cx: *const Cx, field: []const u8) Allocator.Error!Value {
+    return switch (cx.kind) {
+        .context_length => spark.errorBody(a, cx.message, "invalid_request_error", "context_length_exceeded", field),
+        .capacity, .server => spark.errorBody(a, cx.message, "server_error", null, null),
+        .restarting => spark.errorBody(a, cx.message, "server_error", "server_restarting", null),
+        else => spark.errorBody(a, cx.message, "invalid_request_error", null, null),
+    };
 }
 
 /// Why a request got an error reply, logged before it: its access line shows only the status.
@@ -289,7 +375,7 @@ const Run = struct {
             const rows = if (d == .object) d.object.get("logprobs") else null;
             try choice.put(a, "text", if (d == .object) d.object.get("content") orelse .{ .string = "" } else d);
             try choice.put(a, "finish_reason", if (finish) |f| .{ .string = f } else .null);
-            try choice.put(a, "logprobs", if (rows) |v| try @import("logprobs.zig").legacy(a, v, &r.text_offset) else .null);
+            if (r.srv.config.wire != .spark) try choice.put(a, "logprobs", if (rows) |v| try @import("logprobs.zig").legacy(a, v, &r.text_offset) else .null);
         }
         const list = try a.alloc(Value, 1);
         list[0] = .{ .object = choice };
@@ -310,6 +396,7 @@ const Run = struct {
         const cached = try json.newObject(a);
         try cached.put(a, "cached_tokens", try json.intValue(a, reply.cached_tokens));
         try o.put(a, "prompt_tokens_details", .{ .object = cached });
+        if (r.srv.config.wire == .spark) return .{ .object = o };
         const thought = try json.newObject(a);
         try thought.put(a, "reasoning_tokens", try json.intValue(a, reply.reasoning_tokens));
         try o.put(a, "completion_tokens_details", .{ .object = thought });
@@ -318,6 +405,7 @@ const Run = struct {
 
     /// ``response_extras``: exact_mode, the matched stop, the runtime and the draft counters.
     fn extras(r: *Run, o: *json.Object, reply: *const chat.Reply) Allocator.Error!void {
+        if (r.srv.config.wire == .spark) return o.put(r.a, "tensorfold", try r.sparkStats(reply));
         try o.put(r.a, "exact_mode", .{ .string = "exact" });
         if (reply.stop_sequence) |s| try o.put(r.a, "stop_sequence", .{ .string = s });
         try o.put(r.a, "tensorfold", reply.runtime);
@@ -325,8 +413,23 @@ const Run = struct {
         if (r.turn) |t| try o.put(r.a, "cortheon", try t.summary(r.a));
     }
 
+    /// The engine's stats as the Spark server sends them (``tensorfold``), with ``return_token_ids``'s ids.
+    fn sparkStats(r: *Run, reply: *const chat.Reply) Allocator.Error!Value {
+        const a = r.a;
+        const outcome = reply.outcome orelse return .{ .object = try json.newObject(a) };
+        const s = try outcome.value(a);
+        if (r.plan.input.body.get("return_token_ids")) |want| if (want.truthy()) {
+            const list = try a.alloc(Value, reply.token_ids.len);
+            for (reply.token_ids, list) |t, *slot| slot.* = try json.intValue(a, t);
+            try s.put(a, "token_ids", .{ .array = list });
+        };
+        if (reply.images_omitted > 0) try s.put(a, "images_omitted", try json.intValue(a, reply.images_omitted));
+        return .{ .object = s };
+    }
+
     /// ``ToolCallPolicy.finish``: the reply's calls parsed out of its content.
     fn attachCalls(r: *Run, reply: *chat.Reply) Allocator.Error!?[]Value {
+        if (reply.calls) |calls| return if (calls.len > 0) calls else null; // the family parsed them (and applied the one-call policy)
         const tools = r.plan.input.tools;
         if (tools.len == 0) return null;
         const parsed = try tool_parse.parse(r.a, reply.content, tools, r.plan.policy.maxCalls());
@@ -342,9 +445,10 @@ const Run = struct {
 
     fn fail(r: *Run, cx: *const Cx, field: []const u8) void {
         const a = r.a;
+        if (r.srv.config.wire == .spark) return r.out.vt.reply(r.out.ctx, if (cx.kind == .server) 500 else cx.status(), sparkError(a, cx, field) catch return);
         const kind_ok = cx.kind != .other and cx.kind != .server;
         const body = (if (kind_ok) errorBody(a, cx, field) else errorOther(a, cx.message)) catch return;
-        r.out.vt.reply(r.out.ctx, if (kind_ok) cx.status() else 500, wrapError(a, body) catch return);
+        r.out.vt.reply(r.out.ctx, if (cx.kind == .restarting) 503 else if (kind_ok) cx.status() else 500, wrapError(a, body) catch return);
     }
 
     /// An unsent reply: request 400, unavailable 503, failure 500, nothing when the client left.
@@ -406,8 +510,15 @@ const Run = struct {
         if (r.is_chat) {
             const message = try json.newObject(a);
             try message.put(a, "role", .{ .string = "assistant" });
-            try message.put(a, "content", if (calls != null and reply.content.len == 0) .null else .{ .string = reply.content });
-            if (reply.reasoning) |t| if (t.len > 0) try message.put(a, "reasoning_content", .{ .string = t });
+            const empty_null = r.srv.family != null and reply.content.len == 0; // the family's Python app: ``content or None``
+            const keeps_text = r.srv.config.wire == .spark; // the Spark server keeps a call's prose
+            try message.put(a, "content", if ((calls != null and !keeps_text) or empty_null) .null else .{ .string = reply.content });
+            if (reply.reasoning) |t| if (t.len > 0) {
+                if (r.srv.family) |fam| {
+                    const d = try fam.reasoningDelta(a, t);
+                    for (d.object.keys(), d.object.values()) |k, v| try message.put(a, k, v);
+                } else try message.put(a, "reasoning_content", .{ .string = t });
+            };
             if (calls) |c| try message.put(a, "tool_calls", .{ .array = c });
             try choice.put(a, "message", .{ .object = message });
             try choice.put(a, "finish_reason", .{ .string = reply.finish_reason });
@@ -415,9 +526,11 @@ const Run = struct {
         } else {
             try choice.put(a, "text", .{ .string = reply.content });
             try choice.put(a, "finish_reason", .{ .string = reply.finish_reason });
-            var from: usize = 0;
-            try choice.put(a, "logprobs", if (reply.logprobs) |lp| try @import("logprobs.zig").legacy(a, lp, &from) else .null);
-            if (reply.prompt_logprobs) |p| try choice.put(a, "prompt_logprobs", p);
+            if (r.srv.config.wire != .spark) {
+                var from: usize = 0;
+                try choice.put(a, "logprobs", if (reply.logprobs) |lp| try @import("logprobs.zig").legacy(a, lp, &from) else .null);
+                if (reply.prompt_logprobs) |p| try choice.put(a, "prompt_logprobs", p);
+            }
         }
         const list = try a.alloc(Value, 1);
         list[0] = .{ .object = choice };
@@ -495,16 +608,19 @@ const Run = struct {
 
     fn stream(r: *Run, gone: Gone, field: []const u8) void {
         const a = r.a;
-        const tools = r.plan.input.tools.len > 0;
+        // a family streams calls and prose itself, so its stream is the plain one
+        const tools = r.plan.input.tools.len > 0 and r.srv.family == null;
         var cx: Cx = .{ .a = a };
-        // Context-window refusals stay streamed; other pre-admission refusals retain their HTTP status.
+        // a context-window refusal is reported inside the stream; every other refusal is still a 400 before it opens
+        // (the Spark wire, as its Python server: a 400 before the stream for that one too)
+        const in_stream = r.srv.config.wire != .spark;
         var compaction: ?compact.Stamp = null;
         const prepared = if (r.srv.config.compact_at == null) chat.prepare(r.srv, &cx, r.plan.input, gone) catch |e| {
-            if (e == error.Refused and cx.kind == .context_length) return r.streamedContext(&cx, tools, field);
+            if (e == error.Refused and cx.kind == .context_length and in_stream) return r.streamedContext(&cx, tools, field);
             return r.unsent(&cx, e, field);
         } else blk: {
             const ready = compact.prepare(r.srv, &cx, r.plan.input, gone) catch |e| {
-                if (e == error.Refused and cx.kind == .context_length) return r.streamedContext(&cx, tools, field);
+                if (e == error.Refused and cx.kind == .context_length and in_stream) return r.streamedContext(&cx, tools, field);
                 return r.unsent(&cx, e, field);
             };
             compaction = ready.stamp;
@@ -514,8 +630,13 @@ const Run = struct {
         defer if (!handed) chat.release(r.srv, prepared.preparing);
         var sink_state: StreamSink = .{ .run = r, .tools = tools, .prompt_len = prepared.prompt_len };
         handed = true;
+        // the Spark wire opens the stream before admission, as its Python server: a refusal then is an in-stream error
+        if (r.srv.config.wire == .spark) StreamSink.begin(&sink_state, prepared.prompt_len) catch return;
+        var live = gone;
+        live.out = r.out;
+        live.every_ns = @intFromFloat(r.srv.config.spark.keepalive_s * std.time.ns_per_s);
         const sink: chat.Sink = .{ .ctx = &sink_state, .call = StreamSink.call, .begin = StreamSink.begin };
-        var reply = (if (r.turn) |t| cortheon.loop.stream(t, r.srv, &cx, &r.plan.input, prepared, sink, gone) else chat.generate(r.srv, &cx, prepared, sink, gone)) catch |e| {
+        var reply = (if (r.turn) |t| cortheon.loop.stream(t, r.srv, &cx, &r.plan.input, prepared, sink, live) else chat.generate(r.srv, &cx, prepared, sink, live)) catch |e| {
             if (!sink_state.opened) return r.unsent(&cx, e, field);
             switch (e) {
                 error.Cancelled => return,
@@ -531,7 +652,8 @@ const Run = struct {
             const message = if (e == error.Refused) cx.message else if (e == error.OutOfMemory) "out of memory" else "the reply failed";
             log.line("stream error: {s}", .{message});
             const err = json.newObject(a) catch return;
-            err.put(a, "message", .{ .string = message }) catch return;
+            const shown = if (r.srv.config.wire == .spark) std.fmt.allocPrint(a, "{s}: {s}", .{ if (e == error.OutOfMemory) "MemoryError" else "RuntimeError", message[0..@min(message.len, 480)] }) catch return else message;
+            err.put(a, "message", .{ .string = shown }) catch return;
             err.put(a, "type", .{ .string = "server_error" }) catch return;
             r.emit(wrapError(a, .{ .object = err }) catch return) catch return;
             r.out.vt.event(r.out.ctx, null) catch {};
@@ -558,6 +680,13 @@ const Run = struct {
         }
         const last = r.chunk(.{ .string = "" }, if (reply.finish_reason.len > 0) reply.finish_reason else "length") catch return;
         if (compaction) |s| compact.stamp(&cx, &reply, s) catch return;
+        if (r.srv.config.wire == .spark) {
+            // the last chunk carries usage only when asked for, then the engine's stats
+            if (r.plan.separate_usage) last.object.put(a, "usage", r.usage(&reply) catch return) catch return;
+            r.extras(last.object, &reply) catch return;
+            r.emit(last) catch return;
+            return r.out.vt.event(r.out.ctx, null) catch {};
+        }
         r.extras(last.object, &reply) catch return;
         const use = r.usage(&reply) catch return;
         if (!r.plan.separate_usage) last.object.put(a, "usage", use) catch return;

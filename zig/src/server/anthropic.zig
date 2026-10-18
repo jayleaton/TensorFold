@@ -105,7 +105,7 @@ const Wire = struct {
     payload: Value = .null,
 
     fn out(w: *Wire) openai.Out {
-        return .{ .ctx = w, .vt = &.{ .open = open, .event = event, .reply = whole } };
+        return .{ .ctx = w, .vt = &.{ .open = open, .event = event, .reply = whole, .keepalive = ping } };
     }
 
     fn open(ctx: *anyopaque, prompt_len: usize) error{Closed}!void {
@@ -129,6 +129,12 @@ const Wire = struct {
         const w: *Wire = @ptrCast(@alignCast(ctx));
         w.status = status;
         w.payload = payload;
+    }
+
+    /// Anthropic's own keepalive event.
+    fn ping(ctx: *anyopaque) error{Closed}!void {
+        const w: *Wire = @ptrCast(@alignCast(ctx));
+        return w.reply.send("ping", try w.reply.obj("ping"));
     }
 };
 
@@ -207,7 +213,8 @@ const Reply = struct {
     fn text(r: *Reply, kind: []const u8, value: []const u8) E!void {
         if (value.len == 0) return;
         if (r.active != null) {
-            r.pending.append(r.a, .{ .kind = kind, .text = value }) catch return error.Closed;
+            // held until the open tool_use block closes: copied, ``value`` is a slice of a text that grows by then
+            r.pending.append(r.a, .{ .kind = kind, .text = r.a.dupe(u8, value) catch return error.Closed }) catch return error.Closed;
             return;
         }
         const key = if (std.mem.eql(u8, kind, "thinking")) "thinking" else "text";
@@ -251,7 +258,9 @@ const Reply = struct {
             const problem = p.get("error").?;
             const message = if (problem.get("message")) |m| (if (m == .string) m.string else "generation failed") else "generation failed";
             const kind = problem.get("type");
-            const status: u16 = if (kind != null and kind.? == .string and std.mem.eql(u8, kind.?.string, "invalid_request_error")) 400 else 500;
+            const code = problem.get("code");
+            const restarting = code != null and code.? == .string and std.mem.eql(u8, code.?.string, "server_restarting");
+            const status: u16 = if (restarting) 503 else if (kind != null and kind.? == .string and std.mem.eql(u8, kind.?.string, "invalid_request_error")) 400 else 500;
             const e = errorValue(r.a, message, status) catch return error.Closed;
             try r.send("error", e.object);
             r.finished = true;

@@ -12,6 +12,8 @@ const log = @import("log.zig");
 const ids = @import("ids.zig");
 const clock = @import("clock.zig");
 const Server = @import("server.zig").Server;
+const family_mod = @import("family.zig");
+const spark = @import("spark.zig");
 const chunk_plan = @import("chunk_plan.zig");
 const Mailbox = @import("mailbox.zig").Mailbox;
 const Value = json.Value;
@@ -35,6 +37,10 @@ pub const Input = struct {
     logprobs: ?u8 = null,
     /// ``/v1/completions``' ``prompt_logprobs``: rows for the prompt with this many alternatives; null: not asked.
     prompt_logprobs: ?u8 = null,
+    /// The request body (a family reads fields of its own from it, such as ``response_format``).
+    body: Value = .null,
+    /// ``parallel_tool_calls: false``: the reply keeps its first call (a family applies it while streaming).
+    single_call: bool = false,
 };
 
 /// A streamed piece: content text (a string) or a delta object (reasoning or tool calls).
@@ -64,6 +70,12 @@ pub const Reply = struct {
     logprobs: ?Value = null,
     /// ``choices[0].prompt_logprobs`` (vLLM's form) for a request that asked; null otherwise.
     prompt_logprobs: ?Value = null,
+    /// A family's parsed calls (OpenAI tool-call objects); null: the route parses the content itself.
+    calls: ?[]Value = null,
+    /// The engine run as the Spark server reports it (``tensorfold``), the counted ids, image parts replaced.
+    outcome: ?spark.Outcome = null,
+    token_ids: []const u32 = &.{},
+    images_omitted: u32 = 0,
 };
 
 pub const Failure = error{ Refused, Cancelled, Failed, OutOfMemory };
@@ -90,6 +102,9 @@ pub const Prepared = struct {
     drafts: bool,
     stops: fields_mod.Stops,
     preparing: bool,
+    images_omitted: u32 = 0,
+    /// the prompt's prepared images (TF_DSV41_IMAGES=native), held until the reply ends
+    images: ?family_mod.Images = null,
 };
 
 /// Render ``input`` and run every check that can refuse it, before anything reaches the client or the engine.
@@ -109,13 +124,20 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
     if (gone.check()) return error.Cancelled;
     var thinking = flag(f, "enable_thinking") orelse srv.config.enable_thinking;
     if (input.prompt != null) thinking = false;
-    const effort = srv.effortFor(if (f.get("reasoning_effort")) |e| (if (e == .string) e.string else null) else null);
+    const asked: ?[]const u8 = if (f.get("reasoning_effort")) |e| (if (e == .string) e.string else null) else null;
+    const effort: ?[]const u8 = if (srv.family) |fam| asked orelse srv.config.reasoning_effort orelse fam.defaultEffort() else srv.effortFor(asked);
     const rendered = try prompt_mod.prepare(srv, cx, input, thinking, effort);
+    errdefer if (rendered.family_images) |im| im.release();
     if (gone.check()) return error.Cancelled;
     if (rendered.ids.len == 0) return cx.refuse("rendered prompt is empty");
     const window: i64 = srv.info.context_window;
     const n: i64 = @intCast(rendered.ids.len);
-    if (window > 0) {
+    if (window > 0 and srv.config.wire == .spark) {
+        // ``context_problem``: the prompt plus the reply asked for (1 without max_tokens) must fit the limit
+        const reply_max: ?u64 = if (input.max_tokens) |m| (if (m > 0) @intCast(m) else null) else null;
+        if (@as(u64, @intCast(n)) + (reply_max orelse 1) > @as(u64, @intCast(window))) return cx.fail(.context_length, "{s}", .{try spark.contextMessage(a, rendered.ids.len, reply_max, srv.info.context_window, input.prompt == null)});
+        limit = @min(limit, window - n);
+    } else if (window > 0) {
         const room = window - n;
         if (room < 1) return cx.fail(.context_length, "{s} {d} tokens{s}, but the rendered prompt has {d} tokens and leaves no room for a reply, which exceeds the context window. Compact or shorten the conversation.", .{ errors.context_limit, window, if (srv.info.context_fitted) ", the most this server's memory budget fits" else "", n });
         if (input.max_tokens != null and limit > room) return cx.fail(.context_length, "{s} {d} tokens, but the rendered prompt has {d} tokens and requests {d} reply tokens, which exceeds the context window. Reduce the prompt to at most {d} prompt tokens or request at most {d} reply tokens, including chat template and thinking tokens.", .{ errors.context_limit, window, n, limit, @max(0, window - limit), room });
@@ -131,6 +153,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
     const drafts = srv.config.use_drafts and !(draft_field != null and draft_field.? == .bool and !draft_field.?.bool);
     var request: api.Request = .{
         .prompt = rendered.ids,
+        .held_images = if (rendered.family_images) |im| im.held else null,
         .max_tokens = @intCast(@min(limit, std.math.maxInt(u32))),
         .sampling = sampling,
         .eos = if (stops_opt.ignore_eos) &.{} else srv.eos,
@@ -141,10 +164,10 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
         .shared_prefixes = shared.items,
         // a cut before the conversation's own text: fresh sessions resume their whole harness
         .chunks = try chunk_plan.withCut(a, try srv.chunks.starts(a, rendered.ids), if (srv.chunks.step > 0) @intCast(@max(system_len, 1) - 1) else 0, rendered.ids.len, srv.chunks.min_chunk),
-        // from the tokens alone, for every request: cached states are keyed by tokens
-        .decode_spans = try prompt_mod.replySpans(srv, cx, rendered.ids),
+        // from the tokens alone (cached states are keyed by tokens); none for a family, whose engine does not read them
+        .decode_spans = if (srv.family != null) &.{} else try prompt_mod.replySpans(srv, cx, rendered.ids),
         .tools_json = if (input.tools.len > 0) try json.stringify(a, .{ .array = @constCast(input.tools) }, .{ .ascii = false }) else "",
-        .decide = if (input.prompt == null and !background) prompt_mod.decideOf(srv, rendered.ids) else null,
+        .decide = if (input.prompt == null and !background and srv.family == null) prompt_mod.decideOf(srv, rendered.ids) else null,
         .images = rendered.images,
         .cache_key = rendered.cache_key,
     };
@@ -163,7 +186,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
     }
     if (input.logprobs) |count| request.logprobs = try @import("logprobs.zig").admit(srv, cx, thinking, request.think_budget, count);
     request.prompt_logprobs = input.prompt_logprobs;
-    return .{ .input = input, .request = request, .prompt_len = rendered.ids.len, .received = received, .thinking = thinking, .effort = effort, .sampled = sampling != null, .drafts = drafts, .stops = stops_opt, .preparing = preparing };
+    return .{ .input = input, .request = request, .prompt_len = rendered.ids.len, .received = received, .thinking = thinking, .effort = effort, .sampled = sampling != null, .drafts = drafts, .stops = stops_opt, .preparing = preparing, .images_omitted = rendered.images_omitted, .images = rendered.family_images };
 }
 
 /// Submit a prepared request and collect its reply; ``sink`` hears the stream (null: not streamed).
@@ -178,6 +201,7 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
     const stops_opt = prepared.stops;
     var preparing = prepared.preparing;
     defer release(srv, preparing);
+    defer if (prepared.images) |im| im.release(); // after the engine's finished event (the loop below waits for it)
     if (request.background) {
         while (true) {
             const now = nowNs(io);
@@ -191,31 +215,78 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
     if (!srv.info.text_generation) return cx.refuse("this model does not support text generation");
     if (srv.info.decides) return cx.refuse("this model makes decisions and does not write text: use POST /v1/systemone");
     var stop_hook: StopHook = .{ .srv = srv, .stops = .{ .strings = stops_opt.strings } };
-    if (stops_opt.strings.len > 0) request.stop = .{ .ctx = &stop_hook, .check = StopHook.check };
+    // a family matches stop strings in the answer itself (``push``); the generic path, in the raw text on the engine's thread
+    if (stops_opt.strings.len > 0 and srv.family == null) request.stop = .{ .ctx = &stop_hook, .check = StopHook.check };
     var box: Mailbox = .{ .io = io, .gpa = srv.gpa };
     defer box.deinit();
     const id = srv.next_id.fetchAdd(1, .monotonic);
+    const submitted = nowNs(io);
     if (srv.keepalive) |k| k.begin(); // the GPU is busy: the idle ticker holds its commits
     defer if (srv.keepalive) |k| k.end();
-    srv.engine.submit(id, &request, .{ .ctx = &box, .event = Mailbox.onEvent }) catch |e| return switch (e) {
-        error.Busy => cx.fail(.capacity, "the engine is busy; retry shortly", .{}),
-        error.Closed => cx.fail(.capacity, "the engine is unavailable; retry after it restarts", .{}),
-        error.InvalidSpans => cx.fail(.request, "the prompt span layout is invalid", .{}),
-        error.Stale => cx.fail(.server, "{s}", .{api.stale_message}),
+    // the Spark surface: the run in /health's bookkeeping and the request log, from here to its end
+    const hid: ?u64 = if (srv.health) |h| h.begin(prepared.prompt_len) else null;
+    const ticket = if (srv.reqlog) |l| l.begin(request.prompt) else null;
+    srv.engine.submit(id, &request, .{ .ctx = &box, .event = Mailbox.onEvent }) catch |e| {
+        if (hid) |x| srv.health.?.end(x, .{ .failed = .{ .value_error = true, .message = "busy" } });
+        if (srv.reqlog) |l| l.end(ticket, input.body, .{ .chat = input.prompt == null, .finish = null, .completion_tokens = null, .outcome = null, .err = "EngineBusy", .thinking = thinking and input.prompt == null, .max_tokens_eff = effMax(srv, input) });
+        return switch (e) {
+            error.Busy => cx.fail(.capacity, "the engine is busy; retry shortly", .{}),
+            error.Closed => if (srv.config.wire == .spark) cx.fail(.other, "the scheduler is closed", .{}) else cx.fail(.capacity, "the engine is unavailable; retry after it restarts", .{}),
+            error.InvalidSpans => cx.fail(.request, "the prompt span layout is invalid", .{}),
+            error.Stale => cx.fail(.server, "{s}", .{api.stale_message}),
+        };
     };
     release(srv, preparing); // a background request waits only while a foreground one prepares
     preparing = false;
-    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .lp = if (request.logprobs != null) .{} else null };
+    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .lp = if (request.logprobs != null) .{} else null, .hid = hid, .ticket = ticket, .submitted = submitted, .prompt_len = prepared.prompt_len };
     defer srv.noteRequest(prepared.prompt_len, box.cached orelse 0, gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
     const result: Failure!Reply = blk: {
         if (sink) |s| if (s.begin) |begin| begin(s.ctx, prepared.prompt_len) catch break :blk error.Cancelled;
-        if (sink != null and input.tools.len > 0) gen.calls = tool_stream.Streamer.init(a, input.tools) catch |e| break :blk e;
+        if (srv.family) |fam| {
+            gen.reader = fam.reader(a, thinking, input.tools, input.single_call) catch |e| break :blk e;
+        } else if (sink != null and input.tools.len > 0) gen.calls = tool_stream.Streamer.init(a, input.tools) catch |e| break :blk e;
         gen.loop(gone) catch |e| break :blk e;
-        break :blk gen.finish(cx, prepared.prompt_len, received, thinking, effort, prepared.sampled, prepared.drafts);
+        break :blk gen.finish(cx, prepared.prompt_len, received, submitted, thinking, effort, prepared.sampled, prepared.drafts, prepared.images_omitted);
     };
     if (result) |_| {} else |e| logEnded(input.id, e, cx.message, prepared.prompt_len, gen.collected.items.len, seconds(nowNs(io) - received));
+    if (hid != null or ticket != null) sparkEnd(srv, &gen, input, thinking, result, cx.message);
     return result;
+}
+
+/// ``max_tokens or max_completion_tokens or the server's default``: the request log's ``max_tokens_eff``.
+fn effMax(srv: *const Server, input: Input) i64 {
+    if (input.max_tokens) |m| if (m > 0) return m;
+    return srv.config.default_max_tokens;
+}
+
+/// The Spark surface's end of a run: /health's ``end`` (a cancelled run counts as finished, an engine failure is
+/// fatal) and the request log's line.
+fn sparkEnd(srv: *Server, g: *Generation, input: Input, thinking: bool, result: Failure!Reply, message: []const u8) void {
+    var outcome: ?spark.Outcome = null;
+    var failed: ?[]const u8 = null;
+    if (result) |reply| outcome = reply.outcome else |e| switch (e) {
+        error.Cancelled => {
+            if (!g.engine_done) g.cancel();
+            outcome = g.outcome(true);
+        },
+        error.OutOfMemory => failed = "MemoryError",
+        else => failed = "RuntimeError",
+    }
+    if (failed != null and !g.engine_done) g.cancel();
+    if (g.hid) |x| srv.health.?.end(x, if (outcome) |o| .{ .ok = o } else .{ .failed = .{ .value_error = false, .message = if (message.len > 0) message else failed.? } });
+    const l = srv.reqlog orelse return;
+    const chat_ = input.prompt == null;
+    const reply: ?Reply = result catch null;
+    l.end(g.ticket, input.body, .{
+        .chat = chat_,
+        .finish = if (reply) |r| r.finish_reason else null,
+        .completion_tokens = if (reply) |r| r.completion_tokens else if (outcome) |o| o.completion else null,
+        .outcome = outcome,
+        .err = failed,
+        .thinking = thinking and chat_,
+        .max_tokens_eff = effMax(srv, input),
+    });
 }
 
 /// The ``ended`` line of a submitted reply that ends without one: its client left, or it failed.
@@ -262,11 +333,44 @@ const Generation = struct {
     streaming_done: bool = false,
     first_ns: ?i96 = null,
     last_ns: ?i96 = null,
+    /// when the stream last carried bytes (a keepalive goes out after a silence)
+    wrote_ns: ?i96 = null,
     reason: ?[]const u8 = null, // the server ended the reply (a stop string, the length) before the engine said so
     engine_done: bool = false,
     consumed: usize = 0,
     chunk_index: usize = 0,
     lp: ?@import("logprobs.zig").Stream = null, // the request asked for logprobs: its rows, copied with each round
+    // a family's reply: its reader, the answer so far, how much of it streamed, and a stop string's hit
+    reader: ?family_mod.Reader = null,
+    answer: std.ArrayList(u8) = .empty,
+    answer_sent: usize = 0,
+    deltas: std.ArrayList(Value) = .empty,
+    stop_hit: bool = false,
+    stop_at: usize = 0,
+    // the Spark surface: the run's /health entry and request-log ticket
+    hid: ?u64 = null,
+    ticket: ?*spark.RequestLog.Ticket = null,
+    submitted: i96 = 0,
+    prompt_len: usize = 0,
+
+    /// The run's stats as the Spark server reports them (the Python batch engine's ``job.stats``).
+    fn outcome(g: *const Generation, cancelled: bool) spark.Outcome {
+        const m = g.box;
+        const s = m.stats;
+        const end_ns = nowNs(g.srv.io);
+        return .{
+            .prompt = g.prompt_len,
+            .cached = m.cached orelse 0,
+            .ttft_s = if (g.first_ns) |f| @max(0, seconds(f - g.submitted)) else null,
+            .cancelled = cancelled,
+            .completion = m.tokens.items.len,
+            .prefill_s = s.prefill_seconds,
+            .decode_s = s.decode_seconds orelse if (m.prefilled_ns) |p| @max(0, seconds(end_ns - p)) else null,
+            .rounds = s.rounds,
+            .drafted = s.drafted,
+            .accepted = s.accepted,
+        };
+    }
 
     fn eos(g: *const Generation, t: u32) bool {
         return !g.ignore_eos and std.mem.indexOfScalar(u32, g.srv.eos, t) != null;
@@ -291,6 +395,7 @@ const Generation = struct {
 
     /// Commits a round's tokens as ``LaneStream.commit`` would, then streams what they add.
     fn commit(g: *Generation, chunk: []const u32) Failure!void {
+        if (g.reader) |r| return g.commitFamily(r, chunk);
         var landed: usize = 0;
         for (chunk) |t| {
             if (g.reason != null) break;
@@ -346,10 +451,12 @@ const Generation = struct {
     }
 
     fn emit(g: *Generation, sink: Sink, delta: Value) Failure!void {
+        if (g.srv.reqlog) |l| l.first(g.ticket);
         sink.call(sink.ctx, delta) catch {
             g.cancel();
             return error.Cancelled;
         };
+        g.wrote_ns = nowNs(g.srv.io);
     }
 
     /// End the request and wait for the engine; unfinished requests count as disconnects.
@@ -395,55 +502,192 @@ const Generation = struct {
                 g.cancel();
                 return error.Cancelled;
             }
+            if (chunk == null and @hasDecl(@TypeOf(gone), "beat")) {
+                // queueing and a long prefill send nothing: a client that times out a silent stream would leave
+                const now = nowNs(g.srv.io);
+                const since = g.wrote_ns orelse now;
+                if (g.wrote_ns == null) g.wrote_ns = now;
+                if (gone.beat(now - since) catch {
+                    g.cancel();
+                    return error.Cancelled;
+                }) g.wrote_ns = now;
+            }
             const tokens = chunk orelse continue;
+            // /health hears the tokens once they are read (a stop string they hold has cancelled the run by then)
+            defer if (g.hid) |x| g.srv.health.?.progress(x, tokens.len);
             if (g.reason == null) try g.commit(tokens);
         }
     }
 
-    fn finish(g: *Generation, cx: *Cx, prompt_len: usize, received: i96, thinking: bool, effort: ?[]const u8, exact: bool, drafts: bool) Failure!Reply {
+    /// A family's round: tokens committed (an end-of-sentence id ends the reply and shows no text), read by the
+    /// family's reader, and its deltas pushed as the Python app's ``push`` does.
+    fn commitFamily(g: *Generation, r: family_mod.Reader, chunk: []const u32) Failure!void {
+        var landed: usize = 0;
+        const start = g.collected.items.len;
+        for (chunk) |t| {
+            if (g.reason != null) break;
+            try g.collected.append(g.a, t);
+            landed += 1;
+            if (g.eos(t)) {
+                g.reason = "stop";
+            } else if (g.collected.items.len >= g.max_tokens) g.reason = "length";
+        }
+        if (landed == 0) return;
+        const arrived = nowNs(g.srv.io);
+        if (g.first_ns == null) g.first_ns = arrived;
+        g.last_ns = arrived;
+        for (g.collected.items[start..]) |t| if (!g.isEos(t)) try r.push(&.{t});
+        if (r.pending()) return; // a character still split across tokens
+        g.deltas.clearRetainingCapacity();
+        try r.feed(false, &g.deltas);
+        try g.pushFamily(g.deltas.items, false);
+    }
+
+    /// Any end-of-sentence id, ``ignore_eos`` or not: never text.
+    fn isEos(g: *const Generation, t: u32) bool {
+        return std.mem.indexOfScalar(u32, g.srv.eos, t) != null;
+    }
+
+    /// ``push``: reasoning and calls go out as they come; the answer is held where a stop string may begin, and cut
+    /// where one does (which ends the reply).
+    fn pushFamily(g: *Generation, deltas: []const Value, finished: bool) Failure!void {
+        for (deltas) |d| switch (d) {
+            .string => |t| try g.answer.appendSlice(g.a, t),
+            else => if (g.sink) |sink| if (!g.streaming_done or finished) try g.emit(sink, d),
+        };
+        var full = g.answer.items;
+        const stops = g.stops.strings;
+        if (stops.len > 0 and !g.stop_hit) {
+            var longest: usize = 0;
+            for (stops) |st| longest = @max(longest, st.len);
+            const from = (g.answer_sent + 1) -| longest;
+            var cut: ?usize = null;
+            for (stops) |st| if (std.mem.indexOfPos(u8, full, @min(from, full.len), st)) |at| {
+                if (cut == null or at < cut.?) cut = at;
+            };
+            if (cut) |c| {
+                g.answer.shrinkRetainingCapacity(c);
+                full = g.answer.items;
+                g.stop_hit = true;
+                g.stop_at = g.collected.items.len;
+                if (g.reason == null) {
+                    g.reason = "stop";
+                    g.srv.engine.cancel(g.id); // the engine ends EOS and length itself; a stop string is the server's
+                }
+            }
+        }
+        var upto = full.len;
+        if (!finished and !g.stop_hit) {
+            var hold: usize = 0;
+            for (stops) |st| {
+                var k = @min(st.len - 1, full.len);
+                while (k > 0) : (k -= 1) if (std.mem.endsWith(u8, full, st[0..k])) break;
+                hold = @max(hold, k);
+            }
+            upto -= hold;
+        }
+        if (upto > g.answer_sent) {
+            if (g.sink) |sink| try g.emit(sink, .{ .string = full[g.answer_sent..upto] });
+            g.answer_sent = upto;
+        }
+    }
+
+    /// A family's finished reply: the stream's last deltas, then the parts (``app._run``'s end).
+    fn finishFamily(g: *Generation, r: family_mod.Reader) Failure!struct { content: []const u8, reasoning: ?[]const u8, calls: []Value, reason: []const u8, used: usize } {
+        const streaming = g.sink != null;
+        g.deltas.clearRetainingCapacity();
+        try r.feed(true, &g.deltas);
+        try g.pushFamily(g.deltas.items, true);
+        const parsed = try r.parse();
+        var content: []const u8 = undefined;
+        var calls: []Value = undefined;
+        if (streaming) {
+            calls = try r.calls();
+            content = g.answer.items[0..g.answer_sent];
+        } else {
+            calls = parsed.calls;
+            content = parsed.content;
+            for (g.stops.strings) |st| if (std.mem.indexOf(u8, content, st)) |at| {
+                content = content[0..at];
+                if (!g.stop_hit) {
+                    g.stop_hit = true;
+                    g.stop_at = g.collected.items.len;
+                }
+            };
+        }
+        const t = g.collected.items;
+        const reason: []const u8 = if (calls.len > 0) "tool_calls" else if (g.stop_hit or (!g.ignore_eos and t.len > 0 and g.isEos(t[t.len - 1]))) "stop" else "length";
+        if (g.srv.family) |fam| fam.remember(parsed.reasoning, content, calls);
+        // a reply with tools on offer that ended without a call but holds tool markup: what the parser saw (once,
+        // at most 300 bytes of the reply; the window is cut at UTF-8 boundaries and escaped by the log line)
+        if (calls.len == 0 and g.tools.len > 0) if (r.markup() catch null) |m|
+            std.log.warn("tool markup with no call: request {s}, finish {s}: {s}; reply bytes {d}..: {f}", .{ g.reply_id, reason, m.reason, m.at, std.zig.fmtString(m.window) });
+        return .{ .content = content, .reasoning = if (parsed.reasoning.len > 0) parsed.reasoning else null, .calls = calls, .reason = reason, .used = if (g.stop_hit and g.stop_at > 0) g.stop_at else t.len };
+    }
+
+    fn finish(g: *Generation, cx: *Cx, prompt_len: usize, received: i96, submitted: i96, thinking: bool, effort: ?[]const u8, exact: bool, drafts: bool, images_omitted: u32) Failure!Reply {
         const a = g.a;
         const m = g.box;
         if (!g.engine_done) g.drain();
-        const reason: []const u8 = g.reason orelse switch (m.reason) {
+        const reason_generic: []const u8 = g.reason orelse switch (m.reason) {
             .stop => "stop",
             .length => "length",
             .cancelled => "cancelled",
-            .failed => return cx.other(if (m.message.len > 0) try a.dupe(u8, m.message) else "the reply failed"),
+            .failed => {
+                // a drain's deadline ended it: the 503's code, not a failure's
+                if (g.srv.draining.load(.seq_cst) and std.mem.eql(u8, m.message, errors.restarting)) return cx.fail(.restarting, "{s}", .{errors.restarting});
+                return cx.other(if (m.message.len > 0) try a.dupe(u8, m.message) else "the reply failed");
+            },
         };
-        const finished_ns = nowNs(g.srv.io);
-        const content_tokens = if (g.ignore_eos) g.collected.items else reply_text.stripTrailing(g.collected.items, g.srv.eos);
-        const raw = try g.srv.text.decode(a, content_tokens);
-        const visible = g.stops.visible(raw, false);
-        // closed before the think split, so a call ending an unclosed think block is the answer
-        const close = try g.closeCall(visible);
-        const text = if (close.len > 0) try std.mem.concat(a, u8, &.{ visible, close }) else visible;
-        var content: []const u8 = text;
+        var reason = reason_generic;
+        var raw: []const u8 = "";
+        var content: []const u8 = undefined;
         var reasoning: ?[]const u8 = null;
-        if (g.thinking) {
-            const split = try reply_text.splitThinking(a, text, true, g.srv.markers);
-            const r = reply_text.pyStrip(split.reasoning);
-            reasoning = if (r.len > 0) r else null;
-            content = split.answer;
+        var calls: ?[]Value = null;
+        var used = g.collected.items.len;
+        var content_tokens: []const u32 = g.collected.items;
+        if (g.reader) |r| {
+            const f = try g.finishFamily(r);
+            content = f.content;
+            reasoning = f.reasoning;
+            calls = f.calls;
+            used = f.used;
+            if (!(m.reason == .cancelled and g.reason == null)) reason = f.reason;
         } else {
-            const h = reply_text.parseHarmony(text);
-            content = h.content;
-            reasoning = h.reasoning;
+            content_tokens = if (g.ignore_eos) g.collected.items else reply_text.stripTrailing(g.collected.items, g.srv.eos);
+            raw = try g.srv.text.decode(a, content_tokens);
+            const visible = g.stops.visible(raw, false);
+            // closed before the think split, so a call ending an unclosed think block is the answer
+            const close = try g.closeCall(visible);
+            const text = if (close.len > 0) try std.mem.concat(a, u8, &.{ visible, close }) else visible;
+            content = text;
+            if (g.thinking) {
+                const split = try reply_text.splitThinking(a, text, true, g.srv.markers);
+                const r = reply_text.pyStrip(split.reasoning);
+                reasoning = if (r.len > 0) r else null;
+                content = split.answer;
+            } else {
+                const h = reply_text.parseHarmony(text);
+                content = h.content;
+                reasoning = h.reasoning;
+            }
+            if (g.sink) |sink| {
+                const thought = g.streamed_reasoning.text.items;
+                if (reasoning) |r| if (std.mem.startsWith(u8, r, thought) and r.len > thought.len)
+                    try g.emit(sink, try deltaOf(a, "reasoning_content", r[thought.len..]));
+                const shown = if (g.calls != null) try reply_text.finishedProse(a, content) else content;
+                const sent = g.streamed.text.items;
+                const rest = if (std.mem.startsWith(u8, shown, sent) and shown.len > sent.len) shown[sent.len..] else "";
+                if (g.lp) |*l| (if (try l.delta(g.srv, a, g.thinking, g.ignore_eos, g.collected.items, rest, shown.len, true)) |d| try g.emit(sink, d)) else if (rest.len > 0) try g.emit(sink, .{ .string = rest });
+                if (g.calls) |*c| if (close.len > 0) {
+                    // the streamer reads the closers as markup the model wrote, so the call ends with the same deltas
+                    var out: std.ArrayList(Value) = .empty;
+                    try c.feed(if (g.thinking) content else text, &out);
+                    for (out.items) |d| try g.emit(sink, d);
+                };
+            }
         }
-        if (g.sink) |sink| {
-            const thought = g.streamed_reasoning.text.items;
-            if (reasoning) |r| if (std.mem.startsWith(u8, r, thought) and r.len > thought.len)
-                try g.emit(sink, try deltaOf(a, "reasoning_content", r[thought.len..]));
-            const shown = if (g.calls != null) try reply_text.finishedProse(a, content) else content;
-            const sent = g.streamed.text.items;
-            const rest = if (std.mem.startsWith(u8, shown, sent) and shown.len > sent.len) shown[sent.len..] else "";
-            if (g.lp) |*l| (if (try l.delta(g.srv, a, g.thinking, g.ignore_eos, g.collected.items, rest, shown.len, true)) |d| try g.emit(sink, d)) else if (rest.len > 0) try g.emit(sink, .{ .string = rest });
-            if (g.calls) |*c| if (close.len > 0) {
-                // the streamer reads the closers as markup the model wrote, so the call ends with the same deltas
-                var out: std.ArrayList(Value) = .empty;
-                try c.feed(if (g.thinking) content else text, &out);
-                for (out.items) |d| try g.emit(sink, d);
-            };
-        }
+        const finished_ns = nowNs(g.srv.io);
         const prefilled = m.prefilled_ns;
         const decode_s: f64 = if (prefilled) |p| @max(0, seconds(finished_ns - p)) else 0;
         const decode_tokens = g.collected.items.len -| 1;
@@ -452,8 +696,9 @@ const Generation = struct {
         try runtime.put(a, "reasoning_effort", if (!thinking) .{ .string = "none" } else if (effort) |e| .{ .string = e } else .null);
         try runtime.put(a, "engine", .{ .string = g.srv.info.name });
         try runtime.put(a, "tokens_per_second", .{ .float = if (decode_s > 0) @as(f64, @floatFromInt(decode_tokens)) / decode_s else 0 });
-        // the reply's decode seconds, as tokens_per_second divides them
-        try runtime.put(a, "seconds", .{ .float = @max(0, decode_s) });
+        // the reply's decode seconds, as tokens_per_second divides them; the Spark wire's: submission to the end
+        const total = seconds(finished_ns - submitted);
+        try runtime.put(a, "seconds", .{ .float = if (g.srv.config.wire == .spark) @max(0, total) else @max(0, decode_s) });
         try runtime.put(a, "prefill_seconds", if (m.stats.prefill_seconds) |p| .{ .float = p } else .null);
         const widths = try a.alloc(Value, m.widths.len);
         for (m.widths, widths) |w, *slot| slot.* = try json.intValue(a, w);
@@ -468,6 +713,7 @@ const Generation = struct {
         try runtime.put(a, "token_sha", .{ .string = try a.dupe(u8, &sha) });
         const sha256 = @import("tokens.zig").tokenSha256(g.collected.items);
         try runtime.put(a, "token_sha256", .{ .string = try a.dupe(u8, &sha256) });
+        if (images_omitted > 0) try runtime.put(a, "images_omitted", try json.intValue(a, images_omitted));
         try runtime.put(a, "min_rows", try json.intValue(a, m.stats.min_rows));
         if (m.stats.loop_period) |period| {
             const loop_field = try json.newObject(a);
@@ -495,7 +741,7 @@ const Generation = struct {
             .finish_reason = reason,
             .prompt_tokens = prompt_len,
             .cached_tokens = m.cached orelse 0,
-            .completion_tokens = g.collected.items.len,
+            .completion_tokens = used,
             .reasoning_tokens = reply_text.reasoningCount(g.collected.items, think_end),
             .runtime = .{ .object = runtime },
             .speculative = .{ .object = spec },
@@ -503,6 +749,10 @@ const Generation = struct {
             .effort = effort,
             .logprobs = if (g.lp) |l| try @import("logprobs.zig").value(g.srv, cx, a, g.thinking, content_tokens, l.rows.items) else null,
             .prompt_logprobs = if (m.prompt_rows) |r| try @import("logprobs.zig").promptValue(g.srv, a, r) else null,
+            .calls = calls,
+            .outcome = if (g.srv.config.wire == .spark) g.outcome(m.reason == .cancelled and g.reason == null) else null,
+            .token_ids = g.collected.items[0..@min(used, g.collected.items.len)],
+            .images_omitted = images_omitted,
         };
         if (std.mem.eql(u8, reason, "length") and thinking and reply_text.pyStrip(content).len == 0)
             log.line("warning: a reply reached max_tokens while still thinking, so its content is empty and its text is all in reasoning_content; raise max_tokens, or send chat_template_kwargs {{\"enable_thinking\": false}} (server: --no-thinking)", .{});
