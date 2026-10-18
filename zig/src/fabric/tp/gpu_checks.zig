@@ -117,6 +117,17 @@ pub const Ctx = struct {
         }
     }
 
+    /// scatterRows (TF_DSV41_PF_RS's transfer): the peer's rows of this rank's share, bf16 rows of `width`.
+    pub fn scatter(c: *Ctx, comm: Collective, label: []const u8, rows: usize, width: usize, seed: u64) !void {
+        const n = rows * width * 2;
+        c.inputs(n, .bf16, seed);
+        const mine = tp.collective.rowShare(rows, 2, c.rank);
+        const m = (mine[1] - mine[0]) * width * 2;
+        try c.in.uploadAsyncDirect(0, c.mine[0..n], c.stream.handle);
+        try comm.scatterRows(c.in.ptr, c.out.ptr, rows, width, .bf16, c.stream.handle);
+        try c.compare(comm, label, "scatter rows", .bf16, m, 0, c.peer[mine[0] * width * 2 ..][0..m]);
+    }
+
     /// send then recv one way, then the other way (NCCL behind every backend).
     pub fn pointToPoint(c: *Ctx, comm: Collective, label: []const u8, n_bytes: usize, seed: u64) !void {
         const n = n_bytes - n_bytes % 4;

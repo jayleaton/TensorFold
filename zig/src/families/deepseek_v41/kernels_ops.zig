@@ -463,6 +463,8 @@ pub const Functions = struct {
     ds_stage_rows: ?cuda.Function = null,
     /// glue.cu's device keyed choice (vsample.choose; the sampled rounds' device start); optional
     vs_choose: ?cuda.Function = null,
+    /// glue.cu's rank-order sum of a prefill reduce-scatter (TF_DSV41_PF_RS); optional, as ds_cands
+    rank_sum: ?cuda.Function = null,
     pfglue: [pfglue.syms.len]cuda.Function, // pfglue.syms order
 
     /// `pf`: the four pfdense modules (K2 8, 10, 12, 16).
@@ -524,6 +526,7 @@ pub const Functions = struct {
         f.ds_accept_rows = m_glue.function(glue.ds_accept_rows_sym) catch null;
         f.ds_stage_rows = m_glue.function(glue.ds_stage_rows_sym) catch null;
         f.vs_choose = m_glue.function(glue.vs_choose_sym) catch null;
+        f.rank_sum = m_glue.function(glue.rank_sum_sym) catch null;
         inline for (pfglue.syms, 0..) |name, i| f.pfglue[i] = try m_pfglue.function(name);
         return f;
     }
@@ -644,6 +647,8 @@ pub const glue = struct {
     pub const ds_stage_sym: [:0]const u8 = "_ZN10dsv41_glue15ds_stage_kernelEPKxiPxPiiiixiiiiiii";
     pub const ds_accept_rows_sym: [:0]const u8 = "_ZN10dsv41_glue21ds_accept_rows_kernelEPKxS1_S1_iPx";
     pub const ds_stage_rows_sym: [:0]const u8 = "_ZN10dsv41_glue20ds_stage_rows_kernelEPKxS1_iPxPiiiiiiiiiii";
+    /// TF_DSV41_PF_RS's rank-order sum (optional, as ds_cands)
+    pub const rank_sum_sym: [:0]const u8 = "_ZN10dsv41_glue15rank_sum_kernelEPKtS1_iixxPt";
     pub const vs_choose_sym: [:0]const u8 = "_ZN10dsv41_glue16vs_choose_kernelEPKfiiiiyxidddPx";
     /// the candidates vs_choose merges at most (W k)
     pub const vs_max = 2048;
@@ -984,6 +989,21 @@ pub const Ops = struct {
         a.add(y);
         a.add(@as(i64, @intCast(n)));
         try o.glueGo(.cast_bf16, n, &a);
+    }
+
+    /// pf_rs: out[i] = bf16 of the W ranks' bf16 terms in fp32, rank 0 first; peer q's at peers + slot(q) * stride.
+    pub fn rankSum(o: Ops, own: u64, peers: u64, W: usize, me: usize, n: usize, stride: usize, out: u64) !void {
+        if (n == 0) return;
+        const f = o.f.rank_sum orelse return error.Unsupported;
+        var a: cuda.Args = .{};
+        a.add(own);
+        a.add(peers);
+        a.add(@as(c_int, @intCast(W)));
+        a.add(@as(c_int, @intCast(me)));
+        a.add(@as(i64, @intCast(n)));
+        a.add(@as(i64, @intCast(stride)));
+        a.add(out);
+        try o.go(f, .{ glue.grid(n), 1, 1 }, 256, 0, null, &a);
     }
 
     /// pick.kit_weights: y = x.to(fp16).to(fp32) over n elements (y may be x).

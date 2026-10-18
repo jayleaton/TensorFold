@@ -49,6 +49,7 @@ const moe = @import("block_moe.zig");
 const longpf = @import("longpf.zig");
 const gm2pf = @import("gm2pf.zig");
 const ced = @import("ced.zig");
+const pf_rs = @import("pf_rs.zig");
 const Config = config.Config;
 const E = block.Emitter;
 const Arg = calls.Arg;
@@ -115,6 +116,8 @@ const Seg = struct {
     /// TF_DSV41_PF_OVERLAP_SITE: the last exchange's k pieces are all on the side stream, marks 1..k; the next
     /// boundary site runs in those pieces (`sitePieces`), anything else joins first. 0: none pending
     pend: i64 = 0,
+    /// TF_DSV41_PF_RS: the last exchange went as a reduce-scatter; the next boundary site reads its [1, n, D] sums
+    rs: bool = false,
 
     // -----------------------------------------------------------------------------------------------------------
     // TF_DSV41_PF_OVERLAP: the exchanges in row pieces, overlapped with their producers' next piece
@@ -298,6 +301,24 @@ const Seg = struct {
         return e.buf("L.recv.moe", .{}, .bf16, &.{ e.o.world, e.n, D });
     }
 
+    /// What a boundary's mhc_pf reads: the gathered partials, or after a reduce-scatter its sums (world 1: no add).
+    fn sums(s: *Seg, which: []const u8) !Arg {
+        const e = s.e;
+        const g = try gathered(e, which);
+        if (!s.rs) return g;
+        s.rs = false;
+        const D: i64 = e.cfg.hidden;
+        return e.view(g.t.role, .bf16, &.{ 1, e.n, D }, &.{ e.n * D, D, 1 }, 0);
+    }
+
+    /// A sublayer's exchange of `part` [n, D]; TF_DSV41_PF_RS where `boundary` (an mhc_pf boundary site reads it next).
+    fn exchange(s: *Seg, comptime which: []const u8, part: Arg, boundary: bool) !void {
+        const e = s.e;
+        const rs = boundary and e.o.pf_rs and !s.short and e.n >= pf_rows and pf_rs.fits(@intCast(e.n), @intCast(e.o.world));
+        s.rs = rs;
+        try e.glue(if (rs) "exchange_rs" else "exchange", &.{ part, try s.recv(which) });
+    }
+
     /// One mixing site of layer L (`which`: hc_attn / hc_ffn): mhc.site / mhc.boundary, then `_finish_k` (a short
     /// segment: mhc_cuda alone).
     fn site(s: *Seg, L: u32, which: []const u8, mode: moe.Mode) !void {
@@ -330,12 +351,12 @@ const Seg = struct {
         const xout = if (spare) try e.spare() else x;
         if (n >= pf_rows) {
             try e.ext("tf_dsv41_mhc_pf_v1.run", &.{
-                x,                                        if (post) xout else b0,
-                if (post) try gathered(e, which) else b0, if (post) prev[1] else f0,
-                if (post) prev[2] else f0,                if (mode != .site1) prev[0] else f0,
-                fnw,                                      part,
-                c,                                        tap orelse b0,
-                .{ .i = n },                              .{ .i = @backingInt(mode) },
+                x,                                   if (post) xout else b0,
+                if (post) try s.sums(which) else b0, if (post) prev[1] else f0,
+                if (post) prev[2] else f0,           if (mode != .site1) prev[0] else f0,
+                fnw,                                 part,
+                c,                                   tap orelse b0,
+                .{ .i = n },                         .{ .i = @backingInt(mode) },
             });
         } else try s.siteTriton(x, if (post) xout else null, if (post) try gathered(e, which) else null, prev, if (mode != .site1) prev[0] else null, fnw, part, c, tap, if (mode == .site1) 1 else 2, true);
         try s.finish(.{ L, which }, next, try e.weight("L{d}.{s}", .{ L, if (std.mem.eql(u8, which, "hc_attn")) "attn_norm" else "ffn_norm" }, .f32, &.{D}), part, c, 0);
@@ -353,7 +374,6 @@ const Seg = struct {
         const e = s.e;
         const n = e.n;
         const D: i64 = e.cfg.hidden;
-        const W: i64 = e.o.world;
         const x = try e.streams();
         const prev = try coefs(e, e.coef);
         const next = try coefs(e, 1 - e.coef);
@@ -361,7 +381,8 @@ const Seg = struct {
         const fnw = try e.buf("s.L{d}.{s}.fn16", .{ L, which }, .bf16, &.{ 6 * @as(i64, e.cfg.hc_mult), 4 * D });
         const part = try e.buf("L.mhc.part", .{}, .f32, &.{ n, 4, 40, 32 });
         const c = try e.buf("L.mhc.c", .{}, .bf16, &.{ n, D });
-        const g = try gathered(e, which);
+        const g = try s.sums(which);
+        const W: i64 = g.t.shape[0];
         const tap = try tapOf(e, L, which, .boundary);
         const nw = try e.weight("L{d}.{s}", .{ L, if (std.mem.eql(u8, which, "hc_attn")) "attn_norm" else "ffn_norm" }, .f32, &.{D});
         if (overlapped) e.br_join = false; // piece p waits for its own exchange piece; the last joins
@@ -442,6 +463,7 @@ const Seg = struct {
     fn postOnly(s: *Seg, xout: Arg) !void {
         const e = s.e;
         s.pend = 0; // reads the whole gathered buffer: it joined (sendPiece)
+        std.debug.assert(!s.rs);
         if (s.short) return moe.postOnly(e, xout);
         const prev = try coefs(e, e.coef);
         const x = try e.streams();
@@ -452,6 +474,7 @@ const Seg = struct {
     fn final(s: *Seg) !void {
         const e = s.e;
         s.pend = 0;
+        std.debug.assert(!s.rs);
         if (s.short) return moe.finish(e); // mhc_cuda's final, then the same head
         const n = e.n;
         const D: i64 = e.cfg.hidden;
@@ -1391,13 +1414,15 @@ const Seg = struct {
             try s.attention(L);
             if (s.short) try e.prefetchF(L);
             // TF_DSV41_PF_OVERLAP: the partial went out a piece at a time behind its producer
-            if (!s.sent_attn) try e.glue("exchange", &.{ try e.buf("L.part", .{}, .bf16, &.{ n, D }), try s.recv("attn") });
+            if (!s.sent_attn) try s.exchange("attn", try e.buf("L.part", .{}, .bf16, &.{ n, D }), true);
             s.sent_attn = false;
             if (e.marks) |m| try m.append(e.a, e.out.items.len); // its MoE part
             try s.site(L, "hc_ffn", .boundary);
             try s.moeBlock(L);
             if (s.short and i + 1 < layers.len) try e.prefetchX(layers[i + 1]);
-            if (!s.sent_moe) try e.glue("exchange", &.{ try e.buf("L.moe16", .{}, .bf16, &.{ n, D }), try s.recv("moe") });
+            // the next layer's boundary site reads it (not an Engram block's post, the trace's or the head's)
+            const boundary = i + 1 < layers.len and !e.cfg.isEngram(layers[i + 1]) and !e.o.trace;
+            if (!s.sent_moe) try s.exchange("moe", try e.buf("L.moe16", .{}, .bf16, &.{ n, D }), boundary);
             s.sent_moe = false;
             if (e.o.trace) {
                 const y = try e.buf("w.trace", .{}, .bf16, &.{ n, 4 * D });

@@ -135,6 +135,19 @@ __global__ void __launch_bounds__(256) widen_f32_kernel(const uint16_t* __restri
         y[i] = bf(x[i]);
 }
 
+// pf_rs: bf16 of the ranks' terms added in fp32 rank 0 first, cvt.rn as mhc_pf's post; `out` may be peers' slot 0
+__global__ void __launch_bounds__(256) rank_sum_kernel(const uint16_t* own, const uint16_t* peers, int W, int me,
+                                                       long long n, long long stride, uint16_t* out) {
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x) {
+        float s = bf(me == 0 ? own[i] : peers[i]);
+        for (int r = 1; r < W; ++r)
+            s = __fadd_rn(s, bf(r == me ? own[i] : peers[(long long)(r < me ? r : r - 1) * stride + i]));
+        unsigned short h;
+        asm("cvt.rn.bf16.f32 %0, %1;" : "=h"(h) : "f"(s));
+        out[i] = h;
+    }
+}
+
 // DSpark's candidates: one CTA a row of fp32 logits [rows, V] (row stride ld). Keys
 //   u = (mono(bits(x + 0.0)) << 32) | (0xFFFFFFFF - col)
 // are unique in a row and order rows by (value desc, column asc) with -0.0 == +0.0, the host rule (dspark.candidates).

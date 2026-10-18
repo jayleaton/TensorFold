@@ -73,6 +73,7 @@ pub const Nccl = struct {
         .barrier = barrier,
         .check = check,
         .abort = abort,
+        .scatter_rows = scatterRows,
     };
 
     fn self_(ptr: *anyopaque) *Nccl {
@@ -119,6 +120,30 @@ pub const Nccl = struct {
         const e = n.lib.api.ncclGroupEnd();
         try n.call(a, "ncclSend");
         try n.call(b, "ncclRecv");
+        try n.call(e, "ncclGroupEnd");
+    }
+
+    /// upstream rank_scatter.Posts: one group of each peer's send of its share and recv of its rows of ours.
+    pub fn scatterRows(ptr: *anyopaque, s: DevicePtr, r: DevicePtr, rows: usize, width: usize, t: DType, stream: collective.Stream) Error!void {
+        const n = self_(ptr);
+        try n.live();
+        const w: usize = n.size;
+        const me: usize = n.me;
+        const row = width * t.size();
+        const mine = collective.rowShare(rows, w, me);
+        const c = (rows + w - 1) / w;
+        try n.call(n.lib.api.ncclGroupStart(), "ncclGroupStart");
+        var first: nccl.Result = 0;
+        for (0..w) |peer| {
+            if (peer == me) continue;
+            const theirs = collective.rowShare(rows, w, peer);
+            const to: c_int = @intCast(peer);
+            const slot = r + collective.scatterSlot(me, peer) * c * row;
+            if (theirs[1] > theirs[0] and first == 0) first = n.lib.api.ncclSend(s + theirs[0] * row, (theirs[1] - theirs[0]) * width, dataType(t), to, n.comm, stream);
+            if (mine[1] > mine[0] and first == 0) first = n.lib.api.ncclRecv(slot, (mine[1] - mine[0]) * width, dataType(t), to, n.comm, stream);
+        }
+        const e = n.lib.api.ncclGroupEnd();
+        try n.call(first, "ncclSend / ncclRecv");
         try n.call(e, "ncclGroupEnd");
     }
 

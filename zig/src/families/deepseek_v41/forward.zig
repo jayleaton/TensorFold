@@ -26,6 +26,7 @@ const greedy_host = @import("greedy.zig");
 const ph = @import("phases.zig");
 const hs = @import("host_stage.zig");
 const ced = @import("ced.zig");
+const pf_rs = @import("pf_rs.zig");
 
 pub const Error = error{ GlueNotBuilt, BadWindow };
 
@@ -969,6 +970,15 @@ pub const Forward = struct {
             // attention's bf16 partial gathered into the receive buffer, rank 0's first
             const send = c.args[0].arg.t;
             return f.comm.allGather(try r.tensorAddr(send), try r.tensorAddr(c.args[1].arg.t), numel(send), .bf16, s);
+        }
+        if (std.mem.eql(u8, step, "exchange_rs")) {
+            // TF_DSV41_PF_RS: this rank's rows of every rank's partial summed in rank order, the sums gathered (pf_rs)
+            const send = c.args[0].arg.t;
+            const into = c.args[1].arg.t;
+            const n: usize = @intCast(into.shape[1]);
+            if (@as(usize, @intCast(into.shape[0])) != W or numel(send) != n * D) return error.BadGlue;
+            const me: usize = f.comm.rank();
+            return pf_rs.exchange(f.comm, k, try r.tensorAddr(send), try r.tensorAddr(into), n, D, W, me, tp.collective.rowShare(n, W, me), s);
         }
         if (std.mem.eql(u8, step, "exchange_rows")) {
             // TF_DSV41_PF_OVERLAP: rows [r0, r0 + m) of a bf16 partial into the gathered [world, n, D], where the

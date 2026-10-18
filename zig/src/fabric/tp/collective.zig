@@ -62,6 +62,8 @@ pub const Collective = struct {
         /// Host: whether every rank's transport takes device lengths (`var_fits(16)` on all), agreed once per communicator by an
         /// int all-gather and kept on the implementation. Null: false.
         var_agreed: ?*const fn (ptr: *anyopaque) Error!bool = null,
+        /// send's rows of each peer's `rowShare` to it; recv [world - 1][ceil(rows / world)][width]: theirs of ours
+        scatter_rows: ?*const fn (ptr: *anyopaque, send: DevicePtr, recv: DevicePtr, rows: usize, width: usize, t: DType, stream: Stream) Error!void = null,
     };
 
     pub fn kind(c: Collective) Kind {
@@ -107,6 +109,15 @@ pub const Collective = struct {
         return c.vtable.exchange(c.ptr, src, dst, count, t, peer, stream);
     }
 
+    /// A rank-order reduce-scatter's transfer (`VTable.scatter_rows`); else two equal shares trade by `exchange`.
+    pub fn scatterRows(c: Collective, src: DevicePtr, dst: DevicePtr, rows: usize, width: usize, t: DType, stream: Stream) Error!void {
+        if (c.vtable.scatter_rows) |f| return f(c.ptr, src, dst, rows, width, t, stream);
+        const w = c.world();
+        if (w != 2 or rows % 2 != 0) return error.Unsupported;
+        const peer = 1 - c.rank();
+        return c.exchange(src + rowShare(rows, w, peer)[0] * width * t.size(), dst, rows / 2 * width, t, peer, stream);
+    }
+
     pub fn send(c: Collective, buf: DevicePtr, count: usize, t: DType, peer: u32, stream: Stream) Error!void {
         return c.vtable.send(c.ptr, buf, count, t, peer, stream);
     }
@@ -131,6 +142,33 @@ pub const Collective = struct {
 /// Refuses a peer that is this rank or out of range.
 pub fn checkPeer(rank: u32, world: u32, peer: u32) Error!void {
     if (peer == rank or peer >= world) return error.Invalid;
+}
+
+/// Rank `rank`'s rows [lo, hi) of a reduce-scatter: ceil(rows / world) a rank from row 0, cut at `rows`.
+pub fn rowShare(rows: usize, world: usize, rank: usize) [2]usize {
+    const c = (rows + world - 1) / world;
+    return .{ @min(rows, rank * c), @min(rows, (rank + 1) * c) };
+}
+
+/// recv's slot (of world - 1) for `peer`'s rows of this rank's share (`VTable.scatter_rows`).
+pub fn scatterSlot(rank: usize, peer: usize) usize {
+    return if (peer < rank) peer else peer - 1;
+}
+
+test "row shares tile the rows in rank order, ceil(rows / world) a rank; two ranks match upstream's equal cut" {
+    for ([_]usize{ 0, 1, 2, 3, 255, 256, 257, 4095, 4096 }) |rows| for (1..6) |world| {
+        var at: usize = 0;
+        for (0..world) |r| {
+            const s = rowShare(rows, world, r);
+            try std.testing.expectEqual(at, s[0]);
+            try std.testing.expect(s[1] - s[0] <= (rows + world - 1) / world);
+            at = s[1];
+        }
+        try std.testing.expectEqual(rows, at);
+    };
+    try std.testing.expectEqual([2]usize{ 0, 129 }, rowShare(257, 2, 0));
+    try std.testing.expectEqual([2]usize{ 129, 257 }, rowShare(257, 2, 1));
+    for ([_][3]usize{ .{ 1, 0, 0 }, .{ 0, 1, 0 }, .{ 1, 3, 2 }, .{ 2, 1, 1 } }) |x| try std.testing.expectEqual(x[2], scatterSlot(x[0], x[1]));
 }
 
 test "dtype sizes" {

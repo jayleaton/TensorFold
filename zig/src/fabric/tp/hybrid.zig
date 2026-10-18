@@ -98,6 +98,7 @@ pub const Hybrid = struct {
             .all_gather_v = allGatherV,
             .var_fits = varFits,
             .var_agreed = varAgreed,
+            .scatter_rows = scatterRows,
         };
     }
 
@@ -167,6 +168,11 @@ pub const Hybrid = struct {
         try collective.checkPeer(h.nccl.me, h.nccl.size, peer);
         if (h.routed(count * t.size())) return h.small.exchange(s, r, count * t.size(), stream);
         return Nccl.exchange(h.nccl, s, r, count, t, peer, stream);
+    }
+
+    /// Always NCCL's group: a prefill partial's shares are megabytes, past the small path's slot.
+    fn scatterRows(ptr: *anyopaque, s: DevicePtr, r: DevicePtr, rows: usize, width: usize, t: DType, stream: collective.Stream) Error!void {
+        return Nccl.scatterRows(self_(ptr).nccl, s, r, rows, width, t, stream);
     }
 
     fn send(ptr: *anyopaque, buf: DevicePtr, count: usize, t: DType, peer: u32, stream: collective.Stream) Error!void {

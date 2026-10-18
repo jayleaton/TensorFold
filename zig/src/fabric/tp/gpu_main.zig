@@ -59,6 +59,7 @@ fn suite(s: *tp.Session, d: *const cuda.Driver, gpa: std.mem.Allocator, cfg: tp.
     for (backends[0..n_backends]) |b| {
         for (sizes, 0..) |n, i| try c.collectives(b.comm, b.label, n, 100 * i);
         try c.pointToPoint(b.comm, b.label, 64 * 1024, 7);
+        for ([_][2]usize{ .{ 4096, 512 }, .{ 2049, 1024 }, .{ 7, 8 } }, 0..) |rw, i| try c.scatter(b.comm, b.label, rw[0], rw[1], 300 + i);
         for ([_]usize{ 4096, 65536, 1 << 20 }) |n| try c.graphs(b.comm, b.label, n, 4);
         try b.comm.barrier();
     }

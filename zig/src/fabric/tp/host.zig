@@ -9,9 +9,9 @@ const Error = collective.Error;
 
 pub const max_ranks = 8;
 
-const Call = enum(u8) { none, all_reduce, all_gather, all_gather_v, exchange, barrier };
+const Call = enum(u8) { none, all_reduce, all_gather, all_gather_v, exchange, barrier, scatter_rows };
 
-const Post = struct { call: Call = .none, send: DevicePtr = 0, recv: DevicePtr = 0, count: usize = 0, t: DType = .u8, op: Op = .sum, peer: u32 = 0, lens: DevicePtr = 0 };
+const Post = struct { call: Call = .none, send: DevicePtr = 0, recv: DevicePtr = 0, count: usize = 0, t: DType = .u8, op: Op = .sum, peer: u32 = 0, lens: DevicePtr = 0, width: usize = 0 };
 
 /// One-way message slot from rank `src` to rank `dst` (send / recv).
 const Slot = struct { buf: std.atomic.Value(DevicePtr) = .init(0), bytes: usize = 0, taken: std.atomic.Value(bool) = .init(false) };
@@ -92,6 +92,7 @@ pub const Rank = struct {
         .all_gather_v = allGatherV,
         .var_fits = varFits,
         .var_agreed = varAgreed,
+        .scatter_rows = scatterRows,
     };
 
     fn self_(ptr: *anyopaque) *Rank {
@@ -201,6 +202,25 @@ pub const Rank = struct {
         }
         const n = count * t.size();
         @memcpy(bytesAt(r, n), bytesAt(g.posts[peer].send, n));
+        try g.meet();
+    }
+
+    /// Each peer's rows of this rank's share from its send into recv's slot for it; width must match rank 0's.
+    fn scatterRows(ptr: *anyopaque, s: DevicePtr, r: DevicePtr, rows: usize, width: usize, t: DType, _: collective.Stream) Error!void {
+        const self = self_(ptr);
+        const g = self.group;
+        try self.enter(.{ .call = .scatter_rows, .send = s, .recv = r, .count = rows, .t = t, .width = width });
+        if (g.posts[0].width != width) {
+            abort(self);
+            return error.Invalid;
+        }
+        const row = width * t.size();
+        const mine = collective.rowShare(rows, g.world, self.me);
+        const c = (rows + g.world - 1) / g.world;
+        const n = (mine[1] - mine[0]) * row;
+        for (0..g.world) |peer| if (peer != self.me) {
+            @memcpy(bytesAt(r + collective.scatterSlot(self.me, peer) * c * row, n), bytesAt(g.posts[peer].send + mine[0] * row, n));
+        };
         try g.meet();
     }
 

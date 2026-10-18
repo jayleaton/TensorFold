@@ -152,3 +152,38 @@ const VarDesync = struct {
 test "lengths that differ between ranks are refused on every rank" {
     try host.run(2, {}, VarDesync.go);
 }
+
+const Scatter = struct {
+    fn go(c: Collective, rank: u32, rows: usize) !void {
+        const world = c.world();
+        const width = 3;
+        const cmax = (rows + world - 1) / world;
+        var ins: [host.max_ranks][64 * width]u16 = undefined;
+        for (0..world) |r| for (&ins[r], 0..) |*x, i| {
+            x.* = @intCast(r * 1000 + i);
+        };
+        var got: [host.max_ranks * 64 * width]u16 = @splat(0xEEEE);
+        // the native call, then the exchange fallback (two ranks of equal shares; anything else refused)
+        var plain = c.vtable.*;
+        plain.scatter_rows = null;
+        const fallback: Collective = .{ .ptr = c.ptr, .vtable = &plain };
+        for ([_]Collective{ c, fallback }) |cc| {
+            const r = cc.scatterRows(addr(std.mem.sliceAsBytes(&ins[rank])), addr(std.mem.sliceAsBytes(&got)), rows, width, .bf16, null);
+            if (cc.vtable.scatter_rows == null and (world != 2 or rows % 2 != 0)) {
+                try std.testing.expectError(error.Unsupported, r);
+                continue;
+            }
+            try r;
+            const mine = collective.rowShare(rows, world, rank);
+            for (0..world) |peer| if (peer != rank) {
+                const slot = got[collective.scatterSlot(rank, peer) * cmax * width ..][0 .. (mine[1] - mine[0]) * width];
+                try std.testing.expectEqualSlices(u16, ins[peer][mine[0] * width .. mine[1] * width], slot);
+            };
+        }
+        try c.barrier();
+    }
+};
+
+test "scatterRows: each peer's rows of this rank's share land in its slot, odd rows too; the exchange fallback" {
+    for ([_]u32{ 2, 3 }) |w| for ([_]usize{ 64, 63, 7, 1 }) |rows| try host.run(w, rows, Scatter.go);
+}

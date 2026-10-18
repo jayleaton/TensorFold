@@ -95,6 +95,8 @@ pub const Options = struct {
     /// next mixing site (a boundary's mhc_pf.run + `_finish_k`, row-wise) runs in the same row pieces, piece p after
     /// exchange piece p only, so the site's early pieces hide the later pieces' exchanges
     pf_overlap_site: bool = false,
+    /// TF_DSV41_PF_RS (pf_rs.zig): a prefill exchange an mhc_pf boundary reads as a rank-order reduce-scatter + gather
+    pf_rs: bool = false,
     /// TF_DSV41_MHC_SITE_ROWS (0 off; 256-4,096, a multiple of 16): a prefill boundary site (mhc_pf.run + `_finish_k`,
     /// row-wise) in pieces of about this many rows on the main stream, so `_finish_k` reads a piece's partials from
     /// L2; a site the exchange pieces already cut (pf_overlap_site) keeps theirs
