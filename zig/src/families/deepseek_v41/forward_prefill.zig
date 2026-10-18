@@ -55,6 +55,11 @@ pub const State = struct {
     layer: u32 = 0,
     /// TF_DSV41_PREFETCH_AHEAD (prod_knobs.zig): the next segment's Engram reads issued before this one runs
     ahead: bool = false,
+    /// TF_DSV41_PF_AHEAD (prod_knobs.zig): a call's own first Engram reads, then its workspace, before its emit
+    pf_ahead: bool = false,
+    /// TF_DSV41_PF_AHEAD: the position and rows the last call's read-ahead of its next piece covered
+    ahead_at: u64 = std.math.maxInt(u64),
+    ahead_rows: usize = 0,
     /// long prompts' buffers (longpf.zig)
     long: longpf.State = .{},
     /// TF_DSV41_PF_TBO: micro-batch B's own long-prompt buffers (its stream top-k merge grows its own), and the pair in
@@ -400,6 +405,11 @@ fn wsArg(a: std.mem.Allocator, x: calls.Arg) !calls.Arg {
 
 /// The workspace's roles bound to one fresh zeroed allocation (the first 4K segment of a prompt).
 fn k4Acquire(f: *Forward) !void {
+    return k4AcquireAt(f, false);
+}
+
+/// `k4Acquire`; `queued` (TF_DSV41_PF_AHEAD): zeroed on the compute stream ahead of the segment's launches, unwaited.
+fn k4AcquireAt(f: *Forward, queued: bool) !void {
     const ws = &f.prefill_state.k4ws;
     if (ws.buf != null) return;
     const pl = ws.plan orelse return error.Unbound;
@@ -414,7 +424,7 @@ fn k4Acquire(f: *Forward) !void {
         var x = b;
         x.free();
     }
-    try b.fill8(0, null);
+    try b.fill8(0, if (queued) f.runner.stream.handle else null);
     var at: u64 = 0;
     for (pl.sizes.keys(), pl.sizes.values()) |k, v| {
         if (std.mem.indexOf(u8, k, K4.tag) == null) continue;
@@ -425,9 +435,10 @@ fn k4Acquire(f: *Forward) !void {
     ws.bytes = total;
     ws.allocs += 1;
     // the allocation's cost a prompt (the GB10 maps host pages for it): outside the prefill profile's segments
-    try f.runner.stream.synchronize();
+    if (!queued) try f.runner.stream.synchronize();
     const ms = nowMs() - t0;
-    if (ws.allocs <= 4 or ws.allocs % 64 == 0) log.info("prefill 4K: rank {d}: workspace {d} MiB allocated and zeroed in {d:.1} ms (prompt {d}), held while the prompt prefills", .{ f.comm.rank(), total >> 20, ms, ws.allocs });
+    if (queued and (ws.allocs <= 4 or ws.allocs % 64 == 0)) log.info("prefill 4K: rank {d}: workspace {d} MiB allocated in {d:.1} ms, zeroed on the stream (prompt {d}, TF_DSV41_PF_AHEAD), held while the prompt prefills", .{ f.comm.rank(), total >> 20, ms, ws.allocs });
+    if (!queued and (ws.allocs <= 4 or ws.allocs % 64 == 0)) log.info("prefill 4K: rank {d}: workspace {d} MiB allocated and zeroed in {d:.1} ms (prompt {d}), held while the prompt prefills", .{ f.comm.rank(), total >> 20, ms, ws.allocs });
 }
 
 fn nowMs() f64 {
@@ -495,6 +506,7 @@ pub fn prompt(f: *Forward, ids_in: []const u32) !void {
     try ready(f);
     // TF_DSV41_PF_4K / _PF_TBO: the workspace for this call, decided on every rank alike (else 2,048-row segments)
     st.ws_ok = true;
+    if (st.pf_ahead) ownAhead(f, ids);
     if (st.k4 or (st.mode == .replay and f.opts.pf_tbo)) st.ws_ok = try wsAgreed(f);
     const seg: usize = segmentRows(f);
     defer st.next.clearRetainingCapacity();
@@ -604,7 +616,28 @@ fn segmentPair(f: *Forward, ia: []const u32, ib: []const u32) !bool {
 fn ahead(f: *Forward, ids: []const u32, at: usize, n: usize, seg: usize) void {
     const st = &f.prefill_state;
     if (at + n < ids.len) return readAhead(f, ids, at, n, ids[at + n .. at + n + @min(seg, ids.len - at - n)]);
-    if (st.next.items.len > 0) readAhead(f, ids, at, n, st.next.items);
+    if (st.next.items.len == 0) return;
+    readAhead(f, ids, at, n, st.next.items);
+    if (st.pf_ahead) {
+        st.ahead_at = f.slot.pos + n;
+        st.ahead_rows = st.next.items.len;
+    }
+}
+
+/// Whether a call's first `n` rows at `pos` need their own reads: the last read-ahead covered `covered` rows at `at`.
+pub fn ownReads(pos: u64, at: u64, covered: usize, n: usize) bool {
+    return n > 0 and (pos != at or n > covered);
+}
+
+/// TF_DSV41_PF_AHEAD: this call's first segment's Engram reads issued now, unless the last call's read-ahead had them.
+fn ownAhead(f: *Forward, ids: []const u32) void {
+    const st = &f.prefill_state;
+    const n = @min(ids.len, if (st.k4) st.k4ws.rows else @as(usize, @intCast(f.opts.prefill_rows)));
+    if (!ownReads(f.slot.pos, st.ahead_at, st.ahead_rows, n)) return;
+    const h = f.engram orelse return;
+    if (!f.engram_prefetch) return;
+    const src = (f.engramSource(h) catch return) orelse return;
+    h.prefetch(f.gpa, src, ids[0..n], f.slot.tail[0..f.slot.tail_len], f.comm.rank(), f.comm.world());
 }
 
 fn readAhead(f: *Forward, ids: []const u32, at: usize, n: usize, next: []const u32) void {
@@ -637,6 +670,7 @@ fn segment(f: *Forward, ids: []const u32, head: bool) !void {
     if (f.kv) |kx| try kx.reserve(start + n);
     // TF_DSV41_PF_4K: a segment past the forward's rows runs in the workspace (its own roles: block_prefill.ownCalls)
     const big = st.k4 and st.ws_ok and n > f.opts.prefill_rows;
+    if (big and st.pf_ahead) try k4AcquireAt(f, true); // its zeroing runs while the program is emitted
     const o = if (big) k4Options(vision_rows.segmentOptions(f, ids), st.k4ws.rows) else vision_rows.segmentOptions(f, ids);
     const emitted = if (replay) block_prefill.emitReplay(a, f.cfg, f.widths, o, layers, n, @intCast(start), .encoder) else block_prefill.emitPrefill(a, f.cfg, f.widths, o, layers, n, @intCast(start), head);
     const plain = emitted catch |e| {

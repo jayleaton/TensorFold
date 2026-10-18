@@ -328,6 +328,12 @@ pub fn prefetchAhead(get: Get) bool {
     return !std.mem.eql(u8, std.mem.trim(u8, v, " "), "0");
 }
 
+/// TF_DSV41_PF_AHEAD=1: a prompt call's first Engram reads and 4K workspace started before its emit.
+pub fn pfAhead(get: Get) bool {
+    const v = get("TF_DSV41_PF_AHEAD") orelse return false;
+    return std.mem.eql(u8, std.mem.trim(u8, v, " "), "1");
+}
+
 /// TF_DSV41_KV_NORM_STORE=1: KV-only RMS + SWA RoPE/FP8 store, default off until GPU/reply gates pass.
 pub fn kvNormStore(get: Get) bool {
     const v = get("TF_DSV41_KV_NORM_STORE") orelse return false;
@@ -467,6 +473,7 @@ pub fn apply(f: *@import("forward.zig").Forward, a: std.mem.Allocator, io: std.I
     };
     if (try indexBudget(&env)) |b| f.opts.index_budget = b;
     f.prefill_state.ahead = prefetchAhead(&env);
+    f.prefill_state.pf_ahead = pfAhead(&env);
     f.opts.gm_v2 = try @import("gm2pf.zig").mode(&env);
     f.opts.mhc_pf_rows = try mhcPfRows(&env);
     f.prefill_state.mode = try prefillMode(&env);
@@ -559,6 +566,7 @@ pub fn apply(f: *@import("forward.zig").Forward, a: std.mem.Allocator, io: std.I
     if (f.opts.stream_rb > 1) log.info("stream top-k: {d} rows a program (_stream_rb{d})", .{ f.opts.stream_rb, f.opts.stream_rb });
     if (f.opts.pf_tbo) log.info("prefill tbo: encoder segments two at a time on two streams, x3gm on at most {d} SMs (0: all){s}", .{ dk.exl3.gm_sms_cap, if (f.opts.pf_overlap > 0) "; TF_DSV41_PF_OVERLAP is off under it" else "" });
     if (f.opts.pf_shx) log.info("prefill shx: the shared expert on the side stream beside x3gm, x3gm on at most {d} SMs (0: all)", .{dk.exl3.gm_sms_cap});
+    if (f.prefill_state.pf_ahead) log.info("prefill ahead: a prompt call's own first Engram reads, then its 4K workspace (zeroed on the stream), before its emit", .{});
     if (f.opts.pf_rs) log.info("prefill rs: a boundary's exchange as a rank-order reduce-scatter + gather of the bf16 sums", .{});
     if (f.opts.pf_overlap > 0) log.info("prefill overlap: a segment's exchanges in {d} row pieces on the side stream{s}", .{ f.opts.pf_overlap, if (f.opts.pf_overlap_site) ", every piece; the next mixing site in the same pieces, each after its own" else "" });
     log.info("prod knobs: pf_dense {s}, prefill rows {d}{s}, index budget {d} MiB, R1 {s}, prefetch ahead {s}, x3gm v2 {t}, prefill {t}, mhc pfdec {d}", .{ if (f.opts.pfd != null) "fused" else "off", if (big) rows_big else @as(u32, @intCast(f.opts.prefill_rows)), if (k8) " (8K: one x3gm block a segment, in the prefill's own workspace)" else if (big) " (4K: one x3gm block a segment, in the prefill's own workspace)" else "", f.opts.index_budget >> 20, if (f.opts.r1) "on" else "off", if (f.prefill_state.ahead) "on" else "off", f.opts.gm_v2, f.prefill_state.mode, f.opts.mhc_pf_rows });

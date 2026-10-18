@@ -6,6 +6,10 @@ const Driver = @import("driver.zig").Driver;
 const Stream = @import("stream.zig").Stream;
 const launch = @import("launch.zig");
 const triton = @import("triton.zig");
+const cache_mod = @import("aot_cache.zig");
+
+/// TF_DSV41_AOT_CACHE=1: the launch keys' picks (aot_cache.zig).
+pub const Cache = cache_mod.Cache;
 
 /// Where a family's glue kernels come from: our own fatbins, or a captured set in a folder.
 pub const Pick = union(enum) { native, captured: []const u8, missing: []const u8 };
@@ -97,6 +101,8 @@ pub const Set = struct {
     gpa: std.mem.Allocator,
     /// TF_DSV41_AOT_TRACE=<file>: every distinct lookup key and its outcome (Trace)
     trace: ?*Trace = null,
+    /// TF_DSV41_AOT_CACHE=1: each launch key's pick kept (Cache), so a repeated launch skips the searches
+    cache: ?*Cache = null,
 
     /// Loads every cubin listed in `dir`/aot.json into its own module.
     pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const Driver, device: abi.Device, dir: []const u8) !Set {
@@ -124,11 +130,14 @@ pub const Set = struct {
             variants[n] = .{ .spec = k, .kernel = try triton.Kernel.load(d, device, cubin, meta, name_z) };
             n += 1;
         }
-        return .{ .parsed = parsed, .variants = variants, .gpa = gpa, .trace = try Trace.fromEnv(gpa, io) };
+        const trace = try Trace.fromEnv(gpa, io);
+        errdefer if (trace) |t| t.destroy();
+        return .{ .parsed = parsed, .variants = variants, .gpa = gpa, .trace = trace, .cache = if (Cache.on()) try Cache.create(gpa, io) else null };
     }
 
     pub fn deinit(self: *Set) void {
         if (self.trace) |t| t.destroy();
+        if (self.cache) |c| c.destroy();
         for (self.variants) |*v| v.kernel.unload();
         self.gpa.free(self.variants);
         self.parsed.deinit();
@@ -137,6 +146,22 @@ pub const Set = struct {
 
     /// The variant of `function` compiled for these constexprs and these arguments' specialization.
     pub fn find(self: *const Set, function: []const u8, args: []const Arg, consts: []const Const) !*const Variant {
+        return (try self.resolve(function, args, consts)).v;
+    }
+
+    /// `find`'s variant and, from the cache, each of its parameters' index in `args` (null: look them up by name).
+    fn resolve(self: *const Set, function: []const u8, args: []const Arg, consts: []const Const) !struct { v: *const Variant, slots: ?[]const u16 } {
+        const c = self.cache orelse return .{ .v = try self.search(function, args, consts), .slots = null };
+        var kb: [cache_mod.key_max]u8 = undefined;
+        const k = cache_mod.matchKey(&kb, function, args, consts) orelse return .{ .v = try self.search(function, args, consts), .slots = null };
+        if (c.get(k)) |hit| return .{ .v = &self.variants[hit.at], .slots = hit.slots };
+        const v = try self.search(function, args, consts);
+        c.put(k, @intCast((@intFromPtr(v) - @intFromPtr(self.variants.ptr)) / @sizeOf(Variant)), v.spec, args);
+        return .{ .v = v, .slots = null };
+    }
+
+    /// Each function's variants are scanned in order: the first exact fit, else the first general one, else an error.
+    fn search(self: *const Set, function: []const u8, args: []const Arg, consts: []const Const) !*const Variant {
         for (self.variants) |*v| {
             if (!std.mem.eql(u8, v.spec.@"fn", function)) continue;
             if (!matches(v.spec, args, consts, .exact)) continue;
@@ -182,12 +207,19 @@ pub const Set = struct {
         return best;
     }
 
+    /// `function`'s variants' specs in the set's order, from the cache when on (else built in `a`).
+    pub fn specsOf(self: *const Set, a: std.mem.Allocator, function: []const u8) ![]const Spec {
+        if (self.cache) |c| return c.specsOf(self, function);
+        return cache_mod.collect(a, self, function);
+    }
+
     /// Launches `function` on `grid` as Triton's launcher would: runtime arguments in the variant's order, scratch null.
     pub fn run(self: *const Set, stream: Stream, function: []const u8, grid: [3]u32, args: []const Arg, consts: []const Const) !void {
-        const v = try self.find(function, args, consts);
+        const got = try self.resolve(function, args, consts);
+        const v = got.v;
         var packed_args: launch.Args = .{};
-        for (v.spec.params) |p| {
-            const a = lookup(args, p.name).?;
+        for (v.spec.params, 0..) |p, j| {
+            const a = if (got.slots) |s| args[s[j]] else lookup(args, p.name).?;
             switch (a.value) {
                 .ptr => |x| packed_args.add(x.addr),
                 .i32 => |x| packed_args.add(x),
@@ -418,4 +450,76 @@ test "a launch of 1 takes only the variant Triton folded it into, in either pass
     try std.testing.expect(matches(runtime, &.{int("R", 5)}, &.{}, .exact));
     try std.testing.expect(!matches(runtime, &.{int("R", 32)}, &.{}, .exact));
     try std.testing.expectEqualStrings("a", (try set.find("k", &.{int("R", 32)}, &.{})).spec.hash);
+}
+
+test "the launch cache picks what the search picks, key for key, and serves repeats from the cache" {
+    const gpa = std.testing.allocator;
+    var set = try testSet(gpa,
+        \\{"kernels":[{"fn":"k","hash":"a","name":"k","num_warps":4,"consts":{},"params":[
+        \\  {"name":"P","type":"*i8","div16":false,"nospec":false},{"name":"R","type":"i32","div16":false,"nospec":false}]},
+        \\ {"fn":"k","hash":"b","name":"k","num_warps":4,"consts":{},"params":[
+        \\  {"name":"P","type":"*i8","div16":true,"nospec":false},{"name":"R","type":"i32","div16":false,"nospec":false}]},
+        \\ {"fn":"k","hash":"c","name":"k","num_warps":4,"consts":{},"params":[
+        \\  {"name":"R","type":"i32","div16":true,"nospec":false},{"name":"P","type":"*i8","div16":true,"nospec":false}]},
+        \\ {"fn":"k","hash":"d","name":"k","num_warps":4,"consts":{"R":{"int":1}},"params":[
+        \\  {"name":"P","type":"*i8","div16":true,"nospec":false}]},
+        \\ {"fn":"m","hash":"e","name":"m","num_warps":4,"consts":{"B":{"int":64},"E":{"f32":0}},"params":[
+        \\  {"name":"X","type":"*fp32","div16":true,"nospec":false},{"name":"S","type":"fp32","div16":false,"nospec":false}]},
+        \\ {"fn":"m","hash":"f","name":"m","num_warps":4,"consts":{"B":{"int":128},"E":{"f32":0}},"params":[
+        \\  {"name":"X","type":"*fp32","div16":true,"nospec":false},{"name":"S","type":"fp32","div16":false,"nospec":false}]},
+        \\ {"fn":"m","hash":"g","name":"m","num_warps":4,"consts":{"B":{"int":64},"E":{"f32":2147483648}},"params":[
+        \\  {"name":"X","type":"*fp32","div16":true,"nospec":false},{"name":"S","type":"fp32","div16":false,"nospec":false}]}]}
+    );
+    defer freeTestSet(gpa, &set);
+    const cache = try Cache.create(gpa, std.testing.io);
+    defer cache.destroy();
+    const keys = [_]struct { f: []const u8, args: []const Arg, consts: []const Const, hash: []const u8, dup: bool = false }{
+        .{ .f = "k", .args = &.{ ptr("P", "*i8", 0x1008), int("R", 5) }, .consts = &.{}, .hash = "a" },
+        .{ .f = "k", .args = &.{ ptr("P", "*i8", 0x1000), int("R", 5) }, .consts = &.{}, .hash = "b" },
+        .{ .f = "k", .args = &.{ ptr("P", "*i8", 0x2000), int("R", 7) }, .consts = &.{}, .hash = "b", .dup = true },
+        .{ .f = "k", .args = &.{ ptr("P", "*i8", 0x1000), int("R", 32) }, .consts = &.{}, .hash = "c" },
+        .{ .f = "k", .args = &.{ int("R", 48), ptr("P", "*i8", 0x3000) }, .consts = &.{}, .hash = "c" },
+        .{ .f = "k", .args = &.{ ptr("P", "*i8", 0x1000), int("R", 1) }, .consts = &.{}, .hash = "d" },
+        .{ .f = "m", .args = &.{ ptr("X", "*fp32", 0x100), float("S", 0.5) }, .consts = &.{ ci("B", 64), cf("E", 0.0) }, .hash = "e" },
+        .{ .f = "m", .args = &.{ ptr("X", "*fp32", 0x100), float("S", 2.0) }, .consts = &.{ ci("B", 128), cf("E", 0.0) }, .hash = "f" },
+        .{ .f = "m", .args = &.{ ptr("X", "*fp32", 0x100), float("S", 0.5) }, .consts = &.{ ci("B", 64), cf("E", -0.0) }, .hash = "g" },
+    };
+    for (0..2) |round| for (keys) |x| {
+        set.cache = null;
+        const want = try set.find(x.f, x.args, x.consts);
+        try std.testing.expectEqualStrings(x.hash, want.spec.hash);
+        set.cache = cache;
+        const hits = cache.hits;
+        const got = try set.resolve(x.f, x.args, x.consts);
+        try std.testing.expectEqualStrings(want.spec.hash, got.v.spec.hash);
+        const hit = round == 1 or x.dup; // another value of the same class is the same key
+        try std.testing.expectEqual(hits + @intFromBool(hit), cache.hits);
+        if (got.slots) |s| for (got.v.spec.params, s) |p, j| try std.testing.expectEqualStrings(p.name, x.args[j].name);
+        try std.testing.expect((got.slots != null) == hit);
+    };
+    set.cache = null;
+}
+
+test "the cached spec list is the set's own, in order" {
+    const gpa = std.testing.allocator;
+    var set = try testSet(gpa,
+        \\{"kernels":[{"fn":"k","hash":"a","name":"k","num_warps":4,"params":[],"consts":{}},
+        \\ {"fn":"j","hash":"b","name":"j","num_warps":4,"params":[],"consts":{}},
+        \\ {"fn":"k","hash":"c","name":"k","num_warps":4,"params":[],"consts":{}}]}
+    );
+    defer freeTestSet(gpa, &set);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const plain = try set.specsOf(arena.allocator(), "k");
+    set.cache = try Cache.create(gpa, std.testing.io);
+    defer {
+        set.cache.?.destroy();
+        set.cache = null;
+    }
+    for (0..2) |_| {
+        const cached = try set.specsOf(arena.allocator(), "k");
+        try std.testing.expectEqual(plain.len, cached.len);
+        for (plain, cached) |p, q| try std.testing.expectEqualStrings(p.hash, q.hash);
+    }
+    try std.testing.expectEqual(@as(usize, 0), (try set.specsOf(arena.allocator(), "none")).len);
 }

@@ -246,6 +246,7 @@ pub const Model = struct {
         if (cache) |c| std.log.info("dsv41 load: weights {d:.0} ms ({d:.0} ms images, {d:.0} ms upload + digest), {d:.1} GiB; prepared {s}: {d} read ({d:.1} GiB in {d:.0} ms), {d} built, {d} written ({d:.0} ms)", .{ ms(std.Io.Clock.awake.now(io).toNanoseconds() - t_load), ms(t_build), ms(t_upload), @as(f64, @floatFromInt(m.weights.bytes)) / (1 << 30), c.root, c.stats.hits, @as(f64, @floatFromInt(c.stats.read_bytes)) / (1 << 30), ms(c.stats.read_ns), c.stats.misses, c.stats.written, ms(c.stats.write_ns) }) else std.log.info("dsv41 load: weights {d:.0} ms ({d:.0} ms images from the pack, {d:.0} ms upload + digest), {d:.1} GiB; TF_DSV41_PREPARED unset", .{ ms(std.Io.Clock.awake.now(io).toNanoseconds() - t_load), ms(t_build), ms(t_upload), @as(f64, @floatFromInt(m.weights.bytes)) / (1 << 30) });
         tr.step("weights", cuda.usage(false));
         m.aot = try cuda.aot.Set.load(gpa, io, &m.driver, m.ctx.device, try std.fs.path.join(a, &.{ assets, "aot" }));
+        if (m.aot.cache != null) std.log.scoped(.dsv41).info("aot cache: each Triton launch key's variant kept after its first search (TF_DSV41_AOT_CACHE)", .{});
         m.widths = try m2a.widths(a, &m.weights, &m.pl);
         m.runner = .{ .gpa = gpa, .d = &m.driver, .stream = m.stream, .kernels = &m.kernels, .triton = &m.aot, .weights = &m.weights };
         // TF_DSV41_PROFILE=<file>: the served engine's eager windows and prefill segments timed (profile.zig), the JSON

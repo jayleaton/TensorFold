@@ -282,9 +282,7 @@ pub const Runner = struct {
         defer arena.deinit();
         const a = arena.allocator();
         if (c.triton) {
-            var mine: std.ArrayList(cuda.aot.Spec) = .empty;
-            for (r.triton.variants) |v| if (std.mem.eql(u8, v.spec.@"fn", c.name)) try mine.append(a, v.spec);
-            const sp = try tc.split(a, c, mine.items, .{ .ctx = @constCast(r), .of = addrOf });
+            const sp = try tc.split(a, c, try r.triton.specsOf(a, c.name), .{ .ctx = @constCast(r), .of = addrOf });
             const g = c.grid;
             return r.triton.run(stream, c.name, .{ @intCast(g[0]), @intCast(g[1]), @intCast(g[2]) }, sp.args, sp.consts);
         }
@@ -399,9 +397,7 @@ pub fn missingIn(gpa: std.mem.Allocator, set: *const cuda.aot.Set, cs: []const c
     defer arena.deinit();
     const a = arena.allocator();
     for (cs) |*c| if (c.triton) {
-        var mine: std.ArrayList(cuda.aot.Spec) = .empty;
-        for (set.variants) |v| if (std.mem.eql(u8, v.spec.@"fn", c.name)) try mine.append(a, v.spec);
-        const sp = tc.split(a, c, mine.items, .{ .ctx = undefined, .of = alignedOf }) catch return c.name;
+        const sp = tc.split(a, c, try set.specsOf(a, c.name), .{ .ctx = undefined, .of = alignedOf }) catch return c.name;
         _ = set.find(c.name, sp.args, sp.consts) catch return c.name; // error.MissingTritonVariant
     };
     return null;
