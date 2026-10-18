@@ -370,7 +370,7 @@ __device__ __forceinline__ void kloop2(float (&acc)[MTL][NG][4], const unsigned 
 
 // One item (pass x 128-column block) at width K2: the caller claimed it and filled rows_sh; gm_kernel's body
 // otherwise (the same stage layout, decode, mma chains and epilogue).
-template <int MATS, int XM, int K2, int MTL, int NG, int KS, int NSA, int NGR>
+template <int MATS, int XM, int K2, int MTL, int NG, int KS, int NSA, int NGR, bool EXACT = false>
 __device__ __forceinline__ void gm2_item(const Args& a, unsigned char* smem, const int* rows_sh, int e, int cnt,
                                          int nb) {
     using C = Cfg<MATS, XM, K2, MTL, NG, KS, NSA, NGR>;
@@ -439,10 +439,19 @@ __device__ __forceinline__ void gm2_item(const Args& a, unsigned char* smem, con
 #pragma unroll
             for (int c = 0; c < 4; ++c) acc[l][n][c] = 0.f;
 
-    static_assert(NG <= 16 && NG % 2 == 0, "n8 groups");
+    static_assert(NG <= 16 && NG % 2 == 0 && (!EXACT || NG == 16), "n8 groups");
     const int n8 = (cnt + 7) >> 3;                            // >= 1 (a pass has members)
 #define GM2_K(G) kloop2<G, MATS, XM, K2, MTL, NG, KS, NSA, NGR>(acc, smem, S, xmat, mat, slice, lr, lc, map, load_stage)
-    switch (n8 <= 8 ? n8 : (n8 + 1) & ~1) {                   // 1..8, then even counts (NG 16)
+    const bool odd = EXACT && n8 > 8 && (n8 & 1) != 0;       // TF_DSV41_GM_ROWT: odd counts past 8 their own loop
+    if constexpr (EXACT) {
+        if (odd) switch (n8) {
+            case 9: GM2_K(9); break;
+            case 11: GM2_K(11); break;
+            case 13: GM2_K(13); break;
+            default: GM2_K(15); break;
+        }
+    }
+    if (!odd) switch (n8 <= 8 ? n8 : (n8 + 1) & ~1) {         // 1..8, then even counts (NG 16)
         case 1: GM2_K(1); break;
         case 2: GM2_K(2); break;
         case 3: GM2_K(3); break;
@@ -537,9 +546,8 @@ struct Smem2 {
 };
 
 // One v2 launch over the passes of every width (uniform stack: one width; ragged: each expert its own, a.k2e)
-template <int MATS, int XM, int MTL, int NG, int KS, int NSA, int NGR>
-__global__ void __launch_bounds__(Smem2<MATS, XM, MTL, NG, KS, NSA, NGR>::THREADS,
-                                  Smem2<MATS, XM, MTL, NG, KS, NSA, NGR>::MINB) gm2_kernel(const Args a) {
+template <int MATS, int XM, int MTL, int NG, int KS, int NSA, int NGR, bool EXACT>
+__device__ __forceinline__ void gm2_items(const Args& a) {
     constexpr int BM = NG * 8, THREADS = Smem2<MATS, XM, MTL, NG, KS, NSA, NGR>::THREADS;
     extern __shared__ __align__(16) unsigned char smem[];
     __shared__ int rows_sh[BM];
@@ -560,14 +568,25 @@ __global__ void __launch_bounds__(Smem2<MATS, XM, MTL, NG, KS, NSA, NGR>::THREAD
         switch (a.k2e[e]) {                                   // block-uniform
 #define GM2_CASE(K)                                                                                                   \
     case K:                                                                                                           \
-        gm2_item<MATS, XM, K, MTL, NG, KS, Ring2<MATS, XM, K, MTL, NG, KS, NSA, NGR>::value, NGR>(a, smem, rows_sh, e, \
-                                                                                                  cnt, nb);           \
+        gm2_item<MATS, XM, K, MTL, NG, KS, Ring2<MATS, XM, K, MTL, NG, KS, NSA, NGR>::value, NGR, EXACT>(             \
+            a, smem, rows_sh, e, cnt, nb);                                                                            \
         break;
             GM2_WIDTHS(GM2_CASE)
 #undef GM2_CASE
             default: break;                                   // never: the host checks every width is in K2S
         }
     }
+}
+template <int MATS, int XM, int MTL, int NG, int KS, int NSA, int NGR>
+__global__ void __launch_bounds__(Smem2<MATS, XM, MTL, NG, KS, NSA, NGR>::THREADS,
+                                  Smem2<MATS, XM, MTL, NG, KS, NSA, NGR>::MINB) gm2_kernel(const Args a) {
+    gm2_items<MATS, XM, MTL, NG, KS, NSA, NGR, false>(a);
+}
+// TF_DSV41_GM_ROWT: gm2_kernel with an item's exact n8 group count as its k loop's constant (odd counts past 8 too)
+template <int MATS, int XM, int MTL, int NG, int KS, int NSA, int NGR>
+__global__ void __launch_bounds__(Smem2<MATS, XM, MTL, NG, KS, NSA, NGR>::THREADS,
+                                  Smem2<MATS, XM, MTL, NG, KS, NSA, NGR>::MINB) gm2r_kernel(const Args a) {
+    gm2_items<MATS, XM, MTL, NG, KS, NSA, NGR, true>(a);
 }
 
 // Rotated inputs of the routed pairs: out_m[p] = fp16((x[p / slots] * suh_m[e]) H / sqrt 128), upstream rot_in's

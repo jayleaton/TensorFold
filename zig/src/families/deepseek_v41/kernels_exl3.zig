@@ -196,6 +196,31 @@ pub fn gm2GuSymbol(comptime xm: u32, comptime cfg: usize) [:0]const u8 {
     return std.fmt.comptimePrint("_ZN10dsv41_x3gm10gm2_kernelILi2ELi{d}ELi{d}ELi{d}ELi{d}ELi{d}ELi{d}EEEvNS_4ArgsE", .{ xm, t[0], t[1], t[2], t[3], t[4] });
 }
 
+/// TF_DSV41_GM_ROWT: x3gm3.cu's gm2r_kernel at GU2 (every member group count its own k loop, gm2_kernel's bits)
+pub fn gm2rGuSymbol() [:0]const u8 {
+    const t = gu_tiles[gu2_cfg];
+    return std.fmt.comptimePrint("_ZN10dsv41_x3gm11gm2r_kernelILi2ELi2ELi{d}ELi{d}ELi{d}ELi{d}ELi{d}EEEvNS_4ArgsE", .{ t[0], t[1], t[2], t[3], t[4] });
+}
+
+/// TF_DSV41_GM_ROWT (ours; unset / 0 off, 1 on): GU2's gate / up through gm2r_kernel; anything else refused.
+pub fn gmRowtOf(raw: ?[]const u8) !bool {
+    const v = std.mem.trim(u8, raw orelse "0", " \t");
+    if (v.len == 0 or std.mem.eql(u8, v, "0")) return false;
+    if (std.mem.eql(u8, v, "1")) return true;
+    std.log.warn("TF_DSV41_GM_ROWT={s}: 0 or 1", .{v});
+    return error.BadKnob;
+}
+
+pub fn gmRowt() !bool {
+    const v = std.c.getenv("TF_DSV41_GM_ROWT") orelse return false;
+    return gmRowtOf(std.mem.span(v));
+}
+
+/// The GU2 instance a gate / up launch takes: gm2r_kernel when TF_DSV41_GM_ROWT resolved it, else gm2_kernel.
+pub fn gu2Instance(gu2: Gm, rowt: ?Gm) Gm {
+    return rowt orelse gu2;
+}
+
 pub fn gm2DnSymbol(comptime cfg: usize) [:0]const u8 {
     const t = dn_tiles[cfg];
     return std.fmt.comptimePrint("_ZN10dsv41_x3gm10gm2_kernelILi1ELi1ELi{d}ELi{d}ELi{d}ELi{d}ELi{d}EEEvNS_4ArgsE", .{ t[0], t[1], t[2], t[3], t[4] });
@@ -332,6 +357,8 @@ pub const Functions = struct {
     gm2_dn: Gm,
     /// gm2_kernel at GU2 (128-member gate / up, two inputs): x3gm3.cu's instance (TF_DSV41_GM_GU2)
     gm2_gu2: Gm,
+    /// TF_DSV41_GM_ROWT: gm2r_kernel at GU2 (x3gm3.cu), resolved only under the knob; null: gm2_gu2 runs
+    gm2_gu2r: ?Gm,
     gm3: [v3_variants.len]Gm,
     epi: [3][epi_pds.len][ranges.len]cuda.Function, // [EpiKind][pd - 1][range]
 
@@ -371,6 +398,7 @@ pub const Functions = struct {
         };
         f.gm2_dn = try gmResolve(x3gm, gm2DnSymbol(0), gm2Shape(1, 1, dn_tiles[0]), optin);
         f.gm2_gu2 = try gmResolve(x3gm3, gm2GuSymbol(2, gu2_cfg), gm2Shape(2, 2, gu_tiles[gu2_cfg]), optin);
+        f.gm2_gu2r = if (try gmRowt()) try gmResolve(x3gm3, gm2rGuSymbol(), gm2Shape(2, 2, gu_tiles[gu2_cfg]), optin) else null;
         inline for (v3_variants, 0..) |v, i| f.gm3[i] = try gmResolve(x3gm3, gm3Symbol(v), gm2Shape(v.mats, v.xm, v.t), optin);
         f.gm_plan = try x3gm_plan.function("_ZN15dsv41_x3gm_plan11plan_kernelEPKiiiiPiS2_S2_S2_S2_");
         f.gm_rot = .{ .{ try x3gm.function(gm_sym.rot_bf16_1), try x3gm.function(gm_sym.rot_bf16_2) }, .{ try x3gm.function(gm_sym.rot_f16_1), try x3gm.function(gm_sym.rot_f16_2) } };
@@ -705,7 +733,7 @@ pub const Ops = struct {
             a.t0 = tg;
             a.t1 = tu;
         }
-        try o.gmLaunch(if (gu2) o.f.gm2_gu2 else o.f.gm2_gu[if (shx) 0 else 1][ci], a, use_ticket);
+        try o.gmLaunch(if (gu2) gu2Instance(o.f.gm2_gu2, o.f.gm2_gu2r) else o.f.gm2_gu[if (shx) 0 else 1][ci], a, use_ticket);
     }
 
     /// dsv41_x3gm_down2_cuda (x3gm v2): Y of every pass of every width in one launch; `k2e` the experts' down widths.
@@ -818,6 +846,20 @@ test "x3gm v2 at GU2 (TF_DSV41_GM_GU2, x3gm3.cu's instance): 512 threads, every 
     try std.testing.expectEqual(@as(u32, 512), s.threads);
     try std.testing.expect(s.smem > 0 and s.smem + 4 * 8 * gu_tiles[gu2_cfg][1] + 4 <= gm_smem_max);
     try std.testing.expectEqualStrings("_ZN10dsv41_x3gm10gm2_kernelILi2ELi2ELi1ELi16ELi2ELi4ELi4EEEvNS_4ArgsE", gm2GuSymbol(2, gu2_cfg));
+}
+
+test "TF_DSV41_GM_ROWT: unset / empty / 0 off, 1 on, else refused; gm2r_kernel's GU2 name; the launch's instance" {
+    try std.testing.expect(!try gmRowtOf(null));
+    try std.testing.expect(!try gmRowtOf(""));
+    try std.testing.expect(!try gmRowtOf(" 0 "));
+    try std.testing.expect(try gmRowtOf("1"));
+    try std.testing.expectError(error.BadKnob, gmRowtOf("2"));
+    try std.testing.expectError(error.BadKnob, gmRowtOf("on"));
+    try std.testing.expectEqualStrings("_ZN10dsv41_x3gm11gm2r_kernelILi2ELi2ELi1ELi16ELi2ELi4ELi4EEEvNS_4ArgsE", gm2rGuSymbol());
+    const plain: Gm = .{ .f = undefined, .threads = 512, .smem = 1, .per_sm = 1 };
+    const rowt: Gm = .{ .f = undefined, .threads = 512, .smem = 2, .per_sm = 1 };
+    try std.testing.expectEqual(@as(u32, 1), gu2Instance(plain, null).smem);
+    try std.testing.expectEqual(@as(u32, 2), gu2Instance(plain, rowt).smem);
 }
 
 test "x3gm shapes, fits and tuning as x3gm.py" {

@@ -464,6 +464,14 @@ pub fn apply(f: *@import("forward.zig").Forward, a: std.mem.Allocator, io: std.I
         return error.BadKnob;
     }
     if (f.opts.gm_gu2) std.log.scoped(.dsv41).info("x3gm: gate / up at 128-member passes (GU2) in 4,096-row segments", .{});
+    // TF_DSV41_GM_ROWT: the kernels read it where they resolve (kernels_exl3.gmRowt); it changes GU2 launches only
+    if (try dk.exl3.gmRowtOf(env("TF_DSV41_GM_ROWT"))) {
+        if (!f.opts.gm_gu2) {
+            std.log.scoped(.dsv41).err("TF_DSV41_GM_ROWT=1 needs TF_DSV41_GM_GU2=1 (its GU2 gate / up launches)", .{});
+            return error.BadKnob;
+        }
+        std.log.scoped(.dsv41).info("x3gm: GU2's gate / up with every member group count its own k loop (gm2r_kernel)", .{});
+    }
     if (f.opts.pf_overlap_site and f.opts.pf_overlap < 2) {
         std.log.scoped(.dsv41).err("TF_DSV41_PF_OVERLAP_SITE=1 needs TF_DSV41_PF_OVERLAP=2..8 (the pieces it overlaps)", .{});
         return error.BadKnob;

@@ -145,6 +145,38 @@ const State = struct {
     }
 };
 
+const Gu2 = struct {
+    s: *const State,
+    o: exl3.Ops,
+    pl: [5]u64,
+    xd: u64,
+
+    fn gateup(ctx: *const anyopaque) anyerror!void {
+        const g: *const Gu2 = @ptrCast(@alignCast(ctx));
+        const s = g.s;
+        return g.o.gm2Gateup(s.xg, s.xu, s.gate.table.ptr, s.up.table.ptr, s.k2g, g.pl[0], g.pl[1], g.pl[2], g.pl[3], g.pl[4], s.ticket, s.svh_g, s.svh_u, s.suh_d, g.xd, D, I, false, exl3.gu2_cfg, true, 10.0, true);
+    }
+};
+
+/// TF_DSV41_GM_ROWT=1: GU2's gate / up over a 128-member plan through gm2_kernel, then gm2r_kernel; Xd byte for byte.
+fn rowt(gpa: std.mem.Allocator, d: *const cuda.Driver, stream: cuda.Stream, k: *const dsv41.Kernels, st: *const State, pick: u64, P: usize, ticket: cuda.DeviceBuffer, xd2: cuda.DeviceBuffer, xd3: cuda.DeviceBuffer, reps: usize) !void {
+    const T = exl3.planPasses(P, E, 128);
+    var bufs: [5]cuda.DeviceBuffer = undefined;
+    for (&bufs, [_]usize{ P, T, T, T, 1 }) |*bb, n| bb.* = try cuda.DeviceBuffer.alloc(d, 4 * n);
+    defer for (&bufs) |*bb| bb.free();
+    try st.o.gmPlan(pick, P, E, 128, bufs[0].ptr, bufs[1].ptr, bufs[2].ptr, bufs[3].ptr, bufs[4].ptr);
+    var plain = k.exl3;
+    plain.gm2_gu2r = null;
+    const pl = [5]u64{ bufs[0].ptr, bufs[1].ptr, bufs[2].ptr, bufs[3].ptr, bufs[4].ptr };
+    const a: Gu2 = .{ .s = st, .o = .{ .f = &plain, .s = stream, .sms = k.sms }, .pl = pl, .xd = xd2.ptr };
+    const b: Gu2 = .{ .s = st, .o = k.experts(stream), .pl = pl, .xd = xd3.ptr };
+    const ta = try timeIt(stream, d, ticket, .{ .ctx = &a, .run = Gu2.gateup }, reps);
+    const tb = try timeIt(stream, d, ticket, .{ .ctx = &b, .run = Gu2.gateup }, reps);
+    try stream.synchronize();
+    try sameDevice(gpa, "x3gm3-bench GU2 gm2r_kernel Xd vs gm2_kernel", xd3, xd2, 2 * P * I);
+    std.debug.print("  GU2 gate/up {d:.3} ms, TF_DSV41_GM_ROWT {d:.3} ms ({d:.1}%) BITEXACT\n", .{ ta, tb, 100.0 * (tb - ta) / ta });
+}
+
 fn variantName(buf: []u8, v: usize) ![]const u8 {
     const x = exl3.v3_variants[v];
     return std.fmt.bufPrint(buf, "v3[{d}] tile {d},{d},{d},{d},{d} lean {d}", .{ v, x.t[0], x.t[1], x.t[2], x.t[3], x.t[4], x.lean });
@@ -281,6 +313,7 @@ pub fn run(gpu: Gpu, k: *const dsv41.Kernels, rows_arg: ?[]const u8, reps_arg: ?
             total_v2 += gu2 + dn2;
             total_v3 += gud + dnd;
         }
+        if (k.exl3.gm2_gu2r != null) try rowt(gpa, d, stream, k, &st, pick_d.ptr, P, ticket, xd2, xd3, reps);
     };
     check.pass("BITEXACT x3gm3-bench: every v3 variant equals v2 at {d} row counts x 2 routings; uniform v2 {d:.3} ms vs v3 default {d:.3} ms", .{ nrows, total_v2, total_v3 });
 }
