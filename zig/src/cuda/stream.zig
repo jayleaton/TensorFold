@@ -20,6 +20,23 @@ pub const Stream = struct {
         return .{ .d = d, .handle = handle };
     }
 
+    /// A non-blocking stream at `priority`, clamped to the context's range (lower numbers run first; the greatest
+    /// priority is the range's lowest number). `highest`: the greatest the context allows.
+    pub const Priority = enum { default, highest };
+
+    pub fn initPriority(d: *const Driver, priority: Priority) Error!Stream {
+        var least: c_int = 0;
+        var greatest: c_int = 0;
+        try d.check(d.api.cuCtxGetStreamPriorityRange(&least, &greatest), "cuCtxGetStreamPriorityRange");
+        var s: abi.Stream = null;
+        const p: c_int = switch (priority) {
+            .default => 0,
+            .highest => greatest,
+        };
+        try d.check(d.api.cuStreamCreateWithPriority(&s, abi.stream_non_blocking, p), "cuStreamCreateWithPriority");
+        return .{ .d = d, .handle = s };
+    }
+
     pub fn deinit(self: *Stream) void {
         @import("copy_source.zig").synchronizeStream(self.d, self.handle) catch {};
         _ = self.d.api.cuStreamDestroy_v2(self.handle);
@@ -58,6 +75,12 @@ pub const Event = struct {
 
     pub fn record(self: Event, stream: Stream) Error!void {
         try self.d.check(self.d.api.cuEventRecord(self.handle, stream.handle), "cuEventRecord");
+    }
+
+    /// A record that a stream capture keeps as an event record node (abi.event_record_external): a stream outside the
+    /// graph that waits on the event after the graph's launch waits for that point of the launch.
+    pub fn recordExternal(self: Event, stream: Stream) Error!void {
+        try self.d.check(self.d.api.cuEventRecordWithFlags(self.handle, stream.handle, abi.event_record_external), "cuEventRecordWithFlags");
     }
 
     pub fn synchronize(self: Event) Error!void {

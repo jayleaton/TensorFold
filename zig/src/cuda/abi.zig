@@ -39,6 +39,8 @@ pub const DeviceAttribute = enum(c_int) {
     compute_capability_minor = 76,
     max_shared_memory_per_multiprocessor = 81,
     max_shared_memory_per_block_optin = 97,
+    virtual_memory_management_supported = 102,
+    gpu_direct_rdma_with_cuda_vmm_supported = 126,
 };
 
 pub const FunctionAttribute = enum(c_int) {
@@ -149,6 +151,11 @@ pub const ExecUpdateResultInfo = extern struct {
     error_from_node: GraphNode,
 };
 
+/// CU_EVENT_RECORD_EXTERNAL: inside a stream capture the record becomes an event record node (each launch of the
+/// graph records the event there, so work outside the graph can wait on that point of it); outside a capture a plain
+/// record.
+pub const event_record_external: c_uint = 0x1;
+
 pub const jit_info_log_buffer: c_int = 3;
 pub const jit_info_log_buffer_size: c_int = 4;
 pub const jit_error_log_buffer: c_int = 5;
@@ -169,6 +176,7 @@ pub const Api = struct {
     cuDeviceGetAttribute: *const fn (*c_int, DeviceAttribute, Device) callconv(.c) R,
     cuDeviceTotalMem_v2: *const fn (*usize, Device) callconv(.c) R,
     cuDevicePrimaryCtxRetain: *const fn (*Context, Device) callconv(.c) R,
+    cuDevicePrimaryCtxSetFlags_v2: *const fn (Device, c_uint) callconv(.c) R,
     cuDevicePrimaryCtxRelease_v2: *const fn (Device) callconv(.c) R,
     cuCtxSetCurrent: *const fn (Context) callconv(.c) R,
     cuCtxGetCurrent: *const fn (*Context) callconv(.c) R,
@@ -194,6 +202,8 @@ pub const Api = struct {
     cuMemsetD8Async: *const fn (DevicePtr, u8, usize, Stream) callconv(.c) R,
     cuMemsetD32Async: *const fn (DevicePtr, c_uint, usize, Stream) callconv(.c) R,
     cuStreamCreate: *const fn (*Stream, c_uint) callconv(.c) R,
+    cuStreamCreateWithPriority: *const fn (*Stream, c_uint, c_int) callconv(.c) R,
+    cuCtxGetStreamPriorityRange: *const fn (*c_int, *c_int) callconv(.c) R,
     cuStreamDestroy_v2: *const fn (Stream) callconv(.c) R,
     cuStreamSynchronize: *const fn (Stream) callconv(.c) R,
     cuStreamWaitEvent: *const fn (Stream, Event, c_uint) callconv(.c) R,
@@ -201,6 +211,7 @@ pub const Api = struct {
     cuEventCreate: *const fn (*Event, c_uint) callconv(.c) R,
     cuEventDestroy_v2: *const fn (Event) callconv(.c) R,
     cuEventRecord: *const fn (Event, Stream) callconv(.c) R,
+    cuEventRecordWithFlags: *const fn (Event, Stream, c_uint) callconv(.c) R,
     cuEventSynchronize: *const fn (Event) callconv(.c) R,
     cuEventQuery: *const fn (Event) callconv(.c) R,
     cuEventElapsedTime: *const fn (*f32, Event, Event) callconv(.c) R,

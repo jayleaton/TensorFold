@@ -5,13 +5,14 @@ const abi = @import("abi.zig");
 const Driver = @import("driver.zig").Driver;
 const Error = @import("driver.zig").Error;
 
-/// Bytes this process holds in DeviceBuffers and HostBuffers, and device/pinned peaks since the last reset.
-pub const Usage = struct { device: u64, host: u64, peak: u64, host_peak: u64 = 0 };
+/// Bytes this process holds in DeviceBuffers and HostBuffers, device/pinned peaks since the last reset, driver allocs.
+pub const Usage = struct { device: u64, host: u64, peak: u64, host_peak: u64 = 0, allocs: u64 = 0 };
 
 var device_bytes: std.atomic.Value(u64) = .init(0);
 var host_bytes: std.atomic.Value(u64) = .init(0);
 var host_peak_bytes: std.atomic.Value(u64) = .init(0);
 var peak_bytes: std.atomic.Value(u64) = .init(0);
+var driver_allocs: std.atomic.Value(u64) = .init(0);
 var counts_mutex: std.atomic.Mutex = .unlocked;
 var allocation_limit: ?u64 = null;
 var reserved_bytes: u64 = 0;
@@ -75,7 +76,8 @@ fn sample(reset_peak: bool, hook: anytype, pre_reset: bool) Usage {
         peak_bytes.store(now, .monotonic);
         host_peak_bytes.store(host, .monotonic);
     }
-    return .{ .device = now, .host = host, .peak = if (pre_reset) peak else @max(now, peak_bytes.load(.monotonic)), .host_peak = if (pre_reset) host_peak else @max(host, host_peak_bytes.load(.monotonic)) };
+    const allocs = driver_allocs.load(.monotonic);
+    return .{ .device = now, .host = host, .peak = if (pre_reset) peak else @max(now, peak_bytes.load(.monotonic)), .host_peak = if (pre_reset) host_peak else @max(host, host_peak_bytes.load(.monotonic)), .allocs = allocs };
 }
 
 fn recordAllocation(counter: *std.atomic.Value(u64), n: usize) void {
@@ -100,18 +102,42 @@ fn lockCounts() void {
     while (!counts_mutex.tryLock()) std.Thread.yield() catch {};
 }
 
+/// A sub-allocator under DeviceBuffer (arena.zig): `alloc` gives an address or null (cuMemAlloc then); `free`: its own.
+pub const Hook = struct {
+    ctx: *anyopaque,
+    alloc: *const fn (ctx: *anyopaque, len: usize) ?abi.DevicePtr,
+    free: *const fn (ctx: *anyopaque, p: abi.DevicePtr) bool,
+};
+
+var alloc_hook: ?Hook = null;
+
+/// Installs (or with null removes) the sub-allocator; set once at boot, before the buffers it should hold.
+pub fn setHook(h: ?Hook) void {
+    alloc_hook = h;
+}
+
+pub fn currentHook() ?Hook {
+    return alloc_hook;
+}
+
 pub const DeviceBuffer = struct {
     d: *const Driver,
     ptr: abi.DevicePtr,
     len: usize,
     borrowed: bool = false, // a span of memory another value owns (a carveout's): free leaves it alone
 
-    /// `len` bytes, 256-byte aligned by the driver; zero bytes allocate nothing and hold address 0.
+    /// `len` bytes, 256-byte aligned by the driver (512 from an installed arena); zero bytes hold address 0.
     pub fn alloc(d: *const Driver, len: usize) Error!DeviceBuffer {
         try reserveAllocation(len);
         errdefer finishAllocation(null, len);
         var p: abi.DevicePtr = 0;
-        if (len > 0) try d.check(d.api.cuMemAlloc_v2(&p, len), "cuMemAlloc");
+        if (len > 0) {
+            if (alloc_hook) |h| p = h.alloc(h.ctx, len) orelse 0;
+            if (p == 0) {
+                try d.check(d.api.cuMemAlloc_v2(&p, len), "cuMemAlloc");
+                _ = driver_allocs.fetchAdd(1, .monotonic);
+            }
+        }
         finishAllocation(&device_bytes, len);
         return .{ .d = d, .ptr = p, .len = len };
     }
@@ -129,7 +155,13 @@ pub const DeviceBuffer = struct {
 
     pub fn free(self: *DeviceBuffer) void {
         if (!self.borrowed) {
-            if (self.ptr != 0) _ = self.d.api.cuMemFree_v2(self.ptr);
+            if (self.ptr != 0) {
+                const mine = if (alloc_hook) |h| h.free(h.ctx, self.ptr) else false;
+                if (!mine) {
+                    _ = self.d.api.cuMemFree_v2(self.ptr);
+                    _ = driver_allocs.fetchSub(1, .monotonic);
+                }
+            }
             freed(&device_bytes, self.len);
         }
         self.* = undefined;
@@ -146,6 +178,13 @@ pub const DeviceBuffer = struct {
         return self.ptr + offset;
     }
 
+    /// cuMemcpyHtoD as is (no staging copy, no capture check): a family's weight loads and session restores.
+    pub fn uploadDirect(self: DeviceBuffer, offset: usize, bytes: []const u8) Error!void {
+        const dst = try self.span(offset, bytes.len);
+        if (bytes.len == 0) return;
+        try self.d.check(self.d.api.cuMemcpyHtoD_v2(dst, bytes.ptr, bytes.len), "cuMemcpyHtoD");
+    }
+
     /// Returns once the bytes have landed: a pageable copy can return early, and non-blocking streams won't wait.
     pub fn upload(self: DeviceBuffer, offset: usize, bytes: []const u8) Error!void {
         const dst = try self.span(offset, bytes.len);
@@ -157,6 +196,13 @@ pub const DeviceBuffer = struct {
         const src = try self.span(offset, out.len);
         if (out.len == 0) return;
         try self.d.check(self.d.api.cuMemcpyDtoH_v2(out.ptr, src, out.len), "cuMemcpyDtoH");
+    }
+
+    /// cuMemcpyHtoDAsync as is (no staging): `bytes` stay unchanged until the copy ran; a capture reads them at replay.
+    pub fn uploadAsyncDirect(self: DeviceBuffer, offset: usize, bytes: []const u8, stream: abi.Stream) Error!void {
+        const dst = try self.span(offset, bytes.len);
+        if (bytes.len == 0) return;
+        try self.d.check(self.d.api.cuMemcpyHtoDAsync_v2(dst, bytes.ptr, bytes.len, stream), "cuMemcpyHtoDAsync");
     }
 
     /// Owns a pinned source copy until completion. Captured uploads must use copy_source.Stage or Buffer.

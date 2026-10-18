@@ -39,6 +39,9 @@ pub const Config = extern struct {
 
 pub const Error = error{ LibraryUnavailable, MissingSymbol, NcclFailed };
 
+/// ncclInProgress: a non-blocking communicator's call still running (not a failure).
+pub const in_progress: Result = 7;
+
 const R = Result;
 const D = abi.DevicePtr;
 

@@ -24,6 +24,7 @@ pub const Args = launch.Args;
 pub const Config = launch.Config;
 pub const Dim3 = launch.Dim3;
 pub const graph = @import("graph.zig");
+pub const graph_cache = @import("graph_cache.zig");
 pub const cublaslt = @import("cublaslt.zig");
 pub const nccl = @import("nccl.zig");
 pub const roce = @import("roce.zig");
@@ -64,6 +65,8 @@ pub const exl3_experts = @import("exl3_experts.zig");
 pub const exl3_upload = @import("exl3_upload.zig");
 pub const exl3_candidate = @import("exl3_candidate.zig");
 pub const exl3_grouped = @import("exl3_grouped.zig");
+pub const arena = @import("arena.zig");
+pub const pack = @import("pack.zig");
 
 test {
     _ = exl3_grouped;
@@ -106,6 +109,9 @@ test {
     _ = @import("window_attention.zig");
     _ = @import("moe_glue.zig");
     _ = @import("dense_rows.zig");
+    _ = graph_cache;
+    _ = arena;
+    _ = pack;
 }
 
 pub const moe = @import("moe.zig");
