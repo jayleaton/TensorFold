@@ -1175,6 +1175,17 @@ const Seg = struct {
         const Et: i64 = ex.count;
         const I: i64 = e.cfg.expert_width / e.o.world;
         const P = n * topk;
+        const pre = try e.fmt("L{d}.moe", .{L});
+        const lim: f64 = E.dec(e.cfg.swiglu_limit);
+        // TF_DSV41_PF_SHX: the shared expert first, forked onto the side stream (it reads only `x`); moe_sum joins it
+        const shx = s.shxOn(n);
+        var shy: ?Arg = null;
+        if (shx) {
+            e.br_fork = true;
+            e.br_side = true;
+            defer e.br_side = false;
+            shy = try s.sharedExpert(pre, x, I, lim);
+        }
         const pick = try e.buf("L.pick", .{}, .i32, &.{ n, slots });
         const wts = try e.buf("L.wts", .{}, .f32, &.{ n, slots });
         // router_gemv.route, a launch a CHUNK of rows (one at 2,048 rows or fewer; a 4K segment's two halves), prefill's
@@ -1227,7 +1238,6 @@ const Seg = struct {
         // the block is the segment (pf4k.gm_rows: moe.arena_scratch holds it; here the views below size s.ex.z / xg in
         // the buffer plan, one rank's 4,096 x 6 pairs: 503 MB of X / Y, 57 MB of Xd)
         if (!e.o.pf4k and (P * D > zb or P * I > rows * (topk + 1) * D)) return error.Unsupported;
-        const pre = try e.fmt("L{d}.moe", .{L});
         const xg = try e.view(.{ .buf = "s.ex.z" }, .f16, &.{ P, D }, &.{ D, 1 }, 0);
         const xu = try e.view(.{ .buf = "s.ex.z" }, .f16, &.{ P, D }, &.{ D, 1 }, P * D * 2);
         const xd = try e.view(.{ .buf = "s.ex.xg" }, .f16, &.{ P, I }, &.{ I, 1 }, 0);
@@ -1240,7 +1250,6 @@ const Seg = struct {
         const ticket = try e.buf("L.gm.ticket", .{}, .i32, &.{2 * gm_widths});
         try e.glue(if (again) "gm_ticket_again" else "gm_ticket", &.{ticket});
         const tmax = @divFloor(P, gm_bm) + Et + 1;
-        const lim: f64 = E.dec(e.cfg.swiglu_limit);
         // TF_DSV41_GM_V2 (gm2pf.zig): x3gm._run_v2's gm2_kernel launches in place of the loop below
         if (e.o.gm_v2 != .off) try gm2pf.emit(e, e.o.gm_v2, .{ .L = L, .pre = pre, .P = P, .Et = Et, .D = D, .I = I, .pk = pk, .xg = xg, .xu = xu, .xd = xd, .y = y, .ticket = ticket, .limit = lim, .widths = widths }) else for (0..2) |down| {
             const wd = (widths orelse return error.NoWidth)[down];
@@ -1318,17 +1327,34 @@ const Seg = struct {
             return;
         }
         if (e.cfg.shared_experts > 0) {
-            const sh = try e.fmt("{s}.shared.0", .{pre});
-            const g = try e.buf("L.sh.g", .{}, .f32, &.{ n, I });
-            const u = try e.buf("L.sh.u", .{}, .f32, &.{ n, I });
-            const act = try e.buf("L.sh.act", .{}, .f32, &.{ n, I });
-            const sy = try e.buf("L.sh.y", .{}, .f32, &.{ n, D });
-            try s.proj(try e.fmt("{s}.w1", .{sh}), .stored, x, D, I, g);
-            try s.proj(try e.fmt("{s}.w3", .{sh}), .stored, x, D, I, u);
-            try e.glue("swiglu", &.{ g, u, act, .{ .f = lim } });
-            try s.proj(try e.fmt("{s}.w2", .{sh}), .stored, act, I, D, sy);
+            const sy = shy orelse try s.sharedExpert(pre, x, I, lim);
+            if (shx) e.br_join = true;
             try e.glue("moe_sum", &.{ routed, sy, part });
         } else try e.glue("moe_sum", &.{ routed, part });
+    }
+
+    /// The shared expert over the emitter's rows of `x`: gate and up GEMMs, the clamped SiLU product, the down GEMM
+    fn sharedExpert(s: *Seg, pre: []const u8, x: Arg, I: i64, lim: f64) !Arg {
+        const e = s.e;
+        const n = e.n;
+        const D: i64 = e.cfg.hidden;
+        const sh = try e.fmt("{s}.shared.0", .{pre});
+        const g = try e.buf("L.sh.g", .{}, .f32, &.{ n, I });
+        const u = try e.buf("L.sh.u", .{}, .f32, &.{ n, I });
+        const act = try e.buf("L.sh.act", .{}, .f32, &.{ n, I });
+        const sy = try e.buf("L.sh.y", .{}, .f32, &.{ n, D });
+        try s.proj(try e.fmt("{s}.w1", .{sh}), .stored, x, D, I, g);
+        try s.proj(try e.fmt("{s}.w3", .{sh}), .stored, x, D, I, u);
+        try e.glue("swiglu", &.{ g, u, act, .{ .f = lim } });
+        try s.proj(try e.fmt("{s}.w2", .{sh}), .stored, act, I, D, sy);
+        return sy;
+    }
+
+    /// TF_DSV41_PF_SHX: a whole segment's MoE call of at least `shx_min` rows, no row pieces, no TBO, side stream on.
+    fn shxOn(s: *const Seg, n: i64) bool {
+        const e = s.e;
+        if (!e.o.pf_shx or !e.o.branches or e.o.pf_tbo or s.short or e.o.image_rows != 0) return false;
+        return e.cfg.shared_experts > 0 and n >= shx_min and s.pieces() == 1;
     }
 
     /// Engram before the layer's first site (blocks.engram): wkv over the hashed rows (a prefill matmul), the fusion.
@@ -1569,6 +1595,9 @@ fn emitPart(a: std.mem.Allocator, cfg: *const Config, w: *const block.Widths, o:
 /// TF_DSV41_PF_TBO: micro-batches of at least this many rows (smaller ones run alone: their GEMMs' waves and the
 /// interleave's joins cost more than the overlap hides)
 pub const tbo_min: i64 = 512;
+
+/// TF_DSV41_PF_SHX: MoE calls of at least this many rows (CED's decoder passes, short segments: one stream)
+pub const shx_min: i64 = 512;
 
 /// The persistent roles a segment uses as scratch (rewritten every segment, never read by the next): a program in
 /// a namespace of its own (`ownRole`: a TF_DSV41_PF_TBO pair's B, TF_DSV41_PF_4K's workspace) takes its own copy of

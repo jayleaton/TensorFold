@@ -267,15 +267,38 @@ pub fn pfTbo(get: Get) !bool {
 /// default: proto/tbo_bench in the device benchmark, best stream split at 4,096 rows uncapped): every SM.
 pub const tbo_gm_sms: u32 = 0;
 pub fn pfTboGmSms(get: Get) !u32 {
-    const raw = std.mem.trim(u8, get("TF_DSV41_PF_TBO_GM_SMS") orelse return tbo_gm_sms, " ");
-    const v = std.fmt.parseInt(u32, raw, 10) catch return badSms(raw);
-    if (v != 0 and (v < 8 or v > 48)) return badSms(raw);
+    return gmSms(get, "TF_DSV41_PF_TBO_GM_SMS");
+}
+
+/// TF_DSV41_PF_SHX_GM_SMS (under TF_DSV41_PF_SHX): the same cap of x3gm's grid, 8-48; 0 (the default): every SM.
+pub fn pfShxGmSms(get: Get) !u32 {
+    return gmSms(get, "TF_DSV41_PF_SHX_GM_SMS");
+}
+
+fn gmSms(get: Get, comptime name: []const u8) !u32 {
+    const raw = std.mem.trim(u8, get(name) orelse return tbo_gm_sms, " ");
+    const v = std.fmt.parseInt(u32, raw, 10) catch return badSms(name, raw);
+    if (v != 0 and (v < 8 or v > 48)) return badSms(name, raw);
     return v;
 }
 
-fn badSms(raw: []const u8) error{BadKnob} {
-    std.log.warn("TF_DSV41_PF_TBO_GM_SMS={s}: 0 (every SM) or 8-48", .{raw});
+fn badSms(comptime name: []const u8, raw: []const u8) error{BadKnob} {
+    std.log.warn(name ++ "={s}: 0 (every SM) or 8-48", .{raw});
     return error.BadKnob;
+}
+
+/// TF_DSV41_PF_SHX (ours; 0 / 1, default 0): a prefill segment's shared expert on the side stream beside x3gm.
+pub fn pfShx(get: Get) !bool {
+    const raw = std.mem.trim(u8, get("TF_DSV41_PF_SHX") orelse "0", " ");
+    if (std.mem.eql(u8, raw, "0")) return false;
+    if (std.mem.eql(u8, raw, "1")) return true;
+    std.log.warn("TF_DSV41_PF_SHX={s}: 0 or 1", .{raw});
+    return error.BadKnob;
+}
+
+/// TF_DSV41_PF_SHX's company: the branches' side stream, no exchange pieces and no second micro-batch on it.
+pub fn pfShxFits(branches: bool, overlap: i64, tbo: bool) bool {
+    return branches and overlap == 0 and !tbo;
 }
 
 /// TF_DSV41_STREAM_RB (ours; unset / 0 off, 1, 2 or 4): the stream top-k's twin (block_prefill streamSelect): 1 the
@@ -502,6 +525,14 @@ pub fn apply(f: *@import("forward.zig").Forward, a: std.mem.Allocator, io: std.I
         std.log.scoped(.dsv41).err("TF_DSV41_PF_OVERLAP={d} needs TF_DSV41_BRANCHES=1 (its side stream) and TP=2 (world {d})", .{ f.opts.pf_overlap, f.opts.world });
         return error.BadKnob;
     }
+    f.opts.pf_shx = try pfShx(&env);
+    if (f.opts.pf_shx) {
+        if (!pfShxFits(f.opts.branches, f.opts.pf_overlap, f.opts.pf_tbo)) {
+            std.log.scoped(.dsv41).err("TF_DSV41_PF_SHX=1 needs TF_DSV41_BRANCHES=1 (its side stream), TF_DSV41_PF_OVERLAP and TF_DSV41_PF_TBO off", .{});
+            return error.BadKnob;
+        }
+        dk.exl3.gm_sms_cap = try pfShxGmSms(&env);
+    }
     f.opts.pf_rs = try pfRs(&env);
     if (f.opts.pf_rs and !pfRsFits(f.opts.world, f.opts.pf_overlap, f.opts.pf_tbo)) {
         std.log.scoped(.dsv41).err("TF_DSV41_PF_RS=1 needs TP=2 (world {d}), TF_DSV41_PF_OVERLAP and TF_DSV41_PF_TBO off", .{f.opts.world});
@@ -527,6 +558,7 @@ pub fn apply(f: *@import("forward.zig").Forward, a: std.mem.Allocator, io: std.I
     if (f.opts.stream_rb == 1) log.info("stream top-k: _stream_pf (the next tile's key loads issued ahead)", .{});
     if (f.opts.stream_rb > 1) log.info("stream top-k: {d} rows a program (_stream_rb{d})", .{ f.opts.stream_rb, f.opts.stream_rb });
     if (f.opts.pf_tbo) log.info("prefill tbo: encoder segments two at a time on two streams, x3gm on at most {d} SMs (0: all){s}", .{ dk.exl3.gm_sms_cap, if (f.opts.pf_overlap > 0) "; TF_DSV41_PF_OVERLAP is off under it" else "" });
+    if (f.opts.pf_shx) log.info("prefill shx: the shared expert on the side stream beside x3gm, x3gm on at most {d} SMs (0: all)", .{dk.exl3.gm_sms_cap});
     if (f.opts.pf_rs) log.info("prefill rs: a boundary's exchange as a rank-order reduce-scatter + gather of the bf16 sums", .{});
     if (f.opts.pf_overlap > 0) log.info("prefill overlap: a segment's exchanges in {d} row pieces on the side stream{s}", .{ f.opts.pf_overlap, if (f.opts.pf_overlap_site) ", every piece; the next mixing site in the same pieces, each after its own" else "" });
     log.info("prod knobs: pf_dense {s}, prefill rows {d}{s}, index budget {d} MiB, R1 {s}, prefetch ahead {s}, x3gm v2 {t}, prefill {t}, mhc pfdec {d}", .{ if (f.opts.pfd != null) "fused" else "off", if (big) rows_big else @as(u32, @intCast(f.opts.prefill_rows)), if (k8) " (8K: one x3gm block a segment, in the prefill's own workspace)" else if (big) " (4K: one x3gm block a segment, in the prefill's own workspace)" else "", f.opts.index_budget >> 20, if (f.opts.r1) "on" else "off", if (f.prefill_state.ahead) "on" else "off", f.opts.gm_v2, f.prefill_state.mode, f.opts.mhc_pf_rows });

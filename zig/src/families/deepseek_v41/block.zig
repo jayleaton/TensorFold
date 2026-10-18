@@ -105,6 +105,8 @@ pub const Options = struct {
     /// behind the first on the branches' side stream, so one's routed experts (DRAM-bound) run beside the other's
     /// attention and dense GEMMs (compute-bound). Needs `branches`; the exchange pieces (pf_overlap) are off under it
     pf_tbo: bool = false,
+    /// TF_DSV41_PF_SHX (block_prefill.zig `shxOn`): a prefill segment's shared expert on the side stream beside x3gm
+    pf_shx: bool = false,
     /// TF_DSV41_STREAM_RB (1: `_stream_pf`, the next tile's key loads ahead; 2 / 4; 0 off): the long-context indexer's stream top-k (`_stream`, positions mode) as the
     /// Zig-own row-blocked twin `_stream_rb<N>` (tools/zig/dsv41_triton: N rows a program, each row `score_tile`'s
     /// arithmetic: the same split buffers, the same selection)
