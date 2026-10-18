@@ -28,3 +28,5 @@ for backend in roce nccl; do
         for victim in 0 1; do step "ff-$backend-$mode-$victim" "$backend" failfast "$victim" "$mode"; done
     done
 done
+# GATHER_BENCH=1: ours vs upstream's one-shot vs NCCL all-gathers at decode sizes (needs NCCL_IB_HCA or TF_ROCE_HCA)
+if [ "${GATHER_BENCH:-0}" = 1 ]; then TF_TP_ROCE_ONESHOT=1 step gather-bench roce gather-bench "${GATHER_ITERS:-2000}"; fi

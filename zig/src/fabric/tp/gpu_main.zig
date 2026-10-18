@@ -1,4 +1,4 @@
-//! `tf-tp-test suite | failfast RANK fatal|kill|transport [N [HOLD_S]] | roce-host`: one rank of a TP=2 GPU test.
+//! `tf-tp-test suite | failfast RANK fatal|kill|transport [N [HOLD_S]] | roce-host | gather-bench [N]`: one TP=2 rank.
 const std = @import("std");
 const cuda = @import("cuda");
 const tp = @import("tp");
@@ -11,7 +11,7 @@ const max_bytes = (4 << 20) + 4096;
 pub fn main(init: std.process.Init) !u8 {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len < 2) {
-        std.debug.print("usage: tf-tp-test suite | failfast RANK fatal|kill|transport [N [HOLD_S]] | roce-host\n", .{});
+        std.debug.print("usage: tf-tp-test suite | failfast RANK fatal|kill|transport [N [HOLD_S]] | roce-host | gather-bench [N]\n", .{});
         return 2;
     }
     const cfg = try tp.Config.fromEnv();
@@ -27,10 +27,14 @@ pub fn main(init: std.process.Init) !u8 {
     var name_buf: [128]u8 = undefined;
     const t0 = tp.sock.nowNs();
     var s: tp.Session = undefined;
-    try s.open(&driver, cfg, tp_kernel.mailbox);
+    try s.openWith(&driver, cfg, .{ .mailbox = tp_kernel.mailbox, .oneshot = tp_kernel.roce_gather });
     const up_ms = @as(f64, @floatFromInt(tp.sock.nowNs() - t0)) / 1e6;
     std.debug.print("INFO rank {d}/{d} on {s} (sm_{d}), backend {t}, mailbox kernel {d} B, bootstrap + NCCL init {d:.0} ms\n", .{ cfg.rank, cfg.world, try ctx.name(&name_buf), try ctx.capability(), s.comm().kind(), tp_kernel.mailbox.len, up_ms });
     if (std.mem.eql(u8, args[1], "suite")) return suite(&s, &driver, init.gpa, cfg);
+    if (std.mem.eql(u8, args[1], "gather-bench")) {
+        const n = if (args.len > 2) try std.fmt.parseInt(usize, args[2], 10) else 2000;
+        return @import("gather_bench.zig").run(&s, &driver, init.gpa, cfg, n);
+    }
     if (std.mem.eql(u8, args[1], "failfast") and args.len >= 4 and std.mem.eql(u8, args[3], "transport")) {
         const n = if (args.len > 4) try std.fmt.parseInt(u32, args[4], 10) else 50;
         const hold = if (args.len > 5) try std.fmt.parseInt(u32, args[5], 10) else 0;
@@ -48,7 +52,7 @@ fn suite(s: *tp.Session, d: *const cuda.Driver, gpa: std.mem.Allocator, cfg: tp.
     var n_backends: usize = 1;
     backends[0] = .{ .comm = s.nccl.iface(), .label = "nccl" };
     if (s.comm().kind() != .nccl) {
-        backends[1] = .{ .comm = s.comm(), .label = if (s.roce != null) "roce" else "mailbox" };
+        backends[1] = .{ .comm = s.comm(), .label = if (s.oneshot != null) "roce+oneshot" else if (s.roce != null) "roce" else "mailbox" };
         n_backends = 2;
     }
     const sizes = [_]usize{ 6, 1000, 4096, 65536, 256 * 1024, 256 * 1024 + 16, 1 << 20, 4 << 20 };

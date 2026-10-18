@@ -7,9 +7,7 @@ const memory = @import("memory.zig");
 const Module = @import("module.zig").Module;
 const Function = @import("module.zig").Function;
 const launch = @import("launch.zig");
-const tp_group = @import("tp_group.zig");
 const Stream = @import("stream.zig").Stream;
-const kernels = @import("kernels.zig");
 
 const max_hcas = 2;
 const slots = 2;
@@ -152,8 +150,8 @@ pub fn wanted() bool {
     return !std.mem.eql(u8, std.mem.span(v), "0");
 }
 
-/// The peer's `mine`: both ranks' values cross the group's communicator, rank order.
-fn swap(comptime T: type, group: *const tp_group.Group, d: *const Driver, s: Stream, mine: T) !T {
+/// The peer's `mine`: both ranks' values cross the group's link (`world`, `rank`, `gather`), rank order.
+fn swap(comptime T: type, group: anytype, d: *const Driver, s: Stream, mine: T) !T {
     var both: [2]T = undefined;
     try group.gather(T, d, s, mine, &both);
     return both[1 - group.rank];
@@ -233,13 +231,13 @@ pub const Gather = struct {
     err: [256]u8 = @splat(0),
     gathers: u64 = 0,
 
-    /// Both ranks' exchange or null on both; setup crosses ``group``'s communicator on ``s``. ``max_bytes``: a shard.
-    pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const Driver, group: *const tp_group.Group, s: Stream, want: bool, max_bytes: usize) !?*Gather {
+    /// Both ranks' exchange or null on both; setup crosses ``group``'s link on ``s``; ``image``: roce_gather's fatbin.
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const Driver, group: anytype, s: Stream, want: bool, max_bytes: usize, image: []const u8) !?*Gather {
         if (group.world != 2) return error.PeerRefused;
         const g = try gpa.create(Gather);
         var mine: Blob = std.mem.zeroes(Blob);
         const ok = want and blk: {
-            g.setup(gpa, io, d, @intCast(group.rank), max_bytes) catch |e| {
+            g.setup(gpa, io, d, @intCast(group.rank), max_bytes, image) catch |e| {
                 std.log.warn("RoCE all-gather: {s} ({s}); NCCL carries every gather", .{ @errorName(e), std.mem.sliceTo(&g.err, 0) });
                 break :blk false;
             };
@@ -282,7 +280,7 @@ pub const Gather = struct {
         _ = std.fmt.bufPrint(g.err[0 .. g.err.len - 1], fmt, args) catch {};
     }
 
-    fn setup(g: *Gather, gpa: std.mem.Allocator, io: std.Io, d: *const Driver, rank: u8, max_bytes: usize) !void {
+    fn setup(g: *Gather, gpa: std.mem.Allocator, io: std.Io, d: *const Driver, rank: u8, max_bytes: usize, image: []const u8) !void {
         g.* = .{ .gpa = gpa, .d = d, .lib = undefined, .api = undefined, .rank = rank, .layout = .of(max_bytes), .region = undefined, .region_dev = 0, .counters = undefined, .module = undefined, .f = undefined, .max_bytes = max_bytes };
         g.lib = std.DynLib.open("libibverbs.so.1") catch return error.VerbsUnavailable;
         errdefer g.lib.close();
@@ -301,7 +299,7 @@ pub const Gather = struct {
         errdefer g.counters.free();
         const zeros: [64 * 4]u8 = @splat(0);
         try g.counters.upload(0, &zeros);
-        g.module = try Module.load(d, kernels.roce_gather);
+        g.module = try Module.load(d, image);
         errdefer g.module.unload();
         g.f = try g.module.function("roce_gather");
         errdefer g.closeHcas();

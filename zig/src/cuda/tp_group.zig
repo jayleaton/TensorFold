@@ -37,7 +37,7 @@ pub const Group = struct {
     /// Two ranks: gathers up to `max_bytes` a rank go by RoCE writes if both ranks bring it up; else NCCL keeps them.
     pub fn openRoce(g: *Group, gpa: std.mem.Allocator, io: std.Io, d: *const driver.Driver, s: Stream, max_bytes: usize) !void {
         if (g.world != 2 or g.fast != null) return;
-        g.fast = try roce.Gather.init(gpa, io, d, g, s, roce.wanted(), max_bytes);
+        g.fast = try roce.Gather.init(gpa, io, d, g, s, roce.wanted(), max_bytes, @import("kernels.zig").roce_gather);
     }
 
     /// A failed RoCE gather's error (its rows hold nothing valid): call it after a synchronize that reads a gather.

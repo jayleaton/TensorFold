@@ -14,6 +14,7 @@ pub const mailbox = @import("mailbox.zig");
 pub const hybrid = @import("hybrid.zig");
 pub const roce = @import("roce.zig");
 pub const roce_verbs = @import("roce_verbs.zig");
+pub const roce_oneshot = @import("roce_oneshot.zig");
 pub const planlink = @import("planlink.zig");
 pub const Verbs = @import("verbs").Verbs;
 
@@ -30,6 +31,8 @@ pub const Session = struct {
     nccl: nccl.Nccl,
     mail: ?mailbox.Mailbox = null,
     roce: ?*roce.Roce = null,
+    /// TF_TP_ROCE_ONESHOT=1: upstream's one-shot gather in front of the route (or NCCL) for small all-gathers.
+    oneshot: ?roce_oneshot.OneShot = null,
     route: hybrid.Hybrid = undefined,
     /// The round plan's link (rank 0 sends, the others receive), on its own TCP connection.
     plan: planlink.PlanLink = undefined,
@@ -39,9 +42,18 @@ pub const Session = struct {
     /// mailbox.cu's fatbin (the mailbox and RoCE kernels), empty when the build has none: those backends then use
     /// NCCL.
     pub fn open(s: *Session, d: *const cuda.Driver, cfg: Config, kernel_image: []const u8) !void {
+        return s.openWith(d, cfg, .{ .mailbox = kernel_image, .oneshot = cuda.kernels.roce_gather });
+    }
+
+    /// The kernel images: mailbox.cu's, and roce_gather.cu's for TF_TP_ROCE_ONESHOT (the runtime's own by default).
+    pub const Images = struct { mailbox: []const u8, oneshot: []const u8 = &.{} };
+
+    /// `open` with each image given (tf-tp-test embeds its own roce_gather; its runtime has no kernels).
+    pub fn openWith(s: *Session, d: *const cuda.Driver, cfg: Config, images: Images) !void {
+        const kernel_image = images.mailbox;
         var b = try Bootstrap.open(cfg);
         defer b.close();
-        try b.agree(&cfg.digest(), "settings (TF_TP_WORLD, TF_COMM_BACKEND, TF_TP_MAILBOX_MAX_KB, TF_DSV41_FAILFAST, TF_TP_ROCE_WIRE / _FALLBACK)");
+        try b.agree(&cfg.digest(), "settings (TF_TP_WORLD, TF_COMM_BACKEND, TF_TP_MAILBOX_MAX_KB, TF_DSV41_FAILFAST, TF_TP_ROCE_WIRE / _FALLBACK, TF_TP_ROCE_ONESHOT)");
         var lib = try cuda.nccl.Library.openPath(cfg.nccl_lib);
         errdefer lib.close();
         const v = try lib.version();
@@ -63,6 +75,7 @@ pub const Session = struct {
             .roce => try s.openRoce(d, &b, kernel_image),
         }
         try s.agreeVar(&b);
+        if (cfg.roce_oneshot_bytes > 0) try s.openOneshot(d, &b, images.oneshot);
         s.plan = planlink.PlanLink.init(cfg.rank, cfg.world, b.releasePlan());
         s.plan.spin_ns = cfg.plan_spin_ns;
         s.plan.pin = cfg.plan_pin;
@@ -108,6 +121,42 @@ pub const Session = struct {
             s.roce = null;
             return s.roceFallback(error.ProbeMismatch);
         };
+    }
+
+    /// The one-shot gather over the route, then a probe against NCCL's bytes on both ranks: any failure stops both.
+    fn openOneshot(s: *Session, d: *const cuda.Driver, b: *Bootstrap, image: []const u8) !void {
+        const inner = s.comm();
+        s.oneshot = try roce_oneshot.OneShot.open(d, b, image, s.cfg.roce_oneshot_bytes, inner);
+        const good = s.probeGather(d) catch false;
+        var blobs: [bootstrap.max_ranks][]const u8 = undefined;
+        var buf: [bootstrap.max_ranks]u8 = undefined;
+        const all = try b.allGather(&.{@intFromBool(good)}, &buf, &blobs);
+        for (all) |x| if (x[0] != 1) {
+            s.oneshot.?.deinit();
+            s.oneshot = null;
+            std.log.warn("[tensorfold] tp: TF_TP_ROCE_ONESHOT=1: the probe's gather differs from NCCL's on a rank; refusing to start", .{});
+            return error.ProbeMismatch;
+        };
+        std.log.info("[tensorfold] tp: one-shot RoCE all-gathers up to {d} KiB a rank (TF_TP_ROCE_ONESHOT)", .{s.oneshot.?.cap / 1024});
+    }
+
+    /// One 4 KiB all-gather through `comm()` and through NCCL: the bytes must be equal.
+    fn probeGather(s: *Session, d: *const cuda.Driver) !bool {
+        const n = 4096;
+        var a = try cuda.DeviceBuffer.alloc(d, 5 * n);
+        defer a.free();
+        var stream = try cuda.Stream.init(d, true);
+        defer stream.deinit();
+        var bytes: [n]u8 = undefined;
+        reference.fill(&bytes, .bf16, s.cfg.rank, 0x6f6e_6573);
+        try a.uploadAsyncDirect(0, &bytes, stream.handle);
+        try s.comm().allGather(a.ptr, a.ptr + n, n / 2, .bf16, stream.handle);
+        try s.nccl.iface().allGather(a.ptr, a.ptr + 3 * n, n / 2, .bf16, stream.handle);
+        try stream.synchronize();
+        try s.comm().check();
+        var got: [4 * n]u8 = undefined;
+        try a.download(n, &got);
+        return std.mem.eql(u8, got[0 .. 2 * n], got[2 * n .. 4 * n]);
     }
 
     /// `Collective.varAgreed`: whether every rank's transport moves device lengths (`varFits(16)` on all), one all-gather
@@ -171,8 +220,9 @@ pub const Session = struct {
         s.comm().abort();
     }
 
-    /// The communicator the model uses: NCCL, or the hybrid route over the mailbox / RoCE.
+    /// The communicator the model uses: NCCL, or the hybrid route over the mailbox / RoCE, behind the one-shot if on.
     pub fn comm(s: *Session) Collective {
+        if (s.oneshot) |*o| return o.iface();
         if (s.mail != null or s.roce != null) return s.route.iface();
         return s.nccl.iface();
     }
@@ -201,8 +251,10 @@ pub const Session = struct {
     pub fn close(s: *Session) void {
         // a failed transport: every rank goes down (the peers stop posting) before this one lets go of anything
         if (s.roce) |r| if (r.failed()) if (s.fate) |*f| f.fatal("transport", error.BackendFailed);
+        if (s.oneshot) |*o| if (o.failed()) if (s.fate) |*f| f.fatal("transport", error.BackendFailed);
         if (s.fate) |*f| f.close();
         s.plan.close();
+        if (s.oneshot) |*o| if (!o.failed()) o.deinit(); // a failed one's region may still be read: kept until exit
         if (s.roce) |r| r.deinit();
         if (s.mail) |*m| m.deinit();
         s.nccl.deinit();
@@ -218,6 +270,7 @@ test {
     _ = bootstrap;
     _ = mailbox;
     _ = roce_verbs;
+    _ = roce_oneshot;
     _ = planlink;
     _ = @import("roce_test.zig");
     _ = @import("roce_inflight_test.zig");
