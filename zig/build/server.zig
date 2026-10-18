@@ -19,6 +19,10 @@ pub fn addTo(
 ) *std.Build.Module {
     const j = json(b, target, optimize);
     m.addImport("json", j);
-    if (m.import_table.get("engine_api")) |api| if (api.import_table.get("lanes")) |lanes| m.addImport("lanes", lanes);
+    if (m.import_table.get("engine_api")) |api| if (api.import_table.get("lanes")) |lanes| {
+        m.addImport("lanes", lanes);
+        // DeepSeek-V4.1's serving side (zig/src/server/deepseek.zig) over the server's tokenizer and these modules
+        if (m.import_table.get("tokenizer")) |tok| m.addImport("dsv41_serve", @import("dsv41_server.zig").serveModule(b, target, optimize, j, tok, lanes));
+    };
     return j;
 }

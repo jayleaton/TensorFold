@@ -77,6 +77,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     @import("h3_host.zig").library(b, target, optimize, h3_image);
     const cuda = runtime(b, target, optimize, if (nvcc != null or prebuilt != null) &images else &.{});
     const mods = family(b, target, optimize, cuda, draft_ids);
+    @import("dsv41_cuda.zig").targets(b, target, optimize, cuda, mods.core, .{ .nvcc = nvcc, .version = version, .prebuilt = prebuilt, .sms = sms, .step = fatbin_step }, build_options);
     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip });
     cli.addImport("cuda", cuda);
     cli.addImport("core", mods.core);
@@ -226,6 +227,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/build/check_fatbins.zig"), .target = host }) })).step);
     const cuda = runtime(b, host, .debug, &.{});
     @import("h3_host.zig").targets(b, cuda, step);
+    @import("dsv41_cuda.zig").hostTests(b, cuda, step);
     const mods = family(b, host, .debug, cuda, draft_ids);
     @import("qwen_contract.zig").host(b, mods.core, step);
     const mtp_policy = b.createModule(.{ .root_source_file = b.path("zig/nemotron_mtp_policy_host.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "nemotron", .module = mods.nemotron }, .{ .name = "lanes", .module = mods.lanes } } });
@@ -431,7 +433,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
 }
 
 /// nvcc -fatbin with torch's flags, the kernel's own and one -gencode per SASS target, as the Python build passes them.
-fn fatbin(b: *std.Build, nvcc: []const u8, version: std.Build.LazyPath, k: Kernel, sms: []const u8) std.Build.LazyPath {
+pub fn fatbin(b: *std.Build, nvcc: []const u8, version: std.Build.LazyPath, k: Kernel, sms: []const u8) std.Build.LazyPath {
     const run = b.addSystemCommand(&.{ nvcc, "-fatbin" });
     run.addFileInput(version);
     run.addArgs(&torch_flags);
