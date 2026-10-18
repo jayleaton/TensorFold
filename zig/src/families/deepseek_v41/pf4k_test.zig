@@ -54,14 +54,14 @@ test "TF_DSV41_PF_4K: 0 / 1 only, refused without TF_DSV41_PF_4K_MEMORY_OK=1, 4,
     try testing.expectError(error.BadKnob, pk.prefillRows(&Fake.get));
 }
 
-fn widths(a: std.mem.Allocator) !block.Widths {
+pub fn widths(a: std.mem.Allocator) !block.Widths {
     var w: block.Widths = .{};
     try check.parseDense(a, &w, @embedFile("fixtures/q28v2-dense-k2.txt"));
     try check.parseExperts(a, &w, @embedFile("fixtures/q28v2-expert-k2.txt"));
     return w;
 }
 
-fn roleOf(x: calls.Arg) []const u8 {
+pub fn roleOf(x: calls.Arg) []const u8 {
     return switch (x.t.role) {
         .buf => |b| b,
         .weight => |w| w,
@@ -69,11 +69,11 @@ fn roleOf(x: calls.Arg) []const u8 {
     };
 }
 
-fn isRoute(c: calls.Call) bool {
+pub fn isRoute(c: calls.Call) bool {
     return std.mem.eql(u8, c.name, "tf_dsv41_router_gemv_v2.route");
 }
 
-fn count(cs: []const calls.Call, name: []const u8) usize {
+pub fn count(cs: []const calls.Call, name: []const u8) usize {
     var n: usize = 0;
     for (cs) |c| n += @intFromBool(std.mem.eql(u8, c.name, name));
     return n;
@@ -81,7 +81,7 @@ fn count(cs: []const calls.Call, name: []const u8) usize {
 
 /// `big`'s calls are `small`'s (names, argument kinds, roles and dtypes, in order), with each route launch of `small`
 /// a run of `routes` route launches in `big`.
-fn sameCalls(small: []const calls.Call, big: []const calls.Call, routes: usize) !void {
+pub fn sameCalls(small: []const calls.Call, big: []const calls.Call, routes: usize) !void {
     var j: usize = 0;
     for (small) |c| {
         const k: usize = if (isRoute(c)) routes else 1;
@@ -209,7 +209,7 @@ test "TF_DSV41_PF_4K leaves a segment of 2,048 rows or fewer as it was, launch f
 }
 
 /// Two arguments with the same contents (tensors by role, dtype, shape, strides and offset; lists item by item).
-fn argEql(p: calls.Arg, q: calls.Arg) bool {
+pub fn argEql(p: calls.Arg, q: calls.Arg) bool {
     if (std.meta.activeTag(p) != std.meta.activeTag(q)) return false;
     return switch (p) {
         .t, .opaque_table => |t| blk: {
@@ -235,14 +235,15 @@ const branches = @import("branches.zig");
 
 test "TF_DSV41_PF_4K adds no byte to the forward's buffer plan: the 4K program's own roles are its workspace's, the rest the 2K plan's at their sizes" {
     // the forward's options under 4K are its 2K ones (prod_knobs.apply leaves them); 4K segments emit with k4Options
-    try planWithin(.{ .gm_v2 = .one, .limit = 1 << 20, .rope_rows = (1 << 20) + 2048, .index_budget = 64 << 20, .taps = true });
+    try planWithin(.{ .gm_v2 = .one, .limit = 1 << 20, .rope_rows = (1 << 20) + 2048, .index_budget = 64 << 20, .taps = true }, 4096);
 }
 
 test "TF_DSV41_PF_4K + TF_DSV41_PF_OVERLAP (+ _SITE): the pieced 4K program stays in its workspace, its streams share only the partials (and the gathered buffers)" {
-    for ([_]i64{ 2, 4 }) |k| for ([_]bool{ false, true }) |site| try planWithin(.{ .gm_v2 = .one, .limit = 1 << 20, .rope_rows = (1 << 20) + 2048, .index_budget = 64 << 20, .taps = true, .branches = true, .pf_overlap = k, .pf_overlap_site = site });
+    for ([_]i64{ 2, 4 }) |k| for ([_]bool{ false, true }) |site| try planWithin(.{ .gm_v2 = .one, .limit = 1 << 20, .rope_rows = (1 << 20) + 2048, .index_budget = 64 << 20, .taps = true, .branches = true, .pf_overlap = k, .pf_overlap_site = site }, 4096);
 }
 
-fn planWithin(base: block.Options) !void {
+/// The workspace program at `rows` (4,096 / 8,192) against the 2K plan: own roles in the namespace, the rest within.
+pub fn planWithin(base: block.Options, rows: u32) !void {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const aa = arena.allocator();
@@ -250,14 +251,15 @@ fn planWithin(base: block.Options) !void {
     const w = try widths(aa);
     var enc: [21]u32 = undefined;
     for (&enc, 0..) |*l, i| l.* = @intCast(i);
-    const o4 = fp.k4Options(base);
-    try testing.expectEqual(@as(i64, 4096), o4.prefill_rows);
+    const R: i64 = rows;
+    const o4 = fp.k4Options(base, rows);
+    try testing.expectEqual(R, o4.prefill_rows);
     try testing.expect(o4.pf4k and !base.pf4k and base.prefill_rows == 2048);
     var p2: buffers.Plan = .{ .a = aa };
     var p4: buffers.Plan = .{ .a = aa };
-    for ([_]i64{ 0, (1 << 20) - 4096 - 1 }) |start| {
-        try p2.add(try bp.emitReplay(aa, &cfg, &w, base, &enc, 2048, start + 2048, .encoder));
-        const c4 = try bp.ownCalls(aa, try bp.emitReplay(aa, &cfg, &w, o4, &enc, 4096, start, .encoder), fp.K4.tag);
+    for ([_]i64{ 0, (1 << 20) - R - 1 }) |start| {
+        try p2.add(try bp.emitReplay(aa, &cfg, &w, base, &enc, 2048, start + R - 2048, .encoder));
+        const c4 = try bp.ownCalls(aa, try bp.emitReplay(aa, &cfg, &w, o4, &enc, R, start, .encoder), fp.K4.tag);
         try p4.add(c4);
         if (base.pf_overlap > 1) {
             try testing.expect(count(c4, "glue.exchange_rows") > 0);
@@ -292,17 +294,17 @@ fn planWithin(base: block.Options) !void {
         for (bp.own_scratch) |sc| try testing.expect(!std.mem.startsWith(u8, k, sc));
     }
     for (p2.sizes.keys()) |k| try testing.expect(std.mem.indexOf(u8, k, fp.K4.tag) == null);
-    // the workspace: the 4K segment's scratch and window roles (x3gm's z at 24,576 pairs, the 8,192-row staging ring)
-    try testing.expect(p4.sizes.get("s.k4~ex.z").? >= 4096 * 6 * 5120 * 4);
+    // the workspace: the segment's scratch and window roles (x3gm's z at rows x 6 pairs, the 2 x rows staging ring)
+    try testing.expect(p4.sizes.get("s.k4~ex.z").? >= @as(u64, rows) * 6 * 5120 * 4);
     try testing.expect(p4.sizes.contains("s.k4~stage.v") or p4.sizes.contains("s.k4~stage.s"));
     try testing.expect(own > 1 << 30);
-    if (base.pf_overlap == 0) try shared4k(aa, &p2, &p4, own);
+    if (base.pf_overlap == 0) try shared4k(aa, &p2, &p4, own, rows);
 }
 
 /// TF_DSV41_PF_4K alone (forward_prefill.k4Trim): the roles the 2K plan holds at least as large leave the workspace,
 /// and the 4K program as the segment runs it (ownCallsKeep) names them bare. Every role it names is then the
 /// workspace's (in the trimmed plan, at no more than its size) or the forward's (in the 2K plan, at no less).
-fn shared4k(aa: std.mem.Allocator, p2: *const buffers.Plan, p4: *const buffers.Plan, own: u64) !void {
+fn shared4k(aa: std.mem.Allocator, p2: *const buffers.Plan, p4: *const buffers.Plan, own: u64, rows: u32) !void {
     var wp: buffers.Plan = .{ .a = aa };
     for (p4.sizes.keys(), p4.sizes.values()) |k, v| try wp.sizes.put(aa, k, v);
     var keep: bp.Keep = .empty;
@@ -318,10 +320,11 @@ fn shared4k(aa: std.mem.Allocator, p2: *const buffers.Plan, p4: *const buffers.P
     const w = try widths(aa);
     var enc: [21]u32 = undefined;
     for (&enc, 0..) |*l, i| l.* = @intCast(i);
-    const o4 = fp.k4Options(.{ .gm_v2 = .one, .limit = 1 << 20, .rope_rows = (1 << 20) + 2048, .index_budget = 64 << 20, .taps = true });
-    for ([_]i64{ 0, (1 << 20) - 4096 - 1 }) |start| {
+    const o4 = fp.k4Options(.{ .gm_v2 = .one, .limit = 1 << 20, .rope_rows = (1 << 20) + 2048, .index_budget = 64 << 20, .taps = true }, rows);
+    const R: i64 = rows;
+    for ([_]i64{ 0, (1 << 20) - R - 1 }) |start| {
         var run: buffers.Plan = .{ .a = aa };
-        try run.add(try bp.ownCallsKeep(aa, try bp.emitReplay(aa, &cfg, &w, o4, &enc, 4096, start, .encoder), fp.K4.tag, &keep));
+        try run.add(try bp.ownCallsKeep(aa, try bp.emitReplay(aa, &cfg, &w, o4, &enc, R, start, .encoder), fp.K4.tag, &keep));
         for (run.sizes.keys(), run.sizes.values()) |k, v| {
             if (std.mem.indexOf(u8, k, fp.K4.tag) != null) {
                 try testing.expect(v <= wp.sizes.get(k).?);

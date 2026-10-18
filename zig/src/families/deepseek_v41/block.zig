@@ -83,9 +83,9 @@ pub const Options = struct {
     taps: bool = false,
     /// rows a prefill segment holds at most (forward.pchunk): sizes the SWA staging ring (block_prefill.zig)
     prefill_rows: i64 = 2048,
-    /// TF_DSV41_PF_4K (G16 4K, pf4k.py): prefill segments up to 4,096 rows, x3gm's row block the whole segment (the
-    /// expert scratch holds it, as pf4k's arena: the trellis streams once a segment, not once a 2,048 rows), the router
-    /// in 2,048-row launches (router_gemv.CHUNK). Off: Python prod's 2,048 (a longer segment is refused)
+    /// TF_DSV41_PF_4K (G16 4K, pf4k.py; _8K: up to `prefill_rows`): segments up to 4,096 rows, x3gm's row block the
+    /// whole segment (the expert scratch holds it, as pf4k's arena: the trellis streams once a segment, not once 2,048
+    /// rows), the router in 2,048-row launches (router_gemv.CHUNK). Off: Python prod's 2,048 (a longer one is refused)
     pf4k: bool = false,
     /// TF_DSV41_PF_OVERLAP (block_prefill.zig `pieces`): a prefill segment's two exchanges a layer in this many row
     /// pieces, each sent on the branches' side stream while the main stream computes the next piece's producer (wo_a /

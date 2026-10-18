@@ -147,24 +147,50 @@ pub fn pf4k(get: Get) !bool {
     return true;
 }
 
+/// TF_DSV41_PF_8K's segment (ours, no Python twin): two 4K segments' rows, x3gm still one block (the trellis once)
+pub const pf8k_rows: u32 = 8192;
+
+/// TF_DSV41_PF_8K ("0" / "1", PF_4K's rules): 8,192-row segments, refused without TF_DSV41_PF_8K_MEMORY_OK=1.
+pub fn pf8k(get: Get) !bool {
+    const raw = std.mem.trim(u8, get("TF_DSV41_PF_8K") orelse "0", " ");
+    if (std.mem.eql(u8, raw, "0")) return false;
+    if (!std.mem.eql(u8, raw, "1")) {
+        std.log.warn("TF_DSV41_PF_8K={s}: 0 or 1", .{raw});
+        return error.BadKnob;
+    }
+    const ok = std.mem.trim(u8, get("TF_DSV41_PF_8K_MEMORY_OK") orelse "", " ");
+    if (!std.mem.eql(u8, ok, "1")) {
+        std.log.warn("TF_DSV41_PF_8K=1: 8,192-row prefill segments hold about 2 GiB more worker memory than 4,096-row ones; set TF_DSV41_PF_8K_MEMORY_OK=1 to acknowledge", .{});
+        return error.BadKnob;
+    }
+    return true;
+}
+
+/// The workspace segment's rows: 8,192 under TF_DSV41_PF_8K=1 (over TF_DSV41_PF_4K), 4,096 under PF_4K alone, else 0.
+pub fn bigRows(get: Get) !u32 {
+    const k4 = try pf4k(get);
+    if (try pf8k(get)) return pf8k_rows;
+    return if (k4) pf4k_rows else 0;
+}
+
 /// A prompt segment's rows: min(TF_DSV41_PREFILL_CHUNK, TF_DSV41_PREFILL_ROWS), on the 16-row grid, 32-2,048; null
 /// when neither is set (the forward's default, 2,048). Under TF_DSV41_PF_4K=1: 4,096 (pf4k.chunk; the forward's
 /// segment is also the round planner's rows, so an explicit CHUNK or ROWS other than 4,096 is refused rather than
-/// silently keeping 2,048-row segments).
+/// silently keeping 2,048-row segments; TF_DSV41_PF_8K=1: the same at 8,192).
 pub fn prefillRows(get: Get) !?u32 {
-    const big = try pf4k(get);
+    const big = try bigRows(get);
     var rows: ?u32 = null;
     for ([_][]const u8{ "TF_DSV41_PREFILL_CHUNK", "TF_DSV41_PREFILL_ROWS" }) |name| if (get(name)) |raw| {
         const v = std.fmt.parseInt(u32, std.mem.trim(u8, raw, " "), 10) catch return badRows(name, raw, big);
-        if (big and v != pf4k_rows) return badRows(name, raw, big);
-        if (v < 32 or (v > 2048 and !big) or v % 16 != 0) return badRows(name, raw, big);
+        if (big != 0 and v != big) return badRows(name, raw, big);
+        if (v < 32 or (v > 2048 and big == 0) or v % 16 != 0) return badRows(name, raw, big);
         rows = if (rows) |r| @min(r, v) else v;
     };
-    return if (big) pf4k_rows else rows;
+    return if (big != 0) big else rows;
 }
 
-fn badRows(name: []const u8, raw: []const u8, big: bool) error{BadKnob} {
-    if (big) std.log.warn("{s}={s}: TF_DSV41_PF_4K=1 means 4,096-row segments (unset it or set 4096)", .{ name, raw }) else std.log.warn("{s}={s}: expected a multiple of 16 in 32..2048", .{ name, raw });
+fn badRows(name: []const u8, raw: []const u8, big: u32) error{BadKnob} {
+    if (big == pf8k_rows) std.log.warn("{s}={s}: TF_DSV41_PF_8K=1 means 8,192-row segments (unset it or set 8192)", .{ name, raw }) else if (big != 0) std.log.warn("{s}={s}: TF_DSV41_PF_4K=1 means 4,096-row segments (unset it or set 4096)", .{ name, raw }) else std.log.warn("{s}={s}: expected a multiple of 16 in 32..2048", .{ name, raw });
     return error.BadKnob;
 }
 
@@ -395,9 +421,10 @@ pub fn apply(f: *@import("forward.zig").Forward, a: std.mem.Allocator, io: std.I
     f.opts.router_group_rot = routerGroupRot(&env);
     f.opts.x3ld_epi = try x3ldEpi(&env);
     f.opts.pfd = try pfDense(a, io, &env);
-    // TF_DSV41_PF_4K: the forward's own options (decode windows, the drafter, the buffer plan) keep 2,048-row
-    // segments byte for byte; 4,096-row segments run in the prefill's own workspace (forward_prefill.K4)
-    const big = try pf4k(&env);
+    // TF_DSV41_PF_4K / _8K: the forward's own options (decode windows, the drafter, the buffer plan) keep 2,048-row
+    // segments byte for byte; 4,096- (8,192-) row segments run in the prefill's own workspace (forward_prefill.K4)
+    const rows_big = try bigRows(&env);
+    const big = rows_big != 0;
     if (try prefillRows(&env)) |r| if (!big) {
         f.opts.prefill_rows = r;
     };
@@ -407,14 +434,21 @@ pub fn apply(f: *@import("forward.zig").Forward, a: std.mem.Allocator, io: std.I
     f.opts.mhc_pf_rows = try mhcPfRows(&env);
     f.prefill_state.mode = try prefillMode(&env);
     f.prefill_state.k4 = big;
+    if (big) f.prefill_state.k4ws.rows = rows_big;
+    const k8 = rows_big == pf8k_rows;
     // x3gm v1 at 4K runs pf4k's tuning table (128-member passes past 48 members an expert), which the emitter does not
     // take; v2 keeps G6's tiles at any rows (x3gm.tuned2), so 4K is v2's alone; the workspace is released at a
-    // prompt's CED finish, so 4K is replay's alone
+    // prompt's CED finish, so 4K is replay's alone (8K: the same)
     if (big and (f.opts.gm_v2 == .off or f.prefill_state.mode != .replay)) {
-        std.log.scoped(.dsv41).err("TF_DSV41_PF_4K=1 needs TF_DSV41_GM_V2=1 (or split) and TF_DSV41_PREFILL=replay", .{});
+        std.log.scoped(.dsv41).err("TF_DSV41_PF_{s}=1 needs TF_DSV41_GM_V2=1 (or split) and TF_DSV41_PREFILL=replay", .{if (k8) "8K" else "4K"});
         return error.BadKnob;
     }
     f.opts.pf_tbo = try pfTbo(&env);
+    // two 8,192-row micro-batches in flight would hold two 8K workspaces' roles: not built
+    if (k8 and f.opts.pf_tbo) {
+        std.log.scoped(.dsv41).err("TF_DSV41_PF_8K=1 and TF_DSV41_PF_TBO=1 are exclusive (8,192-row micro-batches are not built)", .{});
+        return error.BadKnob;
+    }
     f.opts.stream_rb = try streamRb(&env);
     f.opts.index_bound = try indexBound(&env);
     // TF_DSV41_BRANCHES: the side stream exists before any capture
@@ -467,7 +501,7 @@ pub fn apply(f: *@import("forward.zig").Forward, a: std.mem.Allocator, io: std.I
     if (f.opts.stream_rb > 1) log.info("stream top-k: {d} rows a program (_stream_rb{d})", .{ f.opts.stream_rb, f.opts.stream_rb });
     if (f.opts.pf_tbo) log.info("prefill tbo: encoder segments two at a time on two streams, x3gm on at most {d} SMs (0: all){s}", .{ dk.exl3.gm_sms_cap, if (f.opts.pf_overlap > 0) "; TF_DSV41_PF_OVERLAP is off under it" else "" });
     if (f.opts.pf_overlap > 0) log.info("prefill overlap: a segment's exchanges in {d} row pieces on the side stream{s}", .{ f.opts.pf_overlap, if (f.opts.pf_overlap_site) ", every piece; the next mixing site in the same pieces, each after its own" else "" });
-    log.info("prod knobs: pf_dense {s}, prefill rows {d}{s}, index budget {d} MiB, R1 {s}, prefetch ahead {s}, x3gm v2 {t}, prefill {t}, mhc pfdec {d}", .{ if (f.opts.pfd != null) "fused" else "off", if (big) pf4k_rows else @as(u32, @intCast(f.opts.prefill_rows)), if (big) " (4K: one x3gm block a segment, in the prefill's own workspace)" else "", f.opts.index_budget >> 20, if (f.opts.r1) "on" else "off", if (f.prefill_state.ahead) "on" else "off", f.opts.gm_v2, f.prefill_state.mode, f.opts.mhc_pf_rows });
+    log.info("prod knobs: pf_dense {s}, prefill rows {d}{s}, index budget {d} MiB, R1 {s}, prefetch ahead {s}, x3gm v2 {t}, prefill {t}, mhc pfdec {d}", .{ if (f.opts.pfd != null) "fused" else "off", if (big) rows_big else @as(u32, @intCast(f.opts.prefill_rows)), if (k8) " (8K: one x3gm block a segment, in the prefill's own workspace)" else if (big) " (4K: one x3gm block a segment, in the prefill's own workspace)" else "", f.opts.index_budget >> 20, if (f.opts.r1) "on" else "off", if (f.prefill_state.ahead) "on" else "off", f.opts.gm_v2, f.prefill_state.mode, f.opts.mhc_pf_rows });
 }
 
 pub fn env(name: []const u8) ?[]const u8 {

@@ -61,8 +61,8 @@ pub const State = struct {
     /// flight (the glue runs each micro-batch's steps with its own ids, window, Engram tail and MoE count)
     long_b: longpf.State = .{},
     tbo: ?*Pair = null,
-    /// TF_DSV41_PF_4K (prod_knobs.apply): 4,096-row segments in the prefill's own workspace (`K4`); the forward's
-    /// options, buffer plan and arena stay the 2,048-row ones, so decode windows and the drafter are untouched
+    /// TF_DSV41_PF_4K / _8K (prod_knobs.apply): 4,096- (8,192-) row segments in the prefill's own workspace (`K4`);
+    /// the forward's options, buffer plan and arena stay the 2,048-row ones: decode windows and the drafter untouched
     k4: bool = false,
     k4ws: K4 = .{},
     /// the current prompt call may use the workspace (4K segments, TBO pairs): every rank's MemAvailable leaves the
@@ -187,20 +187,21 @@ fn planWorkspace(f: *Forward, wp: *buffers.Plan, rows: u32, layers: []const u32)
     const replay = f.prefill_state.mode == .replay;
     if (f.prefill_state.k4) {
         const enc = try encoderLayers(f, layers);
-        const o4 = k4Options(vision_rows.planOptions(f));
-        const top4 = try lastStartWith(f, o4, enc, K4.rows, .encoder);
+        const k4rows = f.prefill_state.k4ws.rows;
+        const o4 = k4Options(vision_rows.planOptions(f), k4rows);
+        const top4 = try lastStartWith(f, o4, enc, k4rows, .encoder);
         for ([_]i64{ 0, top4 }) |start| {
             var ka = std.heap.ArenaAllocator.init(f.gpa);
             defer ka.deinit();
-            const cs = try block_prefill.emitReplay(ka.allocator(), f.cfg, f.widths, o4, enc, K4.rows, start, .encoder);
+            const cs = try block_prefill.emitReplay(ka.allocator(), f.cfg, f.widths, o4, enc, k4rows, start, .encoder);
             try wp.add(try block_prefill.ownCalls(ka.allocator(), cs, K4.tag));
         }
     }
     if (replay and f.opts.pf_tbo and rows >= 2 * block_prefill.tbo_min) {
         const enc = try encoderLayers(f, layers);
         const k4 = f.prefill_state.k4;
-        const op = if (k4) k4Options(vision_rows.planOptions(f)) else vision_rows.planOptions(f);
-        const seg: u32 = if (k4) K4.rows else rows;
+        const op = if (k4) k4Options(vision_rows.planOptions(f), f.prefill_state.k4ws.rows) else vision_rows.planOptions(f);
+        const seg: u32 = if (k4) f.prefill_state.k4ws.rows else rows;
         const top = @max(0, try lastStartWith(f, op, enc, seg, .encoder) - seg); // B at the last start a segment takes
         for ([_]i64{ 0, top }) |start| {
             var ta = std.heap.ArenaAllocator.init(f.gpa);
@@ -290,7 +291,7 @@ fn lastStart(f: *Forward, layers: []const u32, n: u32, part: block_prefill.Part)
     return lastStartWith(f, f.opts, layers, n, part);
 }
 
-/// `lastStart` with options `o` (TF_DSV41_PF_4K's segments: k4Options).
+/// `lastStart` with options `o` (TF_DSV41_PF_4K / _8K's segments: k4Options).
 fn lastStartWith(f: *Forward, o: block.Options, layers: []const u32, n: u32, part: block_prefill.Part) !i64 {
     var hi: i64 = o.limit - n - @intFromBool(part == .decoder);
     if (hi < 0) return error.BadWindow;
@@ -313,8 +314,9 @@ fn lastStartWith(f: *Forward, o: block.Options, layers: []const u32, n: u32, par
 /// allocated at a prompt's first 4K segment, released at the prompt's CED finish. Nothing of it is resident while no
 /// long prompt prefills: the 4K path adds no byte to the forward's plan, decode's graphs keep their room.
 pub const K4 = struct {
-    pub const rows: u32 = prod_knobs.pf4k_rows;
     pub const tag = "k4~";
+    /// the workspace segment's rows: 4,096, or 8,192 under TF_DSV41_PF_8K (prod_knobs.apply)
+    rows: u32 = prod_knobs.pf4k_rows,
     plan: ?buffers.Plan = null,
     /// the bare roles a 4K segment shares with the forward (k4Trim under TF_DSV41_PF_WS_SHARE=1; else none)
     keep: block_prefill.Keep = .empty,
@@ -328,10 +330,10 @@ pub const K4 = struct {
     gathered: ?cuda.DeviceBuffer = null,
 };
 
-/// The rows a prompt segment holds: 4,096 under TF_DSV41_PF_4K, else the forward's (the round planner's rows too).
+/// The rows a prompt segment holds: K4.rows under TF_DSV41_PF_4K / _8K, else the forward's (the round planner's too).
 pub fn segmentRows(f: *const Forward) usize {
     const st = &f.prefill_state;
-    return if (st.k4 and st.ws_ok) K4.rows else @intCast(f.opts.prefill_rows);
+    return if (st.k4 and st.ws_ok) st.k4ws.rows else @intCast(f.opts.prefill_rows);
 }
 
 /// Whether this prompt call may use the workspace, on every rank alike: held already (a later piece of the prompt),
@@ -356,10 +358,10 @@ fn wsAgreed(f: *Forward) !bool {
     return ok;
 }
 
-/// The options a 4,096-row segment emits with: the forward's at 4,096 rows with x3gm one block a segment.
-pub fn k4Options(o: block.Options) block.Options {
+/// The options a workspace segment of `rows` (4,096 / 8,192) emits with: the forward's there, x3gm one block.
+pub fn k4Options(o: block.Options, rows: u32) block.Options {
     var x = o;
-    x.prefill_rows = K4.rows;
+    x.prefill_rows = rows;
     x.pf4k = true;
     return x;
 }
@@ -546,7 +548,7 @@ fn segmentPair(f: *Forward, ia: []const u32, ib: []const u32) !bool {
     // under TF_DSV41_PF_4K a micro-batch past the forward's rows is a 4K one (both in the workspace: wsPair)
     const big = st.k4 and @max(na, nb) > f.opts.prefill_rows;
     const o0 = vision_rows.segmentOptions(f, ia.ptr[0 .. na + nb]);
-    const o = if (big) k4Options(o0) else o0;
+    const o = if (big) k4Options(o0, st.k4ws.rows) else o0;
     const plain = block_prefill.emitTbo(a, f.cfg, f.widths, o, layers, na, nb, @intCast(start)) catch |e| switch (e) {
         error.Unsupported => return false,
         else => return e,
@@ -635,7 +637,7 @@ fn segment(f: *Forward, ids: []const u32, head: bool) !void {
     if (f.kv) |kx| try kx.reserve(start + n);
     // TF_DSV41_PF_4K: a segment past the forward's rows runs in the workspace (its own roles: block_prefill.ownCalls)
     const big = st.k4 and st.ws_ok and n > f.opts.prefill_rows;
-    const o = if (big) k4Options(vision_rows.segmentOptions(f, ids)) else vision_rows.segmentOptions(f, ids);
+    const o = if (big) k4Options(vision_rows.segmentOptions(f, ids), st.k4ws.rows) else vision_rows.segmentOptions(f, ids);
     const emitted = if (replay) block_prefill.emitReplay(a, f.cfg, f.widths, o, layers, n, @intCast(start), .encoder) else block_prefill.emitPrefill(a, f.cfg, f.widths, o, layers, n, @intCast(start), head);
     const plain = emitted catch |e| {
         if (e == error.Unsupported) log.warn("prefill: the {d}-row segment at {d} is not on the prefill path (block_prefill: Unsupported)", .{ n, start });

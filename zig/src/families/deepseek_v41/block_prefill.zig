@@ -1447,9 +1447,9 @@ fn stashArgs(e: *E) ![10]Arg {
 pub const Span = struct { slot: u32, start: i64, n: i64, row0: i64 = 0, cnt0: i64 = 0 };
 
 /// The most rows a prefill program takes: one router CHUNK (Python prod's segment), 4,096 under TF_DSV41_PF_4K (the
-/// route in CHUNK launches, x3gm one block).
+/// route in CHUNK launches, x3gm one block), `prefill_rows` past it under TF_DSV41_PF_8K (8,192).
 fn rowsCap(o: block.Options) i64 {
-    return if (o.pf4k) 2 * router_chunk else router_chunk;
+    return if (o.pf4k) @max(2 * router_chunk, o.prefill_rows) else router_chunk;
 }
 
 /// forward.staging's ring rows for a prefill segment the slot's ring cannot hold.

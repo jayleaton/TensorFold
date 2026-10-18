@@ -219,8 +219,8 @@ pub const Served = struct {
         o.limit = try envInt("TF_DSV41_CONTEXT", o.limit);
         o.rope_rows = o.limit + 2048;
         if (try knobs.prefillRows(&knobs.env)) |r| o.prefill_rows = r;
-        // TF_DSV41_PF_4K: 4,096-row segments (their Triton variants at those rows), x3gm v2 as apply has it
-        o.pf4k = try knobs.pf4k(&knobs.env);
+        // TF_DSV41_PF_4K / _8K: 4,096- / 8,192-row segments (their Triton variants at those rows; x3gm v2 as apply)
+        o.pf4k = try knobs.bigRows(&knobs.env) != 0;
         o.gm_v2 = try @import("gm2pf.zig").mode(&knobs.env);
         // TF_DSV41_PF_OVERLAP: its pieces' projections (their own row counts) where the side stream is on
         o.pf_overlap = try knobs.pfOverlap(&knobs.env);

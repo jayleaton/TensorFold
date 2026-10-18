@@ -201,7 +201,7 @@ test "a TBO pair adds no byte to the forward's plan: 2K pairs keep A's roles and
     var p2: buffers.Plan = .{ .a = aa };
     for ([_]i64{ 0, (1 << 20) - 4096 - 1 }) |start| try p2.add(try bp.emitReplay(aa, &cfg, &w, base, &enc, 2048, start + 2048, .encoder));
     for ([_]bool{ false, true }) |k4| {
-        const o = if (k4) fp.k4Options(base) else base;
+        const o = if (k4) fp.k4Options(base, 4096) else base;
         const seg: i64 = if (k4) 4096 else 2048;
         var pp: buffers.Plan = .{ .a = aa };
         const pair = try fp.wsPair(aa, try bp.emitTbo(aa, &cfg, &w, o, &enc, seg, seg, 8192), k4);
@@ -238,7 +238,7 @@ test "TF_DSV41_PF_TBO with TF_DSV41_PF_4K: 4,096-row micro-batches, each its 4K 
     const w = try widths(aa);
     var enc: [21]u32 = undefined;
     for (&enc, 0..) |*l, i| l.* = @intCast(i);
-    const o = fp.k4Options(.{ .gm_v2 = .one, .branches = true, .pf_tbo = true, .limit = 1 << 16, .rope_rows = (1 << 16) + 2048 });
+    const o = fp.k4Options(.{ .gm_v2 = .one, .branches = true, .pf_tbo = true, .limit = 1 << 16, .rope_rows = (1 << 16) + 2048 }, 4096);
     const pair = try bp.emitTbo(aa, &cfg, &w, o, &enc, 4096, 4096, 0);
     const pa = try bp.emitReplay(aa, &cfg, &w, o, &enc, 4096, 0, .encoder);
     const pb = try bp.emitReplay(aa, &cfg, &w, o, &enc, 4096, 4096, .encoder);
