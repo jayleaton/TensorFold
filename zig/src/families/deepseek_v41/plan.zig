@@ -253,7 +253,7 @@ const Builder = struct {
             const info = try b.pack.need(name);
             var n: u64 = 1;
             for (info.dims()) |d| n *= d;
-            if (info.dtype != .f32 and info.dtype != .bf16 or n != b.c.hidden + b.c.dspark_markov_rank) return error.UnexpectedTensor;
+            if (!names.dspark_confidence_store.accepts(info.dtype) or n != b.c.hidden + b.c.dspark_markov_rank) return error.UnexpectedTensor;
             try b.mark(name);
             confidence = .{ .name = try b.dupe(name), .info = info, .slice = .whole, .bytes = info.nbytes };
         }

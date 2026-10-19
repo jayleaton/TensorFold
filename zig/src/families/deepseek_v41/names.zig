@@ -83,8 +83,10 @@ pub fn expertName(block: []const u8, e: u32, p: ExpertProj, buf: []u8) ![]const 
 pub const Store = enum {
     /// norms: bf16 in the pack (fp32 in the forward), fp32 accepted
     norm,
-    /// fp32 only (sinks, hc_*, router bias)
+    /// fp32 only (sinks, hc_*)
     f32,
+    /// fp32 in the forward, stored fp32, fp16 or bf16 (widened exactly; router bias, DSpark's confidence head)
+    f32_wide,
     /// fp16 or bf16, rounded to bf16 once (router gate, indexer weights_proj, Markov heads)
     half,
 
@@ -92,6 +94,7 @@ pub const Store = enum {
         return switch (s) {
             .norm => d == .bf16 or d == .f32,
             .f32 => d == .f32,
+            .f32_wide => d == .f32 or d == .f16 or d == .bf16,
             .half => d == .bf16 or d == .f16,
         };
     }
@@ -146,7 +149,7 @@ pub fn blockNatives(c: *const Config, layer: u32) !Natives {
     if (c.isBackbone(layer) and c.isIndexSource(layer)) try n.push(.m("attn.indexer.weights_proj.weight", .half, c.index_heads, c.hidden));
     const ex = c.expertsOf(layer);
     try n.push(.m("ffn.gate.weight", .half, ex.count, c.hidden));
-    try n.push(.v("ffn.gate.bias", .f32, ex.count));
+    try n.push(.v("ffn.gate.bias", .f32_wide, ex.count));
     if (c.isEngram(layer)) {
         try n.push(.m("engram.q_weight", .norm, hc, c.hidden));
         try n.push(.m("engram.k_weight", .norm, hc, c.hidden));
@@ -178,6 +181,7 @@ pub fn dsparkNatives(c: *const Config) !Natives {
 
 /// The optional confidence head: fp32 values [D + r], any shape with that many.
 pub const dspark_confidence = "confidence_head.proj.weight";
+pub const dspark_confidence_store: Store = .f32_wide;
 pub const dspark_main_proj = "main_proj";
 
 /// Names the text engine never reads: the vision tower, image markers, image routing bias, and bf16 copies of EXL3 groups.
@@ -233,4 +237,15 @@ test "natives and the ignore list" {
     try testing.expect(ignored("vision.blocks.3.mlp.w1.weight", Has{}));
     try testing.expect(ignored("layers.9.ffn.gate.bias_vl", Has{}));
     try testing.expect(Store.half.accepts(.f16) and !Store.f32.accepts(.bf16));
+}
+
+test "half-stored router biases are accepted; mixers and sinks stay fp32 only" {
+    const c: Config = .{};
+    for ([_]u32{ 0, 41 }) |layer| for ((try blockNatives(&c, layer)).items()) |s| {
+        const wide = std.mem.eql(u8, s.suffix, "ffn.gate.bias");
+        try testing.expectEqual(wide, s.store == .f32_wide);
+        if (std.mem.startsWith(u8, s.suffix, "hc_") or std.mem.eql(u8, s.suffix, "attn.attn_sink")) try testing.expectEqual(Store.f32, s.store);
+    };
+    for ([_]DType{ .f32, .f16, .bf16 }) |d| try testing.expect(Store.f32_wide.accepts(d) and dspark_confidence_store.accepts(d));
+    try testing.expect(!Store.f32_wide.accepts(.i16));
 }
