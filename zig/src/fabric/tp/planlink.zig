@@ -6,6 +6,7 @@ const config = @import("config.zig");
 const linux = std.os.linux;
 
 pub const max_ranks = 64;
+const so_prefer_busy_poll: u32 = 69; // linux/socket.h SO_PREFER_BUSY_POLL (5.11), not in std
 const more: u32 = 0x8000; // MSG_MORE: the length and the ints leave as one segment
 
 pub const Error = error{ PeerClosed, TooLarge, NotRankZero, NotFollower };
@@ -35,6 +36,9 @@ pub const PlanLink = struct {
     pinned: bool = false,
     /// TF_DSV41_HELPER_CPUS=spare: the pin records the CPUs before it, less its own and `avoid`, for `toSpare`
     spare: bool = false,
+    /// TF_DSV41_PLAN_BUSY_POLL_US: SO_BUSY_POLL on the follower's socket, set at its first plan; `busy`: it took
+    busy_poll_us: u32 = 0,
+    busy: ?bool = null,
 
     pub fn init(rank: u32, world: u32, fds: [max_ranks]sock.Fd) PlanLink {
         return .{ .rank = rank, .world = world, .fds = fds };
@@ -83,6 +87,7 @@ pub const PlanLink = struct {
     fn header(p: *PlanLink) Error!usize {
         if (p.rank == 0) return error.NotFollower;
         p.pinOnce();
+        if (p.busy == null) p.busy = p.busyPoll();
         if (p.spin_ns > 0) p.spin();
         var len: u32 = undefined;
         sock.recvExact(p.fds[0], std.mem.asBytes(&len), null) catch return error.PeerClosed;
@@ -103,15 +108,42 @@ pub const PlanLink = struct {
         while (left > 0) : (left -= @min(left, scratch.len)) sock.recvExact(p.fds[0], scratch[0..@min(left, scratch.len)], null) catch return error.PeerClosed;
     }
 
-    /// Polls rank 0's socket until it is readable (or hung up) or `spin_ns` passed; the read that follows blocks.
+    /// SO_BUSY_POLL and SO_PREFER_BUSY_POLL on rank 0's socket; false when off or refused (EPERM).
+    fn busyPoll(p: *PlanLink) bool {
+        if (comptime builtin.os.tag != .linux) return false;
+        if (p.busy_poll_us == 0) return false;
+        const us: c_int = @intCast(p.busy_poll_us);
+        const one: c_int = 1;
+        if (std.c.setsockopt(p.fds[0], linux.SOL.SOCKET, linux.SO.BUSY_POLL, &us, @sizeOf(c_int)) != 0) {
+            std.log.warn("[tensorfold] tp: TF_DSV41_PLAN_BUSY_POLL_US={d} refused (needs CAP_NET_ADMIN or net.core.busy_read >= it); the plan spin polls", .{p.busy_poll_us});
+            return false;
+        }
+        _ = std.c.setsockopt(p.fds[0], linux.SOL.SOCKET, so_prefer_busy_poll, &one, @sizeOf(c_int));
+        std.log.info("[tensorfold] tp: plan link rank {d}: busy polling {d} us a read", .{ p.rank, p.busy_poll_us });
+        return true;
+    }
+
+    /// Waits for rank 0's frame up to `spin_ns` (poll, or with `busy` peeks that poll the NIC queue); the read blocks.
     fn spin(p: *PlanLink) void {
         if (comptime builtin.os.tag != .linux) return;
+        if (p.busy == true) return p.spinPeek();
         var fd = [1]linux.pollfd{.{ .fd = p.fds[0], .events = linux.POLL.IN, .revents = 0 }};
         const end = sock.nowNs() + p.spin_ns;
         while (true) {
             const rc = linux.poll(&fd, 1, 0);
             if (linux.errno(rc) == .SUCCESS and rc > 0) return;
             if (sock.nowNs() >= end) return;
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    /// The spin as non-blocking peeks: with SO_BUSY_POLL each one runs the device queue's poll (no interrupt needed).
+    fn spinPeek(p: *PlanLink) void {
+        const end = sock.nowNs() + p.spin_ns;
+        var b: u8 = 0;
+        while (true) {
+            const n = std.c.recv(p.fds[0], @ptrCast(&b), 1, linux.MSG.PEEK | linux.MSG.DONTWAIT);
+            if (n >= 0 or std.posix.errno(n) != .AGAIN or sock.nowNs() >= end) return; // data, EOF, an error or the end
             std.atomic.spinLoopHint();
         }
     }
@@ -387,4 +419,40 @@ test "TF_DSV41_HELPER_CPUS=spare: a thread started after the pin inherits the pi
     one[first / @bitSizeOf(usize)] |= @as(usize, 1) << @intCast(first % @bitSizeOf(usize));
     try std.testing.expectEqual(@as(u32, 0), recordSpare(one, first, null)); // nothing left: no record replaced
     try std.testing.expectEqual(all - 1, spare_count.load(.acquire));
+}
+
+test "TF_DSV41_PLAN_BUSY_POLL_US: the peek spin gets every plan, early or past the spin, and ends on a closed rank 0" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const bootstrap = @import("bootstrap.zig");
+    const l = try bootstrap.testListener();
+    defer sock.close(l.fd);
+    const deadline = sock.nowNs() + 5 * std.time.ns_per_s;
+    const a = try sock.connect("127.0.0.1", l.port, deadline);
+    const b = try sock.accept(l.fd, deadline);
+    var f0: [max_ranks]sock.Fd = @splat(-1);
+    var f1: [max_ranks]sock.Fd = @splat(-1);
+    f0[1] = b;
+    f1[0] = a;
+    var lead = PlanLink.init(0, 2, f0);
+    var follow = PlanLink.init(1, 2, f1);
+    defer follow.close();
+    follow.spin_ns = 2 * std.time.ns_per_ms;
+    follow.busy_poll_us = 50;
+    _ = follow.busyPoll(); // loopback may refuse it without privileges: the peek path is forced below either way
+    follow.busy = true;
+    const Lead = struct {
+        fn go(link: *PlanLink) void {
+            link.send(&.{ 11, 12 }) catch {};
+            var ts: linux.timespec = .{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
+            _ = linux.nanosleep(&ts, null);
+            link.send(&.{22}) catch {};
+            link.close();
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Lead.go, .{&lead});
+    var buf: [8]i64 = undefined;
+    try std.testing.expectEqualSlices(i64, &.{ 11, 12 }, try follow.recv(&buf));
+    try std.testing.expectEqualSlices(i64, &.{22}, try follow.recv(&buf)); // past the 2 ms spin: the blocking read
+    t.join();
+    try std.testing.expectError(error.PeerClosed, follow.recv(&buf));
 }

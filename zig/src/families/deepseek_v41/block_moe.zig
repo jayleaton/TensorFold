@@ -183,7 +183,7 @@ pub fn moe(e: *E, L: u32) !void {
         // prune.fold_args: [min_w, topp, scale, min_k, orig, drop, dup] (empty: no rule, a DSpark block's); drop is
         // moe's block.ex.count, the table's size with the shared expert (Et: an id past the routed and shared rows)
         const pa: []const Arg = if (backbone and e.o.expert_topp != null) &.{
-            .{ .f = 0.0 }, .{ .f = e.o.expert_topp.? }, .{ .f = scale }, .{ .i = 3 }, .{ .i = 0 }, .{ .i = Et }, .{ .i = 0 },
+            .{ .f = 0.0 }, .{ .f = e.o.expert_topp.? }, .{ .f = scale }, .{ .i = e.o.expert_min_k }, .{ .i = 0 }, .{ .i = Et }, .{ .i = 0 },
         } else &.{};
         const last = &e.out.items[e.out.items.len - 1];
         const more = try e.a.alloc(calls.Named, last.args.len + 1);
@@ -193,13 +193,13 @@ pub fn moe(e: *E, L: u32) !void {
     } else if (e.o.r1_sig) try e.appendLast(&.{.{ .list = &.{} }}); // the twin's route always takes the prune list
     if (!fold) {
         try e.triton("_prune", .{ std.math.divCeil(i64, n, 16) catch unreachable, 1, 1 }, &.{
-            .{ .name = "PICK", .arg = pick },             .{ .name = "WTS", .arg = wts },
-            .{ .name = "R", .arg = .{ .i = n } },         .{ .name = "stride", .arg = .{ .i = slots } },
-            .{ .name = "MIN_W", .arg = .{ .f = 0.0 } },   .{ .name = "TOPP", .arg = .{ .f = e.o.expert_topp.? } },
-            .{ .name = "SCALE", .arg = .{ .f = scale } }, .{ .name = "DROP", .arg = .{ .i = Et } },
-            .{ .name = "MIN_K", .arg = .{ .i = 3 } },     .{ .name = "K", .arg = .{ .i = ex.topk } },
-            .{ .name = "KP", .arg = .{ .i = 8 } },        .{ .name = "DUP", .arg = .{ .b = false } },
-            .{ .name = "BR", .arg = .{ .i = 16 } },       .{ .name = "ORIG", .arg = .{ .b = false } },
+            .{ .name = "PICK", .arg = pick },                        .{ .name = "WTS", .arg = wts },
+            .{ .name = "R", .arg = .{ .i = n } },                    .{ .name = "stride", .arg = .{ .i = slots } },
+            .{ .name = "MIN_W", .arg = .{ .f = 0.0 } },              .{ .name = "TOPP", .arg = .{ .f = e.o.expert_topp.? } },
+            .{ .name = "SCALE", .arg = .{ .f = scale } },            .{ .name = "DROP", .arg = .{ .i = Et } },
+            .{ .name = "MIN_K", .arg = .{ .i = e.o.expert_min_k } }, .{ .name = "K", .arg = .{ .i = ex.topk } },
+            .{ .name = "KP", .arg = .{ .i = 8 } },                   .{ .name = "DUP", .arg = .{ .b = false } },
+            .{ .name = "BR", .arg = .{ .i = 16 } },                  .{ .name = "ORIG", .arg = .{ .b = false } },
         });
         if (e.o.r1_sig) { // the twin's `_prune` takes KIT (R1's PRUNE_KIT) as its last constexpr
             const last = &e.out.items[e.out.items.len - 1];

@@ -41,6 +41,8 @@ pub const Settings = struct {
     /// TF_DSV41_GRAPH_FLOOR=hold (default `shed`): under the floor a miss runs eagerly, the held graphs stay
     /// (graph_cache.Settings.hold)
     floor_hold: bool = false,
+    /// TF_DSV41_GRAPH_REUSE_UP=n (0: off): a missed key runs a held graph of its rows up to n context buckets later
+    reuse_up: u32 = 0,
 
     pub fn fromEnv() !Settings {
         return fromEnvOr(false);
@@ -60,6 +62,7 @@ pub const Settings = struct {
             const m = std.mem.span(v);
             if (std.mem.eql(u8, m, "hold")) s.floor_hold = true else if (!(m.len == 0 or std.mem.eql(u8, m, "shed"))) return error.BadGraphFloor;
         }
+        if (std.c.getenv("TF_DSV41_GRAPH_REUSE_UP")) |v| s.reuse_up = try std.fmt.parseInt(u32, std.mem.span(v), 10);
         if (s.bucket == 0) return error.BadGraphBucket;
         return s;
     }
@@ -96,6 +99,20 @@ pub fn bucketEnd(b: u32, size: u64, limit: u64, grow: f64) u64 {
 pub const Key = struct { rows: u32, ctx: u32, part: u8 = 0 };
 
 pub const Cache = gc.Cache(Key);
+
+/// TF_DSV41_GRAPH_REUSE_UP: `key`'s own bucket, or the nearest later one within `up` that `held` has (the same bits).
+pub fn reuseCtx(held: anytype, key: Key, up: u32) u32 {
+    if (up == 0 or whole(held, key.rows, key.ctx)) return key.ctx;
+    var b = key.ctx + 1;
+    while (b <= key.ctx + up) : (b += 1) if (whole(held, key.rows, b)) return b;
+    return key.ctx;
+}
+
+/// Whether `held` has a window's graphs at (rows, ctx): the whole one, or both its head and tail parts.
+fn whole(held: anytype, rows: u32, ctx: u32) bool {
+    if (held.has(.{ .rows = rows, .ctx = ctx })) return true;
+    return held.has(.{ .rows = rows, .ctx = ctx, .part = 1 }) and held.has(.{ .rows = rows, .ctx = ctx, .part = 2 });
+}
 
 /// The window's start for emitting a graphed program: its end lands at the bucket's end, so the indexer's NK is
 /// the bucket's (Python Win.last = bucket_end).
@@ -343,6 +360,33 @@ test "graphs: context buckets as Python's (2,048 steps to 32K, then 1.25x rounde
     try std.testing.expectEqual(@as(u64, 3999), bucketEnd(1, 2048, 4000, 1.25)); // capped at limit - 1
     // grow 1: equal steps throughout
     try std.testing.expectEqual(@as(u64, 2048 * 20), endOf(19, 2048, 1.0));
+}
+
+test "graphs: TF_DSV41_GRAPH_REUSE_UP takes the nearest held later bucket within its reach, never a lone part" {
+    const Held = struct {
+        keys: []const Key,
+        fn has(h: @This(), k: Key) bool {
+            for (h.keys) |x| if (std.meta.eql(x, k)) return true;
+            return false;
+        }
+    };
+    const h: Held = .{
+        .keys = &.{
+            .{ .rows = 4, .ctx = 3, .part = 1 }, .{ .rows = 4, .ctx = 3, .part = 2 }, // a split window at bucket 3
+            .{ .rows = 4, .ctx = 5 }, // a whole one at 5
+            .{ .rows = 2, .ctx = 1, .part = 1 }, // a head without its tail
+            .{ .rows = 5, .ctx = 0 },
+        },
+    };
+    try std.testing.expectEqual(@as(u32, 1), reuseCtx(h, .{ .rows = 4, .ctx = 1 }, 0)); // off: its own
+    try std.testing.expectEqual(@as(u32, 1), reuseCtx(h, .{ .rows = 4, .ctx = 1 }, 1)); // 3 is out of reach
+    try std.testing.expectEqual(@as(u32, 3), reuseCtx(h, .{ .rows = 4, .ctx = 1 }, 2));
+    try std.testing.expectEqual(@as(u32, 3), reuseCtx(h, .{ .rows = 4, .ctx = 2 }, 8)); // the nearest
+    try std.testing.expectEqual(@as(u32, 5), reuseCtx(h, .{ .rows = 4, .ctx = 4 }, 1));
+    try std.testing.expectEqual(@as(u32, 3), reuseCtx(h, .{ .rows = 4, .ctx = 3 }, 4)); // held: its own
+    try std.testing.expectEqual(@as(u32, 0), reuseCtx(h, .{ .rows = 2, .ctx = 0 }, 4)); // a lone head is no window
+    try std.testing.expectEqual(@as(u32, 0), reuseCtx(h, .{ .rows = 3, .ctx = 0 }, 9)); // other rows never
+    try std.testing.expectEqual(@as(u32, 1), reuseCtx(h, .{ .rows = 5, .ctx = 1 }, 9)); // never an earlier bucket
 }
 
 test "graphs: emitted start puts the window's end at the bucket's end" {

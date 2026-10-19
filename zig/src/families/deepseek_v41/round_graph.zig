@@ -21,6 +21,8 @@ pub const Settings = struct {
     gate: bool = false,
     /// layers in the head graph
     head: u32 = 1,
+    /// TF_DSV41_ROUND_GRAPH_EARLY=1 (with `split`): a head that reads no Engram rows launches before the gate's arm
+    early: bool = false,
 };
 
 pub const Get = *const fn ([:0]const u8) ?[]const u8;
@@ -45,6 +47,9 @@ pub fn settings(get: Get) !Settings {
         }
     }
     if (get("TF_DSV41_ROUND_GRAPH_HEAD")) |v| s.head = std.fmt.parseInt(u32, v, 10) catch return error.BadRoundGraph;
+    if (get("TF_DSV41_ROUND_GRAPH_EARLY")) |v| {
+        if (std.mem.eql(u8, v, "1")) s.early = true else if (!std.mem.eql(u8, v, "0")) return error.BadRoundGraph;
+    }
     if (s.head == 0) return error.BadRoundGraph;
     return s;
 }
@@ -82,6 +87,12 @@ pub fn splitAt(cs: []const calls.Call, head: u32) ?usize {
     return null;
 }
 
+/// Whether a head's calls stage or gather Engram rows (`glue.engram_rows`): then it cannot launch before the arm.
+pub fn readsEngram(head: []const calls.Call) bool {
+    for (head) |c| if (c.glue and std.mem.eql(u8, c.name, "glue.engram_rows")) return true;
+    return false;
+}
+
 fn call(begin: calls.Begin, flags: struct { fork: bool = false, join: bool = false, side: bool = false, defer_side: bool = false, defer_join: bool = false }) calls.Call {
     return .{ .triton = false, .name = "x.y", .args = &.{}, .begin = begin, .fork = flags.fork, .join = flags.join, .side = flags.side, .defer_side = flags.defer_side, .defer_join = flags.defer_join };
 }
@@ -90,7 +101,9 @@ test "the knob's words" {
     const T = struct {
         var v: ?[]const u8 = null;
         var h: ?[]const u8 = null;
+        var e: ?[]const u8 = null;
         fn get(name: [:0]const u8) ?[]const u8 {
+            if (std.mem.eql(u8, name, "TF_DSV41_ROUND_GRAPH_EARLY")) return e;
             return if (std.mem.eql(u8, name, "TF_DSV41_ROUND_GRAPH")) v else h;
         }
     };
@@ -110,6 +123,23 @@ test "the knob's words" {
     T.v = "1";
     T.h = "0";
     try std.testing.expectError(error.BadRoundGraph, settings(T.get));
+    T.h = null;
+    try std.testing.expect(!(try settings(T.get)).early); // `1` never includes it
+    T.e = "1";
+    try std.testing.expectEqual(Settings{ .split = true, .gate = true, .early = true }, try settings(T.get));
+    T.e = "yes";
+    try std.testing.expectError(error.BadRoundGraph, settings(T.get));
+    T.e = null;
+}
+
+test "the early head: only a head with no Engram step launches before the arm" {
+    var cs = [_]calls.Call{ call(.window, .{}), call(.none, .{}), call(.layer, .{}), call(.none, .{}) };
+    try std.testing.expect(!readsEngram(cs[0..2]));
+    cs[3].glue = true;
+    cs[3].name = "glue.engram_rows";
+    try std.testing.expect(!readsEngram(cs[0..2]) and readsEngram(&cs));
+    cs[3].glue = false; // a kernel of that name is no glue step
+    try std.testing.expect(!readsEngram(&cs));
 }
 
 test "the split: the head's layers, never inside an open side or deferred fork" {

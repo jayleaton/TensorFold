@@ -95,6 +95,8 @@ pub const Batch = struct {
         captures: u64 = 0,
         capture_ns: u64 = 0,
         eager: u64 = 0,
+        /// TF_DSV41_GRAPH_REUSE_UP: windows run through a later context bucket's held graph instead of a capture
+        reused: u64 = 0,
         /// a window's host time on the round's critical path, by stretch: `prep` (checks, the plan link's send, pages,
         /// the program), `stage` (the row table, Engram's arm or rows), `launch` (the graph's launch or the eager
         /// window); `keep_ns`: the keeps (carries)
@@ -244,14 +246,24 @@ pub const Batch = struct {
         try k.dev.syncTables();
         pt.mark(.tables);
         const s = b.settings;
-        const key: graphs.Key = .{ .rows = R, .ctx = graphs.bucketOf(rowtab.lastPos(mix), s.bucket, s.grow) };
+        var key: graphs.Key = .{ .rows = R, .ctx = graphs.bucketOf(rowtab.lastPos(mix), s.bucket, s.grow) };
+        if (b.g) |*g| {
+            const own = key.ctx;
+            key.ctx = graphs.reuseCtx(&g.cache, key, s.reuse_up); // every rank holds the same keys: the same choice
+            if (key.ctx != own) {
+                b.stats.reused += 1;
+                if (b.stats.reused == 1) std.log.scoped(.dsv41).info("row graphs: TF_DSV41_GRAPH_REUSE_UP: {d} rows at context bucket {d} run bucket {d}'s graphs", .{ key.rows, own, key.ctx });
+            }
+        }
         const cs = try b.program(key, s);
         pt.mark(.program);
         const r = f.runner;
         b.lap(&tp, &b.stats.prep_ns);
         try b.tab.stage(r.stream, mix, ids, R, b.ss.n);
         pt.mark(.rowtab);
-        try b.stageEngram(mix, ids, R);
+        const at = if (b.g != null and b.rg.split) round_graph.splitAt(cs, b.rg.head) else null;
+        const early = if (at) |i| b.rg.early and b.earlyHead(cs[0..i], R) else false;
+        if (!early) try b.stageEngram(mix, ids, R);
         b.lap(&tp, &b.stats.stage_ns);
         defer b.lap(&tp, &b.stats.launch_ns);
         pt.mark(.engram);
@@ -288,7 +300,6 @@ pub const Batch = struct {
             const fp = b.fingerprint();
             pt.mark(.fingerprint);
             // TF_DSV41_ROUND_GRAPH=split: the head's graph, then the tail's, launched while the GPU runs the head
-            const at = if (b.rg.split) round_graph.splitAt(cs, b.rg.head) else null;
             const parts: [2][2]usize = if (at) |i| .{ .{ 0, i }, .{ i, cs.len } } else .{ .{ 0, cs.len }, .{ cs.len, cs.len } };
             for (parts, 0..) |sp, pi| {
                 if (sp[0] == sp[1]) continue;
@@ -308,12 +319,21 @@ pub const Batch = struct {
                     .replayed => {},
                 }
                 if (outcomeLog(out, g)) std.log.scoped(.dsv41).info("row graphs: capture {d} ({d} rows, context bucket {d}, part {d}), {d} replayed", .{ g.cache.stats.captured, pk.rows, pk.ctx, pk.part, g.cache.stats.replayed });
+                if (early and pi == 0) try b.stageEngram(mix, ids, R); // TF_DSV41_ROUND_GRAPH_EARLY: armed before the tail
             }
             if (at != null) b.stats.split += 1;
             return f.gatedEnd();
         }
         try r.timedWindow(cs);
         try f.gatedEnd();
+    }
+
+    /// TF_DSV41_ROUND_GRAPH_EARLY: the head may launch before Engram's staging (no Engram step; the gate, not a copy).
+    fn earlyHead(b: *const Batch, head: []const calls.Call, R: u32) bool {
+        if (round_graph.readsEngram(head)) return false;
+        if (b.f.engram == null or b.stages.items.len == 0) return true;
+        const g = b.f.gate orelse return false; // the copy path stages buffers the fingerprint covers
+        return g.eligible(R);
     }
 
     fn body(ctx: *anyopaque, stream: cuda.Stream) anyerror!void {

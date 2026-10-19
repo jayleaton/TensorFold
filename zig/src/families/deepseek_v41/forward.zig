@@ -1226,7 +1226,8 @@ pub const Forward = struct {
         const n: u32 = @intCast(ids.len);
         const limit: u64 = @intCast(f.opts.limit);
         if (n > g.rows_max or f.slot.pos + n > limit) return false;
-        const key: graphs.Key = .{ .rows = n, .ctx = graphs.bucketOf(f.slot.pos + n - 1, g.settings.bucket, g.settings.grow) };
+        var key: graphs.Key = .{ .rows = n, .ctx = graphs.bucketOf(f.slot.pos + n - 1, g.settings.bucket, g.settings.grow) };
+        key.ctx = graphs.reuseCtx(&g.cache, key, g.settings.reuse_up); // TF_DSV41_GRAPH_REUSE_UP (0: its own bucket)
         const cs = try g.program(f, key);
         if (graphs.audit(cs) != null) return false;
         const r = f.runner;

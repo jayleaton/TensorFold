@@ -81,6 +81,7 @@ pub const Session = struct {
         s.plan.pin = cfg.plan_pin;
         s.plan.avoid = cfg.roce_cpu;
         s.plan.spare = cfg.helper_spare;
+        s.plan.busy_poll_us = cfg.plan_busy_poll_us;
         if (cfg.failfast) {
             s.fate = Fate.init(cfg, b.release());
             s.fate.?.onFail(.{ .ctx = s, .call = abortHook });

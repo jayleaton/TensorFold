@@ -75,6 +75,8 @@ pub const Options = struct {
     /// TF_DSV41_EXPERT_TOPP (prod: 0.85; lossy). null: no pruning, and the router's tail (RG_TAIL) rounds the kit
     /// weights and groups the experts itself, as it does for a DSpark block (moe.py: rule None)
     expert_topp: ?f64 = 0.85,
+    /// TF_DSV41_EXPERT_MIN_K (expert_prune.zig): the prune keeps at least this many routed experts a row
+    expert_min_k: i64 = 3,
     /// M2a: after each block, its streams with the block's last post applied out of place (Python's Forward.trace),
     /// handed to the glue step "trace" (one more launch a block; never in a served window)
     trace: bool = false,
