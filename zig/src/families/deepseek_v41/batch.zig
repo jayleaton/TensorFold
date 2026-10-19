@@ -226,6 +226,7 @@ pub const Batch = struct {
 
     fn runRows(b: *Batch, mix: []const rowtab.Seg, ids: []const u32, more: bool) !void {
         const f = b.f;
+        f.paceWindow(); // TF_DSV41_THERMAL_PACE: rank 0's gap while hot, before the window's timers
         var tp = ph.nowNs();
         var pt = WinProf.start(b.prof);
         defer pt.end();

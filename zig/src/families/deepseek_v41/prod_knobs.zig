@@ -552,6 +552,7 @@ pub fn apply(f: *@import("forward.zig").Forward, a: std.mem.Allocator, io: std.I
         }
         dk.exl3.gm_sms_cap = try pfShxGmSms(&env);
     }
+    if (f.thermal == null) f.thermal = try @import("thermal_pace.zig").Pace.init(f.gpa, &env, rank);
     f.opts.pf_rs = try pfRs(&env);
     if (f.opts.pf_rs and !pfRsFits(f.opts.world, f.opts.pf_overlap, f.opts.pf_tbo)) {
         std.log.scoped(.dsv41).err("TF_DSV41_PF_RS=1 needs TP=2 (world {d}), TF_DSV41_PF_OVERLAP and TF_DSV41_PF_TBO off", .{f.opts.world});

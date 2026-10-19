@@ -35,6 +35,7 @@ const eh = @import("engram_host.zig");
 const ced = @import("ced.zig");
 const graphs = @import("graphs.zig");
 const prod_knobs = @import("prod_knobs.zig");
+const thermal_pace = @import("thermal_pace.zig");
 const Forward = fwd.Forward;
 
 const log = std.log.scoped(.dsv41);
@@ -514,12 +515,14 @@ pub fn prompt(f: *Forward, ids_in: []const u32) !void {
     defer st.next.clearRetainingCapacity();
     var at: usize = 0;
     while (at < ids.len) {
+        const t0 = thermal_pace.nowNs();
         // TF_DSV41_PF_TBO: two segments at a time (the second at least tbo_min rows), else one
         if (pairOf(f, ids.len - at)) |pr| {
             const n = pr[0] + pr[1];
             if (st.ahead) ahead(f, ids, at, n, seg);
             if (try segmentPair(f, ids[at .. at + pr[0]], ids[at + pr[0] .. at + n])) {
                 at += n;
+                try paceSegment(f, t0);
                 continue;
             }
         }
@@ -527,7 +530,20 @@ pub fn prompt(f: *Forward, ids_in: []const u32) !void {
         if (st.ahead) ahead(f, ids, at, n, seg);
         try segment(f, ids[at .. at + n], at + n == ids.len and st.mode == .full);
         at += n;
+        try paceSegment(f, t0);
     }
+}
+
+/// TF_DSV41_THERMAL_PACE (thermal_pace.zig): after a segment begun at `t0`, every rank idles the ranks' largest gap.
+fn paceSegment(f: *Forward, t0: u64) !void {
+    const p = f.thermal orelse return;
+    const st = &f.prefill_state;
+    // the segment's work done (the gap idles the GPU), then its busy time and this rank's gap in microseconds
+    try f.runner.stream.synchronize();
+    const mine = p.segmentGap(thermal_pace.nowNs() - t0) / std.time.ns_per_us;
+    if (st.agreement == null) st.agreement = try graphs.Agreement.init(f.runner.d, f.comm, f.runner.stream);
+    const us = try st.agreement.?.max(@intCast(@min(mine, std.math.maxInt(i32))));
+    p.rest(@as(u64, @intCast(@max(us, 0))) * std.time.ns_per_us, p.reading(), "prefill");
 }
 
 /// TF_DSV41_PF_TBO's split of the `left` prompt rows ahead: two whole segments, or what is left halved on the 16-row
@@ -768,6 +784,7 @@ pub fn promptMulti(f: *Forward, segs: []const MultiSeg) !void {
     st.moe = 0;
     st.taps_rows = 0;
     f.runner.glue = .{ .ctx = f, .run = glueFn };
+    const t0 = thermal_pace.nowNs();
     try longpf.window(&st.long, f.gpa, f.runner, f.kv, segs[0].start, cs);
     if (f.runner.prof) |pr| pr.prefillRows(@intCast(all.items.len), false);
     // each slot keeps its segment (Python's keep(slot, n - 1) a segment, replay.encode's stash ids)
@@ -779,6 +796,7 @@ pub fn promptMulti(f: *Forward, segs: []const MultiSeg) !void {
         if (replay) f.slot.ced.extend(sg.start, sg.ids);
     }
     f.last_rows = 0;
+    try paceSegment(f, t0);
 }
 
 /// Whether a multi-segment run takes `segs` (promptMulti's refusals), checked before the leader sends it.

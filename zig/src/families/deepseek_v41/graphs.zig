@@ -209,15 +209,24 @@ pub const Agreement = struct {
 
     fn all(ctx: *anyopaque, ok: bool) anyerror!bool {
         const a: *Agreement = @ptrCast(@alignCast(ctx));
+        for (try a.gather(@intFromBool(ok))) |v| if (v != 1) return false;
+        return true;
+    }
+
+    /// The largest of every rank's `v` (TF_DSV41_THERMAL_PACE: the ranks' gap after a prefill segment).
+    pub fn max(a: *Agreement, v: i32) !i32 {
+        return std.mem.max(i32, try a.gather(v));
+    }
+
+    fn gather(a: *Agreement, v: i32) ![]const i32 {
         const w = a.comm.world();
         const h = a.host.slice(i32);
-        h[0] = @intFromBool(ok);
+        h[0] = v;
         try a.dev.uploadAsyncDirect(0, std.mem.sliceAsBytes(h[0..1]), a.stream.handle);
         try a.comm.allGather(a.dev.ptr, a.dev.ptr + 4, 1, .i32, a.stream.handle);
         try a.dev.downloadAsync(4, std.mem.sliceAsBytes(h[1 .. 1 + w]), a.stream.handle);
         try a.stream.synchronize();
-        for (h[1 .. 1 + w]) |v| if (v != 1) return false;
-        return true;
+        return h[1 .. 1 + w];
     }
 };
 
