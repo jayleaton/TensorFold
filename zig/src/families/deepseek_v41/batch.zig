@@ -262,7 +262,9 @@ pub const Batch = struct {
         b.lap(&tp, &b.stats.prep_ns);
         try b.tab.stage(r.stream, mix, ids, R, b.ss.n);
         pt.mark(.rowtab);
-        try b.stageEngram(mix, ids, R);
+        const at = if (b.g != null and b.rg.split) round_graph.splitAt(cs, b.rg.head) else null;
+        const early = if (at) |i| b.rg.early and b.earlyHead(cs[0..i], R) else false;
+        if (!early) try b.stageEngram(mix, ids, R);
         b.lap(&tp, &b.stats.stage_ns);
         defer b.lap(&tp, &b.stats.launch_ns);
         pt.mark(.engram);
@@ -299,7 +301,6 @@ pub const Batch = struct {
             const fp = b.fingerprint();
             pt.mark(.fingerprint);
             // TF_DSV41_ROUND_GRAPH=split: the head's graph, then the tail's, launched while the GPU runs the head
-            const at = if (b.rg.split) round_graph.splitAt(cs, b.rg.head) else null;
             const parts: [2][2]usize = if (at) |i| .{ .{ 0, i }, .{ i, cs.len } } else .{ .{ 0, cs.len }, .{ cs.len, cs.len } };
             for (parts, 0..) |sp, pi| {
                 if (sp[0] == sp[1]) continue;
@@ -319,12 +320,21 @@ pub const Batch = struct {
                     .replayed => {},
                 }
                 if (outcomeLog(out, g)) std.log.scoped(.dsv41).info("row graphs: capture {d} ({d} rows, context bucket {d}, part {d}), {d} replayed", .{ g.cache.stats.captured, pk.rows, pk.ctx, pk.part, g.cache.stats.replayed });
+                if (early and pi == 0) try b.stageEngram(mix, ids, R); // TF_DSV41_ROUND_GRAPH_EARLY: armed before the tail
             }
             if (at != null) b.stats.split += 1;
             return f.gatedEnd();
         }
         try r.timedWindow(cs);
         try f.gatedEnd();
+    }
+
+    /// TF_DSV41_ROUND_GRAPH_EARLY: the head may launch before Engram's staging (no Engram step; the gate, not a copy).
+    fn earlyHead(b: *const Batch, head: []const calls.Call, R: u32) bool {
+        if (round_graph.readsEngram(head)) return false;
+        if (b.f.engram == null or b.stages.items.len == 0) return true;
+        const g = b.f.gate orelse return false; // the copy path stages buffers the fingerprint covers
+        return g.eligible(R);
     }
 
     fn body(ctx: *anyopaque, stream: cuda.Stream) anyerror!void {
