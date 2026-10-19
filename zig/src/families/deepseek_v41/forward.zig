@@ -1085,7 +1085,8 @@ pub const Forward = struct {
                 f.engram_rows = try er.Rows.open(f.gpa, std.mem.span(dir), f.comm.rank(), f.comm.world(), h.layer_ids, cap);
                 std.log.scoped(.dsv41).info("engram: rows from {s} (io_uring {s}, {d} records a layer cached)", .{ std.mem.span(dir), if (f.engram_rows.?.ring != null) "on" else "off", cap });
             } else std.log.scoped(.dsv41).warn("engram: TF_DSV41_ENGRAM_DIR unset: synthetic index rows (M2a's), not the model's table", .{});
-            const s = try egate.settings();
+            var s = try egate.settings();
+            s.thread_start = tp.planlink.toSpare; // a no-op unless TF_DSV41_HELPER_CPUS=spare recorded CPUs at the pin
             if (s.on) {
                 if (f.engram_rows) |x| {
                     var la = std.heap.ArenaAllocator.init(f.gpa);
