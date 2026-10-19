@@ -5,6 +5,7 @@ pub const sessions = @import("sessions");
 pub const layout = @import("layout.zig");
 pub const Layout = layout.Layout;
 pub const split = @import("split.zig");
+pub const union_fast = @import("union_fast.zig");
 pub const budget = @import("budget.zig");
 pub const device = @import("device.zig");
 pub const DevicePool = device.DevicePool;
@@ -19,6 +20,7 @@ test {
     _ = device;
     _ = @import("split_test.zig");
     _ = @import("union_plan_test.zig");
+    _ = @import("union_fast_test.zig");
     _ = @import("split_roce_test.zig");
     _ = sess;
     _ = @import("sess4_test.zig");

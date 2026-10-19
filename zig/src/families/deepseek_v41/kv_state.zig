@@ -155,6 +155,9 @@ pub const Kv = struct {
     /// a union's pinned staging: the selection read back, the tokens and rows sent up (reused after the next drain)
     pin_sel: ?cuda.HostBuffer = null,
     pin_up: ?cuda.HostBuffer = null,
+    /// TF_DSV41_PF_HOSTGAP (kv/union_fast.zig): a one-block union planned in reused scratch, staging sized once
+    fast: ?kv.union_fast.Planner = null,
+    fast_table: std.ArrayList(u32) = .empty,
 
     pub const Stats = struct { dense: u64 = 0, unions: u64 = 0, union_rows_max: u64 = 0, bytes: u64 = 0 };
 
@@ -177,6 +180,7 @@ pub const Kv = struct {
             // the compact mode's transport agreement happens here, once, outside any graph
             k.x = try kv.split.Exchange.init(comm, k.ops.kernels(), try kv.split.compactMode());
             if (kv.split.dedupOn()) try k.initDedup(d, cfg.index_topk);
+            if (kv.union_fast.hostgapOn()) k.fast = .{};
             if (kv.split.historyOn()) {
                 if (runner.kernels.ops.kv_hist == null) {
                     std.log.err("[tensorfold] TF_DSV41_KV_SPLIT_HISTORY=1: the kvsplit fatbin has no history kernels (rebuild it)", .{});
@@ -214,6 +218,8 @@ pub const Kv = struct {
         if (k.dedup) |*b| b.free();
         if (k.pin_sel) |*b| b.free();
         if (k.pin_up) |*b| b.free();
+        if (k.fast) |*p| p.deinit(k.gpa);
+        k.fast_table.deinit(k.gpa);
         k.dev.deinit();
         k.pool.deinit();
         k.gpa.free(k.slots);
@@ -339,6 +345,7 @@ pub const Kv = struct {
         try r.stream.synchronize();
         const sel = (try pinned(r.d, &k.pin_sel, n * kk * 4)).slice(i32)[0 .. n * kk];
         try cuda.DeviceBuffer.download(.{ .d = r.d, .ptr = try r.tensorAddr(a.sel), .len = sel.len * 4 }, 0, std.mem.sliceAsBytes(sel));
+        if (k.fast) |*p| if (try k.unionFast(r, p, a, sel, kk)) return;
         const table = try k.gpa.alloc(u32, k.slot.max_pages);
         defer k.gpa.free(table);
         for (table, 0..) |*t, i| t.* = k.slot.localTableAt(@intCast(i));
@@ -363,6 +370,31 @@ pub const Kv = struct {
         k.stats.unions += 1;
         k.stats.union_rows_max = @max(k.stats.union_rows_max, @as(u64, b.m) * k.world);
         k.stats.bytes += @as(u64, b.m) * block.Pool.row_bytes * k.world;
+    }
+
+    /// TF_DSV41_PF_HOSTGAP: unionOf's one block, its bytes and copies, from reused scratch (false: several blocks).
+    fn unionFast(k: *Kv, r: *run.Runner, p: *kv.union_fast.Planner, a: anytype, sel: []const i32, kk: u32) !bool {
+        try k.fast_table.resize(k.gpa, k.slot.max_pages);
+        for (k.fast_table.items, 0..) |*t, i| t.* = k.slot.localTableAt(@intCast(i));
+        const in: kv.split.UnionIn = .{ .sel = sel, .k = kk, .table = k.fast_table.items, .psh = a.psh, .world = k.world, .rank = k.rank, .row_bytes = block.Pool.row_bytes, .cap = k.opts.union_cap };
+        const m = try p.measure(k.gpa, in) orelse return false;
+        // sized for the most rows an owner can list: no regrowth (cuMemFreeHost / cuMemHostAlloc) as the prompt grows
+        const most = @max(m, kv.union_fast.ownerBound(k.slot.max_pages, a.psh, k.world, sel.len));
+        if (k.phys == null or k.phys.?.len < 4 * m) {
+            if (k.phys) |*x| x.free();
+            k.phys = null;
+            k.phys = try cuda.DeviceBuffer.alloc(r.d, @max(4 * most, 256));
+        }
+        const up = (try pinned(r.d, &k.pin_up, 4 * (most + sel.len))).slice(u32);
+        const tokens = std.mem.bytesAsSlice(i32, std.mem.sliceAsBytes(up[m..][0..sel.len]));
+        p.write(in, up[0..m], tokens);
+        try cuda.DeviceBuffer.uploadAsyncDirect(k.phys.?, 0, std.mem.sliceAsBytes(up[0..m]), r.stream.handle);
+        try cuda.DeviceBuffer.uploadAsyncDirect(.{ .d = r.d, .ptr = a.tok, .len = 4 * sel.len }, 0, std.mem.sliceAsBytes(tokens), r.stream.handle);
+        try k.x.unionBlock(a.comp, block.Pool.row_bytes, k.phys.?.ptr, m, a.send, a.recv, r.stream.handle);
+        k.stats.unions += 1;
+        k.stats.union_rows_max = @max(k.stats.union_rows_max, @as(u64, m) * k.world);
+        k.stats.bytes += @as(u64, m) * block.Pool.row_bytes * k.world;
+        return true;
     }
 
     /// The union by history (TF_DSV41_KV_SPLIT_HISTORY): no selection read back, no plan, no drain; M rows an owner.
