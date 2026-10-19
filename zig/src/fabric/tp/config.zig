@@ -71,6 +71,8 @@ pub const Config = struct {
     /// plan socket this long before it blocks (TF_DSV41_PLAN_SPIN_US, 5,000); 0 (tcp, nccl, unset): it blocks at once.
     plan_spin_ns: u64 = 0,
     plan_pin: ?PlanPin = null,
+    /// TF_DSV41_HELPER_CPUS=spare: helpers started after the plan pin leave its CPU (0 / unset: they inherit it).
+    helper_spare: bool = false,
 
     /// Reads every setting from `get` (the environment in `fromEnv`); unset names keep the defaults.
     pub fn parse(get: *const fn ([]const u8) ?[]const u8) Error!Config {
@@ -145,6 +147,13 @@ pub const Config = struct {
                 c.plan_pin = .auto;
             } else if (!std.mem.eql(u8, v, "-1") and !std.mem.eql(u8, v, "off")) {
                 c.plan_pin = .{ .cpu = try int(u32, get, "TF_DSV41_PLAN_PIN", 0, 0, 4095) };
+            }
+        }
+        if (get("TF_DSV41_HELPER_CPUS")) |raw| {
+            const v = std.mem.trim(u8, raw, " ");
+            if (std.mem.eql(u8, v, "spare")) c.helper_spare = true else if (!std.mem.eql(u8, v, "0")) {
+                std.log.warn("TF_DSV41_HELPER_CPUS={s}: expected 0 or spare", .{raw});
+                return error.BadSetting;
             }
         }
         return c;
@@ -292,6 +301,13 @@ test "prod.env's names: GLM53_TF_* where ours are unset, the plan link's spin an
     const s = try Config.parse(&Fake.get);
     try std.testing.expectEqual(@as(u64, 200 * 1000), s.plan_spin_ns);
     try std.testing.expect(s.plan_pin == null);
+    try std.testing.expect(!s.helper_spare and !p.helper_spare);
+    Fake.pairs = &.{ .{ "TF_DSV41_PLAN_PIN", "1" }, .{ "TF_DSV41_HELPER_CPUS", "spare" } };
+    try std.testing.expect((try Config.parse(&Fake.get)).helper_spare);
+    Fake.pairs = &.{.{ "TF_DSV41_HELPER_CPUS", "0" }};
+    try std.testing.expect(!(try Config.parse(&Fake.get)).helper_spare);
+    Fake.pairs = &.{.{ "TF_DSV41_HELPER_CPUS", "1" }};
+    try std.testing.expectError(error.BadSetting, Config.parse(&Fake.get));
     Fake.pairs = &.{.{ "TF_DSV41_PLAN_LINK", "udp" }};
     try std.testing.expectError(error.BadSetting, Config.parse(&Fake.get));
     // the RoCE grid cap: 16 unset, Python's name, ours over it, powers of two only

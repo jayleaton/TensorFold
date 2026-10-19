@@ -38,6 +38,8 @@ pub const Settings = struct {
     rows: u32 = 128,
     timeout_ns: i64 = 30 * std.time.ns_per_s,
     wait_ns: u64 = 300 * std.time.ns_per_s,
+    /// run first on the worker (TF_DSV41_HELPER_CPUS=spare: tp's `toSpare`, off the plan thread's pinned CPU)
+    thread_start: ?*const fn () void = null,
 };
 
 fn get(name: [:0]const u8) ?[]const u8 {
@@ -156,7 +158,7 @@ pub const Gate = struct {
         g.stats.prof = if (std.c.getenv("TF_DSV41_WIN_PROF")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
         if (mem.ctl.len < ctl_n or mem.staging.len < 2 * layers.len * s.rows * cols) return error.BadEngramGate;
         @memset(mem.ctl, 0);
-        g.thread = try std.Thread.spawn(.{ .stack_size = 1 << 20 }, loop, .{g});
+        g.thread = try std.Thread.spawn(.{ .stack_size = 1 << 20 }, loop, .{ g, s.thread_start });
         return g;
     }
 
@@ -356,7 +358,8 @@ pub const Gate = struct {
 
     // -- the worker ------------------------------------------------------------------------------------------------
 
-    fn loop(g: *Gate) void {
+    fn loop(g: *Gate, start: ?*const fn () void) void {
+        if (start) |f| f();
         while (true) {
             _ = std.c.pthread_mutex_lock(&g.mu);
             while (g.jobs.items.len == 0 and !g.stop) _ = std.c.pthread_cond_wait(&g.work, &g.mu);

@@ -33,6 +33,8 @@ pub const PlanLink = struct {
     pin: ?config.PlanPin = null,
     avoid: ?u32 = null,
     pinned: bool = false,
+    /// TF_DSV41_HELPER_CPUS=spare: the pin records the CPUs before it, less its own and `avoid`, for `toSpare`
+    spare: bool = false,
 
     pub fn init(rank: u32, world: u32, fds: [max_ranks]sock.Fd) PlanLink {
         return .{ .rank = rank, .world = world, .fds = fds };
@@ -127,11 +129,17 @@ pub const PlanLink = struct {
                 return;
             },
         };
+        var before: linux.cpu_set_t = undefined;
+        const had = linux.errno(linux.sched_getaffinity(0, @sizeOf(linux.cpu_set_t), &before)) == .SUCCESS;
         pinTo(cpu) catch |e| {
             std.log.warn("[tensorfold] tp: TF_DSV41_PLAN_PIN: CPU {d} refused ({t}); the plan thread stays unpinned", .{ cpu, e });
             return;
         };
         std.log.info("[tensorfold] tp: plan link rank {d} pinned to CPU {d}", .{ p.rank, cpu });
+        if (p.spare and had) {
+            const n = recordSpare(before, cpu, p.avoid);
+            std.log.info("[tensorfold] tp: TF_DSV41_HELPER_CPUS=spare: later helper threads take {d} CPUs, not CPU {d}", .{ n, cpu });
+        }
     }
 
     pub fn close(p: *PlanLink) void {
@@ -141,6 +149,30 @@ pub const PlanLink = struct {
         };
     }
 };
+
+var spare_set: linux.cpu_set_t = @splat(0);
+var spare_count: std.atomic.Value(u32) = .init(0);
+
+/// `before` less `cpu` and `avoid` as the helpers' CPUs (none when that leaves nothing); returns their count.
+fn recordSpare(before: linux.cpu_set_t, cpu: u32, avoid: ?u32) u32 {
+    var set = before;
+    for ([_]?u32{ cpu, avoid }) |c| if (c) |x| if (x < linux.CPU_SETSIZE) {
+        set[x / @bitSizeOf(usize)] &= ~(@as(usize, 1) << @intCast(x % @bitSizeOf(usize)));
+    };
+    var n: u32 = 0;
+    for (set) |w| n += @popCount(w);
+    if (n == 0) return 0;
+    spare_set = set;
+    spare_count.store(n, .release);
+    return n;
+}
+
+/// A helper thread's start (TF_DSV41_HELPER_CPUS=spare): onto the CPUs the plan pin recorded; a no-op without a record.
+pub fn toSpare() void {
+    if (comptime builtin.os.tag != .linux) return;
+    if (spare_count.load(.acquire) == 0) return;
+    linux.sched_setaffinity(0, &spare_set) catch |e| std.log.warn("[tensorfold] tp: a helper thread kept the plan CPU ({t})", .{e});
+}
 
 /// The calling thread onto `cpu` alone.
 pub fn pinTo(cpu: u32) !void {
@@ -305,4 +337,54 @@ test "TF_DSV41_PLAN_LINK=rdma: a spinning follower gets every plan, late or earl
     try std.testing.expectEqual([3]i64{ 11, 22, 1 }, out);
     try std.testing.expect(ok);
     if (bestCpu(null)) |c| try std.testing.expect((set[c / @bitSizeOf(usize)] >> @intCast(c % @bitSizeOf(usize))) & 1 == 1);
+}
+
+test "TF_DSV41_HELPER_CPUS=spare: a thread started after the pin inherits the pin's CPU; toSpare moves it off" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var set: linux.cpu_set_t = undefined;
+    _ = linux.sched_getaffinity(0, @sizeOf(linux.cpu_set_t), &set);
+    var all: u32 = 0;
+    for (set) |w| all += @popCount(w);
+    if (all < 2) return error.SkipZigTest;
+    var first: u32 = 0;
+    for (set, 0..) |w, i| if (w != 0) {
+        first = @intCast(i * @bitSizeOf(usize) + @ctz(w));
+        break;
+    };
+    const T = struct {
+        fn count(out: *[2]u32) void {
+            var now: linux.cpu_set_t = undefined;
+            _ = linux.sched_getaffinity(0, @sizeOf(linux.cpu_set_t), &now);
+            for (now) |w| out[0] += @popCount(w);
+            toSpare();
+            _ = linux.sched_getaffinity(0, @sizeOf(linux.cpu_set_t), &now);
+            for (now) |w| out[1] += @popCount(w);
+        }
+        fn pinned(link: *PlanLink, out: *[2]u32, cpu_out: *u32) void {
+            link.pinOnce();
+            var now: linux.cpu_set_t = undefined;
+            _ = linux.sched_getaffinity(0, @sizeOf(linux.cpu_set_t), &now);
+            const c = link.pin.?.cpu;
+            var n: u32 = 0;
+            for (now) |w| n += @popCount(w);
+            cpu_out.* = if (n == 1 and (now[c / @bitSizeOf(usize)] >> @intCast(c % @bitSizeOf(usize))) & 1 == 1) c else 9999;
+            const t = std.Thread.spawn(.{}, count, .{out}) catch return;
+            t.join();
+        }
+    };
+    var link = PlanLink.init(0, 2, @splat(-1));
+    link.pin = .{ .cpu = first };
+    link.spare = true;
+    var got: [2]u32 = .{ 0, 0 };
+    var cpu: u32 = 0;
+    const t = try std.Thread.spawn(.{}, T.pinned, .{ &link, &got, &cpu });
+    t.join();
+    try std.testing.expectEqual(first, cpu);
+    // the failure: the helper sees one CPU, the plan thread's; the correction: every allowed CPU but that one
+    try std.testing.expectEqual([2]u32{ 1, all - 1 }, got);
+    try std.testing.expectEqual(@as(u32, 0), recordSpare(@as(linux.cpu_set_t, @splat(0)), first, null));
+    var one: linux.cpu_set_t = @splat(0);
+    one[first / @bitSizeOf(usize)] |= @as(usize, 1) << @intCast(first % @bitSizeOf(usize));
+    try std.testing.expectEqual(@as(u32, 0), recordSpare(one, first, null)); // nothing left: no record replaced
+    try std.testing.expectEqual(all - 1, spare_count.load(.acquire));
 }

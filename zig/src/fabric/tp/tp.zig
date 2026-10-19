@@ -80,6 +80,7 @@ pub const Session = struct {
         s.plan.spin_ns = cfg.plan_spin_ns;
         s.plan.pin = cfg.plan_pin;
         s.plan.avoid = cfg.roce_cpu;
+        s.plan.spare = cfg.helper_spare;
         if (cfg.failfast) {
             s.fate = Fate.init(cfg, b.release());
             s.fate.?.onFail(.{ .ctx = s, .call = abortHook });
