@@ -9,6 +9,8 @@ const fitShared = @import("kernels_exl3.zig").fitShared;
 const rg2 = @import("kernels_rg2.zig");
 /// mhc_pf_fold.cu (TF_DSV41_MHC_PF_FOLD): a prefill site and its finish in one launch, its own optional module
 pub const mhc_fold = @import("kernels_fold.zig");
+/// pfrot.cu (TF_DSV41_PF_ROT2 / TF_DSV41_PF_WOROT): rot2 and pfdense + the next rotation, its own optional module
+pub const pfrot = @import("kernels_pfrot.zig");
 
 fn dim(x: usize) u32 {
     return @intCast(x);
@@ -441,6 +443,8 @@ pub const Functions = struct {
     rg2: ?rg2.Rg2 = null,
     /// TF_DSV41_MHC_PF_FOLD: mhc_pf_fold.cu's three site modes, set by Kernels.load when the knob asks for it
     mhc_fold: ?mhc_fold.Fold = null,
+    /// TF_DSV41_PF_ROT2 / _WOROT: pfrot.cu's rot2 and pfdr instances, set by Kernels.load when either knob asks for it
+    pfrot: ?pfrot.PfRot = null,
     pfd: [pfd.k2s.len][2][pfd.cfgs.len]?cuda.Function, // [k2][lanes][cfg]; K2 16 has no lanes kernels
     pfd_dequant: [pfd.k2s.len][2]?cuda.Function,
     gate_copy: cuda.Function,
@@ -477,6 +481,7 @@ pub const Functions = struct {
         var f: Functions = undefined;
         f.rg2 = null;
         f.mhc_fold = null;
+        f.pfrot = null;
         inline for (0..8) |i| f.attn[i] = try m_attn.function(attn.symbol(if (i >= 4) 4 else 2, (i & 2) != 0, (i & 1) != 0));
         inline for (f.attn, 0..) |fun, i| {
             if (!try fitShared(fun, attn.symbol(if (i >= 4) 4 else 2, (i & 2) != 0, (i & 1) != 0), attn.SMEM, optin)) return error.SharedMemoryTooSmall;
@@ -805,6 +810,31 @@ pub const Ops = struct {
         const N: usize = @intCast(a.N);
         var args: cuda.Args = .{};
         args.add(a);
+        try o.go(f, .{ ((M + bm - 1) / bm) * (N >> 7), 1, 1 }, pfd.threads(cfg), pfd.smem(cfg, k2), null, &args);
+    }
+
+    /// pfrot.cu's rot2 (TF_DSV41_PF_ROT2): rot_in of one input for two projections, x read once.
+    pub fn pfRot2(o: Ops, a: pfrot.Rot2Args) !void {
+        const v = o.f.pfrot orelse return error.PfRotNotLoaded;
+        try pfrot.rot2Check(a);
+        var args: cuda.Args = .{};
+        args.add(a);
+        try o.go(v.rot2, pfrot.rot2Grid(@intCast(a.M), @intCast(a.K)), 128, 0, null, &args);
+    }
+
+    /// pfrot.cu's pfdr_kernel (TF_DSV41_PF_WOROT): pfdGemm's launch, then its bf16 output block rotated into `r`.
+    pub fn pfdGemmRot(o: Ops, a: pfd.Args, r: pfrot.RotOut, k2: u32, lanes: bool, cfg: usize, words: usize) !void {
+        const v = o.f.pfrot orelse return error.PfRotNotLoaded;
+        try pfd.check(a, k2, lanes, cfg, words);
+        try pfrot.gemmRotCheck(a, r, k2, lanes);
+        const ki = std.mem.indexOfScalar(u32, &pfrot.k2s, k2).?;
+        const f = v.pfdr[ki][cfg] orelse return error.Unsupported;
+        const bm = pfd.cfgs[cfg][0];
+        const M: usize = @intCast(a.M);
+        const N: usize = @intCast(a.N);
+        var args: cuda.Args = .{};
+        args.add(a);
+        args.add(r);
         try o.go(f, .{ ((M + bm - 1) / bm) * (N >> 7), 1, 1 }, pfd.threads(cfg), pfd.smem(cfg, k2), null, &args);
     }
 

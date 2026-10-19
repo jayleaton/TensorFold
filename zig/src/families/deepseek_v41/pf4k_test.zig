@@ -61,7 +61,7 @@ pub fn widths(a: std.mem.Allocator) !block.Widths {
     return w;
 }
 
-fn roleOf(x: calls.Arg) []const u8 {
+pub fn roleOf(x: calls.Arg) []const u8 {
     return switch (x.t.role) {
         .buf => |b| b,
         .weight => |w| w,
@@ -73,7 +73,7 @@ fn isRoute(c: calls.Call) bool {
     return std.mem.eql(u8, c.name, "tf_dsv41_router_gemv_v2.route");
 }
 
-fn count(cs: []const calls.Call, name: []const u8) usize {
+pub fn count(cs: []const calls.Call, name: []const u8) usize {
     var n: usize = 0;
     for (cs) |c| n += @intFromBool(std.mem.eql(u8, c.name, name));
     return n;

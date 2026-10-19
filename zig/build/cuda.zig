@@ -81,6 +81,7 @@ var dsv41_lin2_image: ?std.Build.LazyPath = null;
 
 /// Ours, optional as lin2 (<name>.fatbin): an empty image when the build has none, and its knob refuses at boot.
 const dsv41_extra = [_]Kernel{
+    .{ .name = "dsv41_pfrot", .src = "deepseek_v41/pfrot", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // TF_DSV41_PF_ROT2 / _PF_WOROT: pfdense's flags
     .{ .name = "dsv41_mhc_pf_fold", .src = "deepseek_v41/mhc_pf_fold", .flags = &.{ "-O3", "-lineinfo", "--fmad=false" } }, // TF_DSV41_MHC_PF_FOLD: mhc_pf.cu's flags
     .{ .name = "dsv41_router_gemv2", .src = "deepseek_v41/router_gemv2", .flags = &.{ "-O3", "-lineinfo" } }, // TF_DSV41_RG_V2: router_gemv.cu's flags
 };

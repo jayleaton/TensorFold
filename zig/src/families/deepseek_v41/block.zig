@@ -103,6 +103,10 @@ pub const Options = struct {
     mhc_site_rows: i64 = 0,
     /// TF_DSV41_MHC_PF_FOLD (block_prefill.zig `site`): a whole tapless mhc_pf site and its `_finish_k`, one launch
     mhc_pf_fold: bool = false,
+    /// TF_DSV41_PF_ROT2 (block_prefill.zig `proj2`): two fused projections of one input, one rot2 for both rot_in
+    pf_rot2: bool = false,
+    /// TF_DSV41_PF_WOROT (block_prefill.zig `woRot`): wo_a's fused GEMMs rotate their z columns for wo_b (no rot_in)
+    pf_worot: bool = false,
     /// TF_DSV41_PF_TBO (block_prefill.emitTbo): a prompt's CED encoder segments two at a time, the second half a layer
     /// behind the first on the branches' side stream, so one's routed experts (DRAM-bound) run beside the other's
     /// attention and dense GEMMs (compute-bound). Needs `branches`; the exchange pieces (pf_overlap) are off under it

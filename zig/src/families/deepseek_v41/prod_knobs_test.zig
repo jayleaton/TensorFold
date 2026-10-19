@@ -19,6 +19,7 @@ test {
     _ = @import("pfovl_test.zig");
     _ = @import("pftbo_test.zig");
     _ = @import("mhcfold_test.zig");
+    _ = @import("pfrot_test.zig");
     _ = @import("pinstage_test.zig");
     _ = @import("streamrb_test.zig");
 }
