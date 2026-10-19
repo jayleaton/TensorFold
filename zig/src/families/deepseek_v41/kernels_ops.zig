@@ -6,6 +6,7 @@
 const std = @import("std");
 const cuda = @import("cuda");
 const fitShared = @import("kernels_exl3.zig").fitShared;
+const rg2 = @import("kernels_rg2.zig");
 
 fn dim(x: usize) u32 {
     return @intCast(x);
@@ -434,6 +435,8 @@ pub const Functions = struct {
     mhc_pf: [mhc_pf.instances.len]cuda.Function,
     gemv: [rg.rts.len][rg.wide.len]cuda.Function,
     narrow: [rg.rts.len][rg.narrow.len]cuda.Function,
+    /// TF_DSV41_RG_V2: router_gemv2.cu's prefill launch, set by Kernels.load when the knob asks for it
+    rg2: ?rg2.Rg2 = null,
     pfd: [pfd.k2s.len][2][pfd.cfgs.len]?cuda.Function, // [k2][lanes][cfg]; K2 16 has no lanes kernels
     pfd_dequant: [pfd.k2s.len][2]?cuda.Function,
     gate_copy: cuda.Function,
@@ -470,6 +473,7 @@ pub const Functions = struct {
     /// `pf`: the four pfdense modules (K2 8, 10, 12, 16).
     pub fn resolve(m_attn: cuda.Module, m_topk: cuda.Module, m_mhc: cuda.Module, m_mhc_pf: cuda.Module, m_rg: cuda.Module, pf: [4]cuda.Module, m_gate: cuda.Module, m_pace: cuda.Module, m_l2pf: cuda.Module, m_keys: cuda.Module, m_pw: cuda.Module, m_kv: cuda.Module, m_glue: cuda.Module, m_pfglue: cuda.Module, m_topk_b: cuda.Module, optin: u32) !Functions {
         var f: Functions = undefined;
+        f.rg2 = null;
         inline for (0..8) |i| f.attn[i] = try m_attn.function(attn.symbol(if (i >= 4) 4 else 2, (i & 2) != 0, (i & 1) != 0));
         inline for (f.attn, 0..) |fun, i| {
             if (!try fitShared(fun, attn.symbol(if (i >= 4) 4 else 2, (i & 2) != 0, (i & 1) != 0), attn.SMEM, optin)) return error.SharedMemoryTooSmall;
@@ -774,6 +778,7 @@ pub const Ops = struct {
             const ni = std.mem.indexOfScalar(u32, &rg.narrow, nw).?;
             return o.go(o.f.narrow[ri][ni], .{ (E + nw - 1) / nw, (R + rt - 1) / rt, 1 }, nw * 32, 0, null, &args);
         }
+        if (o.f.rg2) |v| if (rg2.takes(a.R, a.E, rt, nw, ew)) return o.go(v.f, rg2.grid(E, R), rg2.threads, 0, null, &args);
         var wi: usize = 0;
         for (rg.wide, 0..) |c, j| if (c[0] == nw and c[1] == ew) {
             wi = j;

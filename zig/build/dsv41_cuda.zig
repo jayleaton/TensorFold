@@ -42,6 +42,7 @@ const optional = [_]Kernel{
     .{ .name = "dsv41_sampling", .src = "deepseek_v41/sampling", .flags = &.{ "-O3", "--fmad=false" } }, // sampling.cu
     .{ .name = "dsv41_vision", .src = "deepseek_v41_vision/vision", .flags = &.{"-O3"} }, // vision.cu: fmad on, as torch
     .{ .name = "dsv41_lin2", .src = "deepseek_v41/lin2", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // ours: lin2.cu
+    .{ .name = "dsv41_router_gemv2", .src = "deepseek_v41/router_gemv2", .flags = &.{ "-O3", "-lineinfo" } }, // ours: router_gemv.cu's flags
 };
 
 /// Where the fatbins come from: cuda.zig's -Dnvcc (with its version text), -Dfatbins and -Dsm, and its fatbins step.
