@@ -95,6 +95,8 @@ pub const Batch = struct {
         captures: u64 = 0,
         capture_ns: u64 = 0,
         eager: u64 = 0,
+        /// TF_DSV41_GRAPH_REUSE_UP: windows run through a later context bucket's held graph instead of a capture
+        reused: u64 = 0,
         /// a window's host time on the round's critical path, by stretch: `prep` (checks, the plan link's send, pages,
         /// the program), `stage` (the row table, Engram's arm or rows), `launch` (the graph's launch or the eager
         /// window); `keep_ns`: the keeps (carries)
@@ -245,7 +247,15 @@ pub const Batch = struct {
         try k.dev.syncTables();
         pt.mark(.tables);
         const s = b.settings;
-        const key: graphs.Key = .{ .rows = R, .ctx = graphs.bucketOf(rowtab.lastPos(mix), s.bucket, s.grow) };
+        var key: graphs.Key = .{ .rows = R, .ctx = graphs.bucketOf(rowtab.lastPos(mix), s.bucket, s.grow) };
+        if (b.g) |*g| {
+            const own = key.ctx;
+            key.ctx = graphs.reuseCtx(&g.cache, key, s.reuse_up); // every rank holds the same keys: the same choice
+            if (key.ctx != own) {
+                b.stats.reused += 1;
+                if (b.stats.reused == 1) std.log.scoped(.dsv41).info("row graphs: TF_DSV41_GRAPH_REUSE_UP: {d} rows at context bucket {d} run bucket {d}'s graphs", .{ key.rows, own, key.ctx });
+            }
+        }
         const cs = try b.program(key, s);
         pt.mark(.program);
         const r = f.runner;
