@@ -60,6 +60,8 @@ pub const State = struct {
     /// TF_DSV41_PF_AHEAD: the position and rows the last call's read-ahead of its next piece covered
     ahead_at: u64 = std.math.maxInt(u64),
     ahead_rows: usize = 0,
+    /// TF_DSV41_PF_PINSTAGE (prod_knobs.zig): ready() sizes the pinned staging for the workspace segment's rows
+    pin_stage: bool = false,
     /// long prompts' buffers (longpf.zig)
     long: longpf.State = .{},
     /// TF_DSV41_PF_TBO: micro-batch B's own long-prompt buffers (its stream top-k merge grows its own), and the pair in
@@ -1066,13 +1068,15 @@ fn ready(f: *Forward) !void {
     // a segment's exchange send and Engram rows at their largest (decode's would grow them on the first segment)
     const rows: usize = @intCast(f.opts.prefill_rows);
     const W: usize = f.comm.world();
+    // TF_DSV41_PF_PINSTAGE: the first 4K segment's Engram layers then reuse them (no cuMemFreeHost / cuMemHostAlloc)
+    const srows = prod_knobs.stageRows(rows, if (st.k4) st.k4ws.rows else 0, st.pin_stage);
     _ = try f.sendBuffer(r, 2 * rows * f.cfg.hidden);
     if (f.engram) |h| {
         const cols = h.headShard(f.comm.rank(), f.comm.world())[1] * @as(usize, f.cfg.engram_head_dim);
         _ = try grow(&f.gathered, r.d, W * 2 * rows * cols);
-        for (0..h.layer_ids.len) |li| _ = try f.rows_stage[li].take(r.d, 2 * rows * cols);
+        for (0..h.layer_ids.len) |li| _ = try f.rows_stage[li].take(r.d, 2 * srows * cols);
     }
-    _ = try f.ids_stage.take(r.d, 8 * rows);
+    _ = try f.ids_stage.take(r.d, 8 * srows);
     try r.stream.synchronize();
     st.ready = true;
 }
