@@ -40,4 +40,5 @@ test {
     _ = @import("prepared.zig");
     _ = @import("boot_mem.zig");
     _ = @import("lockstep.zig");
+    _ = @import("thermal_pace.zig");
 }

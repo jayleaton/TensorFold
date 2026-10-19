@@ -26,6 +26,7 @@ const greedy_host = @import("greedy.zig");
 const ph = @import("phases.zig");
 const hs = @import("host_stage.zig");
 const ced = @import("ced.zig");
+const thermal_pace = @import("thermal_pace.zig");
 
 pub const Error = error{ GlueNotBuilt, BadWindow };
 
@@ -146,6 +147,8 @@ pub const Forward = struct {
     /// TF_DSV41_CALIB=measure (calib_gpu.zig): a follower's clock at each op_calib_mark (after a device sync), until the
     /// leader's op_calib_gather pairs them up into this rank's samples
     calib_marks: std.ArrayList(u64) = .empty,
+    /// TF_DSV41_THERMAL_PACE (thermal_pace.zig, prod_knobs.apply): gaps while hot; null when off
+    thermal: ?*thermal_pace.Pace = null,
 
     pub fn init(gpa: std.mem.Allocator, cfg: *const Config, widths: *const block.Widths, opts: block.Options, runner: *run.Runner, comm: tp.collective.Collective) Forward {
         return .{ .gpa = gpa, .cfg = cfg, .widths = widths, .opts = opts, .runner = runner, .comm = comm, .arena = std.heap.ArenaAllocator.init(gpa) };
@@ -163,6 +166,7 @@ pub const Forward = struct {
         for (&f.rows_stage) |*x| x.deinit();
         f.prefill_state.deinit(f.gpa);
         f.calib_marks.deinit(f.gpa);
+        if (f.thermal) |p| p.deinit();
         if (f.gate) |x| x.close();
         if (f.engram_rows) |x| x.close();
         if (f.branches) |b| {
@@ -256,8 +260,15 @@ pub const Forward = struct {
         return pf.prompt(f, ids);
     }
 
+    /// TF_DSV41_THERMAL_PACE: rank 0's gap before a decode window while hot (the others wait on its plan link).
+    pub fn paceWindow(f: *Forward) void {
+        if (f.quiet or f.comm.rank() != 0) return;
+        if (f.thermal) |p| p.decode();
+    }
+
     /// One decode window: `ids` at the slot's position. This rank's logits stay in the runner's "w.logits".
     pub fn window(f: *Forward, ids_in: []const u32) !void {
+        f.paceWindow();
         // the forward's own copy: keep() reads the ids (Engram's tail) after the caller's slice may be gone (lanes
         // hands a stack row or a scratch arena reset before the keep)
         if (ids_in.ptr != f.ids_own.items.ptr) {

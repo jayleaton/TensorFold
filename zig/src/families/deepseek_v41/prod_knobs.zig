@@ -464,6 +464,7 @@ pub fn apply(f: *@import("forward.zig").Forward, a: std.mem.Allocator, io: std.I
         std.log.scoped(.dsv41).err("TF_DSV41_PF_OVERLAP={d} needs TF_DSV41_BRANCHES=1 (its side stream) and TP=2 (world {d})", .{ f.opts.pf_overlap, f.opts.world });
         return error.BadKnob;
     }
+    if (f.thermal == null) f.thermal = try @import("thermal_pace.zig").Pace.init(f.gpa, &env, rank);
     if (f.prefill_state.mode == .replay) {
         const ced = @import("ced.zig");
         const d = ced.decoderStart(f.cfg) catch |e| {
