@@ -30,11 +30,23 @@ const depth = @import("depth.zig");
 const joint = @import("joint.zig");
 const measure_mod = @import("calib_measure.zig");
 const Costs = costs_mod.Costs;
+const log = std.log.scoped(.dsv41);
 
 pub const Mode = enum { cached, default, real, measure, zig };
 
-/// The engine the table must have been measured on (Python's `shape`: slots, world, DSpark; context preferred).
-pub const Shape = struct { slots: u32, world: u32, dspark: bool, context: ?u64 = null };
+/// The engine a table must have been measured on (Python's `shape`, context preferred; `pack`: pack.zig identity).
+pub const Shape = struct {
+    slots: u32,
+    world: u32,
+    dspark: bool,
+    context: ?u64 = null,
+    pack: ?u64 = null,
+
+    /// `pack` as stored: 16 hex digits.
+    pub fn packHex(s: Shape, buf: *[16]u8) ?[]const u8 {
+        return std.fmt.bufPrint(buf, "{x:0>16}", .{s.pack orelse return null}) catch unreachable;
+    }
+};
 
 /// `measure`: the engine must measure (TF_DSV41_CALIB=measure, or `zig` without a Zig entry); the costs are the
 /// defaults until it has. `measured`: the engine's own measurement at this boot.
@@ -83,7 +95,10 @@ pub fn load(gpa: Allocator, io: std.Io, k: Knobs, want: Shape, default_rows: usi
         .measure => return measure(gpa, default_rows),
         .cached, .real, .zig => {}, // real: the newest stored Python measurement
     }
-    if (trimmed(k.file)) |f| return .{ .costs = try readEntry(gpa, io, f), .source = .cached, .path = try gpa.dupe(u8, f) };
+    if (trimmed(k.file)) |f| {
+        warnOtherPack(gpa, io, f, want);
+        return .{ .costs = try readEntry(gpa, io, f), .source = .cached, .path = try gpa.dupe(u8, f) };
+    }
     // nothing to read: the defaults, or (zig) a measurement
     var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     const dir = dirOf(k, &dir_buf) orelse return if (m == .zig) measure(gpa, default_rows) else defaults(gpa, default_rows);
@@ -124,10 +139,22 @@ pub fn shared(gpa: Allocator, c: Costs) !Costs {
 const Meta = struct {
     engine: []const u8 = "",
     meta: struct {
-        shape: struct { slots: u32 = 0, world: u32 = 0, dspark: bool = false, context: ?u64 = null } = .{},
+        shape: struct { slots: u32 = 0, world: u32 = 0, dspark: bool = false, context: ?u64 = null, pack: ?[]const u8 = null } = .{},
         time: []const u8 = "",
     } = .{},
 };
+
+/// A named entry timed on another pack than `want`'s: used as named, with a warning.
+fn warnOtherPack(gpa: Allocator, io: std.Io, path: []const u8, want: Shape) void {
+    var hb: [16]u8 = undefined;
+    const ours = want.packHex(&hb) orelse return;
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 24)) catch return;
+    defer gpa.free(bytes);
+    const parsed = std.json.parseFromSlice(Meta, gpa, bytes, .{ .ignore_unknown_fields = true }) catch return;
+    defer parsed.deinit();
+    const theirs = parsed.value.meta.shape.pack orelse return;
+    if (!std.mem.eql(u8, theirs, ours)) log.warn("TF_DSV41_CALIB_FILE={s}: timed on pack {s}, this pack is {s}; used as named", .{ path, theirs, ours });
+}
 
 /// The directory's `calib-*.json` measured by Python on `want`'s engine (see the top); null: none.
 pub fn pick(gpa: Allocator, io: std.Io, dir: []const u8, want: Shape) !?[]u8 {
@@ -157,6 +184,11 @@ pub fn pickOf(gpa: Allocator, io: std.Io, dir: []const u8, want: Shape, engine: 
         const m = parsed.value.meta;
         if (std.mem.eql(u8, parsed.value.engine, "zig") != (engine == .zig)) continue;
         if (m.shape.world != want.world or m.shape.slots < want.slots or m.shape.dspark != want.dspark) continue;
+        var hb: [16]u8 = undefined;
+        if (engine == .zig) if (want.packHex(&hb)) |ours| if (!std.mem.eql(u8, m.shape.pack orelse "", ours)) {
+            log.info("calibration: {s} was timed on {s}{s}, not this pack ({s}); not reused", .{ e.name, if (m.shape.pack != null) "pack " else "", m.shape.pack orelse "an unkeyed pack", ours });
+            continue;
+        };
         // a usable table (calib.load's rule) before it can win
         var c = Costs.parseJson(gpa, bytes) catch continue;
         c.deinit(gpa);
@@ -175,11 +207,12 @@ pub fn pickOf(gpa: Allocator, io: std.Io, dir: []const u8, want: Shape, engine: 
     return best;
 }
 
-/// The file a Zig measurement for `want` is stored as: calib-zig-<the shape's SHA-256, 16 hex>.json (one a shape; a
-/// new measurement replaces it).
+/// The file a Zig measurement for `want` is stored as: calib-zig-<the shape's SHA-256, 16 hex>.json (one a shape and
+/// pack; a new measurement replaces it).
 pub fn zigName(buf: []u8, want: Shape) ![]const u8 {
-    var key: [96]u8 = undefined;
-    const k = try std.fmt.bufPrint(&key, "slots={d} world={d} dspark={d} context={d}", .{ want.slots, want.world, @intFromBool(want.dspark), want.context orelse 0 });
+    var key: [128]u8 = undefined;
+    var hb: [16]u8 = undefined;
+    const k = try std.fmt.bufPrint(&key, "slots={d} world={d} dspark={d} context={d}{s}{s}", .{ want.slots, want.world, @intFromBool(want.dspark), want.context orelse 0, if (want.pack != null) " pack=" else "", want.packHex(&hb) orelse "" });
     var h: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(k, &h, .{});
     return std.fmt.bufPrint(buf, "calib-zig-{x}.json", .{h[0..8]});
@@ -211,13 +244,14 @@ pub fn store(gpa: Allocator, io: std.Io, dir: []const u8, want: Shape, c: Costs,
     const ds = es.getDaySeconds();
     const time = try std.fmt.bufPrint(&tb, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}", .{ yd.year, @backingInt(md.month), md.day_index + 1, ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute() });
     const m = rec.method;
+    var hb: [16]u8 = undefined;
     const doc = .{
         .verify = c.verify,
         .draft = c.draft,
         .slot = c.slot,
         .engine = "zig",
         .meta = .{
-            .shape = .{ .slots = want.slots, .world = want.world, .dspark = want.dspark, .context = want.context },
+            .shape = .{ .slots = want.slots, .world = want.world, .dspark = want.dspark, .context = want.context, .pack = want.packHex(&hb) },
             .time = time,
             .method = .{ .reps = m.reps, .warm = m.warm, .stat = @tagName(m.stat), .recheck = m.recheck, .shape = @tagName(m.shape), .cycle = m.cycle, .deep = m.deep },
             .seconds = rec.seconds,

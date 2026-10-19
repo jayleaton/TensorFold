@@ -92,7 +92,7 @@ pub const Served = struct {
         // TF_DSV41_CALIB=measure (or zig without a stored Zig table): this engine's own windows timed now, on every
         // rank (calib_gpu.zig), and stored as calib-zig-<shape>.json
         const knobs = calib_env.Knobs.fromEnv();
-        const want: calib_env.Shape = .{ .slots = m.slots, .world = m.f.comm.world(), .dspark = m.pass != null, .context = @intCast(@min(context orelse m.f.opts.limit, m.f.opts.limit)) };
+        const want: calib_env.Shape = .{ .slots = m.slots, .world = m.f.comm.world(), .dspark = m.pass != null, .context = @intCast(@min(context orelse m.f.opts.limit, m.f.opts.limit)), .pack = m.pack.identity() };
         var cal = try calib_env.load(gpa, io, knobs, want, 64);
         defer if (cal.path) |p| gpa.free(p);
         if (cal.source == .measure) {

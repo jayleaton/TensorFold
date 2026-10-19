@@ -180,3 +180,44 @@ test "TF_DSV41_CALIB=measure / zig: the engine measures; a stored Zig table is r
     defer other.deinit(gpa);
     try std.testing.expectEqual(calib_env.Source.measure, other.source);
 }
+
+test "TF_DSV41_CALIB=zig keys the pack: another pack's table, or an unkeyed one, is measured anew" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const flash: calib_env.Shape = .{ .slots = 4, .world = 2, .dspark = true, .context = 1048576, .pack = 0x0123_4567_89ab_cdef };
+    var eaq = flash;
+    eaq.pack = 0xfedc_ba98_7654_3210;
+    var unkeyed = flash;
+    unkeyed.pack = null;
+    var na: [64]u8 = undefined;
+    var nb: [64]u8 = undefined;
+    var nc: [64]u8 = undefined;
+    const names = [_][]const u8{ try calib_env.zigName(&na, flash), try calib_env.zigName(&nb, eaq), try calib_env.zigName(&nc, unkeyed) };
+    try std.testing.expect(!std.mem.eql(u8, names[0], names[1]) and !std.mem.eql(u8, names[0], names[2]));
+    var verify = [_]f64{ 20.0, 24.5 };
+    const c: costs_mod.Costs = .{ .verify = &verify, .draft = 3.5, .slot = 0.6 };
+    const old = try calib_env.store(gpa, io, root, unkeyed, c, .{ .method = .{}, .seconds = 1 }, 1_791_504_000);
+    defer gpa.free(old);
+    var before = try calib_env.load(gpa, io, .{ .mode = "zig", .dir = root }, flash, 64);
+    defer before.deinit(gpa);
+    try std.testing.expectEqual(calib_env.Source.measure, before.source); // stored before packs were keyed
+    const path = try calib_env.store(gpa, io, root, flash, c, .{ .method = .{}, .seconds = 1 }, 1_791_504_000);
+    defer gpa.free(path);
+    try std.testing.expectEqualStrings(names[0], std.fs.path.basename(path));
+    var same = try calib_env.load(gpa, io, .{ .mode = "zig", .dir = root }, flash, 64);
+    defer same.deinit(gpa);
+    try std.testing.expectEqual(calib_env.Source.cached, same.source);
+    try std.testing.expectEqualStrings(names[0], std.fs.path.basename(same.path.?));
+    var other = try calib_env.load(gpa, io, .{ .mode = "zig", .dir = root }, eaq, 64);
+    defer other.deinit(gpa);
+    try std.testing.expectEqual(calib_env.Source.measure, other.source);
+    // named outright: used as named, whichever pack timed it
+    var named = try calib_env.load(gpa, io, .{ .mode = "zig", .dir = root, .file = path }, eaq, 64);
+    defer named.deinit(gpa);
+    try std.testing.expectEqual(calib_env.Source.cached, named.source);
+    const bytes = try tmp.dir.readFileAlloc(io, names[0], gpa, .limited(1 << 20));
+    defer gpa.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"pack\": \"0123456789abcdef\"") != null);
+}

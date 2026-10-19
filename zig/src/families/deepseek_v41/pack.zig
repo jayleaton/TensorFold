@@ -227,6 +227,24 @@ pub const Pack = struct {
         try p.read(io, info, .{ .offset = 0, .len = 4 }, &v);
         return exl3.Codebook.fromMarker(std.mem.readInt(u32, &v, .little));
     }
+
+    /// The weights' identity: each tensor's name, dtype, shape and size, in any order (no paths or times).
+    pub fn identity(p: *const Pack) u64 {
+        var sum: u64 = 0;
+        var it = p.names.iterator();
+        while (it.next()) |e| {
+            var h = std.crypto.hash.sha2.Sha256.init(.{});
+            h.update(e.key_ptr.*);
+            const i = e.value_ptr.*;
+            h.update(@tagName(i.dtype));
+            for (i.dims()) |n| h.update(std.mem.asBytes(&@as(u64, n)));
+            h.update(std.mem.asBytes(&i.nbytes));
+            var d: [32]u8 = undefined;
+            h.final(&d);
+            sum +%= std.mem.readInt(u64, d[0..8], .little);
+        }
+        return sum;
+    }
 };
 
 fn lessStr(_: void, x: []const u8, y: []const u8) bool {
@@ -305,4 +323,25 @@ test "a folder by its headers: index order, groups checked, strided reads, codeb
     try testing.expectEqual(exl3.Codebook.inst3, try p.codebook(io, "y"));
     try testing.expectError(error.MissingTensor, p.group("y", &buf));
     try testing.expectError(error.BadSpan, p.read(io, p.get("y.weight").?, .{ .offset = 8, .len = 8 }, out[0..8]));
+}
+
+test "a pack's identity: its tensors in any order, nothing about the files" {
+    const a = testing.allocator;
+    const x: Spec = .{ .name = "x.weight", .dtype = "F16", .shape = &.{ 4, 2 } };
+    const y: Spec = .{ .name = "y.bias", .dtype = "F32", .shape = &.{4} };
+    const one = try image(a, &.{ x, y });
+    defer a.free(one);
+    const two = try image(a, &.{ y, x });
+    defer a.free(two);
+    const wide = try image(a, &.{ .{ .name = "x.weight", .dtype = "F16", .shape = &.{ 4, 2 } }, .{ .name = "y.bias", .dtype = "F16", .shape = &.{4} } });
+    defer a.free(wide);
+    var ids: [3]u64 = undefined;
+    for ([_][]const u8{ one, two, wide }, [_][]const u8{ "a.safetensors", "b.safetensors", "a.safetensors" }, &ids) |img, name, *id| {
+        var p = Pack.init(a);
+        defer p.deinit();
+        try p.addHeaderDump(name, img[0 .. 8 + std.mem.readInt(u64, img[0..8], .little)]);
+        id.* = p.identity();
+    }
+    try testing.expectEqual(ids[0], ids[1]);
+    try testing.expect(ids[0] != ids[2] and ids[0] != 0);
 }
