@@ -73,7 +73,7 @@ fn num(get: Get, name: []const u8, default: f64, lo: f64, hi: f64) Error!f64 {
 }
 
 fn bad(name: []const u8, raw: []const u8, want: []const u8) Error {
-    std.log.scoped(.dsv41).err("{s}={s}: expected {s} (thermal_pace.zig)", .{ name, raw, want });
+    std.log.scoped(.dsv41).warn("{s}={s}: expected {s} (thermal_pace.zig)", .{ name, raw, want });
     return error.BadKnob;
 }
 
@@ -268,8 +268,8 @@ test "thermal pace knobs: off by default, the fixture's values, junk refused" {
         var name: []const u8 = "";
         var value: []const u8 = "";
         fn get(n: []const u8) ?[]const u8 {
-            if (std.mem.eql(u8, n, "TF_DSV41_THERMAL_PACE")) return "1";
-            return if (std.mem.eql(u8, n, name)) value else null;
+            if (std.mem.eql(u8, n, name)) return value;
+            return if (std.mem.eql(u8, n, "TF_DSV41_THERMAL_PACE")) "1" else null;
         }
     };
     const cases = [_][2][]const u8{
@@ -281,6 +281,7 @@ test "thermal pace knobs: off by default, the fixture's values, junk refused" {
     for (cases) |c| {
         Junk.name = c[0];
         Junk.value = c[1];
+        try testing.expectEqualStrings(c[1], Junk.get(c[0]).?);
         try testing.expectError(error.BadKnob, knobs(&Junk.get));
     }
 }
