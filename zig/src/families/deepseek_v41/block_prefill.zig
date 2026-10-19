@@ -240,13 +240,19 @@ const Seg = struct {
     /// whole layer (no W_q workspace, so no column blocks) reading the same words the unpack would.
     fn fused(s: *Seg, p: *const PfDense, w: []const u8, form: Form, x: Arg, k: i64, n: i64, y: Out) !void {
         const e = s.e;
+        const xh = try e.buf("s.pf.xh", .{}, .f16, &.{ e.n, k });
+        try e.ext("tensorfold_exl3_linear_v4.rot_in", &.{ x, try e.weight("{s}.suh", .{w}, .f16, &.{k}), xh });
+        return s.fusedGemm(p, w, form, xh, k, n, y, null);
+    }
+
+    /// `fused`'s GEMM over the rotated `xh`; `rot` (TF_DSV41_PF_WOROT): gemm_rot's suh_b and xhb after its arguments.
+    fn fusedGemm(s: *Seg, p: *const PfDense, w: []const u8, form: Form, xh: Arg, k: i64, n: i64, y: Out, rot: ?[2]Arg) !void {
+        const e = s.e;
         const m = e.n;
         const k2: u32 = try e.w.k2(w);
         const tw: i64 = 4 * @as(i64, k2);
         const nb = @divExact(n, 128);
         const blk_words = @divExact(k, 16) * 8 * tw;
-        const xh = try e.buf("s.pf.xh", .{}, .f16, &.{ m, k });
-        try e.ext("tensorfold_exl3_linear_v4.rot_in", &.{ x, try e.weight("{s}.suh", .{w}, .f16, &.{k}), xh });
         const st = dense.strides(@intCast(k), k2);
         const words: Arg, const sk: i64, const snb: i64 = switch (form) {
             .lanes => .{ try e.view(.{ .buf = try e.fmt("s.{s}.lanes", .{w}) }, .i32, &.{ nb, @divExact(k, 16), 8, tw }, &.{ blk_words, 8 * tw, tw, 1 }, 0), st[0], st[1] },
@@ -257,14 +263,38 @@ const Seg = struct {
             .stored => .{ try e.view(.{ .weight = try e.fmt("{s}.trellis", .{w}) }, .i32, &.{ @divExact(k, 16), @divExact(n, 16), tw }, &.{ @divExact(n, 16) * tw, tw, 1 }, 0), @divExact(n, 16) * tw, 8 * tw },
         };
         const c = p.pick(@intCast(k), @intCast(n), k2, @intCast(m));
-        try e.ext("tf_dsv41_pfdense_v1.gemm", &.{
+        const args = [11]Arg{
             xh,                                                                words,
             .{ .i = sk },                                                      .{ .i = snb },
             try e.weight("{s}.svh", .{w}, .f16, &.{n}),                        .none,
             try e.view(y.role, y.dt, &.{ m, n }, &.{ y.stride, 1 }, y.offset), .{ .i = k2 },
             .{ .b = form == .lanes },                                          .{ .i = c[0] },
             .{ .i = c[1] },
-        });
+        };
+        if (rot) |r| try e.ext("tf_dsv41_pfrot_v1.gemm_rot", &(args ++ r)) else try e.ext("tf_dsv41_pfdense_v1.gemm", &args);
+    }
+
+    /// The fused path's PfDense when projection `w` [k, n] takes it (`matmul`'s test), else null.
+    fn fusedOf(s: *Seg, w: []const u8, form: Form, k: i64, n: i64) !?*const PfDense {
+        const p = s.e.o.pfd orelse return null;
+        return if (PfDense.eligible(k, n, try s.e.w.k2(w), form == .lanes)) p else null;
+    }
+
+    /// Two `proj`s of one x [m, k]; TF_DSV41_PF_ROT2, both fused, x bf16 / fp16 rows: one rot2, then fusedGemm's two.
+    fn proj2(s: *Seg, w0: []const u8, w1: []const u8, form: Form, x: Arg, k: i64, n0: i64, y0: Arg, n1: i64, y1: Arg) !void {
+        const e = s.e;
+        const flat = x == .t and (x.t.dt == .bf16 or x.t.dt == .f16) and x.t.shape.len == 2 and x.t.stride[0] == k and x.t.stride[1] == 1;
+        const p0 = if (e.o.pf_rot2 and flat) try s.fusedOf(w0, form, k, n0) else null;
+        const p1 = if (p0 != null) try s.fusedOf(w1, form, k, n1) else null;
+        if (p0 == null or p1 == null) {
+            try s.proj(w0, form, x, k, n0, y0);
+            return s.proj(w1, form, x, k, n1, y1);
+        }
+        const xh0 = try e.buf("s.pf.xh", .{}, .f16, &.{ e.n, k });
+        const xh1 = try e.buf("s.pf.xh2", .{}, .f16, &.{ e.n, k });
+        try e.ext("tf_dsv41_pfrot_v1.rot2", &.{ x, try e.weight("{s}.suh", .{w0}, .f16, &.{k}), try e.weight("{s}.suh", .{w1}, .f16, &.{k}), xh0, xh1 });
+        try s.fusedGemm(p0.?, w0, form, xh0, k, n0, .{ .role = y0.t.role, .dt = y0.t.dt, .stride = n0, .offset = y0.t.offset }, null);
+        try s.fusedGemm(p1.?, w1, form, xh1, k, n1, .{ .role = y1.t.role, .dt = y1.t.dt, .stride = n1, .offset = y1.t.offset }, null);
     }
 
     /// A projection into a whole contiguous buffer.
@@ -899,14 +929,15 @@ const Seg = struct {
         const hd: i64 = e.cfg.head_dim;
         const x = try e.buf("w.out", .{}, .bf16, &.{ n, D });
         const cw = try e.buf("L.comp", .{}, .bf16, &.{ n, hd });
-        try s.proj(try e.fmt("L{d}.attn.comp_wkv", .{L}), .lanes, x, D, hd, cw);
+        const wkv = try e.fmt("L{d}.attn.comp_wkv", .{L});
         if (e.cfg.compressRatio(L) == 2) {
             const cg = try e.buf("L.comp_gate", .{}, .bf16, &.{ n, hd });
-            try s.proj(try e.fmt("L{d}.attn.comp_wgate", .{L}), .lanes, x, D, hd, cg);
+            try s.proj2(wkv, try e.fmt("L{d}.attn.comp_wgate", .{L}), .lanes, x, D, hd, cw, hd, cg);
             const p = try e.buf("w.L{d}.proj", .{L}, .f32, &.{ n, 2 * hd });
             try e.glue("proj", &.{ cw, cg, p });
             return p;
         }
+        try s.proj(wkv, .lanes, x, D, hd, cw);
         const p = try e.buf("L.proj", .{}, .f32, &.{ n, hd });
         try e.glue("proj", &.{ cw, p });
         return p;
@@ -949,8 +980,7 @@ const Seg = struct {
         // the x projections (wq_a, wkv, a KV source's compressor), each its own matmul
         const qa = try e.buf("L.qa", .{}, .bf16, &.{ n, e.cfg.q_lora });
         const kva = try e.buf("L.kva", .{}, .bf16, &.{ n, hd });
-        try s.proj(try e.fmt("L{d}.attn.wq_a", .{L}), .lanes, x, D, e.cfg.q_lora, qa);
-        try s.proj(try e.fmt("L{d}.attn.wkv", .{L}), .lanes, x, D, hd, kva);
+        try s.proj2(try e.fmt("L{d}.attn.wq_a", .{L}), try e.fmt("L{d}.attn.wkv", .{L}), .lanes, x, D, e.cfg.q_lora, qa, hd, kva);
         const cproj: Arg = if (own_kv) try s.compProj(L) else undefined;
         const qn = try e.buf("L.qn", .{}, .bf16, &.{ n, e.cfg.q_lora });
         const kv = try e.buf("L.kv", .{}, .bf16, &.{ n, hd });
@@ -1002,6 +1032,7 @@ const Seg = struct {
         const gk = hg * hd;
         const z: Out = .{ .role = .{ .buf = "L.z" }, .dt = .bf16, .stride = groups * ol };
         const k = s.pieces();
+        if (k == 1 and try s.woRot(L, o, z, groups, gk, ol)) return;
         if (k == 1) {
             var g: i64 = 0;
             while (g < groups) : (g += 1) {
@@ -1033,6 +1064,32 @@ const Seg = struct {
             try s.sendPiece(part, gath, r[0], m, p, k);
         }
         s.sent_attn = true;
+    }
+
+    /// TF_DSV41_PF_WOROT (all fused, z bf16): wo_a's gemm_rot writes wo_b's input into "s.pf.xhb", wo_b no rot_in.
+    fn woRot(s: *Seg, L: u32, o: Arg, z: Out, groups: i64, gk: i64, ol: i64) !bool {
+        const e = s.e;
+        if (!e.o.pf_worot or z.dt != .bf16) return false;
+        const n = e.n;
+        const D: i64 = e.cfg.hidden;
+        const wb = try e.fmt("L{d}.attn.wo_b", .{L});
+        const pb = try s.fusedOf(wb, .lanes, groups * ol, D) orelse return false;
+        var g: i64 = 0;
+        while (g < groups) : (g += 1) if (try s.fusedOf(try e.fmt("L{d}.attn.wo_a.{d}", .{ L, g }), .lanes, gk, ol) == null) return false;
+        g = 0;
+        while (g < groups) : (g += 1) {
+            const wa = try e.fmt("L{d}.attn.wo_a.{d}", .{ L, g });
+            var zg = z;
+            zg.offset = g * ol * 2;
+            const xh = try e.buf("s.pf.xh", .{}, .f16, &.{ n, gk });
+            try e.ext("tensorfold_exl3_linear_v4.rot_in", &.{ try e.view(o.t.role, .bf16, &.{ n, gk }, &.{ gk, 1 }, g * n * gk * 2), try e.weight("{s}.suh", .{wa}, .f16, &.{gk}), xh });
+            const suh_b = try e.view(.{ .weight = try e.fmt("{s}.suh", .{wb}) }, .f16, &.{ol}, &.{1}, g * ol * 2);
+            const xhb = try e.view(.{ .buf = "s.pf.xhb" }, .f16, &.{ n, ol }, &.{ groups * ol, 1 }, g * ol * 2);
+            try s.fusedGemm((try s.fusedOf(wa, .lanes, gk, ol)).?, wa, .lanes, xh, gk, ol, zg, .{ suh_b, xhb });
+        }
+        const xb = try e.buf("s.pf.xhb", .{}, .f16, &.{ n, groups * ol });
+        try s.fusedGemm(pb, wb, .lanes, xb, groups * ol, D, .{ .role = .{ .buf = "L.part" }, .dt = .bf16, .stride = D }, null);
+        return true;
     }
 
     /// The CSA2 steps of the current segment (blocks._segment): its SWA rows stored (through the staging ring when its
@@ -1339,8 +1396,7 @@ const Seg = struct {
                 const ur = try rowsOf(e, u, .f32, r[0], m, I);
                 const ar = try rowsOf(e, act, .f32, r[0], m, I);
                 const yr = try rowsOf(e, sy, .f32, r[0], m, D);
-                try s.proj(try e.fmt("{s}.w1", .{sh}), .stored, xr, D, I, gr);
-                try s.proj(try e.fmt("{s}.w3", .{sh}), .stored, xr, D, I, ur);
+                try s.proj2(try e.fmt("{s}.w1", .{sh}), try e.fmt("{s}.w3", .{sh}), .stored, xr, D, I, gr, I, ur);
                 try e.glue("swiglu", &.{ gr, ur, ar, .{ .f = lim } });
                 try s.proj(try e.fmt("{s}.w2", .{sh}), .stored, ar, I, D, yr);
                 try e.glue("moe_sum", &.{ try rowsOf(e, routed, .f32, r[0], m, D), yr, try rowsOf(e, part, .bf16, r[0], m, D) });
@@ -1367,8 +1423,7 @@ const Seg = struct {
         const u = try e.buf("L.sh.u", .{}, .f32, &.{ n, I });
         const act = try e.buf("L.sh.act", .{}, .f32, &.{ n, I });
         const sy = try e.buf("L.sh.y", .{}, .f32, &.{ n, D });
-        try s.proj(try e.fmt("{s}.w1", .{sh}), .stored, x, D, I, g);
-        try s.proj(try e.fmt("{s}.w3", .{sh}), .stored, x, D, I, u);
+        try s.proj2(try e.fmt("{s}.w1", .{sh}), try e.fmt("{s}.w3", .{sh}), .stored, x, D, I, g, I, u);
         try e.glue("swiglu", &.{ g, u, act, .{ .f = lim } });
         try s.proj(try e.fmt("{s}.w2", .{sh}), .stored, act, I, D, sy);
         return sy;

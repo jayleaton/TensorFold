@@ -201,6 +201,7 @@ pub fn call(k: *const Kernels, s: cuda.Stream, ext: []const u8, func: []const u8
     if (is(ext, "tf_dsv41_mhc_pf_fold_v1") and is(func, "run")) return mhcPfFoldRun(k.others(s), args, kwargs);
     if (is(ext, "tf_dsv41_router_gemv_v2") and is(func, "route")) return route(k.others(s), args, kwargs);
     if (is(ext, "tf_dsv41_pfdense_v1")) return pfdenseExt(k.others(s), func, args, kwargs);
+    if (is(ext, "tf_dsv41_pfrot_v1")) return pfrotExt(k.others(s), func, args, kwargs);
     if (is(ext, "tf_dsv41_l2pace_v1") and is(func, "paced")) return paced(k.others(s), args, kwargs);
     if (is(ext, "tf_dsv41_l2pf_v1") and is(func, "segments")) return segments(k.others(s), args, kwargs);
     return false; // engram_gate.gate_copy reads host-mapped words a capture cannot relocate: not replayed
@@ -807,24 +808,67 @@ fn route(o: ops.Ops, args: []const Arg, kwargs: []const Kw) !bool {
 // tf_dsv41_pfdense_v1 (pfdense.cpp)
 fn pfdenseExt(o: ops.Ops, func: []const u8, args: []const Arg, kwargs: []const Kw) !bool {
     if (is(func, "gemm")) {
-        const c: Call = .{ .args = args, .kwargs = kwargs, .names = &.{ "xh", "T", "stride_k", "stride_nb", "svh", "bias", "out", "K2", "lanes", "cfg", "group" } };
-        const xh = try c.tensor(0);
-        const T = try c.tensor(1);
-        const out = try c.tensor(6);
-        const ot: ops.pfd.OutType = switch (out.dtype) {
-            .f32 => .f32,
-            .bf16 => .bf16,
-            .f16 => .f16,
-            else => return error.WrongArgument,
-        };
-        const a: ops.pfd.Args = .{ .xh = xh.ptr, .T = T.ptr, .stride_k = try c.int(2), .stride_nb = try c.int(3), .svh = try c.ptr(4), .bias = try c.ptrOrNull(5), .out = out.ptr, .o_stride = out.stride[0], .M = @intCast(try dim(xh, 0)), .K = @intCast(try dim(xh, 1)), .N = @intCast(try dim(out, 1)), .group = @intCast(try c.int(10)), .out_type = @backingInt(ot) };
-        try o.pfdGemm(a, try c.u(7), try c.boolean(8, false), try c.usz(9), @intCast(numel(T)));
+        const c: Call = .{ .args = args, .kwargs = kwargs, .names = &gemm_names };
+        try o.pfdGemm(try gemmArgs(c), try c.u(7), try c.boolean(8, false), try c.usz(9), @intCast(numel(try c.tensor(1))));
         return true;
     }
     if (is(func, "dequant")) {
         const c: Call = .{ .args = args, .kwargs = kwargs, .names = &.{ "T", "W", "stride_k", "stride_nb", "K2", "lanes" } };
         const w = try c.tensor(1);
         try o.pfdDequant(try c.ptr(0), try c.int(2), try c.int(3), w.ptr, try dim(w, 0), try dim(w, 1), try c.u(4), try c.boolean(5, false));
+        return true;
+    }
+    return false;
+}
+
+const gemm_names = [_][]const u8{ "xh", "T", "stride_k", "stride_nb", "svh", "bias", "out", "K2", "lanes", "cfg", "group" };
+
+/// pfdense.cpp gemm's Args from its 11 parameters (gemm_rot's first 11).
+fn gemmArgs(c: Call) !ops.pfd.Args {
+    const xh = try c.tensor(0);
+    const out = try c.tensor(6);
+    const ot: ops.pfd.OutType = switch (out.dtype) {
+        .f32 => .f32,
+        .bf16 => .bf16,
+        .f16 => .f16,
+        else => return error.WrongArgument,
+    };
+    return .{ .xh = xh.ptr, .T = try c.ptr(1), .stride_k = try c.int(2), .stride_nb = try c.int(3), .svh = try c.ptr(4), .bias = try c.ptrOrNull(5), .out = out.ptr, .o_stride = out.stride[0], .M = @intCast(try dim(xh, 0)), .K = @intCast(try dim(xh, 1)), .N = @intCast(try dim(out, 1)), .group = @intCast(try c.int(10)), .out_type = @backingInt(ot) };
+}
+
+/// A contiguous fp16 [rows, cols] tensor's pointer (rot2's workspaces).
+fn halfRows(t: Tensor, rows: usize, cols: usize) !u64 {
+    if (t.dtype != .f16 or t.shape.len != 2 or try dim(t, 0) != rows or try dim(t, 1) != cols) return error.WrongArgument;
+    if (t.stride[0] != @as(i64, @intCast(cols)) or t.stride[1] != 1) return error.WrongArgument;
+    return t.ptr;
+}
+
+// tf_dsv41_pfrot_v1 (ours, pfrot.cu): rot2 (TF_DSV41_PF_ROT2) and gemm_rot (TF_DSV41_PF_WOROT); refused unloaded
+fn pfrotExt(o: ops.Ops, func: []const u8, args: []const Arg, kwargs: []const Kw) !bool {
+    if (o.f.pfrot == null) return error.PfRotNotLoaded;
+    if (is(func, "rot2")) {
+        const c: Call = .{ .args = args, .kwargs = kwargs, .names = &.{ "x", "suh0", "suh1", "xh0", "xh1" } };
+        const x = try c.tensor(0);
+        if (x.dtype != .bf16 and x.dtype != .f16) return error.WrongArgument;
+        const M = try dim(x, 0);
+        const K = try dim(x, 1);
+        if (x.shape.len != 2 or x.stride[0] != @as(i64, @intCast(K)) or x.stride[1] != 1) return error.WrongArgument;
+        for ([_]usize{ 1, 2 }) |i| {
+            const suh = try c.tensor(i);
+            if (suh.dtype != .f16 or numel(suh) < @as(i64, @intCast(K))) return error.WrongArgument;
+        }
+        try o.pfRot2(.{ .x = x.ptr, .suh0 = try c.ptr(1), .suh1 = try c.ptr(2), .xh0 = try halfRows(try c.tensor(3), M, K), .xh1 = try halfRows(try c.tensor(4), M, K), .x_bf16 = @intFromBool(x.dtype == .bf16), .M = @intCast(M), .K = @intCast(K) });
+        return true;
+    }
+    if (is(func, "gemm_rot")) {
+        const c: Call = .{ .args = args, .kwargs = kwargs, .names = &(gemm_names ++ [_][]const u8{ "suh_b", "xhb" }) };
+        const a = try gemmArgs(c);
+        const suh = try c.tensor(11);
+        const xhb = try c.tensor(12);
+        // the next projection's suh slice and fp16 input view: this GEMM's [M, N], unit column stride
+        if (suh.dtype != .f16 or numel(suh) < a.N or xhb.dtype != .f16 or xhb.shape.len != 2 or xhb.stride[1] != 1) return error.WrongArgument;
+        if (try dim(xhb, 0) != @as(usize, @intCast(a.M)) or try dim(xhb, 1) != @as(usize, @intCast(a.N))) return error.WrongArgument;
+        try o.pfdGemmRot(a, .{ .suh = suh.ptr, .xh = xhb.ptr, .x_stride = xhb.stride[0] }, try c.u(7), try c.boolean(8, false), try c.usz(9), @intCast(numel(try c.tensor(1))));
         return true;
     }
     return false;

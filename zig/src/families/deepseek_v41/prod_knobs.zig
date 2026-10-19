@@ -519,7 +519,7 @@ pub fn apply(f: *@import("forward.zig").Forward, a: std.mem.Allocator, io: std.I
     f.opts.pf_overlap_site = try pfOverlapSite(&env);
     f.opts.gm_gu2 = try gmGu2(&env);
     f.opts.mhc_site_rows = try mhcSiteRows(&env);
-    f.opts.mhc_pf_fold = try mhcPfFold(&env); // the kernels load its module under the same knob (kernels.zig loadFold)
+    try @import("prod_knobs_pf.zig").apply(&f.opts, &env); // TF_DSV41_MHC_PF_FOLD, _PF_ROT2, _PF_WOROT (kernels.zig loads)
     if (f.opts.mhc_site_rows > 0) std.log.scoped(.dsv41).info("mhc: prefill boundary sites in pieces of about {d} rows", .{f.opts.mhc_site_rows});
     if (f.opts.gm_gu2 and f.opts.gm_v2 != .one) {
         std.log.scoped(.dsv41).err("TF_DSV41_GM_GU2=1 needs TF_DSV41_GM_V2=1 (x3gm v2's one plan a block)", .{});

@@ -16,6 +16,8 @@ pub const ops = @import("kernels_ops.zig");
 pub const rg2 = @import("kernels_rg2.zig");
 /// mhc_pf_fold.cu's prefill site + finish launch (TF_DSV41_MHC_PF_FOLD, its own optional module)
 pub const fold = @import("kernels_fold.zig");
+/// pfrot.cu's rot2 and pfdense + rotation launches (TF_DSV41_PF_ROT2 / _WOROT, its own optional module)
+pub const pfrot = @import("kernels_pfrot.zig");
 /// sampling.cu (its own module, loaded by the keyed sampler)
 pub const sampling = @import("sampling_kernels.zig");
 /// vision.cu (its own module, loaded by the vision tower on rank 0)
@@ -82,6 +84,12 @@ const FoldBlob = struct {
 };
 pub const fold_image: []const u8 = &FoldBlob.bytes;
 
+/// pfrot.cu (ours, TF_DSV41_PF_ROT2 / _WOROT): optional as lin2.cu, an empty image when the build has none.
+const PfRotBlob = struct {
+    pub const bytes align(16) = @embedFile("dsv41_fatbin_dsv41_pfrot").*;
+};
+pub const pfrot_image: []const u8 = &PfRotBlob.bytes;
+
 fn env(name: [:0]const u8) ?[]const u8 {
     const v = std.c.getenv(name) orelse return null;
     return std.mem.span(v);
@@ -125,6 +133,9 @@ pub const Kernels = struct {
         try k.loadRg2(d, try rg2.enabled(env("TF_DSV41_RG_V2")));
         errdefer if (k.ops.rg2) |*r| r.module.unload();
         try k.loadFold(d, try fold.enabled(env("TF_DSV41_MHC_PF_FOLD")), optin);
+        errdefer if (k.ops.mhc_fold) |*f| f.module.unload();
+        const rot2 = try pfrot.enabled("TF_DSV41_PF_ROT2", env("TF_DSV41_PF_ROT2"));
+        try k.loadPfRot(d, rot2, try pfrot.enabled("TF_DSV41_PF_WOROT", env("TF_DSV41_PF_WOROT")), optin);
         return k;
     }
 
@@ -148,6 +159,18 @@ pub const Kernels = struct {
         std.log.scoped(.dsv41).info("mhc fold: a prefill site's mhc_pf.run and `_finish_k` as one fold_kernel launch (TF_DSV41_MHC_PF_FOLD)", .{});
     }
 
+    /// TF_DSV41_PF_ROT2 / _WOROT: pfrot.cu behind Ops.pfRot2 / pfdGemmRot, once for either; refused without its fatbin.
+    pub fn loadPfRot(k: *Kernels, d: *const cuda.Driver, rot2: bool, worot: bool, optin: u32) !void {
+        if (!rot2 and !worot) return;
+        if (pfrot_image.len == 0) return error.PfRotKernelNotBuilt;
+        var m = try cuda.Module.load(d, pfrot_image);
+        errdefer m.unload();
+        k.ops.pfrot = try pfrot.PfRot.resolve(m, optin);
+        const log = std.log.scoped(.dsv41);
+        if (rot2) log.info("pf rot2: two fused projections of one input rotate it in one rot2_kernel launch (TF_DSV41_PF_ROT2)", .{});
+        if (worot) log.info("pf worot: wo_a's group GEMMs rotate their output for wo_b (pfdr_kernel), wo_b without rot_in (TF_DSV41_PF_WOROT)", .{});
+    }
+
     /// TF_DSV41_LIN2: lin2.cu's module and instances behind the dense launches (dense.Ops); refused when the build
     /// has no lin2 fatbin (-Dnvcc, or -Dfatbins with dsv41_lin2.fatbin).
     pub fn loadLin2(k: *Kernels, d: *const cuda.Driver, mode: dense.Lin2Mode) !void {
@@ -164,6 +187,7 @@ pub const Kernels = struct {
         if (k.dense.lin2) |*l| l.module.unload();
         if (k.ops.rg2) |*r| r.module.unload();
         if (k.ops.mhc_fold) |*f| f.module.unload();
+        if (k.ops.pfrot) |*r| r.module.unload();
         for (&k.mods) |*m| m.unload();
     }
 
@@ -203,4 +227,5 @@ test {
     std.testing.refAllDecls(ops.Functions);
     std.testing.refAllDecls(rg2);
     std.testing.refAllDecls(fold);
+    std.testing.refAllDecls(pfrot);
 }
