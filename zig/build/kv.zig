@@ -52,4 +52,10 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     sg.addImport("tp", tp_module(b, target, optimize, rt));
     const sexe = b.addExecutable(.{ .name = "tf-kv-split-test", .root_module = sg });
     b.step("tf-kv-split-test", "Split KV's exchange on two GPUs (one process a rank): dense, graph replays, unions vs the replicated rows").dependOn(&b.addInstallArtifact(sexe, .{}).step);
+    const ub = b.createModule(.{ .root_source_file = b.path("zig/src/families/deepseek_v41/kv/union_bench.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
+    const urt = runtime(b, target, .ReleaseFast);
+    ub.addImport("cuda", urt);
+    ub.addImport("tp", tp_module(b, target, .ReleaseFast, urt));
+    const uexe = b.addExecutable(.{ .name = "tf-kv-union-bench", .root_module = ub });
+    b.step("tf-kv-union-bench", "Split KV's prefill union host round trip on one GPU, before vs TF_DSV41_PF_HOSTGAP=1 (equal bytes)").dependOn(&b.addInstallArtifact(uexe, .{}).step);
 }
