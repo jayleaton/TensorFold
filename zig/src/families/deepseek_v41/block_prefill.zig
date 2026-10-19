@@ -317,17 +317,20 @@ const Seg = struct {
         // the forward's second streams buffer (mhc.out_of_place): a boundary of at most 32 rows writes it
         const spare = post and n <= split_rows and s.part != .decoder;
         const xout = if (spare) try e.spare() else x;
+        // TF_DSV41_MHC_PF_FOLD: a whole mhc_pf site without taps and its `_finish_k` as one launch (`fold`)
+        const folded = e.o.mhc_pf_fold and n >= pf_rows and tap == null;
         if (n >= pf_rows) {
-            try e.ext("tf_dsv41_mhc_pf_v1.run", &.{
-                x,                            if (post) xout else b0,
+            const site_args = [12]Arg{
+                x,                                   if (post) xout else b0,
                 if (post) try gathered(e, which) else b0, if (post) prev[1] else f0,
-                if (post) prev[2] else f0,    if (mode != .site1) prev[0] else f0,
-                fnw,                          part,
-                c,                            tap orelse b0,
-                .{ .i = n },                  .{ .i = @intFromEnum(mode) },
-            });
+                if (post) prev[2] else f0,           if (mode != .site1) prev[0] else f0,
+                fnw,                                 part,
+                c,                                   tap orelse b0,
+                .{ .i = n },                         .{ .i = @intFromEnum(mode) },
+            };
+            if (folded) try s.fold(L, which, site_args, next, try e.weight("L{d}.{s}", .{ L, if (std.mem.eql(u8, which, "hc_attn")) "attn_norm" else "ffn_norm" }, .f32, &.{D})) else try e.ext("tf_dsv41_mhc_pf_v1.run", &site_args);
         } else try s.siteTriton(x, if (post) xout else null, if (post) try gathered(e, which) else null, prev, if (mode != .site1) prev[0] else null, fnw, part, c, tap, if (mode == .site1) 1 else 2, true);
-        try s.finish(.{ L, which }, next, try e.weight("L{d}.{s}", .{ L, if (std.mem.eql(u8, which, "hc_attn")) "attn_norm" else "ffn_norm" }, .f32, &.{D}), part, c, 0);
+        if (!folded) try s.finish(.{ L, which }, next, try e.weight("L{d}.{s}", .{ L, if (std.mem.eql(u8, which, "hc_attn")) "attn_norm" else "ffn_norm" }, .f32, &.{D}), part, c, 0);
         e.coef = 1 - e.coef;
         if (spare) e.cur = 1 - e.cur;
     }
@@ -403,6 +406,27 @@ const Seg = struct {
             .{ .name = "COLLAPSE", .arg = .{ .i = collapse } },           .{ .name = "MIX", .arg = .{ .b = mix } },
             .{ .name = "TAP_ON", .arg = .{ .b = tap != null } },           .{ .name = "SPLIT", .arg = .{ .b = split } },
         });
+    }
+
+    /// `site_args` then `finish`'s as one fold run; "w.mhc.fcnt" starts zero in the arena and the kernel resets it.
+    fn fold(s: *Seg, L: u32, which: []const u8, site_args: [12]Arg, next: [3]Arg, nw: Arg) !void {
+        const e = s.e;
+        const D: i64 = e.cfg.hidden;
+        const tail = [12]Arg{
+            try e.weight("L{d}.{s}.base", .{ L, which }, .f32, &.{6 * @as(i64, e.cfg.hc_mult)}),
+            try e.weight("L{d}.{s}.scale", .{ L, which }, .f32, &.{3}),
+            next[0],
+            next[1],
+            next[2],
+            nw,
+            try rowsOf(e, try e.buf("w.out", .{}, .bf16, &.{ e.n, D }), .bf16, 0, e.n, D),
+            try e.buf("w.mhc.fcnt", .{}, .i32, &.{cdiv(e.n, 16)}),
+            .{ .f = E.dec(e.cfg.eps) },
+            .{ .f = E.dec(e.cfg.hc_eps) },
+            .{ .f = E.dec(e.cfg.hc_post_alpha) },
+            .{ .i = e.cfg.hc_sinkhorn_iters },
+        };
+        try e.ext("tf_dsv41_mhc_pf_fold_v1.run", &(site_args ++ tail));
     }
 
     /// mhc._finish: the partials' sums, the next coefficients (a layer's site) and the normed input into "w.out".

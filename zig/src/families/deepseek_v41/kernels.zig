@@ -14,6 +14,8 @@ pub const replay = @import("kernels_replay.zig");
 pub const ops = @import("kernels_ops.zig");
 /// router_gemv2.cu's prefill router launch (TF_DSV41_RG_V2, its own optional module)
 pub const rg2 = @import("kernels_rg2.zig");
+/// mhc_pf_fold.cu's prefill site + finish launch (TF_DSV41_MHC_PF_FOLD, its own optional module)
+pub const fold = @import("kernels_fold.zig");
 /// sampling.cu (its own module, loaded by the keyed sampler)
 pub const sampling = @import("sampling_kernels.zig");
 /// vision.cu (its own module, loaded by the vision tower on rank 0)
@@ -74,6 +76,12 @@ const Rg2Blob = struct {
 };
 pub const rg2_image: []const u8 = &Rg2Blob.bytes;
 
+/// mhc_pf_fold.cu (ours, TF_DSV41_MHC_PF_FOLD): optional as lin2.cu, an empty image when the build has none.
+const FoldBlob = struct {
+    pub const bytes align(16) = @embedFile("dsv41_fatbin_dsv41_mhc_pf_fold").*;
+};
+pub const fold_image: []const u8 = &FoldBlob.bytes;
+
 fn env(name: [:0]const u8) ?[]const u8 {
     const v = std.c.getenv(name) orelse return null;
     return std.mem.span(v);
@@ -115,6 +123,8 @@ pub const Kernels = struct {
         });
         errdefer if (k.dense.lin2) |*l| l.module.unload();
         try k.loadRg2(d, try rg2.enabled(env("TF_DSV41_RG_V2")));
+        errdefer if (k.ops.rg2) |*r| r.module.unload();
+        try k.loadFold(d, try fold.enabled(env("TF_DSV41_MHC_PF_FOLD")), optin);
         return k;
     }
 
@@ -126,6 +136,16 @@ pub const Kernels = struct {
         errdefer m.unload();
         k.ops.rg2 = try rg2.Rg2.resolve(m);
         std.log.scoped(.dsv41).info("router v2: prefill route launches of {d}+ rows as gemv2_kernel<16, 8, 8> (TF_DSV41_RG_V2)", .{rg2.min_rows});
+    }
+
+    /// TF_DSV41_MHC_PF_FOLD: mhc_pf_fold.cu behind ops.Ops.mhcFold; refused without its fatbin (optional).
+    pub fn loadFold(k: *Kernels, d: *const cuda.Driver, on: bool, optin: u32) !void {
+        if (!on) return;
+        if (fold_image.len == 0) return error.MhcFoldKernelNotBuilt;
+        var m = try cuda.Module.load(d, fold_image);
+        errdefer m.unload();
+        k.ops.mhc_fold = try fold.Fold.resolve(m, optin);
+        std.log.scoped(.dsv41).info("mhc fold: a prefill site's mhc_pf.run and `_finish_k` as one fold_kernel launch (TF_DSV41_MHC_PF_FOLD)", .{});
     }
 
     /// TF_DSV41_LIN2: lin2.cu's module and instances behind the dense launches (dense.Ops); refused when the build
@@ -143,6 +163,7 @@ pub const Kernels = struct {
     pub fn deinit(k: *Kernels) void {
         if (k.dense.lin2) |*l| l.module.unload();
         if (k.ops.rg2) |*r| r.module.unload();
+        if (k.ops.mhc_fold) |*f| f.module.unload();
         for (&k.mods) |*m| m.unload();
     }
 
@@ -181,4 +202,5 @@ test {
     std.testing.refAllDecls(ops.Ops);
     std.testing.refAllDecls(ops.Functions);
     std.testing.refAllDecls(rg2);
+    std.testing.refAllDecls(fold);
 }

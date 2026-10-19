@@ -54,7 +54,7 @@ test "TF_DSV41_PF_4K: 0 / 1 only, refused without TF_DSV41_PF_4K_MEMORY_OK=1, 4,
     try testing.expectError(error.BadKnob, pk.prefillRows(&Fake.get));
 }
 
-fn widths(a: std.mem.Allocator) !block.Widths {
+pub fn widths(a: std.mem.Allocator) !block.Widths {
     var w: block.Widths = .{};
     try check.parseDense(a, &w, @embedFile("fixtures/q28v2-dense-k2.txt"));
     try check.parseExperts(a, &w, @embedFile("fixtures/q28v2-expert-k2.txt"));
@@ -209,7 +209,7 @@ test "TF_DSV41_PF_4K leaves a segment of 2,048 rows or fewer as it was, launch f
 }
 
 /// Two arguments with the same contents (tensors by role, dtype, shape, strides and offset; lists item by item).
-fn argEql(p: calls.Arg, q: calls.Arg) bool {
+pub fn argEql(p: calls.Arg, q: calls.Arg) bool {
     if (std.meta.activeTag(p) != std.meta.activeTag(q)) return false;
     return switch (p) {
         .t, .opaque_table => |t| blk: {

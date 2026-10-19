@@ -7,6 +7,8 @@ const std = @import("std");
 const cuda = @import("cuda");
 const fitShared = @import("kernels_exl3.zig").fitShared;
 const rg2 = @import("kernels_rg2.zig");
+/// mhc_pf_fold.cu (TF_DSV41_MHC_PF_FOLD): a prefill site and its finish in one launch, its own optional module
+pub const mhc_fold = @import("kernels_fold.zig");
 
 fn dim(x: usize) u32 {
     return @intCast(x);
@@ -437,6 +439,8 @@ pub const Functions = struct {
     narrow: [rg.rts.len][rg.narrow.len]cuda.Function,
     /// TF_DSV41_RG_V2: router_gemv2.cu's prefill launch, set by Kernels.load when the knob asks for it
     rg2: ?rg2.Rg2 = null,
+    /// TF_DSV41_MHC_PF_FOLD: mhc_pf_fold.cu's three site modes, set by Kernels.load when the knob asks for it
+    mhc_fold: ?mhc_fold.Fold = null,
     pfd: [pfd.k2s.len][2][pfd.cfgs.len]?cuda.Function, // [k2][lanes][cfg]; K2 16 has no lanes kernels
     pfd_dequant: [pfd.k2s.len][2]?cuda.Function,
     gate_copy: cuda.Function,
@@ -472,6 +476,7 @@ pub const Functions = struct {
     pub fn resolve(m_attn: cuda.Module, m_topk: cuda.Module, m_mhc: cuda.Module, m_mhc_pf: cuda.Module, m_rg: cuda.Module, pf: [4]cuda.Module, m_gate: cuda.Module, m_pace: cuda.Module, m_l2pf: cuda.Module, m_keys: cuda.Module, m_pw: cuda.Module, m_kv: cuda.Module, m_glue: cuda.Module, m_pfglue: cuda.Module, m_topk_b: cuda.Module, optin: u32) !Functions {
         var f: Functions = undefined;
         f.rg2 = null;
+        f.mhc_fold = null;
         inline for (0..8) |i| f.attn[i] = try m_attn.function(attn.symbol(if (i >= 4) 4 else 2, (i & 2) != 0, (i & 1) != 0));
         inline for (f.attn, 0..) |fun, i| {
             if (!try fitShared(fun, attn.symbol(if (i >= 4) 4 else 2, (i & 2) != 0, (i & 1) != 0), attn.SMEM, optin)) return error.SharedMemoryTooSmall;
@@ -757,6 +762,15 @@ pub const Ops = struct {
         args.add(a);
         const R: usize = @intCast(a.R);
         try o.go(o.f.mhc_pf[i], .{ mhc_pf.NB, (R + mhc_pf.BM - 1) / mhc_pf.BM, 1 }, mhc_pf.NT, mhc_pf.smem(mhc_pf.instances[i].fn32), null, &args);
+    }
+
+    /// mhc_pf_fold.cu's dispatch (TF_DSV41_MHC_PF_FOLD): mhcSite's mode `mode` and its `_finish_k` as one launch.
+    pub fn mhcFold(o: Ops, a: mhc_fold.Args, mode: u32) !void {
+        const v = o.f.mhc_fold orelse return error.MhcFoldNotLoaded;
+        try mhc_fold.check(a, mode);
+        var args: cuda.Args = .{};
+        args.add(a);
+        try o.go(v.f[mode], mhc_fold.grid(@intCast(a.s.R)), mhc_fold.NT, mhc_fold.smem, null, &args);
     }
 
     /// dsv41_rg_route_cuda: (rt, nw, ew) a wide instance, or ew 0 the narrow kernel. The narrow kernel's shared
