@@ -88,9 +88,10 @@ test "direct reads return the same bytes as buffered reads" {
     const gpa = std.testing.allocator;
     var f = try File.open("/proc/self/exe");
     defer f.close();
-    var plain = try File.open("/proc/self/exe");
+    const plain_fd = std.c.open("/proc/self/exe", .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+    try std.testing.expect(plain_fd >= 0);
+    var plain: File = .{ .fd = plain_fd, .direct = false };
     defer plain.close();
-    plain.direct = false;
     const buf = try gpa.alignedAlloc(u8, .fromByteUnits(alignment), 1 << 20);
     defer gpa.free(buf);
     const want = try gpa.alloc(u8, 1 << 19);
