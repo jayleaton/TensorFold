@@ -1,4 +1,4 @@
-// x3gm v4 M1 (PORT.md 9.5, proto only): gm2_kernel<2, 2, GM_GU1>'s gate/up, warp-specialised; the same Xd bytes.
+// x3gm v4 M1b (PORT.md 9.5, proto only): gm2_kernel<2, 2, GM_GU1>'s gate/up with a loader warp; the same Xd bytes.
 
 #pragma once
 
@@ -16,17 +16,15 @@ struct Args4 {
     int* ticket;              // [1] zeroed, or null (static stride)
 };
 
-template <int K2, int NS, int ND>
+template <int K2, int NS>
 struct Cfg4 {
-    static constexpr int DECODERS = 3, CONSUMERS = 16, WARPS = 1 + DECODERS + CONSUMERS, THREADS = WARPS * 32;
+    static constexpr int WORKERS = 16, WARPS = 1 + WORKERS, THREADS = WARPS * 32;
     static constexpr int BM = 128, TILES = 2 * NB, TW = 4 * K2, ER = 32, LDE = 132, MD = 2, META = BM + 4;
     static constexpr int ROW_B = 2 * BM * 32;                  // a stage's rows: [input][member][16 halves]
     static constexpr int WORD_B = TILES * TW * 4;              // a stage's words: [matrix][column tile][TW]
-    static constexpr int STAGE = ROW_B + WORD_B, DEC_B = TILES * 32 * 16;
-    static constexpr int EPI_B = 2 * ER * LDE * 4;
-    static constexpr int DEC_OFF = NS * STAGE, EPI_OFF = DEC_OFF + ND * DEC_B, META_OFF = EPI_OFF + EPI_B;
-    static constexpr int BAR_OFF = META_OFF + MD * META * 4;   // full / empty [NS], dfull / dempty [ND], meta [MD]
-    static constexpr int SMEM = BAR_OFF + 8 * (2 * NS + 2 * ND + 2 * MD);
+    static constexpr int STAGE = ROW_B + WORD_B, EPI_B = 2 * ER * LDE * 4;
+    static constexpr int EPI_OFF = NS * STAGE, META_OFF = EPI_OFF + EPI_B, BAR_OFF = META_OFF + MD * META * 4;
+    static constexpr int SMEM = BAR_OFF + 8 * (2 * NS + 2 * MD);  // full / empty [NS], meta full / empty [MD]
     static_assert(STAGE % 16 == 0 && BAR_OFF % 8 == 0, "16-byte stages, 8-byte barriers");
     static_assert(SMEM <= 101376, "one CTA an SM: the opt-in shared memory of a block");
 };
@@ -57,15 +55,15 @@ __device__ __forceinline__ void consumers_sync() { asm volatile("bar.sync 1, 512
 // member row r's 16-byte chunk c in a stage: the chunk flips every 4 rows, so an ldmatrix phase is conflict-free
 __device__ __forceinline__ int row_chunk(int r, int c) { return 2 * r + (c ^ ((r >> 2) & 1)); }
 
-template <int K2, int NS, int ND>
+template <int K2, int NS>
 __device__ __forceinline__ void gm4_loader(const Args& a, const Args4& b, unsigned char* smem) {
-    using C = Cfg4<K2, NS, ND>;
-    constexpr int TW = C::TW, WCH = C::TILES * K2;            // word chunks a stage (16 bytes each)
+    using C = Cfg4<K2, NS>;
+    constexpr int TW = C::TW, WCH = C::TILES * K2, RQ = C::BM / 16;  // word chunks a stage; rows a lane
     const int lane = threadIdx.x & 31, K = a.K, KT = K >> 4, NTILES = a.N >> 4, NBLK = a.N >> 7;
-    const int total = b.npass[0] * NBLK;
+    const int total = b.npass[0] * NBLK, c = lane & 1;       // lane pairs copy a row's 32 bytes (whole sectors)
     const size_t se = (size_t)KT * NTILES * TW;
     uint64_t* bars = reinterpret_cast<uint64_t*>(smem + C::BAR_OFF);
-    uint64_t *full = bars, *empty = bars + NS, *mfull = bars + 2 * NS + 2 * ND, *mempty = mfull + C::MD;
+    uint64_t *full = bars, *empty = bars + NS, *mfull = bars + 2 * NS, *mempty = mfull + C::MD;
     int j = 0;
     for (int mi = 0;; ++mi) {
         const int ms = mi % C::MD;
@@ -82,12 +80,16 @@ __device__ __forceinline__ void gm4_loader(const Args& a, const Args4& b, unsign
         }
         const int tt = item / NBLK, nb = item % NBLK;
         const int e = b.pe[tt], off = b.poff[tt], cnt = b.pcnt[tt];
-        int rofs[C::BM / 32];                                  // member lane + 32 q's row offset (-1: absent)
 #pragma unroll
         for (int q = 0; q < C::BM / 32; ++q) {
-            const int i = lane + 32 * q, row = i < cnt ? a.order[off + i] : -1;
-            meta[4 + i] = row;
-            rofs[q] = row < 0 ? -1 : row * K;
+            const int i = lane + 32 * q;
+            meta[4 + i] = i < cnt ? a.order[off + i] : -1;
+        }
+        int rofs[RQ];                                          // member (lane >> 1) + 16 q's row offset (-1: absent)
+#pragma unroll
+        for (int q = 0; q < RQ; ++q) {
+            const int i = (lane >> 1) + 16 * q;
+            rofs[q] = i < cnt ? a.order[off + i] * K + c * 8 : -1;
         }
         if (lane == 0) {
             meta[0] = item;
@@ -104,16 +106,12 @@ __device__ __forceinline__ void gm4_loader(const Args& a, const Args4& b, unsign
             unsigned char* st = smem + (size_t)s * C::STAGE;
             half* ra = reinterpret_cast<half*>(st);
 #pragma unroll
-            for (int q = 0; q < C::BM / 32; ++q) {
+            for (int q = 0; q < RQ; ++q) {
                 if (rofs[q] < 0) continue;
-                const int r = lane + 32 * q;
+                const int r = (lane >> 1) + 16 * q;
 #pragma unroll
-                for (int m = 0; m < 2; ++m) {
-                    const half* src = (m ? a.x1 : a.x0) + rofs[q] + kt * 16;
-#pragma unroll
-                    for (int c = 0; c < 2; ++c)
-                        cp_async16(ra + (m * C::BM * 2 + row_chunk(r, c)) * 8, src + c * 8, true);
-                }
+                for (int m = 0; m < 2; ++m)
+                    cp_async16(ra + (m * C::BM * 2 + row_chunk(r, c)) * 8, (m ? a.x1 : a.x0) + rofs[q] + kt * 16, true);
             }
             uint32_t* rw = reinterpret_cast<uint32_t*>(st + C::ROW_B);
             const size_t w0 = ((size_t)kt * NTILES + nb * NB) * TW;  // the block's 8 tiles are contiguous a matrix
@@ -126,57 +124,19 @@ __device__ __forceinline__ void gm4_loader(const Args& a, const Args4& b, unsign
     }
 }
 
-template <int K2, int NS, int ND>
-__device__ __forceinline__ void gm4_decoder(const Args& a, unsigned char* smem, int dw) {
-    using C = Cfg4<K2, NS, ND>;
-    const int lane = threadIdx.x & 31, KT = a.K >> 4;
-    uint64_t* bars = reinterpret_cast<uint64_t*>(smem + C::BAR_OFF);
-    uint64_t *full = bars, *empty = bars + NS, *dfull = bars + 2 * NS, *dempty = dfull + ND;
-    uint64_t *mfull = dempty + ND, *mempty = mfull + C::MD;
-    const LaneMap<K2> map(lane);
-    int j = 0;
-    for (int mi = 0;; ++mi) {
-        const int ms = mi % C::MD;
-        mb_wait(&mfull[ms], (mi / C::MD) & 1);
-        const bool live = reinterpret_cast<const int*>(smem + C::META_OFF)[ms * C::META] >= 0;
-        __syncwarp();
-        if (lane == 0) mb_arrive(&mempty[ms]);
-        if (!live) return;
-        for (int kt = 0; kt < KT; ++kt, ++j) {
-            const int s = j % NS, d = j % ND;
-            mb_wait(&full[s], (j / NS) & 1);
-            if (j >= ND) mb_wait(&dempty[d], ((j / ND) & 1) ^ 1);
-            const uint32_t* rw = reinterpret_cast<const uint32_t*>(smem + (size_t)s * C::STAGE + C::ROW_B);
-            uint4* dec = reinterpret_cast<uint4*>(smem + C::DEC_OFF + (size_t)d * C::DEC_B);
-#pragma unroll
-            for (int t = 0; t < (C::TILES + C::DECODERS - 1) / C::DECODERS; ++t) {
-                const int tile = dw + C::DECODERS * t;         // matrix tile / 8, column tile tile % 8
-                if (tile >= C::TILES) break;
-                uint32_t af[4];
-                decode_a<K2>(rw + tile * C::TW, map, af);
-                dec[tile * 32 + lane] = make_uint4(af[0], af[1], af[2], af[3]);
-            }
-            __syncwarp();
-            if (lane == 0) {
-                mb_arrive(&dfull[d]);
-                mb_arrive(&empty[s]);
-            }
-        }
-    }
-}
-
-template <int K2, int NS, int ND>
-__device__ __forceinline__ void gm4_consumer(const Args& a, unsigned char* smem, int cw) {
-    using C = Cfg4<K2, NS, ND>;
+// worker cw: matrix cw / 8, column tile cw % 8, all 128 members; decodes its tile once a k tile (v2: once a 64)
+template <int K2, int NS>
+__device__ __forceinline__ void gm4_worker(const Args& a, unsigned char* smem, int cw) {
+    using C = Cfg4<K2, NS>;
     constexpr int ER = C::ER, LDE = C::LDE;
     const int lane = threadIdx.x & 31, KT = a.K >> 4, N = a.N;
-    const int mat = cw >> 3, ch = (cw >> 2) & 1, mg = cw & 3;  // matrix, 64-column half, 32-member group
+    const int mat = cw >> 3, ct = cw & 7;
     const int g = lane >> 2, t = lane & 3;
     const int lr = (lane & 7) + ((lane >> 4) << 3), lc = (lane >> 3) & 1;
     uint64_t* bars = reinterpret_cast<uint64_t*>(smem + C::BAR_OFF);
-    uint64_t *full = bars, *empty = bars + NS, *dfull = bars + 2 * NS, *dempty = dfull + ND;
-    uint64_t *mfull = dempty + ND, *mempty = mfull + C::MD;
+    uint64_t *full = bars, *empty = bars + NS, *mfull = bars + 2 * NS, *mempty = mfull + C::MD;
     float* ep = reinterpret_cast<float*>(smem + C::EPI_OFF);  // [matrix][ER members][LDE]
+    const LaneMap<K2> map(lane);
     int j = 0;
     for (int mi = 0;; ++mi) {
         const int ms = mi % C::MD;
@@ -184,64 +144,51 @@ __device__ __forceinline__ void gm4_consumer(const Args& a, unsigned char* smem,
         const int* meta = reinterpret_cast<const int*>(smem + C::META_OFF) + ms * C::META;
         if (meta[0] < 0) return;
         const int e = meta[1], nb = meta[2], cnt = meta[3];
-        const int n8 = min(max((cnt - 32 * mg + 7) >> 3, 0), 4);  // this warp's live n8 groups (warp-uniform)
-        float acc[4][4][4];
+        const int n8 = (cnt + 7) >> 3;                         // the item's n8 groups, 1..16 (block-uniform)
+        float acc[16][4];
 #pragma unroll
-        for (int l = 0; l < 4; ++l)
+        for (int n = 0; n < 16; ++n)
 #pragma unroll
-            for (int n = 0; n < 4; ++n)
-#pragma unroll
-                for (int c = 0; c < 4; ++c) acc[l][n][c] = 0.f;
+            for (int q = 0; q < 4; ++q) acc[n][q] = 0.f;
         for (int kt = 0; kt < KT; ++kt, ++j) {
-            const int s = j % NS, d = j % ND;
+            const int s = j % NS;
             mb_wait(&full[s], (j / NS) & 1);
-            mb_wait(&dfull[d], (j / ND) & 1);
-            if (n8 > 0) {
-                const half* ra = reinterpret_cast<const half*>(smem + (size_t)s * C::STAGE) + mat * C::BM * 16;
-                uint32_t bf[2][4];
+            const unsigned char* st = smem + (size_t)s * C::STAGE;
+            uint32_t af[4];
+            const uint32_t* tile = reinterpret_cast<const uint32_t*>(st + C::ROW_B) + (mat * NB + ct) * C::TW;
+            decode_a<K2>(tile, map, af);
+            const half* ra = reinterpret_cast<const half*>(st) + mat * C::BM * 16;
 #pragma unroll
-                for (int np = 0; np < 2; ++np) {
-                    const int r = 32 * mg + 16 * np + lr;
-                    if (2 * np < n8) ldsm4(bf[np], ra + row_chunk(r, lc) * 8);
-                }
-                const uint4* dec = reinterpret_cast<const uint4*>(smem + C::DEC_OFF + (size_t)d * C::DEC_B);
-#pragma unroll
-                for (int l = 0; l < 4; ++l) {
-                    const uint4 v = dec[(mat * NB + 4 * ch + l) * 32 + lane];
-                    const uint32_t af[4] = {v.x, v.y, v.z, v.w};
-#pragma unroll
-                    for (int n = 0; n < 4; ++n) {
-                        if (n < n8) {
-                            const uint32_t b2[2] = {bf[n >> 1][2 * (n & 1)], bf[n >> 1][2 * (n & 1) + 1]};
-                            mma16816(acc[l][n], af, b2);
-                        }
-                    }
+            for (int np = 0; np < 8; ++np) {
+                if (2 * np < n8) {                             // warp-uniform
+                    uint32_t bf[4];
+                    ldsm4(bf, ra + row_chunk(16 * np + lr, lc) * 8);
+                    const uint32_t b01[2] = {bf[0], bf[1]}, b23[2] = {bf[2], bf[3]};
+                    mma16816(acc[2 * np], af, b01);
+                    if (2 * np + 1 < n8) mma16816(acc[2 * np + 1], af, b23);
                 }
             }
             __syncwarp();
-            if (lane == 0) {
-                mb_arrive(&empty[s]);
-                mb_arrive(&dempty[d]);
-            }
+            if (lane == 0) mb_arrive(&empty[s]);
         }
 
-        // gm2_item's epilogue; round n = n8 group n of every member group, so acc[.][n] dies with it (no spills)
+        // gm2_item's epilogue; round rd = n8 groups 4 rd .. + 3 (members 32 rd ..), whose accumulators die with it
 #pragma unroll
-        for (int n = 0; n < 4; ++n) {
-            if (8 * n >= cnt) break;                           // block-uniform among consumers
+        for (int rd = 0; rd < 4; ++rd) {
+            if (32 * rd >= cnt) break;                         // block-uniform among workers
             consumers_sync();                                  // the last round's readers are done with ep
-            float* E = ep + ((size_t)mat * ER + 8 * mg + 2 * t) * LDE + ch * 64 + g;
 #pragma unroll
-            for (int l = 0; l < 4; ++l) {
-                E[l * 16] = acc[l][n][0];
-                E[LDE + l * 16] = acc[l][n][1];
-                E[l * 16 + 8] = acc[l][n][2];
-                E[LDE + l * 16 + 8] = acc[l][n][3];
+            for (int nn = 0; nn < 4; ++nn) {
+                float* E = ep + ((size_t)mat * ER + 8 * nn + 2 * t) * LDE + ct * 16 + g;
+                E[0] = acc[4 * rd + nn][0];
+                E[LDE] = acc[4 * rd + nn][1];
+                E[8] = acc[4 * rd + nn][2];
+                E[LDE + 8] = acc[4 * rd + nn][3];
             }
             consumers_sync();
 #pragma unroll
-            for (int h = 0; h < ER / C::CONSUMERS; ++h) {
-                const int r = cw + C::CONSUMERS * h, m = 32 * (r >> 3) + 8 * n + (r & 7);
+            for (int h = 0; h < ER / C::WORKERS; ++h) {
+                const int r = cw + C::WORKERS * h, m = 32 * rd + r;
                 if (m >= cnt) continue;
                 const int row = meta[4 + m];
                 const int c0 = 4 * lane;
@@ -265,43 +212,40 @@ __device__ __forceinline__ void gm4_consumer(const Args& a, unsigned char* smem,
                 o[1] = __halves2half2(__float2half_rn(v[2] * HAD), __float2half_rn(v[3] * HAD));
             }
         }
+        int mr = mi;                                           // an opaque copy: the slot is recomputed, not kept
+        asm volatile("mov.u32 %0, %0;\n" : "+r"(mr));
         __syncwarp();
-        if (lane == 0) mb_arrive(&mempty[ms]);
+        if (lane == 0) mb_arrive(&mempty[mr % C::MD]);
     }
 }
 
 // gate/up of b's passes; a as gm2_kernel's (x0 / x1, t0 / t1 or tp0 / tp1, order, scales, xd), its plan unused
-template <int K2, int NS, int ND>
-__global__ void __launch_bounds__(Cfg4<K2, NS, ND>::THREADS, 1) gm4_gu_kernel(const Args a, const Args4 b) {
-    using C = Cfg4<K2, NS, ND>;
+template <int K2, int NS>
+__global__ void __launch_bounds__(Cfg4<K2, NS>::THREADS, 1) gm4_gu_kernel(const Args a, const Args4 b) {
+    using C = Cfg4<K2, NS>;
     extern __shared__ __align__(16) unsigned char smem[];
     const int warp = threadIdx.x >> 5;
     if (threadIdx.x == 0) {
         uint64_t* bars = reinterpret_cast<uint64_t*>(smem + C::BAR_OFF);
         for (int i = 0; i < NS; ++i) {
             mb_init(&bars[i], 32);                             // full: the loader's lanes (cp.async arrivals)
-            mb_init(&bars[NS + i], C::DECODERS + C::CONSUMERS);  // empty: a lane of each reader warp
-        }
-        for (int i = 0; i < ND; ++i) {
-            mb_init(&bars[2 * NS + i], C::DECODERS);           // dfull
-            mb_init(&bars[2 * NS + ND + i], C::CONSUMERS);     // dempty
+            mb_init(&bars[NS + i], C::WORKERS);                // empty: a lane of each worker
         }
         for (int i = 0; i < C::MD; ++i) {
-            mb_init(&bars[2 * NS + 2 * ND + i], 32);           // meta full: the loader's lanes
-            mb_init(&bars[2 * NS + 2 * ND + C::MD + i], C::DECODERS + C::CONSUMERS);
+            mb_init(&bars[2 * NS + i], 32);                    // meta full: the loader's lanes
+            mb_init(&bars[2 * NS + C::MD + i], C::WORKERS);
         }
     }
     __syncthreads();
-    if (warp == 0) gm4_loader<K2, NS, ND>(a, b, smem);
-    else if (warp <= C::DECODERS) gm4_decoder<K2, NS, ND>(a, smem, warp - 1);
-    else gm4_consumer<K2, NS, ND>(a, smem, warp - 1 - C::DECODERS);
+    if (warp == 0) gm4_loader<K2, NS>(a, b, smem);
+    else gm4_worker<K2, NS>(a, smem, warp - 1);
 }
 
-// (K2, NS, ND): the deepest load ring beside a 2-deep decode ring; 6A: a 3-deep decode ring, one load stage less
-#define GM4_CFG_4 4, 5, 2
-#define GM4_CFG_6 6, 5, 2
-#define GM4_CFG_6A 6, 4, 3
-#define GM4_CFG_8 8, 4, 2
-#define GM4_CFG_10 10, 4, 2
+// (K2, NS): the deepest load ring that fits; 6A: a shallower ring at the same width (ring-depth sensitivity)
+#define GM4_CFG_4 4, 6
+#define GM4_CFG_6 6, 6
+#define GM4_CFG_6A 6, 4
+#define GM4_CFG_8 8, 6
+#define GM4_CFG_10 10, 6
 
 }  // namespace dsv41_x3gm

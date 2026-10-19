@@ -1,4 +1,4 @@
-// x3gm v4 M1 (gm4_gu_kernel, x3gm4.cuh) against production v2 gate/up gm2_kernel<2, 2, GM_GU1>: bytes, oracle, times.
+// x3gm v4 M1b (gm4_gu_kernel, x3gm4.cuh) against production v2 gate/up gm2_kernel<2, 2, GM_GU1>: bytes, oracle, times.
 #include "x3gm4.cuh"
 
 #include <algorithm>
@@ -50,10 +50,10 @@ __global__ void fill_half(half* p, size_t n, uint32_t seed, float lo, float hi) 
 using Kern4 = void (*)(const Args, const Args4);
 struct L4 { Kern4 k; int threads, smem; const char* name; };
 
-template <int K2, int NS, int ND>
+template <int K2, int NS>
 L4 make4(const char* name) {
-    using C = Cfg4<K2, NS, ND>;
-    Kern4 k = gm4_gu_kernel<K2, NS, ND>;
+    using C = Cfg4<K2, NS>;
+    Kern4 k = gm4_gu_kernel<K2, NS>;
     CK(cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM));
     CK(cudaFuncSetAttribute(k, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
     return {k, C::THREADS, C::SMEM, name};
