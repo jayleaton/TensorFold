@@ -265,6 +265,17 @@ pub fn prefetchAhead(get: Get) bool {
     return !std.mem.eql(u8, std.mem.trim(u8, v, " "), "0");
 }
 
+/// TF_DSV41_PF_PINSTAGE=1: the prefill's pinned Engram / ids staging made at the workspace segment's rows up front.
+pub fn pfPinStage(get: Get) bool {
+    const v = get("TF_DSV41_PF_PINSTAGE") orelse return false;
+    return std.mem.eql(u8, std.mem.trim(u8, v, " "), "1");
+}
+
+/// The rows ready() sizes the pinned staging for: the forward's, or the workspace segment's under TF_DSV41_PF_PINSTAGE.
+pub fn stageRows(rows: usize, big: u32, pin: bool) usize {
+    return if (pin) @max(rows, big) else rows;
+}
+
 /// TF_DSV41_KV_NORM_STORE=1: KV-only RMS + SWA RoPE/FP8 store, default off until GPU/reply gates pass.
 pub fn kvNormStore(get: Get) bool {
     const v = get("TF_DSV41_KV_NORM_STORE") orelse return false;
@@ -403,6 +414,7 @@ pub fn apply(f: *@import("forward.zig").Forward, a: std.mem.Allocator, io: std.I
     };
     if (try indexBudget(&env)) |b| f.opts.index_budget = b;
     f.prefill_state.ahead = prefetchAhead(&env);
+    f.prefill_state.pin_stage = pfPinStage(&env);
     f.opts.gm_v2 = try @import("gm2pf.zig").mode(&env);
     f.opts.mhc_pf_rows = try mhcPfRows(&env);
     f.prefill_state.mode = try prefillMode(&env);
