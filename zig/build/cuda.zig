@@ -79,6 +79,12 @@ var dsv41_vision_image: ?std.Build.LazyPath = null;
 const dsv41_lin2: Kernel = .{ .name = "dsv41_lin2", .src = "deepseek_v41/lin2", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } };
 var dsv41_lin2_image: ?std.Build.LazyPath = null;
 
+/// Ours, optional as lin2 (<name>.fatbin): an empty image when the build has none, and its knob refuses at boot.
+const dsv41_extra = [_]Kernel{
+    .{ .name = "dsv41_router_gemv2", .src = "deepseek_v41/router_gemv2", .flags = &.{ "-O3", "-lineinfo" } }, // TF_DSV41_RG_V2: router_gemv.cu's flags
+};
+var dsv41_extra_images: [dsv41_extra.len]?std.Build.LazyPath = @splat(null);
+
 /// The DeepSeek-V4.1 kernel module (zig/src/families/deepseek_v41/kernels.zig) over `cuda`; empty `images`: host-only.
 pub fn dsv41Kernels(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, images: []const ?std.Build.LazyPath) *std.Build.Module {
     const options = b.addOptions();
@@ -96,6 +102,10 @@ pub fn dsv41Kernels(b: *std.Build, target: std.Build.ResolvedTarget, optimize: s
     m.addAnonymousImport("dsv41_fatbin_dsv41_vision", .{ .root_source_file = vision orelse b.addWriteFiles().add("empty.fatbin", "") });
     const lin2 = if (with) dsv41_lin2_image else null;
     m.addAnonymousImport("dsv41_fatbin_dsv41_lin2", .{ .root_source_file = lin2 orelse b.addWriteFiles().add("empty.fatbin", "") });
+    for (dsv41_extra, dsv41_extra_images) |k, image| {
+        const file = (if (with) image else null) orelse b.addWriteFiles().add("empty.fatbin", "");
+        m.addAnonymousImport(b.fmt("dsv41_fatbin_{s}", .{k.name}), .{ .root_source_file = file });
+    }
     return m;
 }
 
@@ -192,6 +202,15 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
         } else |_| {}
     } else if (nvcc) |tool| dsv41_lin2_image = fatbin(b, tool, version.?, dsv41_lin2, sms);
     if (dsv41_lin2_image) |file| fatbin_step.dependOn(&b.addInstallFile(file, "fatbin/dsv41_lin2.fatbin").step);
+    for (dsv41_extra, &dsv41_extra_images) |k, *image| {
+        if (prebuilt) |dir| {
+            const file = b.pathJoin(&.{ dir, b.fmt("{s}.fatbin", .{k.name}) });
+            if (std.Io.Dir.cwd().access(b.graph.io, file, .{})) |_| {
+                image.* = b.graph.cwdRelativePath(file);
+            } else |_| {}
+        } else if (nvcc) |tool| image.* = fatbin(b, tool, version.?, k, sms);
+        if (image.*) |file| fatbin_step.dependOn(&b.addInstallFile(file, b.fmt("fatbin/{s}.fatbin", .{k.name})).step);
+    }
     const dsv41 = dsv41Kernels(b, target, optimize, cuda, if (nvcc != null or prebuilt != null) &dsv41_images else &.{});
     const mods = family(b, target, optimize, cuda, draft_ids);
     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = target, .optimize = optimize, .link_libc = true });

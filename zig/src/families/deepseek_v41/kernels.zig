@@ -12,6 +12,8 @@ pub const dense = @import("kernels_dense.zig");
 pub const kv_glue = @import("kernels_kv_glue.zig");
 pub const replay = @import("kernels_replay.zig");
 pub const ops = @import("kernels_ops.zig");
+/// router_gemv2.cu's prefill router launch (TF_DSV41_RG_V2, its own optional module)
+pub const rg2 = @import("kernels_rg2.zig");
 /// sampling.cu (its own module, loaded by the keyed sampler)
 pub const sampling = @import("sampling_kernels.zig");
 /// vision.cu (its own module, loaded by the vision tower on rank 0)
@@ -66,6 +68,12 @@ const Lin2Blob = struct {
 };
 pub const lin2_image: []const u8 = &Lin2Blob.bytes;
 
+/// router_gemv2.cu (ours, TF_DSV41_RG_V2): optional as lin2.cu, an empty image when the build has none.
+const Rg2Blob = struct {
+    pub const bytes align(16) = @embedFile("dsv41_fatbin_dsv41_router_gemv2").*;
+};
+pub const rg2_image: []const u8 = &Rg2Blob.bytes;
+
 fn env(name: [:0]const u8) ?[]const u8 {
     const v = std.c.getenv(name) orelse return null;
     return std.mem.span(v);
@@ -105,7 +113,19 @@ pub const Kernels = struct {
             lm.cluster = try dense.lin2Cluster(env("TF_DSV41_LIN2_CLUSTER"));
             break :blk lm;
         });
+        errdefer if (k.dense.lin2) |*l| l.module.unload();
+        try k.loadRg2(d, try rg2.enabled(env("TF_DSV41_RG_V2")));
         return k;
+    }
+
+    /// TF_DSV41_RG_V2: router_gemv2.cu behind ops.Ops.route's prefill launch; refused without its fatbin (optional).
+    pub fn loadRg2(k: *Kernels, d: *const cuda.Driver, on: bool) !void {
+        if (!on) return;
+        if (rg2_image.len == 0) return error.RouterV2KernelNotBuilt;
+        var m = try cuda.Module.load(d, rg2_image);
+        errdefer m.unload();
+        k.ops.rg2 = try rg2.Rg2.resolve(m);
+        std.log.scoped(.dsv41).info("router v2: prefill route launches of {d}+ rows as gemv2_kernel<16, 8, 8> (TF_DSV41_RG_V2)", .{rg2.min_rows});
     }
 
     /// TF_DSV41_LIN2: lin2.cu's module and instances behind the dense launches (dense.Ops); refused when the build
@@ -122,6 +142,7 @@ pub const Kernels = struct {
 
     pub fn deinit(k: *Kernels) void {
         if (k.dense.lin2) |*l| l.module.unload();
+        if (k.ops.rg2) |*r| r.module.unload();
         for (&k.mods) |*m| m.unload();
     }
 
@@ -159,4 +180,5 @@ test {
     std.testing.refAllDecls(ops);
     std.testing.refAllDecls(ops.Ops);
     std.testing.refAllDecls(ops.Functions);
+    std.testing.refAllDecls(rg2);
 }
