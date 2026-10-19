@@ -198,6 +198,7 @@ pub fn call(k: *const Kernels, s: cuda.Stream, ext: []const u8, func: []const u8
     if (is(ext, "tf_dsv41_mhc_cuda_v1") and is(func, "run")) return mhcRun(k.others(s), args, kwargs);
     if (is(ext, "tf_dsv41_mhc_cuda_v1") and is(func, "coef")) return mhcCoef(k.others(s), args, kwargs);
     if (is(ext, "tf_dsv41_mhc_pf_v1") and is(func, "run")) return mhcPfRun(k.others(s), args, kwargs);
+    if (is(ext, "tf_dsv41_mhc_pf_fold_v1") and is(func, "run")) return mhcPfFoldRun(k.others(s), args, kwargs);
     if (is(ext, "tf_dsv41_router_gemv_v2") and is(func, "route")) return route(k.others(s), args, kwargs);
     if (is(ext, "tf_dsv41_pfdense_v1")) return pfdenseExt(k.others(s), func, args, kwargs);
     if (is(ext, "tf_dsv41_l2pace_v1") and is(func, "paced")) return paced(k.others(s), args, kwargs);
@@ -686,12 +687,21 @@ fn mhcCoef(o: ops.Ops, args: []const Arg, kwargs: []const Kw) !bool {
 
 // tf_dsv41_mhc_pf_v1.run (mhc_pf.cpp / dsv41_mhc_pf_run_cuda)
 fn mhcPfRun(o: ops.Ops, args: []const Arg, kwargs: []const Kw) !bool {
-    const c: Call = .{ .args = args, .kwargs = kwargs, .names = &.{ "x", "xout", "g", "post", "comb", "pre", "fn", "part", "c", "tap", "R", "mode" } };
+    const c: Call = .{ .args = args, .kwargs = kwargs, .names = &pf_names };
+    const f = try c.tensor(6);
+    try o.mhcSite(try pfArgs(c), try c.u(11), f.dtype == .f32, numel(try c.tensor(9)) > 0);
+    return true;
+}
+
+const pf_names = [_][]const u8{ "x", "xout", "g", "post", "comb", "pre", "fn", "part", "c", "tap", "R", "mode" };
+
+/// mhc_pf.cpp's Args from its 12 parameters (the fold's first 12).
+fn pfArgs(c: Call) !ops.mhc_pf.Args {
     const x = try c.tensor(0);
     const g = try c.tensor(2);
     const f = try c.tensor(6);
     const tap = try c.tensor(9);
-    const a: ops.mhc_pf.Args = .{
+    return .{
         .x = tp(x),
         .xs = x.stride[0],
         .xout = tp(try c.tensor(1)),
@@ -709,7 +719,33 @@ fn mhcPfRun(o: ops.Ops, args: []const Arg, kwargs: []const Kw) !bool {
         .ts = stride0(tap),
         .R = @intCast(try c.int(10)),
     };
-    try o.mhcSite(a, try c.u(11), f.dtype == .f32, numel(tap) > 0);
+}
+
+// tf_dsv41_mhc_pf_fold_v1.run (ours, TF_DSV41_MHC_PF_FOLD): mhc_pf.run's 12 parameters, then `_finish_k`'s
+fn mhcPfFoldRun(o: ops.Ops, args: []const Arg, kwargs: []const Kw) !bool {
+    const c: Call = .{ .args = args, .kwargs = kwargs, .names = &(pf_names ++ [_][]const u8{ "base", "scale", "opre", "opost", "ocomb", "nw", "out", "cnt", "eps", "hc_eps", "post_alpha", "iters" }) };
+    const s = try pfArgs(c);
+    const cnt = try c.tensor(19);
+    // the fold's instances: bf16 fn, no taps; a counter a row tile
+    if ((try c.tensor(6)).dtype != .bf16 or s.tap != 0 or cnt.dtype != .i32 or s.R < 1) return error.WrongArgument;
+    if (numel(cnt) < @as(i64, @intCast(ops.mhc_fold.cntLen(@intCast(s.R))))) return error.WrongArgument;
+    const nw = try c.tensor(17);
+    try o.mhcFold(.{
+        .s = s,
+        .base = try c.ptr(12),
+        .scale = try c.ptr(13),
+        .opre = try c.ptr(14),
+        .opost = try c.ptr(15),
+        .ocomb = try c.ptr(16),
+        .nw = nw.ptr,
+        .nwbf16 = @intFromBool(nw.dtype == .bf16),
+        .out = try c.ptr(18),
+        .cnt = cnt.ptr,
+        .eps = @floatCast(try c.float(20)),
+        .hc_eps = @floatCast(try c.float(21)),
+        .post_alpha = @floatCast(try c.float(22)),
+        .iters = @intCast(try c.int(23)),
+    }, try c.u(11));
     return true;
 }
 
