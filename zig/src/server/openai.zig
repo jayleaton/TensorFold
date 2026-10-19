@@ -511,8 +511,8 @@ const Run = struct {
             const message = try json.newObject(a);
             try message.put(a, "role", .{ .string = "assistant" });
             const empty_null = r.srv.family != null and reply.content.len == 0; // the family's Python app: ``content or None``
-            const keeps_text = r.srv.config.wire == .spark; // the Spark server keeps a call's prose
-            try message.put(a, "content", if ((calls != null and !keeps_text) or empty_null) .null else .{ .string = reply.content });
+            // a call's prose is kept on every wire; empty prose beside calls is null (upstream's rule)
+            try message.put(a, "content", if ((calls != null and reply.content.len == 0) or empty_null) .null else .{ .string = reply.content });
             if (reply.reasoning) |t| if (t.len > 0) {
                 if (r.srv.family) |fam| {
                     const d = try fam.reasoningDelta(a, t);

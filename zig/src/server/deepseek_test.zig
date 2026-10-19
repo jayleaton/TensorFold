@@ -272,7 +272,8 @@ fn check(h: *Harness, a: Allocator) !void {
         const choice = v.get("choices").?.array[0];
         try testing.expectEqualStrings("tool_calls", choice.get("finish_reason").?.string);
         const msg = choice.get("message").?;
-        try testing.expect(msg.get("content").? == .null);
+        // a whole reply keeps its prose beside the call, as the stream does (upstream's rule on this wire)
+        try testing.expectEqualStrings("Checking.", msg.get("content").?.string);
         const calls = msg.get("tool_calls").?.array;
         try testing.expectEqual(@as(usize, 1), calls.len);
         try testing.expectEqualStrings("{\"city\":\"Paris\",\"days\":3}", calls[0].get("function").?.get("arguments").?.string);
