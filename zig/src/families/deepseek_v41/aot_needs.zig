@@ -216,6 +216,7 @@ pub const Served = struct {
         const knobs = @import("prod_knobs.zig");
         var o: block.Options = .{ .world = @intCast(try envInt("TF_TP_WORLD", 2)), .r1 = knobs.r1(&knobs.env) };
         if (std.c.getenv("TF_DSV41_EXPERT_TOPP")) |v| o.expert_topp = try std.fmt.parseFloat(f64, std.mem.span(v));
+        o.expert_min_k = try @import("expert_prune.zig").minK(&knobs.env);
         o.limit = try envInt("TF_DSV41_CONTEXT", o.limit);
         o.rope_rows = o.limit + 2048;
         if (try knobs.prefillRows(&knobs.env)) |r| o.prefill_rows = r;

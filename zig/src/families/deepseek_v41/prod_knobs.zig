@@ -410,6 +410,7 @@ pub fn apply(f: *@import("forward.zig").Forward, a: std.mem.Allocator, io: std.I
     f.opts.kv_norm_store = kvNormStore(&env);
     f.opts.router_group_rot = routerGroupRot(&env);
     f.opts.x3ld_epi = try x3ldEpi(&env);
+    f.opts.expert_min_k = try @import("expert_prune.zig").minK(&env);
     f.opts.pfd = try pfDense(a, io, &env);
     // TF_DSV41_PF_4K: the forward's own options (decode windows, the drafter, the buffer plan) keep 2,048-row
     // segments byte for byte; 4,096-row segments run in the prefill's own workspace (forward_prefill.K4)

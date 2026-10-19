@@ -36,6 +36,7 @@ test {
     _ = @import("engram_gate.zig");
     // dsq-zig-roundgraph-1: the round's launches (TF_DSV41_ROUND_GRAPH)
     _ = @import("round_graph.zig");
+    _ = @import("expert_prune.zig");
     // dsq-zig-ops-1: prepared weight folders (TF_DSV41_PREPARED)
     _ = @import("prepared.zig");
     _ = @import("boot_mem.zig");

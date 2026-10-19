@@ -29,6 +29,7 @@ test {
     _ = @import("ibound_test.zig");
     _ = @import("dev_arena_test.zig");
     _ = @import("x3ld_epi_test.zig");
+    _ = @import("expert_prune_test.zig");
 }
 
 fn widths(a: std.mem.Allocator) !block.Widths {
