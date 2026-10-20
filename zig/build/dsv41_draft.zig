@@ -38,6 +38,8 @@ pub fn steps(b: *std.Build) void {
             b.step("compile-dsv41-draft", "Emit Linux sampling and host drafting tests").dependOn(&test_bin.step);
         } else b.step("test-dsv41-draft", "Keyed sampling, DSpark and shared lane core host tests").dependOn(&b.addRunArtifact(test_bin).step);
     }
+    const serve = @import("dsv41_cuda.zig").module(b, b.graph.host, "draft_host_test.zig", false).import_table.get("dsv41_serve").?;
+    b.step("test-dsv41-serve", "DeepSeek serving tokenizer, chat encoding, DSML tools and sampling goldens").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = serve })).step);
 }
 
 fn server(b: *std.Build, target: std.Build.ResolvedTarget) *std.Build.Step.Compile {

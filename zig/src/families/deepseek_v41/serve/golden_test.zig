@@ -114,8 +114,8 @@ fn imageText(ctx: ?*anyopaque, _: json.Value) []const u8 {
     return s.*;
 }
 
-/// Each line of a gen_template.py golden rendered here: equal text, or a refusal where the reference refused.
-fn checkTemplates(lines: []const u8) !void {
+/// Each line of a gen_template.py / dsv41_reference.py golden rendered here: equal text, or a refusal where it refused.
+fn checkTemplates(lines: []const u8, source: []const u8) !void {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var it = std.mem.splitScalar(u8, lines, '\n');
@@ -123,11 +123,16 @@ fn checkTemplates(lines: []const u8) !void {
     var bad: usize = 0;
     var jinja: usize = 0;
     var efforts: usize = 0;
+    var skipped: usize = 0;
     while (it.next()) |line| {
         if (line.len == 0) continue;
         _ = arena.reset(.retain_capacity);
         const a = arena.allocator();
         const c = (try json.parseText(a, line)).ok;
+        if (c.get("skip") != null) { // a release golden no OpenAI request expresses (the line says why)
+            skipped += 1;
+            continue;
+        }
         cases += 1;
         var image_text: []const u8 = "";
         var opts: template.Options = .{
@@ -179,18 +184,23 @@ fn checkTemplates(lines: []const u8) !void {
             }
         }
     }
-    if (bad > 0 or env("TF_DSV41_GOLDEN") != null) std.debug.print("template golden: {d}/{d} equal to encoding.encode ({d} reasoning_effort values resolved as app.options does; {d} also the release chat_template.jinja's text)\n", .{ cases - bad, cases, efforts, jinja });
+    if (bad > 0 or env("TF_DSV41_GOLDEN") != null) std.debug.print("template golden: {d}/{d} equal to {s}, {d} skipped ({d} reasoning_effort values resolved as app.options does; {d} also the release chat_template.jinja's text)\n", .{ cases - bad, cases, source, skipped, efforts, jinja });
+    try testing.expect(cases > 0);
     try testing.expectEqual(@as(usize, 0), bad);
 }
 
 test "the chat encoding renders the committed conversations as the Python engine and the release template do" {
-    try checkTemplates(@import("dsv41_serve_fixtures").template);
+    try checkTemplates(@import("dsv41_serve_fixtures").template, "encoding.encode");
+}
+
+test "the chat encoding renders DeepSeek's own encoding.py conversations byte for byte" {
+    try checkTemplates(@import("dsv41_serve_fixtures").reference, "DeepSeek's encoding.py");
 }
 
 test "the chat encoding renders the full generated set (TF_DSV41_GOLDEN/template.jsonl)" {
     const data = try readGolden(testing.allocator, "template.jsonl") orelse return error.SkipZigTest;
     defer testing.allocator.free(data);
-    try checkTemplates(data);
+    try checkTemplates(data, "encoding.encode");
 }
 
 const tools = @import("tools.zig");
