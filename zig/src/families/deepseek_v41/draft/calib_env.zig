@@ -22,7 +22,7 @@
 //! - Nothing found (no directory, no matching entry): depth.default_costs, as before this knob, and a log line.
 //! - The depth's knobs: TF_DSV41_DEPTH (cost | static), TF_DSV41_DRAFT_DEPTH (cap 5 / static k 3; 0-15),
 //!   TF_DSV41_DRAFT_SKIP, TF_DSV41_DEPTH_JOINT (0 | 1 | 2), TF_DSV41_DEPTH_FAIR, TF_DSV41_DEPTH_HOST_MS,
-//!   TF_DSV41_GRAPH_ROWS_MAX.
+//!   TF_DSV41_GRAPH_ROWS_MAX, TF_DSV41_DRAFT_SKIP_SHARED (default off).
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const costs_mod = @import("costs.zig");
@@ -249,6 +249,7 @@ pub fn depthSettings(get: *const fn ([*:0]const u8) ?[]const u8) !depth.Settings
         if (s.cap > 15) return error.DraftDepth;
     } else s.cap = if (s.mode == .cost) 5 else 3;
     if (trimmed(get("TF_DSV41_DRAFT_SKIP"))) |v| s.skip = try flag(v, error.DraftSkip);
+    if (trimmed(get("TF_DSV41_DRAFT_SKIP_SHARED"))) |v| s.skip_shared = try flag(v, error.DraftSkipShared);
     if (trimmed(get("TF_DSV41_DEPTH_JOINT"))) |v| s.joint = if (std.mem.eql(u8, v, "2")) 2 else @intFromBool(try flag(v, error.DepthJoint));
     s.fair = try float(get("TF_DSV41_DEPTH_FAIR"), joint.fair, 0.0, 4.0);
     s.host_ms = try float(get("TF_DSV41_DEPTH_HOST_MS"), joint.host_ms, 0.0, 100.0);

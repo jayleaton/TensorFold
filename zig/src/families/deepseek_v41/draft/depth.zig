@@ -18,6 +18,7 @@ pub const Settings = struct {
     mode: Mode = .cost,
     cap: usize = 5,
     skip: bool = true,
+    skip_shared: bool = false, // TF_DSV41_DRAFT_SKIP_SHARED: with skip, a shared round's slot may verify none too
     joint: u2 = 1,
     fair: f64 = joint.fair,
     host_ms: f64 = joint.host_ms,
@@ -151,11 +152,12 @@ pub const Depth = struct {
         return 2.0 / (d.costs.windowMs(2) + d.costs.draft);
     }
 
+    /// A shared slot's zero (skip_shared) is priced as its lone one: E(0) = 1 at verify[0], the slot's own rate.
     fn least(d: *const Depth, alone: bool, first: ?u32) usize {
-        return if (d.set.skip and alone and first != null) 0 else 1;
+        return if (d.set.skip and (alone or d.set.skip_shared) and first != null) 0 else 1;
     }
 
-    /// Drafts to verify of `conf` (1 .. min(most, len, cap); 0 .. when alone with zero depth on and `first` known).
+    /// Drafts to verify of `conf` (1 .. min(most, len, cap); 0 .. alone or skip_shared, zero depth on, `first` known).
     pub fn choose(d: *Depth, slot: u32, conf: []const f64, most: usize, alone: bool, first: ?u32) !usize {
         const top = @min(@min(most, conf.len), d.set.cap);
         const st = try d.state(slot);
@@ -297,7 +299,9 @@ pub const Depth = struct {
             st.ms = null;
             for (a.conf[0..t.*], qb[0..t.*], 0..) |p, *q, j| q.* = d.cal.q(j, p);
             st.q1 = if (t.* > 0) qb[0] else null;
-            s.* = .{ .qs = qb[0..t.*], .least = if (t.* == 0 or (two and d.set.skip and a.first != null)) 0 else 1, .top = t.* };
+            // skip_shared: joint 1's zero is priced by the round's rows together, as mode 2's always is
+            const may_skip = (two or d.set.skip_shared) and d.set.skip and a.first != null;
+            s.* = .{ .qs = qb[0..t.*], .least = if (t.* == 0 or may_skip) 0 else 1, .top = t.* };
         }
         const r = d.jointRate(asks.len + other_windows);
         if (two) {
@@ -408,6 +412,39 @@ test "a lone window skips a weak first draft and keeps a strong chain" {
     try std.testing.expect(d.cal.kept[0] == 1.0 and d.stats.zero == 1);
     try std.testing.expectEqual(@as(usize, 1), try d.choose(0, &.{ 0.05, 0.05, 0.05, 0.05, 0.05 }, 5, false, 7));
     try std.testing.expectEqual(@as(usize, 5), try d.choose(1, &.{ 0.99, 0.99, 0.99, 0.99, 0.99 }, 5, true, 7));
+}
+
+test "skip_shared lets a shared round's weak slot verify none and leaves a strong chain's depth alone" {
+    const gpa = std.testing.allocator;
+    var verify: [16]f64 = undefined;
+    for (&verify, 0..) |*v, r| v.* = 21.4 + 4.6 * @as(f64, @floatFromInt(r));
+    const costs: Costs = .{ .verify = &verify, .draft = 3.52, .slot = 0.65 };
+    const weak = [_]f64{ 0.05, 0.05, 0.05, 0.05, 0.05 };
+    const strong = [_]f64{ 0.99, 0.99, 0.99, 0.99, 0.99 };
+    const asks = [_]Depth.Ask{
+        .{ .slot = 0, .conf = &weak, .most = 5, .first = 7 },
+        .{ .slot = 1, .conf = &strong, .most = 5, .first = 8 },
+        .{ .slot = 2, .conf = &weak, .most = 5 }, // no first draft to learn from: never zero
+    };
+    // joint 0 (prod: each slot's lone rate) and joint 1 (the round's rows priced together)
+    for ([_]u2{ 0, 1 }) |mode| {
+        var ks: [3][3]usize = undefined;
+        const sets = [_]Settings{ .{ .joint = mode }, .{ .joint = mode, .skip_shared = true }, .{ .joint = mode, .skip = false, .skip_shared = true } };
+        for (sets, &ks) |set, *out| {
+            var d = try Depth.init(gpa, costs, 5, set);
+            defer d.deinit();
+            try d.chooseJoint(&asks, 0, 0, false, out);
+            if (out[0] != 0) continue;
+            // a zero-depth shared window commits its 1 row and its bonus teaches the skipped draft, as a lone one's
+            try d.record(0, 1, 1, null);
+            d.bonus(0, 7);
+            try std.testing.expect(d.cal.kept[0] == 1.0 and d.stats.zero == 1);
+        }
+        try std.testing.expectEqualSlices(usize, &.{ 1, ks[0][1], 1 }, &ks[0]); // off: every drafting slot verifies one
+        try std.testing.expectEqualSlices(usize, &.{ 0, ks[0][1], 1 }, &ks[1]);
+        try std.testing.expectEqualSlices(usize, &ks[0], &ks[2]); // skip off: the flag alone changes nothing
+        try std.testing.expect(ks[0][1] >= 3);
+    }
 }
 
 test "high acceptance fills paid padding and preserves cold, prose, context and forward limits" {

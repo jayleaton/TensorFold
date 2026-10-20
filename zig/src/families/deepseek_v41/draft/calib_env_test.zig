@@ -128,6 +128,22 @@ test "the depth's knobs read as Python's" {
     try std.testing.expectError(error.DepthJoint, calib_env.depthSettings(&Env.get));
 }
 
+test "skipping a shared round's drafts is default off, changes no other knob and rejects invalid flags" {
+    Env.pairs = &.{};
+    var want = try calib_env.depthSettings(&Env.get);
+    try std.testing.expect(!want.skip_shared);
+    Env.pairs = &.{.{ "TF_DSV41_DRAFT_SKIP_SHARED", "0" }};
+    try std.testing.expectEqual(want, try calib_env.depthSettings(&Env.get));
+    want.skip_shared = true;
+    Env.pairs = &.{.{ "TF_DSV41_DRAFT_SKIP_SHARED", "1" }};
+    try std.testing.expectEqual(want, try calib_env.depthSettings(&Env.get));
+    Env.pairs = &.{.{ "TF_DSV41_DRAFT_SKIP_SHARED", " On " }};
+    try std.testing.expectEqual(want, try calib_env.depthSettings(&Env.get));
+    Env.pairs = &.{.{ "TF_DSV41_DRAFT_SKIP_SHARED", "2" }};
+    try std.testing.expectError(error.DraftSkipShared, calib_env.depthSettings(&Env.get));
+    Env.pairs = &.{};
+}
+
 test "TF_DSV41_CALIB=measure / zig: the engine measures; a stored Zig table is read back by zig only" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

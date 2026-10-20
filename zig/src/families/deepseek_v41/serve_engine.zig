@@ -141,7 +141,7 @@ pub const Served = struct {
         s.cfg.timed = if (std.c.getenv("TF_DSV41_DRAFT_TIMED")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
         // the depth policy as booted (Python's "M2 boot: DSpark on (depth ...)"): what a gate reads back from the log
         const dset = s.x.policy.depth.set;
-        std.log.info("dsv41 depth: {t}, cap {d}, skip {s}, joint {d}, drafts priced {s}", .{ dset.mode, dset.cap, if (dset.skip) "on" else "off", dset.joint, if (s.cfg.timed) "by the wall clock" else "from the cost tables" });
+        std.log.info("dsv41 depth: {t}, cap {d}, skip {s}, skip shared {s}, joint {d}, drafts priced {s}", .{ dset.mode, dset.cap, if (dset.skip) "on" else "off", if (dset.skip_shared) "on" else "off", dset.joint, if (s.cfg.timed) "by the wall clock" else "from the cost tables" });
         s.clock = .{ .io = io };
         s.core = lanes.Engine.init(gpa, &s.cfg, s.x.backend(), s.clock.clock());
         s.x.attach(&s.core);
