@@ -374,14 +374,22 @@ fn messagesOf(r: *R, messages: Value, o: Options) Error![]Msg {
     return merged.items;
 }
 
+/// ``find_last_user_index``'s skip (DeepSeek's encoding.py at 314113f): a turn of tool results only continues the call.
+fn onlyToolResults(blocks: []const Block) bool {
+    if (blocks.len == 0) return false;
+    for (blocks) |b| if (!b.tool) return false;
+    return true;
+}
+
 /// The prompt text for ``messages`` (a JSON array of OpenAI messages); error.Refused sets ``problem``.
 pub fn render(a: Allocator, messages: Value, o: Options, problem: *Problem) Error![]u8 {
     var r: R = .{ .a = a, .problem = problem };
     if (o.budget < 1 or o.budget > 100) return r.refuse("reasoning_effort must be 1-100 or low / medium / high / max", .{});
     const msgs = try messagesOf(&r, messages, o);
     const drop = o.drop_thinking and !(msgs.len > 0 and msgs[0].tools);
-    var last: ?usize = null; // the last user turn (or a system message after the first)
+    var last: ?usize = null; // the last user turn (or a system message after the first); tool results alone are not one
     for (msgs, 0..) |m, idx| if (m.role == .user or (m.role == .system and idx > 0)) {
+        if (m.role == .user and onlyToolResults(m.blocks.items)) continue;
         last = idx;
     };
     const thinking = o.thinking;
