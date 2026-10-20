@@ -184,6 +184,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         }
         return lfm2.open(a, gpa, io, o, problem);
     }
+    if (@import("minimax_m3").claims(o.model_type)) return @import("minimax_m3").refuse(api.Opened, a, io, o.dir, problem);
     problem.* = try std.fmt.allocPrint(a, "the native CUDA engine has no backend for {s} checkpoints yet", .{o.model_type});
     return null;
 }

@@ -204,6 +204,7 @@ fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
             .{ .name = "glm_cuda", .module = glmCuda(b, target, optimize, cuda, core, lanes, heat) },
             .{ .name = "qwen35", .module = qwen35 },
             .{ .name = "kolibri1", .module = kolibri1Module(b, target, optimize, cuda, core, lanes) },
+            .{ .name = "minimax_m3", .module = @import("minimax_m3_host.zig").module(b, target, optimize) },
         },
     });
     return .{ .api = api, .engines = mod };
