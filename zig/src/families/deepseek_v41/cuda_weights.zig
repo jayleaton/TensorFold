@@ -40,15 +40,16 @@ pub const Weights = struct {
         w.map.deinit(w.gpa);
         w.* = undefined;
     }
-    /// A failure closes admission. Host copy sources and device buffers remain owned until a successful drain.
+    /// A failure drains, then undoes this call's names and buffers for a retry. A failed drain keeps them and poisons.
     pub fn upload(w: *Weights, d: *const cuda.Driver, b: *const named.Builder) !void {
         if (w.poisoned) return error.UploadPoisoned;
         if (w.driver != null and w.driver.? != d) return error.WrongDriver;
+        const before: Mark = .{ .bufs = w.bufs.items.len, .bytes = w.bytes };
+        var added: std.ArrayList([]const u8) = .empty;
+        defer added.deinit(w.gpa);
+        errdefer w.rollback(before, added.items);
+        try added.ensureTotalCapacity(w.gpa, b.out.items.len);
         w.driver = d;
-        errdefer {
-            w.poisoned = true;
-            w.finish() catch {};
-        }
         var paired: std.AutoHashMapUnmanaged(usize, void) = .empty;
         defer paired.deinit(w.gpa);
         try paired.ensureTotalCapacity(w.gpa, @intCast(b.out.items.len));
@@ -65,17 +66,29 @@ pub const Weights = struct {
             defer w.gpa.free(pairs);
             for (pairs) |pair| {
                 if (paired.contains(pair[0]) or paired.contains(pair[1])) return error.DuplicateWeight;
-                try w.transfer(d, &.{ b.out.items[pair[0]], b.out.items[pair[1]] });
+                try w.transfer(d, &added, &.{ b.out.items[pair[0]], b.out.items[pair[1]] });
                 paired.putAssumeCapacity(pair[0], {});
                 paired.putAssumeCapacity(pair[1], {});
             }
         }
         for (b.out.items, 0..) |n, i| if (!paired.contains(i)) {
-            try w.transfer(d, &.{n});
+            try w.transfer(d, &added, &.{n});
         };
         try w.finish();
     }
-    fn transfer(w: *Weights, d: *const cuda.Driver, items: []const named.Named) !void {
+    const Mark = struct { bufs: usize, bytes: usize };
+    /// Only after a successful drain: this call's names out of the map, its buffers freed and `bytes` restored.
+    fn rollback(w: *Weights, before: Mark, added: []const []const u8) void {
+        w.finish() catch {
+            w.poisoned = true;
+            return;
+        };
+        for (added) |key| w.gpa.free(w.map.fetchRemove(key).?.key);
+        for (w.bufs.items[before.bufs..]) |*buf| buf.free();
+        w.bufs.shrinkRetainingCapacity(before.bufs);
+        w.bytes = before.bytes;
+    }
+    fn transfer(w: *Weights, d: *const cuda.Driver, added: *std.ArrayList([]const u8), items: []const named.Named) !void {
         var total: usize = 0;
         for (items, 0..) |n, i| {
             if (w.map.contains(n.name)) return error.DuplicateWeight;
@@ -103,7 +116,8 @@ pub const Weights = struct {
             @memcpy(copy[offset..][0..n.bytes.len], n.bytes);
             var sha: [32]u8 = @splat(0);
             if (w.digest) std.crypto.hash.sha2.Sha256.hash(n.bytes, &sha, .{});
-            w.map.putAssumeCapacity(keys[i], .{ .ptr = buf.ptr + offset, .len = n.bytes.len, .kind = n.kind, .sha256 = sha, .shape = n.shape, .rank = n.rank });
+            w.map.putAssumeCapacityNoClobber(keys[i], .{ .ptr = buf.ptr + offset, .len = n.bytes.len, .kind = n.kind, .sha256 = sha, .shape = n.shape, .rank = n.rank });
+            added.appendAssumeCapacity(keys[i]);
             offset += n.bytes.len;
         }
         w.bytes = held;

@@ -5,9 +5,12 @@ const mock = @import("load_mock.zig");
 const named = @import("named.zig");
 const Weights = @import("cuda_weights.zig").Weights;
 fn builder(a: std.mem.Allocator) !named.Builder {
+    return builderOf(a, &.{ "one", "two" });
+}
+fn builderOf(a: std.mem.Allocator, names: []const []const u8) !named.Builder {
     var b: named.Builder = .{ .gpa = a, .io = std.testing.io, .pack = undefined };
     errdefer b.deinit();
-    for ([_][]const u8{ "one", "two" }) |name| {
+    for (names) |name| {
         const key = try a.dupe(u8, name);
         errdefer a.free(key);
         const bytes = try a.alignedAlloc(u8, .@"16", 16);
@@ -42,6 +45,8 @@ test "copy and drain failures retain device owners until a successful close" {
     mock.fail_copy = true;
     mock.fail_sync = true;
     try t.expectError(error.NotReady, w.upload(&driver, &b));
+    try t.expectError(error.UploadPoisoned, w.upload(&driver, &b));
+    try t.expectEqual(@as(usize, 1), w.bufs.items.len);
     const result = w.close();
     if (result) |_| return error.UnsafeClose else |e| try t.expectEqual(error.NotReady, e);
     try t.expectEqual(@as(usize, 0), mock.freed);
@@ -49,6 +54,85 @@ test "copy and drain failures retain device owners until a successful close" {
     mock.fail_sync = false;
     try w.close();
     try t.expectEqual(mock.allocated, mock.freed);
+}
+test "a failed upload drains and rolls back for a retry, leaving no freed buffer in the owner list" {
+    var first = try builderOf(t.allocator, &.{"embed"});
+    defer first.deinit();
+    var second = try builderOf(t.allocator, &.{ "L0.moe.w1.suh", "L0.attn.wkv", "L0.moe.shared.0.w1.suh" });
+    defer second.deinit();
+    for ([_]bool{ false, true }) |stacks| {
+        var at: usize = 0;
+        while (true) : (at += 1) {
+            var driver = mock.init();
+            var fail = std.testing.FailingAllocator.init(t.allocator, .{});
+            var w: Weights = .{ .gpa = fail.allocator(), .pair_stacks = stacks };
+            try w.upload(&driver, &first);
+            fail.fail_index = fail.alloc_index + at;
+            const failed = if (w.upload(&driver, &second)) |_| false else |e| refused: {
+                try t.expectEqual(error.OutOfMemory, e);
+                break :refused true;
+            };
+            if (failed) {
+                try t.expect(!w.poisoned);
+                try t.expectEqual(@as(usize, 1), w.bufs.items.len);
+                try t.expectEqual(@as(u32, 1), w.map.count());
+                try t.expectEqual(@as(usize, 16), w.bytes);
+                for (second.out.items) |n| try t.expect(w.get(n.name) == null);
+                fail.fail_index = std.math.maxInt(usize);
+                try w.upload(&driver, &second);
+            }
+            for (w.bufs.items) |buf| try t.expect(mock.live[buf.ptr / 256]);
+            for (second.out.items) |n| try t.expect(w.get(n.name) != null);
+            try t.expectEqual(@as(usize, if (stacks) 3 else 4), w.bufs.items.len);
+            try w.close();
+            try t.expectEqual(mock.allocated, mock.freed);
+            try t.expectEqual(@as(usize, 0), mock.double_free);
+            try t.expectEqual(@as(usize, 0), mock.early_free);
+            if (!failed) break;
+        }
+        try t.expect(at > 4);
+    }
+}
+test "a failed copy whose drain succeeds rolls back, and the same weights upload on retry" {
+    var b = try builder(t.allocator);
+    defer b.deinit();
+    var driver = mock.init();
+    var w: Weights = .{ .gpa = t.allocator };
+    mock.fail_copy = true;
+    try t.expectError(error.NotReady, w.upload(&driver, &b));
+    try t.expect(!w.poisoned);
+    try t.expectEqual(@as(usize, 0), w.bufs.items.len);
+    try t.expectEqual(@as(u32, 0), w.map.count());
+    try t.expectEqual(mock.allocated, mock.freed);
+    try t.expectEqual(@as(usize, 0), mock.early_free);
+    mock.fail_copy = false;
+    try w.upload(&driver, &b);
+    for (b.out.items) |n| try t.expect(w.get(n.name) != null);
+    try w.close();
+    try t.expectEqual(mock.allocated, mock.freed);
+    try t.expectEqual(@as(usize, 0), mock.double_free);
+}
+test "a name already uploaded refuses the call, keeps the earlier weights and admits a distinct retry" {
+    var b = try builder(t.allocator);
+    defer b.deinit();
+    var again = try builderOf(t.allocator, &.{ "three", "one" });
+    defer again.deinit();
+    var other = try builderOf(t.allocator, &.{"three"});
+    defer other.deinit();
+    var driver = mock.init();
+    var w: Weights = .{ .gpa = t.allocator };
+    try w.upload(&driver, &b);
+    try t.expectError(error.DuplicateWeight, w.upload(&driver, &again));
+    try t.expect(w.get("three") == null);
+    try t.expectEqual(@as(usize, 2), w.bufs.items.len);
+    try t.expectEqual(@as(u32, 2), w.map.count());
+    try t.expectEqual(@as(usize, 32), w.bytes);
+    try t.expectEqual(@as(usize, 1), mock.freed);
+    try w.upload(&driver, &other);
+    try t.expect(w.get("three") != null);
+    try w.close();
+    try t.expectEqual(mock.allocated, mock.freed);
+    try t.expectEqual(@as(usize, 0), mock.double_free);
 }
 test "event record failure keeps staging pending and falls back to a stream drain" {
     var driver = mock.init();
