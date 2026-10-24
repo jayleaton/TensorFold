@@ -1,4 +1,4 @@
-//! `test-minimax-template`: MiniMax-M3.1-Flash tokenizer, chat template and tool-call parser tests, host only, no GPU.
+//! `test-minimax-template`: MiniMax-M3.1-Flash tokenizer, chat template, serving goldens and tool calls, host only.
 const std = @import("std");
 
 pub fn steps(b: *std.Build, host: std.Build.ResolvedTarget, api: *std.Build.Module, tokenizer: *std.Build.Module, template: *std.Build.Module, server_add: *const fn (*std.Build, *std.Build.Module, std.Build.ResolvedTarget, std.builtin.OptimizeMode) *std.Build.Module, all: *std.Build.Step) void {
@@ -18,5 +18,14 @@ pub fn steps(b: *std.Build, host: std.Build.ResolvedTarget, api: *std.Build.Modu
     } });
     _ = server_add(b, parse, host, .Debug);
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = parse })).step);
+    const fixtures = b.createModule(.{ .root_source_file = b.path("zig/src/families/minimax_m3/fixtures/serve.zig"), .target = host, .optimize = .Debug });
+    const serve = b.createModule(.{ .root_source_file = b.path("zig/src/server/template_reference_test.zig"), .target = host, .optimize = .Debug, .link_libc = true, .imports = &.{
+        .{ .name = "engine_api", .module = api },
+        .{ .name = "tokenizer", .module = tokenizer },
+        .{ .name = "template", .module = template },
+        .{ .name = "mm3_serve_fixtures", .module = fixtures },
+    } });
+    _ = server_add(b, serve, host, .Debug);
+    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = serve })).step);
     all.dependOn(step);
 }

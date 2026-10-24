@@ -129,6 +129,7 @@ pub fn normalizeWith(cx: *Cx, messages: ?Value, late_system: []const u8, needs_u
             return cx.refuse("message content must be text or an array of text parts");
         }
         const r = role.?.string;
+        if (std.mem.eql(u8, r, "assistant")) item = try reasoningAlias(cx, item);
         if (std.mem.eql(u8, r, "system") or std.mem.eql(u8, r, "developer")) {
             if (out.items.len == 0) {
                 try instructions.append(cx.a, item);
@@ -175,7 +176,72 @@ pub fn normalizeWith(cx: *Cx, messages: ?Value, late_system: []const u8, needs_u
     return .{ .array = out.items };
 }
 
-/// ``_normalize_tool_call_arguments``: call arguments as objects for templates; bad ones under ``_invalid_arguments``.
+/// What a chat template reads from a request's messages: `normalizeWith`, `resultsInCallOrder`, then `toolArguments`.
+pub fn forTemplate(cx: *Cx, messages: ?Value, late_system: []const u8, needs_user_after_tool: bool, media: Media) errors.Refused!Value {
+    return toolArguments(cx, try resultsInCallOrder(cx, try normalizeWith(cx, messages, late_system, needs_user_after_tool, media)));
+}
+
+/// An assistant turn's ``reasoning`` (as vLLM and OpenRouter echo it) as its ``reasoning_content`` when that is unset.
+fn reasoningAlias(cx: *Cx, item: *json.Object) errors.Refused!*json.Object {
+    const set = item.get("reasoning_content");
+    const echoed = item.get("reasoning") orelse return item;
+    if ((set != null and set.? != .null) or echoed != .string) return item;
+    return withField(cx, item, "reasoning_content", echoed);
+}
+
+/// Templates read tool results by position: a run in its calling turn's order, when each id names a distinct call.
+pub fn resultsInCallOrder(cx: *Cx, messages: Value) errors.Refused!Value {
+    if (messages != .array) return messages;
+    const list = messages.array;
+    var out: ?[]Value = null;
+    var i: usize = 1;
+    while (i < list.len) : (i += 1) {
+        if (!isTool(list[i]) or isTool(list[i - 1])) continue;
+        var end = i;
+        while (end < list.len and isTool(list[end])) end += 1;
+        if (!std.mem.eql(u8, list[i - 1].strField("role") orelse "", "assistant")) continue;
+        const calls = list[i - 1].get("tool_calls") orelse continue;
+        if (calls != .array) continue;
+        if (try ranked(cx, calls.array, list[i..end])) |run| {
+            const dst = out orelse try cx.a.dupe(Value, list);
+            out = dst;
+            for (run, dst[i..end]) |r, *slot| slot.* = r.message;
+        }
+    }
+    return .{ .array = out orelse list };
+}
+
+const Ranked = struct {
+    rank: usize,
+    message: Value,
+
+    fn before(_: void, x: Ranked, y: Ranked) bool {
+        return x.rank < y.rank;
+    }
+};
+
+/// The run sorted by its calls' order; null when it is in order already or an id is missing, unknown or repeated.
+fn ranked(cx: *Cx, calls: []const Value, results: []const Value) errors.Refused!?[]Ranked {
+    const run = try cx.a.alloc(Ranked, results.len);
+    for (results, run) |result, *r| r.* = .{ .rank = callIndex(calls, result.strField("tool_call_id")) orelse return null, .message = result };
+    if (std.sort.isSorted(Ranked, run, {}, Ranked.before)) return null;
+    std.mem.sort(Ranked, run, {}, Ranked.before);
+    for (run[1..], run[0 .. run.len - 1]) |r, prev| if (r.rank == prev.rank) return null;
+    return run;
+}
+
+fn isTool(message: Value) bool {
+    return std.mem.eql(u8, message.strField("role") orelse "", "tool");
+}
+
+/// The first call whose string ``id`` is `id`.
+fn callIndex(calls: []const Value, id: ?[]const u8) ?usize {
+    const want = id orelse return null;
+    for (calls, 0..) |call, k| if (std.mem.eql(u8, call.strField("id") orelse continue, want)) return k;
+    return null;
+}
+
+/// ``_normalize_tool_call_arguments``: arguments as objects; null or empty ones ``{}``, bad ones ``_invalid_arguments``
 pub fn toolArguments(cx: *Cx, messages: Value) errors.Refused!Value {
     if (messages != .array) return messages;
     const out = try cx.a.alloc(Value, messages.array.len);
@@ -188,11 +254,13 @@ pub fn toolArguments(cx: *Cx, messages: Value) errors.Refused!Value {
         for (calls.array, new_calls) |call, *dst| {
             dst.* = call;
             const function = call.get("function") orelse continue;
-            if (function != .object or !function.has("arguments")) continue;
-            const args = function.get("arguments").?;
+            if (function != .object) continue;
+            const args = function.get("arguments") orelse Value.null;
             if (args == .object) continue;
             var parsed: ?Value = args;
-            if (args == .string) {
+            if (args == .null or (args == .string and std.mem.trim(u8, args.string, " \t\r\n").len == 0)) {
+                parsed = .{ .object = try json.newObject(cx.a) };
+            } else if (args == .string) {
                 parsed = switch (try json.parseText(cx.a, args.string)) {
                     .ok => |v| v,
                     .err => null,
@@ -297,4 +365,54 @@ test "a conversation keeps its shape when the template does not need the rule" {
     try std.testing.expectEqual(@as(usize, 2), out.array.len);
     try std.testing.expectEqualStrings("assistant", out.array[0].get("role").?.string);
     try std.testing.expectEqualStrings("tool", out.array[1].get("role").?.string);
+}
+
+fn templateView(cx: *Cx, text: []const u8) ![]const u8 {
+    const out = try forTemplate(cx, (try json.parse(cx.a, text)).ok, "system", false, .{});
+    return json.stringify(cx.a, out, .{ .ascii = false });
+}
+
+test "tool results out of call order are put in the calling turn's order; an unknown or repeated id keeps the sent order" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var cx: Cx = .{ .a = arena.allocator() };
+    const calls =
+        \\{"role": "assistant", "content": "", "tool_calls": [{"id": "a", "type": "function", "function": {"name": "f", "arguments": {}}}, {"id": "b", "type": "function", "function": {"name": "g", "arguments": {}}}, {"id": "c", "type": "function", "function": {"name": "h", "arguments": {}}}]}
+    ;
+    const ordered = try templateView(&cx, "[{\"role\": \"user\", \"content\": \"q\"}, " ++ calls ++ ", {\"role\": \"tool\", \"tool_call_id\": \"a\", \"content\": \"1\"}, {\"role\": \"tool\", \"tool_call_id\": \"c\", \"content\": \"3\"}]");
+    const shuffled = try templateView(&cx, "[{\"role\": \"user\", \"content\": \"q\"}, " ++ calls ++ ", {\"role\": \"tool\", \"tool_call_id\": \"c\", \"content\": \"3\"}, {\"role\": \"tool\", \"tool_call_id\": \"a\", \"content\": \"1\"}]");
+    try std.testing.expectEqualStrings(ordered, shuffled);
+    for ([_][]const u8{ "\"z\"", "\"c\"", "null" }) |id| {
+        const sent = try std.fmt.allocPrint(cx.a, "[{{\"role\": \"user\", \"content\": \"q\"}}, {s}, {{\"role\": \"tool\", \"tool_call_id\": \"c\", \"content\": \"3\"}}, {{\"role\": \"tool\", \"tool_call_id\": {s}, \"content\": \"1\"}}]", .{ calls, id });
+        const out = try forTemplate(&cx, (try json.parse(cx.a, sent)).ok, "system", false, .{});
+        try std.testing.expectEqualStrings("3", out.array[2].get("content").?.string);
+    }
+    // results after a user message belong to no calling turn: their order stays
+    const apart = try forTemplate(&cx, (try json.parse(cx.a, "[" ++ calls ++ ", {\"role\": \"user\", \"content\": \"q\"}, {\"role\": \"tool\", \"tool_call_id\": \"c\", \"content\": \"3\"}, {\"role\": \"tool\", \"tool_call_id\": \"a\", \"content\": \"1\"}]")).ok, "system", false, .{});
+    try std.testing.expectEqualStrings("3", apart.array[2].get("content").?.string);
+}
+
+test "an assistant turn's echoed reasoning reaches the template as reasoning_content unless that is set" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var cx: Cx = .{ .a = arena.allocator() };
+    const out = try forTemplate(&cx, (try json.parse(cx.a,
+        \\[{"role": "user", "content": "q"}, {"role": "assistant", "content": "a", "reasoning": "r1"}, {"role": "user", "content": "q"}, {"role": "assistant", "content": "b", "reasoning_content": null, "reasoning": "r2"}, {"role": "user", "content": "q"}, {"role": "assistant", "content": "c", "reasoning_content": "kept", "reasoning": "r3"}, {"role": "user", "content": "q", "reasoning": "not a turn's"}]
+    )).ok, "system", false, .{});
+    try std.testing.expectEqualStrings("r1", out.array[1].get("reasoning_content").?.string);
+    try std.testing.expectEqualStrings("r2", out.array[3].get("reasoning_content").?.string);
+    try std.testing.expectEqualStrings("kept", out.array[5].get("reasoning_content").?.string);
+    try std.testing.expect(out.array[6].get("reasoning_content") == null);
+}
+
+test "null, empty and absent call arguments reach the template as {}; text that is not an object stays marked invalid" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var cx: Cx = .{ .a = arena.allocator() };
+    const out = try toolArguments(&cx, (try json.parse(cx.a,
+        \\[{"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "f", "arguments": null}}, {"function": {"name": "f", "arguments": ""}}, {"function": {"name": "f", "arguments": " \n"}}, {"function": {"name": "f"}}, {"function": {"name": "f", "arguments": "{\"a\": 1}"}}, {"function": {"name": "f", "arguments": "[1]"}}, {"function": {"name": "f", "arguments": "{a"}}]}]
+    )).ok);
+    const want = [_][]const u8{ "{}", "{}", "{}", "{}", "{\"a\":1}", "{\"_invalid_arguments\":\"[1]\"}", "{\"_invalid_arguments\":\"{a\"}" };
+    for (out.array[0].get("tool_calls").?.array, want) |call, w|
+        try std.testing.expectEqualStrings(w, try json.stringify(cx.a, call.get("function").?.get("arguments").?, .{ .compact = true }));
 }
