@@ -1,6 +1,7 @@
 //! The EXL3 decode-row linear (exl3/linear.cu's device code): the plan, a layer's tensors, and the two kernels.
 const std = @import("std");
 const candidate = @import("exl3_candidate.zig");
+const pfd_ = @import("exl3_pfd.zig");
 const driver = @import("driver.zig");
 const module = @import("module.zig");
 const launch_ = @import("launch.zig");
@@ -135,16 +136,9 @@ pub const Linear = struct {
         return 8 * (w.n / 128) * 4;
     }
 
-    /// y [m, n] = x [m, k] through the weight; `xh` is fp16 [m, k] scratch, `z` the split partials, `counters` zeroed.
-    pub fn matmul(l: *const Linear, s: Stream, w: Weight, x: u64, x_dtype: DType, m: usize, y: u64, y_dtype: DType, xh: u64, z: u64, counters: u64) !void {
-        // Shapes the loader admits (linear.py's k % 128 and n % 128, 1..128 rows) are returned errors here too.
-        if (m < 1 or m > 128) return error.Exl3Shape;
-        if (w.k % 128 != 0 or w.n % 128 != 0) return error.Exl3Shape;
-        const p = plan(w.k, w.n, 192, 8);
-        if ((w.k / 16) % (p.sk * p.wk) != 0) return error.Exl3Shape;
-        const idx = variantIndex(w.halves, w.codebook, p.wk) orelse return error.UnsupportedExl3Width;
-        if (p.sk > 1 and z == 0) return error.Exl3Scratch;
-
+    /// xh [m, k] = fp16((x * suh) H / sqrt 128): matmul's first launch alone, any row count the grid takes.
+    pub fn rotIn(l: *const Linear, s: Stream, w: Weight, x: u64, x_dtype: DType, m: usize, xh: u64) !void {
+        if (m < 1 or m > 65535 or w.k % 128 != 0) return error.Exl3Shape;
         var r: launch_.Args = .{};
         r.add(x);
         r.add(w.suh);
@@ -157,6 +151,19 @@ pub const Linear = struct {
             .block = .{ .x = 128, .y = 1, .z = 1 },
             .shared = 0,
         }, s, &r);
+    }
+
+    /// y [m, n] = x [m, k] through the weight; `xh` is fp16 [m, k] scratch, `z` the split partials, `counters` zeroed.
+    pub fn matmul(l: *const Linear, s: Stream, w: Weight, x: u64, x_dtype: DType, m: usize, y: u64, y_dtype: DType, xh: u64, z: u64, counters: u64) !void {
+        // Shapes the loader admits (linear.py's k % 128 and n % 128, 1..128 rows) are returned errors here too.
+        if (m < 1 or m > 128) return error.Exl3Shape;
+        if (w.k % 128 != 0 or w.n % 128 != 0) return error.Exl3Shape;
+        const p = plan(w.k, w.n, 192, 8);
+        if ((w.k / 16) % (p.sk * p.wk) != 0) return error.Exl3Shape;
+        const idx = variantIndex(w.halves, w.codebook, p.wk) orelse return error.UnsupportedExl3Width;
+        if (p.sk > 1 and z == 0) return error.Exl3Scratch;
+
+        try l.rotIn(s, w, x, x_dtype, m, xh);
 
         var args: launch_.Args = .{};
         args.add(xh);
@@ -191,12 +198,15 @@ pub const Dense = struct {
     candidate_k: ?candidate.Kernels = null,
     implementation: enum { reference, tiles } = .reference,
     counters: ?memory.DeviceBuffer = null, // per pass and block, zeroed before every call
+    pfd: ?pfd_.Dense = null, // usePromptTiles: prompt rows of the widths pfdense builds on the tensor units
 
     pub fn load(d: *const Driver) !Dense {
         return .{ .d = d, .lin = try Linear.load(d) };
     }
 
     pub fn unload(de: *Dense) void {
+        if (de.pfd) |*p| p.unload();
+        de.pfd = null;
         if (de.candidate_k) |*k| k.deinit();
         if (de.candidate_mod) |*m| m.unload();
         de.lin.unload();
@@ -229,10 +239,20 @@ pub const Dense = struct {
         return de.blocks(s, w, x, x_dtype, rows, y, y_dtype);
     }
 
-    /// Prompt rows: 128-row blocks of `matmul`, so a row's bits never depend on where its chunk starts.
+    /// Prompt rows, each row's bits independent of its chunk: 128-row `matmul` blocks, or pfdense after usePromptTiles.
     pub fn prompt(de: *Dense, s: Stream, w: Weight, x: u64, x_dtype: DType, rows: usize, y: u64, y_dtype: DType) !void {
         if (de.implementation == .tiles) return de.tiles(s, w, x, x_dtype, rows, y, y_dtype, true);
+        if (de.pfd != null and pfd_.eligible(w) and rows <= 65535) {
+            const xh = try de.scratch(&de.xh, rows * w.k * 2);
+            try de.lin.rotIn(s, w, x, x_dtype, rows, xh);
+            return de.pfd.?.gemm(s, w, xh, rows, y, y_dtype);
+        }
         return de.blocks(s, w, x, x_dtype, rows, y, y_dtype);
+    }
+
+    /// Loads pfdense's image: prompt rows of mul1 4-, 5-, 6- and 8-bit weights take it from now on.
+    pub fn usePromptTiles(de: *Dense) !void {
+        if (de.pfd == null) de.pfd = try pfd_.Dense.load(de.d);
     }
     pub fn candidateWeight(w: Weight) !candidate.Matrix {
         const st = strides(w.k, w.n, w.halves, false);
