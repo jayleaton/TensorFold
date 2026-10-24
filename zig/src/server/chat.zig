@@ -9,6 +9,7 @@ const tool_stream = @import("tool_stream.zig");
 const tool_parse = @import("tool_parse.zig");
 const tool_lfm2 = @import("tool_lfm2.zig");
 const prompt_mod = @import("prompt.zig");
+const think_plan = @import("think_plan.zig");
 const log = @import("log.zig");
 const ids = @import("ids.zig");
 const clock = @import("clock.zig");
@@ -115,6 +116,7 @@ pub const Prepared = struct {
     drafts: bool,
     stops: fields_mod.Stops,
     preparing: bool,
+    forced: ?u32 = null, // the think close forced as the reply's first token (think_plan.zig)
 };
 
 /// Render ``input`` and run every check that can refuse it, before anything reaches the client or the engine.
@@ -135,7 +137,8 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
     var thinking = flag(f, "enable_thinking") orelse srv.config.enable_thinking;
     if (input.prompt != null) thinking = false;
     const effort = srv.effortFor(if (f.get("reasoning_effort")) |e| (if (e == .string) e.string else null) else null);
-    const rendered = try prompt_mod.prepare(srv, cx, input, thinking, effort);
+    var rendered = try prompt_mod.prepare(srv, cx, input, thinking, effort);
+    const forced = try think_plan.cutFirst(srv, cx, f, input.tools.len > 0, thinking, &rendered.ids);
     if (gone.check()) return error.Cancelled;
     if (rendered.ids.len == 0) return cx.refuse("rendered prompt is empty");
     const window: i64 = srv.info.context_window;
@@ -174,23 +177,10 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
         .cache_key = rendered.cache_key,
     };
     try srv.checkFeatures(cx, f, input.tools.len > 0, thinking, rendered.ids, input.tools, &request);
-    if (thinking) {
-        const budget_field = f.get("thinking_budget");
-        const budget: i64 = if (budget_field != null and budget_field.?.truthy()) budget_field.?.int64() orelse 0 else srv.config.thinking_budget;
-        if (budget > 0 and !srv.info.thinking_budget)
-            return cx.refuse("thinking_budget is not supported by this native engine");
-        if (srv.think_close.len > 0) request.loop_guard = srv.config.loop_guard;
-        if ((budget > 0 or request.loop_guard) and srv.think_close.len > 0) {
-            if (budget > 0) request.think_budget = @intCast(@min(budget, std.math.maxInt(u32)));
-            request.think_close = srv.think_close;
-            request.think_end = srv.think_close_end;
-        }
-        // The answer quota is separate only on engines that enforce it.
-        if (srv.info.answer_limit) @import("thinking_reserve.zig").apply(&request, srv.config.thinking_reserve, if (window > 0) window - n else std.math.maxInt(u32), srv.think_close_end);
-    }
+    try think_plan.apply(srv, cx, f, thinking, forced, if (window > 0) window - n else std.math.maxInt(u32), &request);
     if (input.logprobs) |count| request.logprobs = try @import("logprobs.zig").admit(srv, cx, thinking, request.think_budget, count);
     request.prompt_logprobs = input.prompt_logprobs;
-    return .{ .input = input, .request = request, .prompt_len = rendered.ids.len, .received = received, .thinking = thinking, .effort = effort, .sampled = sampling != null, .drafts = drafts, .stops = stops_opt, .preparing = preparing };
+    return .{ .input = input, .request = request, .prompt_len = rendered.ids.len, .received = received, .thinking = thinking, .effort = effort, .sampled = sampling != null, .drafts = drafts, .stops = stops_opt, .preparing = preparing, .forced = forced };
 }
 
 /// Submit a prepared request and collect its reply; ``sink`` hears the stream (null: not streamed).
@@ -233,7 +223,7 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
     };
     release(srv, preparing); // a background request waits only while a foreground one prepares
     preparing = false;
-    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .seed = if (request.sampling) |v| v.seed else null, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .markers = srv.markersFor(request.prompt), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .lp = if (request.logprobs != null) .{} else null };
+    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .seed = if (request.sampling) |v| v.seed else null, .sink = sink, .thinking = thinking or prepared.forced != null or reply_text.isChannel(srv.markers), .markers = srv.markersFor(request.prompt, prepared.forced != null), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .lp = if (request.logprobs != null) .{} else null };
     defer srv.noteRequest(prepared.prompt_len, box.cached orelse 0, gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
     const result: Failure!Reply = blk: {

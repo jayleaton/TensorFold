@@ -17,10 +17,10 @@ const probe = "tfprobe_fn";
 const key = "tfprobe_k";
 
 /// Blanks around and between calls: the template's newlines, never an endless run.
-const blanks = "[ \\t\\r\\n]{0,8}";
+pub const blanks = "[ \\t\\r\\n]{0,8}";
 
 /// The most blank characters between an argument's JSON tokens (grammar.py BLANKS).
-const value_blanks = 32;
+pub const value_blanks = 32;
 
 /// The style of `rendered`, a turn that calls `probe` with {key: "v"}; null: markup this grammar does not write.
 pub fn style(rendered: []const u8) ?Style {
@@ -34,9 +34,6 @@ pub fn style(rendered: []const u8) ?Style {
     return null;
 }
 
-/// MiniMax tags each parameter by its own name after a namespace token; no xgrammar style is known to write that.
-pub const minimax_refusal = "tool_choice \"required\" or a named function cannot be enforced for MiniMax-M3.1's tool markup yet: use tool_choice \"auto\" and check the reply's tool_calls";
-
 /// The grammar for a reply that must call one of `tools`: one call, or (`parallel`) one or more, then the end.
 pub fn structure(srv: *Server, cx: *Cx, tools: []const Value, parallel: bool, thinking: bool) errors.Refused!api.Structure {
     const probe_turn = (try json.parse(cx.a, "[{\"role\": \"user\", \"content\": \"x\"}, {\"role\": \"assistant\", \"content\": \"\", \"tool_calls\": [{\"id\": \"call_0\", \"type\": \"function\", \"function\": {\"name\": \"" ++ probe ++ "\", \"arguments\": {\"" ++ key ++ "\": \"v\"}}}]}]")).ok;
@@ -46,7 +43,6 @@ pub fn structure(srv: *Server, cx: *Cx, tools: []const Value, parallel: bool, th
         error.Refused => "",
     };
     const s = style(rendered) orelse .json; // unrecognized markup uses the canonical call form the parser accepts
-    if (s == .minimax) return cx.refuse(minimax_refusal);
     const text = try build(cx.a, s, tools, parallel);
     const field = try std.fmt.allocPrint(cx.a, "tool_choice \"required\" or a named function on backend '{s}'", .{srv.backendName()});
     return srv.compiledStructure(cx, .structural_tag, text, field, thinking);
@@ -54,6 +50,7 @@ pub fn structure(srv: *Server, cx: *Cx, tools: []const Value, parallel: bool, th
 
 /// The structural tag's JSON text (xgrammar's form).
 pub fn build(a: Allocator, s: Style, tools: []const Value, parallel: bool) Allocator.Error![]const u8 {
+    if (s == .minimax) return @import("tool_grammar_minimax.zig").build(a, tools, parallel); // one block of invokes
     const calls = try a.alloc(Value, tools.len);
     for (tools, calls) |t, *c| c.* = try call(a, s, try tool_specs.toolName(a, t), try parameters(a, t));
     const one: Value = if (calls.len == 1) calls[0] else try node(a, "or", &.{.{ "elements", .{ .array = calls } }});
@@ -89,7 +86,7 @@ fn call(a: Allocator, s: Style, name: []const u8, schema: Value) Allocator.Error
             try whole.put(a, "required", try list(a, &.{ .{ .string = "name" }, .{ .string = "arguments" } }));
             break :blk try list(a, &.{ try constant(a, "<tool_call>"), ws, try arguments(a, .{ .object = whole }, "json"), ws, try constant(a, "</tool_call>") });
         },
-        .minimax => unreachable, // `structure` refuses before it builds
+        .minimax => unreachable, // `build` hands MiniMax's block to tool_grammar_minimax.zig
         // GLM's template writes NAME<arg_key>K</arg_key><arg_value>V</arg_value>... with no blanks: xgrammar's glm_xml
         .glm => try list(a, &.{
             try constant(a, try std.fmt.allocPrint(a, "<tool_call>{s}", .{name})), try arguments(a, schema, "glm_xml"),
@@ -100,7 +97,7 @@ fn call(a: Allocator, s: Style, name: []const u8, schema: Value) Allocator.Error
 }
 
 /// The tool's parameter schema (OpenAI's function.parameters, a bare tool's parameters or input_schema).
-fn parameters(a: Allocator, tool: Value) Allocator.Error!Value {
+pub fn parameters(a: Allocator, tool: Value) Allocator.Error!Value {
     const function = if (tool.get("function")) |f| (if (f == .object) f else tool) else tool;
     for ([_][]const u8{ "parameters", "input_schema" }) |k| if (function.get(k)) |p| if (p == .object) return p;
     const empty = try json.newObject(a);
@@ -113,16 +110,16 @@ fn arguments(a: Allocator, schema: Value, style_name: []const u8) Allocator.Erro
     return node(a, "json_schema", &.{ .{ "json_schema", schema }, .{ "style", .{ .string = style_name } }, .{ "max_whitespace_cnt", try json.intValue(a, value_blanks) } });
 }
 
-fn constant(a: Allocator, text: []const u8) Allocator.Error!Value {
+pub fn constant(a: Allocator, text: []const u8) Allocator.Error!Value {
     return node(a, "const_string", &.{.{ "value", .{ .string = text } }});
 }
 
-fn list(a: Allocator, items: []const Value) Allocator.Error!Value {
+pub fn list(a: Allocator, items: []const Value) Allocator.Error!Value {
     return .{ .array = try a.dupe(Value, items) };
 }
 
 /// {"type": kind, fields...}.
-fn node(a: Allocator, kind: []const u8, entries: []const struct { []const u8, Value }) Allocator.Error!Value {
+pub fn node(a: Allocator, kind: []const u8, entries: []const struct { []const u8, Value }) Allocator.Error!Value {
     const o = try json.newObject(a);
     try o.put(a, "type", .{ .string = kind });
     for (entries) |e| try o.put(a, e[0], e[1]);
@@ -136,9 +133,18 @@ test "the probe call's markup picks the style" {
     try std.testing.expectEqual(Style.glm, style("</think><tool_call>tfprobe_fn<arg_key>tfprobe_k</arg_key><arg_value>v</arg_value></tool_call>").?);
 }
 
-test "MiniMax's probe call picks its own style, which a required call refuses by name" {
-    try std.testing.expectEqual(Style.minimax, style("]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"tfprobe_fn\">]<]minimax[>[<tfprobe_k>v]<]minimax[>[</tfprobe_k>").?);
-    try std.testing.expect(std.mem.indexOf(u8, minimax_refusal, "tool_choice") != null);
+test "MiniMax's probe call picks its own style, whose required grammar is its invoke block" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const picked = style("]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"tfprobe_fn\">]<]minimax[>[<tfprobe_k>v]<]minimax[>[</tfprobe_k>").?;
+    try std.testing.expectEqual(Style.minimax, picked);
+    const tools = (try json.parse(arena.allocator(), "[{\"name\":\"lookup\"}]")).ok;
+    const text = try build(arena.allocator(), picked, tools.array, false);
+    try std.testing.expect(std.mem.indexOf(u8, text, "minimax_m3_xml") != null and std.mem.indexOf(u8, text, "<tool_call>\\n") != null);
+}
+
+test {
+    _ = @import("tool_grammar_minimax.zig");
 }
 
 test "a required call's grammar names every offered tool and its schema; one call without parallel" {

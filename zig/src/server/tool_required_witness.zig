@@ -28,7 +28,10 @@ pub fn text(a: A, n: V) A.Error![]const u8 {
     } else {
         std.debug.assert(std.mem.eql(u8, t, "json_schema"));
         const v = try sample(a, n.get("json_schema").?);
-        if (std.mem.eql(u8, n.strField("style").?, "qwen_xml")) {
+        if (std.mem.eql(u8, n.strField("style").?, "minimax_m3_xml")) {
+            const ns = "]<]minimax[>[";
+            for (v.object.keys(), v.object.values()) |key, val| try out.print(a, ns ++ "<{s}>{s}" ++ ns ++ "</{s}>", .{ key, if (val == .string) val.string else try json.stringify(a, val, .{ .compact = true }), key });
+        } else if (std.mem.eql(u8, n.strField("style").?, "qwen_xml")) {
             for (v.object.keys(), v.object.values()) |key, val| try out.print(a, "<parameter={s}>{s}</parameter>", .{ key, if (val == .string) val.string else try json.stringify(a, val, .{ .compact = true }) });
         } else try out.appendSlice(a, try json.stringify(a, v, .{ .compact = true }));
     }

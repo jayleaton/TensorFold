@@ -190,6 +190,8 @@ pub const Info = struct {
     /// The engine stops the reply after the think block at Request.answer_max (every lane engine: Info.ofLanes).
     answer_limit: bool = false,
     structures: bool = false,
+    /// It masks a reply's first token too; else a grammar starts after a forced first token (server first_mask.zig).
+    first_mask: bool = true,
     /// Requests may ask for ``logprobs`` (the engine's lanes give the target's rows).
     logprobs: bool = false,
     /// Requests may ask for ``prompt_logprobs`` (a prompt pass from 0 that reads every row).

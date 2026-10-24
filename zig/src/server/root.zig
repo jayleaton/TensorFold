@@ -73,6 +73,7 @@ test {
     _ = @import("logprobs_test.zig");
     _ = @import("think_split_test.zig");
     _ = @import("thinking_reserve_test.zig");
+    _ = @import("think_plan.zig");
     _ = @import("late_system_test.zig");
     _ = @import("compact_test.zig");
     _ = @import("request_log.zig");

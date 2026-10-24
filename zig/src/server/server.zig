@@ -202,8 +202,9 @@ pub const Server = struct {
         return srv;
     }
 
-    /// The markers a reply to `prompt` is split by (an enabled MiniMax prompt ends in the opener).
-    pub fn markersFor(srv: *const Server, prompt: []const u32) reply_text.Markers {
+    /// The markers a reply to `prompt` is split by (an enabled MiniMax prompt ends in the opener; a forced close: none).
+    pub fn markersFor(srv: *const Server, prompt: []const u32, forced: bool) reply_text.Markers {
+        if (forced) return .{ .open = "", .close = srv.markers.close };
         const m = srv.mm_think orelse return srv.markers;
         return if (prompt.len > 0 and prompt[prompt.len - 1] == m.open) reply_text.mm_think_prompt_markers else srv.markers;
     }
@@ -471,11 +472,12 @@ test "MiniMax's reply markers follow the prompt's tail: enabled ends in the open
     var srv: Server = undefined;
     srv.markers = reply_text.mm_think_markers;
     srv.mm_think = .{ .open = 7, .close = 8 };
-    try std.testing.expectEqualStrings("", srv.markersFor(&.{ 1, 2, 7 }).open);
-    try std.testing.expectEqualStrings("<mm:think>", srv.markersFor(&.{ 1, 2, 8 }).open);
-    try std.testing.expectEqualStrings("<mm:think>", srv.markersFor(&.{ 1, 2 }).open);
-    try std.testing.expectEqualStrings("</mm:think>", srv.markersFor(&.{}).close);
+    try std.testing.expectEqualStrings("", srv.markersFor(&.{ 1, 2, 7 }, false).open);
+    try std.testing.expectEqualStrings("<mm:think>", srv.markersFor(&.{ 1, 2, 8 }, false).open);
+    try std.testing.expectEqualStrings("<mm:think>", srv.markersFor(&.{ 1, 2 }, false).open);
+    try std.testing.expectEqualStrings("</mm:think>", srv.markersFor(&.{}, false).close);
     srv.mm_think = null;
     srv.markers = reply_text.think_markers;
-    try std.testing.expectEqualStrings("</think>", srv.markersFor(&.{7}).close);
+    try std.testing.expectEqualStrings("</think>", srv.markersFor(&.{7}, false).close);
+    try std.testing.expectEqualStrings("", srv.markersFor(&.{7}, true).open);
 }

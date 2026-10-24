@@ -32,6 +32,8 @@ pub const window_rows: u32 = iface.window_rows;
 pub const explains_open = true;
 // --drafter takes the dspark draft (the checkpoint's own dspark/ folder, or a folder of one): there is no MTP head
 pub const takes_drafter = true;
+/// Grammar masks every verify row on rank 0 (`Lanes.masks`) but not the first token, which has no `first_masked`.
+pub const masks_rows = true;
 // Decision M2: the backend owns a radix prompt cache over the pool's pages, so the host builds no snapshot store.
 pub const owns_prompt_cache = iface.decisions.owns_prompt_cache;
 

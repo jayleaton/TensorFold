@@ -14,7 +14,7 @@ const a = std.testing.allocator;
 const specs = "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"parameters\":{\"type\":\"object\",\"properties\":{\"q\":{\"type\":\"string\"}},\"required\":[\"q\"]}}},{\"type\":\"function\",\"function\":{\"name\":\"now\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}}]";
 
 const Text = struct {
-    form: enum { xml, json, gemma, unknown } = .json,
+    form: enum { xml, json, gemma, unknown, minimax } = .json,
     fn text(t: *Text) mt.Text {
         return .{ .ctx = t, .vtable = &.{ .encode = encode, .decode = decode, .token_id = tokenId, .token_string = tokenString, .vocab_size = vocab, .eos_ids = eos, .render = render, .template_source = source } };
     }
@@ -28,7 +28,10 @@ const Text = struct {
         for (ids) |id| if (id < 95) try out.append(g, @intCast(id + 32)) else if (id == 95) try out.append(g, '\n');
         return out.toOwnedSlice(g);
     }
-    fn tokenId(_: *anyopaque, s: []const u8) ?u32 {
+    fn tokenId(ptr: *anyopaque, s: []const u8) ?u32 {
+        const t: *Text = @ptrCast(@alignCast(ptr));
+        if (t.form == .minimax and std.mem.eql(u8, s, "<mm:think>")) return 93;
+        if (t.form == .minimax and std.mem.eql(u8, s, "</mm:think>")) return 94;
         return if (std.mem.eql(u8, s, "<tool_call>")) 28 else null;
     }
     fn tokenString(_: *anyopaque, g: std.mem.Allocator, id: u32) std.mem.Allocator.Error![]u8 {
@@ -50,6 +53,7 @@ const Text = struct {
             .json => "<tool_call>{\"name\":\"tfprobe_fn\",\"arguments\":{\"tfprobe_k\":\"v\"}}</tool_call>",
             .gemma => "<|tool_call>call:tfprobe_fn{tfprobe_k:<|\"|>v<|\"|>}<tool_call|>",
             .unknown => "prompt",
+            .minimax => "]~b]ai\n</mm:think>]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"tfprobe_fn\">]<]minimax[>[<tfprobe_k>v]<]minimax[>[</tfprobe_k>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
         })) };
     }
 };
@@ -294,4 +298,55 @@ test "qwen27 tool calls: required and named calls use the masked lane fake throu
             try std.testing.expectEqualStrings(if (named) "now" else "lookup", result.calls.?[0].get("function").?.strField("name").?);
         }
     };
+}
+
+test "required tools: MiniMax's invoke block is enforced on an engine that masks every row but the first" {
+    const witness = @import("tool_required_witness.zig");
+    const think_plan = @import("think_plan.zig");
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const g = arena.allocator();
+    var stub: Stub = .{};
+    var compile: Compile = .{};
+    var compiler = compile.compiler();
+    for ([_]bool{ false, true }) |named| {
+        var text: Text = .{ .form = .minimax };
+        const srv = try Server.init(a, std.testing.io, stub.engine(), text.text(), .{ .served_name = "m", .model_ids = &.{"m"} }, null);
+        defer srv.deinit();
+        srv.info.structures = true;
+        srv.info.first_mask = false;
+        srv.grammars = &compiler;
+        var cx: errors.Cx = .{ .a = g };
+        const choice = if (named) "{\"type\":\"function\",\"function\":{\"name\":\"now\"}}" else "\"required\"";
+        const input = try openai.chatInput(srv, &cx, try body(&cx, false, choice));
+        // thinking off: the prompt's think close becomes the forced first token and the grammar starts after it
+        var ids: []const u32 = &.{ 1, 2, 94 };
+        try std.testing.expectEqual(@as(?u32, 94), try think_plan.cutFirst(srv, &cx, input.fields, true, false, &ids));
+        try std.testing.expectEqualSlices(u32, &.{ 1, 2 }, ids);
+        var open_ids: []const u32 = &.{ 1, 2, 3 };
+        try std.testing.expectError(error.Refused, think_plan.cutFirst(srv, &cx, input.fields, true, false, &open_ids));
+        try std.testing.expectEqual(@as(?u32, null), try think_plan.cutFirst(srv, &cx, input.fields, true, true, &ids));
+        var request: api.Request = .{ .prompt = ids, .max_tokens = 512 };
+        try srv.checkFeatures(&cx, input.fields, true, true, ids, input.tools, &request);
+        try std.testing.expectEqual(@as(?u32, 94), request.structure.?.after); // thinking on: after the think close
+        const root = try value(g, request.structure.?.text);
+        const reply = try witness.text(g, root);
+        try std.testing.expect(std.mem.startsWith(u8, reply, "]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\""));
+        try std.testing.expect(std.mem.endsWith(u8, reply, "]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>"));
+        if (named) try std.testing.expect(std.mem.indexOf(u8, request.structure.?.text, "lookup") == null);
+        const want = try Text.encode(undefined, g, reply, false);
+        for ([_]u64{ 1235, 1236 }) |seed| {
+            const plain = try witness.run(want, 0, seed);
+            defer a.free(plain.tokens);
+            for ([_]u32{ 1, 4 }) |depth| {
+                const drafted = try witness.run(want, depth, seed);
+                defer a.free(drafted.tokens);
+                try std.testing.expectEqualSlices(u32, plain.tokens, drafted.tokens);
+            }
+            const result = try parse.parse(g, try Text.decode(undefined, g, plain.tokens), input.tools, 1);
+            try std.testing.expectEqualStrings("", result.content);
+            try std.testing.expectEqual(@as(usize, 1), result.calls.?.len);
+            try std.testing.expectEqualStrings(if (named) "now" else "lookup", result.calls.?[0].get("function").?.strField("name").?);
+        }
+    }
 }

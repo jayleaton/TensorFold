@@ -1,0 +1,326 @@
+[
+ {
+  "name": "one-tool",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "parallel": false,
+  "accept": [
+   {
+    "name": "get_weather",
+    "arguments": {
+     "city": "Paris"
+    }
+   },
+   {
+    "name": "get_weather",
+    "arguments": {
+     "city": "São Paulo <&> \"x\"",
+     "days": 3
+    }
+   }
+  ],
+  "reject": [
+   {
+    "name": "get_weather",
+    "arguments": {
+     "days": 3
+    }
+   },
+   {
+    "name": "get_weather",
+    "arguments": {
+     "city": "P",
+     "days": "three"
+    }
+   },
+   {
+    "name": "other",
+    "arguments": {
+     "city": "P"
+    }
+   }
+  ],
+  "tag": "{\"type\":\"structural_tag\",\"format\":{\"type\":\"sequence\",\"elements\":[{\"type\":\"regex\",\"pattern\":\"[ \\\\t\\\\r\\\\n]{0,8}\"},{\"type\":\"const_string\",\"value\":\"]<]minimax[>[<tool_call>\\n\"},{\"type\":\"sequence\",\"elements\":[{\"type\":\"const_string\",\"value\":\"]<]minimax[>[<invoke name=\\\"get_weather\\\">\"},{\"type\":\"json_schema\",\"json_schema\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"},\"days\":{\"type\":\"integer\"}},\"additionalProperties\":false,\"required\":[\"city\"]},\"style\":\"minimax_m3_xml\",\"max_whitespace_cnt\":32},{\"type\":\"const_string\",\"value\":\"]<]minimax[>[</invoke>\\n\"}]},{\"type\":\"const_string\",\"value\":\"]<]minimax[>[</tool_call>\"},{\"type\":\"regex\",\"pattern\":\"[ \\\\t\\\\r\\\\n]{0,8}\"}]}}"
+ },
+ {
+  "name": "nested-narrowed",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "q": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "^\\S"
+       },
+       "when": {
+        "type": "string",
+        "format": "date"
+       },
+       "filters": {
+        "type": "object",
+        "properties": {
+         "lang": {
+          "type": "string",
+          "enum": [
+           "en",
+           "fr"
+          ]
+         },
+         "safe": {
+          "type": "boolean"
+         },
+         "n": {
+          "type": "number"
+         }
+        },
+        "additionalProperties": true
+       },
+       "ids": {
+        "type": "array",
+        "items": {
+         "type": "integer"
+        }
+       },
+       "tags": {
+        "type": "array"
+       },
+       "any": {},
+       "pick": {
+        "anyOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "integer"
+         }
+        ]
+       },
+       "rows": {
+        "type": "array",
+        "items": {
+         "$ref": "#/$defs/row"
+        }
+       }
+      },
+      "required": [
+       "q"
+      ],
+      "$defs": {
+       "row": {
+        "type": "object",
+        "properties": {
+         "k": {
+          "type": "string"
+         },
+         "v": {
+          "type": "integer"
+         }
+        },
+        "required": [
+         "k"
+        ]
+       }
+      }
+     }
+    }
+   }
+  ],
+  "parallel": false,
+  "accept": [
+   {
+    "name": "search",
+    "arguments": {
+     "q": "a b",
+     "when": "2026-10-24",
+     "filters": {
+      "lang": "en",
+      "safe": true,
+      "n": 1.5
+     },
+     "ids": [
+      1,
+      2,
+      3
+     ],
+     "tags": [
+      "x",
+      "y"
+     ],
+     "any": "free text",
+     "pick": 7,
+     "rows": [
+      {
+       "k": "a",
+       "v": 1
+      },
+      {
+       "k": "b"
+      }
+     ]
+    }
+   },
+   {
+    "name": "search",
+    "arguments": {
+     "q": "only"
+    }
+   }
+  ],
+  "reject": [
+   {
+    "name": "search",
+    "arguments": {
+     "q": "x",
+     "filters": {
+      "lang": "de"
+     }
+    }
+   },
+   {
+    "name": "search",
+    "arguments": {
+     "q": "x",
+     "ids": [
+      "a"
+     ]
+    }
+   }
+  ],
+  "tag": "{\"type\":\"structural_tag\",\"format\":{\"type\":\"sequence\",\"elements\":[{\"type\":\"regex\",\"pattern\":\"[ \\\\t\\\\r\\\\n]{0,8}\"},{\"type\":\"const_string\",\"value\":\"]<]minimax[>[<tool_call>\\n\"},{\"type\":\"sequence\",\"elements\":[{\"type\":\"const_string\",\"value\":\"]<]minimax[>[<invoke name=\\\"search\\\">\"},{\"type\":\"json_schema\",\"json_schema\":{\"type\":\"object\",\"properties\":{\"q\":{\"type\":\"string\"},\"when\":{\"type\":\"string\"},\"filters\":{\"type\":\"object\",\"properties\":{\"lang\":{\"type\":\"string\",\"enum\":[\"en\",\"fr\"]},\"safe\":{\"type\":\"boolean\"},\"n\":{\"type\":\"number\"}},\"additionalProperties\":false},\"ids\":{\"type\":\"array\",\"items\":{\"type\":\"integer\"}},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"any\":{\"type\":\"string\"},\"pick\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"integer\"}]},\"rows\":{\"type\":\"array\",\"items\":{\"$ref\":\"#/$defs/row\"}}},\"$defs\":{\"row\":{\"type\":\"object\",\"properties\":{\"k\":{\"type\":\"string\"},\"v\":{\"type\":\"integer\"}},\"additionalProperties\":false,\"required\":[\"k\"]}},\"additionalProperties\":false,\"required\":[\"q\"]},\"style\":\"minimax_m3_xml\",\"max_whitespace_cnt\":32},{\"type\":\"const_string\",\"value\":\"]<]minimax[>[</invoke>\\n\"}]},{\"type\":\"const_string\",\"value\":\"]<]minimax[>[</tool_call>\"},{\"type\":\"regex\",\"pattern\":\"[ \\\\t\\\\r\\\\n]{0,8}\"}]}}"
+ },
+ {
+  "name": "parallel-two",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "now"
+    }
+   }
+  ],
+  "parallel": true,
+  "accept": [
+   {
+    "calls": [
+     {
+      "name": "get_weather",
+      "arguments": {
+       "city": "A"
+      }
+     },
+     {
+      "name": "now",
+      "arguments": {}
+     },
+     {
+      "name": "get_weather",
+      "arguments": {
+       "city": "B",
+       "days": 1
+      }
+     }
+    ]
+   }
+  ],
+  "reject": [],
+  "tag": "{\"type\":\"structural_tag\",\"format\":{\"type\":\"sequence\",\"elements\":[{\"type\":\"regex\",\"pattern\":\"[ \\\\t\\\\r\\\\n]{0,8}\"},{\"type\":\"const_string\",\"value\":\"]<]minimax[>[<tool_call>\\n\"},{\"type\":\"or\",\"elements\":[{\"type\":\"sequence\",\"elements\":[{\"type\":\"const_string\",\"value\":\"]<]minimax[>[<invoke name=\\\"get_weather\\\">\"},{\"type\":\"json_schema\",\"json_schema\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"},\"days\":{\"type\":\"integer\"}},\"additionalProperties\":false,\"required\":[\"city\"]},\"style\":\"minimax_m3_xml\",\"max_whitespace_cnt\":32},{\"type\":\"const_string\",\"value\":\"]<]minimax[>[</invoke>\\n\"}]},{\"type\":\"sequence\",\"elements\":[{\"type\":\"const_string\",\"value\":\"]<]minimax[>[<invoke name=\\\"now\\\">\"},{\"type\":\"json_schema\",\"json_schema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false},\"style\":\"minimax_m3_xml\",\"max_whitespace_cnt\":32},{\"type\":\"const_string\",\"value\":\"]<]minimax[>[</invoke>\\n\"}]}]},{\"type\":\"star\",\"content\":{\"type\":\"or\",\"elements\":[{\"type\":\"sequence\",\"elements\":[{\"type\":\"const_string\",\"value\":\"]<]minimax[>[<invoke name=\\\"get_weather\\\">\"},{\"type\":\"json_schema\",\"json_schema\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"},\"days\":{\"type\":\"integer\"}},\"additionalProperties\":false,\"required\":[\"city\"]},\"style\":\"minimax_m3_xml\",\"max_whitespace_cnt\":32},{\"type\":\"const_string\",\"value\":\"]<]minimax[>[</invoke>\\n\"}]},{\"type\":\"sequence\",\"elements\":[{\"type\":\"const_string\",\"value\":\"]<]minimax[>[<invoke name=\\\"now\\\">\"},{\"type\":\"json_schema\",\"json_schema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false},\"style\":\"minimax_m3_xml\",\"max_whitespace_cnt\":32},{\"type\":\"const_string\",\"value\":\"]<]minimax[>[</invoke>\\n\"}]}]}},{\"type\":\"const_string\",\"value\":\"]<]minimax[>[</tool_call>\"},{\"type\":\"regex\",\"pattern\":\"[ \\\\t\\\\r\\\\n]{0,8}\"}]}}"
+ },
+ {
+  "name": "single-of-two",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "now"
+    }
+   }
+  ],
+  "parallel": false,
+  "accept": [
+   {
+    "name": "now",
+    "arguments": {}
+   }
+  ],
+  "reject": [
+   {
+    "calls": [
+     {
+      "name": "now",
+      "arguments": {}
+     },
+     {
+      "name": "now",
+      "arguments": {}
+     }
+    ]
+   }
+  ],
+  "tag": "{\"type\":\"structural_tag\",\"format\":{\"type\":\"sequence\",\"elements\":[{\"type\":\"regex\",\"pattern\":\"[ \\\\t\\\\r\\\\n]{0,8}\"},{\"type\":\"const_string\",\"value\":\"]<]minimax[>[<tool_call>\\n\"},{\"type\":\"or\",\"elements\":[{\"type\":\"sequence\",\"elements\":[{\"type\":\"const_string\",\"value\":\"]<]minimax[>[<invoke name=\\\"get_weather\\\">\"},{\"type\":\"json_schema\",\"json_schema\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"},\"days\":{\"type\":\"integer\"}},\"additionalProperties\":false,\"required\":[\"city\"]},\"style\":\"minimax_m3_xml\",\"max_whitespace_cnt\":32},{\"type\":\"const_string\",\"value\":\"]<]minimax[>[</invoke>\\n\"}]},{\"type\":\"sequence\",\"elements\":[{\"type\":\"const_string\",\"value\":\"]<]minimax[>[<invoke name=\\\"now\\\">\"},{\"type\":\"json_schema\",\"json_schema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false},\"style\":\"minimax_m3_xml\",\"max_whitespace_cnt\":32},{\"type\":\"const_string\",\"value\":\"]<]minimax[>[</invoke>\\n\"}]}]},{\"type\":\"const_string\",\"value\":\"]<]minimax[>[</tool_call>\"},{\"type\":\"regex\",\"pattern\":\"[ \\\\t\\\\r\\\\n]{0,8}\"}]}}"
+ }
+]
