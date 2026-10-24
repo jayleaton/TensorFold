@@ -218,11 +218,11 @@ pub const Streamer = struct {
             shard_open = it.shard;
             const file = s.cat.files.items[it.shard];
             const limit = plan.slots[it.slot].bytes;
-            if (it.fold) {
-                // a norm weight: one read, bf16 to fp32 1 + w
+            if (it.fold != .none) {
+                // a norm weight or a router tensor: one read, 2-byte values to fp32
                 if (it.span.len > room or it.span.count != 1 or it.dst != 0) return error.BadPlan;
                 const got = try file.read(buf, it.first(), @intCast(it.span.len));
-                const out = load.foldGemma(s.folded, got);
+                const out = load.applyFold(s.folded, it.fold, got);
                 try sink.put(sink.ctx, it.slot, 0, std.mem.sliceAsBytes(out));
                 continue;
             }
@@ -308,7 +308,7 @@ const Shared = struct {
 // ---- the schedule: runs in file order folded into windows ----
 
 /// A piece of one run still to read: `len` bytes at absolute offset `at`, bound for `dst` of `slot`.
-const Piece = struct { shard: u16, at: u64, len: u64, slot: u32, dst: u64, fold: bool };
+const Piece = struct { shard: u16, at: u64, len: u64, slot: u32, dst: u64, fold: load.Fold };
 
 /// One read: the runs from `start` up to `stop` fall in [lo, end) of a shard, and none crosses `hard`.
 fn Window(comptime I: type) type {
@@ -356,10 +356,10 @@ const Runs = struct {
         return a.item == other.item and a.run == other.run and a.used == other.used;
     }
 
-    /// The part of `p` a window takes must stay in its slot; a norm weight is one whole run (folded as a unit).
+    /// The part of `p` a window takes must stay in its slot; a folded tensor is one whole run (folded as a unit).
     fn admit(r: *const Runs, p: Piece, n: u64, room: u64) !void {
         if (p.dst + n > r.plan.slots[p.slot].bytes) return error.BadPlan;
-        if (p.fold) {
+        if (p.fold != .none) {
             const it = r.plan.items[r.item];
             if (it.span.len > room or it.span.count != 1 or it.dst != 0) return error.BadPlan;
         }
@@ -389,7 +389,7 @@ const Marks = struct {
     fn head(r: *Marks) ?Piece {
         if (r.i >= r.marks.len) return null;
         const m = r.marks[r.i];
-        return .{ .shard = m.shard, .at = m.at, .len = 4, .slot = 0, .dst = 0, .fold = false };
+        return .{ .shard = m.shard, .at = m.at, .len = 4, .slot = 0, .dst = 0, .fold = .none };
     }
 
     fn skip(r: *Marks, _: u64) void {
@@ -422,7 +422,7 @@ fn schedule(comptime I: type, gpa: std.mem.Allocator, start: I, room: u64, gap: 
             open = true;
         }
         const n = @min(h.len, w.hard - h.at);
-        if (h.fold and n < h.len) {
+        if (h.fold != .none and n < h.len) {
             // a folded run is never split: it opens a window of its own
             if (w.end == w.lo) return error.BadPlan;
             w.stop = it;
@@ -467,9 +467,9 @@ const PlanCtx = struct {
             const h = it.head().?;
             const n: usize = @intCast(@min(h.len, w.hard - h.at));
             const src: usize = @intCast(h.at - w.lo);
-            if (h.fold) {
+            if (h.fold != .none) {
                 try c.flush(&group, data, packed_to);
-                const out = load.foldGemma(c.s.folded, data[src..][0..n]);
+                const out = load.applyFold(c.s.folded, h.fold, data[src..][0..n]);
                 try c.sink.put(c.sink.ctx, h.slot, h.dst, std.mem.sliceAsBytes(out));
             } else {
                 if (group) |g| if (g.slot != h.slot or g.dst + (packed_to - g.from) != h.dst) try c.flush(&group, data, packed_to);

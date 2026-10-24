@@ -284,7 +284,8 @@ pub fn expectStreamed(c: *const Config, pack: *Pack, plan: *const load.Plan, hos
         try std.testing.expectEqual(@as(u32, @intCast(if (axis == .col) cut.len() else sv.len / 2)), m.n);
     }
     for (plan.plain) |pt| {
-        const full = pack.find(names.plain(&b, pt.role, pt.layer)).data;
+        const stored = pack.find(names.plain(&b, pt.role, pt.layer));
+        const full = stored.data;
         const got = host.bufs[pt.slot];
         if (pt.folded) {
             try std.testing.expectEqual(full.len * 2, got.len);
@@ -297,6 +298,15 @@ pub fn expectStreamed(c: *const Config, pack: *Pack, plan: *const load.Plan, hos
             const rows = plan.share.indexRows(c);
             const row = full.len / (c.index.heads * c.index.dim);
             try std.testing.expectEqualSlices(u8, full[rows.lo * row .. rows.hi * row], got);
+        } else if (pt.dtype == .f32 and !std.mem.eql(u8, stored.dtype, "F32")) {
+            // a widened router tensor: each value as it was, now 4 bytes (NaN stays NaN)
+            try std.testing.expectEqual(full.len * 2, got.len);
+            for (0..full.len / 2) |i| {
+                const h = std.mem.readInt(u16, full[2 * i ..][0..2], .little);
+                const w: f32 = if (std.mem.eql(u8, stored.dtype, "F16")) @as(f16, @bitCast(h)) else @bitCast(@as(u32, h) << 16);
+                const g: f32 = @bitCast(std.mem.readInt(u32, got[4 * i ..][0..4], .little));
+                if (std.math.isNan(w)) try std.testing.expect(std.math.isNan(g)) else try std.testing.expectEqual(w, g);
+            }
         } else try std.testing.expectEqualSlices(u8, full, got);
     }
 }
@@ -483,7 +493,7 @@ test "misshaped tensors fail closed with the reason that names them" {
         .{ .name = q0 ++ ".mul1", .dtype = "I32", .shape = &.{2}, .want = error.MisshapedTensor },
         .{ .name = q0 ++ ".mul1", .dtype = "I16", .shape = &.{}, .want = error.MisshapedTensor },
         .{ .name = "language_model.lm_head.trellis", .dtype = "I16", .shape = &.{ 16, 16, 80 }, .want = error.UnsupportedWidth }, // head_bits is 6
-        .{ .name = "language_model.model.layers.1.block_sparse_moe.gate.weight", .dtype = "F16", .shape = &.{ 4, 256 }, .want = error.MisshapedTensor },
+        .{ .name = "language_model.model.layers.1.block_sparse_moe.gate.weight", .dtype = "I32", .shape = &.{ 4, 256 }, .want = error.MisshapedTensor },
         .{ .name = "language_model.model.layers.1.block_sparse_moe.gate.weight", .dtype = "F32", .shape = &.{ 3, 256 }, .want = error.MisshapedTensor },
         .{ .name = "language_model.model.layers.1.self_attn.index_q_proj.weight", .dtype = "F32", .shape = &.{ 256, 256 }, .want = error.MisshapedTensor },
         .{ .name = "language_model.model.layers.1.self_attn.index_k_proj.weight", .dtype = "F16", .shape = &.{ 64, 256 }, .want = error.MisshapedTensor },

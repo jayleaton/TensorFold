@@ -84,10 +84,10 @@ fn halvesOf(plan: *const load.Plan, proj: names.Proj, layer: u32, expert: u32) u
     return plan.matrix(proj, layer, expert).?.halves;
 }
 
-/// What every plan owes: the item bytes fill the slots exactly (a folded norm is held as fp32).
+/// What every plan owes: the item bytes fill the slots exactly (a folded tensor is held as fp32).
 fn expectFilled(plan: *const load.Plan) !void {
     var want: u64 = 0;
-    for (plan.items) |i| want += i.span.bytes() * @as(u64, if (i.fold) 2 else 1);
+    for (plan.items) |i| want += i.span.bytes() * @as(u64, if (i.fold != .none) 2 else 1);
     try std.testing.expectEqual(want, plan.slotBytes());
     for (plan.items[1..], plan.items[0 .. plan.items.len - 1]) |b, a| try std.testing.expect(a.shard < b.shard or (a.shard == b.shard and a.base + a.span.offset <= b.base + b.span.offset));
 }

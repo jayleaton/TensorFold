@@ -178,7 +178,7 @@ test "the cuts: q 4096 rows, kv 256, o and down input halves, gate/up 6144 rows;
     defer cut.deinit();
     try std.testing.expectEqual(@as(u32, 781 * 128), cut.tensor(.markov_w2, 0).?.rows);
     // nothing is folded: the norms are stored as they are (the Gemma offset is an unverified switch)
-    for (plan.items) |i| try std.testing.expect(!i.fold);
+    for (plan.items) |i| try std.testing.expect(i.fold == .none);
 }
 
 test "a missing, misshaped, retyped or extra tensor refuses the plan" {

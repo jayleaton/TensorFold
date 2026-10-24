@@ -14,8 +14,8 @@ pub const Error = error{ MissingTensor, BadDtype, BadShape, BadLayer, OutOfMemor
 pub const Dense = struct { gate: exl3.Weight, up: exl3.Weight, down: exl3.Weight };
 
 pub const Moe = struct {
-    router: u64, // fp32 [experts, hidden], as stored
-    bias: u64, // fp32 [experts], e_score_correction_bias
+    router: u64, // fp32 [experts, hidden] (an f16 or bf16 checkpoint's widened by the loader)
+    bias: u64, // fp32 [experts], e_score_correction_bias (widened like the router)
     experts: cuda.exl3_experts.Layer,
     shared: Dense,
 };

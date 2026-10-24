@@ -174,6 +174,9 @@ fn uniqueKeys(gpa: std.mem.Allocator, json: []const u8) !void {
 /// A device allocation the plan asks for; the sink decides what backs it.
 pub const Slot = struct { bytes: u64 };
 
+/// How a plain tensor's 2-byte values become the fp32 its slot holds: Gemma's `1 + w`, or a lossless widening.
+pub const Fold = enum { none, gemma, f16, bf16 };
+
 /// Bytes `span` of one stored tensor (absolute file offset `base`), appended at `dst` of `slot`.
 pub const Item = struct {
     shard: u16,
@@ -181,7 +184,7 @@ pub const Item = struct {
     span: layout.Span,
     slot: u32,
     dst: u64,
-    fold: bool = false, // bf16 norm weights stored as fp32 1 + w (the destination holds 4-byte floats)
+    fold: Fold = .none, // anything but none: one whole run, held as 4-byte floats
 
     pub fn first(i: Item) u64 {
         return i.base + i.span.offset;
@@ -206,15 +209,15 @@ pub const Matrix = struct {
     marker_at: u64,
 };
 
-/// A plain tensor on this rank (fp16 index projections and fp32 router tensors as they are).
+/// A plain tensor on this rank (fp16 index projections as they are, router tensors in fp32).
 pub const PlainTensor = struct {
     role: names.Plain,
     layer: u16,
     slot: u32,
-    dtype: st.DType, // as held in the slot: fp32 where the Gemma fold ran
+    dtype: st.DType, // as held in the slot: fp32 where a fold ran
     rows: u32,
     cols: u32, // 1 for vectors
-    folded: bool,
+    folded: bool, // the Gemma fold ran (a widened router is not "folded")
 };
 
 /// One routed projection of a layer on this rank: the per-expert widths and pointer offsets, as the kernels take them.
@@ -354,8 +357,8 @@ const Builder = struct {
             try b.denseGroup(.dense_up, l, c.hidden, c.dense_inter);
             return b.denseGroup(.dense_down, l, c.dense_inter, c.hidden);
         }
-        try b.plainTensor(.router, l, &.{ c.experts, c.hidden }, &.{.f32}, null);
-        try b.plainTensor(.router_bias, l, &.{c.experts}, &.{ .f32, .bf16 }, null);
+        try b.plainTensor(.router, l, &.{ c.experts, c.hidden }, &.{ .f32, .f16, .bf16 }, null);
+        try b.plainTensor(.router_bias, l, &.{c.experts}, &.{ .f32, .f16, .bf16 }, null);
         try b.denseGroup(.shared_gate, l, c.hidden, c.shared_inter);
         try b.denseGroup(.shared_up, l, c.hidden, c.shared_inter);
         try b.denseGroup(.shared_down, l, c.shared_inter, c.hidden);
@@ -385,11 +388,11 @@ const Builder = struct {
             len = s.len() * row_bytes;
             n_rows = s.len();
         }
-        const fold = b.gemma and role.isNorm();
-        const held: st.DType = if (fold) .f32 else r.dtype;
+        const fold = foldOf(b.gemma, role, r.dtype);
+        const held: st.DType = if (fold != .none) .f32 else r.dtype;
         const slot_id = try b.slot(len / r.dtype.size() * held.size());
         try b.items.append(b.a, .{ .shard = r.shard, .base = r.begin, .span = .{ .offset = offset, .len = len }, .slot = slot_id, .dst = 0, .fold = fold });
-        try b.plain.append(b.a, .{ .role = role, .layer = l, .slot = slot_id, .dtype = held, .rows = @intCast(n_rows), .cols = @intCast(cols), .folded = fold });
+        try b.plain.append(b.a, .{ .role = role, .layer = l, .slot = slot_id, .dtype = held, .rows = @intCast(n_rows), .cols = @intCast(cols), .folded = fold == .gemma });
     }
 
     const Admitted = struct { group: layout.Group, halves: u8, trellis: *Ref, suh: *Ref, svh: *Ref, marker: *Ref };
@@ -518,6 +521,33 @@ pub const Streamer = @import("stream.zig").Streamer;
 pub const StreamOptions = @import("stream.zig").Options;
 pub const StreamStats = @import("stream.zig").Stats;
 
+/// The fold a plain tensor takes: Gemma norms to `1 + w`; the router and its bias widened to the fp32 kernels read.
+pub fn foldOf(gemma: bool, role: names.Plain, stored: st.DType) Fold {
+    if (gemma and role.isNorm()) return .gemma;
+    if (role != .router and role != .router_bias) return .none;
+    return switch (stored) {
+        .f16 => .f16,
+        .bf16 => .bf16,
+        else => .none,
+    };
+}
+
+/// `src`'s 2-byte values through `fold` as fp32 (`fold` is not none); the caller's `out` holds the result.
+pub fn applyFold(out: []f32, fold: Fold, src: []const u8) []f32 {
+    const n = src.len / 2;
+    switch (fold) {
+        .none => unreachable,
+        .gemma => return foldGemma(out, src),
+        .bf16 => for (out[0..n], 0..) |*o, i| {
+            o.* = @bitCast(@as(u32, std.mem.readInt(u16, src[2 * i ..][0..2], .little)) << 16);
+        },
+        .f16 => for (out[0..n], 0..) |*o, i| {
+            o.* = @as(f16, @bitCast(std.mem.readInt(u16, src[2 * i ..][0..2], .little)));
+        },
+    }
+    return out[0..n];
+}
+
 /// bf16 norm weights as fp32 `1 + w` (Gemma RMSNorm), summed once in fp32; the caller's `out` holds the result.
 pub fn foldGemma(out: []f32, bf16: []const u8) []f32 {
     const n = bf16.len / 2;
@@ -537,4 +567,5 @@ test {
     _ = @import("load_test.zig");
     _ = @import("load_synth_test.zig");
     _ = @import("load_widths_test.zig");
+    _ = @import("load_widen_test.zig");
 }
