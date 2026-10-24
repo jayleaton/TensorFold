@@ -234,6 +234,7 @@ pub const Gather = struct {
     thread: ?std.Thread = null,
     err: [256]u8 = @splat(0),
     gathers: u64 = 0,
+    mark: @import("roce_mark.zig").Mark = .{}, // TF_ROCE_MARK: a failed gather writes it once, for the next start
 
     /// Both ranks' exchange or null on both; setup crosses ``group``'s communicator on ``s``. ``max_bytes``: a shard.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const Driver, group: *const tp_group.Group, s: Stream, want: bool, max_bytes: usize) !?*Gather {
@@ -530,6 +531,7 @@ pub const Gather = struct {
         const bad = @atomicLoad(u32, &c[c_error], .acquire);
         if (bad == 0 and !g.failed.load(.acquire)) return;
         std.log.err("RoCE all-gather failed (sequence {d}, HCA {d}): {s}", .{ bad, c[c_hca], std.mem.sliceTo(&g.err, 0) });
+        g.mark.once(g.rank, "RoCE all-gather failed while serving");
         return error.ProxyFailed;
     }
 

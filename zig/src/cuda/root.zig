@@ -28,6 +28,7 @@ pub const graph = @import("graph.zig");
 pub const cublaslt = @import("cublaslt.zig");
 pub const nccl = @import("nccl.zig");
 pub const roce = @import("roce.zig");
+pub const roce_mark = @import("roce_mark.zig");
 pub const triton = @import("triton.zig");
 pub const aot = @import("aot.zig");
 pub const kernels = @import("kernels.zig");
@@ -101,6 +102,7 @@ test {
     _ = @import("sample.zig");
     _ = @import("roce.zig");
     _ = @import("roce_nap.zig");
+    _ = @import("roce_mark.zig");
     _ = @import("rank_scatter.zig");
     _ = @import("relay_plan.zig");
     _ = launch;

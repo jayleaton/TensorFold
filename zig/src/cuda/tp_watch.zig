@@ -9,6 +9,10 @@ const ready_kind: u32 = 1;
 const error_kind: u32 = 2;
 const wake_kind: u32 = 3;
 const max_lines = 16;
+/// The status a stop exits with: 1, or `coherent_exit` once a family opts in (`exitCoherently`).
+var exit_status: u8 = 1;
+/// fabric/tp/fate.zig's fail-fast status: a supervisor restarts the pair, not one rank.
+pub const coherent_exit: u8 = 70;
 
 /// Set by a rank that ends on purpose, before it tells the others: a line closing after that is expected.
 var ending = std.atomic.Value(bool).init(false);
@@ -159,9 +163,14 @@ pub fn fatal(name: []const u8) void {
     stop();
 }
 
+/// This process's stops exit with `coherent_exit` (a family whose supervisor reads it; others keep 1).
+pub fn exitCoherently() void {
+    exit_status = coherent_exit;
+}
+
 /// Ends this process at once: a stream may hold kernels that wait on the gone rank, which a normal exit would join.
 fn stop() noreturn {
-    platform.c._exit(1);
+    platform.c._exit(exit_status);
 }
 
 /// A line's records; it closing or carrying an error stops this rank unless it ends on purpose.
@@ -333,6 +342,7 @@ const ProcessTest = struct {
         if (pid == 0) {
             _ = posix.system.close(pair[1]);
             ending.store(mode == 2, .release);
+            if (mode == 4) exitCoherently(); // the child alone: the parent's status stays a non-opted family's
             watch(pair[0], 0);
             std.c._exit(0);
         }
@@ -353,7 +363,7 @@ const ProcessTest = struct {
             }
         }
         if (mode == 3) return error.InjectedParentFailure;
-        if (mode == 1) {
+        if (mode == 1 or mode == 4) {
             var record: Record = .{ .kind = error_kind, .rank = 1 };
             @memcpy(record.text[0..8], "peer OOM");
             const data = std.mem.asBytes(&record);
@@ -366,7 +376,7 @@ const ProcessTest = struct {
             if (std.c.waitpid(pid, &status, 1) == pid) {
                 last_reaped = true;
                 try std.testing.expectEqual(@as(c_int, 0), status & 0x7f);
-                try std.testing.expectEqual(@as(c_int, if (mode == 2) 0 else 1), (status >> 8) & 0xff);
+                try std.testing.expectEqual(@as(c_int, if (mode == 2) 0 else if (mode == 4) coherent_exit else 1), (status >> 8) & 0xff);
                 return;
             }
             std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
@@ -382,6 +392,14 @@ test "the real peer watcher exits on a closed line and on an error record, and r
     try ProcessTest.check(0);
     try ProcessTest.check(1);
     try ProcessTest.check(2);
+}
+
+test "a family that does not opt in still exits 1 on a peer's error; one that opts in exits 70" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(u8, 1), exit_status); // GLM, Nemotron, DeepSeek: as before
+    try ProcessTest.check(1);
+    try ProcessTest.check(4);
+    try std.testing.expectEqual(@as(u8, 1), exit_status);
 }
 
 test "a failing parent check still closes the line, kills and reaps the watcher's child" {

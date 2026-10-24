@@ -5,6 +5,8 @@ const driver = @import("driver.zig");
 const stream_ = @import("stream.zig");
 const memory = @import("memory.zig");
 const roce = @import("roce.zig");
+const roce_mark = @import("roce_mark.zig");
+const tp_watch = @import("tp_watch.zig");
 
 const Stream = stream_.Stream;
 
@@ -15,6 +17,7 @@ pub const Group = struct {
     world: usize,
     aborted: std.atomic.Value(bool) = .init(false),
     fast: ?*roce.Gather = null, // two ranks' small all-gathers by RoCE writes (openRoce), when both ranks brought it up
+    coherent: bool = false, // opt-in (MiniMax): TF_ROCE_MARK is read and written, a failed RoCE gather stops every rank
 
     /// Rank `rank` of `world` (NCCL opened at run time; NCCL_COMM_ID names rank 0's address, every rank the same).
     pub fn open(rank: usize, world: usize) !Group {
@@ -44,15 +47,26 @@ pub const Group = struct {
         if (!g.aborted.swap(true, .acq_rel)) _ = g.lib.api.ncclCommAbort(g.comm);
     }
 
-    /// Two ranks: gathers up to `max_bytes` a rank go by RoCE writes if both ranks bring it up; else NCCL keeps them.
+    /// Two ranks: small gathers go by RoCE if both ask (TF_ROCE; coherent: no TF_ROCE_MARK) and bring it up; else NCCL.
     pub fn openRoce(g: *Group, gpa: std.mem.Allocator, io: std.Io, d: *const driver.Driver, s: Stream, max_bytes: usize) !void {
         if (g.world != 2 or g.fast != null) return;
-        g.fast = try roce.Gather.init(gpa, io, d, g, s, roce.wanted(), max_bytes);
+        g.fast = try roce.Gather.init(gpa, io, d, g, s, wantsRoce(g.coherent, io, roce.wanted(), roce_mark.path()), max_bytes);
+        if (g.coherent) if (g.fast) |f| {
+            f.mark = .of(io);
+        };
     }
 
-    /// A failed RoCE gather's error (its rows hold nothing valid): call it after a synchronize that reads a gather.
+    /// What this rank asks for: TF_ROCE alone, or with `coherent` also no marker from an earlier failed run.
+    fn wantsRoce(coherent: bool, io: std.Io, want: bool, mark: ?[]const u8) bool {
+        return if (coherent) roce_mark.wanted(io, want, mark) else want;
+    }
+
+    /// A failed RoCE gather's error (its rows hold nothing valid): check after a sync; coherent, every rank stops.
     pub fn check(g: *const Group) !void {
-        if (g.fast) |f| try f.check();
+        if (g.fast) |f| f.check() catch |e| {
+            if (g.coherent) tp_watch.fatal("RoCE all-gather failed");
+            return e;
+        };
     }
 
     /// `bytes` at `mine` from every rank into `all` in rank order (world * bytes there), on `s`.
@@ -97,6 +111,23 @@ pub const Group = struct {
         try dev.download(0, std.mem.sliceAsBytes(out));
     }
 };
+
+test "a group that does not opt in ignores the RoCE marker; a coherent one serves on NCCL while it exists" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    const at = try std.fs.path.join(std.testing.allocator, &.{ dir, "roce-failed" });
+    defer std.testing.allocator.free(at);
+    roce_mark.write(io, at, 1, "earlier run");
+    try std.testing.expect(Group.wantsRoce(false, io, true, at)); // GLM and others: TF_ROCE alone, as before
+    try std.testing.expect(!Group.wantsRoce(true, io, true, at));
+    try std.testing.expect(!Group.wantsRoce(false, io, false, at));
+    const g: Group = .{ .lib = undefined, .comm = null, .rank = 0, .world = 2 };
+    try std.testing.expect(!g.coherent);
+    try g.check(); // no RoCE gather: nothing to fail
+}
 
 test "an aborted two-rank communicator is not destroyed a second time" {
     const Fake = struct {
