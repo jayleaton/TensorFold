@@ -282,11 +282,14 @@ pub fn plan(g: *const Geometry, sh: Shape, sink: anytype) !void {
     try sink.emit(.{ .zero = .{ .buf = .res, .rows = n } });
     try sink.emit(.{ .norm_add = .{ .x = .{ .buf = .emb }, .x_f32 = false, .norm = .input, .layer = 0, .y = .{ .buf = .a }, .rows = n } });
     var l: u32 = 0;
-    while (l < g.layers) : (l += 1) {
-        try attention(g, sh, l, sink);
-        try mlp(g, sh, l, sink);
-    }
+    while (l < g.layers) : (l += 1) try planLayer(g, sh, l, sink);
     try head(g, sh, sink);
+}
+
+/// Layer `l`'s launches from its normed input in `a`: attention, feed-forward, next norm; `res` is its output.
+pub fn planLayer(g: *const Geometry, sh: Shape, l: u32, sink: anytype) !void {
+    try attention(g, sh, l, sink);
+    try mlp(g, sh, l, sink);
 }
 
 fn lin(sink: anytype, w: Lin, l: u32, x: Ref, y: Ref, n: u32, prompt: bool) !void {

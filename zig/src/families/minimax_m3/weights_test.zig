@@ -98,6 +98,33 @@ test "a thin model describes its first layers only, and a wrong plain dtype or m
     try weights.checkPlain(odd);
 }
 
+test "a plan cut to layer 2 alone describes that layer at its own index; unordered or foreign ids are refused" {
+    const io = std.testing.io;
+    const c = synth.mini();
+    var f = try Fixture.init(io, &c, false);
+    defer f.deinit();
+    var plan = try load.Plan.build(gpa, &f.cat, &c, try shard.Share.of(&c, 0, 1), .{ .layers = &.{2} });
+    defer plan.deinit();
+    var bases: [4096]u64 = undefined;
+    fakeBases(&plan, bases[0..plan.slots.len]);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const d = try weights.describeLayers(arena.allocator(), &plan, &c, bases[0..plan.slots.len], &.{2});
+    try std.testing.expectEqual(@as(usize, 3), d.weights.layers.len);
+    const q = plan.matrix(.q, 2, 0).?;
+    try std.testing.expectEqual(bases[q.trellis] + q.trellis_off, d.weights.layers[2].q.trellis);
+    try std.testing.expect(d.weights.layers[2].ffn.moe.router != 0 and d.weights.layers[2].input_ln != 0);
+    try std.testing.expectEqual(@as(usize, 1), d.tables.len);
+    try std.testing.expectEqual(@as(u16, 2), d.tables[0].layer);
+    try std.testing.expectError(error.MissingTensor, weights.describeLayers(arena.allocator(), &plan, &c, bases[0..plan.slots.len], &.{ 1, 2 }));
+    try std.testing.expectError(error.BadLayer, weights.describeLayers(arena.allocator(), &plan, &c, bases[0..plan.slots.len], &.{ 2, 2 }));
+    var full = try load.Plan.build(gpa, &f.cat, &c, try shard.Share.of(&c, 0, 1), .{});
+    defer full.deinit();
+    fakeBases(&full, bases[0..full.slots.len]);
+    const sparse = try weights.describeLayers(arena.allocator(), &full, &c, bases[0..full.slots.len], &.{ 0, 3 });
+    try std.testing.expect(sparse.weights.layers[0].ffn == .dense and sparse.weights.layers[3].ffn.moe.bias != 0);
+}
+
 test "the tables pack to the layout the pointers say, and a gate/up swap exchanges both pairs" {
     const io = std.testing.io;
     const c = synth.mini();

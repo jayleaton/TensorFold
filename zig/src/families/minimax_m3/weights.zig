@@ -150,11 +150,22 @@ fn moeLayer(a: std.mem.Allocator, plan: *const load.Plan, c: *const Config, base
 
 /// `bases[slot]` is slot's device address. `layers` is how many layers the plan holds (a thin model: the first ones).
 pub fn describe(a: std.mem.Allocator, plan: *const load.Plan, c: *const Config, bases: []const u64, layers: usize) Error!Described {
-    if (bases.len != plan.slots.len or layers > c.layers) return error.BadLayer;
+    if (layers > c.layers) return error.BadLayer;
+    const ids = try a.alloc(u16, layers);
+    for (ids, 0..) |*id, i| id.* = @intCast(i);
+    return describeLayers(a, plan, c, bases, ids);
+}
+
+/// Layers `ids` (ascending) of a plan cut to them; `layers` has max(ids) + 1 entries, the others undefined and unread.
+pub fn describeLayers(a: std.mem.Allocator, plan: *const load.Plan, c: *const Config, bases: []const u64, ids: []const u16) Error!Described {
+    if (bases.len != plan.slots.len) return error.BadLayer;
+    for (ids, 0..) |l, i| if (l >= c.layers or (i > 0 and l <= ids[i - 1])) return error.BadLayer;
+    const layers: usize = if (ids.len == 0) 0 else @as(usize, ids[ids.len - 1]) + 1;
     const out = try a.alloc(Layer, layers);
     var pending: std.ArrayList(Tables) = .empty;
-    for (out, 0..) |*o, i| {
-        const l: u32 = @intCast(i);
+    for (ids) |id| {
+        const l: u32 = id;
+        const o = &out[id];
         o.* = .{
             .q = try matrix(plan, bases, .q, l),
             .k = try matrix(plan, bases, .k, l),
@@ -179,7 +190,7 @@ pub fn describe(a: std.mem.Allocator, plan: *const load.Plan, c: *const Config, 
             },
             .final_norm => w.final_norm = at,
             else => {
-                if (p.layer >= layers) continue;
+                if (std.mem.indexOfScalar(u16, ids, p.layer) == null) continue;
                 const o = &out[p.layer];
                 switch (p.role) {
                     .input_ln => o.input_ln = at,

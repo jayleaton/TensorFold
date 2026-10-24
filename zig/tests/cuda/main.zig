@@ -222,6 +222,7 @@ const usage =
     \\  train-pack MODEL EXAMPLES [COUNT]   training passes holding several sequences against one a pass: differences, time
     \\  kernel-contract           the registered kernels through the contract's gates, each planted control red (needs -Dnvcc)
     \\  kernel-contract-limits DIR   each registered launch against sm_80/86/89/120/121 from the fatbins in DIR
+    \\  mm3-layer-parity PACK LAYER IN.npy OUT [IDS.npy|-] [HEAD_IN.npy]  one real-pack layer on given rows, partials as .npy
     \\  mm3-dspark-pass [DIR]     the dspark draft absorb and block pass on synthetic weights against float64 (writes 1.5 GB under DIR)
     \\  mm3-dspark-bench          milliseconds a launch of each dspark kernel takes at the shipped shapes
     \\  mm3-dspark-contract       MiniMax-M3.1-Flash dspark draft kernels alone through gates 1-4 (no controls, no limits)
@@ -433,6 +434,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "gdn-back-27b")) return gdn_back_tests.runShape(gpu, 5120, 64);
     if (std.mem.eql(u8, cmd, "kernel-contract")) return contract_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "kernel-contract-limits")) return contract_tests.fatbins(gpu, try arg(rest, 0));
+    if (std.mem.eql(u8, cmd, "mm3-layer-parity")) return @import("mm3_layer_parity.zig").run(gpu, rest);
     if (std.mem.eql(u8, cmd, "mm3-dspark-pass")) return @import("mm3_dspark_pass.zig").run(gpu, rest);
     if (std.mem.eql(u8, cmd, "mm3-proj-contract")) return @import("contract_minimax_proj.zig").run(gpu);
     if (std.mem.eql(u8, cmd, "mm3-dspark-bench")) return @import("contract_minimax_dspark.zig").bench(gpu);

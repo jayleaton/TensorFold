@@ -91,15 +91,20 @@ pub const Loaded = struct {
 
 /// Plans rank `share` (the first `layers` layers; 0: all), fills the slots, uploads the expert tables. UNEXERCISED.
 pub fn loadWeights(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: cuda.Stream, dir: []const u8, c: *const Config, share: shard_.Share, layers: usize) !Loaded {
-    var cat = try load.Catalog.open(gpa, io, dir);
-    defer cat.deinit();
-    const sum = try digest(gpa, &cat);
     var first: [64]u16 = undefined;
     const subset: []const u16 = if (layers == 0 or layers >= c.layers) &.{} else blk: {
         for (first[0..layers], 0..) |*f, i| f.* = @intCast(i);
         break :blk first[0..layers];
     };
-    var plan = try load.Plan.build(gpa, &cat, c, share, .{ .layers = subset });
+    return loadLayers(gpa, io, d, stream, dir, c, share, subset);
+}
+
+/// Rank `share`'s layers `ids` (ascending; empty: all) with the embedding, final norm and head, as `loadWeights`.
+pub fn loadLayers(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: cuda.Stream, dir: []const u8, c: *const Config, share: shard_.Share, ids: []const u16) !Loaded {
+    var cat = try load.Catalog.open(gpa, io, dir);
+    defer cat.deinit();
+    const sum = try digest(gpa, &cat);
+    var plan = try load.Plan.build(gpa, &cat, c, share, .{ .layers = ids });
     defer plan.deinit();
     var out: Loaded = .{ .arena = .init(gpa), .bufs = &.{}, .tables = &.{}, .weights = undefined, .digest = sum, .bytes = plan.slotBytes() };
     errdefer out.arena.deinit();
@@ -117,7 +122,7 @@ pub fn loadWeights(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, st
     var drop: CacheDrop = .{ .cat = &cat };
     try feed(gpa, &cat, &plan, .{ .ctx = &up, .put = Upload.put }, drop.hook());
     try stream.synchronize();
-    var described = try weights.describe(a, &plan, c, bases, if (layers == 0) c.layers else layers);
+    var described = if (ids.len == 0) try weights.describe(a, &plan, c, bases, c.layers) else try weights.describeLayers(a, &plan, c, bases, ids);
     var tab: std.ArrayList(cuda.DeviceBuffer) = .empty;
     errdefer tab.deinit(gpa);
     errdefer for (tab.items) |*b| b.free();
