@@ -41,6 +41,9 @@ const modelopt_tests = @import("modelopt_tests.zig");
 const exl3_tests = @import("exl3_tests.zig");
 const exl3_tp2_tests = @import("exl3_tp2_tests.zig");
 const exl3_candidate_tests = @import("exl3_candidate_tests.zig");
+const mm3_prompt_tests = @import("mm3_prompt_tests.zig");
+const mm3_prompt_dense = @import("mm3_prompt_dense.zig");
+const mm3_prompt_bench = @import("mm3_prompt_bench.zig");
 const experts3_tests = @import("experts3_tests.zig");
 const moe_tests = @import("moe_tests.zig");
 const ck_tests = @import("ck_tests.zig");
@@ -231,6 +234,9 @@ const usage =
     \\  mm3-dspark-bench          milliseconds a launch of each dspark kernel takes at the shipped shapes
     \\  mm3-dspark-contract       MiniMax-M3.1-Flash dspark draft kernels alone through gates 1-4 (no controls, no limits)
     \\  mm3-proj-contract         MiniMax-M3.1-Flash index projection and pick kernels alone through gates 1-4 (no controls, no limits)
+    \\  mm3-prompt-contract       MiniMax-M3.1-Flash prompt experts (x3gm) per width: FP64 bounds, decode kernel, tiles, splits
+    \\  mm3-prompt-dense          MiniMax-M3.1-Flash dense prompt rows (pfdense) per class: FP64 bounds, decode blocks, rows
+    \\  mm3-prompt-bench PACK [ROWS] [REPS]  MiniMax-M3.1-Flash prompt experts and dense rows: decode path vs prompt kernels
     \\  mm3-contract              every MiniMax-M3.1-Flash kernel (act, index, select, attn, rows, router, proj, pick) through gates 1-4 (no controls, no limits)
     \\  mm3-pack                  MiniMax-M3.1-Flash pack shapes: 8-bit k/v EXL3 projections and layer 18's 3/3/4-bit routed experts against float64
     \\  glm-exl3                  GLM's EXL3 routed experts, decode and prompt, against float64 (synthetic)
@@ -379,6 +385,9 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "exlr8-bench")) return exlr8_tests.bench(gpu, try arg(rest, 0), if (rest.len > 1) rest[1] else "home", if (rest.len > 2) try std.fmt.parseInt(u16, rest[2], 10) else 40, if (rest.len > 3) try std.fmt.parseInt(usize, rest[3], 10) else 4);
     if (std.mem.eql(u8, cmd, "exl3")) return exl3_tests.run(gpu, if (rest.len > 0) rest[0] else "none");
     if (std.mem.eql(u8, cmd, "exl3-tiles")) return exl3_candidate_tests.run(gpu, if (rest.len > 0) rest[0] else null);
+    if (std.mem.eql(u8, cmd, "mm3-prompt-contract")) return mm3_prompt_tests.run(gpu);
+    if (std.mem.eql(u8, cmd, "mm3-prompt-dense")) return mm3_prompt_dense.run(gpu);
+    if (std.mem.eql(u8, cmd, "mm3-prompt-bench")) return mm3_prompt_bench.run(gpu, try arg(rest, 0), rest[1..]);
     if (std.mem.eql(u8, cmd, "exl3-tp2")) return exl3_tp2_tests.run(gpu, try arg(rest, 0), try arg(rest, 1), if (rest.len > 2) rest[2] else "none");
     if (std.mem.eql(u8, cmd, "sample")) return sample_tests.draws(gpu);
     if (std.mem.eql(u8, cmd, "topk")) return sample_tests.topk(gpu);
