@@ -6,13 +6,14 @@ const weights = @import("weights.zig");
 const ffn = @import("ffn.zig");
 const rows_cfg = @import("rows.zig");
 const iface = @import("iface.zig");
+const rows_plan = @import("rows_plan.zig");
 const sparse = cuda.minimax_m3_sparse;
 const rk = cuda.minimax_m3_rows;
 const Op = plan.Op;
 const Buf = plan.Buf;
 const Ref = plan.Ref;
 
-pub const Error = error{ NoLink, BadOp };
+pub const Error = error{ NoLink, BadOp, ScoreScratch };
 
 /// Every kernel module a step launches from.
 pub const Modules = struct {
@@ -83,17 +84,20 @@ fn shareRows(rows: usize, world: usize) usize {
 pub const Extra = enum { experts, gathered, scatter, share, shares, bmax, sel, status };
 
 pub const Buffers = struct {
-    mem: [plan.bufs.len + std.enums.values(Extra).len]cuda.DeviceBuffer,
+    pub const slots = plan.bufs.len + std.enums.values(Extra).len;
+
+    mem: [slots]cuda.DeviceBuffer,
     n: usize,
-    bm_stride: usize,
+    kvh: u32,
 
     fn take(b: *Buffers, d: *const cuda.Driver, bytes: usize) !void {
         b.mem[b.n] = try cuda.DeviceBuffer.alloc(d, bytes);
         b.n += 1;
     }
 
-    pub fn init(d: *const cuda.Driver, g: *const plan.Geometry, bm_stride: usize) !Buffers {
-        var b: Buffers = .{ .mem = undefined, .n = 0, .bm_stride = bm_stride };
+    /// `score_bytes` bounds the block maxima (rows_plan.Plan.scratch); a call's stride is its own block count.
+    pub fn init(d: *const cuda.Driver, g: *const plan.Geometry, score_bytes: u64) !Buffers {
+        var b: Buffers = .{ .mem = undefined, .n = 0, .kvh = g.kvh };
         errdefer b.deinit();
         for (plan.bufs) |id| try b.take(d, g.rowBytes(id) * g.capacity(id));
         const world: usize = g.world;
@@ -105,7 +109,7 @@ pub const Buffers = struct {
         try b.take(d, world * slot_rows * g.hidden * 4);
         try b.take(d, slot_rows * g.hidden * 4);
         try b.take(d, world * slot_rows * g.hidden * 4);
-        try b.take(d, @as(usize, g.max_rows) * g.kvh * bm_stride * 4);
+        try b.take(d, score_bytes);
         try b.take(d, @as(usize, g.max_rows) * g.kvh * 16 * 4);
         try b.take(d, 4);
         return b;
@@ -124,8 +128,10 @@ pub const Buffers = struct {
         return &b.mem[plan.bufs.len + @backingInt(e)];
     }
 
-    pub fn scratch(b: *const Buffers) sparse.Scratch {
-        return .{ .bmax = b.extra(.bmax).ptr, .sel = b.extra(.sel).ptr, .bm_stride = b.bm_stride };
+    /// The scratch of `rows` rows whose last position is at most `max_pos`, packed at that call's stride.
+    pub fn scratch(b: *const Buffers, rows: u32, max_pos: u32) Error!sparse.Scratch {
+        if (rows_plan.need(b.kvh, rows, max_pos) > b.extra(.bmax).len) return error.ScoreScratch;
+        return .{ .bmax = b.extra(.bmax).ptr, .sel = b.extra(.sel).ptr, .bm_stride = rows_plan.blocks(max_pos) };
     }
 };
 
@@ -248,12 +254,12 @@ pub const Device = struct {
             .qk_rope => |o| try dv.qkRope(o.layer, o.rows),
             .score => |o| {
                 const scale: f32 = @floatCast(std.math.pow(f64, 128, -0.5));
-                try m.sparse.score(s, dv.b.ptr(.iqn), dv.rowsOf(o.rows), try dv.paged(o.layer), dv.b.scratch(), o.max_pos, scale);
+                try m.sparse.score(s, dv.b.ptr(.iqn), dv.rowsOf(o.rows), try dv.paged(o.layer), try dv.b.scratch(o.rows, o.max_pos), o.max_pos, scale);
             },
-            .select => |o| try m.sparse.select(s, dv.rowsOf(o.rows), dv.g.kvh, dv.b.scratch(), .{}),
+            .select => |o| try m.sparse.select(s, dv.rowsOf(o.rows), dv.g.kvh, try dv.b.scratch(o.rows, o.max_pos), .{}),
             .attend => |o| {
                 const scale: f32 = @floatCast(std.math.pow(f64, 128, -0.5));
-                try m.sparse.attend(s, dv.b.ptr(.qn), dv.rowsOf(o.rows), try dv.paged(o.layer), dv.b.scratch(), dv.b.ptr(.attn), scale);
+                try m.sparse.attend(s, dv.b.ptr(.qn), dv.rowsOf(o.rows), try dv.paged(o.layer), try dv.b.scratch(o.rows, 0), dv.b.ptr(.attn), scale); // reads only the selections
             },
             .router => |o| try m.rows.routerLogits(s, rows_cfg.router, dv.b.ptr(.a), hidden, false, dv.layer(o.layer).ffn.moe.router, dv.b.ptr(.logits_r), o.rows),
             .route => |o| {

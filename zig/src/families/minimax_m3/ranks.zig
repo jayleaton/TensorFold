@@ -1,5 +1,6 @@
 //! This process's rank (TF_MM3_RANK, TF_MM3_WORLD, NCCL_COMM_ID) and whether all ranks agree (docs/rank-contract.md).
 const std = @import("std");
+const speed_ = @import("speed.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const floor = @import("floor.zig");
 
@@ -8,6 +9,10 @@ pub const world_var = "TF_MM3_WORLD";
 pub const layers_var = "TF_MM3_LAYERS";
 pub const roce_var = "TF_ROCE";
 pub const roce_cap_var = "TF_ROCE_MAX_KB";
+pub const graphs_var = "TF_MM3_GRAPHS";
+pub const graphs_max_var = "TF_MM3_GRAPHS_MAX";
+pub const graphs_tp_var = "TF_MM3_GRAPHS_TP";
+pub const score_var = "TF_MM3_SCORE_MIB";
 /// NCCL's own rendezvous variable: rank 0's IPv4 address and port, the same text on every rank.
 pub const comm_id_var = "NCCL_COMM_ID";
 
@@ -82,6 +87,13 @@ pub const Settings = struct {
     roce_kb: u32 = 4096, // TF_ROCE_MAX_KB, the small-gather RoCE path's cap in KiB; 0 when TF_ROCE=0 keeps every gather on NCCL
     kv8: bool = false, // --kv-cache fp8 (native.Options.kv8): K and V pages as e4m3 rows with fp32 scales; set by `open`, not read here
     floor: floor.Floor = .{}, // TF_MM3_FLOOR_*: the ranks' memory floor (floor.zig); every rank's gate stops the same chunk
+    graphs: speed_.Graphs = .{}, // TF_MM3_GRAPHS (0 off), TF_MM3_GRAPHS_MAX, TF_MM3_GRAPHS_TP=1 (capture exchanges)
+    score_mib: u32 = speed_.score_mib_default, // TF_MM3_SCORE_MIB: the block-score scratch's bound (0: unbounded)
+
+    /// The speed settings as one fingerprint word: graphs and the score bound change no bit, but ranks must match.
+    pub fn speed(s: Settings) u32 {
+        return s.graphs.digest() ^ (s.score_mib *% 0x9e3779b1);
+    }
 
     pub fn read(get: Get, problem: *[]const u8) Error!Settings {
         var s: Settings = .{};
@@ -103,20 +115,32 @@ pub const Settings = struct {
             s.roce_kb = 0;
         };
         s.floor = floor.Floor.read(get, problem) catch return error.BadSetting;
+        if (get(graphs_var)) |v| s.graphs.on = !std.mem.eql(u8, v, "0");
+        if (get(graphs_tp_var)) |v| s.graphs.tp = std.mem.eql(u8, v, "1");
+        if (get(graphs_max_var)) |v| s.graphs.max = std.fmt.parseInt(u32, v, 10) catch {
+            problem.* = "TF_MM3_GRAPHS_MAX: graphs held at most, 0 or more";
+            return error.BadSetting;
+        };
+        if (get(score_var)) |v| s.score_mib = std.fmt.parseInt(u32, v, 10) catch {
+            problem.* = "TF_MM3_SCORE_MIB: the block-score scratch's bound in MiB, 0 for none";
+            return error.BadSetting;
+        };
         return s;
     }
 };
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 2, // this struct's version
+    layout: u32 = 3, // this struct's version
     world: u32,
     rank: u32,
     layers: u32, // TF_MM3_LAYERS (0: all)
     reduce: u32 = 1, // tp.zig's reduction_version: the fp32 rank-order sum
     roce: u32, // Settings.roce_kb: the ranks open the RoCE small-gather path together or not at all
     kv8: u32 = 0, // Settings.kv8: the ranks' pages are one layout or the other, never mixed
-    floor: u32 = 0, // Settings.floor.gateMib(): the chunk gate's MiB, one number on every rank (keeps `capacity` 8-aligned)
+    floor: u32 = 0, // Settings.floor.gateMib(): the chunk gate's MiB, one number on every rank
+    speed: u32 = 0, // Settings.speed: graph settings and the score bound
+    reserved: u32 = 0, // keeps `capacity` 8-aligned without padding
     capacity: u64, // tokens a sequence holds
     config: [32]u8, // sha256 of config.json
     quant: [32]u8, // sha256 of quantization_config.json: codebook, version, every matrix's bits
@@ -124,7 +148,7 @@ pub const Fingerprint = extern struct {
     weights: [32]u8, // digest of the checkpoint's metadata and shard bytes (the engine's checkpoint digest)
     draft: [32]u8 = @splat(0), // the dspark draft: sha256 of its config.json and its shard metadata; zeros without one
 
-    pub const Field = enum { layout, rank, world, layers, reduce, roce, kv8, floor, capacity, config, quant, program, weights, draft };
+    pub const Field = enum { layout, rank, world, layers, reduce, roce, kv8, floor, speed, capacity, config, quant, program, weights, draft };
 
     pub fn of(p: Place, s: Settings, capacity: usize, config: [32]u8, quant: [32]u8, program: [32]u8, weights: [32]u8) Fingerprint {
         return .{
@@ -134,6 +158,7 @@ pub const Fingerprint = extern struct {
             .roce = s.roce_kb,
             .kv8 = @intFromBool(s.kv8),
             .floor = s.floor.gateMib(),
+            .speed = s.speed(),
             .capacity = capacity,
             .config = config,
             .quant = quant,
@@ -151,7 +176,7 @@ pub fn mismatch(all: []const Fingerprint) ?Mismatch {
         if (f.layout != all[0].layout) return .{ .field = .layout, .rank = r };
         if (f.rank != r) return .{ .field = .rank, .rank = r };
         if (f.world != all.len) return .{ .field = .world, .rank = r };
-        inline for (.{ "world", "layers", "reduce", "roce", "kv8", "floor", "capacity", "config", "quant", "program", "weights", "draft" }) |name| {
+        inline for (.{ "world", "layers", "reduce", "roce", "kv8", "floor", "speed", "capacity", "config", "quant", "program", "weights", "draft" }) |name| {
             if (!std.mem.eql(u8, std.mem.asBytes(&@field(f, name)), std.mem.asBytes(&@field(all[0], name))))
                 return .{ .field = @field(Fingerprint.Field, name), .rank = r };
         }
@@ -169,6 +194,7 @@ pub fn explain(f: Fingerprint.Field) []const u8 {
         .roce => "TF_ROCE or TF_ROCE_MAX_KB",
         .kv8 => "--kv-cache (one rank serves fp8 pages, another bf16)",
         .floor => "TF_MM3_FLOOR_HARD_GIB or TF_MM3_FLOOR_TRANSIENT_GIB (the memory floor's chunk gate)",
+        .speed => "TF_MM3_GRAPHS, TF_MM3_GRAPHS_MAX, TF_MM3_GRAPHS_TP, TF_GRAPH_CACHE or TF_MM3_SCORE_MIB",
         .capacity => "the sequence capacity (the context)",
         .config => "config.json",
         .quant => "quantization_config.json (codebook, version or bit widths)",
@@ -329,5 +355,5 @@ test "agree refuses a mismatch on the rank that sees it and passes agreeing rank
 }
 
 test "the fingerprint has no padding bytes to compare by accident" {
-    try std.testing.expectEqual(@as(usize, 4 * 8 + 8 + 160), @sizeOf(Fingerprint));
+    try std.testing.expectEqual(@as(usize, 4 * 10 + 8 + 160), @sizeOf(Fingerprint));
 }

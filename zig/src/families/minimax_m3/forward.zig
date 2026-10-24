@@ -7,6 +7,8 @@ const iface = @import("iface.zig");
 const weights = @import("weights.zig");
 const rows_cfg = @import("rows.zig");
 const Config = @import("config.zig").Config;
+const graphs = @import("graphs.zig");
+const rows_plan = @import("rows_plan.zig");
 const rk = cuda.minimax_m3_rows;
 
 pub const Geometry = plan.Geometry;
@@ -42,6 +44,9 @@ fn maxOf(xs: []const i32) u32 {
 pub const Forward = struct {
     dev: exec.Device,
     tab: []i32, // host copy of a shared window's per-row table offsets
+    pos: []i32, // host copy of a graphed window's positions
+    graphs: ?*graphs.Graphs = null, // windows replay captured graphs (null: every call eager)
+    graphed: plan.Shape = .{ .rows = 1 }, // the rows-form shape the graph body plans
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, st: cuda.Stream, m: *Modules, w: *const weights.Weights, g: *const Geometry, b: *Buffers, pages: Pages, link: ?Link) !Forward {
         const c = g.cfg;
@@ -50,10 +55,13 @@ pub const Forward = struct {
         return .{
             .dev = .{ .d = d, .st = st, .m = m, .w = w, .g = g, .b = b, .pages = pages, .link = link, .opts = o },
             .tab = try gpa.alloc(i32, iface.shared_rows),
+            .pos = try gpa.alloc(i32, iface.shared_rows),
         };
     }
 
     pub fn deinit(f: *Forward, gpa: std.mem.Allocator) void {
+        if (f.graphs) |g| g.destroy();
+        gpa.free(f.pos);
         gpa.free(f.tab);
         f.* = undefined;
     }
@@ -73,6 +81,7 @@ pub const Forward = struct {
     /// The ids (and a shared window's positions and table offsets) go to the device; the ops are queued on the stream.
     pub fn run(f: *Forward, c: Call) !Out {
         const sh = try shape(c);
+        if (f.graphs) |g| if (!sh.prompt and sh.rows <= g.settings.rows_max) return f.runRows(g, c, sh);
         const dev = &f.dev;
         const b = dev.b;
         dev.pages.slot = c.slot;
@@ -92,6 +101,81 @@ pub const Forward = struct {
         }
         try plan.plan(dev.g, sh, dev);
         return out(dev.g, sh);
+    }
+
+    /// Graphs from now on under `s` (inactive settings: none); a group of ranks votes on every miss.
+    pub fn useGraphs(f: *Forward, gpa: std.mem.Allocator, s: graphs.Settings) !void {
+        if (f.graphs) |g| g.destroy();
+        f.graphs = null;
+        if (!s.active(f.dev.g.world)) return;
+        const g = try graphs.Graphs.create(gpa, f.dev.d, s);
+        errdefer g.destroy();
+        if (f.dev.link) |l| try g.join(f.dev.d, l.group, f.dev.st, f.dev.g.world);
+        f.graphs = g;
+    }
+
+    /// A window in rows form: per-row positions and table offsets staged, its graph replayed (eager on first use).
+    fn runRows(f: *Forward, g: *graphs.Graphs, c: Call, sh: plan.Shape) !Out {
+        const dev = &f.dev;
+        const n = sh.rows;
+        const one = [1]iface.Seg{.{ .slot = c.slot, .row0 = 0, .rows = n }};
+        const segs: []const iface.Seg = if (sh.shared) c.segs else &one;
+        if (segs.len > iface.max_shared) return error.BadCall;
+        const pos = f.pos[0..n];
+        if (sh.shared) {
+            @memcpy(pos, c.positions);
+        } else for (pos, 0..) |*p, k| {
+            p.* = @intCast(c.pos0 + k);
+        }
+        const taps = dev.taps.base != 0 and dev.g.n_taps > 0;
+        const key = try g.keyOf(n, sh.max_pos, @backingInt(sh.head), @backingInt(sh.mode), segs, taps);
+        var rs = sh;
+        rs.shared = true;
+        rs.max_pos = g.scorePos(key, dev.pages.mirror.max_pages * rows_plan.block);
+        try plan.check(dev.g, rs);
+        dev.pages.slot = c.slot;
+        dev.pages.pos0 = c.pos0;
+        if (dev.taps.base != 0) {
+            dev.taps.prompt = false;
+            dev.taps.n = @intCast(segs.len);
+            @memcpy(dev.taps.segs[0..segs.len], segs);
+        }
+        try cuda.copy_source.enqueue(dev.d, dev.b.ptr(.ids), std.mem.sliceAsBytes(c.ids), dev.st);
+        var gs: [iface.max_shared]rk.geom.Seg = undefined;
+        for (segs, gs[0..segs.len]) |s, *o| o.* = .{ .slot = s.slot, .rows = s.rows };
+        try dev.pages.mirror.setRows(dev.st, f.tab[0..n], gs[0..segs.len]);
+        try cuda.copy_source.enqueue(dev.d, dev.b.ptr(.pos), std.mem.sliceAsBytes(pos), dev.st);
+        f.graphed = rs;
+        const body: graphs.gc.Body = .{ .ctx = f, .run = graphBody };
+        if (try g.first(key)) try graphBody(f, dev.st) else _ = try g.cache.run(key, dev.st, f.fingerprint(), body);
+        return out(dev.g, sh);
+    }
+
+    fn graphBody(ctx: *anyopaque, st: cuda.Stream) anyerror!void {
+        const f: *Forward = @ptrCast(@alignCast(ctx));
+        std.debug.assert(st.handle == f.dev.st.handle);
+        try plan.plan(f.dev.g, f.graphed, &f.dev);
+    }
+
+    /// Every address a graph bakes in: a change (a grown kernel scratch, a new pool or taps buffer) drops all graphs.
+    pub fn fingerprint(f: *const Forward) u64 {
+        const dev = &f.dev;
+        var words: [exec.Buffers.slots + 16]u64 = undefined;
+        var n: usize = 0;
+        for (dev.b.mem[0..dev.b.n]) |m| {
+            words[n] = m.ptr;
+            n += 1;
+        }
+        const de = &dev.m.dense;
+        for ([_]?cuda.DeviceBuffer{ de.xh, de.z, de.counters }) |m| {
+            words[n] = if (m) |x| x.ptr ^ (@as(u64, x.len) << 1) else 0;
+            n += 1;
+        }
+        const fast: u64 = if (dev.link) |l| @intFromPtr(l.group.fast) else 0;
+        const rest = [_]u64{ dev.pages.cache.pool, dev.pages.mirror.tables.ptr, dev.pages.mirror.row_tab.ptr, dev.taps.base, dev.g.n_taps, dev.m.dspark.part.ptr, fast, @intFromPtr(dev.w) };
+        @memcpy(words[n..][0..rest.len], &rest);
+        n += rest.len;
+        return graphs.gc.fingerprintOf(words[0..n]);
     }
 
     /// Where `sh`'s head left its rows.
@@ -115,4 +199,6 @@ pub const Forward = struct {
 
 test {
     _ = @import("forward_test.zig");
+    _ = graphs;
+    _ = rows_plan;
 }

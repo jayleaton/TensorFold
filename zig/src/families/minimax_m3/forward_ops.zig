@@ -7,6 +7,7 @@ const fw = @import("forward.zig");
 const plan = @import("forward_plan.zig");
 const pool = @import("pool.zig");
 const shard = @import("shard.zig");
+const rows_plan = @import("rows_plan.zig");
 const rk = cuda.minimax_m3_rows;
 
 pub const Impl = struct {
@@ -31,7 +32,7 @@ pub const Impl = struct {
         const layers: u32 = if (a.settings.layers > 0) a.settings.layers else a.cfg.layers;
         self.* = .{ .gpa = a.gpa, .g = try plan.Geometry.of(a.cfg, a.share, layers, iface.max_rows), .m = try fw.Modules.load(a.d), .b = undefined, .f = undefined, .dims = (try pool.Dims.of(a.cfg, a.share)).withKv8(a.settings.kv8) };
         errdefer self.m.deinit();
-        self.b = try fw.Buffers.init(a.d, &self.g, iface.maxPages(a.capacity));
+        self.b = try fw.Buffers.init(a.d, &self.g, planOf(a, self.g.kvh).scratch);
         errdefer self.b.deinit();
         const link: ?fw.Link = if (a.place.world > 1) .{ .group = a.group, .lib = a.lib, .comm = a.comm } else null;
         // the pages arrive at `attach`: the forward is made there, over the engine's arena and block table
@@ -39,6 +40,11 @@ pub const Impl = struct {
         self.link = link;
         self.args = a;
         return .{ .ptr = self, .vtable = &.{ .attach = attach, .run = run, .logits = logits, .sync = sync, .deinit = deinit, .set_taps = setTaps, .taps_base = tapsBase, .tap_copy = tapCopy } };
+    }
+
+    /// The prompt row plan both this forward's scratch and the engine's chunks follow.
+    pub fn planOf(a: ops.OpenArgs, kvh: u32) rows_plan.Plan {
+        return rows_plan.Plan.of(kvh, iface.maxPages(a.capacity), a.settings.score_mib);
     }
 
     fn of(p: *anyopaque) *Impl {
@@ -60,6 +66,7 @@ pub const Impl = struct {
         const pages: fw.Pages = .{ .cache = .{ .pool = view.arena, .page_bytes = view.page_bytes, .layer_off = 0, .kvh = s.g.kvh, .kv8 = s.dims.kv8 }, .layer_bytes = s.dims.layerToken() * pool.page_tokens, .mirror = &s.mirror.? };
         s.f = try fw.Forward.init(s.gpa, a.d, a.stream, &s.m, a.weights, &s.g, &s.b, pages, s.link);
         s.made = true;
+        try s.f.useGraphs(s.gpa, a.settings.graphs);
         if (s.g.n_taps > 0) { // one row of the buffer = every tap's hidden state side by side, bf16
             if (s.taps) |*t| t.free();
             s.taps = null;

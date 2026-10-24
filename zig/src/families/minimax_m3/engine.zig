@@ -5,6 +5,7 @@ const iface = @import("iface.zig");
 const pool = @import("pool.zig");
 const ops_ = @import("engine_ops.zig");
 const floor_ = @import("floor.zig");
+const rows_plan = @import("rows_plan.zig");
 
 pub const Sampling = iface.Sampling;
 pub const Part = iface.Part;
@@ -43,22 +44,11 @@ pub const Parts = struct {
     draft: ?ops_.Draft = null, // the dspark draft (--drafter): its rings, block pass and results; the forward taps for it
     floor: ?floor_.Floor = null, // the ranks' memory floor, with `mem` on every rank or on none (floor.zig)
     mem: ?floor_.Mem = null,
+    rows: ?rows_plan.Plan = null, // prompt chunk rows under the forward's score scratch (null: fixed chunk rows)
 };
 
 /// Frees what an engine's parts own (device buffers, the communicator, the forward's buffers) at `deinit`.
 pub const Closer = struct { ptr: *anyopaque, call: *const fn (ptr: *anyopaque) void };
-
-/// Where a prompt pass's chunk starting at `start` of a `len`-id prompt ends: a chunk's rows, or the next mark.
-pub fn chunkEnd(start: usize, len: usize, marks: ?Marks) usize {
-    var end = @min(len, start + prefill_rows);
-    if (marks) |m| for (m.at) |at| {
-        if (at > start and at < end) {
-            end = at;
-            break;
-        }
-    };
-    return end;
-}
 
 pub const Engine = struct {
     gpa: std.mem.Allocator,
@@ -72,6 +62,7 @@ pub const Engine = struct {
     slot: u32 = 0,
     view: ?ops_.PoolView = null,
     last_rows: [3]usize = @splat(0), // rows of the last pass of each kind: the gathered logits' rank stride
+    rows: rows_plan.Plan, // where prompt chunks end: rank 0 cuts them, the other ranks run the rows they are sent
     checkpoint_digest: [32]u8,
     peer_low: std.atomic.Value(u64) = .init(floor_.unknown), // the other ranks' lowest MemAvailable at the last gate
 
@@ -79,7 +70,7 @@ pub const Engine = struct {
     pub fn make(gpa: std.mem.Allocator, io: std.Io, parts: Parts) !*Engine {
         const e = try gpa.create(Engine);
         errdefer gpa.destroy(e);
-        e.* = .{ .gpa = gpa, .io = io, .p = parts, .rank = parts.comm.rank, .world = parts.comm.world, .capacity = parts.capacity, .max_pages = iface.maxPages(parts.capacity), .checkpoint_digest = parts.checkpoint_digest };
+        e.* = .{ .gpa = gpa, .io = io, .p = parts, .rank = parts.comm.rank, .world = parts.comm.world, .capacity = parts.capacity, .max_pages = iface.maxPages(parts.capacity), .checkpoint_digest = parts.checkpoint_digest, .rows = parts.rows orelse rows_plan.Plan.fixed(1, iface.maxPages(parts.capacity)) };
         try e.seqs.append(gpa, .{});
         return e;
     }
@@ -216,10 +207,15 @@ pub const Engine = struct {
     pub fn prefill(e: *Engine, ids: []const u32, from: ?Resume, cancel: ?Cancel, marks: ?Marks) !u32 {
         var start = try e.prefillStart(ids.len, from);
         while (true) {
-            const end = chunkEnd(start, ids.len, marks);
+            const end = e.chunkEnd(start, ids.len, marks);
             if (try e.prefillChunk(ids[start..end], start, ids.len, if (start == (if (from) |r| r.at else 0)) from else null, cancel, marks)) |first| return first;
             start = end;
         }
+    }
+
+    /// Where a prompt pass's chunk starting at `start` of a `len`-id prompt ends: the plan's rows, or the next mark.
+    pub fn chunkEnd(e: *const Engine, start: usize, len: usize, marks: ?Marks) usize {
+        return e.rows.chunkEnd(start, len, marks);
     }
 
     /// Where a prompt pass of `len` ids starts: 0, or the rows already in the adopted pages.
@@ -382,18 +378,19 @@ comptime {
 }
 
 test "a chunk ends at the pass's chunk rows, at a mark, or at the prompt's end" {
-    try std.testing.expectEqual(@as(usize, 2048), chunkEnd(0, 5000, null));
-    try std.testing.expectEqual(@as(usize, 100), chunkEnd(0, 100, null));
+    const p = rows_plan.Plan.fixed(1, iface.maxPages(65536 + window_rows));
+    try std.testing.expectEqual(@as(usize, 2048), p.chunkEnd(0, 5000, null));
+    try std.testing.expectEqual(@as(usize, 100), p.chunkEnd(0, 100, null));
     const Hook = struct {
         fn call(_: *anyopaque, _: u32) void {}
     };
     var x: u8 = 0;
     const m: Marks = .{ .at = &.{ 512, 1024, 4096 }, .ctx = &x, .call = Hook.call };
-    try std.testing.expectEqual(@as(usize, 512), chunkEnd(0, 5000, m));
-    try std.testing.expectEqual(@as(usize, 1024), chunkEnd(512, 5000, m));
-    try std.testing.expectEqual(@as(usize, 3072), chunkEnd(1024, 5000, m));
-    try std.testing.expectEqual(@as(usize, 4096), chunkEnd(3072, 5000, m));
-    try std.testing.expectEqual(@as(usize, 5000), chunkEnd(4096, 5000, m));
+    try std.testing.expectEqual(@as(usize, 512), p.chunkEnd(0, 5000, m));
+    try std.testing.expectEqual(@as(usize, 1024), p.chunkEnd(512, 5000, m));
+    try std.testing.expectEqual(@as(usize, 3072), p.chunkEnd(1024, 5000, m));
+    try std.testing.expectEqual(@as(usize, 4096), p.chunkEnd(3072, 5000, m));
+    try std.testing.expectEqual(@as(usize, 5000), p.chunkEnd(4096, 5000, m));
 }
 
 test "temperature 0 is greedy" {

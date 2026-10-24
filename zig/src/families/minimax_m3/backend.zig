@@ -201,7 +201,7 @@ pub const Lanes = struct {
         const ids = s.prompt();
         const at = l.fill.?;
         const marks = marksOf(l);
-        const to = engine.chunkEnd(at, ids.len, marks);
+        const to = self.x.e.chunkEnd(at, ids.len, marks);
         const first = self.x.chunk(ids, at, l.adopted, cancelOf(s), marks) catch |err| {
             l.fill = null; // the pass is over; the host releases the stream
             // under the floor beside other streams: it waits for one to end (alone, the floor's words refuse it)

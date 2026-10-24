@@ -8,6 +8,7 @@ const fakes = @import("engine_fake.zig");
 const dev = @import("engine_dev.zig");
 const ranks = @import("ranks.zig");
 const pool = @import("pool.zig");
+const rows_plan = @import("rows_plan.zig");
 
 const gpa = std.testing.allocator;
 const World = fakes.World;
@@ -67,6 +68,36 @@ test "a prompt crosses in chunks of at most 2048 rows and rank 1 runs the same f
     try std.testing.expectEqualSlices(u32, w.r0.kv, w.r1.kv);
     try std.testing.expectEqualSlices(i32, w.r0.table, w.r1.table);
     try std.testing.expectEqual(w.r0.draws, w.r1.draws); // the follower sent its span for every draw
+}
+
+test "a bounded score scratch cuts shorter whole-page chunks; rank 1 runs rank 0's cuts and the pages and token match fixed rows" {
+    const ids = try prompt(5000, 3);
+    defer gpa.free(ids);
+    const fixed = try World.create(gpa, 6000, 2, 120);
+    defer fixed.destroy();
+    var fs = try admit(fixed, 0, ids.len);
+    defer fs.done(fixed);
+    const want = try fixed.lanes.x.prefill(ids, null, null, null);
+    const w = try World.create(gpa, 6000, 2, 120);
+    defer w.destroy();
+    w.e0.rows = .{ .kvh = 4, .positions = w.e0.rows.positions, .scratch = rows_plan.need(4, 1024, 2047) };
+    var s = try admit(w, 0, ids.len);
+    defer s.done(w);
+    const first = try w.lanes.x.prefill(ids, null, null, null);
+    try std.testing.expectEqual(want, first);
+    try std.testing.expect(w.r0.runs.items.len > fixed.r0.runs.items.len);
+    var at: usize = 0;
+    for (w.r0.runs.items) |r| {
+        try std.testing.expect(at + r.ids.len == ids.len or r.ids.len % pool.page_tokens == 0);
+        try std.testing.expect(w.e0.rows.fits(r.ids.len, at + r.ids.len - 1));
+        at += r.ids.len;
+    }
+    try std.testing.expectEqual(ids.len, at);
+    try std.testing.expectEqualSlices(u32, fixed.r0.kv, w.r0.kv);
+    try w.replay();
+    try std.testing.expectEqual(w.r0.runs.items.len, w.r1.runs.items.len);
+    for (w.r0.runs.items, w.r1.runs.items) |a, b| try std.testing.expectEqualSlices(u32, a.ids, b.ids);
+    try std.testing.expectEqualSlices(u32, w.r0.kv, w.r1.kv);
 }
 
 test "chunk and resume equivalence: any cut of the prompt, and a pass resumed from adopted pages, give the same rows and token" {

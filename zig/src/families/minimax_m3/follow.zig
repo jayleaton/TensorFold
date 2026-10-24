@@ -162,7 +162,7 @@ pub const Leader = struct {
     /// One chunk `ids[start..chunkEnd]` of a prompt pass on every rank; the first token once the chunk ends the prompt.
     pub fn chunk(x: Leader, ids: []const u32, start: usize, from: ?engine.Resume, cancel: ?engine.Cancel, marks: ?engine.Marks) !?u32 {
         if (start >= ids.len) return error.BadChunk;
-        const part = ids[start..engine.chunkEnd(start, ids.len, marks)];
+        const part = ids[start..x.e.chunkEnd(start, ids.len, marks)];
         // a mark keeps the prefix before the step goes out: its page swap must reach the other ranks first
         if (marks) |m| if (start > 0 and std.mem.indexOfScalar(u32, m.at, @intCast(start)) != null) m.call(m.ctx, @intCast(start));
         try x.send(.{ .kind = @backingInt(Kind.chunk), .a = if (from) |r| r.at else 0, .depth = @intCast(start), .top_k = @intCast(ids.len) }, part);
@@ -175,7 +175,7 @@ pub const Leader = struct {
         var adopted = from;
         while (true) {
             if (try x.chunk(ids, start, adopted, cancel, marks)) |first| return first;
-            start = engine.chunkEnd(start, ids.len, marks);
+            start = x.e.chunkEnd(start, ids.len, marks);
             adopted = null;
         }
     }

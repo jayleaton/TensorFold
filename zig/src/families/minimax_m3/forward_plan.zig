@@ -65,7 +65,7 @@ pub const Op = union(enum) {
     index_proj: struct { layer: u32, rows: u32 }, // fp16 weights: a -> iq_raw, ik_raw
     qk_rope: struct { layer: u32, rows: u32 }, // norm + rope; q, index q to scratch; k, v, index key into pages
     score: struct { layer: u32, rows: u32, max_pos: u32 },
-    select: struct { layer: u32, rows: u32 },
+    select: struct { layer: u32, rows: u32, max_pos: u32 }, // reads the block maxima at score's stride
     attend: struct { layer: u32, rows: u32 },
     router: struct { layer: u32, rows: u32 }, // fp32 gate times a
     route: struct { layer: u32, rows: u32 },
@@ -317,7 +317,7 @@ fn attention(g: *const Geometry, sh: Shape, l: u32, sink: anytype) !void {
     try sink.emit(.{ .index_proj = .{ .layer = l, .rows = n } });
     try sink.emit(.{ .qk_rope = .{ .layer = l, .rows = n } });
     try sink.emit(.{ .score = .{ .layer = l, .rows = n, .max_pos = sh.max_pos } });
-    try sink.emit(.{ .select = .{ .layer = l, .rows = n } });
+    try sink.emit(.{ .select = .{ .layer = l, .rows = n, .max_pos = sh.max_pos } });
     try sink.emit(.{ .attend = .{ .layer = l, .rows = n } });
     try lin(sink, .o, l, .{ .buf = .attn }, .{ .buf = .part }, n, sh.prompt);
     try normAdd(sink, try exchange(g, sh, .attn_out, sink), .post, l, n);

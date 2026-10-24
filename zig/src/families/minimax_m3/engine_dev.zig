@@ -15,6 +15,7 @@ const weights_device = @import("weights_device.zig");
 const dc = @import("dspark_config.zig");
 const dspark_device = @import("dspark_device.zig");
 const forward_ops = @import("forward_ops.zig");
+const rows_plan = @import("rows_plan.zig");
 
 /// GLM's NCCL defaults, set when the environment leaves them unset: connect at init, no cuMem host buffers.
 pub const nccl_defaults = [_][2][:0]const u8{
@@ -398,6 +399,7 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ctx: *con
         .draft = if (own.draft) |dd| dd.interface() else null,
         .floor = o.settings.floor, // every rank gathers its MemAvailable at the chunk gates (floor.zig)
         .mem = @import("floor.zig").proc,
+        .rows = rows_plan.Plan.of(@intCast(share.kv_heads.len()), iface.maxPages(o.capacity), o.settings.score_mib),
     });
     try stream.synchronize();
     return e;
