@@ -226,7 +226,8 @@ const usage =
     \\  mm3-dspark-bench          milliseconds a launch of each dspark kernel takes at the shipped shapes
     \\  mm3-dspark-contract       MiniMax-M3.1-Flash dspark draft kernels alone through gates 1-4 (no controls, no limits)
     \\  mm3-proj-contract         MiniMax-M3.1-Flash index projection and pick kernels alone through gates 1-4 (no controls, no limits)
-    \\  mm3-contract              every MiniMax-M3.1-Flash kernel (act, select, attn, rows, router, proj, pick) through gates 1-4 (no controls, no limits)
+    \\  mm3-contract              every MiniMax-M3.1-Flash kernel (act, index, select, attn, rows, router, proj, pick) through gates 1-4 (no controls, no limits)
+    \\  mm3-pack                  MiniMax-M3.1-Flash pack shapes: 8-bit k/v EXL3 projections and layer 18's 3/3/4-bit routed experts against float64
     \\  glm-exl3                  GLM's EXL3 routed experts, decode and prompt, against float64 (synthetic)
     \\  glm-vision MODEL F32 BF16 IMG  GLM's image tower and preparation against vision_ref.py's torch runs
     \\  glm-mm-fixed              Prompt K policies: FP64, every row alone/batched, offsets and guarded tails
@@ -437,6 +438,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "mm3-dspark-bench")) return @import("contract_minimax_dspark.zig").bench(gpu);
     if (std.mem.eql(u8, cmd, "mm3-dspark-contract")) return @import("contract_minimax_dspark.zig").run(gpu);
     if (std.mem.eql(u8, cmd, "mm3-contract")) return @import("contract_minimax_all.zig").run(gpu);
+    if (std.mem.eql(u8, cmd, "mm3-pack")) return @import("mm3_pack_tests.zig").run(gpu);
     if (std.mem.eql(u8, cmd, "tree")) return tree_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "block")) return block_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "window")) return window_tests.run(gpu);

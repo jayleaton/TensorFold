@@ -1,9 +1,10 @@
-//! All MiniMax kernels (act, select, attn, rows, router, proj, pick) through gates 1-4; no controls, no limits.
+//! All MiniMax kernels (act, index, select, attn, rows, router, proj, pick) through gates 1-4; no controls, no limits.
 const std = @import("std");
 const cuda = @import("cuda");
 const core = @import("core");
 const act_k = @import("contract_minimax_act.zig");
 const sparse_k = @import("contract_minimax_sparse.zig");
+const index_k = @import("contract_minimax_index.zig");
 const rows_k = @import("contract_minimax_rows.zig");
 const proj_k = @import("contract_minimax_proj.zig");
 const ds_k = @import("contract_minimax_dspark.zig");
@@ -32,6 +33,9 @@ pub fn run(gpu: @import("check.zig").Gpu) !void {
 
     var sparse = try cuda.minimax_m3_sparse.Sparse.load(gpu.d);
     defer sparse.unload();
+    var indexes: [index_k.cfgs.len]index_k.Index = undefined;
+    for (index_k.cfgs, &indexes) |f, *x| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .f = f, .s = &sparse };
+    defer for (&indexes) |*x| x.deinit();
     var selects: [sparse_k.variants.len]sparse_k.Select = undefined;
     for (sparse_k.variants, &selects) |v, *x| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .f = &sparse, .v = v };
     defer for (&selects) |*x| x.deinit();
@@ -64,9 +68,12 @@ pub fn run(gpu: @import("check.zig").Gpu) !void {
 
     var dspark = try ds_k.Holder.open(gpu, s, &kernels);
     defer dspark.close();
+    // last, so every earlier kernel keeps the seed it had before the index kernels joined
+    for (&indexes) |*x| try kernels.append(a, x.kernel());
 
     var t: g.Tally = .{};
     try g.runAll(a, kernels.items, 0x6d33, &t);
+    for (&indexes) |*x| x.report();
     std.debug.print("SUMMARY mm3-contract {d} kernels: {d} pass gates 1-4, {d} fail, {d} known findings\n", .{ t.kernels, t.passed, t.failed, t.known });
     try check.expect(t.failed == 0, "mm3-contract: {d} gate failures", .{t.failed});
 }
