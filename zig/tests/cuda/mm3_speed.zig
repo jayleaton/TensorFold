@@ -277,8 +277,7 @@ pub fn bench(gpu: check.Gpu, rest: []const [:0]const u8) !void {
         std.debug.print("RESULT mm3-bench prefill layers={d} moe={?d} tokens={d} rows={s}{d}: {d:.1} ms, {d:.0} tok/s (median of 3)\n", .{ a.layers, a.first_moe, n, if (rows == 0) "plan:" else "", if (rows == 0) m.plan.rowsAt(0, n) else rows, med, @as(f64, @floatFromInt(n)) / (med / 1e3) });
     };
 
-    // decode windows at each context: eager, then graphs (warm-up runs the first-use eager step and the capture);
-    // `decode` times them over the zeroed pool instead, as sparse attention reads its selected blocks either way
+    // decode windows, eager then graphs (warm-up covers first use and capture); `decode` skips prefill (zeroed pool)
     if (!a.decode_only) for (1..4) |s| {
         _ = try m.prefill(@intCast(s), ids[0..32768], 2048);
     };

@@ -369,7 +369,7 @@ pub const Model = struct {
         return rows;
     }
 
-    /// A prompt on `slot` from 0 in `chunk_rows`-row chunks (a page multiple; 0: the plan's rows); the last row's token.
+    /// A prompt on `slot` in `chunk_rows`-row chunks (page multiple; 0: the plan's rows); the last row's token.
     pub fn prefill(m: *Model, slot: u32, ids: []const i32, chunk_rows: u32) !u32 {
         if (slot >= m.o.slots or ids.len == 0 or chunk_rows % 128 != 0 or chunk_rows > iface.prefill_rows) return error.BadOptions;
         if (ids.len > @as(usize, m.max_pages) * 128) return error.BadOptions;
