@@ -326,6 +326,22 @@ test "out_scales auto is admitted: the loader still requires every matrix' fp16 
     try std.testing.expectEqualDeep(flash.quant, (try parse(gpa, json)).quant);
 }
 
+test "an EXL3 1.6.4 pack's quantization_config parses; its original_quantization_config is never read" {
+    const gpa = std.testing.allocator;
+    const from = "\"version\": \"1.6.1\",\n        \"bits\": 3.55,\n        \"head_bits\": 6,\n        \"out_scales\": \"always\",";
+    // the nested decoys would each be refused if the parser read them as the top level's keys
+    const to =
+        \\"version": "1.6.4", "bits": 3.61, "head_bits": 8, "calibration": {"rows": 1154, "cols": 2048}, "out_scales": "auto",
+        \\"original_quantization_config": {"quant_method": "mxfp8", "codebook": "none", "out_scales": "never", "version": "0.1",
+        \\"bits": 8, "head_bits": 4, "weight_block_size": [1, 32], "ignored_layers": ["language_model.model.layers.3.mlp.gate"]},
+    ;
+    const json = try patched(gpa, from, to);
+    defer gpa.free(json);
+    try std.testing.expectEqualDeep(Quant{ .version = .{ 1, 6, 4 }, .bits = 3.61, .head_bits = 8 }, (try parse(gpa, json)).quant);
+    // a quant_method only inside the original description is not the pack's
+    try refuses(error.BadConfig, "\"quant_method\": \"exl3\",", "\"original_quantization_config\": {\"quant_method\": \"exl3\"},");
+}
+
 test "the 3.06 bpw pack spells its mean bits avg_bits and its head 8 bits" {
     const gpa = std.testing.allocator;
     const json = try patched(gpa, "\"bits\": 3.55,", "\"avg_bits\": 3.06,");
