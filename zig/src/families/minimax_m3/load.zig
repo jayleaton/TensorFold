@@ -16,10 +16,10 @@ comptime {
 /// The mul1 codebook marker's value: exl3_decode.cuh hard-codes this multiplier.
 pub const mul1_multiplier: u32 = 0x83DCD12D;
 
-/// Half-bit widths (2 * bits) the CUDA kernels were built and tested for: 3, 4, 5 and 6 bits.
-pub const allowed_halves = [_]u32{ 6, 8, 10, 12 };
-/// The head alone may also be 7 or 8 bits (the 3.06 bpw pack stores it at 8); the dense kernels run those widths.
-pub const head_halves = [_]u32{ 6, 8, 10, 12, 14, 16 };
+/// Half-bit widths (2 * bits) admitted for routed experts (the exl3_experts kernels): 3, 4, 5 and 6 bits.
+pub const expert_halves = [_]u32{ 6, 8, 10, 12 };
+/// Every other matrix (attention, dense and shared MLP, head) runs cuda.exl3.Dense: mul1 at 3 to 8 bits.
+pub const dense_halves = [_]u32{ 6, 8, 10, 12, 14, 16 };
 
 /// One stored tensor: where its bytes sit in which shard (absolute file offset) and what its header said.
 pub const Ref = struct {
@@ -411,7 +411,7 @@ const Builder = struct {
         const words = trellis.shape[2];
         if (words % 8 != 0 or words < 16 or words > 128) return bad(error.BadTrellis, prefix, "trellis last dim {d} is not 16 * bits", .{words});
         const halves: u32 = @intCast(words / 8);
-        if (std.mem.indexOfScalar(u32, if (proj == .head) &head_halves else &allowed_halves, halves) == null) return bad(error.UnsupportedWidth, prefix, "{d} half-bits are not a width the kernels run", .{halves});
+        if (std.mem.indexOfScalar(u32, if (proj.isExpert()) &expert_halves else &dense_halves, halves) == null) return bad(error.UnsupportedWidth, prefix, "{d} half-bits are not a width the kernels run", .{halves});
         if (trellis.shape[0] * 16 % 128 != 0 or trellis.shape[1] * 16 % 128 != 0) return bad(error.NotAligned, prefix, "K {d} x N {d} is not 128-aligned", .{ trellis.shape[0] * 16, trellis.shape[1] * 16 });
         if (trellis.shape[0] * 16 != k or trellis.shape[1] * 16 != n) return bad(error.MisshapedTensor, prefix, "trellis {any} is not K {d} x N {d}", .{ trellis.shape[0..3].*, k, n });
         if (!suh.is(.f16, &.{k}) or !svh.is(.f16, &.{n})) return bad(error.MisshapedTensor, prefix, "scales are not fp16 [{d}] and [{d}]", .{ k, n });
@@ -536,4 +536,5 @@ test {
     _ = shard;
     _ = @import("load_test.zig");
     _ = @import("load_synth_test.zig");
+    _ = @import("load_widths_test.zig");
 }

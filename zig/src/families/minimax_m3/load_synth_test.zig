@@ -475,7 +475,7 @@ test "misshaped tensors fail closed with the reason that names them" {
         .{ .name = q0 ++ ".trellis", .dtype = "I16", .shape = &.{ 16, 32 }, .want = error.BadTrellis },
         .{ .name = q0 ++ ".trellis", .dtype = "I16", .shape = &.{ 16, 32, 32 }, .want = error.UnsupportedWidth }, // 2 bits
         .{ .name = q0 ++ ".trellis", .dtype = "I16", .shape = &.{ 16, 32, 88 }, .want = error.UnsupportedWidth }, // 5.5 bits
-        .{ .name = q0 ++ ".trellis", .dtype = "I16", .shape = &.{ 16, 32, 128 }, .want = error.UnsupportedWidth }, // 8 bits
+        .{ .name = e1 ++ ".trellis", .dtype = "I16", .shape = &.{ 16, 16, 128 }, .want = error.UnsupportedWidth }, // expert, 8 bits
         .{ .name = q0 ++ ".trellis", .dtype = "I16", .shape = &.{ 17, 32, 96 }, .want = error.NotAligned }, // K 272
         .{ .name = q0 ++ ".trellis", .dtype = "I16", .shape = &.{ 8, 32, 96 }, .want = error.MisshapedTensor }, // K 128, not 256
         .{ .name = q0 ++ ".suh", .dtype = "F16", .shape = &.{255}, .want = error.MisshapedTensor },
