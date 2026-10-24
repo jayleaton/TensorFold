@@ -61,6 +61,24 @@ __device__ __forceinline__ void decode_a(const uint32_t* tile, const LaneMap<K2>
     a[3] = cb_pair<MUL1>(st[6], st[7]);      // b1[1]                              -> A row g + 8, k 2t+8..
 }
 
+// X3GM_FLUSH_K (an image's define): the chain restarts every that many k into an fp32 total; unset, one chain.
+template <int KS, int MTL, int NG>
+__device__ __forceinline__ void flush(float (&tot)[MTL][NG][4], float (&acc)[MTL][NG][4], int s) {
+#ifdef X3GM_FLUSH_K
+    static_assert(X3GM_FLUSH_K % (KS * 16) == 0, "flush points on stage edges");
+    if (((s + 1) * KS * 16) % X3GM_FLUSH_K != 0) return;
+#pragma unroll
+    for (int l = 0; l < MTL; ++l)
+#pragma unroll
+        for (int n = 0; n < NG; ++n)
+#pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                tot[l][n][c] += acc[l][n][c];
+                acc[l][n][c] = 0.f;
+            }
+#endif
+}
+
 template <int MATS, int XM, int K2, int MTL, int NG, int KS, int NSA, int NGR>
 struct Cfg {
     static constexpr int BM = NG * 8, WPM = NB / MTL, W = MATS * WPM, THREADS = W * 32;
@@ -163,12 +181,20 @@ __global__ void __launch_bounds__(Cfg<MATS, XM, K2, MTL, NG, KS, NSA, NGR>::THRE
         };
 
         float acc[MTL][NG][4];
+#ifdef X3GM_FLUSH_K
+        float tot[MTL][NG][4];
+#endif
 #pragma unroll
         for (int l = 0; l < MTL; ++l)
 #pragma unroll
             for (int n = 0; n < NG; ++n)
 #pragma unroll
-                for (int c = 0; c < 4; ++c) acc[l][n][c] = 0.f;
+                for (int c = 0; c < 4; ++c) {
+                    acc[l][n][c] = 0.f;
+#ifdef X3GM_FLUSH_K
+                    tot[l][n][c] = 0.f;
+#endif
+                }
 
 #pragma unroll
         for (int s = 0; s < NSA - 1; ++s) {
@@ -204,9 +230,20 @@ __global__ void __launch_bounds__(Cfg<MATS, XM, K2, MTL, NG, KS, NSA, NGR>::THRE
                     }
                 }
             }
+#ifdef X3GM_FLUSH_K
+            flush<KS>(tot, acc, s);
+#endif
             cp_wait<NSA - 2>();
             __syncthreads();
         }
+#ifdef X3GM_FLUSH_K
+#pragma unroll
+        for (int l = 0; l < MTL; ++l)
+#pragma unroll
+            for (int n = 0; n < NG; ++n)
+#pragma unroll
+                for (int c = 0; c < 4; ++c) acc[l][n][c] += tot[l][n][c];
+#endif
 
         // epilogue: ER members a round, accumulators -> ep[mat][member][column], then one warp a member row
 #pragma unroll

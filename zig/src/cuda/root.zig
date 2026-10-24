@@ -72,6 +72,8 @@ pub const exl3_experts = @import("exl3_experts.zig");
 pub const exl3_upload = @import("exl3_upload.zig");
 pub const exl3_candidate = @import("exl3_candidate.zig");
 pub const exl3_grouped = @import("exl3_grouped.zig");
+pub const exl3_gm = @import("exl3_gm.zig");
+pub const exl3_pfd = @import("exl3_pfd.zig");
 
 pub const arena = @import("arena.zig");
 pub const pack = @import("pack.zig");
@@ -80,6 +82,8 @@ pub const graph_cache = @import("graph_cache.zig");
 test {
     _ = nccl;
     _ = exl3_grouped;
+    _ = exl3_gm;
+    _ = exl3_pfd;
     _ = gdn_train;
     _ = train_q4;
     _ = train_attn;

@@ -13,6 +13,15 @@ __device__ __forceinline__ void kloop2(float (&acc)[MTL][NG][4], const unsigned 
                                        int slice, int lr, int lc, const LaneMap<K2>& map, LoadFn&& load_stage) {
     using C = Cfg<MATS, XM, K2, MTL, NG, KS, NSA, NGR>;
     constexpr int BM = C::BM, LDA = C::LDA, CPR = C::CPR, TW = C::TW, PAIRS = N8 / 2;
+#ifdef X3GM_FLUSH_K
+    float tot[MTL][NG][4];
+#pragma unroll
+    for (int l = 0; l < MTL; ++l)
+#pragma unroll
+        for (int n = 0; n < NG; ++n)
+#pragma unroll
+            for (int c = 0; c < 4; ++c) tot[l][n][c] = 0.f;
+#endif
 #pragma unroll
     for (int s = 0; s < NSA - 1; ++s) {
         if (s < S) load_stage(s);
@@ -51,9 +60,20 @@ __device__ __forceinline__ void kloop2(float (&acc)[MTL][NG][4], const unsigned 
                 for (int l = 0; l < MTL; ++l) mma16816(acc[l][2 * PAIRS], af[l], b);
             }
         }
+#ifdef X3GM_FLUSH_K
+        flush<KS>(tot, acc, s);
+#endif
         cp_wait<NSA - 2>();
         __syncthreads();
     }
+#ifdef X3GM_FLUSH_K
+#pragma unroll
+    for (int l = 0; l < MTL; ++l)
+#pragma unroll
+        for (int n = 0; n < NG; ++n)
+#pragma unroll
+            for (int c = 0; c < 4; ++c) acc[l][n][c] += tot[l][n][c];
+#endif
 }
 
 // One item (pass x 128-column block) at width K2, rows_sh filled by the caller; otherwise gm_kernel's body

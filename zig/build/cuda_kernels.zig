@@ -100,6 +100,8 @@ pub const kernels = [_]Kernel{
     .{ .name = "exl3_linear", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // exl3/linear.cu's device code, tensorfold_exl3_linear_v5
     .{ .name = "exl3_experts", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // exl3/experts.cu's device code, tensorfold_exl3_experts
     .{ .name = "exl3_candidate", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // #806's EXL3 tiles: Dense's candidate
+    .{ .name = "exl3_gm", .min_sm = 80, .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // x3gm's routed prompt experts (cuda/exl3_gm.zig)
+    .{ .name = "exl3_pfd", .min_sm = 80, .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // pfdense's dense prompt rows (cuda/exl3_pfd.zig)
     .{ .name = "glm_vision", .flags = &.{"-O3"} }, // ours: GLM's image tower steps around cuBLASLt (norms, rotary, softmax, merger)
     .{ .name = "glm_mm", .flags = &.{"-O3"} }, // ours: GLM's bf16 linears on tensor cores, weights tiled at load, row-stable
     .{ .name = "glm_dflash", .flags = &.{"-O3"} }, // the DFlash2 block drafter
