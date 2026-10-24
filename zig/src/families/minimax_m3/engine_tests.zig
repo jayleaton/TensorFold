@@ -9,4 +9,6 @@ test {
     _ = @import("engine_fake.zig");
     _ = @import("engine_test.zig");
     _ = @import("backend_test.zig");
+    _ = @import("floor.zig");
+    _ = @import("floor_test.zig");
 }

@@ -356,7 +356,7 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ctx: *con
     errdefer gpa.destroy(own);
     var stream = try cuda.Stream.init(d, false);
     errdefer stream.deinit();
-    own.* = .{ .gpa = gpa, .stream = stream, .cfg = c, .comm = undefined, .pool = .{ .d = d, .stream = stream }, .loaded = undefined, .group = .{ .lib = lib.*, .comm = comm, .rank = rank, .world = world }, .forward = undefined, .download = .{ .d = d, .stream = stream }, .drawer = undefined };
+    own.* = .{ .gpa = gpa, .stream = stream, .cfg = c, .comm = undefined, .pool = .{ .d = d, .stream = stream }, .loaded = undefined, .group = .{ .lib = lib.*, .comm = comm, .rank = rank, .world = world, .coherent = true }, .forward = undefined, .download = .{ .d = d, .stream = stream }, .drawer = undefined };
     var one = try cuda.DeviceBuffer.alloc(d, 8);
     errdefer one.free();
     own.comm = .{ .d = d, .lib = lib, .comm = comm, .stream = stream, .rank = rank, .world = world, .one = one, .group = &own.group };
@@ -396,6 +396,8 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ctx: *con
         .group = &own.group,
         .close = .{ .ptr = own, .call = Owner.close },
         .draft = if (own.draft) |dd| dd.interface() else null,
+        .floor = o.settings.floor, // every rank gathers its MemAvailable at the chunk gates (floor.zig)
+        .mem = @import("floor.zig").proc,
     });
     try stream.synchronize();
     return e;

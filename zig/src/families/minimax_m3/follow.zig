@@ -259,12 +259,12 @@ fn run(e: *Engine, link: *Link) !void {
                 const len: usize = if (kind == .prefill) ids.len else h.top_k;
                 if (kind == .prefill) {
                     _ = e.prefill(ids, from, null, null) catch |err| switch (err) {
-                        error.Cancelled => {},
+                        error.Cancelled, error.MemoryFloor => {}, // rank 0's gate stopped the same chunk
                         else => return err,
                     };
                 } else {
                     _ = e.prefillChunk(ids, start, len, from, null, null) catch |err| switch (err) {
-                        error.Cancelled => {},
+                        error.Cancelled, error.MemoryFloor => {}, // rank 0's gate stopped the same chunk
                         else => return err,
                     };
                 }

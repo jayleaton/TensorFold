@@ -204,6 +204,8 @@ pub const Lanes = struct {
         const to = engine.chunkEnd(at, ids.len, marks);
         const first = self.x.chunk(ids, at, l.adopted, cancelOf(s), marks) catch |err| {
             l.fill = null; // the pass is over; the host releases the stream
+            // under the floor beside other streams: it waits for one to end (alone, the floor's words refuse it)
+            if (err == error.MemoryFloor and self.lanes.count() > 1) return error.LaneMemory;
             return err;
         };
         l.adopted = null;

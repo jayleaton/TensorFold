@@ -10,6 +10,7 @@ const backend = @import("backend.zig");
 const pages_mod = @import("pages.zig");
 const pool = @import("pool.zig");
 const dc = @import("dspark_config.zig");
+const floor = @import("floor.zig");
 
 const fake = lanes.fake;
 const none: u32 = 0xffff_ffff;
@@ -62,6 +63,9 @@ pub const Rank = struct {
     draft_on: bool = false, // the engine runs a dspark draft: forwards tap, the draft's ring is `fd`
     taps: []TapRow = &.{},
     fd: FakeDraft = .{},
+    mem_seq: []const u64 = &.{}, // MemAvailable at each memory gather (the last holds after); empty: no floor
+    peer_mem: []const u64 = &.{}, // the other rank's, gather by gather (a collective sees both at the same step)
+    mem_at: usize = 0,
 
     pub fn deinit(r: *Rank) void {
         for (r.runs.items) |x| {
@@ -92,7 +96,14 @@ pub const Rank = struct {
             .drawer = .{ .ptr = r, .draw_fn = drawFn },
             .capacity = capacity,
             .page_bytes = 1 << 20,
+            .floor = if (r.mem_seq.len > 0) .{} else null,
+            .mem = if (r.mem_seq.len > 0) .{ .ctx = r, .read_fn = memRead } else null,
         };
+    }
+
+    fn memRead(p: ?*anyopaque, _: std.Io) ?u64 {
+        const r = of(p.?);
+        return r.mem_seq[@min(r.mem_at, r.mem_seq.len - 1)];
     }
 
     fn of(p: *anyopaque) *Rank {
@@ -279,6 +290,12 @@ pub const Rank = struct {
 
     fn gather(p: *anyopaque, mine: []const u8, out: []u8) anyerror!void {
         const r = of(p);
+        if (r.mem_seq.len > 0 and mine.len == @sizeOf(floor.Sample)) { // a memory gather: the peer's reading at this step
+            defer r.mem_at += 1;
+            const theirs: floor.Sample = .{ .avail = r.peer_mem[@min(r.mem_at, r.peer_mem.len - 1)] };
+            for (0..r.world) |q| @memcpy(out[q * mine.len ..][0..mine.len], if (q == r.rank) mine else std.mem.asBytes(&theirs));
+            return;
+        }
         for (0..r.world) |q| {
             const dst = out[q * mine.len ..][0..mine.len];
             if (q == r.rank or q >= r.peers.len) @memcpy(dst, mine) else @memcpy(dst, r.peers[q]);
@@ -399,10 +416,20 @@ pub const World = struct {
 
     /// `draft`: both ranks tap and hold a fake draft ring, and the lanes backend knows the draft's taps.
     pub fn createWith(gpa: std.mem.Allocator, context: usize, slots: u32, count: usize, draft: bool) !*World {
+        return createMem(gpa, context, slots, count, draft, .{ &.{}, &.{} });
+    }
+
+    /// `mem[r]`: rank r's MemAvailable at each memory gather (both empty: no floor); the default floor gates them.
+    pub fn createMem(gpa: std.mem.Allocator, context: usize, slots: u32, count: usize, draft: bool, mem: [2][]const u64) !*World {
         const w = try gpa.create(World);
         errdefer gpa.destroy(w);
         const cap = std.mem.alignForward(usize, context + iface.window_rows, pool.page_tokens);
-        w.* = .{ .gpa = gpa, .r0 = .{ .gpa = gpa, .rank = 0, .world = 2, .draft_on = draft }, .r1 = .{ .gpa = gpa, .rank = 1, .world = 2, .draft_on = draft }, .e0 = undefined, .e1 = undefined, .tape = .{ .gpa = gpa }, .link0 = undefined, .link1 = undefined, .pg = undefined, .lanes = undefined };
+        w.* = .{ .gpa = gpa, .r0 = .{ .gpa = gpa, .rank = 0, .world = 2, .draft_on = draft, .mem_seq = mem[0], .peer_mem = mem[1] }, .r1 = .{ .gpa = gpa, .rank = 1, .world = 2, .draft_on = draft, .mem_seq = mem[1], .peer_mem = mem[0] }, .e0 = undefined, .e1 = undefined, .tape = .{ .gpa = gpa }, .link0 = undefined, .link1 = undefined, .pg = undefined, .lanes = undefined };
+        errdefer { // a start that fails (the floor at attach) leaves nothing behind
+            w.tape.deinit();
+            w.r0.deinit();
+            w.r1.deinit();
+        }
         w.e0 = try engine.Engine.make(gpa, std.testing.io, w.r0.parts(cap));
         errdefer w.e0.deinit();
         w.e1 = try engine.Engine.make(gpa, std.testing.io, w.r1.parts(cap));

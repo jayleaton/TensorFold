@@ -1,6 +1,7 @@
 //! This process's rank (TF_MM3_RANK, TF_MM3_WORLD, NCCL_COMM_ID) and whether all ranks agree (docs/rank-contract.md).
 const std = @import("std");
 const Sha256 = std.crypto.hash.sha2.Sha256;
+const floor = @import("floor.zig");
 
 pub const rank_var = "TF_MM3_RANK";
 pub const world_var = "TF_MM3_WORLD";
@@ -80,6 +81,7 @@ pub const Settings = struct {
     layers: u32 = 0, // TF_MM3_LAYERS: the first this many layers only, for one-GPU checks (0: all)
     roce_kb: u32 = 4096, // TF_ROCE_MAX_KB, the small-gather RoCE path's cap in KiB; 0 when TF_ROCE=0 keeps every gather on NCCL
     kv8: bool = false, // --kv-cache fp8 (native.Options.kv8): K and V pages as e4m3 rows with fp32 scales; set by `open`, not read here
+    floor: floor.Floor = .{}, // TF_MM3_FLOOR_*: the ranks' memory floor (floor.zig); every rank's gate stops the same chunk
 
     pub fn read(get: Get, problem: *[]const u8) Error!Settings {
         var s: Settings = .{};
@@ -100,20 +102,21 @@ pub const Settings = struct {
         if (get(roce_var)) |v| if (std.mem.eql(u8, v, "0")) {
             s.roce_kb = 0;
         };
+        s.floor = floor.Floor.read(get, problem) catch return error.BadSetting;
         return s;
     }
 };
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 1, // this struct's version
+    layout: u32 = 2, // this struct's version
     world: u32,
     rank: u32,
     layers: u32, // TF_MM3_LAYERS (0: all)
     reduce: u32 = 1, // tp.zig's reduction_version: the fp32 rank-order sum
     roce: u32, // Settings.roce_kb: the ranks open the RoCE small-gather path together or not at all
     kv8: u32 = 0, // Settings.kv8: the ranks' pages are one layout or the other, never mixed
-    reserved: u32 = 0, // keeps `capacity` 8-aligned without padding
+    floor: u32 = 0, // Settings.floor.gateMib(): the chunk gate's MiB, one number on every rank (keeps `capacity` 8-aligned)
     capacity: u64, // tokens a sequence holds
     config: [32]u8, // sha256 of config.json
     quant: [32]u8, // sha256 of quantization_config.json: codebook, version, every matrix's bits
@@ -121,7 +124,7 @@ pub const Fingerprint = extern struct {
     weights: [32]u8, // digest of the checkpoint's metadata and shard bytes (the engine's checkpoint digest)
     draft: [32]u8 = @splat(0), // the dspark draft: sha256 of its config.json and its shard metadata; zeros without one
 
-    pub const Field = enum { layout, rank, world, layers, reduce, roce, kv8, capacity, config, quant, program, weights, draft };
+    pub const Field = enum { layout, rank, world, layers, reduce, roce, kv8, floor, capacity, config, quant, program, weights, draft };
 
     pub fn of(p: Place, s: Settings, capacity: usize, config: [32]u8, quant: [32]u8, program: [32]u8, weights: [32]u8) Fingerprint {
         return .{
@@ -130,6 +133,7 @@ pub const Fingerprint = extern struct {
             .layers = s.layers,
             .roce = s.roce_kb,
             .kv8 = @intFromBool(s.kv8),
+            .floor = s.floor.gateMib(),
             .capacity = capacity,
             .config = config,
             .quant = quant,
@@ -147,7 +151,7 @@ pub fn mismatch(all: []const Fingerprint) ?Mismatch {
         if (f.layout != all[0].layout) return .{ .field = .layout, .rank = r };
         if (f.rank != r) return .{ .field = .rank, .rank = r };
         if (f.world != all.len) return .{ .field = .world, .rank = r };
-        inline for (.{ "world", "layers", "reduce", "roce", "kv8", "capacity", "config", "quant", "program", "weights", "draft" }) |name| {
+        inline for (.{ "world", "layers", "reduce", "roce", "kv8", "floor", "capacity", "config", "quant", "program", "weights", "draft" }) |name| {
             if (!std.mem.eql(u8, std.mem.asBytes(&@field(f, name)), std.mem.asBytes(&@field(all[0], name))))
                 return .{ .field = @field(Fingerprint.Field, name), .rank = r };
         }
@@ -164,6 +168,7 @@ pub fn explain(f: Fingerprint.Field) []const u8 {
         .reduce => "a different reduction order",
         .roce => "TF_ROCE or TF_ROCE_MAX_KB",
         .kv8 => "--kv-cache (one rank serves fp8 pages, another bf16)",
+        .floor => "TF_MM3_FLOOR_HARD_GIB or TF_MM3_FLOOR_TRANSIENT_GIB (the memory floor's chunk gate)",
         .capacity => "the sequence capacity (the context)",
         .config => "config.json",
         .quant => "quantization_config.json (codebook, version or bit widths)",
@@ -255,6 +260,18 @@ test "settings: TF_ROCE=0 turns the RoCE path off and TF_ROCE_MAX_KB must be a u
     try std.testing.expectError(error.BadSetting, Settings.read(&Fake.get, &problem));
     var all = [_]Fingerprint{ fp(0), Fingerprint.of(.{ .rank = 1, .world = 2 }, .{ .roce_kb = 0 }, 131072, hashBytes("config"), hashBytes("quant"), @splat(1), hashBytes("weights")) };
     try std.testing.expectEqual(Mismatch{ .field = .roce, .rank = 1 }, mismatch(&all).?);
+}
+
+test "settings: the memory floor is read with the rest, and ranks whose chunk gates differ refuse at boot" {
+    var problem: []const u8 = "";
+    Fake.pairs = &.{.{ floor.hard_var, "6" }};
+    const s = try Settings.read(&Fake.get, &problem);
+    try std.testing.expectEqual(6 * floor.GiB, s.floor.hard);
+    Fake.pairs = &.{ .{ floor.hard_var, "6" }, .{ floor.target_var, "5" } };
+    try std.testing.expectError(error.BadSetting, Settings.read(&Fake.get, &problem));
+    var all = [_]Fingerprint{ fp(0), Fingerprint.of(.{ .rank = 1, .world = 2 }, s, 131072, hashBytes("config"), hashBytes("quant"), @splat(1), hashBytes("weights")) };
+    try std.testing.expectEqual(Mismatch{ .field = .floor, .rank = 1 }, mismatch(&all).?);
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(Fingerprint, "capacity") % 8);
 }
 
 test "fingerprints: agreeing ranks pass; config, quantization, weights and the rest name the first difference" {

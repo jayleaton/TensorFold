@@ -4,6 +4,7 @@ const cuda = @import("cuda");
 const iface = @import("iface.zig");
 const pool = @import("pool.zig");
 const ops_ = @import("engine_ops.zig");
+const floor_ = @import("floor.zig");
 
 pub const Sampling = iface.Sampling;
 pub const Part = iface.Part;
@@ -40,6 +41,8 @@ pub const Parts = struct {
     group: ?*cuda.tp_group.Group = null, // the group the forward holds: the host's RoCE small gather goes into it
     close: ?Closer = null,
     draft: ?ops_.Draft = null, // the dspark draft (--drafter): its rings, block pass and results; the forward taps for it
+    floor: ?floor_.Floor = null, // the ranks' memory floor, with `mem` on every rank or on none (floor.zig)
+    mem: ?floor_.Mem = null,
 };
 
 /// Frees what an engine's parts own (device buffers, the communicator, the forward's buffers) at `deinit`.
@@ -70,6 +73,7 @@ pub const Engine = struct {
     view: ?ops_.PoolView = null,
     last_rows: [3]usize = @splat(0), // rows of the last pass of each kind: the gathered logits' rank stride
     checkpoint_digest: [32]u8,
+    peer_low: std.atomic.Value(u64) = .init(floor_.unknown), // the other ranks' lowest MemAvailable at the last gate
 
     /// The engine over `parts` with the one sequence a block table starts with (slot 0); `attach` makes the pool.
     pub fn make(gpa: std.mem.Allocator, io: std.Io, parts: Parts) !*Engine {
@@ -112,6 +116,36 @@ pub const Engine = struct {
         if (e.p.draft) |d| try d.attach(slots);
         e.view = view;
         while (e.seqs.items.len < slots) try e.seqs.append(e.gpa, .{});
+        const f = e.p.floor orelse return;
+        const low = try e.memLow() orelse return;
+        switch (f.boot(low.low)) { // the pool is made on every rank: what it left is the floor serving starts from
+            .ok => {},
+            .under_target => if (e.rank == 0) std.log.warn("minimax memory: rank {d} has {d:.2} GiB MemAvailable with the pool made, under the {d:.2} GiB floor target (TF_MM3_FLOOR_GIB): prompts beside others will wait", .{ low.rank, floor_.gibs(low.low), floor_.gibs(f.target) }),
+            .under_hard => {
+                if (e.rank == 0) std.log.warn("minimax memory: rank {d} has {d:.2} GiB MemAvailable with the pool made, under the {d:.2} GiB hard floor and {d:.2} GiB chunk transient: every rank stops", .{ low.rank, floor_.gibs(low.low), floor_.gibs(f.hard), floor_.gibs(f.transient) });
+                return error.MemoryFloor;
+            },
+        }
+    }
+
+    /// Every rank's MemAvailable through one small gather (a collective: every rank calls it at the same step).
+    fn memLow(e: *Engine) !?floor_.Low {
+        const m = e.p.mem orelse return null;
+        var all: [8]floor_.Sample = undefined;
+        if (e.world > all.len) return error.BadWorld;
+        const mine: floor_.Sample = .{ .avail = m.read(e.io) orelse floor_.unknown };
+        try e.p.comm.gatherBytes(std.mem.asBytes(&mine), std.mem.sliceAsBytes(all[0..e.world]));
+        const low = floor_.lowest(all[0..e.world], e.rank);
+        e.peer_low.store(low.others, .release);
+        return low;
+    }
+
+    /// Rank 0's admission: the floor's target on this rank now and on the others at their last gate (none: true).
+    pub fn floorAdmits(e: *const Engine) bool {
+        const f = e.p.floor orelse return true;
+        const m = e.p.mem orelse return true;
+        const mine = m.read(e.io) orelse floor_.unknown;
+        return f.admits(@min(mine, e.peer_low.load(.acquire)));
     }
 
     /// `entries` of `slot`'s table row from entry `from` to the device (also rank 0's `Tables.upload`).
@@ -222,10 +256,16 @@ pub const Engine = struct {
         return t[0];
     }
 
-    /// The chunk gate on every rank: rank 0's cancel decides for all, so no rank enters a forward the others skip.
+    /// The chunk gate on every rank: rank 0's cancel and the lowest rank's memory decide for all, before the forward.
     pub fn gate(e: *Engine, cancel: ?Cancel) !void {
         const mine: f64 = if (cancel) |c| @floatFromInt(@intFromBool(c.check(c.ptr))) else 0;
         if (try e.p.comm.maxF64(mine) > 0) return error.Cancelled;
+        const f = e.p.floor orelse return;
+        const low = try e.memLow() orelse return;
+        if (!f.stops(low.low)) return;
+        // every rank saw the same samples: each stops this chunk before its forward, none waits on another
+        if (e.rank == 0) std.log.warn("minimax memory: rank {d} has {d:.2} GiB MemAvailable, under the {d:.2} GiB hard floor plus a {d:.2} GiB chunk: the prompt stops before its next forward", .{ low.rank, floor_.gibs(low.low), floor_.gibs(f.hard), floor_.gibs(f.transient) });
+        return error.MemoryFloor;
     }
 
     /// A verify window: `ids` (pending token, then drafts) at the committed position; `out[r]` drawn at pos + 1 + r.

@@ -131,7 +131,9 @@ pub fn cache_limit(p: *anyopaque, count: usize, snaps: usize) void {
 /// Whether a request's caches fit now (the lane host's admission, on its engine thread).
 pub fn fits(p: *anyopaque, prompt: u32, max_tokens: u32) bool {
     const own: *Owned = @ptrCast(@alignCast(p));
-    return if (own.pages) |pg| pg.fits(prompt, max_tokens) else false;
+    const pg = own.pages orelse return false;
+    if (!pg.fits(prompt, max_tokens)) return false;
+    return !own.up or own.e.floorAdmits(); // the memory floor's target on every rank (alone, the host admits anyway)
 }
 
 /// The words of the last budget refusal (single-threaded start-up), for `explain`.
@@ -162,14 +164,25 @@ pub fn admissionWith(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, c: *co
     const dims = (try pool.Dims.of(c, share)).withKv8(o.kv8);
     var out: Admission = .{ .place = p, .weights = plan.slotBytes(), .verdict = null, .fingerprint_weights = try weights_device.digest(gpa, &cat) };
     if (o.grant == 0) return out;
-    const terms = if (draft) |dcost| budget.withDraft(budget.hosted(), dcost) else budget.hosted();
+    const terms = scoreTerms(if (draft) |dcost| budget.withDraft(budget.hosted(), dcost) else budget.hosted(), dims);
     out.verdict = budget.check(dims, .{ .available = o.grant, .weights = out.weights, .terms = terms, .lanes = o.lanes, .lanes_fixed = o.lanes_fixed, .window = window_rows, .max_positions = c.max_positions }, o.context);
     return out;
+}
+
+/// `t` with the block-score scratch the forward makes (forward_exec.Buffers' bmax): its rows, this rank's kv heads.
+pub fn scoreTerms(t: budget.Terms, dims: pool.Dims) budget.Terms {
+    var u = t;
+    u.prefill_rows = iface.max_rows;
+    u.index_heads = dims.kv_heads;
+    return u;
 }
 
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
     _ = kernels; // our own kernels: a captured set is not used
     const p = try ranks.admit(&ranks.environment);
+    // the ranks' lines before any refusal (cuda/tp_watch.zig): a rank that refuses, fails or dies stops every rank
+    cuda.tp_watch.exitCoherently(); // every stop exits 70: the recipe's watchdog restarts the pair
+    if (p.world > 1) try cuda.tp_watch.start(io, p.rank, p.world);
     var problem: []const u8 = "";
     var set = ranks.Settings.read(&ranks.environment, &problem) catch |err| {
         std.log.err("{s}", .{problem});
@@ -202,8 +215,6 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         },
         .ok => |cap| std.log.info("minimax budget: {d} tokens a stream, {d} pages, {d:.2} GiB of KV room, {s} K/V (the host's plan has the last word)", .{ cap.context, cap.pages, @as(f64, @floatFromInt(cap.pool_bytes)) / (1 << 30), if (o.kv8) "fp8" else "bf16" }),
     };
-    // the ranks' lines before NCCL (cuda/tp_watch.zig): a rank that fails, refuses or dies stops every rank
-    if (p.world > 1) try cuda.tp_watch.start(io, p.rank, p.world);
     return openRank(gpa, io, ctx, dir, &c, o, p, set, draft_dir, draft_cfg) catch |err| {
         cuda.tp_watch.fail(@errorName(err)); // the other ranks stop with this rank's error
         return err;
@@ -226,7 +237,7 @@ fn openRank(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     try lib.check(lib.api.ncclGetUniqueId(&id), "ncclGetUniqueId"); // NCCL_COMM_ID: the same id on every rank
     var comm: cuda.nccl.Comm = null;
     try lib.check(lib.api.ncclCommInitRank(&comm, @intCast(p.world), id, @intCast(p.rank)), "ncclCommInitRank");
-    own.group = .{ .lib = lib, .comm = comm, .rank = p.rank, .world = p.world };
+    own.group = .{ .lib = lib, .comm = comm, .rank = p.rank, .world = p.world, .coherent = true }; // RoCE marker and fail-both: opt-in
     errdefer _ = own.group.lib.api.ncclCommDestroy(own.group.comm);
     if (p.world > 1) try engine_dev.warmPeers(ctx.d, &own.group);
     own.e = try engine.Engine.init(gpa, io, ctx.d, ctx, dir, &own.group.lib, own.group.comm, p.rank, p.world, .{ .capacity = cap, .settings = set, .drafter = draft_dir });
@@ -254,7 +265,7 @@ fn openRank(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     if (p.rank != 0) { // a follower never serves: it runs rank 0's steps, then leaves the process
         follow.follow(own.e, &own.link) catch |err| {
             std.log.err("rank {d}: following rank 0 stopped ({s})", .{ p.rank, @errorName(err) });
-            std.c._exit(1); // follow told the other ranks; the stream may hold kernels waiting on a gone rank
+            std.c._exit(cuda.tp_watch.coherent_exit); // follow told the other ranks; the stream may hold kernels waiting on a gone rank
         };
         std.log.info("rank {d}: rank 0 ended; leaving", .{p.rank});
         std.process.exit(0);
@@ -346,6 +357,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.VisionUnsupported => "MiniMax-M3.1-Flash on CUDA is text only: this pack has no vision tower, send the request without images",
         error.RankLost => "another rank of MiniMax-M3.1-Flash stopped: every rank ends, start them again",
         error.BudgetRefused, error.DrafterRefused => detail_buf[0..detail_len],
+        error.MemoryFloor => "a rank's MemAvailable less TF_MM3_FLOOR_TRANSIENT_GIB is under TF_MM3_FLOOR_HARD_GIB (rank 0's log names the rank): the prompt stopped before its next forward; free memory on that host, or serve a smaller --context or --parallel",
         error.RankMismatch => "the ranks' settings differ (each rank's log names the one): start them alike",
         error.BadRank => "TF_MM3_WORLD is larger than the checkpoint can be cut for (4 kv heads, 128-unit widths)",
         else => null,
@@ -393,6 +405,19 @@ test "the draft's cost: its weights, the module and absorb chunk with eight ring
     const terms = budget.withDraft(budget.hosted(), cost);
     try std.testing.expectEqual(cost.weights + cost.runtime + 3 * cost.per_lane, budget.draftBytes(terms, 3));
     try std.testing.expect(budget.draftBytes(budget.hosted(), 3) == 0);
+}
+
+test "the budget prices the block-score scratch the forward makes: its rows and this rank's kv heads" {
+    const share = try shard.Share.of(&config.flash, 0, 2);
+    const dims = try pool.Dims.of(&config.flash, share);
+    const t = scoreTerms(budget.hosted(), dims);
+    const context: u64 = 131072;
+    try std.testing.expectEqual(@as(u64, iface.max_rows) * dims.kv_heads * (context / pool.page_tokens) * 4, budget.scoreBytes(t, context));
+    try std.testing.expect(budget.scoreBytes(t, context) < budget.scoreBytes(budget.hosted(), context));
+}
+
+test "a floor refusal is worded for the server" {
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.MemoryFloor).?, "TF_MM3_FLOOR_HARD_GIB") != null);
 }
 
 test "a refused draft is worded for the server, and --drafter is taken" {
