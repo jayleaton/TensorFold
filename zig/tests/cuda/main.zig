@@ -224,6 +224,10 @@ const usage =
     \\  kernel-contract-limits DIR   each registered launch against sm_80/86/89/120/121 from the fatbins in DIR
     \\  mm3-layer-parity PACK LAYER IN.npy OUT [IDS.npy|-] [HEAD_IN.npy]  one real-pack layer on given rows, partials as .npy
     \\  mm3-dspark-pass [DIR]     the dspark draft absorb and block pass on synthetic weights against float64 (writes 1.5 GB under DIR)
+    \\  mm3-synth-smoke [LAYERS] [kv8] [moe=N]  a synthetic MiniMax-M3.1-Flash: prompt, greedy decode, slots, verify and shared rows alike
+    \\  mm3-graph-eq [LAYERS] [kv8] [moe=N]  synthetic MiniMax-M3.1-Flash windows: graph replay equals eager in logits and KV bytes
+    \\  mm3-rows-eq [LAYERS] [kv8] [moe=N]  synthetic MiniMax-M3.1-Flash prompts: 512/1024/adaptive chunk rows equal 2048
+    \\  mm3-speed-bench [LAYERS] [moe=N] [decode]  synthetic MiniMax-M3.1-Flash: prefill rows at 2K/8K/32K, decode graph vs eager
     \\  mm3-dspark-bench          milliseconds a launch of each dspark kernel takes at the shipped shapes
     \\  mm3-dspark-contract       MiniMax-M3.1-Flash dspark draft kernels alone through gates 1-4 (no controls, no limits)
     \\  mm3-proj-contract         MiniMax-M3.1-Flash index projection and pick kernels alone through gates 1-4 (no controls, no limits)
@@ -436,6 +440,10 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "kernel-contract-limits")) return contract_tests.fatbins(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "mm3-layer-parity")) return @import("mm3_layer_parity.zig").run(gpu, rest);
     if (std.mem.eql(u8, cmd, "mm3-dspark-pass")) return @import("mm3_dspark_pass.zig").run(gpu, rest);
+    if (std.mem.eql(u8, cmd, "mm3-synth-smoke")) return @import("mm3_synth_smoke.zig").run(gpu, rest);
+    if (std.mem.eql(u8, cmd, "mm3-graph-eq")) return @import("mm3_speed.zig").graphEq(gpu, rest);
+    if (std.mem.eql(u8, cmd, "mm3-rows-eq")) return @import("mm3_speed.zig").rowsEq(gpu, rest);
+    if (std.mem.eql(u8, cmd, "mm3-speed-bench")) return @import("mm3_speed.zig").bench(gpu, rest);
     if (std.mem.eql(u8, cmd, "mm3-proj-contract")) return @import("contract_minimax_proj.zig").run(gpu);
     if (std.mem.eql(u8, cmd, "mm3-dspark-bench")) return @import("contract_minimax_dspark.zig").bench(gpu);
     if (std.mem.eql(u8, cmd, "mm3-dspark-contract")) return @import("contract_minimax_dspark.zig").run(gpu);

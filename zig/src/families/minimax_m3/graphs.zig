@@ -64,6 +64,9 @@ pub const Agreement = struct {
     }
 };
 
+/// Keys remembered as seen once at most.
+pub const seen_max = 4096;
+
 /// A forward's graphs: the engine, the cache, the keys seen once (a key is captured the second time it comes).
 pub const Graphs = struct {
     gpa: std.mem.Allocator,
@@ -101,6 +104,7 @@ pub const Graphs = struct {
     /// True the first time `key` comes: that step runs eagerly, so lazily grown scratch settles before a capture.
     pub fn first(g: *Graphs, key: Key) !bool {
         if (g.cache.has(key)) return false;
+        if (g.seen.count() >= seen_max) g.seen.clearRetainingCapacity(); // tap layouts are many: forget, never grow
         const r = try g.seen.getOrPut(g.gpa, key);
         return !r.found_existing;
     }
