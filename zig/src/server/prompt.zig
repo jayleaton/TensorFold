@@ -51,6 +51,10 @@ pub fn renderIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, t
             };
             if (close.len == 1) ids = try std.mem.concat(cx.a, u32, &.{ ids, close });
         }
+        // MiniMax's adaptive prompt leaves the choice to the model; its system text starts an off reply after the close
+        if (srv.mm_think) |m| if (ids[ids.len - 1] != m.close) {
+            ids = try std.mem.concat(cx.a, u32, &.{ ids, &.{m.close} });
+        };
     }
     return ids;
 }

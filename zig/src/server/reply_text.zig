@@ -101,6 +101,9 @@ pub fn splitThinkingTokens(a: Allocator, decode: anytype, ctx: anytype, full: []
 /// As `splitThinking`, but the close marker is the model's own close token: the reasoning ends at that token's bytes.
 pub fn splitThinkingAt(a: Allocator, full: []const u8, finished: bool, m: Markers, close: Close) Allocator.Error!Split {
     var text = full;
+    // a reply that skips the block it may open writes only its close (MiniMax's adaptive prompt): no reasoning
+    if (m.open.len > 0 and std.mem.startsWith(u8, trimNewlines(text), m.close))
+        return .{ .reasoning = "", .answer = trimNewlines(trimNewlines(text)[m.close.len..]) };
     var at: ?usize = switch (close) {
         .spelled, .pending => null,
         .token => |v| v,
@@ -505,4 +508,18 @@ test "an opener the reply names in prose keeps the text after it, streamed and w
     try std.testing.expectEqualStrings("a b", try hideToolCalls(a, "a <|tool_call>call:f{x:1}<tool_call|>b", false));
     // a finished reply's unclosed envelope is text, as tool_parse.parse keeps it in the content
     try std.testing.expectEqualStrings("a <tool_call>{\"name\"", try finishedProse(a, "a <tool_call>{\"name\""));
+}
+
+test "an adaptive reply that skips its think block writes only the close, which is neither reasoning nor answer" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |finished| {
+        const skipped = try splitThinking(a, "</mm:think>\n\nParis.", finished, mm_think_markers);
+        try std.testing.expectEqualStrings("", skipped.reasoning);
+        try std.testing.expectEqualStrings("Paris.", skipped.answer);
+        const thought = try splitThinking(a, "<mm:think>\nhm\n</mm:think>Paris.", finished, mm_think_markers);
+        try std.testing.expectEqualStrings("hm\n", thought.reasoning);
+        try std.testing.expectEqualStrings("Paris.", thought.answer);
+    }
+    const partial = try splitThinking(a, "</mm:th", false, mm_think_markers);
+    try std.testing.expectEqualStrings("", partial.answer);
 }

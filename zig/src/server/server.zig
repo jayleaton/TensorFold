@@ -180,6 +180,7 @@ pub const Server = struct {
         srv.close_id = text.tokenId(srv.markers.close);
         const source = text.templateSource();
         srv.effort_levels = try fields.effortLevels(a, source);
+        if (srv.mm_think != null and srv.effort_levels.len == 0) srv.effort_levels = &minimax_efforts; // its `<effort>` tag
         srv.thinking_switch = std.mem.indexOf(u8, source, "enable_thinking") != null or
             std.mem.indexOf(u8, source, "thinking_mode") != null;
         srv.late_system = try lateSystem(a, text);
@@ -202,7 +203,7 @@ pub const Server = struct {
         return srv;
     }
 
-    /// The markers a reply to `prompt` is split by (an enabled MiniMax prompt ends in the opener; a forced close: none).
+    /// The markers a reply to `prompt` is split by (MiniMax's enabled prompt ends in the opener; a forced close too).
     pub fn markersFor(srv: *const Server, prompt: []const u32, forced: bool) reply_text.Markers {
         if (forced) return .{ .open = "", .close = srv.markers.close };
         const m = srv.mm_think orelse return srv.markers;
@@ -462,6 +463,9 @@ fn templateImages(srv: *Server) bool {
     for (ids) |t| if (t == v.image_token) return true;
     return false;
 }
+
+/// MiniMax-M3.1's effort levels (its API's), which its template writes verbatim and names nowhere.
+const minimax_efforts = [_][]const u8{ "max", "xhigh", "high", "medium", "low" };
 
 /// Templates requiring a user query gain a user turn after trailing tool results replace their last user turn.
 fn needsUserAfterTool(source: []const u8) bool {
