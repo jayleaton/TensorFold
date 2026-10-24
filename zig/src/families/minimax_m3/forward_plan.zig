@@ -9,6 +9,8 @@ pub const Error = error{ BadRows, TooManyRows, BadThin };
 
 /// Routed-expert rows one launch takes: its scratch is sized for them, a longer chunk runs in several calls.
 pub const expert_rows: u32 = 256;
+/// Routed-expert rows one prompt call takes: the prompt kernels' scratch is sized for them (forward_exec Buffers).
+pub const prompt_expert_rows: u32 = 2048;
 /// Most rows whose logits the head keeps at once (a decode or verify window; a prompt chunk keeps one row).
 pub const head_rows: u32 = 128;
 
@@ -69,7 +71,7 @@ pub const Op = union(enum) {
     attend: struct { layer: u32, rows: u32 },
     router: struct { layer: u32, rows: u32 }, // fp32 gate times a
     route: struct { layer: u32, rows: u32 },
-    experts: struct { layer: u32, row0: u32, rows: u32 },
+    experts: struct { layer: u32, row0: u32, rows: u32, prompt: bool = false },
     swiglu: struct { layer: u32, shared: bool, n: u32, rows: u32 }, // act = swigluoai(gate, up)
     add2: struct { a: Buf, b: Buf, out: Buf, rows: u32 }, // out = a + b in fp32 (routed + shared)
     exchange: struct { form: Form, site: tp.Site, src: Buf, dst: Buf, rows: u32 },
@@ -338,9 +340,10 @@ fn mlp(g: *const Geometry, sh: Shape, l: u32, sink: anytype) !void {
     } else {
         try sink.emit(.{ .router = .{ .layer = l, .rows = n } });
         try sink.emit(.{ .route = .{ .layer = l, .rows = n } });
+        const per: u32 = if (sh.prompt) prompt_expert_rows else expert_rows;
         var at: u32 = 0;
-        while (at < n) : (at += expert_rows) {
-            try sink.emit(.{ .experts = .{ .layer = l, .row0 = at, .rows = @min(expert_rows, n - at) } });
+        while (at < n) : (at += per) {
+            try sink.emit(.{ .experts = .{ .layer = l, .row0 = at, .rows = @min(per, n - at), .prompt = sh.prompt } });
         }
         try lin(sink, .shared_gate, l, a, .{ .buf = .gate }, n, sh.prompt);
         try lin(sink, .shared_up, l, a, .{ .buf = .up }, n, sh.prompt);

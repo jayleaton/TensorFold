@@ -18,6 +18,7 @@ pub const Moe = struct {
     bias: u64, // fp32 [experts], e_score_correction_bias (widened like the router)
     experts: cuda.exl3_experts.Layer,
     shared: Dense,
+    prompt: ?cuda.exl3_gm.Widths = null, // the prompt experts' widths (promptWidths), null: the decode kernel
 };
 
 pub const Ffn = union(enum) { dense: Dense, moe: Moe };
@@ -100,6 +101,29 @@ pub fn uniformK2(m: *const load.MoeLayer) u32 {
     return width orelse 0;
 }
 
+/// x3gm's widths: a projection's shared K2, else 0 (each expert's own); null for gate != up or an unbuilt width.
+pub fn promptWidths(m: *const load.MoeLayer) ?cuda.exl3_gm.Widths {
+    for (m.w1.halves, m.w3.halves, m.w2.halves) |g, u, d| {
+        if (g != u) return null;
+        for ([_]i32{ g, d }) |k2| if (k2 < 0 or std.mem.indexOfScalar(u32, &cuda.exl3_gm.k2s, @intCast(k2)) == null) return null;
+    }
+    const gu = soleK2(&m.w1.histogram);
+    const down = soleK2(&m.w2.histogram);
+    if (gu == 0 or down == 0) return .{};
+    return .{ .gu = gu, .down = down };
+}
+
+/// The one K2 a histogram holds, else 0.
+fn soleK2(h: *const [17]u32) u32 {
+    var seen: u32 = 0;
+    for (h, 0..) |count, k2| {
+        if (count == 0) continue;
+        if (seen != 0) return 0;
+        seen = @intCast(k2);
+    }
+    return seen;
+}
+
 fn tables(a: std.mem.Allocator, m: *const load.MoeLayer, bases: []const u64) Error!Tables {
     const n = m.w1.halves.len;
     var out: Tables = .{ .layer = m.layer, .gate = undefined, .up = undefined, .down = undefined, .gate_k2 = m.w1.halves, .up_k2 = m.w3.halves, .down_k2 = m.w2.halves };
@@ -145,6 +169,7 @@ fn moeLayer(a: std.mem.Allocator, plan: *const load.Plan, c: *const Config, base
             .uniform_k2 = uniformK2(m),
             .shared_input = false, // decision M7: no check of the gate/up scales yet
         },
+        .prompt = promptWidths(m),
     };
 }
 
@@ -262,4 +287,29 @@ pub fn tablePtrs(base: u64, n: usize) TablePtrs {
 
 test {
     _ = @import("weights_test.zig");
+}
+
+fn projOf(halves: []i32) load.MoeProj {
+    var p: load.MoeProj = .{ .halves = halves, .trellis_off = &.{}, .trellis_slot = 0, .suh_slot = 0, .svh_slot = 0, .k = 0, .n = 0, .histogram = @splat(0) };
+    for (halves) |k2| p.histogram[@intCast(k2)] += 1;
+    return p;
+}
+
+test "the prompt experts' widths: 3/3/3, 4/4/4 and 3/3/4 layers by projection, ragged ones per expert" {
+    var g333 = [_]i32{ 6, 6, 6 };
+    var g444 = [_]i32{ 8, 8, 8 };
+    var mixed = [_]i32{ 6, 8, 6 };
+    var m: load.MoeLayer = .{ .layer = 19, .w1 = projOf(&g333), .w3 = projOf(&g333), .w2 = projOf(&g333) };
+    try std.testing.expectEqual(cuda.exl3_gm.Widths{ .gu = 6, .down = 6 }, promptWidths(&m).?);
+    m = .{ .layer = 3, .w1 = projOf(&g444), .w3 = projOf(&g444), .w2 = projOf(&g444) };
+    try std.testing.expectEqual(cuda.exl3_gm.Widths{ .gu = 8, .down = 8 }, promptWidths(&m).?);
+    m = .{ .layer = 18, .w1 = projOf(&g333), .w3 = projOf(&g333), .w2 = projOf(&g444) };
+    try std.testing.expectEqual(cuda.exl3_gm.Widths{ .gu = 6, .down = 8 }, promptWidths(&m).?);
+    m = .{ .layer = 1, .w1 = projOf(&mixed), .w3 = projOf(&mixed), .w2 = projOf(&g444) };
+    try std.testing.expectEqual(cuda.exl3_gm.Widths{}, promptWidths(&m).?); // v2: each expert's own
+    m = .{ .layer = 1, .w1 = projOf(&g333), .w3 = projOf(&g444), .w2 = projOf(&g444) };
+    try std.testing.expectEqual(@as(?cuda.exl3_gm.Widths, null), promptWidths(&m)); // gate and up apart
+    var six = [_]i32{ 12, 12, 12 };
+    m = .{ .layer = 1, .w1 = projOf(&six), .w3 = projOf(&six), .w2 = projOf(&six) };
+    try std.testing.expectEqual(@as(?cuda.exl3_gm.Widths, null), promptWidths(&m)); // 6-bit experts: decode kernel
 }

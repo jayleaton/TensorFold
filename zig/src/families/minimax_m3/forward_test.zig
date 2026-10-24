@@ -195,7 +195,7 @@ test "every width the contract names plans the same stages; only the rows differ
                 try std.testing.expectEqual(plan.Form.gather_sum, o.form);
                 try std.testing.expectEqual(n, o.rows);
             },
-            .experts => |o| try std.testing.expectEqual(n, o.rows),
+            .experts => |o| try std.testing.expect(o.rows == n and !o.prompt),
             .score => |o| try std.testing.expectEqual(@as(u32, 300), o.max_pos),
             else => {},
         };
@@ -228,7 +228,7 @@ test "a prompt chunk: prompt kernels, one head row, the share-form sum, expert c
         },
         .experts => |o| {
             try std.testing.expectEqual(covered, o.row0);
-            try std.testing.expect(o.rows <= plan.expert_rows);
+            try std.testing.expect(o.prompt and o.rows <= plan.prompt_expert_rows);
             covered += o.rows;
         },
         .exchange => |o| {

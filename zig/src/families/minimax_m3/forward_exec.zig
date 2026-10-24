@@ -19,6 +19,7 @@ pub const Error = error{ NoLink, BadOp, ScoreScratch };
 pub const Modules = struct {
     dense: cuda.exl3.Dense,
     experts: cuda.exl3_experts.Experts,
+    gm: cuda.exl3_gm.Experts, // the prompt chunks' routed experts
     norms: cuda.norms.Norms,
     embed: cuda.embed_rows.EmbedRows,
     act: cuda.minimax_m3_act.MiniMaxAct,
@@ -32,8 +33,11 @@ pub const Modules = struct {
         var m: Modules = undefined;
         m.dense = try cuda.exl3.Dense.load(d);
         errdefer m.dense.unload();
+        try m.dense.usePromptTiles();
         m.experts = try cuda.exl3_experts.Experts.load(d);
         errdefer m.experts.unload();
+        m.gm = try cuda.exl3_gm.Experts.load(d);
+        errdefer m.gm.unload();
         m.norms = try cuda.norms.Norms.load(d);
         errdefer m.norms.unload();
         m.embed = try cuda.embed_rows.EmbedRows.load(d);
@@ -61,6 +65,7 @@ pub const Modules = struct {
         m.act.unload();
         m.embed.unload();
         m.norms.unload();
+        m.gm.unload();
         m.experts.unload();
         m.dense.unload();
         m.* = undefined;
@@ -81,7 +86,12 @@ fn shareRows(rows: usize, world: usize) usize {
 }
 
 /// Buffers that are not rows of a step: scratch of the kernels and the exchange.
-pub const Extra = enum { experts, gathered, scatter, share, shares, bmax, sel, status };
+pub const Extra = enum { experts, gathered, scatter, share, shares, bmax, sel, status, gm };
+
+/// Rows of one prompt-experts call the buffers hold: a prompt chunk's, at most the planner's call.
+pub fn gmRows(g: *const plan.Geometry) usize {
+    return @min(g.max_rows, plan.prompt_expert_rows);
+}
 
 pub const Buffers = struct {
     pub const slots = plan.bufs.len + std.enums.values(Extra).len;
@@ -112,6 +122,7 @@ pub const Buffers = struct {
         try b.take(d, score_bytes);
         try b.take(d, @as(usize, g.max_rows) * g.kvh * 16 * 4);
         try b.take(d, 4);
+        try b.take(d, cuda.exl3_gm.scratchBytes(shapeLayer(g), gmRows(g), g.topk));
         return b;
     }
 
@@ -267,14 +278,7 @@ pub const Device = struct {
                 const rp = try ffn.routePlan(dv.sw);
                 try m.act.route(s, dv.b.ptr(.logits_r), moe.bias, rp.route, dv.b.ptr(.pick), dv.b.ptr(.wts), o.rows);
             },
-            .experts => |o| {
-                const l = dv.layer(o.layer).ffn.moe.experts;
-                const sc = try cuda.exl3_experts.scratch(dv.b.extra(.experts).ptr, l, plan.expert_rows, dv.g.topk);
-                const x = dv.at(.{ .buf = .a, .row = o.row0 });
-                const pick = dv.at(.{ .buf = .pick, .row = o.row0 });
-                const wts = dv.at(.{ .buf = .wts, .row = o.row0 });
-                try m.experts.run(s, l, x, hidden, .bf16, pick, wts, o.rows, dv.at(.{ .buf = .routed, .row = o.row0 }), sc);
-            },
+            .experts => |o| try dv.experts(o.layer, o.row0, o.rows, o.prompt),
             .swiglu => |o| {
                 const p = ffn.actParams(dv.sw);
                 const ld: usize = o.n;
@@ -297,6 +301,26 @@ pub const Device = struct {
                 const link = dv.link orelse return error.NoLink;
                 try link.group.allGather(s, dv.b.ptr(.pairs), dv.b.ptr(.pairs_all), @as(usize, o.rows) * 8);
             },
+        }
+    }
+
+    /// Routed experts of rows row0..: a prompt call on x3gm when the layer's widths allow, else decode-kernel calls.
+    fn experts(dv: *const Device, li: u32, row0: u32, rows: u32, prompt: bool) !void {
+        const moe = dv.layer(li).ffn.moe;
+        const l = moe.experts;
+        const hidden = dv.g.hidden;
+        const w = moe.prompt orelse cuda.exl3_gm.Widths{};
+        if (prompt and moe.prompt != null and cuda.exl3_gm.eligible(l, w) and rows <= gmRows(dv.g)) {
+            const sc = cuda.exl3_gm.scratch(dv.b.extra(.gm).ptr, l, gmRows(dv.g), dv.g.topk);
+            const x = dv.at(.{ .buf = .a, .row = row0 });
+            return dv.m.gm.run(dv.d, dv.st, l, w, x, hidden, dv.at(.{ .buf = .pick, .row = row0 }), dv.at(.{ .buf = .wts, .row = row0 }), rows, dv.at(.{ .buf = .routed, .row = row0 }), sc);
+        }
+        const sc = try cuda.exl3_experts.scratch(dv.b.extra(.experts).ptr, l, plan.expert_rows, dv.g.topk);
+        var r: u32 = row0;
+        while (r < row0 + rows) : (r += plan.expert_rows) {
+            const n = @min(plan.expert_rows, row0 + rows - r);
+            const x = dv.at(.{ .buf = .a, .row = r });
+            try dv.m.experts.run(dv.st, l, x, hidden, .bf16, dv.at(.{ .buf = .pick, .row = r }), dv.at(.{ .buf = .wts, .row = r }), n, dv.at(.{ .buf = .routed, .row = r }), sc);
         }
     }
 
