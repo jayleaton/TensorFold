@@ -7,6 +7,11 @@ const reply_text = @import("reply_text.zig");
 const Value = json.Value;
 const Allocator = std.mem.Allocator;
 
+test {
+    _ = @import("tool_minimax_recover_test.zig");
+    _ = @import("tool_minimax_golden_test.zig");
+}
+
 const ns = "]<]minimax[>[";
 const nested_call = "]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"search\">]<]minimax[>[<q>a<b & \"c\"]<]minimax[>[</q>]<]minimax[>[<filters>]<]minimax[>[<lang>en]<]minimax[>[</lang>]<]minimax[>[<deep>]<]minimax[>[<x>1]<]minimax[>[</x>]<]minimax[>[<y>]<]minimax[>[<item>1]<]minimax[>[</item>]<]minimax[>[<item>2.5]<]minimax[>[</item>]<]minimax[>[<item>z]<]minimax[>[</item>]<]minimax[>[</y>]<]minimax[>[</deep>]<]minimax[>[<flag>true]<]minimax[>[</flag>]<]minimax[>[</filters>]<]minimax[>[<ids>]<]minimax[>[<item>3]<]minimax[>[</item>]<]minimax[>[<item>4]<]minimax[>[</item>]<]minimax[>[<item>5]<]minimax[>[</item>]<]minimax[>[</ids>]<]minimax[>[<off>false]<]minimax[>[</off>]<]minimax[>[<pi>3.14159]<]minimax[>[</pi>]<]minimax[>[<big>12345678901234567890]<]minimax[>[</big>]<]minimax[>[<u>café 中文]<]minimax[>[</u>]<]minimax[>[<empty_list>]<]minimax[>[</empty_list>]<]minimax[>[<empty_map>]<]minimax[>[</empty_map>]<]minimax[>[<list_of_maps>]<]minimax[>[<item>]<]minimax[>[<a>1]<]minimax[>[</a>]<]minimax[>[</item>]<]minimax[>[<item>]<]minimax[>[<b>]<]minimax[>[<item>true]<]minimax[>[</item>]<]minimax[>[<item>false]<]minimax[>[</item>]<]minimax[>[</b>]<]minimax[>[</item>]<]minimax[>[</list_of_maps>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>";
 const multi_call = "]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"get_weather\">]<]minimax[>[<city>A]<]minimax[>[</city>]<]minimax[>[</invoke>\n]<]minimax[>[<invoke name=\"search\">]<]minimax[>[<q>B]<]minimax[>[</q>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>";
@@ -85,7 +90,7 @@ test "minimax: scalars are the text unless the schema names another type (UNVERI
     try std.testing.expectEqualStrings("{\"n\":\"five\"}", argsOf(bad.calls.?[0]));
 }
 
-test "minimax: unoffered, malformed and unclosed calls stay text" {
+test "minimax: unoffered, headerless and unclosed calls stay text" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -93,9 +98,8 @@ test "minimax: unoffered, malformed and unclosed calls stay text" {
     const example = ns ++ "<tool_call>\n" ++ ns ++ "<invoke name=\"tool-name-1\">" ++ ns ++ "<param-1>value-1" ++ ns ++ "</param-1>" ++ ns ++ "</invoke>\n" ++ ns ++ "</tool_call>";
     const cases = [_][]const u8{
         example,
-        ns ++ "<tool_call>\n" ++ ns ++ "<invoke name=\"search\">" ++ ns ++ "<q>x" ++ ns ++ "</z>" ++ ns ++ "</invoke>\n" ++ ns ++ "</tool_call>",
-        ns ++ "<tool_call>\n" ++ ns ++ "<invoke name=\"search\">" ++ ns ++ "<q>x" ++ ns ++ "</q>" ++ ns ++ "</tool_call>",
-        ns ++ "<tool_call>\nstray text " ++ ns ++ "<invoke name=\"ping\">" ++ ns ++ "</invoke>\n" ++ ns ++ "</tool_call>",
+        ns ++ "<tool_call>\n" ++ ns ++ "<invoke nam=\"search\">" ++ ns ++ "<q>x" ++ ns ++ "</q>" ++ ns ++ "</invoke>\n" ++ ns ++ "</tool_call>",
+        ns ++ "<tool_call>\n" ++ ns ++ "<q>x" ++ ns ++ "</q>\n" ++ ns ++ "</tool_call>",
         ns ++ "<tool_call>\n" ++ ns ++ "<invoke name=\"search\">" ++ ns ++ "<q>x" ++ ns ++ "</q>" ++ ns ++ "</invoke>\n",
     };
     for (cases) |text| {
@@ -118,7 +122,8 @@ test "minimax: closeCall completes a call the end token left open, and only then
     const head = ns ++ "<tool_call>\n" ++ ns ++ "<invoke name=\"search\">" ++ ns ++ "<q>x" ++ ns ++ "</q>";
     try std.testing.expectEqualStrings(ns ++ "</invoke>" ++ ns ++ "</tool_call>", try tool_parse.closeCall(a, head, offered));
     try std.testing.expectEqualStrings(ns ++ "</tool_call>", try tool_parse.closeCall(a, head ++ ns ++ "</invoke>\n", offered));
-    try std.testing.expectEqualStrings("", try tool_parse.closeCall(a, head ++ ns ++ "<r>cut", offered));
+    // a parameter the end token left open closes with the invoke, as one the model's own `</invoke>` closes
+    try std.testing.expectEqualStrings(ns ++ "</invoke>" ++ ns ++ "</tool_call>", try tool_parse.closeCall(a, head ++ ns ++ "<r>cut", offered));
     try std.testing.expectEqualStrings("", try tool_parse.closeCall(a, single_call, offered));
     try std.testing.expectEqualStrings("", try tool_parse.closeCall(a, ns ++ "<tool_call>\n" ++ ns ++ "<invoke name=\"nope\">", offered));
 }
@@ -141,6 +146,7 @@ fn heads(deltas: []const Value) usize {
 test "minimax: a streamed call splits at every byte boundary into the same calls" {
     const text = "Sure. " ++ multi_call ++ " done";
     const call_end = "Sure. ".len + multi_call.len;
+    const head_end = comptime std.mem.indexOf(u8, multi_call, "get_weather\">").? + "get_weather\">".len;
     for (0..text.len + 1) |boundary| {
         var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
         defer arena.deinit();
@@ -150,7 +156,9 @@ test "minimax: a streamed call splits at every byte boundary into the same calls
         var grown = try tool_stream.Streamer.init(a, offered);
         var out: std.ArrayList(Value) = .empty;
         try grown.feed(text[0..boundary], &out);
-        if (boundary < call_end) try std.testing.expectEqual(@as(usize, 0), out.items.len);
+        // a header goes out once its invoke's tag is whole, and nothing before the block
+        if (boundary < "Sure. ".len + head_end) try std.testing.expectEqual(@as(usize, 0), out.items.len);
+        if (boundary >= call_end) try std.testing.expectEqual(@as(usize, 2), heads(out.items));
         try grown.feed(text, &out);
         try grown.feed(text, &out);
         try std.testing.expectEqual(@as(usize, 2), heads(out.items));

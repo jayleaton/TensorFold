@@ -12,7 +12,6 @@ pub const ns = "]<]minimax[>[";
 pub const open = ns ++ "<tool_call>";
 pub const close = ns ++ "</tool_call>";
 
-pub const Error = error{ Invalid, OutOfMemory };
 pub const Invoke = struct { name: []const u8, arguments: Value };
 
 /// One block found in a reply: where it starts and ends, and the text between its markers.
@@ -40,9 +39,10 @@ pub fn unclosed(text: []const u8) ?usize {
     return null;
 }
 
-const Node = struct {
+/// One parameter element: its text, or the elements inside it.
+pub const Node = struct {
     name: []const u8,
-    text: []const u8 = "",
+    text: std.ArrayList(u8) = .empty,
     kids: std.ArrayList(*Node) = .empty,
 };
 
@@ -50,55 +50,143 @@ fn allSpace(s: []const u8) bool {
     return reply_text.pyStrip(s).len == 0;
 }
 
-/// Every invoke of a block's payload with its arguments typed by `schemas`; Invalid when anything else is in it.
-pub fn calls(a: Allocator, block: []const u8, schemas: *const tool_params.Schemas) Error![]Invoke {
-    var out: std.ArrayList(Invoke) = .empty;
-    var stack: std.ArrayList(*Node) = .empty;
-    var parts = std.mem.splitSequence(u8, block, ns);
-    if (!allSpace(parts.first())) return error.Invalid;
-    while (parts.next()) |seg| {
-        if (seg.len == 0 or seg[0] != '<') return error.Invalid;
-        const gt = std.mem.indexOfScalar(u8, seg, '>') orelse return error.Invalid;
-        const tag = seg[1..gt];
-        const rest = seg[gt + 1 ..];
-        const invoke_head = "invoke name=\"";
-        if (std.mem.startsWith(u8, tag, invoke_head)) {
-            if (stack.items.len != 0 or tag.len < invoke_head.len + 1 or tag[tag.len - 1] != '"') return error.Invalid;
-            const node = try a.create(Node);
-            node.* = .{ .name = tag[invoke_head.len .. tag.len - 1] };
-            if (!allSpace(rest)) return error.Invalid;
-            try stack.append(a, node);
-        } else if (std.mem.eql(u8, tag, "/invoke")) {
-            if (stack.items.len != 1 or !allSpace(rest)) return error.Invalid;
-            const node = stack.pop().?;
-            const arguments = try json.newObject(a);
-            for (node.kids.items) |kid| {
-                const schema = try tool_params.schemaOf(schemas, node.name, kid.name, a);
-                try arguments.put(a, kid.name, try value(a, kid, schema));
-            }
-            try out.append(a, .{ .name = reply_text.pyStrip(node.name), .arguments = .{ .object = arguments } });
-        } else if (tag.len > 1 and tag[0] == '/') {
-            if (stack.items.len < 2 or !std.mem.eql(u8, stack.items[stack.items.len - 1].name, tag[1..]) or !allSpace(rest)) return error.Invalid;
-            _ = stack.pop();
-        } else {
-            if (stack.items.len == 0 or tag.len == 0 or std.mem.indexOfAny(u8, tag, " \t\r\n\"<=/") != null) return error.Invalid;
-            const node = try a.create(Node);
-            node.* = .{ .name = tag, .text = rest };
-            try stack.items[stack.items.len - 1].kids.append(a, node);
-            try stack.append(a, node);
-        }
+/// One invoke's parameter elements as they are read: any run of tags makes a tree, so a known invoke is always a call.
+pub const Args = struct {
+    params: std.ArrayList(*Node) = .empty,
+    stack: std.ArrayList(*Node) = .empty, // the elements open now, outermost first
+
+    fn top(p: *const Args) ?*Node {
+        return if (p.stack.items.len > 0) p.stack.items[p.stack.items.len - 1] else null;
     }
-    if (stack.items.len != 0 or out.items.len == 0) return error.Invalid;
-    return out.items;
+
+    /// An element opens; a leaf already holding text ends here first (the model left out its close).
+    fn open(p: *Args, a: Allocator, name: []const u8) Allocator.Error!void {
+        if (p.top()) |t| if (t.kids.items.len == 0 and !allSpace(t.text.items)) {
+            _ = p.stack.pop();
+        };
+        const node = try a.create(Node);
+        node.* = .{ .name = try a.dupe(u8, name) };
+        try (if (p.top()) |t| &t.kids else &p.params).append(a, node);
+        try p.stack.append(a, node);
+    }
+
+    /// The innermost open element named `name` closes, with any left open inside it; false when none is open.
+    fn close(p: *Args, name: []const u8) bool {
+        var i = p.stack.items.len;
+        while (i > 0) : (i -= 1) if (std.mem.eql(u8, p.stack.items[i - 1].name, name)) {
+            p.stack.shrinkRetainingCapacity(i - 1);
+            return true;
+        };
+        return false;
+    }
+
+    /// Text is the innermost open element's; between parameters it is dropped.
+    fn text(p: *Args, a: Allocator, bytes: []const u8) Allocator.Error!void {
+        if (p.top()) |t| try t.text.appendSlice(a, bytes);
+    }
+};
+
+/// One invoke of a block: where it starts and ends in the block's inner text (end null while it is open), its args.
+pub const Call = struct { start: usize, end: ?usize = null, name: []const u8, args: Args = .{} };
+
+const Tag = union(enum) { invoke: []const u8, end_invoke, block, open: []const u8, close: []const u8, literal };
+
+fn nameOk(name: []const u8) bool {
+    return name.len > 0 and std.mem.indexOfAny(u8, name, " \t\r\n\"<=/>") == null;
 }
 
-/// `calls`, or null where it is Invalid: the block stays text.
-pub fn tryCalls(a: Allocator, block: []const u8, schemas: *const tool_params.Schemas) Allocator.Error!?[]Invoke {
-    return calls(a, block, schemas) catch |e| switch (e) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.Invalid => null,
-    };
+/// `invoke name="X"` with any spacing around its parts: X.
+fn invokeName(tag: []const u8) ?[]const u8 {
+    const blank = " \t\r\n";
+    var s = std.mem.trimStart(u8, tag, blank);
+    if (!std.mem.startsWith(u8, s, "invoke") or s.len == 6 or std.mem.indexOfScalar(u8, blank, s[6]) == null) return null;
+    s = std.mem.trimStart(u8, s[6..], blank);
+    if (!std.mem.startsWith(u8, s, "name")) return null;
+    s = std.mem.trimStart(u8, s[4..], blank);
+    if (!std.mem.startsWith(u8, s, "=")) return null;
+    s = std.mem.trimStart(u8, s[1..], blank);
+    if (!std.mem.startsWith(u8, s, "\"")) return null;
+    const q = std.mem.lastIndexOfScalar(u8, s, '"').?;
+    if (q == 0 or std.mem.trim(u8, s[q + 1 ..], blank).len > 0) return null;
+    return s[1..q];
 }
+
+/// The tag a segment (the bytes after one NS) opens with and its length, or null while more bytes may change it.
+fn tagOf(seg: []const u8, complete: bool) ?struct { tag: Tag, len: usize } {
+    if (seg.len > 0 and seg[0] != '<') return .{ .tag = .literal, .len = 0 };
+    const gt = std.mem.indexOfScalar(u8, seg, '>') orelse return if (complete) .{ .tag = .literal, .len = 0 } else null;
+    const inner = seg[1..gt];
+    const len = gt + 1;
+    if (invokeName(inner)) |n| return .{ .tag = .{ .invoke = n }, .len = len };
+    const body = std.mem.trim(u8, inner, " \t\r\n");
+    if (std.mem.eql(u8, body, "/invoke")) return .{ .tag = .end_invoke, .len = len };
+    if (std.mem.eql(u8, body, "tool_call") or std.mem.eql(u8, body, "/tool_call")) return .{ .tag = .block, .len = len };
+    if (body.len > 1 and body[0] == '/' and nameOk(body[1..])) return .{ .tag = .{ .close = body[1..] }, .len = len };
+    if (nameOk(body)) return .{ .tag = .{ .open = body }, .len = len };
+    return .{ .tag = .literal, .len = 0 };
+}
+
+/// A block's inner text read as it grows, whole or streamed alike; an invoke ends at `</invoke>` or the next invoke.
+pub const Reader = struct {
+    calls: std.ArrayList(*Call) = .empty,
+    current: ?*Call = null,
+    pos: usize = 0,
+    in_text: bool = true, // `pos` is inside a segment's text, else at an NS
+
+    fn end(r: *Reader, at: usize) void {
+        const c = r.current orelse return;
+        c.end = at;
+        c.args.stack.clearRetainingCapacity();
+        r.current = null;
+    }
+
+    fn put(r: *Reader, a: Allocator, bytes: []const u8) Allocator.Error!void {
+        if (r.current) |c| try c.args.text(a, bytes);
+    }
+
+    /// Reads `text` (all of the inner text so far) from where the last call stopped; `done`: the block closed there.
+    pub fn feed(r: *Reader, a: Allocator, text: []const u8, done: bool) Allocator.Error!void {
+        while (true) {
+            if (r.in_text) {
+                const next = reply_text.findTag(text, r.pos, ns);
+                const stop = next orelse if (done) text.len else text.len - reply_text.partialTag(text[r.pos..], ns);
+                try r.put(a, text[r.pos..stop]);
+                r.pos = stop;
+                if (next == null) {
+                    if (done) r.end(text.len);
+                    return;
+                }
+                r.in_text = false;
+            }
+            const seg_start = r.pos + ns.len;
+            if (seg_start > text.len) { // the NS waited at was the block's closer, cut off once it was whole
+                if (done) r.end(text.len);
+                return;
+            }
+            const next = reply_text.findTag(text, seg_start, ns);
+            const t = tagOf(text[seg_start .. next orelse text.len], next != null or done) orelse return;
+            const tag_end = seg_start + t.len;
+            switch (t.tag) {
+                .invoke => |name| {
+                    r.end(r.pos);
+                    const c = try a.create(Call);
+                    c.* = .{ .start = r.pos, .name = try a.dupe(u8, name) };
+                    try r.calls.append(a, c);
+                    r.current = c;
+                },
+                .end_invoke => r.end(tag_end),
+                .block => r.end(r.pos),
+                .open => |name| if (r.current) |c| try c.args.open(a, name),
+                .close => |name| if (r.current) |c| {
+                    _ = c.args.close(name); // a close nothing open matches is dropped, as a bare NS is
+                },
+                .literal => {},
+            }
+            r.pos = tag_end;
+            r.in_text = true;
+        }
+    }
+};
 
 /// `$ref` ("#/a/b") followed through the root, a bounded number of times.
 fn deref(schema: tool_params.Schema) Value {
@@ -142,19 +230,26 @@ fn sub(a: Allocator, schema: tool_params.Schema, key: ?[]const u8) Allocator.Err
     return tool_params.emptySchema(a);
 }
 
-fn value(a: Allocator, node: *const Node, schema: tool_params.Schema) Error!Value {
+/// A leaf under `schema` is its own text whatever it holds: the schema names no type but string.
+pub fn textual(a: Allocator, schema: tool_params.Schema) Allocator.Error!bool {
+    const here: tool_params.Schema = .{ .value = deref(schema), .root = schema.root };
+    const kinds = try tool_kinds.schemaKinds(a, here.value, here.root) orelse return true;
+    return !tool_kinds.takesJson(kinds);
+}
+
+/// An element's value (the module comment's rules); text beside child elements is dropped.
+fn value(a: Allocator, node: *const Node, schema: tool_params.Schema) Allocator.Error!Value {
     const here: tool_params.Schema = .{ .value = deref(schema), .root = schema.root };
     const kinds = try tool_kinds.schemaKinds(a, here.value, here.root);
     if (node.kids.items.len == 0) {
-        if (node.text.len == 0) if (kinds) |k| {
+        if (node.text.items.len == 0) if (kinds) |k| {
             if (!k.contains(.string)) {
                 if (k.contains(.array) and !k.contains(.object)) return .{ .array = &.{} };
                 if (k.contains(.object) and !k.contains(.array)) return .{ .object = try json.newObject(a) };
             }
         };
-        return tool_params.decode(a, node.text, here, false);
+        return tool_params.decode(a, node.text.items, here, false);
     }
-    if (!allSpace(node.text)) return error.Invalid;
     var items = true;
     for (node.kids.items) |k| items = items and std.mem.eql(u8, k.name, "item");
     var as_list = items;
@@ -173,11 +268,65 @@ fn value(a: Allocator, node: *const Node, schema: tool_params.Schema) Error!Valu
     return .{ .object = object };
 }
 
-/// The shortest closing of the reply's open block (`text` from its opener) making one whole call, else nothing.
-pub fn closing(a: Allocator, text: []const u8, tools: []const Value) Allocator.Error![]const u8 {
-    for ([_][]const u8{ close, ns ++ "</invoke>" ++ close }) |tail| {
-        const closed = try std.mem.concat(a, u8, &.{ text, tail });
-        if ((try tool_parse.parse(a, closed, tools, 1)).calls != null) return tail;
+/// One top-level parameter of a call to offered tool `tool`, read by its schema.
+pub fn paramValue(a: Allocator, node: *const Node, schemas: *const tool_params.Schemas, tool: []const u8) Allocator.Error!Value {
+    return value(a, node, try tool_params.schemaOf(schemas, tool, node.name, a));
+}
+
+/// A call's arguments: each parameter in order, a repeated one keeping its first value (streamed before the repeat).
+pub fn arguments(a: Allocator, args: *const Args, schemas: *const tool_params.Schemas, tool: []const u8) Allocator.Error!Value {
+    const object = try json.newObject(a);
+    for (args.params.items) |p| if (!object.contains(p.name)) try object.put(a, p.name, try paramValue(a, p, schemas, tool));
+    return .{ .object = object };
+}
+
+/// The offered spelling of an invoke's name, or null when the request did not offer it.
+pub fn offered(a: Allocator, name: []const u8, known: anytype) Allocator.Error!?[]const u8 {
+    return known.get(try std.ascii.allocLowerString(a, reply_text.pyStrip(name)));
+}
+
+/// A block (markers included) into `calls`; false when it is no MiniMax block. An offered tool's invoke is a call.
+pub fn take(a: Allocator, block: []const u8, schemas: *const tool_params.Schemas, known: anytype, max_calls: ?usize, calls: *std.ArrayList(Value), residue: *std.ArrayList(u8)) Allocator.Error!bool {
+    if (!std.mem.startsWith(u8, block, open)) return false;
+    const inner = block[open.len .. block.len - close.len];
+    var r: Reader = .{};
+    try r.feed(a, inner, true);
+    var found: std.ArrayList(Value) = .empty;
+    var kept: std.ArrayList(u8) = .empty;
+    var cursor: usize = 0;
+    for (r.calls.items) |c| {
+        try keep(a, &kept, inner[cursor..c.start]);
+        cursor = c.end.?;
+        const tool = try offered(a, c.name, known) orelse {
+            try keep(a, &kept, inner[c.start..cursor]);
+            continue;
+        };
+        if (max_calls == null or calls.items.len + found.items.len < max_calls.?)
+            try found.append(a, try tool_parse.openaiCall(a, tool, try arguments(a, &c.args, schemas, tool)));
     }
-    return "";
+    try keep(a, &kept, inner[cursor..]);
+    // the rest stays text (newline-joined) when calls are unlimited, the whole block when none is a call
+    if (found.items.len == 0) {
+        if (max_calls == null) try residue.appendSlice(a, block);
+        return true;
+    }
+    try calls.appendSlice(a, found.items);
+    if (max_calls == null) try residue.appendSlice(a, kept.items);
+    return true;
+}
+
+fn keep(a: Allocator, kept: *std.ArrayList(u8), piece: []const u8) Allocator.Error!void {
+    const s = reply_text.pyStrip(piece);
+    if (s.len == 0) return;
+    if (kept.items.len > 0) try kept.append(a, '\n');
+    try kept.appendSlice(a, s);
+}
+
+/// What closes the block the reply ended in (`text` from its opener): an open invoke's close, the block's, else "".
+pub fn closing(a: Allocator, text: []const u8, tools: []const Value) Allocator.Error![]const u8 {
+    const opened = std.mem.lastIndexOf(u8, text, ns ++ "<invoke");
+    const shut = std.mem.lastIndexOf(u8, text, ns ++ "</invoke>");
+    const tail = if (opened != null and (shut == null or shut.? < opened.?)) ns ++ "</invoke>" ++ close else close;
+    const closed = try std.mem.concat(a, u8, &.{ text, tail });
+    return if ((try tool_parse.parse(a, closed, tools, 1)).calls != null) tail else "";
 }

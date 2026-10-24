@@ -1,0 +1,4507 @@
+[
+ {
+  "name": "weather",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "fixture tool get_weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       },
+       "days": {
+        "type": "integer"
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "strs",
+     "description": "fixture tool strs",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "text": {
+        "type": "string"
+       },
+       "lines": {
+        "type": "string"
+       },
+       "tags": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "typed",
+     "description": "fixture tool typed",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "s": {
+        "type": "string"
+       },
+       "i": {
+        "type": "integer"
+       },
+       "f": {
+        "type": "number"
+       },
+       "f2": {
+        "type": "number"
+       },
+       "f3": {
+        "type": "number"
+       },
+       "f4": {
+        "type": "number"
+       },
+       "big": {
+        "type": "integer"
+       },
+       "b": {
+        "type": "boolean"
+       },
+       "list": {
+        "type": "array",
+        "items": {
+         "type": "integer"
+        }
+       },
+       "obj": {
+        "type": "object",
+        "properties": {
+         "lang": {
+          "type": "string"
+         },
+         "flag": {
+          "type": "boolean"
+         },
+         "deep": {
+          "type": "object",
+          "properties": {
+           "x": {
+            "type": "integer"
+           },
+           "y": {
+            "type": "array",
+            "items": {
+             "type": [
+              "number",
+              "string"
+             ]
+            }
+           }
+          }
+         }
+        }
+       },
+       "objs": {
+        "type": "array",
+        "items": {
+         "$ref": "#/$defs/entry"
+        }
+       },
+       "ref": {
+        "$ref": "#/$defs/entry"
+       },
+       "empty_list": {
+        "type": "array"
+       },
+       "empty_map": {
+        "type": "object"
+       },
+       "any": {
+        "anyOf": [
+         {
+          "type": "integer"
+         },
+         {
+          "type": "string"
+         }
+        ]
+       }
+      },
+      "$defs": {
+       "entry": {
+        "type": "object",
+        "properties": {
+         "a": {
+          "type": "integer"
+         },
+         "b": {
+          "type": "array",
+          "items": {
+           "type": "boolean"
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "free",
+     "description": "fixture tool free"
+    }
+   }
+  ],
+  "reply": "Let me check. ]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"get_weather\">]<]minimax[>[<city>Paris]<]minimax[>[</city>]<]minimax[>[<unit>c]<]minimax[>[</unit>]<]minimax[>[<days>3]<]minimax[>[</days>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
+  "calls": [
+   {
+    "name": "get_weather",
+    "arguments": {
+     "city": "Paris",
+     "unit": "c",
+     "days": 3
+    }
+   }
+  ],
+  "lossy": null,
+  "skip": null
+ },
+ {
+  "name": "strings",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "fixture tool get_weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       },
+       "days": {
+        "type": "integer"
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "strs",
+     "description": "fixture tool strs",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "text": {
+        "type": "string"
+       },
+       "lines": {
+        "type": "string"
+       },
+       "tags": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "typed",
+     "description": "fixture tool typed",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "s": {
+        "type": "string"
+       },
+       "i": {
+        "type": "integer"
+       },
+       "f": {
+        "type": "number"
+       },
+       "f2": {
+        "type": "number"
+       },
+       "f3": {
+        "type": "number"
+       },
+       "f4": {
+        "type": "number"
+       },
+       "big": {
+        "type": "integer"
+       },
+       "b": {
+        "type": "boolean"
+       },
+       "list": {
+        "type": "array",
+        "items": {
+         "type": "integer"
+        }
+       },
+       "obj": {
+        "type": "object",
+        "properties": {
+         "lang": {
+          "type": "string"
+         },
+         "flag": {
+          "type": "boolean"
+         },
+         "deep": {
+          "type": "object",
+          "properties": {
+           "x": {
+            "type": "integer"
+           },
+           "y": {
+            "type": "array",
+            "items": {
+             "type": [
+              "number",
+              "string"
+             ]
+            }
+           }
+          }
+         }
+        }
+       },
+       "objs": {
+        "type": "array",
+        "items": {
+         "$ref": "#/$defs/entry"
+        }
+       },
+       "ref": {
+        "$ref": "#/$defs/entry"
+       },
+       "empty_list": {
+        "type": "array"
+       },
+       "empty_map": {
+        "type": "object"
+       },
+       "any": {
+        "anyOf": [
+         {
+          "type": "integer"
+         },
+         {
+          "type": "string"
+         }
+        ]
+       }
+      },
+      "$defs": {
+       "entry": {
+        "type": "object",
+        "properties": {
+         "a": {
+          "type": "integer"
+         },
+         "b": {
+          "type": "array",
+          "items": {
+           "type": "boolean"
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "free",
+     "description": "fixture tool free"
+    }
+   }
+  ],
+  "reply": "]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"strs\">]<]minimax[>[<text>café 中文 😀 \"quoted\" 'single' <b>bold</b> & amp; a<b && c>d ]<] [>[ \\ end]<]minimax[>[</text>]<]minimax[>[<lines>line1\nline2\n\n  indented\ttab\r\n]<]minimax[>[</lines>]<]minimax[>[<tags>]<]minimax[>[<item><x>]<]minimax[>[</item>]<]minimax[>[<item>&]<]minimax[>[</item>]<]minimax[>[<item>a\"b]<]minimax[>[</item>]<]minimax[>[<item>]<]minimax[>[</item>]<]minimax[>[<item> ]<]minimax[>[</item>]<]minimax[>[</tags>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
+  "calls": [
+   {
+    "name": "strs",
+    "arguments": {
+     "text": "café 中文 😀 \"quoted\" 'single' <b>bold</b> & amp; a<b && c>d ]<] [>[ \\ end",
+     "lines": "line1\nline2\n\n  indented\ttab\r\n",
+     "tags": [
+      "<x>",
+      "&",
+      "a\"b",
+      "",
+      " "
+     ]
+    }
+   }
+  ],
+  "lossy": null,
+  "skip": null
+ },
+ {
+  "name": "strings_look_typed",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "fixture tool get_weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       },
+       "days": {
+        "type": "integer"
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "strs",
+     "description": "fixture tool strs",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "text": {
+        "type": "string"
+       },
+       "lines": {
+        "type": "string"
+       },
+       "tags": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "typed",
+     "description": "fixture tool typed",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "s": {
+        "type": "string"
+       },
+       "i": {
+        "type": "integer"
+       },
+       "f": {
+        "type": "number"
+       },
+       "f2": {
+        "type": "number"
+       },
+       "f3": {
+        "type": "number"
+       },
+       "f4": {
+        "type": "number"
+       },
+       "big": {
+        "type": "integer"
+       },
+       "b": {
+        "type": "boolean"
+       },
+       "list": {
+        "type": "array",
+        "items": {
+         "type": "integer"
+        }
+       },
+       "obj": {
+        "type": "object",
+        "properties": {
+         "lang": {
+          "type": "string"
+         },
+         "flag": {
+          "type": "boolean"
+         },
+         "deep": {
+          "type": "object",
+          "properties": {
+           "x": {
+            "type": "integer"
+           },
+           "y": {
+            "type": "array",
+            "items": {
+             "type": [
+              "number",
+              "string"
+             ]
+            }
+           }
+          }
+         }
+        }
+       },
+       "objs": {
+        "type": "array",
+        "items": {
+         "$ref": "#/$defs/entry"
+        }
+       },
+       "ref": {
+        "$ref": "#/$defs/entry"
+       },
+       "empty_list": {
+        "type": "array"
+       },
+       "empty_map": {
+        "type": "object"
+       },
+       "any": {
+        "anyOf": [
+         {
+          "type": "integer"
+         },
+         {
+          "type": "string"
+         }
+        ]
+       }
+      },
+      "$defs": {
+       "entry": {
+        "type": "object",
+        "properties": {
+         "a": {
+          "type": "integer"
+         },
+         "b": {
+          "type": "array",
+          "items": {
+           "type": "boolean"
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "free",
+     "description": "fixture tool free"
+    }
+   }
+  ],
+  "reply": "]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"strs\">]<]minimax[>[<text>{\"a\": 1}]<]minimax[>[</text>]<]minimax[>[<lines>12345]<]minimax[>[</lines>]<]minimax[>[<tags>]<]minimax[>[<item>1]<]minimax[>[</item>]<]minimax[>[<item>2.5]<]minimax[>[</item>]<]minimax[>[<item>true]<]minimax[>[</item>]<]minimax[>[<item>null]<]minimax[>[</item>]<]minimax[>[<item>None]<]minimax[>[</item>]<]minimax[>[<item>[1]]<]minimax[>[</item>]<]minimax[>[</tags>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
+  "calls": [
+   {
+    "name": "strs",
+    "arguments": {
+     "text": "{\"a\": 1}",
+     "lines": "12345",
+     "tags": [
+      "1",
+      "2.5",
+      "true",
+      "null",
+      "None",
+      "[1]"
+     ]
+    }
+   }
+  ],
+  "lossy": null,
+  "skip": null
+ },
+ {
+  "name": "strings_blank",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "fixture tool get_weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       },
+       "days": {
+        "type": "integer"
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "strs",
+     "description": "fixture tool strs",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "text": {
+        "type": "string"
+       },
+       "lines": {
+        "type": "string"
+       },
+       "tags": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "typed",
+     "description": "fixture tool typed",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "s": {
+        "type": "string"
+       },
+       "i": {
+        "type": "integer"
+       },
+       "f": {
+        "type": "number"
+       },
+       "f2": {
+        "type": "number"
+       },
+       "f3": {
+        "type": "number"
+       },
+       "f4": {
+        "type": "number"
+       },
+       "big": {
+        "type": "integer"
+       },
+       "b": {
+        "type": "boolean"
+       },
+       "list": {
+        "type": "array",
+        "items": {
+         "type": "integer"
+        }
+       },
+       "obj": {
+        "type": "object",
+        "properties": {
+         "lang": {
+          "type": "string"
+         },
+         "flag": {
+          "type": "boolean"
+         },
+         "deep": {
+          "type": "object",
+          "properties": {
+           "x": {
+            "type": "integer"
+           },
+           "y": {
+            "type": "array",
+            "items": {
+             "type": [
+              "number",
+              "string"
+             ]
+            }
+           }
+          }
+         }
+        }
+       },
+       "objs": {
+        "type": "array",
+        "items": {
+         "$ref": "#/$defs/entry"
+        }
+       },
+       "ref": {
+        "$ref": "#/$defs/entry"
+       },
+       "empty_list": {
+        "type": "array"
+       },
+       "empty_map": {
+        "type": "object"
+       },
+       "any": {
+        "anyOf": [
+         {
+          "type": "integer"
+         },
+         {
+          "type": "string"
+         }
+        ]
+       }
+      },
+      "$defs": {
+       "entry": {
+        "type": "object",
+        "properties": {
+         "a": {
+          "type": "integer"
+         },
+         "b": {
+          "type": "array",
+          "items": {
+           "type": "boolean"
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "free",
+     "description": "fixture tool free"
+    }
+   }
+  ],
+  "reply": "]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"strs\">]<]minimax[>[<text>   ]<]minimax[>[</text>]<]minimax[>[<lines>\n]<]minimax[>[</lines>]<]minimax[>[<tags>]<]minimax[>[</tags>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
+  "calls": [
+   {
+    "name": "strs",
+    "arguments": {
+     "text": "   ",
+     "lines": "\n",
+     "tags": []
+    }
+   }
+  ],
+  "lossy": null,
+  "skip": null
+ },
+ {
+  "name": "numbers",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "fixture tool get_weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       },
+       "days": {
+        "type": "integer"
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "strs",
+     "description": "fixture tool strs",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "text": {
+        "type": "string"
+       },
+       "lines": {
+        "type": "string"
+       },
+       "tags": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "typed",
+     "description": "fixture tool typed",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "s": {
+        "type": "string"
+       },
+       "i": {
+        "type": "integer"
+       },
+       "f": {
+        "type": "number"
+       },
+       "f2": {
+        "type": "number"
+       },
+       "f3": {
+        "type": "number"
+       },
+       "f4": {
+        "type": "number"
+       },
+       "big": {
+        "type": "integer"
+       },
+       "b": {
+        "type": "boolean"
+       },
+       "list": {
+        "type": "array",
+        "items": {
+         "type": "integer"
+        }
+       },
+       "obj": {
+        "type": "object",
+        "properties": {
+         "lang": {
+          "type": "string"
+         },
+         "flag": {
+          "type": "boolean"
+         },
+         "deep": {
+          "type": "object",
+          "properties": {
+           "x": {
+            "type": "integer"
+           },
+           "y": {
+            "type": "array",
+            "items": {
+             "type": [
+              "number",
+              "string"
+             ]
+            }
+           }
+          }
+         }
+        }
+       },
+       "objs": {
+        "type": "array",
+        "items": {
+         "$ref": "#/$defs/entry"
+        }
+       },
+       "ref": {
+        "$ref": "#/$defs/entry"
+       },
+       "empty_list": {
+        "type": "array"
+       },
+       "empty_map": {
+        "type": "object"
+       },
+       "any": {
+        "anyOf": [
+         {
+          "type": "integer"
+         },
+         {
+          "type": "string"
+         }
+        ]
+       }
+      },
+      "$defs": {
+       "entry": {
+        "type": "object",
+        "properties": {
+         "a": {
+          "type": "integer"
+         },
+         "b": {
+          "type": "array",
+          "items": {
+           "type": "boolean"
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "free",
+     "description": "fixture tool free"
+    }
+   }
+  ],
+  "reply": "]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"typed\">]<]minimax[>[<i>42]<]minimax[>[</i>]<]minimax[>[<f>3.14159]<]minimax[>[</f>]<]minimax[>[<f2>1e-07]<]minimax[>[</f2>]<]minimax[>[<f3>2.0]<]minimax[>[</f3>]<]minimax[>[<f4>1e+16]<]minimax[>[</f4>]<]minimax[>[<big>12345678901234567890]<]minimax[>[</big>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
+  "calls": [
+   {
+    "name": "typed",
+    "arguments": {
+     "i": 42,
+     "f": 3.14159,
+     "f2": 1e-07,
+     "f3": 2.0,
+     "f4": 1e+16,
+     "big": 12345678901234567890
+    }
+   }
+  ],
+  "lossy": null,
+  "skip": null
+ },
+ {
+  "name": "negative_numbers",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "fixture tool get_weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       },
+       "days": {
+        "type": "integer"
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "strs",
+     "description": "fixture tool strs",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "text": {
+        "type": "string"
+       },
+       "lines": {
+        "type": "string"
+       },
+       "tags": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "typed",
+     "description": "fixture tool typed",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "s": {
+        "type": "string"
+       },
+       "i": {
+        "type": "integer"
+       },
+       "f": {
+        "type": "number"
+       },
+       "f2": {
+        "type": "number"
+       },
+       "f3": {
+        "type": "number"
+       },
+       "f4": {
+        "type": "number"
+       },
+       "big": {
+        "type": "integer"
+       },
+       "b": {
+        "type": "boolean"
+       },
+       "list": {
+        "type": "array",
+        "items": {
+         "type": "integer"
+        }
+       },
+       "obj": {
+        "type": "object",
+        "properties": {
+         "lang": {
+          "type": "string"
+         },
+         "flag": {
+          "type": "boolean"
+         },
+         "deep": {
+          "type": "object",
+          "properties": {
+           "x": {
+            "type": "integer"
+           },
+           "y": {
+            "type": "array",
+            "items": {
+             "type": [
+              "number",
+              "string"
+             ]
+            }
+           }
+          }
+         }
+        }
+       },
+       "objs": {
+        "type": "array",
+        "items": {
+         "$ref": "#/$defs/entry"
+        }
+       },
+       "ref": {
+        "$ref": "#/$defs/entry"
+       },
+       "empty_list": {
+        "type": "array"
+       },
+       "empty_map": {
+        "type": "object"
+       },
+       "any": {
+        "anyOf": [
+         {
+          "type": "integer"
+         },
+         {
+          "type": "string"
+         }
+        ]
+       }
+      },
+      "$defs": {
+       "entry": {
+        "type": "object",
+        "properties": {
+         "a": {
+          "type": "integer"
+         },
+         "b": {
+          "type": "array",
+          "items": {
+           "type": "boolean"
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "free",
+     "description": "fixture tool free"
+    }
+   }
+  ],
+  "reply": "]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"typed\">]<]minimax[>[<i>-7]<]minimax[>[</i>]<]minimax[>[<f>-0.5]<]minimax[>[</f>]<]minimax[>[<big>-98765432109876543210]<]minimax[>[</big>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
+  "calls": [
+   {
+    "name": "typed",
+    "arguments": {
+     "i": -7,
+     "f": -0.5,
+     "big": -98765432109876543210
+    }
+   }
+  ],
+  "lossy": null,
+  "skip": null
+ },
+ {
+  "name": "bools",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "fixture tool get_weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       },
+       "days": {
+        "type": "integer"
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "strs",
+     "description": "fixture tool strs",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "text": {
+        "type": "string"
+       },
+       "lines": {
+        "type": "string"
+       },
+       "tags": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "typed",
+     "description": "fixture tool typed",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "s": {
+        "type": "string"
+       },
+       "i": {
+        "type": "integer"
+       },
+       "f": {
+        "type": "number"
+       },
+       "f2": {
+        "type": "number"
+       },
+       "f3": {
+        "type": "number"
+       },
+       "f4": {
+        "type": "number"
+       },
+       "big": {
+        "type": "integer"
+       },
+       "b": {
+        "type": "boolean"
+       },
+       "list": {
+        "type": "array",
+        "items": {
+         "type": "integer"
+        }
+       },
+       "obj": {
+        "type": "object",
+        "properties": {
+         "lang": {
+          "type": "string"
+         },
+         "flag": {
+          "type": "boolean"
+         },
+         "deep": {
+          "type": "object",
+          "properties": {
+           "x": {
+            "type": "integer"
+           },
+           "y": {
+            "type": "array",
+            "items": {
+             "type": [
+              "number",
+              "string"
+             ]
+            }
+           }
+          }
+         }
+        }
+       },
+       "objs": {
+        "type": "array",
+        "items": {
+         "$ref": "#/$defs/entry"
+        }
+       },
+       "ref": {
+        "$ref": "#/$defs/entry"
+       },
+       "empty_list": {
+        "type": "array"
+       },
+       "empty_map": {
+        "type": "object"
+       },
+       "any": {
+        "anyOf": [
+         {
+          "type": "integer"
+         },
+         {
+          "type": "string"
+         }
+        ]
+       }
+      },
+      "$defs": {
+       "entry": {
+        "type": "object",
+        "properties": {
+         "a": {
+          "type": "integer"
+         },
+         "b": {
+          "type": "array",
+          "items": {
+           "type": "boolean"
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "free",
+     "description": "fixture tool free"
+    }
+   }
+  ],
+  "reply": "]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"typed\">]<]minimax[>[<b>true]<]minimax[>[</b>]<]minimax[>[<obj>]<]minimax[>[<flag>false]<]minimax[>[</flag>]<]minimax[>[</obj>]<]minimax[>[</invoke>\n]<]minimax[>[<invoke name=\"typed\">]<]minimax[>[<b>false]<]minimax[>[</b>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
+  "calls": [
+   {
+    "name": "typed",
+    "arguments": {
+     "b": true,
+     "obj": {
+      "flag": false
+     }
+    }
+   },
+   {
+    "name": "typed",
+    "arguments": {
+     "b": false
+    }
+   }
+  ],
+  "lossy": null,
+  "skip": null
+ },
+ {
+  "name": "nested",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "fixture tool get_weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       },
+       "days": {
+        "type": "integer"
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "strs",
+     "description": "fixture tool strs",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "text": {
+        "type": "string"
+       },
+       "lines": {
+        "type": "string"
+       },
+       "tags": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "typed",
+     "description": "fixture tool typed",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "s": {
+        "type": "string"
+       },
+       "i": {
+        "type": "integer"
+       },
+       "f": {
+        "type": "number"
+       },
+       "f2": {
+        "type": "number"
+       },
+       "f3": {
+        "type": "number"
+       },
+       "f4": {
+        "type": "number"
+       },
+       "big": {
+        "type": "integer"
+       },
+       "b": {
+        "type": "boolean"
+       },
+       "list": {
+        "type": "array",
+        "items": {
+         "type": "integer"
+        }
+       },
+       "obj": {
+        "type": "object",
+        "properties": {
+         "lang": {
+          "type": "string"
+         },
+         "flag": {
+          "type": "boolean"
+         },
+         "deep": {
+          "type": "object",
+          "properties": {
+           "x": {
+            "type": "integer"
+           },
+           "y": {
+            "type": "array",
+            "items": {
+             "type": [
+              "number",
+              "string"
+             ]
+            }
+           }
+          }
+         }
+        }
+       },
+       "objs": {
+        "type": "array",
+        "items": {
+         "$ref": "#/$defs/entry"
+        }
+       },
+       "ref": {
+        "$ref": "#/$defs/entry"
+       },
+       "empty_list": {
+        "type": "array"
+       },
+       "empty_map": {
+        "type": "object"
+       },
+       "any": {
+        "anyOf": [
+         {
+          "type": "integer"
+         },
+         {
+          "type": "string"
+         }
+        ]
+       }
+      },
+      "$defs": {
+       "entry": {
+        "type": "object",
+        "properties": {
+         "a": {
+          "type": "integer"
+         },
+         "b": {
+          "type": "array",
+          "items": {
+           "type": "boolean"
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "free",
+     "description": "fixture tool free"
+    }
+   }
+  ],
+  "reply": "]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"typed\">]<]minimax[>[<obj>]<]minimax[>[<lang>en]<]minimax[>[</lang>]<]minimax[>[<deep>]<]minimax[>[<x>1]<]minimax[>[</x>]<]minimax[>[<y>]<]minimax[>[<item>1]<]minimax[>[</item>]<]minimax[>[<item>2.5]<]minimax[>[</item>]<]minimax[>[<item>z]<]minimax[>[</item>]<]minimax[>[</y>]<]minimax[>[</deep>]<]minimax[>[<flag>true]<]minimax[>[</flag>]<]minimax[>[</obj>]<]minimax[>[<s>after]<]minimax[>[</s>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
+  "calls": [
+   {
+    "name": "typed",
+    "arguments": {
+     "obj": {
+      "lang": "en",
+      "deep": {
+       "x": 1,
+       "y": [
+        1,
+        2.5,
+        "z"
+       ]
+      },
+      "flag": true
+     },
+     "s": "after"
+    }
+   }
+  ],
+  "lossy": null,
+  "skip": null
+ },
+ {
+  "name": "list_of_objects",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "fixture tool get_weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       },
+       "days": {
+        "type": "integer"
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "strs",
+     "description": "fixture tool strs",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "text": {
+        "type": "string"
+       },
+       "lines": {
+        "type": "string"
+       },
+       "tags": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "typed",
+     "description": "fixture tool typed",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "s": {
+        "type": "string"
+       },
+       "i": {
+        "type": "integer"
+       },
+       "f": {
+        "type": "number"
+       },
+       "f2": {
+        "type": "number"
+       },
+       "f3": {
+        "type": "number"
+       },
+       "f4": {
+        "type": "number"
+       },
+       "big": {
+        "type": "integer"
+       },
+       "b": {
+        "type": "boolean"
+       },
+       "list": {
+        "type": "array",
+        "items": {
+         "type": "integer"
+        }
+       },
+       "obj": {
+        "type": "object",
+        "properties": {
+         "lang": {
+          "type": "string"
+         },
+         "flag": {
+          "type": "boolean"
+         },
+         "deep": {
+          "type": "object",
+          "properties": {
+           "x": {
+            "type": "integer"
+           },
+           "y": {
+            "type": "array",
+            "items": {
+             "type": [
+              "number",
+              "string"
+             ]
+            }
+           }
+          }
+         }
+        }
+       },
+       "objs": {
+        "type": "array",
+        "items": {
+         "$ref": "#/$defs/entry"
+        }
+       },
+       "ref": {
+        "$ref": "#/$defs/entry"
+       },
+       "empty_list": {
+        "type": "array"
+       },
+       "empty_map": {
+        "type": "object"
+       },
+       "any": {
+        "anyOf": [
+         {
+          "type": "integer"
+         },
+         {
+          "type": "string"
+         }
+        ]
+       }
+      },
+      "$defs": {
+       "entry": {
+        "type": "object",
+        "properties": {
+         "a": {
+          "type": "integer"
+         },
+         "b": {
+          "type": "array",
+          "items": {
+           "type": "boolean"
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "free",
+     "description": "fixture tool free"
+    }
+   }
+  ],
+  "reply": "]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"typed\">]<]minimax[>[<objs>]<]minimax[>[<item>]<]minimax[>[<a>1]<]minimax[>[</a>]<]minimax[>[</item>]<]minimax[>[<item>]<]minimax[>[<b>]<]minimax[>[<item>true]<]minimax[>[</item>]<]minimax[>[<item>false]<]minimax[>[</item>]<]minimax[>[</b>]<]minimax[>[</item>]<]minimax[>[<item>]<]minimax[>[<a>2]<]minimax[>[</a>]<]minimax[>[<b>]<]minimax[>[</b>]<]minimax[>[</item>]<]minimax[>[</objs>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
+  "calls": [
+   {
+    "name": "typed",
+    "arguments": {
+     "objs": [
+      {
+       "a": 1
+      },
+      {
+       "b": [
+        true,
+        false
+       ]
+      },
+      {
+       "a": 2,
+       "b": []
+      }
+     ]
+    }
+   }
+  ],
+  "lossy": null,
+  "skip": null
+ },
+ {
+  "name": "empties",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "fixture tool get_weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       },
+       "days": {
+        "type": "integer"
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "strs",
+     "description": "fixture tool strs",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "text": {
+        "type": "string"
+       },
+       "lines": {
+        "type": "string"
+       },
+       "tags": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "typed",
+     "description": "fixture tool typed",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "s": {
+        "type": "string"
+       },
+       "i": {
+        "type": "integer"
+       },
+       "f": {
+        "type": "number"
+       },
+       "f2": {
+        "type": "number"
+       },
+       "f3": {
+        "type": "number"
+       },
+       "f4": {
+        "type": "number"
+       },
+       "big": {
+        "type": "integer"
+       },
+       "b": {
+        "type": "boolean"
+       },
+       "list": {
+        "type": "array",
+        "items": {
+         "type": "integer"
+        }
+       },
+       "obj": {
+        "type": "object",
+        "properties": {
+         "lang": {
+          "type": "string"
+         },
+         "flag": {
+          "type": "boolean"
+         },
+         "deep": {
+          "type": "object",
+          "properties": {
+           "x": {
+            "type": "integer"
+           },
+           "y": {
+            "type": "array",
+            "items": {
+             "type": [
+              "number",
+              "string"
+             ]
+            }
+           }
+          }
+         }
+        }
+       },
+       "objs": {
+        "type": "array",
+        "items": {
+         "$ref": "#/$defs/entry"
+        }
+       },
+       "ref": {
+        "$ref": "#/$defs/entry"
+       },
+       "empty_list": {
+        "type": "array"
+       },
+       "empty_map": {
+        "type": "object"
+       },
+       "any": {
+        "anyOf": [
+         {
+          "type": "integer"
+         },
+         {
+          "type": "string"
+         }
+        ]
+       }
+      },
+      "$defs": {
+       "entry": {
+        "type": "object",
+        "properties": {
+         "a": {
+          "type": "integer"
+         },
+         "b": {
+          "type": "array",
+          "items": {
+           "type": "boolean"
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "free",
+     "description": "fixture tool free"
+    }
+   }
+  ],
+  "reply": "]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"typed\">]<]minimax[>[<empty_list>]<]minimax[>[</empty_list>]<]minimax[>[<empty_map>]<]minimax[>[</empty_map>]<]minimax[>[<s>]<]minimax[>[</s>]<]minimax[>[<list>]<]minimax[>[</list>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
+  "calls": [
+   {
+    "name": "typed",
+    "arguments": {
+     "empty_list": [],
+     "empty_map": {},
+     "s": "",
+     "list": []
+    }
+   }
+  ],
+  "lossy": null,
+  "skip": null
+ },
+ {
+  "name": "none_keys",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "fixture tool get_weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       },
+       "days": {
+        "type": "integer"
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "strs",
+     "description": "fixture tool strs",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "text": {
+        "type": "string"
+       },
+       "lines": {
+        "type": "string"
+       },
+       "tags": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "typed",
+     "description": "fixture tool typed",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "s": {
+        "type": "string"
+       },
+       "i": {
+        "type": "integer"
+       },
+       "f": {
+        "type": "number"
+       },
+       "f2": {
+        "type": "number"
+       },
+       "f3": {
+        "type": "number"
+       },
+       "f4": {
+        "type": "number"
+       },
+       "big": {
+        "type": "integer"
+       },
+       "b": {
+        "type": "boolean"
+       },
+       "list": {
+        "type": "array",
+        "items": {
+         "type": "integer"
+        }
+       },
+       "obj": {
+        "type": "object",
+        "properties": {
+         "lang": {
+          "type": "string"
+         },
+         "flag": {
+          "type": "boolean"
+         },
+         "deep": {
+          "type": "object",
+          "properties": {
+           "x": {
+            "type": "integer"
+           },
+           "y": {
+            "type": "array",
+            "items": {
+             "type": [
+              "number",
+              "string"
+             ]
+            }
+           }
+          }
+         }
+        }
+       },
+       "objs": {
+        "type": "array",
+        "items": {
+         "$ref": "#/$defs/entry"
+        }
+       },
+       "ref": {
+        "$ref": "#/$defs/entry"
+       },
+       "empty_list": {
+        "type": "array"
+       },
+       "empty_map": {
+        "type": "object"
+       },
+       "any": {
+        "anyOf": [
+         {
+          "type": "integer"
+         },
+         {
+          "type": "string"
+         }
+        ]
+       }
+      },
+      "$defs": {
+       "entry": {
+        "type": "object",
+        "properties": {
+         "a": {
+          "type": "integer"
+         },
+         "b": {
+          "type": "array",
+          "items": {
+           "type": "boolean"
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "free",
+     "description": "fixture tool free"
+    }
+   }
+  ],
+  "reply": "]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"typed\">]<]minimax[>[<s>x]<]minimax[>[</s>]<]minimax[>[<obj>]<]minimax[>[<flag>true]<]minimax[>[</flag>]<]minimax[>[</obj>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
+  "calls": [
+   {
+    "name": "typed",
+    "arguments": {
+     "s": "x",
+     "obj": {
+      "flag": true
+     }
+    }
+   }
+  ],
+  "lossy": null,
+  "skip": null
+ },
+ {
+  "name": "any_of",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "fixture tool get_weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       },
+       "days": {
+        "type": "integer"
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "strs",
+     "description": "fixture tool strs",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "text": {
+        "type": "string"
+       },
+       "lines": {
+        "type": "string"
+       },
+       "tags": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "typed",
+     "description": "fixture tool typed",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "s": {
+        "type": "string"
+       },
+       "i": {
+        "type": "integer"
+       },
+       "f": {
+        "type": "number"
+       },
+       "f2": {
+        "type": "number"
+       },
+       "f3": {
+        "type": "number"
+       },
+       "f4": {
+        "type": "number"
+       },
+       "big": {
+        "type": "integer"
+       },
+       "b": {
+        "type": "boolean"
+       },
+       "list": {
+        "type": "array",
+        "items": {
+         "type": "integer"
+        }
+       },
+       "obj": {
+        "type": "object",
+        "properties": {
+         "lang": {
+          "type": "string"
+         },
+         "flag": {
+          "type": "boolean"
+         },
+         "deep": {
+          "type": "object",
+          "properties": {
+           "x": {
+            "type": "integer"
+           },
+           "y": {
+            "type": "array",
+            "items": {
+             "type": [
+              "number",
+              "string"
+             ]
+            }
+           }
+          }
+         }
+        }
+       },
+       "objs": {
+        "type": "array",
+        "items": {
+         "$ref": "#/$defs/entry"
+        }
+       },
+       "ref": {
+        "$ref": "#/$defs/entry"
+       },
+       "empty_list": {
+        "type": "array"
+       },
+       "empty_map": {
+        "type": "object"
+       },
+       "any": {
+        "anyOf": [
+         {
+          "type": "integer"
+         },
+         {
+          "type": "string"
+         }
+        ]
+       }
+      },
+      "$defs": {
+       "entry": {
+        "type": "object",
+        "properties": {
+         "a": {
+          "type": "integer"
+         },
+         "b": {
+          "type": "array",
+          "items": {
+           "type": "boolean"
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "free",
+     "description": "fixture tool free"
+    }
+   }
+  ],
+  "reply": "]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"typed\">]<]minimax[>[<any>5]<]minimax[>[</any>]<]minimax[>[</invoke>\n]<]minimax[>[<invoke name=\"typed\">]<]minimax[>[<any>abc]<]minimax[>[</any>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
+  "calls": [
+   {
+    "name": "typed",
+    "arguments": {
+     "any": 5
+    }
+   },
+   {
+    "name": "typed",
+    "arguments": {
+     "any": "abc"
+    }
+   }
+  ],
+  "lossy": null,
+  "skip": null
+ },
+ {
+  "name": "ref",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "fixture tool get_weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       },
+       "days": {
+        "type": "integer"
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "strs",
+     "description": "fixture tool strs",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "text": {
+        "type": "string"
+       },
+       "lines": {
+        "type": "string"
+       },
+       "tags": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "typed",
+     "description": "fixture tool typed",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "s": {
+        "type": "string"
+       },
+       "i": {
+        "type": "integer"
+       },
+       "f": {
+        "type": "number"
+       },
+       "f2": {
+        "type": "number"
+       },
+       "f3": {
+        "type": "number"
+       },
+       "f4": {
+        "type": "number"
+       },
+       "big": {
+        "type": "integer"
+       },
+       "b": {
+        "type": "boolean"
+       },
+       "list": {
+        "type": "array",
+        "items": {
+         "type": "integer"
+        }
+       },
+       "obj": {
+        "type": "object",
+        "properties": {
+         "lang": {
+          "type": "string"
+         },
+         "flag": {
+          "type": "boolean"
+         },
+         "deep": {
+          "type": "object",
+          "properties": {
+           "x": {
+            "type": "integer"
+           },
+           "y": {
+            "type": "array",
+            "items": {
+             "type": [
+              "number",
+              "string"
+             ]
+            }
+           }
+          }
+         }
+        }
+       },
+       "objs": {
+        "type": "array",
+        "items": {
+         "$ref": "#/$defs/entry"
+        }
+       },
+       "ref": {
+        "$ref": "#/$defs/entry"
+       },
+       "empty_list": {
+        "type": "array"
+       },
+       "empty_map": {
+        "type": "object"
+       },
+       "any": {
+        "anyOf": [
+         {
+          "type": "integer"
+         },
+         {
+          "type": "string"
+         }
+        ]
+       }
+      },
+      "$defs": {
+       "entry": {
+        "type": "object",
+        "properties": {
+         "a": {
+          "type": "integer"
+         },
+         "b": {
+          "type": "array",
+          "items": {
+           "type": "boolean"
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "free",
+     "description": "fixture tool free"
+    }
+   }
+  ],
+  "reply": "]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"typed\">]<]minimax[>[<ref>]<]minimax[>[<a>2]<]minimax[>[</a>]<]minimax[>[<b>]<]minimax[>[<item>false]<]minimax[>[</item>]<]minimax[>[</b>]<]minimax[>[</ref>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
+  "calls": [
+   {
+    "name": "typed",
+    "arguments": {
+     "ref": {
+      "a": 2,
+      "b": [
+       false
+      ]
+     }
+    }
+   }
+  ],
+  "lossy": null,
+  "skip": null
+ },
+ {
+  "name": "unicode_keys",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "fixture tool get_weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       },
+       "days": {
+        "type": "integer"
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "strs",
+     "description": "fixture tool strs",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "text": {
+        "type": "string"
+       },
+       "lines": {
+        "type": "string"
+       },
+       "tags": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "typed",
+     "description": "fixture tool typed",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "s": {
+        "type": "string"
+       },
+       "i": {
+        "type": "integer"
+       },
+       "f": {
+        "type": "number"
+       },
+       "f2": {
+        "type": "number"
+       },
+       "f3": {
+        "type": "number"
+       },
+       "f4": {
+        "type": "number"
+       },
+       "big": {
+        "type": "integer"
+       },
+       "b": {
+        "type": "boolean"
+       },
+       "list": {
+        "type": "array",
+        "items": {
+         "type": "integer"
+        }
+       },
+       "obj": {
+        "type": "object",
+        "properties": {
+         "lang": {
+          "type": "string"
+         },
+         "flag": {
+          "type": "boolean"
+         },
+         "deep": {
+          "type": "object",
+          "properties": {
+           "x": {
+            "type": "integer"
+           },
+           "y": {
+            "type": "array",
+            "items": {
+             "type": [
+              "number",
+              "string"
+             ]
+            }
+           }
+          }
+         }
+        }
+       },
+       "objs": {
+        "type": "array",
+        "items": {
+         "$ref": "#/$defs/entry"
+        }
+       },
+       "ref": {
+        "$ref": "#/$defs/entry"
+       },
+       "empty_list": {
+        "type": "array"
+       },
+       "empty_map": {
+        "type": "object"
+       },
+       "any": {
+        "anyOf": [
+         {
+          "type": "integer"
+         },
+         {
+          "type": "string"
+         }
+        ]
+       }
+      },
+      "$defs": {
+       "entry": {
+        "type": "object",
+        "properties": {
+         "a": {
+          "type": "integer"
+         },
+         "b": {
+          "type": "array",
+          "items": {
+           "type": "boolean"
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "free",
+     "description": "fixture tool free"
+    }
+   }
+  ],
+  "reply": "]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"free\">]<]minimax[>[<ключ>значение]<]minimax[>[</ключ>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
+  "calls": [
+   {
+    "name": "free",
+    "arguments": {
+     "ключ": "значение"
+    }
+   }
+  ],
+  "lossy": null,
+  "skip": null
+ },
+ {
+  "name": "parallel",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "fixture tool get_weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       },
+       "days": {
+        "type": "integer"
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "strs",
+     "description": "fixture tool strs",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "text": {
+        "type": "string"
+       },
+       "lines": {
+        "type": "string"
+       },
+       "tags": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "typed",
+     "description": "fixture tool typed",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "s": {
+        "type": "string"
+       },
+       "i": {
+        "type": "integer"
+       },
+       "f": {
+        "type": "number"
+       },
+       "f2": {
+        "type": "number"
+       },
+       "f3": {
+        "type": "number"
+       },
+       "f4": {
+        "type": "number"
+       },
+       "big": {
+        "type": "integer"
+       },
+       "b": {
+        "type": "boolean"
+       },
+       "list": {
+        "type": "array",
+        "items": {
+         "type": "integer"
+        }
+       },
+       "obj": {
+        "type": "object",
+        "properties": {
+         "lang": {
+          "type": "string"
+         },
+         "flag": {
+          "type": "boolean"
+         },
+         "deep": {
+          "type": "object",
+          "properties": {
+           "x": {
+            "type": "integer"
+           },
+           "y": {
+            "type": "array",
+            "items": {
+             "type": [
+              "number",
+              "string"
+             ]
+            }
+           }
+          }
+         }
+        }
+       },
+       "objs": {
+        "type": "array",
+        "items": {
+         "$ref": "#/$defs/entry"
+        }
+       },
+       "ref": {
+        "$ref": "#/$defs/entry"
+       },
+       "empty_list": {
+        "type": "array"
+       },
+       "empty_map": {
+        "type": "object"
+       },
+       "any": {
+        "anyOf": [
+         {
+          "type": "integer"
+         },
+         {
+          "type": "string"
+         }
+        ]
+       }
+      },
+      "$defs": {
+       "entry": {
+        "type": "object",
+        "properties": {
+         "a": {
+          "type": "integer"
+         },
+         "b": {
+          "type": "array",
+          "items": {
+           "type": "boolean"
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "free",
+     "description": "fixture tool free"
+    }
+   }
+  ],
+  "reply": "Doing all three. ]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"get_weather\">]<]minimax[>[<city>A]<]minimax[>[</city>]<]minimax[>[</invoke>\n]<]minimax[>[<invoke name=\"typed\">]<]minimax[>[<i>1]<]minimax[>[</i>]<]minimax[>[</invoke>\n]<]minimax[>[<invoke name=\"free\">]<]minimax[>[</invoke>\n]<]minimax[>[<invoke name=\"get_weather\">]<]minimax[>[<city>B]<]minimax[>[</city>]<]minimax[>[<unit>f]<]minimax[>[</unit>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
+  "calls": [
+   {
+    "name": "get_weather",
+    "arguments": {
+     "city": "A"
+    }
+   },
+   {
+    "name": "typed",
+    "arguments": {
+     "i": 1
+    }
+   },
+   {
+    "name": "free",
+    "arguments": {}
+   },
+   {
+    "name": "get_weather",
+    "arguments": {
+     "city": "B",
+     "unit": "f"
+    }
+   }
+  ],
+  "lossy": null,
+  "skip": null
+ },
+ {
+  "name": "no_args",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "fixture tool get_weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       },
+       "days": {
+        "type": "integer"
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "strs",
+     "description": "fixture tool strs",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "text": {
+        "type": "string"
+       },
+       "lines": {
+        "type": "string"
+       },
+       "tags": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "typed",
+     "description": "fixture tool typed",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "s": {
+        "type": "string"
+       },
+       "i": {
+        "type": "integer"
+       },
+       "f": {
+        "type": "number"
+       },
+       "f2": {
+        "type": "number"
+       },
+       "f3": {
+        "type": "number"
+       },
+       "f4": {
+        "type": "number"
+       },
+       "big": {
+        "type": "integer"
+       },
+       "b": {
+        "type": "boolean"
+       },
+       "list": {
+        "type": "array",
+        "items": {
+         "type": "integer"
+        }
+       },
+       "obj": {
+        "type": "object",
+        "properties": {
+         "lang": {
+          "type": "string"
+         },
+         "flag": {
+          "type": "boolean"
+         },
+         "deep": {
+          "type": "object",
+          "properties": {
+           "x": {
+            "type": "integer"
+           },
+           "y": {
+            "type": "array",
+            "items": {
+             "type": [
+              "number",
+              "string"
+             ]
+            }
+           }
+          }
+         }
+        }
+       },
+       "objs": {
+        "type": "array",
+        "items": {
+         "$ref": "#/$defs/entry"
+        }
+       },
+       "ref": {
+        "$ref": "#/$defs/entry"
+       },
+       "empty_list": {
+        "type": "array"
+       },
+       "empty_map": {
+        "type": "object"
+       },
+       "any": {
+        "anyOf": [
+         {
+          "type": "integer"
+         },
+         {
+          "type": "string"
+         }
+        ]
+       }
+      },
+      "$defs": {
+       "entry": {
+        "type": "object",
+        "properties": {
+         "a": {
+          "type": "integer"
+         },
+         "b": {
+          "type": "array",
+          "items": {
+           "type": "boolean"
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "free",
+     "description": "fixture tool free"
+    }
+   }
+  ],
+  "reply": "]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"free\">]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
+  "calls": [
+   {
+    "name": "free",
+    "arguments": {}
+   }
+  ],
+  "lossy": null,
+  "skip": null
+ },
+ {
+  "name": "no_schema",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "fixture tool get_weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       },
+       "days": {
+        "type": "integer"
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "strs",
+     "description": "fixture tool strs",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "text": {
+        "type": "string"
+       },
+       "lines": {
+        "type": "string"
+       },
+       "tags": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "typed",
+     "description": "fixture tool typed",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "s": {
+        "type": "string"
+       },
+       "i": {
+        "type": "integer"
+       },
+       "f": {
+        "type": "number"
+       },
+       "f2": {
+        "type": "number"
+       },
+       "f3": {
+        "type": "number"
+       },
+       "f4": {
+        "type": "number"
+       },
+       "big": {
+        "type": "integer"
+       },
+       "b": {
+        "type": "boolean"
+       },
+       "list": {
+        "type": "array",
+        "items": {
+         "type": "integer"
+        }
+       },
+       "obj": {
+        "type": "object",
+        "properties": {
+         "lang": {
+          "type": "string"
+         },
+         "flag": {
+          "type": "boolean"
+         },
+         "deep": {
+          "type": "object",
+          "properties": {
+           "x": {
+            "type": "integer"
+           },
+           "y": {
+            "type": "array",
+            "items": {
+             "type": [
+              "number",
+              "string"
+             ]
+            }
+           }
+          }
+         }
+        }
+       },
+       "objs": {
+        "type": "array",
+        "items": {
+         "$ref": "#/$defs/entry"
+        }
+       },
+       "ref": {
+        "$ref": "#/$defs/entry"
+       },
+       "empty_list": {
+        "type": "array"
+       },
+       "empty_map": {
+        "type": "object"
+       },
+       "any": {
+        "anyOf": [
+         {
+          "type": "integer"
+         },
+         {
+          "type": "string"
+         }
+        ]
+       }
+      },
+      "$defs": {
+       "entry": {
+        "type": "object",
+        "properties": {
+         "a": {
+          "type": "integer"
+         },
+         "b": {
+          "type": "array",
+          "items": {
+           "type": "boolean"
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "free",
+     "description": "fixture tool free"
+    }
+   }
+  ],
+  "reply": "]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"free\">]<]minimax[>[<n>5]<]minimax[>[</n>]<]minimax[>[<ok>true]<]minimax[>[</ok>]<]minimax[>[<l>]<]minimax[>[<item>1]<]minimax[>[</item>]<]minimax[>[<item>2]<]minimax[>[</item>]<]minimax[>[</l>]<]minimax[>[<m>]<]minimax[>[<k>v]<]minimax[>[</k>]<]minimax[>[</m>]<]minimax[>[<s>x]<]minimax[>[</s>]<]minimax[>[<e>]<]minimax[>[</e>]<]minimax[>[<em>]<]minimax[>[</em>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
+  "calls": [
+   {
+    "name": "free",
+    "arguments": {
+     "n": "5",
+     "ok": "true",
+     "l": [
+      "1",
+      "2"
+     ],
+     "m": {
+      "k": "v"
+     },
+     "s": "x",
+     "e": "",
+     "em": ""
+    }
+   }
+  ],
+  "lossy": "no schema: a scalar is its text, an empty list or map renders as nothing",
+  "skip": null
+ },
+ {
+  "name": "no_schema_item_keys",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "fixture tool get_weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       },
+       "days": {
+        "type": "integer"
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "strs",
+     "description": "fixture tool strs",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "text": {
+        "type": "string"
+       },
+       "lines": {
+        "type": "string"
+       },
+       "tags": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "typed",
+     "description": "fixture tool typed",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "s": {
+        "type": "string"
+       },
+       "i": {
+        "type": "integer"
+       },
+       "f": {
+        "type": "number"
+       },
+       "f2": {
+        "type": "number"
+       },
+       "f3": {
+        "type": "number"
+       },
+       "f4": {
+        "type": "number"
+       },
+       "big": {
+        "type": "integer"
+       },
+       "b": {
+        "type": "boolean"
+       },
+       "list": {
+        "type": "array",
+        "items": {
+         "type": "integer"
+        }
+       },
+       "obj": {
+        "type": "object",
+        "properties": {
+         "lang": {
+          "type": "string"
+         },
+         "flag": {
+          "type": "boolean"
+         },
+         "deep": {
+          "type": "object",
+          "properties": {
+           "x": {
+            "type": "integer"
+           },
+           "y": {
+            "type": "array",
+            "items": {
+             "type": [
+              "number",
+              "string"
+             ]
+            }
+           }
+          }
+         }
+        }
+       },
+       "objs": {
+        "type": "array",
+        "items": {
+         "$ref": "#/$defs/entry"
+        }
+       },
+       "ref": {
+        "$ref": "#/$defs/entry"
+       },
+       "empty_list": {
+        "type": "array"
+       },
+       "empty_map": {
+        "type": "object"
+       },
+       "any": {
+        "anyOf": [
+         {
+          "type": "integer"
+         },
+         {
+          "type": "string"
+         }
+        ]
+       }
+      },
+      "$defs": {
+       "entry": {
+        "type": "object",
+        "properties": {
+         "a": {
+          "type": "integer"
+         },
+         "b": {
+          "type": "array",
+          "items": {
+           "type": "boolean"
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "free",
+     "description": "fixture tool free"
+    }
+   }
+  ],
+  "reply": "]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"free\">]<]minimax[>[<m>]<]minimax[>[<item>x]<]minimax[>[</item>]<]minimax[>[</m>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
+  "calls": [
+   {
+    "name": "free",
+    "arguments": {
+     "m": [
+      "x"
+     ]
+    }
+   }
+  ],
+  "lossy": "no schema: a mapping whose keys are all `item` reads as a list",
+  "skip": null
+ },
+ {
+  "name": "string_for_any_of",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "fixture tool get_weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       },
+       "days": {
+        "type": "integer"
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "strs",
+     "description": "fixture tool strs",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "text": {
+        "type": "string"
+       },
+       "lines": {
+        "type": "string"
+       },
+       "tags": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "typed",
+     "description": "fixture tool typed",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "s": {
+        "type": "string"
+       },
+       "i": {
+        "type": "integer"
+       },
+       "f": {
+        "type": "number"
+       },
+       "f2": {
+        "type": "number"
+       },
+       "f3": {
+        "type": "number"
+       },
+       "f4": {
+        "type": "number"
+       },
+       "big": {
+        "type": "integer"
+       },
+       "b": {
+        "type": "boolean"
+       },
+       "list": {
+        "type": "array",
+        "items": {
+         "type": "integer"
+        }
+       },
+       "obj": {
+        "type": "object",
+        "properties": {
+         "lang": {
+          "type": "string"
+         },
+         "flag": {
+          "type": "boolean"
+         },
+         "deep": {
+          "type": "object",
+          "properties": {
+           "x": {
+            "type": "integer"
+           },
+           "y": {
+            "type": "array",
+            "items": {
+             "type": [
+              "number",
+              "string"
+             ]
+            }
+           }
+          }
+         }
+        }
+       },
+       "objs": {
+        "type": "array",
+        "items": {
+         "$ref": "#/$defs/entry"
+        }
+       },
+       "ref": {
+        "$ref": "#/$defs/entry"
+       },
+       "empty_list": {
+        "type": "array"
+       },
+       "empty_map": {
+        "type": "object"
+       },
+       "any": {
+        "anyOf": [
+         {
+          "type": "integer"
+         },
+         {
+          "type": "string"
+         }
+        ]
+       }
+      },
+      "$defs": {
+       "entry": {
+        "type": "object",
+        "properties": {
+         "a": {
+          "type": "integer"
+         },
+         "b": {
+          "type": "array",
+          "items": {
+           "type": "boolean"
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "free",
+     "description": "fixture tool free"
+    }
+   }
+  ],
+  "reply": "]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"typed\">]<]minimax[>[<any>5]<]minimax[>[</any>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
+  "calls": [
+   {
+    "name": "typed",
+    "arguments": {
+     "any": 5
+    }
+   }
+  ],
+  "lossy": "anyOf integer|string: the text 5 reads as the integer",
+  "skip": null
+ },
+ {
+  "name": "float_for_integer",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "fixture tool get_weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       },
+       "days": {
+        "type": "integer"
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "strs",
+     "description": "fixture tool strs",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "text": {
+        "type": "string"
+       },
+       "lines": {
+        "type": "string"
+       },
+       "tags": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "typed",
+     "description": "fixture tool typed",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "s": {
+        "type": "string"
+       },
+       "i": {
+        "type": "integer"
+       },
+       "f": {
+        "type": "number"
+       },
+       "f2": {
+        "type": "number"
+       },
+       "f3": {
+        "type": "number"
+       },
+       "f4": {
+        "type": "number"
+       },
+       "big": {
+        "type": "integer"
+       },
+       "b": {
+        "type": "boolean"
+       },
+       "list": {
+        "type": "array",
+        "items": {
+         "type": "integer"
+        }
+       },
+       "obj": {
+        "type": "object",
+        "properties": {
+         "lang": {
+          "type": "string"
+         },
+         "flag": {
+          "type": "boolean"
+         },
+         "deep": {
+          "type": "object",
+          "properties": {
+           "x": {
+            "type": "integer"
+           },
+           "y": {
+            "type": "array",
+            "items": {
+             "type": [
+              "number",
+              "string"
+             ]
+            }
+           }
+          }
+         }
+        }
+       },
+       "objs": {
+        "type": "array",
+        "items": {
+         "$ref": "#/$defs/entry"
+        }
+       },
+       "ref": {
+        "$ref": "#/$defs/entry"
+       },
+       "empty_list": {
+        "type": "array"
+       },
+       "empty_map": {
+        "type": "object"
+       },
+       "any": {
+        "anyOf": [
+         {
+          "type": "integer"
+         },
+         {
+          "type": "string"
+         }
+        ]
+       }
+      },
+      "$defs": {
+       "entry": {
+        "type": "object",
+        "properties": {
+         "a": {
+          "type": "integer"
+         },
+         "b": {
+          "type": "array",
+          "items": {
+           "type": "boolean"
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "free",
+     "description": "fixture tool free"
+    }
+   }
+  ],
+  "reply": "]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"typed\">]<]minimax[>[<i>2.5]<]minimax[>[</i>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
+  "calls": [
+   {
+    "name": "typed",
+    "arguments": {
+     "i": "2.5"
+    }
+   }
+  ],
+  "lossy": "a float under an integer schema stays its text",
+  "skip": null
+ },
+ {
+  "name": "none_in_list",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "fixture tool get_weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       },
+       "days": {
+        "type": "integer"
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "strs",
+     "description": "fixture tool strs",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "text": {
+        "type": "string"
+       },
+       "lines": {
+        "type": "string"
+       },
+       "tags": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "typed",
+     "description": "fixture tool typed",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "s": {
+        "type": "string"
+       },
+       "i": {
+        "type": "integer"
+       },
+       "f": {
+        "type": "number"
+       },
+       "f2": {
+        "type": "number"
+       },
+       "f3": {
+        "type": "number"
+       },
+       "f4": {
+        "type": "number"
+       },
+       "big": {
+        "type": "integer"
+       },
+       "b": {
+        "type": "boolean"
+       },
+       "list": {
+        "type": "array",
+        "items": {
+         "type": "integer"
+        }
+       },
+       "obj": {
+        "type": "object",
+        "properties": {
+         "lang": {
+          "type": "string"
+         },
+         "flag": {
+          "type": "boolean"
+         },
+         "deep": {
+          "type": "object",
+          "properties": {
+           "x": {
+            "type": "integer"
+           },
+           "y": {
+            "type": "array",
+            "items": {
+             "type": [
+              "number",
+              "string"
+             ]
+            }
+           }
+          }
+         }
+        }
+       },
+       "objs": {
+        "type": "array",
+        "items": {
+         "$ref": "#/$defs/entry"
+        }
+       },
+       "ref": {
+        "$ref": "#/$defs/entry"
+       },
+       "empty_list": {
+        "type": "array"
+       },
+       "empty_map": {
+        "type": "object"
+       },
+       "any": {
+        "anyOf": [
+         {
+          "type": "integer"
+         },
+         {
+          "type": "string"
+         }
+        ]
+       }
+      },
+      "$defs": {
+       "entry": {
+        "type": "object",
+        "properties": {
+         "a": {
+          "type": "integer"
+         },
+         "b": {
+          "type": "array",
+          "items": {
+           "type": "boolean"
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "free",
+     "description": "fixture tool free"
+    }
+   }
+  ],
+  "reply": "]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"typed\">]<]minimax[>[<list>]<]minimax[>[<item>1]<]minimax[>[</item>]<]minimax[>[<item>]<]minimax[>[</item>]<]minimax[>[<item>3]<]minimax[>[</item>]<]minimax[>[</list>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
+  "calls": [
+   {
+    "name": "typed",
+    "arguments": {
+     "list": [
+      1,
+      "",
+      3
+     ]
+    }
+   }
+  ],
+  "lossy": "None inside a list renders an empty item, read back as the empty text",
+  "skip": null
+ },
+ {
+  "name": "text_for_integer",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "fixture tool get_weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       },
+       "days": {
+        "type": "integer"
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "strs",
+     "description": "fixture tool strs",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "text": {
+        "type": "string"
+       },
+       "lines": {
+        "type": "string"
+       },
+       "tags": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "typed",
+     "description": "fixture tool typed",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "s": {
+        "type": "string"
+       },
+       "i": {
+        "type": "integer"
+       },
+       "f": {
+        "type": "number"
+       },
+       "f2": {
+        "type": "number"
+       },
+       "f3": {
+        "type": "number"
+       },
+       "f4": {
+        "type": "number"
+       },
+       "big": {
+        "type": "integer"
+       },
+       "b": {
+        "type": "boolean"
+       },
+       "list": {
+        "type": "array",
+        "items": {
+         "type": "integer"
+        }
+       },
+       "obj": {
+        "type": "object",
+        "properties": {
+         "lang": {
+          "type": "string"
+         },
+         "flag": {
+          "type": "boolean"
+         },
+         "deep": {
+          "type": "object",
+          "properties": {
+           "x": {
+            "type": "integer"
+           },
+           "y": {
+            "type": "array",
+            "items": {
+             "type": [
+              "number",
+              "string"
+             ]
+            }
+           }
+          }
+         }
+        }
+       },
+       "objs": {
+        "type": "array",
+        "items": {
+         "$ref": "#/$defs/entry"
+        }
+       },
+       "ref": {
+        "$ref": "#/$defs/entry"
+       },
+       "empty_list": {
+        "type": "array"
+       },
+       "empty_map": {
+        "type": "object"
+       },
+       "any": {
+        "anyOf": [
+         {
+          "type": "integer"
+         },
+         {
+          "type": "string"
+         }
+        ]
+       }
+      },
+      "$defs": {
+       "entry": {
+        "type": "object",
+        "properties": {
+         "a": {
+          "type": "integer"
+         },
+         "b": {
+          "type": "array",
+          "items": {
+           "type": "boolean"
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "free",
+     "description": "fixture tool free"
+    }
+   }
+  ],
+  "reply": "]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"typed\">]<]minimax[>[<i>five]<]minimax[>[</i>]<]minimax[>[<b>yes]<]minimax[>[</b>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
+  "calls": [
+   {
+    "name": "typed",
+    "arguments": {
+     "i": "five",
+     "b": "yes"
+    }
+   }
+  ],
+  "lossy": null,
+  "skip": null
+ },
+ {
+  "name": "ns_in_string",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "fixture tool get_weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       },
+       "days": {
+        "type": "integer"
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "strs",
+     "description": "fixture tool strs",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "text": {
+        "type": "string"
+       },
+       "lines": {
+        "type": "string"
+       },
+       "tags": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "typed",
+     "description": "fixture tool typed",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "s": {
+        "type": "string"
+       },
+       "i": {
+        "type": "integer"
+       },
+       "f": {
+        "type": "number"
+       },
+       "f2": {
+        "type": "number"
+       },
+       "f3": {
+        "type": "number"
+       },
+       "f4": {
+        "type": "number"
+       },
+       "big": {
+        "type": "integer"
+       },
+       "b": {
+        "type": "boolean"
+       },
+       "list": {
+        "type": "array",
+        "items": {
+         "type": "integer"
+        }
+       },
+       "obj": {
+        "type": "object",
+        "properties": {
+         "lang": {
+          "type": "string"
+         },
+         "flag": {
+          "type": "boolean"
+         },
+         "deep": {
+          "type": "object",
+          "properties": {
+           "x": {
+            "type": "integer"
+           },
+           "y": {
+            "type": "array",
+            "items": {
+             "type": [
+              "number",
+              "string"
+             ]
+            }
+           }
+          }
+         }
+        }
+       },
+       "objs": {
+        "type": "array",
+        "items": {
+         "$ref": "#/$defs/entry"
+        }
+       },
+       "ref": {
+        "$ref": "#/$defs/entry"
+       },
+       "empty_list": {
+        "type": "array"
+       },
+       "empty_map": {
+        "type": "object"
+       },
+       "any": {
+        "anyOf": [
+         {
+          "type": "integer"
+         },
+         {
+          "type": "string"
+         }
+        ]
+       }
+      },
+      "$defs": {
+       "entry": {
+        "type": "object",
+        "properties": {
+         "a": {
+          "type": "integer"
+         },
+         "b": {
+          "type": "array",
+          "items": {
+           "type": "boolean"
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "free",
+     "description": "fixture tool free"
+    }
+   }
+  ],
+  "reply": "]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"strs\">]<]minimax[>[<text>a ]<]minimax[>[ b]<]minimax[>[</text>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
+  "calls": [
+   {
+    "name": "strs",
+    "arguments": {
+     "text": "a ]<]minimax[>[ b"
+    }
+   }
+  ],
+  "lossy": null,
+  "skip": "a string holding the NS token renders markup the reader takes apart"
+ },
+ {
+  "name": "key_not_a_name",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "fixture tool get_weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       },
+       "days": {
+        "type": "integer"
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "strs",
+     "description": "fixture tool strs",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "text": {
+        "type": "string"
+       },
+       "lines": {
+        "type": "string"
+       },
+       "tags": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "typed",
+     "description": "fixture tool typed",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "s": {
+        "type": "string"
+       },
+       "i": {
+        "type": "integer"
+       },
+       "f": {
+        "type": "number"
+       },
+       "f2": {
+        "type": "number"
+       },
+       "f3": {
+        "type": "number"
+       },
+       "f4": {
+        "type": "number"
+       },
+       "big": {
+        "type": "integer"
+       },
+       "b": {
+        "type": "boolean"
+       },
+       "list": {
+        "type": "array",
+        "items": {
+         "type": "integer"
+        }
+       },
+       "obj": {
+        "type": "object",
+        "properties": {
+         "lang": {
+          "type": "string"
+         },
+         "flag": {
+          "type": "boolean"
+         },
+         "deep": {
+          "type": "object",
+          "properties": {
+           "x": {
+            "type": "integer"
+           },
+           "y": {
+            "type": "array",
+            "items": {
+             "type": [
+              "number",
+              "string"
+             ]
+            }
+           }
+          }
+         }
+        }
+       },
+       "objs": {
+        "type": "array",
+        "items": {
+         "$ref": "#/$defs/entry"
+        }
+       },
+       "ref": {
+        "$ref": "#/$defs/entry"
+       },
+       "empty_list": {
+        "type": "array"
+       },
+       "empty_map": {
+        "type": "object"
+       },
+       "any": {
+        "anyOf": [
+         {
+          "type": "integer"
+         },
+         {
+          "type": "string"
+         }
+        ]
+       }
+      },
+      "$defs": {
+       "entry": {
+        "type": "object",
+        "properties": {
+         "a": {
+          "type": "integer"
+         },
+         "b": {
+          "type": "array",
+          "items": {
+           "type": "boolean"
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "free",
+     "description": "fixture tool free"
+    }
+   }
+  ],
+  "reply": "]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"free\">]<]minimax[>[<a b>1]<]minimax[>[</a b>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
+  "calls": [
+   {
+    "name": "free",
+    "arguments": {
+     "a b": 1
+    }
+   }
+  ],
+  "lossy": null,
+  "skip": "a key that is no XML name renders a tag the reader cannot take back"
+ }
+]

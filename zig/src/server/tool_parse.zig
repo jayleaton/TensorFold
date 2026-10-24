@@ -129,6 +129,7 @@ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?u
             continue;
         }
         if (max_calls) |m| if (calls.items.len >= m) continue;
+        if (try tool_minimax.take(a, text[env.start..env.end], &schemas, &known, max_calls, &calls, &residue)) continue;
         const parsed: ?[]Call = blk: {
             if (std.mem.startsWith(u8, env.payload, dsml_open)) {
                 const inner = env.payload[dsml_open.len .. env.payload.len - dsml_close.len];
@@ -137,7 +138,6 @@ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?u
                     error.Invalid => null,
                 };
             }
-            if (std.mem.startsWith(u8, env.payload, tool_minimax.ns ++ "<invoke ")) break :blk try tool_minimax.tryCalls(a, env.payload, &schemas);
             const one = payload(a, env.payload, &schemas, max_calls != null) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Invalid => break :blk null,
@@ -207,7 +207,7 @@ fn callName(a: Allocator, c: Call, known: *const std.StringArrayHashMapUnmanaged
 }
 
 /// ``_openai_tool_call``: the call under ``name`` (``callName``), arguments as compact JSON.
-fn openaiCall(a: Allocator, name: []const u8, arguments: Value) Allocator.Error!Value {
+pub fn openaiCall(a: Allocator, name: []const u8, arguments: Value) Allocator.Error!Value {
     const function = try json.newObject(a);
     try function.put(a, "name", .{ .string = name });
     try function.put(a, "arguments", .{ .string = try json.stringify(a, arguments, .{ .ascii = false, .compact = true }) });

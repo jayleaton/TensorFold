@@ -7,6 +7,7 @@ const tool_params = @import("tool_params.zig");
 const tool_specs = @import("tool_specs.zig");
 const tool_parse = @import("tool_parse.zig");
 const tool_minimax = @import("tool_minimax.zig");
+const tool_stream_minimax = @import("tool_stream_minimax.zig");
 const Value = json.Value;
 const Allocator = std.mem.Allocator;
 
@@ -44,7 +45,8 @@ pub const Streamer = struct {
     typed: bool = false,
     buffer: std.ArrayList(u8) = .empty,
     pos: usize = 0,
-    state: enum { outside, call, buffered, function, value, closing, abort } = .outside,
+    state: enum { outside, call, buffered, function, value, closing, minimax, abort } = .outside,
+    minimax: tool_stream_minimax.Block = .init(0),
     index: i64 = -1,
     args_open: bool = false,
     lead: bool = false,
@@ -130,11 +132,9 @@ pub const Streamer = struct {
                     while (std.mem.indexOfScalarPos(u8, text, at, '<')) |start| {
                         // MiniMax's `]<]minimax[>[<tool_call>`: its first '<' is the second byte of the opener
                         if (start > s.pos and std.mem.startsWith(u8, text[start - 1 ..], tool_minimax.open)) {
-                            s.buffered_start = start - 1;
-                            s.buffered_close = tool_minimax.close;
                             s.pos = start - 1 + tool_minimax.open.len;
-                            s.dsml_searched = s.pos;
-                            s.state = .buffered;
+                            s.minimax = .init(s.pos);
+                            s.state = .minimax;
                             break;
                         }
                         if (std.mem.startsWith(u8, text[start..], dsml_open)) {
@@ -296,6 +296,15 @@ pub const Streamer = struct {
                     } else try out.append(s.a, try s.args("\""));
                     s.pos += tail.len;
                     s.state = .function;
+                },
+                .minimax => {
+                    const before = s.index;
+                    const ctx: tool_stream_minimax.Ctx = .{ .a = s.a, .schemas = &s.schemas, .known = &s.known, .index = &s.index };
+                    const end = try s.minimax.feed(ctx, text, out);
+                    if (s.index != before) s.streamed = true;
+                    s.pos = end orelse return;
+                    s.searched = s.pos;
+                    s.state = .outside;
                 },
                 .closing => {
                     const n = closing(rest, "</tool_call>") orelse return;
