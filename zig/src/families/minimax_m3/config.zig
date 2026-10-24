@@ -14,7 +14,7 @@ pub const Error = error{
     NotExl3, // quant_method is not exl3
     UnsupportedCodebook, // codebook is not mul1
     UnsupportedVersion, // EXL3 version older than 1.6.1, newer than 1.x, or unreadable
-    UnsupportedOutScales, // out_scales is not "always": svh would not carry the output scales
+    UnsupportedOutScales, // out_scales is neither "always" nor "auto": svh might not carry the output scales
     Unsupported, // a text_config feature this family does not implement
     BadShape, // widths the kernels cannot cut: not 128-aligned, heads not whole groups
     VisionUnsupported, // an image or video request: the pack ships no vision tower
@@ -168,11 +168,13 @@ fn semver(text_: []const u8) ?[3]u32 {
     return if (it.next() == null) out else null;
 }
 
-/// quantization_config: exl3, codebook mul1, out_scales, version 1.6.1 or later 1.x; mean bits `bits` or `avg_bits`.
+/// quantization_config: exl3, mul1, out_scales always or auto, version 1.6.1 or a later 1.x; mean `bits` or `avg_bits`.
 fn quant(q: Obj) Error!Quant {
     if (!std.mem.eql(u8, try text(q, "quant_method"), "exl3")) return error.NotExl3;
     if (!std.mem.eql(u8, try text(q, "codebook"), "mul1")) return error.UnsupportedCodebook;
-    if (!std.mem.eql(u8, try text(q, "out_scales"), "always")) return error.UnsupportedOutScales;
+    // the label is redundant beside the loader's own rule: every matrix must store fp16 suh and svh (load.zig admit)
+    const scales = try text(q, "out_scales");
+    if (!std.mem.eql(u8, scales, "always") and !std.mem.eql(u8, scales, "auto")) return error.UnsupportedOutScales;
     const v = semver(try text(q, "version")) orelse return error.UnsupportedVersion;
     if (v[0] != min_version[0] or std.mem.order(u32, &v, &min_version) == .lt) return error.UnsupportedVersion;
     return .{ .version = v, .bits = @floatCast(float(q, "bits") catch try float(q, "avg_bits")), .head_bits = try int(q, "head_bits") };
@@ -306,7 +308,8 @@ test "only exl3 mul1 with output scales and version 1.6.1 or newer is admitted" 
     try refuses(error.NotExl3, "\"quant_method\": \"exl3\"", "\"quant_method\": \"gptq\"");
     try refuses(error.UnsupportedCodebook, "\"codebook\": \"mul1\"", "\"codebook\": \"mcg\"");
     try refuses(error.UnsupportedCodebook, "\"codebook\": \"mul1\"", "\"codebook\": \"3inst\"");
-    try refuses(error.UnsupportedOutScales, "\"out_scales\": \"always\"", "\"out_scales\": \"auto\"");
+    try refuses(error.UnsupportedOutScales, "\"out_scales\": \"always\"", "\"out_scales\": \"never\"");
+    try refuses(error.UnsupportedOutScales, "\"out_scales\": \"always\"", "\"out_scales\": \"sometimes\"");
     try refuses(error.UnsupportedVersion, "\"version\": \"1.6.1\"", "\"version\": \"1.6.0\"");
     try refuses(error.UnsupportedVersion, "\"version\": \"1.6.1\"", "\"version\": \"2.0.0\"");
     try refuses(error.UnsupportedVersion, "\"version\": \"1.6.1\"", "\"version\": \"latest\"");
@@ -314,6 +317,13 @@ test "only exl3 mul1 with output scales and version 1.6.1 or newer is admitted" 
     const newer = try patched(gpa, "\"version\": \"1.6.1\"", "\"version\": \"1.7.0\"");
     defer gpa.free(newer);
     try std.testing.expectEqual([3]u32{ 1, 7, 0 }, (try parse(gpa, newer)).quant.version);
+}
+
+test "out_scales auto is admitted: the loader still requires every matrix' fp16 suh and svh" {
+    const gpa = std.testing.allocator;
+    const json = try patched(gpa, "\"out_scales\": \"always\"", "\"out_scales\": \"auto\"");
+    defer gpa.free(json);
+    try std.testing.expectEqualDeep(flash.quant, (try parse(gpa, json)).quant);
 }
 
 test "the 3.06 bpw pack spells its mean bits avg_bits and its head 8 bits" {
