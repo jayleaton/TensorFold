@@ -1,6 +1,5 @@
-"""Regenerates template_goldens.json: the checkpoint's chat_template.jinja rendered by Python Jinja2 the way
-transformers renders it (ImmutableSandboxedEnvironment, trim_blocks, lstrip_blocks, loopcontrols, its tojson).
-Usage: python3 -I gen_template_goldens.py chat_template.jinja template_goldens.json   (jinja2 3.1.x)"""
+"""Regenerates template_goldens.json: chat_template.jinja rendered by Jinja2 (3.1.x) as transformers renders it."""
+# Usage: python3 -I gen_template_goldens.py chat_template.jinja template_goldens.json
 import json, sys
 import jinja2
 import jinja2.ext

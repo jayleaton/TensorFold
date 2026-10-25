@@ -1,6 +1,4 @@
-//! MiniMax-M3.1-Flash's stream state and prompt cache on the page pool. Every layer is attention: a stream is its
-//! position and its pages, so a kept prompt snapshot is page references in the radix store plus a record of the
-//! position. Restoring one copies nothing; the resumed stream adopts the store's pages.
+//! MiniMax-M3.1-Flash stream state and prompt cache on the page pool; a snapshot is page references, never a copy.
 const std = @import("std");
 const api = @import("engine_api");
 const kv = @import("core").kv_pool;
@@ -9,8 +7,7 @@ const radix = api.prompt_radix;
 
 pub const Error = error{ ContextTooLong, LaneMemory };
 
-/// Prompt-cache rules: one page is one block, so marks and resumes sit on 128 rows; a row's bits do not depend on
-/// its chunk (kernels are row-invariant), so the store is not `planned`.
+/// Prompt-cache rules: marks and resumes on 128-row pages; kernels are row-invariant, so the store is not `planned`.
 pub const rules: radix.Rules = .{ .page = pool.page_tokens, .min_gap = 1024, .min_prompt = 2048, .tail = true };
 
 /// A live stream: the lease (its page ids in token order, the block table's entries), its slot and rows filled.
@@ -126,11 +123,7 @@ pub const Cache = struct {
         return c.layout.need(prompt, max_tokens, window);
     }
 
-    /// Admits `s` as the backend does: resume the longest kept prefix (the stream's pages start as the store's), promise
-    /// the rest of its pages and take them into the block table. Returns the marks (rows, page multiples, ascending, in
-    /// `a`) where the pass should call `keep` as its prefill reaches them.
-    /// `LaneMemory`: the pool cannot promise the pages even after the store gave its idle pages back (the host requeues).
-    /// `ContextTooLong`: the request's pages pass the stream's block-table row or the whole pool (it can never run).
+    /// Admits `s`: resumes the longest kept prefix and takes the rest's pages; returns the marks where to call `keep`.
     pub fn admit(c: *Cache, a: std.mem.Allocator, s: *Stream, prompt: []const u32, history: u32, max_new: u64, window: u64, table: ?kv.Table, max_pages: usize) ![]const u32 {
         const want = c.need(prompt.len, max_new, window);
         if (want > max_pages or want > c.pages.total()) return error.ContextTooLong;
@@ -147,8 +140,7 @@ pub const Cache = struct {
         return plan.marks;
     }
 
-    /// The pass has filled `at` rows (a mark): the store keeps a snapshot there, and the stream's leading pages become
-    /// the store's copies of the same tokens where it already held them. The block table is rewritten to match.
+    /// The pass filled `at` rows (a mark): the store keeps a snapshot and the stream adopts the store's matching pages.
     pub fn keep(c: *Cache, s: *Stream, prompt: []const u32, at: u32, table: ?kv.Table) !void {
         const n = at / pool.page_tokens;
         if (n == 0 or n > s.lease.ids.items.len) return;
@@ -159,8 +151,7 @@ pub const Cache = struct {
         if (kept.shared > 0) if (table) |t| try t.write(t.ctx, s.lease.ids.items[0..kept.shared], 0);
     }
 
-    /// The stream ended (finished, cancelled, failed): its pages and promise go back; pages the store kept stay.
-    /// Its block-table row, if given, goes back to -1.
+    /// The stream ended: its pages and promise go back (kept pages stay) and its block-table row, if given, goes to -1.
     pub fn end(c: *Cache, s: *Stream, tables: ?*pool.Tables) void {
         c.pages.finish(&s.lease);
         if (tables) |t| t.clear(s.slot);

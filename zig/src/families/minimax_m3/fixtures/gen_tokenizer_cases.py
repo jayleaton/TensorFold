@@ -1,5 +1,5 @@
-"""Regenerates tokenizer_cases.json with the Python `tokenizers` library (0.23.x) from the checkpoint's tokenizer.json.
-Usage: python3 -I gen_tokenizer_cases.py tokenizer.json template_goldens.json tokenizer_cases.json"""
+"""Regenerates tokenizer_cases.json with Python `tokenizers` (0.23.x) from the checkpoint's tokenizer.json."""
+# Usage: python3 -I gen_tokenizer_cases.py tokenizer.json template_goldens.json tokenizer_cases.json
 import json, sys
 from tokenizers import Tokenizer
 tok = Tokenizer.from_file(sys.argv[1])

@@ -1,8 +1,4 @@
-//! MiniMax-M3.1-Flash block-sparse attention under the contract on CUDA: the forced-block top-16 against
-//! core/minimax_ref.zig selectBlocks (a stated, exact rule) and the selected-block GQA attention against attention_ref, head by head,
-//! over paged K/V (page ids from a shuffled block table, the other layer and unwritten tokens poisoned with NaN).
-//! Compile-checked only so far: no GPU has run these. The planted controls for these kernels are the host mutants in
-//! zig/tests/minimax_sparse_tests.zig; no contract_controls.cu kernel exists for them yet.
+//! MiniMax-M3.1-Flash forced-block top-16 and selected-block GQA attention under the contract, over NaN-poisoned pages.
 const std = @import("std");
 const cuda = @import("cuda");
 const core = @import("core");
@@ -257,7 +253,7 @@ pub const Attn = struct {
         const rng = prng.random();
         self.shape = shape;
         const n = shape.rows;
-        // positions: a decode window's spread over [0, k), the last at k - 1 (stress: all there); a prompt chunk's k + i
+        // positions: a decode window's spread over [0, k), the last at k - 1; a prompt chunk's k + i
         try self.pos.resize(a, n);
         for (self.pos.items, 0..) |*p, i| p.* = @intCast(if (self.f.prompt) shape.k + i else if (fill == .stress or i == n - 1) shape.k - 1 else (i * 7919) % shape.k);
         var top: usize = 0;

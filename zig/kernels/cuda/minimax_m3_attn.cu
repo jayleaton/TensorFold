@@ -1,10 +1,4 @@
-// MiniMax-M3.1-Flash selected-block GQA attention (float64 reference: core/minimax_ref.zig attendBlocks).
-// One CTA per (row, kv head): the 16 query heads of the group share one K/V stream over the row's selected blocks, taken in
-// the select kernel's ascending order, 32 keys at a time with an online softmax. The key order, the 32-key tile and the
-// fp32 chains are fixed by the row's own selection alone, so a row's bits do not depend on the window width, on the other
-// rows of a call, or on whether the call is a decode window or a prompt chunk (pos null: pos0 + r).
-// Keys past the row's position are never read (an unwritten page may hold NaN) and a -1 entry ends the list.
-// Scores: sequential fp32 dot over d = 0..127, then times `scale`; softmax weights expf(s - m) in fp32; P.V in key order.
+// MiniMax-M3.1-Flash selected-block GQA attention, a CTA per (row, kv head), row-invariant; ref attendBlocks.
 
 // kv8 != 0 (launch parameter; 0: the unchanged bf16 pool): e4m3 K/V rows with an fp32 scale each (docs/fp8-kv.md).
 #include <cuda_fp8.h>

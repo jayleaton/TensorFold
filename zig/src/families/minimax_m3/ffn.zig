@@ -1,5 +1,4 @@
-//! MiniMax-M3.1-Flash's FFN wiring (engine-port-plan.md T4): which kernel parameters the unverified T0 switches become,
-//! the router's launch plan, and the layer descriptor for the fused swigluoai epilogues. Host-testable; no GPU work here.
+//! MiniMax-M3.1-Flash's FFN wiring: switches to kernel parameters, the router plan and the swigluoai layer descriptor.
 const std = @import("std");
 const core = @import("core");
 const cuda = @import("cuda");
@@ -26,8 +25,7 @@ pub fn actParams(sw: Switches) act.Params {
     };
 }
 
-/// Set a routed-experts layer to swigluoai. The loader builds `gate` from w1 and `up` from w3; when the switch says w1 is
-/// the linear side instead (`w1_is_gate` false), the two descriptors swap so the kernels' "gate" is w3.
+/// Set a routed-experts layer to swigluoai; when w1 is not the gate (`w1_is_gate` false), gate and up swap.
 pub fn configureLayer(l: *Layer, sw: Switches) void {
     const p = actParams(sw);
     l.act_mode = p.mode();
@@ -42,13 +40,12 @@ pub fn configureLayer(l: *Layer, sw: Switches) void {
     }
 }
 
-/// For a dense layer or the shared expert, the (gate, up) of the pointwise kernel given w1/w3 or gate_proj/up_proj outputs.
+/// For a dense layer or the shared expert, the pointwise kernel's (gate, up) from w1/w3 or gate_proj/up_proj.
 pub fn pickGateUp(sw: Switches, w1: u64, w3: u64) struct { gate: u64, up: u64 } {
     return if (sw.w1_is_gate) .{ .gate = w1, .up = w3 } else .{ .gate = w3, .up = w1 };
 }
 
-/// What a router launch needs, from the switches: the kernel's own normalize/scale, and the scale to apply after routed +
-/// shared are added (1 unless the switch says the factor multiplies both).
+/// A router launch's normalize/scale, and the scale applied after routed + shared are added (1 unless it scales both).
 pub const RoutePlan = struct {
     route: act.Route,
     post_scale: f32,
@@ -69,14 +66,12 @@ pub fn routePlan(sw: Switches) error{Unsupported}!RoutePlan {
     };
 }
 
-/// The same plan as moe_glue.zig's Route, for tf_moe_topk_sigmoid (normalize 1, scale 2.0 by default). That kernel ranks by
-/// logit + bias, so it matches the model only where the correction bias is zero (see `moeGlueRanksLikeTheModel`); the
-/// engine uses `act.MiniMaxAct.route` (tf_mm3_route_warp), which ranks by sigmoid(logit) + bias.
+/// moe_glue's Route for the same plan; it ranks by logit + bias, so it matches the model only where the bias is zero.
 pub fn moeGlueRoute(p: RoutePlan) cuda.moe_glue.Route {
     return .{ .experts = p.route.experts, .topk = p.route.topk, .shared = false, .normalize = p.route.normalize, .scale = p.route.scale };
 }
 
-/// moe_glue.cu's pick for one row (float64 emulation of its ranking: logit + bias, lower id on ties), for the host test.
+/// moe_glue.cu's pick for one row (float64 emulation: logit + bias, lower id on ties), for the host test.
 fn moeGluePick(logits: []const f64, bias: []const f64, ids: []usize) void {
     for (ids, 0..) |*id, k| {
         var best: usize = 0;
@@ -90,7 +85,7 @@ fn moeGluePick(logits: []const f64, bias: []const f64, ids: []usize) void {
     }
 }
 
-/// Float32 mirror of minimax_m3_act.cuh's swigluoai (same operations, same order), so the formula is checked on the host.
+/// Float32 mirror of minimax_m3_act.cuh's swigluoai (same operations, same order) for the host check.
 fn swigluoaiF32(g_in: f32, u_in: f32, a: f32, lim: f32, bias: f32, sym: bool) f32 {
     var g = g_in;
     var u = u_in;
@@ -186,7 +181,7 @@ test "the kernel's swigluoai formula in fp32 tracks the float64 reference, NaN a
     // the unverified switches: symmetric clamp and no "+1" change the value, as the reference says
     const sym: Switches = .{ .gate_clamp = .symmetric, .up_plus_one = false };
     try std.testing.expect(@abs(@as(f64, swigluoaiF32(-12.5, 0.3, alpha, limit, 0.0, true)) - mr.swigluoai(-12.5, 0.3, alpha, limit, sym)) < 1e-6);
-    // below -limit the sigmoid has already shrunk the gate, so the clamp's side moves the value by little but not by zero
+    // below -limit the sigmoid already shrank the gate, so the clamp side moves the value little but not zero
     try std.testing.expect(mr.swigluoai(-12.5, 0.3, alpha, limit, sym) != mr.swigluoai(-12.5, 0.3, alpha, limit, .{ .up_plus_one = false }));
     try std.testing.expect(mr.swigluoai(-12.5, 0.3, alpha, limit, .{ .gate_clamp = .symmetric }) != mr.swigluoai(-12.5, 0.3, alpha, limit, .{}));
 }

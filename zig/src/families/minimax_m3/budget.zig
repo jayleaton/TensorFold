@@ -1,5 +1,4 @@
-//! A rank's memory budget for MiniMax-M3.1-Flash: weights, runtime, workspaces and host reserve first, the KV pool
-//! the rest. Gives the largest context that fits, or the words that refuse an explicit CONTEXT that cannot.
+//! A rank's MiniMax-M3.1-Flash memory budget: fixed terms first, the KV pool the rest; largest context or a refusal.
 const std = @import("std");
 const kv = @import("core").kv_pool;
 const pool = @import("pool.zig");
@@ -56,8 +55,7 @@ pub fn reserveBytes(text: ?[]const u8, total: u64) Error!u64 {
     return if (bytes <= total) bytes else error.BadReserve;
 }
 
-/// TensorFold's admission: the reserve above, 4.5 GiB of CUDA context, NCCL and graphs (the GLM recipe measured
-/// 3.5-4.8 GiB outside its estimate; plan section 5 takes 4-5), 1.5 GiB of prompt workspaces.
+/// TensorFold's admission: the reserve above, 4.5 GiB of CUDA context, NCCL and graphs, 1.5 GiB of prompt workspaces.
 pub fn tensorfold(total: u64, reserve_text: ?[]const u8) Error!Terms {
     return .{ .reserve = try reserveBytes(reserve_text, total), .runtime = 4 * GiB + GiB / 2, .workspace = GiB + GiB / 2 };
 }
@@ -67,9 +65,7 @@ pub fn hosted() Terms {
     return .{ .reserve = 0, .runtime = 4 * GiB + GiB / 2, .workspace = GiB + GiB / 2 };
 }
 
-/// The DeepSeek sibling's priced floor (families/deepseek_v41/kv/budget.zig): a hard floor of 4 GiB MemAvailable kept
-/// after boot, runtime 1.0, workspace 4.0 (graphs 1.2, prefill 1.3, select .25, drafting .35, slack .9), session RAM
-/// .25 and the 128 MiB staging set. The workspace is its fitted total, so no block-score chunk is added on top.
+/// The DeepSeek sibling's priced floor (deepseek_v41/kv/budget.zig); its workspace is a fitted total, no score chunk.
 pub fn dsv41() Terms {
     return .{ .reserve = 4 * GiB, .runtime = GiB, .workspace = 4 * GiB, .session_ram = GiB / 4, .staging = 128 << 20, .prefill_rows = 0 };
 }
@@ -150,7 +146,7 @@ fn g(bytes: u64) f64 {
 
 pub const Verdict = union(enum) { ok: Capacity, refused: Refusal };
 
-/// The block-score chunk (fp32 per index head, row and 128-key block) a prefill chunk of the terms' rows needs at `context`.
+/// The block-score chunk (fp32 per index head, row and 128-key block) a prefill chunk needs at `context`.
 pub fn scoreBytes(t: Terms, context: u64) u64 {
     const rows = @min(@as(u64, t.prefill_rows), context);
     return rows * t.index_heads * @as(u64, @intCast(pages(context))) * 4;
@@ -220,8 +216,7 @@ fn largestPages(d: pool.Dims, in: Input) ?usize {
     return lo;
 }
 
-/// The largest context (explicit `context` null) or the verdict on `context`: its capacity, or a refusal that names
-/// the largest context fitting the same budget.
+/// The largest context (`context` null) or the verdict on `context`: its capacity, or a refusal naming the largest fit.
 pub fn check(d: pool.Dims, in: Input, context: ?u64) Verdict {
     const best = largestPages(d, in);
     const largest: u64 = if (best) |p| contextOf(in, p) else 0;

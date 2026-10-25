@@ -1,5 +1,4 @@
-//! MiniMax-M3.1-Flash's paged KV on core/kv_pool.zig: a rank's page geometry, its Layout, and the attention block tables.
-//! One page is one selection block (128 keys), so the kernels address a block by its page id and nothing else.
+//! MiniMax-M3.1-Flash's paged KV on core/kv_pool.zig: page geometry, Layout and block tables (a page is a block).
 const std = @import("std");
 const kv = @import("core").kv_pool;
 const Config = @import("config.zig").Config;
@@ -63,7 +62,7 @@ pub const Dims = struct {
         return .{ .fixed_bytes = tableBytes(max_pages), .token_bytes = d.tokenBytes(), .page_tokens = page_tokens, .snap_bytes = snap_bytes, .all_paged = true };
     }
 
-    /// Where things sit inside one page, per layer: `K[kvh][128 tok][head_dim]`, `V[kvh][128][head_dim]`, `IK[128][index_dim]`.
+    /// Per-layer layout of a page: `K[kvh][128 tok][head_dim]`, `V[kvh][128][head_dim]`, `IK[128][index_dim]`.
     pub fn map(d: Dims) PageMap {
         return .{ .d = d };
     }
@@ -128,8 +127,7 @@ pub const Upload = struct {
     call: *const fn (ctx: *anyopaque, slot: u32, from: usize, entries: []const i32) anyerror!void,
 };
 
-/// The attention kernels' block tables: int32 page ids, one row of `max_pages` a slot, -1 past the stream's pages.
-/// Block `b` of a stream is page `row[b]`: selection lists (block indices) index straight into it.
+/// Block tables: int32 page ids, a `max_pages` row a slot, -1 past the end; block `b` of a stream is page `row[b]`.
 pub const Tables = struct {
     gpa: std.mem.Allocator,
     rows: []i32,

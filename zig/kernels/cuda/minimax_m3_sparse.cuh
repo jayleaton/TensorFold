@@ -1,11 +1,4 @@
-// MiniMax-M3.1-Flash block-sparse attention: constants and paged addressing shared by minimax_m3_{index,select,attn}.cu.
-// Semantics: core/minimax_ref.zig (float64). Nothing here is copied from another project; written from the formulas in
-// the engine-port plan (section 2, T5).
-//
-// Page = 128 tokens = one selection block. Inside one page and one layer (head-major, bf16):
-//   K[kvh][128 tok][128] | V[kvh][128][128] | IK[128 tok][128]
-// A pool address is  base + page * page_bytes + layer_off + element offset * 2; the kernels take page ids from a block
-// table (tables[row_tab[r] + block]), never an address, so a pool may move or grow between launches.
+// MiniMax-M3.1-Flash block-sparse attention constants and paged addressing (a page is a 128-token block).
 #pragma once
 
 #include <cuda_bf16.h>

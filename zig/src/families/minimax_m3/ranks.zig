@@ -1,7 +1,4 @@
-//! Which rank this process is and whether every rank agrees on what it runs (plan T7; the contract is spelled out in the
-//! recipe's docs/rank-contract.md). TensorFold v1.1.2's CUDA build has no --tp/--rank/--master flags: a family reads its
-//! own environment, as GLM does (TF_GLM_RANK, TF_GLM_WORLD, NCCL_COMM_ID). This family reads TF_MM3_RANK, TF_MM3_WORLD and
-//! NCCL_COMM_ID. Everything here is host code: the fingerprint is carried by a gather the engine supplies (`agree`).
+//! This process's rank (TF_MM3_RANK, TF_MM3_WORLD, NCCL_COMM_ID) and whether all ranks agree (docs/rank-contract.md).
 const std = @import("std");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
@@ -46,8 +43,7 @@ pub fn place(get: Get) Error!Place {
     return p;
 }
 
-/// Rank 0's address and port as NCCL_COMM_ID names them. The ranks' liveness lines (cuda/tp_watch.zig) listen on the port
-/// after it, so the largest usable port is 65534.
+/// Rank 0's address and port from NCCL_COMM_ID; liveness lines use the next port, so the largest usable is 65534.
 pub const Rendezvous = struct { ip: [4]u8, port: u16 };
 
 pub fn rendezvous(text: []const u8) Error!Rendezvous {
@@ -79,8 +75,7 @@ pub fn refusal(err: Error) []const u8 {
     };
 }
 
-/// Forward knobs read from the environment. Only the thin-model switch exists in v1; anything that changes the
-/// arithmetic must be here and in the fingerprint so both ranks are made to agree.
+/// Forward knobs from the environment; anything changing the arithmetic must also be in the fingerprint.
 pub const Settings = struct {
     layers: u32 = 0, // TF_MM3_LAYERS: the first this many layers only, for one-GPU checks (0: all)
     roce_kb: u32 = 4096, // TF_ROCE_MAX_KB, the small-gather RoCE path's cap in KiB; 0 when TF_ROCE=0 keeps every gather on NCCL
@@ -146,7 +141,7 @@ pub const Fingerprint = extern struct {
 
 pub const Mismatch = struct { field: Fingerprint.Field, rank: usize };
 
-/// The first field where rank r's fingerprint differs from rank 0's (or r holds the wrong rank number), null when all agree.
+/// The first field where rank r's fingerprint differs from rank 0's (or r has the wrong rank), null when all agree.
 pub fn mismatch(all: []const Fingerprint) ?Mismatch {
     for (all, 0..) |f, r| {
         if (f.layout != all[0].layout) return .{ .field = .layout, .rank = r };
@@ -184,8 +179,7 @@ pub fn hashBytes(bytes: []const u8) [32]u8 {
     return out;
 }
 
-/// `gather` puts every rank's `mine` in `out` in rank order (an ncclAllGather of bytes, as glm/cuda_ranks.zig does it).
-/// Any disagreement is error.RankMismatch on every rank, printing what differs.
+/// `gather` fills `out` with every rank's `mine` in rank order; any disagreement is error.RankMismatch on every rank.
 pub fn agree(ctx: anytype, comptime gather: fn (@TypeOf(ctx), Fingerprint, []Fingerprint) anyerror!void, mine: Fingerprint, out: []Fingerprint) !void {
     try gather(ctx, mine, out);
     if (mismatch(out)) |m| {

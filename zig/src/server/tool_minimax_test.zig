@@ -1,5 +1,4 @@
-//! MiniMax-M3.1 tool calls: the chat template's own renderings (fixtures/template_goldens.json, made by Python Jinja2)
-//! parsed back, scalar typing against the tool schema, and streaming split at every byte boundary.
+//! MiniMax-M3.1 tool calls: template goldens parsed back, scalar typing by schema, streaming split at every byte.
 const std = @import("std");
 const json = @import("json");
 const tool_parse = @import("tool_parse.zig");

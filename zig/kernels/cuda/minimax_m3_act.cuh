@@ -1,12 +1,4 @@
-// MiniMax-M3.1-Flash's swigluoai, one definition for every fused epilogue and the pointwise kernel.
-// Written from the engine-port plan's formula (section 2), no third-party code:
-//   g = min(g, limit) (act_mode 3: clamp(g, -limit, limit)), u = clamp(u, -limit, limit),
-//   out = g * sigmoid(alpha * g) * (u + up_bias), fp32 throughout.
-// alpha 1.702, limit 7 and up_bias 1 are the plan's REFERENCE values; the gate/up assignment, the "+1" and the gate
-// clamp are UNVERIFIED against upstream, so each is a parameter (up_bias 0 drops the +1, mode 3 is the symmetric
-// clamp; w1-is-gate is the caller's choice of which projection it passes as g).
-// A NaN in g or u stays a NaN: the clamps are compares, not fminf/fmaxf (which hand back the limit).
-// limit <= 0 means no clamp, as for the silu paths.
+// MiniMax-M3.1-Flash swigluoai for every epilogue, fp32; compare clamps keep NaN, limit <= 0 is no clamp.
 #pragma once
 
 namespace tf_mm3 {

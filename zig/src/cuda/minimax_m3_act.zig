@@ -1,6 +1,4 @@
-//! minimax_m3_act.cu: MiniMax-M3.1-Flash's swigluoai as a pointwise kernel, for the dense layers 0-2 and the shared
-//! expert (plain EXL3 linears with no fused epilogue). Float64 reference: core/minimax_ref.zig `swigluoai`.
-//! alpha, limit, up_bias and the gate clamp are launch arguments: the unverified switches are not compiled in.
+//! minimax_m3_act.cu: MiniMax-M3.1-Flash's pointwise swigluoai and router; unverified switches are launch arguments.
 const std = @import("std");
 const kernels = @import("kernels.zig");
 const module = @import("module.zig");
@@ -56,7 +54,7 @@ pub const MiniMaxAct = struct {
         g.mod.unload();
     }
 
-    /// out[r, :n] = bf16(swigluoai(gate[r, :n], up[r, :n])); rows at element strides g_ld, u_ld, o_ld; `in` the gate/up type.
+    /// out[r, :n] = bf16(swigluoai(gate, up)) at element strides g_ld, u_ld, o_ld; `in` the gate/up type.
     pub fn swigluoai(g: *const MiniMaxAct, s: Stream, in: Input, gate: u64, g_ld: usize, up: u64, u_ld: usize, out: u64, o_ld: usize, rows: usize, n: usize, p: Params) !void {
         try check(rows, n, g_ld, u_ld, o_ld);
         if (rows == 0) return;
@@ -78,8 +76,7 @@ pub const MiniMaxAct = struct {
         try launch_.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = @intCast((n + threads - 1) / threads), .z = 1 }, .block = .{ .x = threads } }, s, &a);
     }
 
-    /// fp32 logits [rows, experts] and fp32 bias (or null) into int32 picks and fp32 weights, both [rows, topk]: top `topk` by
-    /// sigmoid(logit) + bias, weights sigmoid(logit) [/ their sum] * scale. Not moe_glue's ranking (logit + bias).
+    /// Top `topk` of fp32 logits by sigmoid(logit) + bias into int32 picks and fp32 weights (sigmoid [/ sum] * scale).
     pub fn route(g: *const MiniMaxAct, s: Stream, logits: u64, bias: ?u64, r: Route, pick: u64, wts: u64, rows: usize) !void {
         try routeCheck(r, rows);
         if (rows == 0) return;

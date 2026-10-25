@@ -1,9 +1,4 @@
-// MiniMax-M3.1-Flash forced-block top-16 (float64 reference: core/minimax_ref.zig forced, topk, selectBlocks).
-// A row with nb = pos / 128 + 1 blocks attends all of them when nb <= 16, else the 16 best by (score desc, then block id
-// by the tie rule) with forced blocks scored +inf. The forcing rules and the tie rule are UNVERIFIED upstream semantics,
-// so they are launch parameters mirroring minimax_ref.Switches: init_n/init_inclusive (sparse_init_block count or
-// inclusive), local_n/local_trailing (sparse_local_block as "own block if > 0" or "trailing window of n"), higher_tie.
-// A NaN block score ranks as -inf (the reference's rule). Output: ascending block ids, -1 padded, per (row, kv head).
+// MiniMax-M3.1-Flash forced-block top-16, rules as launch parameters (UNVERIFIED); ref minimax_ref.zig selectBlocks.
 #include "minimax_m3_sparse.cuh"
 
 using namespace tf_mm3;

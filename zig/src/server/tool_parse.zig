@@ -92,8 +92,7 @@ fn envelopes(a: Allocator, text: []const u8) Allocator.Error![]Envelope {
         try found.append(a, .{ .start = s, .end = end, .payload = text[s..end], .complete = e != null });
         pos = end;
     }
-    pos = 0;
-    while (tool_minimax.nextBlock(text, pos)) |b| : (pos = b.end) try found.append(a, .{ .start = b.start, .end = b.end, .payload = b.payload, .complete = b.complete });
+    try tool_minimax.appendBlocks(Envelope, a, &found, text);
     std.mem.sort(Envelope, found.items, {}, struct {
         fn less(_: void, x: Envelope, y: Envelope) bool {
             if (x.start != y.start) return x.start < y.start;

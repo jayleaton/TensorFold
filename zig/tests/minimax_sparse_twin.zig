@@ -1,6 +1,4 @@
-//! Host twins of zig/kernels/cuda/minimax_m3_{index,select,attn}.cu: the same fp32 operation order, written in Zig (no fused
-//! multiply-add, as the kernels build with --fmad=false), plus planted mutants ("controls") that each break one rule. The
-//! kernels themselves have not run; a twin only shows the algorithm and its order are right and that the checks have teeth.
+//! Host twins of minimax_m3_{index,select,attn}.cu (same fp32 order, no fma) and planted mutants each breaking a rule.
 const std = @import("std");
 const core = @import("core");
 const geom = @import("mm3_geom");
@@ -112,13 +110,12 @@ pub fn select(bmax: []const f32, pos: usize, rules: geom.Rules, m: Mutant, out: 
     }
 }
 
-/// tf_mm3_attn for one (row, kv head): q [16][128] (bf16 values in f32), k and v [pos + 1][128] of that head, ids from select.
-/// Returns out [16][128] rounded to bf16 values. `m == .window_split` uses a 16-key tile when the row sees under 1024 keys.
+/// tf_mm3_attn for one (row, kv head) into bf16-rounded out [16][128]; `.window_split`: 16-key tiles under 1024 keys.
 pub fn attend(q: []const f32, k: []const f32, v: []const f32, ids: []const i32, pos: usize, scale: f32, m: Mutant, out: []f32) void {
     attendImpl(q, k, v, ids, pos, scale, m, true, out);
 }
 
-/// The same with the fp32 result before the bf16 store, where a tile change shows (bf16 hides most fp32-level differences).
+/// The same with the fp32 result before the bf16 store, where a tile change shows.
 pub fn attendRaw(q: []const f32, k: []const f32, v: []const f32, ids: []const i32, pos: usize, scale: f32, m: Mutant, out: []f32) void {
     attendImpl(q, k, v, ids, pos, scale, m, false, out);
 }

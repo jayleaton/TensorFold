@@ -321,8 +321,7 @@ pub fn x3ldEpiCheck(g: Grouped, kind: EpiKind, pd: u32) Error!struct { pd: usize
     return .{ .pd = pi, .range = c.range };
 }
 
-/// The gate/up activation of the x3gm launches (gmGateup, gm2Gateup, gm3Gateup): silu by default (mode 0), or MiniMax's
-/// swigluoai (mode 2: gate clamped above, 3: both sides; `limit` is the launch's limit argument).
+/// The x3gm launches' gate/up activation: silu (mode 0) or MiniMax swigluoai (2: gate clamped above, 3: both sides).
 pub const Act = struct {
     mode: c_int = 0,
     alpha: f32 = 0,
@@ -413,7 +412,7 @@ pub const Ops = struct {
 
     /// exl3x_gateup_epilogue_cuda: splits summed, rotated, * svh, SwiGLU (act_mode 0 bf16 roundings, 1 fp32), Xd.
     pub fn gateupEpilogue(o: Ops, z: u64, pick: u64, svh_g: u64, svh_u: u64, suh_d: u64, xd: u64, rows: usize, P: usize, N: usize, SK: usize, slots: usize, E: usize, limit: f32, act_mode: c_int) !void {
-        // This entry point is DeepSeek's mangled kernel: it has no swigluoai arm (x3ld_epi's and the x3gm launches' do).
+        // DeepSeek's mangled kernel has no swigluoai arm (x3ld_epi's and the x3gm launches' do).
         if (act_mode != 0 and act_mode != 1) return error.Unsupported;
         var a: cuda.Args = .{};
         for ([_]u64{ z, pick, svh_g, svh_u, suh_d, xd }) |v| a.add(v);

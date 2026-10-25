@@ -1,8 +1,4 @@
-// MiniMax-M3.1-Flash index scoring and per-128-key block maxima (float64 reference: core/minimax_ref.zig blockScores).
-//   s[j] = (iq[g] . IK[j]) * scale   for keys j <= pos of a row, fp32; bmax[r][g][b] = max over the block's valid keys.
-// One CTA per (block, index head g, row): 4 warps, a warp scores its keys one at a time with the 32 lanes split over the
-// 128 dims (4 each, fixed order) and a fixed xor tree, so a score's bits depend on nothing but its two vectors.
-// NaN rule (stated, matches the reference): fmax drops a NaN key score; a block whose keys are all NaN scores -inf.
+// MiniMax-M3.1-Flash index scores and per-128-key block maxima (fmax drops NaN); ref minimax_ref.zig blockScores.
 #include "minimax_m3_sparse.cuh"
 
 using namespace tf_mm3;

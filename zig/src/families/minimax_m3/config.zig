@@ -168,8 +168,7 @@ fn semver(text_: []const u8) ?[3]u32 {
     return if (it.next() == null) out else null;
 }
 
-/// quantization_config: exl3, codebook mul1, out_scales always, version 1.6.1 or a later 1.x. The mean bits are `bits`
-/// (the 3.5 bpw pack) or `avg_bits` (the 3.06 bpw pack).
+/// quantization_config: exl3, codebook mul1, out_scales, version 1.6.1 or later 1.x; mean bits `bits` or `avg_bits`.
 fn quant(q: Obj) Error!Quant {
     if (!std.mem.eql(u8, try text(q, "quant_method"), "exl3")) return error.NotExl3;
     if (!std.mem.eql(u8, try text(q, "codebook"), "mul1")) return error.UnsupportedCodebook;

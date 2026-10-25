@@ -1,6 +1,4 @@
-//! MiniMax-M3.1-Flash sparse attention, host only: paged addressing, launch and memory arithmetic at block boundaries, the
-//! kernels' host twins against the float64 reference (core/minimax_ref.zig), planted controls, and the gate-5 launch records.
-//! No GPU ran any of this: the CUDA kernels are compile-checked only.
+//! MiniMax-M3.1-Flash sparse attention, host only: addressing, sizing, twins vs float64, controls, launch records.
 const std = @import("std");
 const core = @import("core");
 const geom = @import("mm3_geom");

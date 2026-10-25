@@ -1,7 +1,4 @@
-//! MiniMax-M3.1-Flash block-sparse attention launches: index scoring + block maxima, forced-block top-16, selected-block
-//! GQA attention (zig/kernels/cuda/minimax_m3_{index,select,attn}.cu). K/V/IK live in 128-token pages addressed by page
-//! ids from block tables (geometry in minimax_m3_geom.zig). Decode rows come with positions; a prompt chunk is `pos == 0`
-//! and `pos0`. Never run on a GPU in this tree's history: see docs for what is checked.
+//! MiniMax-M3.1-Flash block-sparse attention launches (index, select, attn) over 128-token pages from block tables.
 const std = @import("std");
 const kernels = @import("kernels.zig");
 const module = @import("module.zig");

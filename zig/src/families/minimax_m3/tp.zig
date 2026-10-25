@@ -1,7 +1,4 @@
-//! The two-rank tensor-parallel plan of MiniMax-M3.1-Flash (plan T7, sections 4 and 5): which tensor needs which collective
-//! in a layer, the geometry of those collectives, and the rank-order fp32 sum that leaves every rank the same bits.
-//! Host code only. The device side is cuda/tp_group.zig (`allGather`), kernels/cuda/rank_sum.cu (`tf_rank_sum`) and
-//! cuda/rank_scatter.zig (`RankScatter`); their contracts, as read, are stated at `rankSum` below.
+//! MiniMax-M3.1-Flash's two-rank TP plan: each tensor's collective, their geometry and the rank-order fp32 sum (host).
 const std = @import("std");
 const names = @import("names.zig");
 const Config = @import("config.zig").Config;
@@ -40,14 +37,10 @@ pub fn reductionOf(p: names.Proj) Reduction {
     };
 }
 
-/// The tensors with no collective, and why (documentation the tests pin):
-/// q/k/v: whole kv groups per rank; index_q_proj: the rank's own index heads select for its own kv heads and score over
-/// the full IK cache; index_k_proj, q/k norms, the router (fp32 gate), the embedding: replicated, same kernel, same bits.
-/// Dense gate/up, shared gate/up and routed w1/w3 are column cuts: their activations stay rank-local until the down row cut.
+/// Tensors replicated on every rank with the same kernel, so the same bits, and so needing no collective.
 pub const replicated = [_][]const u8{ "index_k_proj", "q_norm", "k_norm", "index_q_norm", "index_k_norm", "router_gate", "embed_tokens", "layernorms" };
 
-/// The collectives of layer `layer`, in execution order: always the attention sum, then one FFN sum. A MoE layer's routed
-/// experts and its shared expert are added into one partial before the exchange, so a layer costs two exchanges either way.
+/// Layer `layer`'s collectives in order: the attention sum, then one FFN sum (routed + shared added before it).
 pub fn layerPlan(c: *const Config, layer: u32) [2]Collective {
     _ = layer; // dense and MoE layers have the same two sites; only the tensors feeding the second differ
     return .{
@@ -65,8 +58,7 @@ pub fn tokenExchanges(c: *const Config, layers: u32) usize {
     return n;
 }
 
-/// fp32 bytes each rank puts on the wire for one sum of `rows` rows (the same from every rank), and the receive buffer
-/// the all-gather form fills: a slot per rank in rank order.
+/// fp32 bytes a rank sends for one sum of `rows` rows; the all-gather receive buffer has a slot per rank in rank order.
 pub fn sumSlotBytes(c: *const Config, rows: usize) usize {
     return rows * c.hidden * 4;
 }
@@ -74,8 +66,7 @@ pub fn sumGatherBytes(c: *const Config, rows: usize, world: usize) usize {
     return world * sumSlotBytes(c, rows);
 }
 
-/// The lm_head's gather: ncclAllGather wants equal slots, so every rank's slot holds the largest share and the shorter
-/// ranks' tails are padding the merge ignores.
+/// The lm_head's gather: equal slots of the largest share, the shorter ranks' tails padding the merge ignores.
 pub const LogitsGather = struct {
     slot: usize, // logits a rank's slot holds per row
     world: usize,
@@ -103,8 +94,7 @@ pub const LogitsGather = struct {
     }
 };
 
-/// A greedy pick: (logit, token id). The per-rank form of argmax over the head gathers one candidate a rank and keeps the
-/// larger logit, the lower token id on a tie, so it equals argmax over the whole vocabulary taken lowest-id-first.
+/// A greedy pick (logit, id); merging ranks keeps the larger logit, lower id on ties, equal to a whole-vocab argmax.
 pub const Pick = struct { logit: f32, id: u32 };
 
 /// A NaN logit ranks last (all NaN: the lower id), as tf_mm3_pick does, so a NaN rank never hides a finite one.
@@ -124,12 +114,7 @@ pub fn mergePicks(all: []const Pick) Pick {
     return best;
 }
 
-/// The rank-order sum, as the device does it. Contract of tf_rank_sum (kernels/cuda/rank_sum.cu), read from source:
-///   args (peers, own, world, me, n, out); fp32 only; `peers` holds `world` slots of `n` floats, slot r at r * n, and slot
-///   `me` is never read; `own` is this rank's n floats; out[i] = ((t0 + t1) + t2) ... with t_r = (r == me ? own : peers[r]),
-///   every add a single __fadd_rn (no fma, no reassociation); one thread owns an index end to end, so out may alias own
-///   (and peers' slot me). Launch is grid-stride, 256 threads, at most 4096 blocks; any n >= 0 (n = 0: launch not needed).
-/// Same bits on every rank iff every rank holds the same t_r values: that is what the gather guarantees.
+/// The rank-order sum as tf_rank_sum does it: out[i] = ((t0 + t1) + t2) ..., single __fadd_rn adds, own at slot `me`.
 pub fn rankSum(peers: []const f32, own: []const f32, world: usize, me: usize, out: []f32) void {
     const n = own.len;
     std.debug.assert(out.len == n and peers.len == world * n and me < world);
@@ -143,17 +128,7 @@ pub fn rankSum(peers: []const f32, own: []const f32, world: usize, me: usize, ou
     }
 }
 
-/// Which collective form carries a sum (both give `rankSum`'s bits; the engine picks by rows).
-/// `gather_sum`: Group.allGather of every rank's whole partial ([world][rows][hidden] fp32), then tf_rank_sum over all
-///   rows with peers = the gathered buffer, own = this rank's slot, out = the sum on every rank. Best for decode and
-///   verify windows (R <= 128): one latency, 24 KB a row.
-/// `scatter_gather`: RankScatter.run (send/recv of row shares, then tf_rank_sum over the rank's rows), then an allGather
-///   of the summed shares back into every rank. Contract of RankScatter (cuda/rank_scatter.zig), read from source:
-///   `share(rows, world, rank)` = whole rows, the first rows % world ranks one more; `scratchBytes(rows, world, width)`
-///   = world * ceil(rows / world) * width * 4 receive bytes (slot r at r * n, n = this rank's row count * width);
-///   `run` needs partial/scratch/out device pointers, fp32, a Library with ncclSend/ncclRecv, and `kernels.available`.
-///   It returns only this rank's rows, so the second gather (unequal shares need padded slots) is the caller's.
-///   For prompt chunks (R in the thousands) this moves 1/world of the bytes a gather_sum would.
+/// Which collective carries a sum (both give `rankSum`'s bits): gather_sum for decode windows, scatter_gather prompts.
 pub const Form = enum { gather_sum, scatter_gather };
 
 /// The reduction form for `rows` rows. Both are bit-identical by construction (tested below on host arithmetic).
@@ -288,7 +263,7 @@ test "Share-based: the TP2 spans of every projection, rank by rank" {
     // the head: 782 and 781 units of 128
     try spanEq(r0.cut(flash, .head), 0, 782 * 128);
     try spanEq(r1.cut(flash, .head), 782 * 128, 200064);
-    // GQA: the 16 q heads of kv head g sit on the rank that owns kv head g, so no attention exchange exists before o_proj
+    // GQA: kv head g's 16 q heads sit on its rank, so there is no attention exchange before o_proj
     for (0..4) |g| {
         const owner: usize = if (g < 2) 0 else 1;
         const s = if (owner == 0) r0 else r1;

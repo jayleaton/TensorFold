@@ -8,8 +8,7 @@ pub const think_markers: Markers = .{ .open = "", .close = "</think>" };
 /// The opener a reply writes itself when its template leaves the think block to it (Kolibri 1's does).
 const think_open = "<think>";
 pub const channel_markers: Markers = .{ .open = "<|channel>thought", .close = "<channel|>" };
-/// MiniMax-M3.1 writes `<mm:think>` itself when its prompt left thinking adaptive; with thinking enabled the prompt
-/// already ends in it, so the reply holds only the close (`mm_think_prompt_markers`). Which one applies is the prompt's tail.
+/// MiniMax-M3.1 opens `<mm:think>` itself when thinking is adaptive, else only closes it (the prompt's tail decides).
 pub const mm_think_markers: Markers = .{ .open = "<mm:think>", .close = "</mm:think>" };
 pub const mm_think_prompt_markers: Markers = .{ .open = "", .close = "</mm:think>" };
 /// (opener, closer) of a tool call's markup: Qwen's, Gemma 4's, DeepSeek-V4's DSML block, LFM2's, MiniMax-M3.1's.

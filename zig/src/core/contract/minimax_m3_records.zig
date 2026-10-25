@@ -1,6 +1,4 @@
-//! MiniMax-M3.1-Flash sparse attention CUDA launch records (registry.cuda): nvcc 13.0.88 `cuobjdump --dump-resource-usage` of
-//! each kernel built with the cuda_kernels.zig flags for sm_80, 86, 89, 120 and 121 (sm_120/121 static shared = reported - 1 KiB).
-//! The kernels take no dynamic shared memory. Values come from a compile, not a GPU run; index and attn include kv8.
+//! MiniMax-M3.1-Flash sparse attention CUDA launch records: nvcc 13.0.88 resource usage for sm_80 to sm_121.
 const L = @import("limits.zig");
 
 fn u(regs: u32, static: u32, bound: u32) L.Usage {

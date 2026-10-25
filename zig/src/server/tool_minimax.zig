@@ -1,12 +1,4 @@
-//! MiniMax-M3.1's tool calls: `NS<tool_call>` `NS<invoke name="n">` `NS<k>value NS</k>` ... `NS</invoke>` `NS</tool_call>`,
-//! NS being the special token `]<]minimax[>[`. Parameters are the chat template's own `to_xml` read back: a mapping is
-//! child elements, a list is repeated `<item>` elements, None is omitted, booleans are `true`/`false`, any other scalar is
-//! its `str()` text. The template never says how scalars were typed, so reading them back is a decision (UNVERIFIED
-//! against MiniMax's own parser): a leaf takes the type its tool's schema names, through the same `tool_params.decode`
-//! the Qwen and GLM branches use, and is the text itself (a string) wherever no schema is declared or the text does not
-//! spell the declared type. An element with children is a list when its schema says array (not object), an object when
-//! it says object (not array), and otherwise a list exactly when every child is `item`. An empty element (an empty list,
-//! mapping or string all render as nothing) is "" unless the schema is array-only ([]) or object-only ({}).
+//! MiniMax-M3.1's tool calls (`NS<tool_call>` ... `NS</tool_call>`), parameters read back from the template's to_xml.
 const std = @import("std");
 const json = @import("json");
 const reply_text = @import("reply_text.zig");
@@ -31,6 +23,12 @@ pub fn nextBlock(text: []const u8, from: usize) ?Block {
     const s = reply_text.findTag(text, from, open) orelse return null;
     const e = reply_text.findTag(text, s + open.len, close) orelse return .{ .start = s, .end = text.len, .payload = text[s..], .complete = false };
     return .{ .start = s, .end = e + close.len, .payload = reply_text.pyStrip(text[s + open.len .. e]), .complete = true };
+}
+
+/// Every block in `text` appended to `found`, a list of envelopes with `Block`'s four fields.
+pub fn appendBlocks(comptime E: type, a: Allocator, found: *std.ArrayList(E), text: []const u8) Allocator.Error!void {
+    var pos: usize = 0;
+    while (nextBlock(text, pos)) |b| : (pos = b.end) try found.append(a, .{ .start = b.start, .end = b.end, .payload = b.payload, .complete = b.complete });
 }
 
 /// Where the block the reply ends inside starts, if it does.
@@ -175,8 +173,7 @@ fn value(a: Allocator, node: *const Node, schema: tool_params.Schema) Error!Valu
     return .{ .object = object };
 }
 
-/// What closes the block the reply ended inside (`text` from its opener): the shortest closing that makes one whole
-/// call to an offered tool, else nothing.
+/// The shortest closing of the reply's open block (`text` from its opener) making one whole call, else nothing.
 pub fn closing(a: Allocator, text: []const u8, tools: []const Value) Allocator.Error![]const u8 {
     for ([_][]const u8{ close, ns ++ "</invoke>" ++ close }) |tail| {
         const closed = try std.mem.concat(a, u8, &.{ text, tail });

@@ -1,6 +1,4 @@
-//! MiniMax-M3.1-Flash text side on TensorFold's engines: the checkpoint's tokenizer.json through core/tokenizer and
-//! its chat_template.jinja through core/template. Expected ids come from the Python `tokenizers` library and
-//! expected prompts from Python Jinja2 (fixtures/gen_*.py regenerate both); the comparison is byte for byte.
+//! MiniMax-M3.1-Flash tokenizer and chat template on TensorFold's engines, byte for byte against Python goldens.
 const std = @import("std");
 const tokenizer = @import("tokenizer");
 const template = @import("template");

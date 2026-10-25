@@ -328,9 +328,7 @@ TF_CTL_SWIGLU_L2(tf_ctl_swiglu_l2_drop_gs, tf_act_l2::US | tf_act_l2::PROD)
 TF_CTL_SWIGLU_L2(tf_ctl_swiglu_l2_drop_us, tf_act_l2::GS | tf_act_l2::PROD)
 TF_CTL_SWIGLU_L2(tf_ctl_swiglu_l2_drop_prod, tf_act_l2::GS | tf_act_l2::US)
 #undef TF_CTL_SWIGLU_L2
-// Gate 1 (mode 0) and gate 3 (mode 1): minimax_m3_act.cu's swigluoai bf16 rows with one fault each. Mode 0 clamps by
-// fminf/fmaxf, which hand back the limit for a NaN (the plan's "fminf drops NaN"), so a NaN input reads as a finite number.
-// Mode 1 is right at whole 256-value tiles and loses the last value of a row otherwise.
+// Gates 1/3 (modes 0/1): mm3 swigluoai rows clamped by fminf (a NaN reads finite) or losing a row's last value.
 #include "minimax_m3_act.cuh"
 
 extern "C" __global__ void __launch_bounds__(256) tf_ctl_mm3_act(const __nv_bfloat16* gate, const __nv_bfloat16* up,

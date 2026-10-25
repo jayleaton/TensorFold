@@ -1,5 +1,4 @@
-//! MiniMax-M3.1-Flash sparse attention: paged cache addressing, launch geometry and memory sizing (std only, host-testable).
-//! Mirrors zig/kernels/cuda/minimax_m3_sparse.cuh; the engine-port plan (sections 2 and 5) gives the numbers.
+//! MiniMax-M3.1-Flash sparse attention: paged addressing, launch geometry and sizing (mirrors minimax_m3_sparse.cuh).
 const std = @import("std");
 
 pub const d = 128; // head_dim and index_head_dim
@@ -11,7 +10,7 @@ pub const bf16_bytes = 2;
 pub const index_threads = 128;
 pub const select_threads = 256;
 pub const attn_threads = 256;
-/// Static shared bytes the attention kernel declares: sq 8 KiB + sk 8.5 KiB + sv 8 KiB + sp 2 KiB (plus 1 KiB reserved).
+/// Static shared bytes of the attention kernel: sq 8 + sk 8.5 + sv 8 + sp 2 KiB (plus 1 KiB reserved).
 pub const attn_static_shared = (group * d + group * 32) * 4 + (32 * 136 + 32 * d) * bf16_bytes;
 /// Scores a block at 1 key a warp step: the index kernel's reduction tree (32 lanes, offsets 16..1) is fixed.
 pub const max_grid_z = 65535;
@@ -130,7 +129,7 @@ pub fn check(rows: usize, kvh: usize) LaunchError!void {
     if (kvh == 0 or kvh > 4) return error.KvHeads;
 }
 
-/// The select kernel's launch arguments; the defaults are core/minimax_ref.zig's Switches defaults (UNVERIFIED upstream).
+/// The select kernel's launch arguments; defaults are minimax_ref.zig's Switches defaults (UNVERIFIED upstream).
 pub const Rules = struct {
     init_n: i32 = 0,
     init_inclusive: bool = false,

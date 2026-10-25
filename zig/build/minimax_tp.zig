@@ -1,4 +1,4 @@
-//! test-minimax-tp: MiniMax-M3.1-Flash's rank contract, collective plan, rank-order reduction and fingerprint on the host, no GPU.
+//! test-minimax-tp: MiniMax-M3.1-Flash's rank contract, collective plan, rank-order sum and fingerprint, host only.
 const std = @import("std");
 
 pub fn step(b: *std.Build, host: std.Build.ResolvedTarget, core: *std.Build.Module) *std.Build.Step {

@@ -1,6 +1,4 @@
-//! minimax_m3_act.cu's swigluoai under the contract on CUDA: float64 reference core/minimax_ref.zig `swigluoai`, NaN
-//! propagating as float64 does, and two planted controls (a clamp by fminf, which drops a NaN, and a lost tail value).
-//! Written for the GB10 run; nothing here has run on a GPU yet.
+//! minimax_m3_act.cu's swigluoai under the contract on CUDA, NaN propagating, plus two planted controls.
 const std = @import("std");
 const cuda = @import("cuda");
 const core = @import("core");

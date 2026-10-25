@@ -1,7 +1,4 @@
-// MiniMax-M3.1-Flash's swigluoai as a pointwise kernel for the dense layers 0-2 and the shared expert, whose gate and up
-// are plain EXL3 dense linears (no fused epilogue). Float64 reference: core/minimax_ref.zig `swigluoai`.
-// out[r, i] = bf16(swigluoai(gate[r * g_ld + i], up[r * u_ld + i])), one thread a value, a row's bits depend on that row.
-// `mode` is minimax_m3_act.cuh's act_mode (2 or 3); alpha, limit and up_bias are launch arguments, not constants.
+// MiniMax-M3.1-Flash swigluoai, pointwise (dense layers 0-2, shared expert); ref core/minimax_ref.zig `swigluoai`.
 
 #include <cuda_bf16.h>
 #include <math.h>
@@ -36,12 +33,7 @@ extern "C" __global__ void __launch_bounds__(NT) tf_mm3_swigluoai_f32(
     out[r * o_ld + i] = __float2bfloat16_rn(v);
 }
 
-// MiniMax's router: top `topk` of 128-ish experts by sigmoid(logit) + bias (ties: lower id), weights sigmoid(logit) of the
-// picks, divided by their sum when `normalize`, times `scale`. moe_glue.cu's tf_moe_topk_sigmoid ranks by logit + bias
-// (the bias added in logit space), which picks differently from sigmoid(logit) + bias whenever the bias is not zero;
-// this kernel ranks as the plan's section 2 step 11b says. A warp a row, up to 4 * 32 experts, topk <= 32, slots = topk.
-// NaN rule (stated): a NaN score ranks as -inf (picked last, by lower id), so a pick is always a real expert.
-// Float64 reference: core/minimax_ref.zig `routerPick`.
+// MiniMax router: top-k by sigmoid(logit) + bias (ties lower id, NaN as -inf), a warp a row; ref routerPick.
 extern "C" __global__ void __launch_bounds__(256) tf_mm3_route_warp(const float* __restrict__ logits,
         const float* __restrict__ bias, int* __restrict__ pick, float* __restrict__ wts, int rows, int ne, int topk,
         int normalize, float scale) {
