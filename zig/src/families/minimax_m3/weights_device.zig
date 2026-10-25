@@ -27,7 +27,7 @@ pub fn digest(gpa: std.mem.Allocator, cat: *const load.Catalog) ![32]u8 {
         const r = cat.map.get(k).?;
         h.update(k);
         h.update(&.{0});
-        const fields = [_]u64{ r.shard, @intFromEnum(r.dtype), r.rank, r.begin, r.len };
+        const fields = [_]u64{ r.shard, @backingInt(r.dtype), r.rank, r.begin, r.len };
         for (fields) |f| h.update(std.mem.asBytes(&std.mem.nativeToLittle(u64, f)));
         for (r.shape[0..r.rank]) |d| h.update(std.mem.asBytes(&std.mem.nativeToLittle(u64, d)));
     }

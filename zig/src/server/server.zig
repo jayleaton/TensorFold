@@ -477,5 +477,5 @@ test "MiniMax's reply markers follow the prompt's tail: enabled ends in the open
     try std.testing.expectEqualStrings("</mm:think>", srv.markersFor(&.{}).close);
     srv.mm_think = null;
     srv.markers = reply_text.think_markers;
-    try std.testing.expectEqualStrings("</think>", srv.markersFor(&.{ 7 }).close);
+    try std.testing.expectEqualStrings("</think>", srv.markersFor(&.{7}).close);
 }
