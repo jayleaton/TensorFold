@@ -114,6 +114,8 @@ pub const Server = struct {
     eos: []const u32 = &.{},
     think_close: []const u32 = &.{},
     think_close_end: ?u32 = null,
+    /// MiniMax-M3.1's think tokens when the tokenizer has both: the reply's markers depend on the prompt's tail.
+    mm_think: ?struct { open: u32, close: u32 } = null,
     metrics: metrics.Metrics,
     store: responses.Store,
     next_id: std.atomic.Value(u64) = .init(1),
@@ -171,6 +173,10 @@ pub const Server = struct {
         const a = srv.arena.allocator();
         srv.eos = try a.dupe(u32, text.eosIds());
         if (text.tokenId(reply_text.channel_markers.close) != null) srv.markers = reply_text.channel_markers;
+        if (text.tokenId(reply_text.mm_think_markers.close)) |close| if (text.tokenId(reply_text.mm_think_markers.open)) |open| {
+            srv.markers = reply_text.mm_think_markers;
+            srv.mm_think = .{ .open = open, .close = close };
+        };
         srv.close_id = text.tokenId(srv.markers.close);
         const source = text.templateSource();
         srv.effort_levels = try fields.effortLevels(a, source);
@@ -182,7 +188,7 @@ pub const Server = struct {
             const template_images = templateImages(srv);
             if (!template_images) log.line("warning: --vision: the chat template writes no image placeholder for an image part, so image requests will fail; serve with --chat-template naming a template that has an image path", .{});
         }
-        if (text.tokenId("</think>")) |end| {
+        if (text.tokenId(if (srv.mm_think != null) reply_text.mm_think_markers.close else "</think>")) |end| {
             const lead = try text.encode(a, "\n", false);
             const trail = try text.encode(a, "\n\n", false);
             srv.think_close = try std.mem.concat(a, u32, &.{ lead, &.{end}, trail });
@@ -194,6 +200,12 @@ pub const Server = struct {
             log.line("prompt chunks of up to {s} tokens, cut at replies {d}+ tokens apart", .{ live.commas(&step, srv.info.prefill_step), srv.chunks.min_chunk });
         }
         return srv;
+    }
+
+    /// The markers a reply to `prompt` is split by (an enabled MiniMax prompt ends in the opener).
+    pub fn markersFor(srv: *const Server, prompt: []const u32) reply_text.Markers {
+        const m = srv.mm_think orelse return srv.markers;
+        return if (prompt.len > 0 and prompt[prompt.len - 1] == m.open) reply_text.mm_think_prompt_markers else srv.markers;
     }
 
     pub fn stopKeepalive(srv: *Server) void {
@@ -453,4 +465,17 @@ fn templateImages(srv: *Server) bool {
 /// Templates requiring a user query gain a user turn after trailing tool results replace their last user turn.
 fn needsUserAfterTool(source: []const u8) bool {
     return std.mem.indexOf(u8, source, "No user query found") != null;
+}
+
+test "MiniMax's reply markers follow the prompt's tail: enabled ends in the opener, so only the close is left" {
+    var srv: Server = undefined;
+    srv.markers = reply_text.mm_think_markers;
+    srv.mm_think = .{ .open = 7, .close = 8 };
+    try std.testing.expectEqualStrings("", srv.markersFor(&.{ 1, 2, 7 }).open);
+    try std.testing.expectEqualStrings("<mm:think>", srv.markersFor(&.{ 1, 2, 8 }).open);
+    try std.testing.expectEqualStrings("<mm:think>", srv.markersFor(&.{ 1, 2 }).open);
+    try std.testing.expectEqualStrings("</mm:think>", srv.markersFor(&.{}).close);
+    srv.mm_think = null;
+    srv.markers = reply_text.think_markers;
+    try std.testing.expectEqualStrings("</think>", srv.markersFor(&.{ 7 }).close);
 }

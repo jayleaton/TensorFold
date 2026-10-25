@@ -46,6 +46,7 @@ pub const route_rows = @import("route_rows.zig");
 pub const vit = @import("vit.zig");
 pub const tree_round = @import("tree_round.zig");
 pub const act_rows = @import("act_rows.zig");
+pub const minimax_m3_act = @import("minimax_m3_act.zig");
 pub const gdn_prep = @import("gdn_prep.zig");
 pub const qk_rows = @import("qk_rows.zig");
 pub const experts = @import("experts.zig");
@@ -60,6 +61,10 @@ pub const tree_attention = @import("tree_attention.zig");
 pub const block_attention = @import("block_attention.zig");
 pub const window_attention = @import("window_attention.zig");
 pub const moe_glue = @import("moe_glue.zig");
+pub const minimax_m3_sparse = @import("minimax_m3_sparse.zig");
+pub const minimax_m3_rows = @import("minimax_m3_rows.zig");
+pub const minimax_m3_proj = @import("minimax_m3_proj.zig");
+pub const minimax_m3_dspark = @import("minimax_m3_dspark.zig");
 pub const dense_rows = @import("dense_rows.zig");
 pub const exl3 = @import("exl3.zig");
 pub const exl3_experts = @import("exl3_experts.zig");
@@ -88,6 +93,7 @@ test {
     _ = @import("vit.zig");
     _ = @import("tree_round.zig");
     _ = @import("act_rows.zig");
+    _ = @import("minimax_m3_act.zig");
     _ = @import("gdn_prep.zig");
     _ = @import("qk_rows.zig");
     _ = @import("exl3_candidate.zig");
@@ -117,6 +123,10 @@ test {
     _ = @import("block_attention.zig");
     _ = @import("window_attention.zig");
     _ = @import("moe_glue.zig");
+    _ = @import("minimax_m3_sparse.zig");
+    _ = @import("minimax_m3_rows.zig");
+    _ = @import("minimax_m3_proj.zig");
+    _ = @import("minimax_m3_dspark.zig");
     _ = @import("dense_rows.zig");
 }
 

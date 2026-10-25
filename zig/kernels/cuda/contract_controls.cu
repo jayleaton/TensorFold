@@ -328,3 +328,25 @@ TF_CTL_SWIGLU_L2(tf_ctl_swiglu_l2_drop_gs, tf_act_l2::US | tf_act_l2::PROD)
 TF_CTL_SWIGLU_L2(tf_ctl_swiglu_l2_drop_us, tf_act_l2::GS | tf_act_l2::PROD)
 TF_CTL_SWIGLU_L2(tf_ctl_swiglu_l2_drop_prod, tf_act_l2::GS | tf_act_l2::US)
 #undef TF_CTL_SWIGLU_L2
+// Gate 1 (mode 0) and gate 3 (mode 1): minimax_m3_act.cu's swigluoai bf16 rows with one fault each. Mode 0 clamps by
+// fminf/fmaxf, which hand back the limit for a NaN (the plan's "fminf drops NaN"), so a NaN input reads as a finite number.
+// Mode 1 is right at whole 256-value tiles and loses the last value of a row otherwise.
+#include "minimax_m3_act.cuh"
+
+extern "C" __global__ void __launch_bounds__(256) tf_ctl_mm3_act(const __nv_bfloat16* gate, const __nv_bfloat16* up,
+                                                                  __nv_bfloat16* out, int n, float alpha, float limit,
+                                                                  float up_bias, int mode) {
+    const int64_t r = blockIdx.x;
+    const int i = blockIdx.y * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    if (mode == 1 && n % 256 != 0 && i == n - 1) return;
+    float g = __bfloat162float(gate[r * n + i]);
+    float u = __bfloat162float(up[r * n + i]);
+    if (mode == 0) {
+        g = fminf(g, limit);
+        u = fminf(fmaxf(u, -limit), limit);
+        out[r * n + i] = __float2bfloat16_rn(tf_mm3::swigluoai(g, u, alpha, 0.f, up_bias, false));
+        return;
+    }
+    out[r * n + i] = __float2bfloat16_rn(tf_mm3::swigluoai(g, u, alpha, limit, up_bias, false));
+}

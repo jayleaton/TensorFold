@@ -4,6 +4,7 @@ const json = @import("json");
 const ids = @import("ids.zig");
 const reply_text = @import("reply_text.zig");
 const tool_closers = @import("tool_closers.zig");
+const tool_minimax = @import("tool_minimax.zig");
 const tool_params = @import("tool_params.zig");
 const tool_specs = @import("tool_specs.zig");
 const tool_streaming = @import("tool_streaming.zig");
@@ -16,7 +17,7 @@ pub const deltas = tool_streaming.deltas;
 pub const wrapCalls = tool_streaming.wrapCalls;
 
 const Error = error{ Invalid, OutOfMemory };
-const Call = struct { name: []const u8, arguments: Value };
+const Call = tool_minimax.Invoke;
 const Envelope = struct { start: usize, end: usize, payload: []const u8, complete: bool = true };
 
 pub const Parsed = struct { content: []const u8, calls: ?[]Value, rejected_envelopes: usize = 0 };
@@ -91,6 +92,8 @@ fn envelopes(a: Allocator, text: []const u8) Allocator.Error![]Envelope {
         try found.append(a, .{ .start = s, .end = end, .payload = text[s..end], .complete = e != null });
         pos = end;
     }
+    pos = 0;
+    while (tool_minimax.nextBlock(text, pos)) |b| : (pos = b.end) try found.append(a, .{ .start = b.start, .end = b.end, .payload = b.payload, .complete = b.complete });
     std.mem.sort(Envelope, found.items, {}, struct {
         fn less(_: void, x: Envelope, y: Envelope) bool {
             if (x.start != y.start) return x.start < y.start;
@@ -135,6 +138,7 @@ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?u
                     error.Invalid => null,
                 };
             }
+            if (std.mem.startsWith(u8, env.payload, tool_minimax.ns ++ "<invoke ")) break :blk try tool_minimax.tryCalls(a, env.payload, &schemas);
             const one = payload(a, env.payload, &schemas, max_calls != null) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Invalid => break :blk null,
@@ -164,6 +168,7 @@ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?u
 
 /// What closes the call ``text`` ends inside (the model's end token came before its ``
 pub fn closeCall(a: Allocator, text: []const u8, tools: []const Value) Allocator.Error![]const u8 {
+    if (tool_minimax.unclosed(text)) |start| return tool_minimax.closing(a, text[start..], tools);
     var pos: usize = 0;
     var dsml = find(text, dsml_open, 0); // as in ``envelopes``
     // the opener ``envelopes`` leaves without a closer, so the one appended pairs with it

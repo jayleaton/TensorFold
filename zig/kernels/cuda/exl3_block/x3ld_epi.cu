@@ -4,6 +4,7 @@
 
 #include "x3ld.cu"
 #include "exl3_experts.cu"
+#include "../minimax_m3_act.cuh"
 
 namespace dsv41_x3ld_epi {
 
@@ -28,13 +29,14 @@ struct Epi {
     int E;
     float limit;
     int act_mode;
+    float alpha, up_bias;  // act_mode 2, 3 (minimax_m3_act.cuh's swigluoai); 0 elsewhere
 };
 
 // gateup_epilogue_kernel's body for program (p, blk) on one warp (Z read through L2: other CTAs wrote it).
 __device__ __forceinline__ void gateup_block(const float* __restrict__ Z, int e, const half* __restrict__ svh_g,
                                              const half* __restrict__ svh_u, const half* __restrict__ suh_d,
                                              half* __restrict__ xd, int p, int blk, int lane, int P, int N, int SK,
-                                             float limit, int act_mode) {
+                                             float limit, int act_mode, float alpha, float up_bias) {
     const int n = blk * 128 + 4 * lane;
     float gv[4], uv[4];
 #pragma unroll
@@ -53,7 +55,11 @@ __device__ __forceinline__ void gateup_block(const float* __restrict__ Z, int e,
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
         float act;
-        if (act_mode == 0) {
+        if (act_mode >= tf_mm3::ACT_SWIGLUOAI) {
+            act = tf_mm3::swigluoai(gv[j] * HAD_SCALE * __half2float(svh_g[(size_t)e * N + n + j]),
+                                    uv[j] * HAD_SCALE * __half2float(svh_u[(size_t)e * N + n + j]), alpha, limit, up_bias,
+                                    act_mode == tf_mm3::ACT_SWIGLUOAI_SYM);
+        } else if (act_mode == 0) {
             float gg = fminf(bf16r(gv[j] * HAD_SCALE * __half2float(svh_g[(size_t)e * N + n + j])), limit);
             float uu = fminf(fmaxf(bf16r(uv[j] * HAD_SCALE * __half2float(svh_u[(size_t)e * N + n + j])), -limit),
                              limit);
@@ -187,7 +193,7 @@ __device__ __forceinline__ void epi_body(const half* __restrict__ X0, const half
             if (p < 0) continue;
             const int ep = a.pick[p];
             if (ep < 0 || ep >= a.E) continue;                       // gateup_epilogue_kernel's exit
-            gateup_block(Z, ep, a.sv0, a.sv1, a.sd, a.xd, p, blockIdx.y, lane, P, N, SK, a.limit, a.act_mode);
+            gateup_block(Z, ep, a.sv0, a.sv1, a.sd, a.xd, p, blockIdx.y, lane, P, N, SK, a.limit, a.act_mode, a.alpha, a.up_bias);
         }
     } else {
         // ---- down_combine's per-slot part from the complete Z in shared memory (SK 1) ----

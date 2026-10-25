@@ -233,7 +233,7 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
     };
     release(srv, preparing); // a background request waits only while a foreground one prepares
     preparing = false;
-    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .seed = if (request.sampling) |v| v.seed else null, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .lp = if (request.logprobs != null) .{} else null };
+    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .seed = if (request.sampling) |v| v.seed else null, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .markers = srv.markersFor(request.prompt), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .lp = if (request.logprobs != null) .{} else null };
     defer srv.noteRequest(prepared.prompt_len, box.cached orelse 0, gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
     const result: Failure!Reply = blk: {
@@ -278,6 +278,7 @@ const Generation = struct {
     seed: ?u64 = null,
     sink: ?Sink,
     thinking: bool,
+    markers: reply_text.Markers = reply_text.think_markers, // this reply's think markers (MiniMax's depend on the prompt's tail)
     stops: reply_text.Stops,
     ignore_eos: bool,
     max_tokens: u32,
@@ -353,7 +354,7 @@ const Generation = struct {
         var answer = text;
         if (g.thinking) {
             const close = try g.visible.closeOf(g.a, reply_text.decodeText, g.srv.text, g.srv.close_id);
-            const split = try reply_text.splitThinkingAt(g.a, text, false, g.srv.markers, close);
+            const split = try reply_text.splitThinkingAt(g.a, text, false, g.markers, close);
             const piece = g.streamed_reasoning.after(split.reasoning, true);
             if (piece.len > 0) {
                 try g.streamed_reasoning.set(g.a, split.reasoning, piece);
@@ -475,7 +476,7 @@ const Generation = struct {
         var content: []const u8 = text;
         var reasoning: ?[]const u8 = null;
         if (g.thinking) {
-            const split = try reply_text.splitThinkingTokens(a, reply_text.decodeText, g.srv.text, text, true, g.srv.markers, content_tokens, g.srv.close_id);
+            const split = try reply_text.splitThinkingTokens(a, reply_text.decodeText, g.srv.text, text, true, g.markers, content_tokens, g.srv.close_id);
             const r = reply_text.pyStrip(split.reasoning);
             reasoning = if (r.len > 0) r else null;
             content = split.answer;

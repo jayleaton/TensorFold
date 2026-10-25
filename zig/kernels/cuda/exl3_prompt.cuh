@@ -144,7 +144,7 @@ template <int XR>
 __device__ __forceinline__ void tgateup(const half* __restrict__ Xg, const half* __restrict__ Xu, const uint64_t* __restrict__ Tg,
         const uint64_t* __restrict__ Tu, const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members,
         const half* __restrict__ svh_g, const half* __restrict__ svh_u, const half* __restrict__ suh_d, half* __restrict__ xd,
-        int K, int N, int xdiv, float limit, int act_mode, unsigned char* smem_raw, int* rows_sh) {
+        int K, int N, int xdiv, float limit, int act_mode, float alpha, float up_bias, unsigned char* smem_raw, int* rows_sh) {
     const int cb = blockIdx.x, item = blockIdx.y;
     if (item >= counts[0]) return;
     const int e = items[3 * item], first = items[3 * item + 1], cnt = items[3 * item + 2];
@@ -177,12 +177,17 @@ __device__ __forceinline__ void tgateup(const half* __restrict__ Xg, const half*
             for (int j = 0; j < 4; ++j) {
                 float gg = gv[j] * HAD_SCALE * __half2float(svh_g[(size_t)e * N + n + j]);
                 float uu = uv[j] * HAD_SCALE * __half2float(svh_u[(size_t)e * N + n + j]);
+                float act;
+                if (act_mode >= tf_mm3::ACT_SWIGLUOAI) {
+                    act = tf_mm3::swigluoai(gg, uu, alpha, limit, up_bias, act_mode == tf_mm3::ACT_SWIGLUOAI_SYM);
+                } else {
                 if (act_mode == 0) { gg = bf16r(gg); uu = bf16r(uu); }
                 if (limit > 0) { gg = upTo(gg, limit); uu = within(uu, limit); }
-                float act = gg / (1.f + expf(-gg));
+                act = gg / (1.f + expf(-gg));
                 if (act_mode == 0) act = bf16r(act);
                 act *= uu;
                 if (act_mode == 0) act = bf16r(act);
+                }
                 v[j] = act * __half2float(suh_d[(size_t)e * N + n + j]);
             }
             fwht128(v, lane);

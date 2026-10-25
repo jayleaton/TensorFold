@@ -214,10 +214,13 @@ pub const GmArgs = extern struct {
     K: c_int = 0,
     N: c_int = 0,
     limit: f32 = 0,
+    act_mode: c_int = 0, // 0: silu; 2, 3: swigluoai (gate/up launches only)
+    alpha: f32 = 0,
+    up_bias: f32 = 0,
 };
 
 comptime {
-    std.debug.assert(@sizeOf(GmArgs) == 160 and @offsetOf(GmArgs, "k2e") == 48 and @offsetOf(GmArgs, "K") == 144 and @offsetOf(GmArgs, "limit") == 152);
+    std.debug.assert(@sizeOf(GmArgs) == 168 and @offsetOf(GmArgs, "k2e") == 48 and @offsetOf(GmArgs, "K") == 144 and @offsetOf(GmArgs, "limit") == 152 and @offsetOf(GmArgs, "act_mode") == 156 and @offsetOf(GmArgs, "alpha") == 160);
 }
 
 /// x3gm's per-launch checks (launch<>): K in whole stages, N in 128-column Hadamard blocks.
@@ -243,7 +246,7 @@ pub fn gmGateup(o: Ops, xg: u64, xu: u64, tg: u64, tu: u64, order: u64, pe: u64,
     const ki = gmK2Index(k2) orelse return error.Unsupported;
     if (cfg >= gu_tiles.len) return error.Unsupported;
     try gmCheck(.gu, cfg, K, N);
-    var a: GmArgs = .{ .x0 = xg, .x1 = xu, .order = order, .pe = pe, .poff = poff, .pcnt = pcnt, .npass = npass, .ticket = ticket, .sv0 = svh_g, .sv1 = svh_u, .sd = suh_d, .xd = xd, .K = int(K), .N = int(N), .limit = limit };
+    var a: GmArgs = .{ .x0 = xg, .x1 = xu, .order = order, .pe = pe, .poff = poff, .pcnt = pcnt, .npass = npass, .ticket = ticket, .sv0 = svh_g, .sv1 = svh_u, .sd = suh_d, .xd = xd, .K = int(K), .N = int(N), .limit = limit, .act_mode = o.act.mode, .alpha = o.act.alpha, .up_bias = o.act.up_bias };
     if (tables) {
         a.tp0 = tg;
         a.tp1 = tu;
@@ -275,7 +278,7 @@ pub fn gm2Gateup(o: Ops, xg: u64, xu: u64, tg: u64, tu: u64, k2e: u64, order: u6
     const gu2 = cfg == gu2_cfg and !shx;
     const ci = std.mem.indexOfScalar(usize, &v2_gu, cfg) orelse if (gu2) 0 else return error.Unsupported;
     try gmCheck(.gu, cfg, K, N);
-    var a: GmArgs = .{ .x0 = xg, .x1 = xu, .k2e = k2e, .order = order, .pe = pe, .poff = poff, .pcnt = pcnt, .npass = npass, .ticket = ticket, .sv0 = svh_g, .sv1 = svh_u, .sd = suh_d, .xd = xd, .K = int(K), .N = int(N), .limit = limit };
+    var a: GmArgs = .{ .x0 = xg, .x1 = xu, .k2e = k2e, .order = order, .pe = pe, .poff = poff, .pcnt = pcnt, .npass = npass, .ticket = ticket, .sv0 = svh_g, .sv1 = svh_u, .sd = suh_d, .xd = xd, .K = int(K), .N = int(N), .limit = limit, .act_mode = o.act.mode, .alpha = o.act.alpha, .up_bias = o.act.up_bias };
     if (tables) {
         a.tp0 = tg;
         a.tp1 = tu;
@@ -306,7 +309,7 @@ pub fn gm3Gateup(o: Ops, v: usize, xg: u64, xu: u64, tg: u64, tu: u64, k2e: u64,
     const vv = v3_variants[v];
     if (vv.mats != 2 or vv.xm != @as(u32, if (shx) 1 else 2)) return error.Unsupported;
     if ((K / 16) % vv.t[2] != 0 or N % 128 != 0) return error.Shape;
-    var a: GmArgs = .{ .x0 = xg, .x1 = xu, .k2e = k2e, .order = order, .pe = pe, .poff = poff, .pcnt = pcnt, .npass = npass, .ticket = ticket, .sv0 = svh_g, .sv1 = svh_u, .sd = suh_d, .xd = xd, .K = int(K), .N = int(N), .limit = limit };
+    var a: GmArgs = .{ .x0 = xg, .x1 = xu, .k2e = k2e, .order = order, .pe = pe, .poff = poff, .pcnt = pcnt, .npass = npass, .ticket = ticket, .sv0 = svh_g, .sv1 = svh_u, .sd = suh_d, .xd = xd, .K = int(K), .N = int(N), .limit = limit, .act_mode = o.act.mode, .alpha = o.act.alpha, .up_bias = o.act.up_bias };
     if (tables) {
         a.tp0 = tg;
         a.tp1 = tu;

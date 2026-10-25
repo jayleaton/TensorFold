@@ -341,3 +341,25 @@ test "combined page cap: all three windows and only the two extra streams' recur
     b.engine_paged = false;
     try expectEqual(@as(usize, 10), (try kv.plan(l, b)).pages);
 }
+
+test "an all-paged layout counts every stream against the pool: lanes are the streams that fit, none is the engine's own" {
+    const g: u64 = 1 << 30;
+    const all: kv.Layout = .{ .fixed_bytes = mib, .token_bytes = 75 << 10, .page_tokens = 128, .snap_bytes = 64, .all_paged = true };
+    const one = try kv.plan(all, .{ .room = 40 * g, .engine = 0, .lanes = 1 });
+    try expectEqual(@as(u32, 1), one.lanes);
+    try expectEqual(@as(u32, 1), one.paged);
+    const four = try kv.plan(all, .{ .room = 40 * g, .engine = 0, .lanes = 4 });
+    try expectEqual(@as(u32, 4), four.lanes);
+    try expectEqual(@as(u32, 4), four.paged);
+    try expectEqual(@as(usize, @intCast((40 * g - 4 * mib) / all.pageBytes())), four.pages);
+    const same = nemotron_like(false);
+    try expectEqual(@as(u32, 3), (try kv.plan(same, .{ .room = 40 * g, .engine = 0, .lanes = 4 })).paged);
+    try std.testing.expectError(error.TooMany, kv.plan(all, .{ .room = 3 * (mib + all.pageBytes()), .engine = 0, .lanes = 4, .fixed = true }));
+    try std.testing.expectError(error.NoStream, kv.plan(all, .{ .room = mib, .engine = 0, .lanes = 2 }));
+    try expect(kv.holds(all, .{ .room = 2 * (mib + all.pageBytes()) + g, .engine = 0, .lanes = 2, .cache = g }));
+    try expect(!kv.holds(all, .{ .room = 2 * (mib + all.pageBytes()) + g - 1, .engine = 0, .lanes = 2, .cache = g }));
+}
+
+fn nemotron_like(all: bool) kv.Layout {
+    return .{ .fixed_bytes = mib, .token_bytes = 75 << 10, .page_tokens = 128, .snap_bytes = 64, .all_paged = all };
+}

@@ -296,10 +296,12 @@ pub const Epi = extern struct {
     E: c_int = 0,
     limit: f32 = 0,
     act_mode: c_int = 0,
+    alpha: f32 = 0, // act_mode 2, 3: swigluoai
+    up_bias: f32 = 0,
 };
 
 comptime {
-    std.debug.assert(@sizeOf(Epi) == 88 and @offsetOf(Epi, "E") == 72);
+    std.debug.assert(@sizeOf(Epi) == 96 and @offsetOf(Epi, "E") == 72 and @offsetOf(Epi, "alpha") == 84);
 }
 
 /// The ticket words a fused launch counts on (gate/up: expert x member tile x 128 columns; down: row x 128 columns).
@@ -319,10 +321,23 @@ pub fn x3ldEpiCheck(g: Grouped, kind: EpiKind, pd: u32) Error!struct { pd: usize
     return .{ .pd = pi, .range = c.range };
 }
 
+/// The gate/up activation of the x3gm launches (gmGateup, gm2Gateup, gm3Gateup): silu by default (mode 0), or MiniMax's
+/// swigluoai (mode 2: gate clamped above, 3: both sides; `limit` is the launch's limit argument).
+pub const Act = struct {
+    mode: c_int = 0,
+    alpha: f32 = 0,
+    up_bias: f32 = 0,
+
+    pub fn swigluoai(alpha: f32, up_bias: f32, symmetric_gate_clamp: bool) Act {
+        return .{ .mode = if (symmetric_gate_clamp) 3 else 2, .alpha = alpha, .up_bias = up_bias };
+    }
+};
+
 pub const Ops = struct {
     f: *const Functions,
     s: cuda.Stream,
     sms: usize,
+    act: Act = .{},
 
     /// x3ld (expert_loads.grouped): Z of every (mat, split, live member row, column), upstream's bits.
     pub fn x3ld(o: Ops, g: Grouped, nt: u32, pd: u32, probe: u32, pdl: bool) !void {
@@ -398,6 +413,8 @@ pub const Ops = struct {
 
     /// exl3x_gateup_epilogue_cuda: splits summed, rotated, * svh, SwiGLU (act_mode 0 bf16 roundings, 1 fp32), Xd.
     pub fn gateupEpilogue(o: Ops, z: u64, pick: u64, svh_g: u64, svh_u: u64, suh_d: u64, xd: u64, rows: usize, P: usize, N: usize, SK: usize, slots: usize, E: usize, limit: f32, act_mode: c_int) !void {
+        // This entry point is DeepSeek's mangled kernel: it has no swigluoai arm (x3ld_epi's and the x3gm launches' do).
+        if (act_mode != 0 and act_mode != 1) return error.Unsupported;
         var a: cuda.Args = .{};
         for ([_]u64{ z, pick, svh_g, svh_u, suh_d, xd }) |v| a.add(v);
         for ([_]usize{ P, N, SK, E }) |v| a.add(int(v));

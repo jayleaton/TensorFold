@@ -8,6 +8,7 @@
 #include <cuda_bf16.h>
 
 #include "../exl3_decode.cuh"
+#include "../minimax_m3_act.cuh"
 #include "experts_grouped.cuh"
 
 namespace dsv41_x3gm {
@@ -99,6 +100,8 @@ struct Args {
     float* y;                 // down out [P, N]
     int K, N;
     float limit;
+    int act_mode;             // 0: the silu path above; 2, 3: minimax_m3_act.cuh's swigluoai (gate/up only)
+    float alpha, up_bias;     // act_mode 2 and 3
 };
 
 template <int MATS, int XM, int K2, int MTL, int NG, int KS, int NSA, int NGR>
@@ -237,9 +240,16 @@ __global__ void __launch_bounds__(Cfg<MATS, XM, K2, MTL, NG, KS, NSA, NGR>::THRE
                     tf_exl3::fwht128(u, lane);
 #pragma unroll
                     for (int j = 0; j < 4; ++j) {                 // upstream gateup_epilogue, ACT_F32
-                        const float gg = fminf(v[j] * HAD * __half2float(a.sv0[col + j]), a.limit);
-                        const float uu = fminf(fmaxf(u[j] * HAD * __half2float(a.sv1[col + j]), -a.limit), a.limit);
-                        const float act = gg / (1.f + expf(-gg)) * uu;
+                        const float gr = v[j] * HAD * __half2float(a.sv0[col + j]);
+                        const float ur = u[j] * HAD * __half2float(a.sv1[col + j]);
+                        float act;
+                        if (a.act_mode >= tf_mm3::ACT_SWIGLUOAI) {                // MiniMax swigluoai (act_mode 2, 3)
+                            act = tf_mm3::swigluoai(gr, ur, a.alpha, a.limit, a.up_bias, a.act_mode == tf_mm3::ACT_SWIGLUOAI_SYM);
+                        } else {
+                            const float gg = fminf(gr, a.limit);
+                            const float uu = fminf(fmaxf(ur, -a.limit), a.limit);
+                            act = gg / (1.f + expf(-gg)) * uu;
+                        }
                         v[j] = act * __half2float(a.sd[col + j]);
                     }
                     tf_exl3::fwht128(v, lane);

@@ -8,12 +8,17 @@ pub const think_markers: Markers = .{ .open = "", .close = "</think>" };
 /// The opener a reply writes itself when its template leaves the think block to it (Kolibri 1's does).
 const think_open = "<think>";
 pub const channel_markers: Markers = .{ .open = "<|channel>thought", .close = "<channel|>" };
-/// (opener, closer) of a tool call's markup: Qwen's, Gemma 4's, DeepSeek-V4's DSML block, LFM2's.
+/// MiniMax-M3.1 writes `<mm:think>` itself when its prompt left thinking adaptive; with thinking enabled the prompt
+/// already ends in it, so the reply holds only the close (`mm_think_prompt_markers`). Which one applies is the prompt's tail.
+pub const mm_think_markers: Markers = .{ .open = "<mm:think>", .close = "</mm:think>" };
+pub const mm_think_prompt_markers: Markers = .{ .open = "", .close = "</mm:think>" };
+/// (opener, closer) of a tool call's markup: Qwen's, Gemma 4's, DeepSeek-V4's DSML block, LFM2's, MiniMax-M3.1's.
 pub const calls = [_][2][]const u8{
     .{ "<tool_call>", "</tool_call>" },
     .{ "<|tool_call>", "<tool_call|>" },
     .{ "<\u{ff5c}DSML\u{ff5c}tool_calls>", "</\u{ff5c}DSML\u{ff5c}tool_calls>" },
     .{ "<|tool_call_start|>", "<|tool_call_end|>" },
+    .{ "]<]minimax[>[<tool_call>", "]<]minimax[>[</tool_call>" },
 };
 /// Each opener's payload lead: Gemma 4's ``call:`` (26B: ``:``), DSML's invoke; ``<tool_call>`` and LFM2 have none.
 const leads = [calls.len][]const []const u8{ &.{}, &.{ "call:", ":" }, &.{"<\u{ff5c}DSML\u{ff5c}invoke"}, &.{} };

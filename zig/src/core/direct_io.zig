@@ -35,6 +35,11 @@ pub const File = struct {
         return .{ .fd = fd, .direct = false };
     }
 
+    /// Drops this file's pages from the page cache (a refused direct read falls back to it); a no-op without the call.
+    pub fn dropCache(f: File) void {
+        if (builtin.os.tag == .linux) _ = std.os.linux.fadvise(f.fd, 0, 0, std.os.linux.POSIX_FADV.DONTNEED);
+    }
+
     pub fn close(f: *File) void {
         _ = platform.c.close(f.fd);
         f.* = undefined;

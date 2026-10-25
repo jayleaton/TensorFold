@@ -98,7 +98,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     runner.addImport("exlr8_frozen_dense", b.createModule(.{ .root_source_file = b.path("zig/tests/fixtures/exlr8/frozen_dense.zig"), .target = target, .optimize = optimize }));
     for (exlr8_build.denseModules(b, target, optimize, exlr8, exlr8_tests[0])) |m| runner.addImport(m.name, m.module);
     const glm_cuda = glmCuda(b, target, optimize, cuda, mods.core, mods.lanes, mods.heat);
-    runner.addImport("glm_cuda", glm_cuda);
+    for ([_]struct { []const u8, *std.Build.Module }{ .{ "glm_cuda", glm_cuda }, .{ "minimax_cuda", @import("minimax_family.zig").module(b, target, optimize, cuda, mods.core, mods.lanes, native.api, glm_cuda.import_table.get("canon").?) } }) |m| runner.addImport(m[0], m[1]);
     for ([_]struct { []const u8, *std.Build.Module }{ .{ "kolibri1", kolibri1Module(b, target, optimize, cuda, mods.core, mods.lanes) }, .{ "dory", @import("dory.zig").module(b, target, optimize, cuda, mods.core, mods.lanes) } }) |m| runner.addImport(m[0], m[1]);
     runner.addImport("gemma4_cuda", @import("gemma4_cuda.zig").module(b, target, optimize, cuda, mods.core, mods.lanes));
     const runner_exe = b.addExecutable(.{ .name = "tf-cuda-test", .root_module = runner });
@@ -143,7 +143,6 @@ fn glmCuda(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
 
 /// The Kolibri-1 CUDA family over the runtime, the core and the lane core.
 const kolibri1Module = @import("kolibri.zig").module;
-
 /// LFM2 (d1's decision model) on CUDA: config, weights, kernels and the forward that scores labels.
 fn lfm2Module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module) *std.Build.Module {
     return b.createModule(.{ .root_source_file = b.path("zig/src/families/lfm2/lfm2.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = core } } });
@@ -173,6 +172,7 @@ fn flashnextModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: st
 /// The CUDA engines a native server opens (native/cuda.zig), over the given runtime and families.
 fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, heat: *std.Build.Module, qwen35: *std.Build.Module, qwen_vision: *std.Build.Module) struct { api: *std.Build.Module, engines: *std.Build.Module } {
     const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} });
+    const glm = glmCuda(b, target, optimize, cuda, core, lanes, heat);
     const mod = b.createModule(.{
         .root_source_file = b.path("zig/src/native/cuda.zig"),
         .target = target,
@@ -187,7 +187,8 @@ fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
             .{ .name = "lfm2", .module = lfm2Module(b, target, optimize, cuda, core) },
             .{ .name = "core", .module = core },
             .{ .name = "flashnext", .module = flashnextModule(b, target, optimize, cuda, core, lanes, qwen_vision) },
-            .{ .name = "glm_cuda", .module = glmCuda(b, target, optimize, cuda, core, lanes, heat) },
+            .{ .name = "glm_cuda", .module = glm },
+            .{ .name = "minimax_cuda", .module = @import("minimax_family.zig").module(b, target, optimize, cuda, core, lanes, api, glm.import_table.get("canon").?) },
             .{ .name = "qwen35", .module = qwen35 },
             .{ .name = "kolibri1", .module = kolibri1Module(b, target, optimize, cuda, core, lanes) },
             .{ .name = "gemma4_cuda", .module = @import("gemma4_cuda.zig").module(b, target, optimize, cuda, core, lanes) },
@@ -491,6 +492,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     const parse_tests = b.createModule(.{ .root_source_file = b.path("zig/src/server/tool_parse_test.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "engine_api", .module = native_modules.api }, .{ .name = "tokenizer", .module = mods.tokenizer }, .{ .name = "template", .module = template } } });
     _ = @import("server.zig").addTo(b, parse_tests, host, .debug);
     @import("server.zig").toolHostTests(b, parse_tests, server_tests, step);
+    @import("minimax_family.zig").steps(b, host, cuda, mods.core, mods.lanes, native_modules.api, mods.tokenizer, template, @import("server.zig").addTo, step);
     // Living Weights: the family-neutral learner, then the pocket in each family's shards over the core's shard files
     const living_run = b.addRunArtifact(b.addTest(.{ .root_module = mods.living }));
     const shards = b.createModule(.{ .root_source_file = b.path("zig/src/living_shards_test.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{.{ .name = "living", .module = mods.living }} });

@@ -11,7 +11,7 @@ const Cx = errors.Cx;
 const Allocator = std.mem.Allocator;
 
 /// The template's call envelope, with XML parameters or JSON arguments.
-pub const Style = enum { xml, json, gemma, glm };
+pub const Style = enum { xml, json, gemma, glm, minimax };
 
 const probe = "tfprobe_fn";
 const key = "tfprobe_k";
@@ -24,6 +24,7 @@ const value_blanks = 32;
 
 /// The style of `rendered`, a turn that calls `probe` with {key: "v"}; null: markup this grammar does not write.
 pub fn style(rendered: []const u8) ?Style {
+    if (std.mem.indexOf(u8, rendered, "]<]minimax[>[<invoke name=\"" ++ probe ++ "\">") != null) return .minimax;
     if (std.mem.indexOf(u8, rendered, "<|tool_call>call:" ++ probe ++ "{") != null) return .gemma;
     const at = std.mem.lastIndexOf(u8, rendered, "<tool_call>") orelse return null;
     const text = rendered[at..];
@@ -32,6 +33,9 @@ pub fn style(rendered: []const u8) ?Style {
     if (std.mem.indexOf(u8, text, "<tool_call>" ++ probe ++ "<arg_key>" ++ key ++ "</arg_key>") != null) return .glm;
     return null;
 }
+
+/// MiniMax tags each parameter by its own name after a namespace token; no xgrammar style is known to write that.
+pub const minimax_refusal = "tool_choice \"required\" or a named function cannot be enforced for MiniMax-M3.1's tool markup yet: use tool_choice \"auto\" and check the reply's tool_calls";
 
 /// The grammar for a reply that must call one of `tools`: one call, or (`parallel`) one or more, then the end.
 pub fn structure(srv: *Server, cx: *Cx, tools: []const Value, parallel: bool, thinking: bool) errors.Refused!api.Structure {
@@ -42,6 +46,7 @@ pub fn structure(srv: *Server, cx: *Cx, tools: []const Value, parallel: bool, th
         error.Refused => "",
     };
     const s = style(rendered) orelse .json; // unrecognized markup uses the canonical call form the parser accepts
+    if (s == .minimax) return cx.refuse(minimax_refusal);
     const text = try build(cx.a, s, tools, parallel);
     const field = try std.fmt.allocPrint(cx.a, "tool_choice \"required\" or a named function on backend '{s}'", .{srv.backendName()});
     return srv.compiledStructure(cx, .structural_tag, text, field, thinking);
@@ -84,6 +89,7 @@ fn call(a: Allocator, s: Style, name: []const u8, schema: Value) Allocator.Error
             try whole.put(a, "required", try list(a, &.{ .{ .string = "name" }, .{ .string = "arguments" } }));
             break :blk try list(a, &.{ try constant(a, "<tool_call>"), ws, try arguments(a, .{ .object = whole }, "json"), ws, try constant(a, "</tool_call>") });
         },
+        .minimax => unreachable, // `structure` refuses before it builds
         // GLM's template writes NAME<arg_key>K</arg_key><arg_value>V</arg_value>... with no blanks: xgrammar's glm_xml
         .glm => try list(a, &.{
             try constant(a, try std.fmt.allocPrint(a, "<tool_call>{s}", .{name})), try arguments(a, schema, "glm_xml"),
@@ -128,6 +134,11 @@ test "the probe call's markup picks the style" {
     try std.testing.expectEqual(Style.json, style("<tool_call>\n{\"name\": \"tfprobe_fn\", \"arguments\": {\"tfprobe_k\": \"v\"}}\n</tool_call>").?);
     try std.testing.expectEqual(Style.gemma, style("<|tool_call>call:tfprobe_fn{tfprobe_k:<|\"|>v<|\"|>}<tool_call|>").?);
     try std.testing.expectEqual(Style.glm, style("</think><tool_call>tfprobe_fn<arg_key>tfprobe_k</arg_key><arg_value>v</arg_value></tool_call>").?);
+}
+
+test "MiniMax's probe call picks its own style, which a required call refuses by name" {
+    try std.testing.expectEqual(Style.minimax, style("]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"tfprobe_fn\">]<]minimax[>[<tfprobe_k>v]<]minimax[>[</tfprobe_k>").?);
+    try std.testing.expect(std.mem.indexOf(u8, minimax_refusal, "tool_choice") != null);
 }
 
 test "a required call's grammar names every offered tool and its schema; one call without parallel" {

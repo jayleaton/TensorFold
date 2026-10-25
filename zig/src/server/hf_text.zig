@@ -347,7 +347,7 @@ pub const HfText = struct {
             var it = t.specials.object.iterator();
             while (it.next()) |e| try globals.put(a, e.key_ptr.*, e.value_ptr.*);
         }
-        try globals.put(a, "thinking_mode", .{ .string = if (options.enable_thinking) "thinking" else "chat" });
+        try globals.put(a, "thinking_mode", .{ .string = thinkingMode(t.source, options.enable_thinking) });
         var context: std.json.ObjectMap = .empty;
         try context.put(a, "enable_thinking", .{ .bool = options.enable_thinking });
         if (options.reasoning_effort) |e| try context.put(a, "reasoning_effort", .{ .string = e });
@@ -361,6 +361,19 @@ pub const HfText = struct {
         return .{ .text = out.s, .spans = out.spans };
     }
 };
+
+/// The template's `thinking_mode` word: "thinking" or "chat"; MiniMax-M3.1's template reads "enabled" and "disabled".
+fn thinkingMode(source: []const u8, on: bool) []const u8 {
+    if (std.mem.indexOf(u8, source, "thinking_mode == \"adaptive\"") != null) return if (on) "enabled" else "disabled";
+    return if (on) "thinking" else "chat";
+}
+
+test "thinking_mode: MiniMax's template gets its own words, every other template keeps thinking and chat" {
+    try std.testing.expectEqualStrings("enabled", thinkingMode("{% if thinking_mode == \"adaptive\" %}", true));
+    try std.testing.expectEqualStrings("disabled", thinkingMode("{% if thinking_mode == \"adaptive\" %}", false));
+    try std.testing.expectEqualStrings("thinking", thinkingMode("{% if thinking_mode == \"thinking\" %}", true));
+    try std.testing.expectEqualStrings("chat", thinkingMode("", false));
+}
 
 test "model EOS does not hide a different tokenizer chat end" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

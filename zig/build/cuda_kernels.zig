@@ -91,6 +91,7 @@ pub const kernels = [_]Kernel{
     .{ .name = "window_rows", .flags = &.{"-O3"} }, // ours: window attention at head dims 256 and 512 (cuda/window_attention.zig)
     .{ .name = "moe_glue", .flags = &.{"-O3"} }, // ours: sigmoid top-k and the weighted combine (cuda/moe_glue.zig)
     .{ .name = "dense_rows", .flags = &.{"-O3"} }, // ours: bf16 rows times weight rows into fp32 (cuda/dense_rows.zig)
+    .{ .name = "minimax_m3_act", .flags = &.{"-O3"} }, // ours: MiniMax-M3.1-Flash swigluoai for the dense and shared experts (cuda/minimax_m3_act.zig)
     .{ .name = "modelopt_pack", .flags = &.{"-O3"} }, // ours: ModelOpt tensors into the lane, prompt and expert layouts
     .{ .name = "glm_kda", .flags = &.{ "-O3", "--fmad=false" } }, // GLM: the Python family's glm5_next/cuda/kda.cu
     .{ .name = "glm_glue", .flags = &.{"-O3"} }, // ours: the Python family's Triton glue by hand, its PTX op for op
@@ -109,6 +110,12 @@ pub const kernels = [_]Kernel{
     .{ .name = "torch_movement", .src = "torch_ops/movement", .flags = torch_ops },
     .{ .name = "torch_nemotron_constants", .src = "torch_ops/nemotron_constants", .flags = torch_ops },
     .{ .name = "roce_gather", .src = "roce_gather", .flags = &.{"-O3"} }, // b12x's one-shot RoCE all-gather, two ranks
+    .{ .name = "minimax_m3_index", .flags = glue }, // ours: MiniMax-M3.1-Flash index scores and per-128-key block maxima (cuda/minimax_m3_sparse.zig)
+    .{ .name = "minimax_m3_select", .flags = glue }, // ours: forced-block top-16 with the tie and forcing rules as launch parameters
+    .{ .name = "minimax_m3_attn", .flags = glue }, // ours: selected-block GQA attention over paged K/V, 16 q heads a K/V stream
+    .{ .name = "minimax_m3_rows", .flags = glue }, // ours: MiniMax-M3.1-Flash per-head norm, partial RoPE, paged K/V/IK writes and the fp32 router GEMV
+    .{ .name = "minimax_m3_proj", .flags = glue }, // ours: MiniMax-M3.1-Flash fp16-weight index projections and the per-rank greedy (logit, id) pick
+    .{ .name = "minimax_m3_dspark", .flags = glue }, // ours: MiniMax-M3.1-Flash dspark draft taps, norms, head norm + RoPE, ring attention, top-C and Markov chain
     .{ .name = "drama3_staged_gemv", .flags = glue },
     .{ .name = "drama3", .flags = &.{"-O3"} },
     .{ .name = "drama3_fp8", .flags = &.{"-O3"} },

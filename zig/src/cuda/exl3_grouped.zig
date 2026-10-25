@@ -31,6 +31,8 @@ const Stage = extern struct {
     epi: i32,
     act_mode: i32,
     limit: f32,
+    alpha: f32,
+    up_bias: f32,
 };
 
 pub const UpContract = enum { bf16, combined_fp32 };
@@ -81,7 +83,7 @@ pub const Grouped = struct {
             .up => 2,
             .down_f32 => 0,
             .down_bf16 => 3,
-        }, .act_mode = w.act_mode, .limit = w.limit };
+        }, .act_mode = w.act_mode, .limit = w.limit, .alpha = w.alpha, .up_bias = w.up_bias };
         var rot: launch.Args = .{};
         rot.add(a);
         try launch.launch(g.kernels.plan_rotate, .{ .grid = .{ .x = @intCast(items), .y = @intCast(k / 128), .z = @intCast(mats) }, .block = .{ .x = 32 } }, s, &rot);

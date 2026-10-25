@@ -6,6 +6,7 @@ const reply_text = @import("reply_text.zig");
 const tool_params = @import("tool_params.zig");
 const tool_specs = @import("tool_specs.zig");
 const tool_parse = @import("tool_parse.zig");
+const tool_minimax = @import("tool_minimax.zig");
 const Value = json.Value;
 const Allocator = std.mem.Allocator;
 
@@ -127,6 +128,15 @@ pub const Streamer = struct {
                     const from = @min(text.len, @max(s.pos, s.searched -| (dsml_open.len - 1)));
                     var at = from;
                     while (std.mem.indexOfScalarPos(u8, text, at, '<')) |start| {
+                        // MiniMax's `]<]minimax[>[<tool_call>`: its first '<' is the second byte of the opener
+                        if (start > s.pos and std.mem.startsWith(u8, text[start - 1 ..], tool_minimax.open)) {
+                            s.buffered_start = start - 1;
+                            s.buffered_close = tool_minimax.close;
+                            s.pos = start - 1 + tool_minimax.open.len;
+                            s.dsml_searched = s.pos;
+                            s.state = .buffered;
+                            break;
+                        }
                         if (std.mem.startsWith(u8, text[start..], dsml_open)) {
                             s.dsml_seen = true;
                             s.dsml_start = start;
@@ -320,15 +330,14 @@ fn nameLike(s: []const u8) bool {
 /// Hides tool envelopes from streamed prose, holding only a partial tag between deltas.
 pub const TextFilter = struct {
     pending: std.ArrayList(u8) = .empty,
-    hidden: ?[]const u8 = null,
+    hidden: ?[]const u8 = null, // the closer of the envelope being hidden
 
     pub fn feed(f: *TextFilter, a: Allocator, text: []const u8) Allocator.Error![]const u8 {
         try f.pending.appendSlice(a, text);
         var out: std.ArrayList(u8) = .empty;
         while (f.pending.items.len > 0) {
             const p = f.pending.items;
-            if (f.hidden) |name| {
-                const close = try std.mem.concat(a, u8, &.{ "</", name, ">" });
+            if (f.hidden) |close| {
                 const end = std.ascii.findIgnoreCase(p, close) orelse {
                     const keep = reply_text.charCount(close) - 1;
                     const chars = reply_text.charCount(p);
@@ -340,7 +349,21 @@ pub const TextFilter = struct {
                 f.hidden = null;
                 continue;
             }
-            const start = std.mem.indexOfScalar(u8, p, '<') orelse {
+            const lt = std.mem.indexOfScalar(u8, p, '<');
+            // MiniMax's opener holds a '<' second, so it is found, or held back while partial, before the generic scan
+            if (reply_text.findTag(p, 0, tool_minimax.open)) |m| if (lt == null or m < lt.?) {
+                try out.appendSlice(a, p[0..m]);
+                f.hidden = tool_minimax.close;
+                try f.reset(a, p[m + tool_minimax.open.len ..]);
+                continue;
+            };
+            const held = reply_text.partialTag(p, tool_minimax.open);
+            if (held > 0 and (lt == null or lt.? >= p.len - held)) {
+                try out.appendSlice(a, p[0 .. p.len - held]);
+                try f.reset(a, p[p.len - held ..]);
+                break;
+            }
+            const start = lt orelse {
                 try out.appendSlice(a, p);
                 f.pending.clearRetainingCapacity();
                 break;
@@ -362,7 +385,7 @@ pub const TextFilter = struct {
             };
             const name = rest[1..end];
             if (callTag(name)) {
-                f.hidden = try std.ascii.allocLowerString(a, name);
+                f.hidden = try std.ascii.allocLowerString(a, try std.mem.concat(a, u8, &.{ "</", name, ">" }));
             } else try out.appendSlice(a, rest[0 .. end + 1]);
             try f.reset(a, rest[end + 1 ..]);
         }
@@ -438,7 +461,15 @@ pub const Policy = struct {
 };
 
 /// The first whole envelope from ``from`` (``<((?:NAME:)?tool_call)>.*?</\1>``, any case).
-fn wholeEnvelope(a: Allocator, s: []const u8, from: usize) Allocator.Error!?struct { start: usize, end: usize } {
+const Whole = struct { start: usize, end: usize };
+
+fn wholeEnvelope(a: Allocator, s: []const u8, from: usize) Allocator.Error!?Whole {
+    const generic = try genericEnvelope(a, s, from);
+    if (tool_minimax.nextBlock(s, from)) |b| if (b.complete and (generic == null or b.start < generic.?.start)) return .{ .start = b.start, .end = b.end };
+    return generic;
+}
+
+fn genericEnvelope(a: Allocator, s: []const u8, from: usize) Allocator.Error!?Whole {
     var at = from;
     while (std.mem.indexOfScalarPos(u8, s, at, '<')) |start| : (at = start + 1) {
         const close = std.mem.indexOfScalarPos(u8, s, start, '>') orelse return null;

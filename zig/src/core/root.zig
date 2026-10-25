@@ -50,6 +50,7 @@ pub const attention_ref = @import("attention_ref.zig");
 pub const attention_range = @import("attention_range.zig");
 pub const gdn_prep_ref = @import("gdn_prep_ref.zig");
 pub const qk_ref = @import("qk_ref.zig");
+pub const minimax_ref = @import("minimax_ref.zig");
 pub const moe_ref = @import("moe_ref.zig");
 pub const dense_ref = @import("dense_ref.zig");
 

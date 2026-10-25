@@ -37,7 +37,9 @@ pub const Layer = struct {
     shared_input: bool = false, // the loader verified identical gate/up input scales across every expert
     gu_stride: usize = 0, // gate/up trellis row stride in tiles (0: contiguous per projection)
     limit: f32 = 0, // the SwiGLU clamp (0: none)
-    act_mode: i32 = 0, // 0: GLM's bf16 roundings (the route RED-SNOW runs), 1: fp32
+    act_mode: i32 = 0, // 0: GLM's bf16 roundings (the route RED-SNOW runs), 1: fp32, 2/3: MiniMax swigluoai (3: both-sided gate clamp)
+    alpha: f32 = 1.702, // act_mode 2, 3: sigmoid(alpha * gate); ignored by 0 and 1
+    up_bias: f32 = 1.0, // act_mode 2, 3: the up side is (up + up_bias); 0 drops the "+1" (UNVERIFIED switch)
 };
 
 /// What one projection launches (experts.py default_config): the 8-tile 4-warp K splits, shape-fixed; n % 128 required.
@@ -232,6 +234,8 @@ pub const Experts = struct {
         ep.add(i32d(l.experts));
         ep.add(l.limit);
         ep.add(l.act_mode);
+        ep.add(l.alpha);
+        ep.add(l.up_bias);
         try launch_.launch(e.gateup, .{ .grid = .{ .x = @intCast(p), .y = @intCast(w / 128), .z = 1 }, .block = .{ .x = 32, .y = 1, .z = 1 } }, s, &ep);
 
         var dn: launch_.Args = .{};

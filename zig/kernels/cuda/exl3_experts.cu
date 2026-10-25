@@ -5,6 +5,7 @@
 #include <cuda_fp16.h>
 
 #include "exl3_decode.cuh"
+#include "minimax_m3_act.cuh"
 
 namespace tf_exl3 {
 
@@ -274,6 +275,7 @@ struct GateUpArgs {
     int p, n, sk, experts;
     float limit;
     int act_mode;
+    float alpha, up_bias; // act_mode 2 and 3 (swigluoai); ignored by 0 and 1
 };
 
 extern "C" __global__ void tf_exl3_gateup_epilogue(const GateUpArgs a) {
@@ -299,7 +301,11 @@ extern "C" __global__ void tf_exl3_gateup_epilogue(const GateUpArgs a) {
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
         float act;
-        if (a.act_mode == 0) {
+        if (a.act_mode >= tf_mm3::ACT_SWIGLUOAI) {
+            act = tf_mm3::swigluoai(gv[j] * HAD_SCALE * __half2float(a.svh_g[(size_t)e * a.n + n + j]),
+                                    uv[j] * HAD_SCALE * __half2float(a.svh_u[(size_t)e * a.n + n + j]), a.alpha, a.limit,
+                                    a.up_bias, a.act_mode == tf_mm3::ACT_SWIGLUOAI_SYM);
+        } else if (a.act_mode == 0) {
             float gg = bf16r(gv[j] * HAD_SCALE * __half2float(a.svh_g[(size_t)e * a.n + n + j]));
             float uu = bf16r(uv[j] * HAD_SCALE * __half2float(a.svh_u[(size_t)e * a.n + n + j]));
             if (a.limit > 0) { gg = upTo(gg, a.limit); uu = within(uu, a.limit); }
@@ -384,6 +390,7 @@ struct PlanStage {
     void* out;
     int k, n, p, sk, slots, stride, skip, epi, act_mode;
     float limit;
+    float alpha, up_bias; // act_mode 2 and 3 (swigluoai); ignored by 0 and 1
 };
 
 extern "C" __global__ void tf_exl3_plan_rotate(const PlanStage a) {
@@ -424,11 +431,15 @@ extern "C" __global__ void tf_exl3_plan_finish(const PlanStage a) {
             float v = g[q] * tf_exl3::HAD_SCALE * __half2float(a.sv0[(size_t)e * a.n + n + q]);
             if (a.epi == 2) {
                 float up = u[q] * tf_exl3::HAD_SCALE * __half2float(a.sv1[(size_t)e * a.n + n + q]);
+                if (a.act_mode >= tf_mm3::ACT_SWIGLUOAI) {
+                    v = tf_mm3::swigluoai(v, up, a.alpha, a.limit, a.up_bias, a.act_mode == tf_mm3::ACT_SWIGLUOAI_SYM);
+                } else {
                 if (a.act_mode == 0) { v = tf_exl3::bf16r(v); up = tf_exl3::bf16r(up); }
                 if (a.limit > 0) { v = tf_exl3::upTo(v, a.limit); up = tf_exl3::within(up, a.limit); }
                 v = v / (1.f + expf(-v));
                 if (a.act_mode == 0) v = tf_exl3::bf16r(v);
                 v *= up;
+                }
             }
             const size_t at = (size_t)p * a.n + n + q;
             if (a.epi == 0) reinterpret_cast<float*>(a.out)[at] = v;
@@ -458,12 +469,12 @@ extern "C" __global__ void tf_exl3_prompt_rotate(const __nv_bfloat16* __restrict
 extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_gu(const half* __restrict__ Xg, const half* __restrict__ Xu,
         const uint64_t* __restrict__ Tg, const uint64_t* __restrict__ Tu, const int* __restrict__ items, const int* __restrict__ counts,
         const int* __restrict__ members, const half* __restrict__ svh_g, const half* __restrict__ svh_u, const half* __restrict__ suh_d,
-        half* __restrict__ xd, int K, int N, int xdiv, float limit, int act_mode) {
+        half* __restrict__ xd, int K, int N, int xdiv, float limit, int act_mode, float alpha, float up_bias) {
 
     __shared__ __align__(16) unsigned char smem_raw[tsmem_bytes()];   // one buffer for either instantiation
     __shared__ int rows_sh[TPM];
-    if (xdiv > 1) tgateup<TPM>(Xg, Xu, Tg, Tu, items, counts, members, svh_g, svh_u, suh_d, xd, K, N, xdiv, limit, act_mode, smem_raw, rows_sh);
-    else tgateup<2 * TPM>(Xg, Xu, Tg, Tu, items, counts, members, svh_g, svh_u, suh_d, xd, K, N, 1, limit, act_mode, smem_raw, rows_sh);
+    if (xdiv > 1) tgateup<TPM>(Xg, Xu, Tg, Tu, items, counts, members, svh_g, svh_u, suh_d, xd, K, N, xdiv, limit, act_mode, alpha, up_bias, smem_raw, rows_sh);
+    else tgateup<2 * TPM>(Xg, Xu, Tg, Tu, items, counts, members, svh_g, svh_u, suh_d, xd, K, N, 1, limit, act_mode, alpha, up_bias, smem_raw, rows_sh);
 }
 
 // Block (256 model-width columns, item): y[row][slot][:] = the down epilogue of the item's pairs (this rank's share).

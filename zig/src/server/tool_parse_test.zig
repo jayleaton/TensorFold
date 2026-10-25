@@ -4,6 +4,10 @@ const json = @import("json");
 const tool_parse = @import("tool_parse.zig");
 const tool_closers = @import("tool_closers.zig");
 const witness = @import("tool_union_witness.zig");
+
+test {
+    _ = @import("tool_minimax_test.zig");
+}
 const parse = tool_parse.parse;
 const closeCall = tool_parse.closeCall;
 const repairGlmKeys = tool_parse.repairGlmKeys;
