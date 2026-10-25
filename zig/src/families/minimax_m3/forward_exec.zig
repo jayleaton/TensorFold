@@ -93,6 +93,11 @@ pub fn gmRows(g: *const plan.Geometry) usize {
     return @min(g.max_rows, plan.prompt_expert_rows);
 }
 
+/// Bytes of the prompt experts' scratch Buffers holds (its `gm`), for admission before any device exists.
+pub fn promptExpertBytes(g: *const plan.Geometry) usize {
+    return cuda.exl3_gm.scratchBytes(shapeLayer(g), gmRows(g), g.topk);
+}
+
 pub const Buffers = struct {
     pub const slots = plan.bufs.len + std.enums.values(Extra).len;
 
@@ -122,7 +127,7 @@ pub const Buffers = struct {
         try b.take(d, score_bytes);
         try b.take(d, @as(usize, g.max_rows) * g.kvh * 16 * 4);
         try b.take(d, 4);
-        try b.take(d, cuda.exl3_gm.scratchBytes(shapeLayer(g), gmRows(g), g.topk));
+        try b.take(d, promptExpertBytes(g));
         return b;
     }
 

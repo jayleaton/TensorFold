@@ -14,6 +14,8 @@ const pages = @import("pages.zig");
 const weights_device = @import("weights_device.zig");
 const engine = @import("engine.zig");
 const engine_dev = @import("engine_dev.zig");
+const forward_plan = @import("forward_plan.zig");
+const forward_exec = @import("forward_exec.zig");
 const follow = @import("follow.zig");
 const backend = @import("backend.zig");
 const dspark_config = @import("dspark_config.zig");
@@ -164,7 +166,7 @@ pub fn admissionWith(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, c: *co
     const dims = (try pool.Dims.of(c, share)).withKv8(o.kv8);
     var out: Admission = .{ .place = p, .weights = plan.slotBytes(), .verdict = null, .fingerprint_weights = try weights_device.digest(gpa, &cat) };
     if (o.grant == 0) return out;
-    const terms = scoreTerms(if (draft) |dcost| budget.withDraft(budget.hosted(), dcost) else budget.hosted(), dims);
+    const terms = try promptTerms(scoreTerms(if (draft) |dcost| budget.withDraft(budget.hosted(), dcost) else budget.hosted(), dims), c, share);
     out.verdict = budget.check(dims, .{ .available = o.grant, .weights = out.weights, .terms = terms, .lanes = o.lanes, .lanes_fixed = o.lanes_fixed, .window = window_rows, .max_positions = c.max_positions }, o.context);
     return out;
 }
@@ -174,6 +176,14 @@ pub fn scoreTerms(t: budget.Terms, dims: pool.Dims) budget.Terms {
     var u = t;
     u.prefill_rows = iface.max_rows;
     u.index_heads = dims.kv_heads;
+    return u;
+}
+
+/// `t` with the prompt experts' x3gm scratch (forward_exec.Buffers' gm) on its workspace, at this rank's share.
+pub fn promptTerms(t: budget.Terms, c: *const config.Config, share: shard.Share) !budget.Terms {
+    const g = try forward_plan.Geometry.of(c, share, c.layers, iface.max_rows);
+    var u = t;
+    u.workspace += forward_exec.promptExpertBytes(&g);
     return u;
 }
 
@@ -414,6 +424,14 @@ test "the budget prices the block-score scratch the forward makes: its rows and 
     const context: u64 = 131072;
     try std.testing.expectEqual(@as(u64, iface.max_rows) * dims.kv_heads * (context / pool.page_tokens) * 4, budget.scoreBytes(t, context));
     try std.testing.expect(budget.scoreBytes(t, context) < budget.scoreBytes(budget.hosted(), context));
+}
+
+test "the budget prices the prompt experts' scratch the forward makes at this rank's share" {
+    const share = try shard.Share.of(&config.flash, 0, 2);
+    const g = try forward_plan.Geometry.of(&config.flash, share, config.flash.layers, iface.max_rows);
+    const t = try promptTerms(budget.hosted(), &config.flash, share);
+    try std.testing.expectEqual(budget.hosted().workspace + forward_exec.promptExpertBytes(&g), t.workspace);
+    try std.testing.expect(forward_exec.promptExpertBytes(&g) > 400_000_000); // 2,048 rows, top 4, width 6144 and 1536
 }
 
 test "a floor refusal is worded for the server" {
