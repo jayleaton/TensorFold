@@ -126,7 +126,7 @@ pub fn run(gpu: check.Gpu, rest: []const [:0]const u8) !void {
     var m = try fw.Modules.load(gpu.d);
     defer m.deinit();
     const max_pages = mm.iface.maxPages(n);
-    var b = try fw.Buffers.init(gpu.d, &g, max_pages);
+    var b = try fw.Buffers.init(gpu.d, &g, mm.rows_plan.Plan.fixed(g.kvh, max_pages).scratch);
     defer b.deinit();
     const dims = try mm.pool.Dims.of(&c, share);
     var pool = try cuda.DeviceBuffer.alloc(gpu.d, max_pages * dims.pageBytes());
