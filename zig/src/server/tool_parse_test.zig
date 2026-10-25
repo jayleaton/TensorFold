@@ -290,7 +290,8 @@ test "namespaced openers without closers read in linear time" {
     // one namespace repeated, then a new namespace per opener
     for ([_]bool{ false, true }) |distinct| {
         var ns: [2]u64 = undefined;
-        for ([_]usize{ 1000, 8000 }, &ns) |n, *best| {
+        // past the small sizes whose per-opener time moves with the build, so the ratio measures growth
+        for ([_]usize{ 8000, 64000 }, &ns) |n, *best| {
             var reply: std.ArrayList(u8) = .empty;
             for (0..n) |i| try reply.print(a, "<ns{d}:tool_call>", .{if (distinct) i else 0});
             best.* = std.math.maxInt(u64);
@@ -304,7 +305,7 @@ test "namespaced openers without closers read in linear time" {
             }
         }
         // 8x the openers: near 8x the time, not 64x
-        try std.testing.expect(ns[1] <= 20 * std.time.ns_per_ms or ns[1] <= 24 * ns[0]);
+        try std.testing.expect(ns[1] <= 160 * std.time.ns_per_ms or ns[1] <= 24 * ns[0]);
     }
 }
 
