@@ -231,6 +231,27 @@ def router(tf_pick, ref_pick, scores, tf_w, ref_w):
             "disagree_margins": sorted(margins)[:16], "max_disagree_margin": max(margins) if margins else 0.0}
 
 
+def gap(scores):
+    """Each row's 4th minus 5th largest score."""
+    s = -np.sort(-scores.astype(np.float64), axis=1)
+    return s[:, 3] - s[:, 4]
+
+
+def flips(tf_routed, ref_routed, tf_pick, ref_pick, ref_scores, tf_scores):
+    """Routed cosine over the rows whose top-4 sets agree, and every flipped row with both sides' 4th-5th gap."""
+    same = np.array([set(x.tolist()) == set(y.tolist()) for x, y in zip(tf_pick, ref_pick)])
+    out = {"rows": int(same.size), "agreeing": int(same.sum()), "flips": int((~same).sum())}
+    if same.any():
+        out.update({f"agreeing_{k}": v for k, v in stats(tf_routed[same], ref_routed[same]).items()})
+    g_ref, g_tf = gap(ref_scores), gap(tf_scores)
+    out["flipped"] = [{"row": int(r), "ref_gap": float(g_ref[r]), "tf_gap": float(g_tf[r]),
+                       "tf_only": sorted(set(tf_pick[r].tolist()) - set(ref_pick[r].tolist())),
+                       "ref_only": sorted(set(ref_pick[r].tolist()) - set(tf_pick[r].tolist()))}
+                      for r in np.flatnonzero(~same)]
+    out["max_flip_gap"] = max((max(f["ref_gap"], f["tf_gap"]) for f in out["flipped"]), default=0.0)
+    return out
+
+
 def cmd_compare(a):
     ref, tf = Path(a.ref), Path(a.tf)
     report = {}
@@ -247,6 +268,12 @@ def cmd_compare(a):
         if (t / "pick.npy").exists():
             rows["router"] = router(load(t, "pick"), load(r, "pick"), load(r, "scores"), load(t, "wts"), load(r, "wts"))
             rows["router_logits"] = stats(load(t, "router_logits"), load(r, "router_logits"))
+            # TF's scores: its logits through the reference's sigmoid plus the bias the reference's scores carry
+            ref_lg = bf16(load(r, "router_logits")).astype(np.float64)
+            bias = (bf16(load(r, "scores")).astype(np.float64) - 1 / (1 + np.exp(-ref_lg)))[0]
+            tf_scores = 1 / (1 + np.exp(-bf16(load(t, "router_logits")).astype(np.float64))) + bias
+            rows["routed_flips"] = flips(bf16(load(t, "routed")), bf16(load(r, "routed")), load(t, "pick"),
+                                         load(r, "pick"), bf16(load(r, "scores")), tf_scores)
         if (t / "emb.npy").exists():
             rows["emb"] = stats(load(t, "emb"), np.load(ref / "emb.npy"))
         report[f"L{layer}"] = rows
