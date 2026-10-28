@@ -114,6 +114,7 @@ pub const Model = struct {
     slots: u32 = 1,
     /// TF_DSV41_ARENA's sub-allocator (dev_arena.zig), for the process's lifetime
     dev_arena: ?*@import("dev_arena.zig").Installed = null,
+    supervisor: ?@import("model_supervisor.zig").Supervisor = null,
     /// the boot check's figures before the pool, for its measured end (kv_state.afterBoot)
     boot_check: ?kvs.Boot = null,
     slot_set: ?*slots_mod.SlotSet = null,
@@ -163,6 +164,7 @@ pub const Model = struct {
         m.grammar_masks = null;
         m.vision_config = null;
         m.dev_arena = null;
+        m.supervisor = null;
         m.arena = std.heap.ArenaAllocator.init(gpa);
         errdefer if (!keep_owner) m.arena.deinit();
         const a = m.arena.allocator();
@@ -181,10 +183,20 @@ pub const Model = struct {
         else
             &.{};
         try m.session.open(&m.driver, m.tcfg, image);
+        m.supervisor = .{ .io = io, .ctx = m, .healthy = contextHealthy, .fail = contextFailed };
+        m.supervisor.?.start() catch |err| {
+            m.session.bootFailed(err);
+            return err;
+        };
+        errdefer {
+            m.supervisor.?.stop();
+            m.supervisor = null;
+        }
         // TF_DSV41_ARENA: every device buffer from here on (weights, forms, roles, scratch) carved from large chunks
         m.dev_arena = try @import("dev_arena.zig").install(gpa, &m.ctx, m.tcfg.rank);
         // a failure from here to serving: every rank down with its reason, the session closed before `m` is freed
         m.boot(gpa, io, pack_dir, assets, o) catch |err| {
+            _ = m.supervisor.?.check();
             if (m.ctx.synchronize()) |_| {
                 m.session.bootFailed(err);
             } else |_| {}
@@ -468,6 +480,16 @@ pub const Model = struct {
         s.announceStop();
     }
 
+    fn contextHealthy(ctx: *anyopaque) bool {
+        const m: *Model = @ptrCast(@alignCast(ctx));
+        return m.ctx.healthy();
+    }
+    fn contextFailed(ctx: *anyopaque, err: anyerror) void {
+        const m: *Model = @ptrCast(@alignCast(ctx));
+        m.session.fatal("CUDA context", err);
+        std.c._exit(70);
+    }
+
     pub fn close(m: *Model) void {
         m.closeChecked() catch |err| {
             if (!quiet) std.log.err("DeepSeek close incomplete ({t}); model, driver and allocation owner retained", .{err});
@@ -508,6 +530,8 @@ pub const Model = struct {
         m.aot.deinit();
         m.pl.deinit();
         m.pack.deinit();
+        if (m.supervisor) |*s| s.stop();
+        m.supervisor = null;
         m.session.close();
         m.kernels.deinit();
         m.stream.deinit();
