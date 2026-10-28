@@ -83,6 +83,12 @@ pub fn resize(gpa: Allocator, src: Rgb, w: u32, h: u32) Error!Rgb {
     if (src.w > std.math.maxInt(i32) or src.h > std.math.maxInt(i32)) return error.ImageTooSmall;
     const need_h = w != src.w;
     const need_v = h != src.h;
+    // ``Image.resize`` shrinks a source over 100x taller than wide vertically first, then horizontally.
+    if (need_h and need_v and @as(u64, src.h) > @as(u64, src.w) * 100 and h < src.h) {
+        var mid = try resize(gpa, src, src.w, h);
+        defer mid.deinit(gpa);
+        return resize(gpa, mid, w, h);
+    }
     var vert = try Coeffs.init(gpa, src.h, h);
     defer vert.deinit(gpa);
     const first: usize = @intCast(vert.bounds[0]);
@@ -191,4 +197,20 @@ test "a fitted or requested zero dimension is refused, not divided by" {
     defer tall.deinit(a);
     @memset(tall.data, 0);
     try std.testing.expectError(error.ImageTooSmall, pad(a, tall, 42, 2646, 127));
+}
+
+test "Pillow 12.3 pad reference: a 3x997 source" {
+    const a = std.testing.allocator;
+    const src: pixels.Rgb = .{ .w = 3, .h = 997, .data = @constCast(@embedFile("fixtures/resample/3x997-src.bin")) };
+    var dst = try pad(a, src, 42, 501, 127);
+    defer dst.deinit(a);
+    try std.testing.expectEqualSlices(u8, @embedFile("fixtures/resample/3x997-ref.bin"), dst.data);
+}
+
+test "Pillow 12.3 pad reference: its 997x3 orientation" {
+    const a = std.testing.allocator;
+    const src: pixels.Rgb = .{ .w = 997, .h = 3, .data = @constCast(@embedFile("fixtures/resample/997x3-src.bin")) };
+    var dst = try pad(a, src, 501, 42, 127);
+    defer dst.deinit(a);
+    try std.testing.expectEqualSlices(u8, @embedFile("fixtures/resample/997x3-ref.bin"), dst.data);
 }
