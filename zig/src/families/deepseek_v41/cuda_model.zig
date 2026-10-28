@@ -35,6 +35,7 @@ const dspark_slots = @import("dspark_slots.zig");
 const l2pf_mod = @import("l2pf.zig");
 const iface = @import("draft/iface.zig");
 const grammar = @import("grammar_gpu.zig");
+const vision = @import("vision_open.zig");
 
 /// The files `boot` opens under TF_DSV41_ASSETS, and the refusal that names them when it is unset (serve_engine.zig).
 pub const asset_names = struct {
@@ -46,6 +47,7 @@ pub const asset_names = struct {
 
 pub const Options = struct {
     drafts: bool = true,
+    vision: ?@import("engine_api").VisionOpen = null,
     /// rows a prefill window takes (the decode buckets the plan sizes for) when the prompt runs as decode windows
     prefill_rows: u32 = 16,
     /// the prompt through the forward's own prefill (2,048-row segments) instead: TF_DSV41_OWN_PREFILL (default on)
@@ -121,6 +123,7 @@ pub const Model = struct {
     /// the keyed sampler, every rank with TF_DSV41_SAMPLING=1 (requests with T > 0; followers run its gathers)
     sampler: ?*samp.GpuSampler = null,
     grammar_masks: ?*grammar.Masks = null,
+    vision_config: ?vision.Config = null,
     /// TF_DSV41_L2PF (l2pf.zig): the filled prefetch tables and the runner's side stream
     l2pf: ?*l2pf_mod.L2pf = null,
 
@@ -158,6 +161,7 @@ pub const Model = struct {
         m.slot_pass = null;
         m.sampler = null;
         m.grammar_masks = null;
+        m.vision_config = null;
         m.dev_arena = null;
         m.arena = std.heap.ArenaAllocator.init(gpa);
         errdefer if (!keep_owner) m.arena.deinit();
@@ -198,7 +202,15 @@ pub const Model = struct {
         tr.step("start", cuda.usage(false));
         const comm = m.session.comm();
         const world: u32 = @intCast(comm.world());
+        const vision_boot = @import("vision_boot.zig");
+        const requested_vision = if (m.tcfg.rank == 0) try vision_boot.fromEnv(o.vision) else null;
+        const selected_vision = try vision_boot.select(&m.session.plan, requested_vision);
         m.cfg = try Config.read(gpa, io, pack_dir);
+        if (selected_vision) |requested| {
+            const path = try std.fs.path.join(a, &.{ pack_dir, "config.json" });
+            const text = try cwd.readFileAlloc(io, path, a, .limited(1 << 24));
+            m.vision_config = try vision.readConfig(a, text, requested);
+        }
         if (o.own_prefill) try @import("block_admission.zig").nativePrefill(&m.cfg, world);
         m.pack = try Pack.open(gpa, io, pack_dir);
         const backbone = if (o.layers) |ls| try a.dupe(u32, ls) else blk: {
@@ -279,6 +291,10 @@ pub const Model = struct {
         m.f = fwd.Forward.init(gpa, &m.cfg, &m.widths, .{ .world = world, .rank = m.tcfg.rank, .expert_topp = topp, .r1 = r1, .taps = o.drafts }, &m.runner, comm);
         try @import("engine_hooks.zig").open(&m.f); // the forward's later-layer hooks and prefill state
         m.f.layers = backbone;
+        if (m.vision_config != null) {
+            const bias_dir = std.mem.span(std.c.getenv("TF_DSV41_BIAS_VL") orelse return error.MissingBiasVl);
+            try vision.plan(gpa, io, &m.f, &m.driver, &m.weights, bias_dir);
+        }
         // the rope tables cover the limit + a prefill segment (the assets' rope.bin)
         if (try contextEnv()) |c| {
             m.f.opts.limit = c;
@@ -304,6 +320,7 @@ pub const Model = struct {
         const nb = @max(o.prefill_rows, m.cfg.dspark_block + 1);
         for (buckets[0..nb], 0..) |*b, i| b.* = @intCast(i + 1);
         var bp = try m.f.plan(buckets[0..nb]);
+        try vision.checkPlan(&m.f, &bp);
         // the pass ingests a prompt's prefilled tail in one call (the drafter's window) with the own prefill
         const ingest_rows: u32 = if (o.own_prefill) @max(nb, m.cfg.window) else nb;
         if (o.drafts) try dspark_gpu.GpuPass.plan(m.f.arena.allocator(), &m.f, &bp, ingest_rows);
@@ -401,6 +418,7 @@ pub const Model = struct {
         m.sampler = if (samp.enabled()) try samp.GpuSampler.init(gpa, &m.f) else null;
         m.gt.sampler = m.sampler;
         m.grammar_masks = try grammar.Masks.init(gpa, &m.f, @max(64, rows_cap));
+        if (m.vision_config) |v| try vision.tower(gpa, io, &m.f, &m.pack, &m.driver, m.tcfg.rank, v.shape);
         try m.driver.synchronize();
         tr.step("end", cuda.usage(false));
         tr.trim();
@@ -474,6 +492,7 @@ pub const Model = struct {
         if (m.rows) |b| b.deinit();
         if (m.slot_set) |ss| ss.deinit();
         if (m.pass) |p| p.deinit();
+        vision.closeAfterDrain(&m.f);
         m.gt.deinitGrammar();
         if (m.grammar_masks) |x| x.deinit();
         if (m.sampler) |x| x.deinit();

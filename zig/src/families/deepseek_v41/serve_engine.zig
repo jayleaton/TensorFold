@@ -40,7 +40,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         problem.* = model.asset_names.unset;
         return null;
     });
-    const s = Served.open(gpa, io, o.dir, assets, o.drafts, o.context) catch |e| {
+    const s = Served.open(gpa, io, o.dir, assets, o.drafts, o.context, o.vision) catch |e| {
         problem.* = try std.fmt.allocPrint(a, "the DeepSeek-V4.1 CUDA engine cannot load {s} ({s})", .{ o.dir, @errorName(e) });
         return null;
     };
@@ -60,6 +60,8 @@ pub const Served = struct {
     core: lanes.Engine,
     host: api.LaneHost,
     rec: Recorder,
+    vision_native: ?@import("vision_native.zig").Native = null,
+    vision_engine: ?@import("vision_engine.zig").Engine = null,
     /// TF_DSV41_PHASES (phases.zig): the round's phases around the target and the pass
     phases: ?*ph.Phases = null,
     tt: timed.TimedTarget = undefined,
@@ -70,8 +72,8 @@ pub const Served = struct {
     lookup: ?*lookup.Planner = null,
 
     /// Rank 0's engine over a loaded model (`drafts`: DSpark's pass, else serial windows through the same lanes).
-    pub fn open(gpa: Allocator, io: std.Io, dir: []const u8, assets: []const u8, drafts: bool, context: ?i64) !*Served {
-        const m = try model.Model.open(gpa, io, dir, assets, .{ .drafts = drafts, .own_prefill = model.ownPrefillEnv(), .layers = try model.layersEnv(gpa) });
+    pub fn open(gpa: Allocator, io: std.Io, dir: []const u8, assets: []const u8, drafts: bool, context: ?i64, vision: ?api.VisionOpen) !*Served {
+        const m = try model.Model.open(gpa, io, dir, assets, .{ .drafts = drafts, .own_prefill = model.ownPrefillEnv(), .layers = try model.layersEnv(gpa), .vision = vision });
         errdefer m.close();
         if (m.rank() != 0) return error.NotRankZero; // the other ranks run `tf-dsv41 follow`
         const s = try gpa.create(Served);
@@ -80,6 +82,10 @@ pub const Served = struct {
         s.io = io;
         s.m = m;
         s.nd = .{};
+        s.vision_native = null;
+        s.vision_engine = null;
+        errdefer if (s.vision_native) |*v| v.deinit();
+        errdefer if (s.vision_engine) |*v| v.deinit();
         // draft pricing: the cached calibration and depth knobs (TF_DSV41_CALIB=measure: timed now, stored)
         const knobs = calib_env.Knobs.fromEnv();
         const want: calib_env.Shape = .{ .slots = m.slots, .world = m.f.comm.world(), .dspark = m.pass != null, .context = @intCast(@min(context orelse m.f.opts.limit, m.f.opts.limit)) };
@@ -153,8 +159,14 @@ pub const Served = struct {
             s.host.proposers = .{ .ctx = pl, .make = makeLookup, .free = freeLookup };
             std.log.info("dsv41 lookup: Python's priced plan (min match {d}, up to {d} rows{s})", .{ ls.min_match, ls.max_rows, if (ls.lookup) "" else ", lookup off" });
         }
+        var inner = s.host.engine();
+        if (m.vision_config) |v| {
+            s.vision_native = try @import("vision_native.zig").Native.init(gpa, io, v.settings, v.limits);
+            s.vision_engine = .{ .gpa = gpa, .io = io, .inner = inner, .native = &s.vision_native.?, .rows = @ptrCast(@alignCast(m.f.vision orelse return error.MissingVisionTower)) };
+            inner = s.vision_engine.?.engine();
+        }
+        s.rec = Recorder.init(gpa, io, inner);
         try s.host.start();
-        s.rec = Recorder.init(gpa, io, s.host.engine());
         return s;
     }
 
@@ -223,6 +235,10 @@ pub const Served = struct {
         const s: *Served = @ptrCast(@alignCast(ctx));
         const gpa = s.gpa;
         s.host.stop();
+        s.m.ctx.synchronize() catch |err| {
+            if (!quiet) std.log.err("DeepSeek close retained serving owners after GPU drain failed ({t})", .{err});
+            return;
+        };
         if (s.lookup) |pl| gpa.destroy(pl);
         if (s.sched) |sh| {
             s.m.gt.settleReleases();
@@ -236,6 +252,8 @@ pub const Served = struct {
             gpa.destroy(x);
         }
         s.rec.deinit();
+        if (s.vision_engine) |*v| v.deinit();
+        if (s.vision_native) |*v| v.deinit();
         s.core.deinit();
         s.cfg.deinit(gpa);
         s.arena.deinit();
