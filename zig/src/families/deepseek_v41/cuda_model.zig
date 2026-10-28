@@ -34,6 +34,7 @@ const dspark_rows = @import("dspark_rows.zig");
 const dspark_slots = @import("dspark_slots.zig");
 const l2pf_mod = @import("l2pf.zig");
 const iface = @import("draft/iface.zig");
+const grammar = @import("grammar_gpu.zig");
 
 /// The files `boot` opens under TF_DSV41_ASSETS, and the refusal that names them when it is unset (serve_engine.zig).
 pub const asset_names = struct {
@@ -119,6 +120,7 @@ pub const Model = struct {
     slot_pass: ?*dspark_slots.SlotPass = null,
     /// the keyed sampler, every rank with TF_DSV41_SAMPLING=1 (requests with T > 0; followers run its gathers)
     sampler: ?*samp.GpuSampler = null,
+    grammar_masks: ?*grammar.Masks = null,
     /// TF_DSV41_L2PF (l2pf.zig): the filled prefetch tables and the runner's side stream
     l2pf: ?*l2pf_mod.L2pf = null,
 
@@ -155,6 +157,7 @@ pub const Model = struct {
         m.rows = null;
         m.slot_pass = null;
         m.sampler = null;
+        m.grammar_masks = null;
         m.dev_arena = null;
         m.arena = std.heap.ArenaAllocator.init(gpa);
         errdefer if (!keep_owner) m.arena.deinit();
@@ -397,6 +400,7 @@ pub const Model = struct {
         // TF_DSV41_SAMPLING=1: keyed sampling (T > 0) on every rank; off: such requests are refused (error.Sampling)
         m.sampler = if (samp.enabled()) try samp.GpuSampler.init(gpa, &m.f) else null;
         m.gt.sampler = m.sampler;
+        m.grammar_masks = try grammar.Masks.init(gpa, &m.f, @max(64, rows_cap));
         try m.driver.synchronize();
         tr.step("end", cuda.usage(false));
         tr.trim();
@@ -470,6 +474,8 @@ pub const Model = struct {
         if (m.rows) |b| b.deinit();
         if (m.slot_set) |ss| ss.deinit();
         if (m.pass) |p| p.deinit();
+        m.gt.deinitGrammar();
+        if (m.grammar_masks) |x| x.deinit();
         if (m.sampler) |x| x.deinit();
         if (m.sessions) |x| x.deinitAfterDrain();
         if (m.f.kv) |k| k.deinitAfterDrain();

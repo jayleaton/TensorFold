@@ -28,6 +28,7 @@ pub fn targetWindow(b: *Batch, segments: []const iface.Segment, choices: [][]u32
             @memcpy(ids[n..][0..sg.tokens.len], sg.tokens);
             n += sg.tokens.len;
         }
+        try @import("grammar_gpu.zig").segments(b.f, segments[rg[0]..rg[1]]);
         try b.window(mix[rg[0]..rg[1]], ids[0..n], j > 0);
         var greedy_rows = false;
         for (segments[rg[0]..rg[1]]) |sg| greedy_rows = greedy_rows or !samp.sampled(sg.sampling);

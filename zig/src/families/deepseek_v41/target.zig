@@ -17,6 +17,8 @@ pub const Error = error{ TreeWindow, Sampling, Slots, NotAChain, WindowRows };
 
 pub const GpuTarget = struct {
     f: *fwd.Forward,
+    tree_masks: []const u32 = &.{},
+    prompt_masks: [16]std.ArrayList(u32) = @splat(.empty),
     /// rows a prefill window takes (the decode path's buckets; the forward plans buffers for them)
     prefill_rows: u32 = 16,
     /// a slot that already holds the prompt: prefill returns this choice without running the prompt again
@@ -61,7 +63,25 @@ pub const GpuTarget = struct {
         return .{ .ptr = t, .vtable = &vtable };
     }
 
-    const vtable: iface.Target.VTable = .{ .prefill = prefill, .window = window, .keep = keep, .taps = taps, .release = release, .release_checked = releaseChecked, .available = available, .admit = admit, .begin = begin, .piece = piece, .finish = finish, .tail = tail, .pieces = pieces, .replays = replays, .warm = warm };
+    const vtable: iface.Target.VTable = .{ .prompt_mask = promptMask, .prefill = prefill, .window = window, .keep = keep, .taps = taps, .release = release, .release_checked = releaseChecked, .available = available, .admit = admit, .begin = begin, .piece = piece, .finish = finish, .tail = tail, .pieces = pieces, .replays = replays, .warm = warm };
+
+    fn promptMask(p: *anyopaque, slot: u32, mask: []const u32) anyerror!void {
+        const t = self_(p);
+        if (slot >= t.prompt_masks.len) return error.Slots;
+        if (mask.len != 0 and (t.f.grammar == null or mask.len != (t.f.cfg.vocab + 31) / 32)) return error.StructuresUnsupported;
+        const dst = &t.prompt_masks[slot];
+        dst.clearRetainingCapacity();
+        try dst.appendSlice(t.f.gpa, mask);
+    }
+
+    pub fn deinitGrammar(t: *GpuTarget) void {
+        for (&t.prompt_masks) |*mask| mask.deinit(t.f.gpa);
+    }
+
+    fn stagePrompt(t: *GpuTarget, slot: u32) !void {
+        const mask = t.prompt_masks[slot].items;
+        return @import("grammar_gpu.zig").stage(t.f, if (mask.len == 0) &.{} else &.{.{ .index = null, .bits = mask }});
+    }
 
     fn admit(p: *anyopaque, slot: u32, max_new: u64) void {
         const t = self_(p);
@@ -79,7 +99,10 @@ pub const GpuTarget = struct {
         _ = t.takeReplayed(slot);
         const keyed = try t.keyedOf(sampling);
         t.tree.clear();
-        if (t.resume_first) |first| if (t.f.slot.pos == ids.len and t.f.slot.pending == null) return first;
+        if (t.resume_first) |first| if (t.f.slot.pos == ids.len and t.f.slot.pending == null) {
+            if (t.prompt_masks[slot].items.len != 0) return error.StructuresResumeUnsupported;
+            return first;
+        };
         // the request's pool pages, then a saved entry that prefixes the prompt: the slot continues, the rest prefills
         const max_new: ?u64 = if (slot < t.max_new.len) t.max_new[slot] else null;
         if (slot < t.max_new.len) t.max_new[slot] = null;
@@ -106,7 +129,7 @@ pub const GpuTarget = struct {
             try t.handTaps(slot);
             var one: [1]u32 = undefined;
             var out = [_][]u32{&one};
-            try window(p, &.{.{ .slot = slot, .start = ids.len - sp.window, .tokens = ids[ids.len - sp.window ..], .parents = null, .draws = &.{draw}, .sampling = sampling }}, &out);
+            try window(p, &.{.{ .slot = slot, .start = ids.len - sp.window, .tokens = ids[ids.len - sp.window ..], .parents = null, .draws = &.{draw}, .sampling = sampling, .masks = t.prompt_masks[slot].items }}, &out);
             return one[0];
         }
         if (t.own_prefill) {
@@ -114,6 +137,7 @@ pub const GpuTarget = struct {
             try t.f.prefill(rest);
             const seg: usize = @import("forward_prefill.zig").segmentRows(t.f);
             const last = if (rest.len % seg == 0) seg else rest.len % seg;
+            try t.stagePrompt(slot);
             if (keyed) |s| return t.pickOne(@intCast(last - 1), s, draw);
             const picks = try t.f.gpa.alloc(u32, last);
             defer t.f.gpa.free(picks);
@@ -127,6 +151,7 @@ pub const GpuTarget = struct {
             try t.f.window(ids[at_ .. at_ + n]);
             if (at_ + n == ids.len) {
                 // the keyed choice after the prompt's last row: the last row's greedy pick, or its sampled one
+                try t.stagePrompt(slot);
                 if (keyed) |s| choice[0] = try t.pickOne(@intCast(n - 1), s, draw) else {
                     var rows: [64]u32 = undefined;
                     try t.f.greedy(rows[0..n]);
@@ -206,7 +231,7 @@ pub const GpuTarget = struct {
         }
         var one: [1]u32 = undefined;
         var out = [_][]u32{&one};
-        try window(p, &.{.{ .slot = slot, .start = ids.len - 1, .tokens = ids[ids.len - 1 ..], .parents = null, .draws = &.{draw}, .sampling = sampling }}, &out);
+        try window(p, &.{.{ .slot = slot, .start = ids.len - 1, .tokens = ids[ids.len - 1 ..], .parents = null, .draws = &.{draw}, .sampling = sampling, .masks = t.prompt_masks[slot].items }}, &out);
         return one[0];
     }
 
@@ -256,8 +281,8 @@ pub const GpuTarget = struct {
 
     /// `finish` up to the last token (TF_DSV41_TAIL_JOIN): the decoder replay and its taps, no window pending.
     fn tail(p: *anyopaque, slot: u32, ids: []const u32, sampling: ?lanes.Sampling, draw: u64) anyerror!?u32 {
-        _ = draw;
         const t = self_(p);
+        if (slot < t.prompt_masks.len and t.prompt_masks[slot].items.len != 0) return try finish(p, slot, ids, sampling, draw);
         try t.onSlot(slot);
         if (ids.len == 0 or t.f.slot.pos != ids.len - 1) return error.NotAChain;
         _ = try t.keyedOf(sampling); // refused here as `finish` would, not in the round
@@ -284,7 +309,11 @@ pub const GpuTarget = struct {
         if (segments.len != 1) return error.Slots;
         const s = segments[0];
         if (s.slot != 0) return error.Slots;
-        if (s.parents != null) return t.tree.window(.{ .ptr = t, .vtable = &chains }, s, choices[0]);
+        if (s.parents != null) {
+            t.tree_masks = s.masks;
+            defer t.tree_masks = &.{};
+            return t.tree.window(.{ .ptr = t, .vtable = &chains }, s, choices[0]);
+        }
         t.tree.clear();
         const keyed = try t.keyedOf(s.sampling);
         // a chain window never kept keeps every row: the lanes' undrafted step sends the next row without a keep
@@ -294,6 +323,7 @@ pub const GpuTarget = struct {
         }
         if (s.start != t.f.slot.pos) return error.NotAChain;
         if (s.tokens.len > t.max_rows) return error.WindowRows;
+        try @import("grammar_gpu.zig").segments(t.f, segments);
         try t.f.window(s.tokens);
         if (keyed) |smp| return t.sampler.?.choose(0, @intCast(s.tokens.len), smp, s.draws, choices[0][0..s.tokens.len]);
         try t.f.greedy(choices[0][0..s.tokens.len]);
@@ -404,8 +434,16 @@ pub const GpuTarget = struct {
     const chains: branches.Chains.VTable = .{ .run = chainRun, .drop = chainDrop };
 
     fn chainRun(p: *anyopaque, slot: u32, start: u64, tokens: []const u32, draws: []const u64, sampling: ?lanes.Sampling, out: []u32) anyerror!void {
+        const t = self_(p);
+        var arena = std.heap.ArenaAllocator.init(t.f.gpa);
+        defer arena.deinit();
+        const words = (t.f.cfg.vocab + 31) / 32;
+        const masks: []u32 = if (t.tree_masks.len == 0) &.{} else try arena.allocator().alloc(u32, tokens.len * words);
+        if (masks.len != 0) for (t.tree.rows[0..tokens.len], 0..) |row, i| {
+            @memcpy(masks[i * words ..][0..words], t.tree_masks[@as(usize, row) * words ..][0..words]);
+        };
         var one = [_][]u32{out};
-        return window(p, &.{.{ .slot = slot, .start = start, .tokens = tokens, .parents = null, .draws = draws, .sampling = sampling }}, &one);
+        return window(p, &.{.{ .slot = slot, .start = start, .tokens = tokens, .parents = null, .draws = draws, .sampling = sampling, .masks = masks }}, &one);
     }
 
     fn chainDrop(p: *anyopaque, slot: u32) anyerror!void {

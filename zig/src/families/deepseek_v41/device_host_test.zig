@@ -21,3 +21,7 @@ test {
 test {
     _ = @import("review_handoff_test.zig");
 }
+
+test {
+    std.testing.refAllDecls(@import("grammar_gpu.zig").Masks);
+}
