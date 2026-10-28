@@ -63,4 +63,5 @@ test "asset commands cannot select a GPU operation" {
 test {
     _ = @import("config.zig");
     _ = @import("engram_discovery.zig");
+    _ = @import("arithmetic_oracle_test.zig");
 }
