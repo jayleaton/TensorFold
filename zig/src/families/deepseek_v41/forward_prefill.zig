@@ -166,7 +166,7 @@ pub fn planPrograms(f: *Forward, p: *buffers.Plan, rows: u32, layers: []const u3
     var ra = std.heap.ArenaAllocator.init(f.gpa);
     defer ra.deinit();
     const replay = state(f).mode == .replay;
-    const runs = try block_prefill.planRuns(ra.allocator(), f.cfg, f.widths, image_opts.planOptions(f), if (replay) try encoderLayers(f, layers) else layers, if (replay) try decoderLayers(f, layers) else null, rows, if (replay) .encoder else .whole);
+    const runs = try block_prefill.planRuns(ra.allocator(), f.cfg, f.widths, image_opts.runOptions(f), if (replay) try encoderLayers(f, layers) else layers, if (replay) try decoderLayers(f, layers) else null, rows, if (replay) .encoder else .whole);
     for (runs.items) |cs| try p.add(cs);
 }
 

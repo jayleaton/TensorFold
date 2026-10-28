@@ -308,6 +308,7 @@ pub const GpuTarget = struct {
         if (t.rows) |b| return b.targetWindow(segments, choices, t.sampler);
         if (segments.len != 1) return error.Slots;
         const s = segments[0];
+        if (@import("image_opts.zig").hasImage(s.tokens)) return error.ImageInWindow;
         if (s.slot != 0) return error.Slots;
         if (s.parents != null) {
             t.tree_masks = s.masks;

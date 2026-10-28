@@ -29,6 +29,13 @@ pub fn planOptions(f: *const Forward) block.Options {
     return planWith(f.opts, f.images, f.image_bias);
 }
 
+/// Text-only multi-segment programs retain keep storage but never plan an image split.
+pub fn runOptions(f: *const Forward) block.Options {
+    var o = planOptions(f);
+    o.image_rows = 0;
+    return o;
+}
+
 /// A segment's options: the keep step when it holds an image position, its image rows under the image bias.
 pub fn segmentWith(base: block.Options, images: bool, bias: bool, ids: []const u32) block.Options {
     var o = base;
@@ -65,4 +72,16 @@ test "image options: text segments keep the forward's options, image ones the ke
     try std.testing.expect(kept.image_keep);
     try std.testing.expectEqual(o.image_rows, kept.image_rows);
     try std.testing.expectEqual(@as(i64, 2), segmentWith(o, true, true, &ids).image_rows);
+}
+
+test "image options: text-only runs retain image keep storage without split image rows" {
+    var f: Forward = undefined;
+    f.opts = .{};
+    f.images = true;
+    f.image_bias = true;
+    const planned = planOptions(&f);
+    try std.testing.expectEqual(@as(i64, -1), planned.image_rows);
+    const run = runOptions(&f);
+    try std.testing.expect(run.image_keep);
+    try std.testing.expectEqual(@as(i64, 0), run.image_rows);
 }
