@@ -6,6 +6,8 @@ const Rgb = pixels.Rgb;
 
 const PRECISION_BITS = 32 - 8 - 2;
 
+pub const Error = error{ImageTooSmall} || Allocator.Error;
+
 fn bicubic(x0: f64) f64 {
     const a = -0.5;
     const x = @abs(x0);
@@ -75,7 +77,10 @@ fn clip8(ss: i32) u8 {
 }
 
 /// ``ImagingResample(im, w, h, BICUBIC, (0, 0, W, H))`` of an RGB image.
-pub fn resize(gpa: Allocator, src: Rgb, w: u32, h: u32) Allocator.Error!Rgb {
+pub fn resize(gpa: Allocator, src: Rgb, w: u32, h: u32) Error!Rgb {
+    // Pillow's ImagingResize: a dimension below one pixel is refused, not fitted
+    if (w == 0 or h == 0 or src.w == 0 or src.h == 0) return error.ImageTooSmall;
+    if (src.w > std.math.maxInt(i32) or src.h > std.math.maxInt(i32)) return error.ImageTooSmall;
     const need_h = w != src.w;
     const need_v = h != src.h;
     var vert = try Coeffs.init(gpa, src.h, h);
@@ -140,7 +145,8 @@ pub fn roundHalfEven(x: f64) i64 {
 }
 
 /// ``ImageOps.pad(image, (bw, bh), color=(127, 127, 127))``: ``contain`` (aspect kept, BICUBIC), centred.
-pub fn pad(gpa: Allocator, src: Rgb, bw: u32, bh: u32, fill: u8) Allocator.Error!Rgb {
+pub fn pad(gpa: Allocator, src: Rgb, bw: u32, bh: u32, fill: u8) Error!Rgb {
+    if (src.w == 0 or src.h == 0 or bw == 0 or bh == 0) return error.ImageTooSmall;
     const im_ratio = @as(f64, @floatFromInt(src.w)) / @as(f64, @floatFromInt(src.h));
     const dest_ratio = @as(f64, @floatFromInt(bw)) / @as(f64, @floatFromInt(bh));
     var sw = bw;
@@ -154,6 +160,8 @@ pub fn pad(gpa: Allocator, src: Rgb, bw: u32, bh: u32, fill: u8) Allocator.Error
             if (nw != bw) sw = @intCast(nw);
         }
     }
+    // Pillow 12.3's contain can round a fitted side to 0; its resize then raises, so refuse it here
+    if (sw == 0 or sh == 0) return error.ImageTooSmall;
     var resized: Rgb = if (sw == src.w and sh == src.h) .{ .w = sw, .h = sh, .data = try gpa.dupe(u8, src.data) } else try resize(gpa, src, sw, sh);
     if (sw == bw and sh == bh) return resized;
     defer resized.deinit(gpa);
@@ -170,4 +178,17 @@ test "round half to even, as Python's round" {
     try std.testing.expectEqual(@as(i64, 2), roundHalfEven(2.5));
     try std.testing.expectEqual(@as(i64, 4), roundHalfEven(3.5));
     try std.testing.expectEqual(@as(i64, 3), roundHalfEven(2.51));
+}
+
+test "a fitted or requested zero dimension is refused, not divided by" {
+    const a = std.testing.allocator;
+    var src = pixels.Rgb{ .w = 1, .h = 1, .data = try a.alloc(u8, 3) };
+    defer src.deinit(a);
+    @memset(src.data, 0);
+    try std.testing.expectError(error.ImageTooSmall, resize(a, src, 0, 1));
+    try std.testing.expectError(error.ImageTooSmall, resize(a, src, 1, 0));
+    var tall = pixels.Rgb{ .w = 1, .h = 100_000, .data = try a.alloc(u8, 100_000 * 3) };
+    defer tall.deinit(a);
+    @memset(tall.data, 0);
+    try std.testing.expectError(error.ImageTooSmall, pad(a, tall, 42, 2646, 127));
 }

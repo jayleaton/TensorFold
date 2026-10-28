@@ -21,6 +21,8 @@ const Huff = struct {
         var k: usize = 0;
         for (1..17) |len| {
             const n = counts[len - 1];
+            // the whole bucket must fit the canonical code space before any entry is written
+            if (k + n > vals.len or k + n > h.vals.len or code + @as(i32, @intCast(n)) > (@as(i32, 1) << @intCast(len))) return error.BadJpeg;
             h.valoff[len] = @as(i32, @intCast(k)) - code;
             for (0..n) |_| {
                 if (len <= 9) {
@@ -32,7 +34,6 @@ const Huff = struct {
                 code += 1;
             }
             h.maxcode[len] = if (n > 0) code - 1 else -1;
-            if (code > (@as(i32, 1) << @intCast(len))) return error.BadJpeg;
             code <<= 1;
         }
         h.maxcode[17] = std.math.maxInt(i32);
@@ -202,7 +203,10 @@ pub fn decode(gpa: Allocator, raw: []const u8, max_pixels: u64) Error!pixels.Ima
         const seg = raw[at + 2 .. at + len];
         at += len;
         switch (m) {
-            0xC0, 0xC1, 0xC2 => frame = try sof(gpa, seg, m == 0xC2, max_pixels),
+            0xC0, 0xC1, 0xC2 => {
+                if (frame != null) return error.BadJpeg; // one frame a container; a second would abandon the first
+                frame = try sof(gpa, seg, m == 0xC2, max_pixels);
+            },
             0xC3, 0xC5...0xC7, 0xC9...0xCB, 0xCD...0xCF => return error.UnsupportedJpeg,
             0xC4 => try dht(seg, &dc, &ac),
             0xDB => try dqt(seg, &quant, &qset),
@@ -252,6 +256,8 @@ fn sof(gpa: Allocator, s: []const u8, progressive: bool, max_pixels: u64) Error!
     }
     f.mcux = (w + 8 * @as(usize, f.hmax) - 1) / (8 * @as(usize, f.hmax));
     f.mcuy = (h + 8 * @as(usize, f.vmax) - 1) / (8 * @as(usize, f.vmax));
+    var allocated: usize = 0;
+    errdefer for (f.comps[0..allocated]) |c| gpa.free(c.coef);
     for (f.comps[0..nc]) |*c| {
         c.bw = f.mcux * c.h;
         c.bh = f.mcuy * c.v;
@@ -260,6 +266,7 @@ fn sof(gpa: Allocator, s: []const u8, progressive: bool, max_pixels: u64) Error!
         c.real_bw = (c.dw + 7) / 8;
         c.real_bh = (c.dh + 7) / 8;
         c.coef = try gpa.alloc(i16, c.bw * c.bh * 64);
+        allocated += 1;
         @memset(c.coef, 0);
     }
     return f;
@@ -527,4 +534,42 @@ fn finish(gpa: Allocator, f: *Frame, quant: *const [4][64]u16, jfif: bool, adobe
         }
     }
     return im;
+}
+
+test "an oversubscribed Huffman table is refused before its lookup is written" {
+    const raw = blk: {
+        var b: [28]u8 = @splat(0);
+        @memcpy(b[0..8], "\xff\xd8\xff\xc4\x00\x16\x00\x03");
+        b[23] = 0;
+        b[24] = 1;
+        b[25] = 2;
+        b[26] = 0xff;
+        b[27] = 0xd9;
+        break :blk b;
+    };
+    try std.testing.expectError(error.BadJpeg, decode(std.testing.allocator, &raw, 64 * 1024 * 1024));
+}
+
+test "a second frame header is refused before it allocates another coefficient image" {
+    const sof_hdr = [_]u8{ 0xff, 0xc0, 0x00, 0x0b, 0x08, 0x00, 0x01, 0x00, 0x01, 0x01, 0x01, 0x11, 0x00 };
+    const soi = [_]u8{ 0xff, 0xd8 };
+    const eoi = [_]u8{ 0xff, 0xd9 };
+    var raw: [30]u8 = undefined;
+    @memcpy(raw[0..2], &soi);
+    @memcpy(raw[2..15], &sof_hdr);
+    @memcpy(raw[15..28], &sof_hdr);
+    @memcpy(raw[28..30], &eoi);
+    var pool: [128]u8 align(16) = undefined; // exactly one 1x1 frame's coefficients
+    var fba = std.heap.FixedBufferAllocator.init(&pool);
+    try std.testing.expectError(error.BadJpeg, decode(fba.allocator(), &raw, 64 * 1024 * 1024));
+}
+
+fn sofOnce(a: Allocator, seg: []const u8) !void {
+    const f = try sof(a, seg, false, 64 * 1024 * 1024);
+    for (f.comps[0..f.nc]) |c| a.free(c.coef);
+}
+
+test "a frame releases its earlier components when a later allocation fails" {
+    const seg = [_]u8{ 8, 0, 1, 0, 1, 3, 1, 0x11, 0, 2, 0x11, 0, 3, 0x11, 0 };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, sofOnce, .{&seg});
 }

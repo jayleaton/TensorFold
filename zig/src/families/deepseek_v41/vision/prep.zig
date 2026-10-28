@@ -10,7 +10,7 @@ pub const IMAGE_TOKEN: u32 = 129264;
 
 pub const Type = enum(i8) { text = -1, start = 0, image = 1, newline = 2, end = 3 };
 
-pub const Error = error{ NoGrid, BadSettings } || Allocator.Error;
+pub const Error = error{ NoGrid, BadSettings, ImageTooSmall } || Allocator.Error;
 
 extern "c" fn pow(x: f64, y: f64) f64; // Python's float ** (libm), not a Zig reimplementation
 
@@ -132,6 +132,10 @@ pub fn spanLen(h: u32, w: u32) u32 {
     return h * (w + 1) + 2;
 }
 
+fn spanLen64(h: u32, w: u32) u64 {
+    return @as(u64, h) * (@as(u64, w) + 1) + 2;
+}
+
 /// ``llm_grid``: the aligner's grid of a pixel size.
 fn llmGrid(height: f64, width: f64, patch: u32, ratio: u32) [2]u32 {
     const p: f64 = @floatFromInt(patch);
@@ -174,12 +178,12 @@ pub fn plan(width0: u32, height0: u32, s: *const Settings) Error![4]u32 {
     var bw = @ceil(width / p) * p;
     var bh = @ceil(height / p) * p;
     var g = llmGrid(bh, bw, s.patch, s.downsample);
-    if (spanLen(g[0], g[1]) > most) {
+    if (spanLen64(g[0], g[1]) > @as(u64, most)) {
         const hw = solve(height, width, s.patch, s.downsample, most);
         bh = hw[0];
         bw = hw[1];
         g = llmGrid(bh, bw, s.patch, s.downsample);
-        if (spanLen(g[0], g[1]) > most) return error.NoGrid;
+        if (spanLen64(g[0], g[1]) > @as(u64, most)) return error.NoGrid;
     }
     return .{ g[0], g[1], @intFromFloat(bh), @intFromFloat(bw) };
 }
@@ -278,4 +282,17 @@ test "span types and the planned grid of a small image" {
     for (want, 0..) |t, i| try std.testing.expectEqual(t, pr.typeAt(@intCast(i)));
     try std.testing.expectEqual(@as(u16, 0xbf80), norm_table[0]); // -1.0
     try std.testing.expectEqual(@as(u16, 0x3f80), norm_table[255]); // 1.0
+}
+
+test "a valid tall or wide image whose fitted side rounds to zero is refused" {
+    const a = std.testing.allocator;
+    for ([_][2]u32{ [2]u32{ 1, 100_000 }, [2]u32{ 100_000, 1 } }) |wh| {
+        var rgb: pixels.Rgb = .{ .w = wh[0], .h = wh[1], .data = try a.alloc(u8, @as(usize, wh[0]) * wh[1] * 3) };
+        defer rgb.deinit(a);
+        @memset(rgb.data, 0);
+        for ([_]u32{ 5, 128, 1024 }) |most| { // the minimum, the reproducer's and the default budget
+            var s: Settings = .{ .cap_tokens = most };
+            try std.testing.expectError(error.ImageTooSmall, preprocess(a, rgb, &s));
+        }
+    }
 }
