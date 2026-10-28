@@ -11,6 +11,7 @@ pub fn targetWindow(b: *Batch, segments: []const iface.Segment, choices: [][]u32
     if (segments.len == 0 or segments.len > 16) return error.Slots;
     var mix: [16]rowtab.Seg = undefined;
     for (segments, mix[0..segments.len]) |sg, *m| {
+        if (@import("image_opts.zig").hasImage(sg.tokens)) return error.ImageInWindow;
         if (sg.parents != null) return error.TreeWindow;
         if (samp.sampled(sg.sampling) and sampler == null) return error.Sampling;
         if (sg.slot >= b.ss.n) return error.Slots;

@@ -584,7 +584,7 @@ test {
     _ = learning;
 }
 pub const all_cuda = @import("nvfp4_tile_pending.zig").records ++ landed_cuda ++ dsv41_pending ++ @import("inc4_pending.zig").trees ++ @import("inc4_pending.zig").rows ++ @import("affine_verify_records.zig").records;
-pub const dsv41_pending = @import("registry_union.zig").extra(landed_cuda, @import("dsv41_pending_1.zig").records ++ @import("dsv41_pending_2.zig").records ++ dsv41_grammar.records);
+pub const dsv41_pending = @import("registry_union.zig").extra(landed_cuda, @import("dsv41_pending_1.zig").records ++ @import("dsv41_pending_2.zig").records ++ dsv41_grammar.records ++ @import("dsv41_vision_records.zig").records);
 test {
     _ = @import("qwen4_cuda_receipts_test.zig");
     _ = @import("glm_kv_pending.zig");

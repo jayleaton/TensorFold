@@ -214,7 +214,7 @@ pub const Served = struct {
             .replay = try knobs.prefillMode(&knobs.env) == .replay,
             .runs = slots > 1 and envOn("TF_DSV41_PIECE_RUNS", false) and try knobs.prefillMode(&knobs.env) == .replay,
             .replay_runs = slots > 1 and envOn("TF_DSV41_REPLAY_RUNS", false) and try knobs.prefillMode(&knobs.env) == .replay,
-            .images = if (std.c.getenv("TF_DSV41_IMAGES")) |v| std.mem.eql(u8, std.mem.trim(u8, std.mem.span(v), " "), "native") else false,
+            .images = try @import("image_mode.zig").fromEnv(),
             .image_bias = if (std.c.getenv("TF_DSV41_BIAS_VL")) |v| std.mem.trim(u8, std.mem.span(v), " ").len > 0 else false,
         };
     }

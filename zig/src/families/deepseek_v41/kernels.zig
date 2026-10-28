@@ -9,6 +9,7 @@ pub const dense = @import("cuda").qlinear.block.dense;
 pub const kv_glue = @import("kernels_kv_glue.zig");
 pub const replay = @import("kernels_replay.zig");
 pub const ops = @import("kernels_ops.zig");
+pub const vision = @import("vision_kernels.zig");
 /// sampling.cu (its own module, loaded by the keyed sampler)
 pub const sampling = @import("sampling_kernels.zig");
 

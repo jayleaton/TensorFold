@@ -20,6 +20,7 @@ pub fn open(f: *Forward) !void {
         .round_graph = &round_graph_table,
         .greedy = &greedy_table,
         .branches = &@import("branches.zig").hooks_table,
+        .vision = &@import("vision_rows.zig").hooks,
     });
     try @import("forward_prefill.zig").attach(f);
 }

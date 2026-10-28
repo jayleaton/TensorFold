@@ -34,6 +34,7 @@ pub const units = [_]cuda_build.Kernel{
 
 /// Optional images: the keyed sampler (TF_DSV41_SAMPLING) and two-tile linears (TF_DSV41_LIN2); empty, they refuse.
 pub const optional = [_]cuda_build.Kernel{
+    .{ .name = "dsv41_vision", .src = "deepseek_v41_vision/vision", .min_sm = 80, .flags = &.{"-O3"} },
     .{ .name = "dsv41_sampling", .src = "deepseek_v41/sampling", .flags = &.{ "-O3", "--fmad=false" } },
     .{ .name = "dsv41_lin2", .src = "exl3_block/lin2", .min_sm = 90, .flags = &.{ "-O3", "--expt-relaxed-constexpr" } },
 };
