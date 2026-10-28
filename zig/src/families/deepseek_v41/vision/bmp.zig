@@ -87,7 +87,11 @@ pub fn decode(gpa: Allocator, raw: []const u8, max_pixels: u64) Error!pixels.Ima
     var rle = false;
     switch (compression) {
         0 => {},
-        1, 2 => rle = true,
+        1, 2 => {
+            const want_bits: u32 = if (compression == 1) 8 else 4; // RLE8 needs 8 bpp, RLE4 needs 4
+            if (bits != want_bits) return error.BadBmp;
+            rle = true;
+        },
         3 => {
             const m = masks;
             if (bits == 32) {
@@ -218,7 +222,8 @@ fn decodeRle(gpa: Allocator, raw: []const u8, offset: usize, rle4: bool, w: u32,
             const right: usize = raw[at];
             const up: usize = raw[at + 1];
             at += 2;
-            try data.appendNTimes(gpa, 0, right + up * w);
+            const want = right + up * w;
+            try data.appendNTimes(gpa, 0, @min(want, dest - data.items.len)); // a delta never extends the frame
             x = data.items.len % w;
         } else {
             const want: usize = if (rle4) byte / 2 else byte;
@@ -238,4 +243,47 @@ fn decodeRle(gpa: Allocator, raw: []const u8, offset: usize, rle4: bool, w: u32,
         const y = if (down) r else h - 1 - r;
         @memcpy(im.data[y * w ..][0..w], data.items[r * w ..][0..w]);
     }
+}
+
+test "RLE compression is refused at bit depths it cannot carry" {
+    var raw: [56]u8 = @splat(0);
+    raw[0] = 'B';
+    raw[1] = 'M';
+    std.mem.writeInt(u32, raw[2..6], @intCast(raw.len), .little);
+    std.mem.writeInt(u32, raw[10..14], 54, .little);
+    std.mem.writeInt(u32, raw[14..18], 40, .little);
+    std.mem.writeInt(u32, raw[18..22], 4, .little);
+    std.mem.writeInt(u32, raw[22..26], 1, .little);
+    std.mem.writeInt(u16, raw[26..28], 1, .little);
+    std.mem.writeInt(u16, raw[28..30], 24, .little);
+    std.mem.writeInt(u32, raw[30..34], 1, .little);
+    raw[54] = 4; // a four-pixel RLE8 run that a 24-bpp frame cannot hold
+    try std.testing.expectError(error.BadBmp, decode(std.testing.allocator, &raw, 64 * 1024 * 1024));
+    std.mem.writeInt(u16, raw[28..30], 8, .little);
+    std.mem.writeInt(u32, raw[30..34], 2, .little); // the same run at 8 bpp is RLE4
+    try std.testing.expectError(error.BadBmp, decode(std.testing.allocator, &raw, 64 * 1024 * 1024));
+}
+
+test "an RLE delta cannot extend the frame past its own size" {
+    var raw: [1082]u8 = @splat(0);
+    raw[0] = 'B';
+    raw[1] = 'M';
+    std.mem.writeInt(u32, raw[2..6], @intCast(raw.len), .little);
+    std.mem.writeInt(u32, raw[10..14], 1078, .little);
+    std.mem.writeInt(u32, raw[14..18], 40, .little);
+    std.mem.writeInt(u32, raw[18..22], 1000, .little);
+    std.mem.writeInt(u32, raw[22..26], 1, .little);
+    std.mem.writeInt(u16, raw[26..28], 1, .little);
+    std.mem.writeInt(u16, raw[28..30], 8, .little);
+    std.mem.writeInt(u32, raw[30..34], 1, .little);
+    raw[1078] = 0;
+    raw[1079] = 2;
+    raw[1080] = 0xff;
+    raw[1081] = 0xff; // delta right 255, up 255: 255,255 pixels requested for a 1,000-pixel row
+    var pool: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&pool);
+    var im = try decode(fba.allocator(), &raw, 64 * 1024 * 1024);
+    defer im.deinit(fba.allocator());
+    try std.testing.expectEqual(@as(u32, 1000), im.w);
+    try std.testing.expectEqual(@as(usize, 1000), im.data.len);
 }
