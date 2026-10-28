@@ -76,7 +76,8 @@ pub fn decode(gpa: Allocator, raw: []const u8, max_pixels: u64) Error!pixels.Ima
     if (at >= raw.len) return error.BadGif;
     const bits = raw[at];
     at += 1;
-    if (bits > 12) return error.BadGif;
+    // the LZW minimum code size's byte alphabet (2..8)
+    if (bits < 2 or bits > 8) return error.BadGif;
     var im: pixels.Image = .{ .w = w, .h = h, .mode = if (palette != null) .p else .l, .data = try gpa.alloc(u8, @as(usize, w) * h) };
     errdefer im.deinit(gpa);
     @memset(im.data, transparency orelse 0);
@@ -178,7 +179,8 @@ fn lzw(src: []const u8, bits: u8, interlace: bool, im: *pixels.Image, x0: u32, y
             lastcode = this;
         }
         for (stack[table - n ..]) |v| {
-            im.data[(@as(usize, y + y0)) * im.w + x0 + x] = v;
+            const dst = (@as(usize, y) + @as(usize, y0)) * @as(usize, im.w) + @as(usize, x0) + @as(usize, x);
+            im.data[dst] = v;
             x += 1;
             if (x < xs) continue;
             x = 0;
@@ -201,5 +203,38 @@ fn lzw(src: []const u8, bits: u8, interlace: bool, im: *pixels.Image, x0: u32, y
                 0 => return, // the last row is in
             };
         }
+    }
+}
+
+fn testGif(bits: u8) [29]u8 {
+    var g: [29]u8 = @splat(0);
+    const sig = [_]u8{ 'G', 'I', 'F', '8', '9', 'a' };
+    @memcpy(g[0..6], &sig);
+    std.mem.writeInt(u16, g[6..8], 1, .little);
+    std.mem.writeInt(u16, g[8..10], 1, .little);
+    g[13] = ',';
+    std.mem.writeInt(u16, g[18..20], 1, .little);
+    std.mem.writeInt(u16, g[20..22], 1, .little);
+    g[23] = bits;
+    g[24] = 2;
+    g[25] = 0;
+    g[26] = 0;
+    g[27] = 0;
+    g[28] = ';';
+    return g;
+}
+
+test "the GIF LZW minimum code size is limited to the 2..8 byte alphabet" {
+    const a = std.testing.allocator;
+    for ([_]u8{ 0, 1, 9, 10, 11, 12 }) |bits| {
+        const raw = testGif(bits);
+        try std.testing.expectError(error.BadGif, decode(a, &raw, 64 * 1024 * 1024));
+    }
+    for (2..9) |bits| {
+        const raw = testGif(@intCast(bits));
+        var im = try decode(a, &raw, 64 * 1024 * 1024);
+        defer im.deinit(a);
+        try std.testing.expectEqual(@as(u32, 1), im.w);
+        try std.testing.expectEqual(@as(u8, 0), im.data[0]);
     }
 }
