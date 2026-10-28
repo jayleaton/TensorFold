@@ -539,3 +539,27 @@ fn responseLength(reply: []const u8) !usize {
     while (lines.next()) |line| if (std.mem.startsWith(u8, line, "Content-Length: ")) return std.fmt.parseInt(usize, line[16..], 10);
     return error.MissingContentLength;
 }
+
+test "health wire stays independent of recorded-run totals while native counting remains exact" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var engine: Idle = .{};
+    var text: Bytes = .{};
+    const srv = try server.Server.init(std.testing.allocator, std.testing.io, engine.engine(), text.text(), .{ .served_name = "m", .model_ids = &.{"m"} }, null);
+    defer srv.deinit();
+    const before = try json.stringify(a, try status_routes.openHealth(srv, a, false), .{});
+    srv.metrics.note(srv.io, 101, 17, 7, 9, 4, 3, 1, null, null, null, null);
+    srv.metrics.note(srv.io, 23, 2, 5, 6, 2, 4, 1, null, null, null, null);
+    const after = try json.stringify(a, try status_routes.openHealth(srv, a, false), .{});
+    try std.testing.expectEqualStrings(before, after);
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, after, .{});
+    for ([_][]const u8{ "requests", "requests_total", "prompt_tokens_total", "completion_tokens_total", "cached_tokens_total", "rounds_total", "drafted_total", "accepted_total" }) |field_name|
+        try std.testing.expect(!parsed.object.contains(field_name));
+    try std.testing.expectEqual(@as(u64, 124), srv.metrics.prompt);
+    try std.testing.expectEqual(@as(u64, 19), srv.metrics.cached);
+    try std.testing.expectEqual(@as(u64, 12), srv.metrics.generation);
+    try std.testing.expectEqual(@as(u64, 15), srv.metrics.drafted);
+    try std.testing.expectEqual(@as(u64, 6), srv.metrics.accepted);
+    try std.testing.expectEqual(@as(u64, 7), srv.metrics.rounds);
+}
