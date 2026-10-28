@@ -25,3 +25,7 @@ test {
 test {
     std.testing.refAllDecls(@import("grammar_gpu.zig").Masks);
 }
+
+test {
+    _ = @import("model_supervisor_test.zig");
+}
