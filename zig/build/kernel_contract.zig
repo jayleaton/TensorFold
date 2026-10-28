@@ -14,6 +14,7 @@ pub fn hostTests(b: *std.Build, family: *std.Build.Step) void {
     run.has_side_effects = true;
     b.step("test-kernel-seed-host", "Named contract fixtures keep their seed when entries are inserted").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = module(b, b.graph.host, .debug), .filters = &.{"contract seed:"} })).step);
     const step = b.step("test-kernel-contract", "The kernel contract's host tests: gate logic, controls, every launch against every chip");
+    @import("dsv41_grammar.zig").hostTests(b, step);
     step.dependOn(&run.step);
     step.dependOn(family);
     const rotary = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{

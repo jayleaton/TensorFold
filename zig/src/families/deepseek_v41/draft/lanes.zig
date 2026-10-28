@@ -86,7 +86,7 @@ pub const Lanes = struct {
         return .{ .ptr = x, .vtable = if (pieces) &vtable_pieces else &vtable };
     }
 
-    const vtable: be.Backend.VTable = .{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .probabilities = probabilities, .tree = heldTree, .release = release };
+    const vtable: be.Backend.VTable = .{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .probabilities = probabilities, .tree = heldTree, .held = @import("../grammar_lane.zig").held, .first_masked = @import("../grammar_lane.zig").firstMasked, .release = release };
     /// a target that runs prompts in pieces (iface.Target begin / piece / finish): the round planner may use them
     const vtable_pieces: be.Backend.VTable = blk: {
         var v = vtable;
@@ -188,6 +188,7 @@ pub const Lanes = struct {
         x.policy.depth.reset(slot);
         const ids = s.prompt();
         x.target.admit(slot, s.max_new);
+        try @import("../grammar_lane.zig").prompt(x, s, slot);
         st.first = try x.target.prefill(slot, ids, s.sampling, ids.len);
         st.len = ids.len;
         _ = x.scratch.reset(.retain_capacity);
@@ -263,6 +264,7 @@ pub const Lanes = struct {
         const st = try x.get(s);
         try x.settle();
         const ids = s.prompt();
+        try @import("../grammar_lane.zig").prompt(x, s, st.slot);
         return x.finished(st, ids, try x.target.finish(st.slot, ids, s.sampling, ids.len));
     }
 
@@ -272,6 +274,7 @@ pub const Lanes = struct {
         const st = try x.get(s);
         try x.settle();
         const ids = s.prompt();
+        try @import("../grammar_lane.zig").prompt(x, s, st.slot);
         if (try x.target.tail(st.slot, ids, s.sampling, ids.len)) |first_| {
             try x.finished(st, ids, first_);
             return false;
@@ -336,7 +339,7 @@ pub const Lanes = struct {
             @memcpy(tokens[1 .. 1 + w.held], st.held[0..w.held]);
             @memcpy(tokens[1 + w.held ..], w.tokens);
             const parents = w.parents; // each row's parent row (row 0: -1)
-            g.* = .{ .slot = st.slot, .start = st.len, .tokens = tokens, .parents = parents, .draws = w.positions, .sampling = w.stream.sampling };
+            g.* = .{ .slot = st.slot, .start = st.len, .tokens = tokens, .parents = parents, .draws = w.positions, .sampling = w.stream.sampling, .masks = w.masks };
             c.* = o.sampled;
             @memcpy(o.drafts, tokens[1..]);
         }

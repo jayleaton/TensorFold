@@ -1,6 +1,7 @@
 //! The registered launches gate 5 checks: each one's threads and memory, and the limits its compiles recorded.
 const std = @import("std");
 const limits = @import("limits.zig");
+pub const dsv41_grammar = @import("dsv41_grammar_record.zig");
 const M = limits.MetalLaunch;
 const C = limits.CudaLaunch;
 const U = limits.Usage;
@@ -581,7 +582,7 @@ test {
     _ = learning;
 }
 pub const all_cuda = @import("nvfp4_tile_pending.zig").records ++ landed_cuda ++ dsv41_pending ++ @import("inc4_pending.zig").trees ++ @import("inc4_pending.zig").rows ++ @import("affine_verify_records.zig").records;
-pub const dsv41_pending = @import("registry_union.zig").extra(landed_cuda, @import("dsv41_pending_1.zig").records ++ @import("dsv41_pending_2.zig").records);
+pub const dsv41_pending = @import("registry_union.zig").extra(landed_cuda, @import("dsv41_pending_1.zig").records ++ @import("dsv41_pending_2.zig").records ++ dsv41_grammar.records);
 test {
     _ = @import("qwen4_cuda_receipts_test.zig");
     _ = @import("glm_kv_pending.zig");

@@ -8,3 +8,7 @@ test {
 test {
     _ = @import("draft/review_release_test.zig");
 }
+
+test {
+    _ = @import("grammar_host_test.zig");
+}
