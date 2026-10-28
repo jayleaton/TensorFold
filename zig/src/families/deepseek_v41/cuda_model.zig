@@ -219,6 +219,7 @@ pub const Model = struct {
         tr.step("start", cuda.usage(false));
         const comm = m.session.comm();
         const world: u32 = @intCast(comm.world());
+        try @import("session_protocol.zig").preflight(&m.session.plan);
         const vision_boot = @import("vision_boot.zig");
         const requested_vision = if (m.tcfg.rank == 0) try vision_boot.fromEnv(o.vision) else null;
         const selected_vision = try vision_boot.select(&m.session.plan, requested_vision);
