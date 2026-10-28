@@ -3,6 +3,7 @@ pub fn addImports(b: *std.Build, m: *std.Build.Module, target: std.Build.Resolve
     addImportsAt(b, m, target, .Debug);
 }
 pub fn addImportsAt(b: *std.Build, m: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+    @import("dsv41_grammar.zig").addTo(b, m);
     const core = m.import_table.get("core").?;
     const tokenizer = core.import_table.get("tokenizer").?;
     const lanes = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = target, .optimize = optimize, .link_libc = true });

@@ -11,6 +11,7 @@ pub const Segment = struct {
     parents: ?[]const i32, // each row's parent row (row 0: -1); null: a chain
     draws: []const u64,
     sampling: ?lanes.Sampling,
+    masks: []const u32 = &.{},
 };
 
 /// A slot's last rows' taps (bf16 [rows, 3 x hidden] at `address`); `map`: tree window row -> taps row (branches.zig).
@@ -21,6 +22,7 @@ pub const Target = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        prompt_mask: ?*const fn (*anyopaque, u32, []const u32) anyerror!void = null,
         /// Run the prompt into the slot's state; the keyed choice after its last row (drawn at `draw`).
         prefill: *const fn (ptr: *anyopaque, slot: u32, ids: []const u32, sampling: ?lanes.Sampling, draw: u64) anyerror!u32,
         /// One forward over every segment into `choices[i][r]`; rows stay until `keep` (never kept: all rows stay).
@@ -86,6 +88,11 @@ pub const Target = struct {
     pub fn tail(t: Target, slot: u32, ids: []const u32, sampling: ?lanes.Sampling, draw: u64) !?u32 {
         const f = t.vtable.tail orelse return try t.finish(slot, ids, sampling, draw);
         return f(t.ptr, slot, ids, sampling, draw);
+    }
+
+    pub fn promptMask(t: Target, slot: u32, mask: []const u32) !void {
+        if (t.vtable.prompt_mask) |f| return f(t.ptr, slot, mask);
+        if (mask.len != 0) return error.StructuresUnsupported;
     }
 
     pub fn prefill(t: Target, slot: u32, ids: []const u32, sampling: ?lanes.Sampling, draw: u64) !u32 {
