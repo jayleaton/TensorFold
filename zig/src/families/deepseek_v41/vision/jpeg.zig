@@ -21,6 +21,8 @@ const Huff = struct {
         var k: usize = 0;
         for (1..17) |len| {
             const n = counts[len - 1];
+            // the whole bucket must fit the canonical code space before any entry is written
+            if (k + n > vals.len or k + n > h.vals.len or code + @as(i32, @intCast(n)) > (@as(i32, 1) << @intCast(len))) return error.BadJpeg;
             h.valoff[len] = @as(i32, @intCast(k)) - code;
             for (0..n) |_| {
                 if (len <= 9) {
@@ -32,7 +34,6 @@ const Huff = struct {
                 code += 1;
             }
             h.maxcode[len] = if (n > 0) code - 1 else -1;
-            if (code > (@as(i32, 1) << @intCast(len))) return error.BadJpeg;
             code <<= 1;
         }
         h.maxcode[17] = std.math.maxInt(i32);
@@ -528,3 +529,18 @@ fn finish(gpa: Allocator, f: *Frame, quant: *const [4][64]u16, jfif: bool, adobe
     }
     return im;
 }
+
+test "an oversubscribed Huffman table is refused before its lookup is written" {
+    const raw = blk: {
+        var b: [28]u8 = @splat(0);
+        @memcpy(b[0..8], "\xff\xd8\xff\xc4\x00\x16\x00\x03");
+        b[23] = 0;
+        b[24] = 1;
+        b[25] = 2;
+        b[26] = 0xff;
+        b[27] = 0xd9;
+        break :blk b;
+    };
+    try std.testing.expectError(error.BadJpeg, decode(std.testing.allocator, &raw, 64 * 1024 * 1024));
+}
+
