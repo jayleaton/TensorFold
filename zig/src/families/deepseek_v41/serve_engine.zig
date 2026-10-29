@@ -118,7 +118,10 @@ pub const Served = struct {
         const trees = if (m.pass != null) try tree.Settings.fromEnv() else tree.Settings{};
         s.x = try ln.Lanes.init(gpa, tgt, pass, s.costs, .{ .shape = gate_lanes.shapeOf(&m.f), .slots = m.slots, .siblings = trees.siblings, .sib_rows = trees.sib_rows, .dup = trees.dup, .depth = try calib_env.depthSettings(&calib_env.env), .spec = if (m.pass != null) try spec.Settings.fromEnv() else .{} });
         s.arena = std.heap.ArenaAllocator.init(gpa);
-        s.cfg = try lanes.Config.init(gpa, try s.x.model(s.arena.allocator(), 64), 16, 15);
+        const copy_policy = try @import("draft/copy_policy.zig").Settings.fromEnv(&calib_env.env);
+        var lane_model = try s.x.model(s.arena.allocator(), 64);
+        copy_policy.apply(m.pass != null, &lane_model);
+        s.cfg = try lanes.Config.init(gpa, lane_model, 16, 15);
         s.x.policy.depth.forward_rows = if (m.rows) |b| b.cap else 16;
         // drafts sized from cost tables, not the wall clock, so HTTP == CLI replay (TF_DSV41_DRAFT_TIMED=1: measured)
         s.cfg.timed = if (std.c.getenv("TF_DSV41_DRAFT_TIMED")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
@@ -152,7 +155,8 @@ pub const Served = struct {
             }
         } else std.log.info("dsv41 rounds: whole prompts at admission (TF_DSV41_PREFILL_PIECES=1: the reference server's pieces between decode rounds)", .{});
         s.lookup = null;
-        const ls = try lookup.Settings.fromEnv();
+        const ls = copy_policy.lookup(m.pass != null, try lookup.Settings.fromEnv());
+        if (copy_policy.suppressed(m.pass != null)) std.log.info("dsv41 copies: disabled beside the loaded draft head", .{});
         if (ls.plan) {
             const pl = try gpa.create(lookup.Planner);
             pl.* = lookup.Planner.init(ls, &s.x.policy.depth.costs, m.pass != null);
