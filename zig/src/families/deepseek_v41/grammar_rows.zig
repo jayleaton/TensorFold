@@ -20,6 +20,24 @@ pub fn maskRows(logits: []f32, width: u32, indices: []const u32, bits: []const u
 
 pub const Row = struct { index: ?u32, bits: []const u32 };
 
+/// Whether `bits` allows every token below `vocab`: masking a row with it changes no logit on any rank.
+pub fn free(bits: []const u32, vocab: u32) bool {
+    const full = vocab / 32;
+    if (!std.mem.allEqual(u32, bits[0..full], std.math.maxInt(u32))) return false;
+    const tail: u5 = @intCast(vocab % 32);
+    return tail == 0 or (~bits[full] & ((@as(u32, 1) << tail) - 1)) == 0;
+}
+
+/// The rows of `list` that disallow a token, into `out`; null when none do and none are staged (nothing to change).
+pub fn constraining(list: []const Row, vocab: u32, staged: u32, out: []Row) ?[]Row {
+    var n: usize = 0;
+    for (list) |r| if (!free(r.bits, vocab)) {
+        out[n] = r;
+        n += 1;
+    };
+    return if (n == 0 and staged == 0) null else out[0..n];
+}
+
 pub fn validate(rows: []const Row, words: u32, max_rows: u32) !void {
     if (words == 0 or rows.len > max_rows) return error.GrammarRows;
     for (rows) |r| {
