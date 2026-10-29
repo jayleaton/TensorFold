@@ -385,3 +385,7 @@ test {
 test {
     _ = @import("request_admission_test.zig");
 }
+
+test {
+    _ = @import("prefill_scratch_test.zig");
+}

@@ -80,7 +80,13 @@ pub const HfText = struct {
             };
         } else if (!t.native_deepseek) try t.readTemplates(io, a, dir, config);
         // DeepSeek-V4.x releases ship encoding.py, not Jinja: a checkpoint's Jinja is a third party's (--chat-template)
-        if (t.native_deepseek) t.schema_prompt = schemaPrompt(if (std.c.getenv("TF_DSV41_SCHEMA_PROMPT")) |v| std.mem.span(v) else null);
+        if (t.native_deepseek) {
+            t.schema_prompt = schemaPrompt(if (std.c.getenv("TF_DSV41_SCHEMA_PROMPT")) |v| std.mem.span(v) else null);
+            t.tok.message_memo = if (std.c.getenv("TF_DSV41_TOKENIZER_MESSAGE_MEMO")) |v|
+                std.mem.eql(u8, std.mem.span(v), "1")
+            else
+                false;
+        }
         t.specials = try specialsOf(a, config);
         t.eos = t.eosIds(a, model_config, generation, config, t.tok.id_to_token.tokens.items.len) catch |e| {
             if (e == error.OutOfMemory) return e;

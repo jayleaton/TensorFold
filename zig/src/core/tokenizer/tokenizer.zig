@@ -139,6 +139,7 @@ pub const Tokenizer = struct {
     normalized: Trie = .{},
     specials: std.StringHashMapUnmanaged(void) = .empty,
     memo: ?*Memo = null, // long segments' ids kept between encodes (null: each encode tokenizes everything)
+    message_memo: bool = false, // select before encoding: memoize after normalized added-token boundaries
 
     pub fn deinit(t: *Tokenizer) void {
         t.vocab.deinit();
@@ -245,6 +246,7 @@ pub const Tokenizer = struct {
 
     /// encodeText through the memo for a long segment: its kept ids, else encoded and kept.
     fn encodeSegment(t: *const Tokenizer, ctx: *steps.Context, text: []const u8, first: bool, ids: *std.ArrayList(u32)) Error!void {
+        if (t.message_memo) return t.encodeText(ctx, text, first, ids);
         const m = t.memo orelse return t.encodeText(ctx, text, first, ids);
         if (text.len < @import("memo.zig").min_bytes) return t.encodeText(ctx, text, first, ids);
         if (try m.append(text, first, ctx.a, ids)) return;
@@ -301,14 +303,23 @@ pub const Tokenizer = struct {
                 continue;
             }
             if (seg.end == seg.start) continue;
+            const part = normalized[seg.start..seg.end];
+            const lead = seg.start < zero;
+            const memo = if (t.message_memo and added and part.len >= @import("memo.zig").min_bytes) t.memo else null;
+            const from_part = ids.items.len;
+            if (memo) |m| if (try m.append(part, lead, ctx.a, ids)) {
+                if (spans.len > 0) try t.refuseAdded(ids.items[from_part..]);
+                continue;
+            };
             var pieces: std.ArrayList(steps.Piece) = .empty;
-            try pieces.append(ctx.a, .{ .text = normalized[seg.start..seg.end], .first = seg.start < zero });
+            try pieces.append(ctx.a, .{ .text = part, .first = lead });
             if (t.pre_tokenizer) |*p| try p.apply(ctx, &pieces);
             for (pieces.items) |piece| {
                 const from = ids.items.len;
                 try t.model.tokenize(ctx, &t.vocab, piece.text, ids);
                 if (spans.len > 0) try t.refuseAdded(ids.items[from..]);
             }
+            if (memo) |m| m.put(part, lead, ids.items[from_part..]);
         }
     }
 
@@ -540,4 +551,5 @@ fn addTokens(t: *Tokenizer, keep: Allocator, scratch: Allocator, list: std.json.
 test {
     _ = @import("tokenizer_test.zig");
     _ = @import("masked_test.zig");
+    _ = @import("message_memo_test.zig");
 }

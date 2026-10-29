@@ -116,3 +116,38 @@ fn mappingCase(a: std.mem.Allocator) !void {
 test "Completion ownership: failed workspace mapping publication unwinds every partial external binding" {
     try t.checkAllAllocationFailures(t.allocator, mappingCase, .{});
 }
+
+test "Completion ownership: K4 acquire binds the alias layout and releases every name after completion" {
+    const scratch = @import("prefill_scratch.zig");
+    var d = mock.init();
+    var runner: run.Runner = .{ .gpa = t.allocator, .d = &d, .stream = .{ .d = &d, .handle = null }, .kernels = undefined, .triton = undefined, .weights = undefined };
+    defer runner.deinit();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    var plan: @import("buffers.zig").Plan = .{ .a = arena.allocator() };
+    for (scratch.members, [_]u64{ 64, 512, 128, 256, 1024 }) |role, bytes|
+        try plan.sizes.put(arena.allocator(), role, bytes);
+    var state: pf.State = .{};
+    state.k4ws = .{ .plan = plan, .alias = true, .allocs = 4, .releases = 4 };
+    var f: fwd.Forward = undefined;
+    f.prefill_state = &state;
+    f.runner = &runner;
+    defer {
+        mock.fail_sync = false;
+        ws.k4Release(&f) catch unreachable;
+    }
+    try ws.k4Acquire(&f);
+    try t.expectEqual(@as(u64, 1536), state.k4ws.bytes);
+    try t.expectEqual(runner.addressOf(scratch.members[0]), runner.addressOf(scratch.members[1]));
+    try t.expectEqual(runner.addressOf(scratch.members[0]), runner.addressOf(scratch.members[2]));
+    try t.expectEqual(runner.addressOf(scratch.members[3]), runner.addressOf(scratch.members[4]));
+    mock.fail_sync = true;
+    try t.expectError(error.NotReady, ws.k4Release(&f));
+    for (scratch.members) |role| try t.expect(runner.addressOf(role) != null);
+    try t.expect(state.k4ws.buf != null);
+    mock.fail_sync = false;
+    try ws.k4Release(&f);
+    for (scratch.members) |role| try t.expect(runner.addressOf(role) == null);
+    try t.expectEqual(mock.allocated, mock.freed);
+    try t.expectEqual(@as(usize, 0), mock.early_free);
+}
