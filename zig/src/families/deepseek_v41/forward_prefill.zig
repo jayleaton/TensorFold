@@ -432,10 +432,7 @@ fn segment(f: *Forward, ids: []const u32, head: bool) !void {
         return e;
     };
     const cs = if (big) try block_prefill.ownCallsKeep(a, plain, K4.tag, &st.k4ws.keep) else plain;
-    if (big) {
-        if (st.k4ws.alias) try @import("prefill_scratch.zig").validate(cs);
-        try k4Acquire(f);
-    }
+    try pf_k4.acquireSegment(f, big, cs);
     // the glue reads the ids (embedding, Engram) and the pending window (positions)
     f.ids = ids;
     f.slot.pending = .{ .start = start, .n = n };

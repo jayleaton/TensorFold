@@ -190,6 +190,13 @@ pub fn wsArg(a: std.mem.Allocator, x: calls.Arg) !calls.Arg {
     }
 }
 
+/// Validate the actual segment before acquiring or reusing its workspace; smaller segments use the forward's roles.
+pub fn acquireSegment(f: *Forward, big: bool, cs: []const calls.Call) !void {
+    if (!big) return;
+    if (pf.state(f).k4ws.alias) try scratch.validate(cs);
+    try k4Acquire(f);
+}
+
 /// The workspace's roles bound to one fresh zeroed allocation (the first 4K segment of a prompt).
 pub fn k4Acquire(f: *Forward) !void {
     const ws = &pf.state(f).k4ws;
