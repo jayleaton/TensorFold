@@ -275,7 +275,7 @@ test "Draft state: every draft depth preserves plain output and concurrent equal
 
 test "copy suppression beside DSpark preserves serial tokens through priced and unpriced request paths" {
     const repeated = p1 ++ p1;
-    for ([_]bool{ false, true }) |priced| for ([_]?lanes.Sampling{ null, hot }) |sampling| {
+    for ([_]bool{ false, true }) |priced| for ([_]?lanes.Sampling{ null, hot }) |sampling| for ([_]bool{ false, true }) |speculate| {
         const cases = [_]Case{
             .{ .prompt = &repeated, .sampling = sampling, .max_new = 48, .copies = true },
             .{ .prompt = &p3, .sampling = sampling, .max_new = 48, .copies = true },
@@ -283,14 +283,64 @@ test "copy suppression beside DSpark preserves serial tokens through priced and 
             .{ .prompt = &p1, .sampling = sampling, .max_new = 48, .drafts = false },
         };
         for ([_]usize{ 1, 2, 4 }) |n| {
-            const off = try run(cases[0..n], .{ .priced = priced, .costs = .cheap });
+            const off = try run(cases[0..n], .{ .priced = priced, .costs = .cheap, .spec = speculate });
             defer off.deinit();
-            const on = try run(cases[0..n], .{ .priced = priced, .costs = .cheap, .no_copies = true });
+            const on = try run(cases[0..n], .{ .priced = priced, .costs = .cheap, .no_copies = true, .spec = speculate });
             defer on.deinit();
             try expectSerial(cases[0..n], off, .{});
             try expectSerial(cases[0..n], on, .{});
             for (off.out, on.out) |a, b| try std.testing.expectEqualSlices(u32, a, b);
             try std.testing.expect(on.drafted > 0);
+            if (speculate and sampling == null and n == 1) try std.testing.expect(on.spec.launched > 0);
         }
     };
+}
+
+test "copy suppression survives cancellation after speculation and reuses the same slot with fresh serial tokens" {
+    const t = try twin.Twin.init(gpa, .{}, 1);
+    defer t.deinit();
+    const d = try twin.Drafter.init(gpa, t, 1);
+    defer d.deinit();
+    var c = try servedCosts(gpa);
+    defer c.deinit(gpa);
+    const x = try ln.Lanes.init(gpa, t.target(), d.passAsync(), c, .{ .shape = d.shape, .slots = 1, .spec = .{ .on = true } });
+    defer x.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const copies: copy_policy.Settings = .{ .no_copies = true };
+    var model = try x.model(arena.allocator(), 64);
+    copies.apply(true, &model);
+    var cfg = try lanes.Config.init(gpa, model, 16, 15);
+    defer cfg.deinit(gpa);
+    try std.testing.expectEqual(@as(u32, 0), cfg.max_copy);
+    var clock: lanes.fake.FixedClock = .{};
+    var e = lanes.Engine.init(gpa, &cfg, x.backend(), clock.clock());
+    defer e.deinit();
+    x.attach(&e);
+    const planner = lookup.Planner.init(copies.lookup(true, .{ .plan = true }), &c, true);
+    var old_proposer = try lookup.Proposer.init(&planner, gpa, &p1, &.{});
+    defer old_proposer.deinit();
+    var cancelled = try lanes.Stream.init(gpa, .{ .id = "cancelled", .prompt = &p1, .max_new = 120, .proposer = old_proposer.proposer() });
+    defer cancelled.deinit(gpa);
+    try e.addStream(&cancelled);
+    const slot = x.state(&cancelled).?.slot;
+    var steps: usize = 0;
+    while (steps < 16 and !cancelled.finished and x.spec.?.stats.launched == 0) : (steps += 1) try e.step();
+    try std.testing.expect(x.spec.?.stats.launched > 0 and !cancelled.finished);
+    e.discard(&cancelled);
+    try std.testing.expectEqual(.cancelled, cancelled.reason);
+    try std.testing.expect(x.state(&cancelled) == null);
+    try std.testing.expect(!x.spec.?.begun and !x.spec.?.live and !d.begun);
+    try std.testing.expectEqual(@as(usize, 1), x.free.items.len);
+    const replacement: Case = .{ .prompt = &p2, .max_new = 80, .copies = true };
+    var new_proposer = try lookup.Proposer.init(&planner, gpa, replacement.prompt, &.{});
+    defer new_proposer.deinit();
+    var reused = try lanes.Stream.init(gpa, .{ .id = "replacement", .prompt = replacement.prompt, .max_new = replacement.max_new, .proposer = new_proposer.proposer() });
+    defer reused.deinit(gpa);
+    try e.addStream(&reused);
+    try std.testing.expectEqual(slot, x.state(&reused).?.slot);
+    while (e.activeCount() > 0) try e.step();
+    const want = try serial(replacement, .{});
+    defer gpa.free(want);
+    try std.testing.expectEqualSlices(u32, want, reused.emitted());
 }

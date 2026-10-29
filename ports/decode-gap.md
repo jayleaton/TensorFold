@@ -372,3 +372,28 @@ outputs or caches were generated. No push, PR, kit, export or public publication
 HeNryous rail detail verified from pinned serve/serve_example.sh:64: both NCCL_IB_HCA and EXL3_RDMA_DEVICES
 select rocep1s0f0,roceP2p1s0f0. This is two devices (opposite port functions from our cabling), not evidence
 that our two active f1 devices need changing. The same launcher caps redirected gathers at3072KiB (:67).
+
+## D2 P3 follow-up contract
+
+Address REVIEW-D2-decode-gap.md's one P3 on the existing branch, after cba19b2f9, in a new commit.
+Only tests/notes change: cover speculation in no-copy parity and cancel/reuse of the actual lane adapter slot.
+Standards/checks remain those recorded above (AGENTS.md, CONTRIBUTING.md, docs/recipes/SKILL.md,
+.zig-version, build.zig/zig/build/dsv41_draft.zig, format/no-GPU workflows and tools/zig/lean_check.py).
+Required checks remain fmt, lean baseline/candidate identity comparison, test-cuda-host and test-dsv41-draft.
+No nested native test standards were found. User explicitly says the lock is held and prohibits builds/tests;
+all executable gates and baseline counts stay unrun. ATC publication remains skipped. No helper needed for
+this small sequential test-only extension; use the existing twin and asynchronous Pass contract directly.
+
+D2 P3 addressed in source: the existing priced/unpriced C1/C2/C4 parity matrix now covers speculation both off
+and on, retaining greedy/keyed full off==on==fresh-serial comparisons. An eligible greedy C1 no-copy run must
+report a nonzero launched count, so speculation coverage cannot silently pass without executing the feature.
+The added cancellation/reuse test uses the twin's actual asynchronous Pass.begin/collect path with one lane
+slot and no-copies enabled for both core and priced planner. It steps with a bounded launch wait, requires a
+real speculative launch before cancelling an unfinished request through Engine.discard, checks cancellation,
+released slot ownership and cleared speculative/pass state, then admits a different prompt onto that exact
+slot and compares its complete emitted tokens with a separate fresh serial twin execution.
+
+Verification for this follow-up: actual diff, asynchronous pass implementation, Engine.discard and slot-retire
+paths inspected; git diff --check passed. No formatter, lean checker, build, host test or model test was run.
+Baseline/candidate counts remain unmeasured; required gates listed above are still pending, not passing.
+The benchmark lock is still held. No production behavior, flag defaults, transport, kernels or assets changed.
