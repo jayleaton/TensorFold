@@ -137,6 +137,7 @@ pub fn plan(f: *Forward, p: *buffers.Plan, rows: u32) !void {
     if (state(f).k4 or (state(f).mode == .replay and f.opts.pf_tbo)) {
         const ws = &state(f).k4ws;
         if (ws.plan == null) {
+            ws.alias = @import("prefill_scratch.zig").enabled(f.opts.pf_tbo);
             ws.plan = .{ .a = f.gpa };
             try planWorkspace(f, &ws.plan.?, rows, layers);
             if (keepsShared(f)) {
@@ -431,7 +432,10 @@ fn segment(f: *Forward, ids: []const u32, head: bool) !void {
         return e;
     };
     const cs = if (big) try block_prefill.ownCallsKeep(a, plain, K4.tag, &st.k4ws.keep) else plain;
-    if (big) try k4Acquire(f);
+    if (big) {
+        if (st.k4ws.alias) try @import("prefill_scratch.zig").validate(cs);
+        try k4Acquire(f);
+    }
     // the glue reads the ids (embedding, Engram) and the pending window (positions)
     f.ids = ids;
     f.slot.pending = .{ .start = start, .n = n };

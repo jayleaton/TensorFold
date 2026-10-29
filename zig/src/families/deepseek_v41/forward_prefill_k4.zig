@@ -1,6 +1,7 @@
 //! The prefill's own workspace (TF_DSV41_PF_4K / _PF_TBO): plan, agreement, acquire, release.
 
 const std = @import("std");
+const scratch = @import("prefill_scratch.zig");
 const quiet = @import("builtin").is_test; // a test's stderr is the build runner's channel
 const cuda = @import("cuda");
 const calls = @import("block_calls.zig");
@@ -95,7 +96,7 @@ pub fn workspaceBytes(f: *Forward, rows: u32) !u64 {
         var keep: block_prefill.Keep = .empty;
         try k4Trim(la.allocator(), &wp, &fp, &keep);
     }
-    return planBytes(&wp);
+    return scratch.Layout.init(&wp, scratch.enabled(f.opts.pf_tbo)).bytes;
 }
 
 pub fn planBytes(wp: *const buffers.Plan) u64 {
@@ -116,6 +117,7 @@ pub const K4 = struct {
     keep: block_prefill.Keep = .empty,
     buf: ?cuda.DeviceBuffer = null,
     ready: bool = false,
+    alias: bool = false,
     bytes: u64 = 0,
     allocs: u64 = 0,
     releases: u64 = 0,
@@ -136,7 +138,7 @@ pub fn wsAgreed(f: *Forward) !bool {
     const ws = &st.k4ws;
     if (ws.buf != null) return true;
     const pl = ws.plan orelse return false;
-    const bytes = planBytes(&pl);
+    const bytes = scratch.Layout.init(&pl, ws.alias).bytes;
     const hard = wsFloorGiB();
     const avail = graphs.memAvailableGiB();
     const left = if (avail) |v| v - @as(f64, @floatFromInt(bytes)) / (1 << 30) else hard;
@@ -193,7 +195,8 @@ pub fn k4Acquire(f: *Forward) !void {
     const ws = &pf.state(f).k4ws;
     if (ws.ready) return;
     const pl = ws.plan orelse return error.Unbound;
-    const total = planBytes(&pl);
+    var layout = scratch.Layout.init(&pl, ws.alias);
+    const total = layout.bytes;
     // the room was agreed first (wsAgreed): every rank fits the workspace above the hard floor
     const t0 = nowMs();
     if (ws.buf != null) try f.runner.stream.synchronize();
@@ -207,11 +210,9 @@ pub fn k4Acquire(f: *Forward) !void {
         if (std.mem.indexOf(u8, k, K4.tag) != null) f.runner.forget(k);
     };
     try b.fill8(0, null);
-    var at: u64 = 0;
     for (pl.sizes.keys(), pl.sizes.values()) |k, v| {
         if (std.mem.indexOf(u8, k, K4.tag) == null) continue;
-        try f.runner.external(k, b.ptr + at);
-        at += std.mem.alignForward(u64, v, 256);
+        try f.runner.external(k, b.ptr + layout.next(k, v));
     }
     try f.runner.stream.synchronize();
     ws.ready = true;
