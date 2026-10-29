@@ -41,11 +41,19 @@ fn decode(frame: []const i64) !?VisionOpen {
 pub fn fromEnv(explicit: ?VisionOpen) !?VisionOpen {
     if (explicit != null) return explicit;
     const raw: ?[]const u8 = if (std.c.getenv("TF_DSV41_IMAGES")) |value| std.mem.span(value) else null;
-    return legacy(null, raw);
+    const max: ?[]const u8 = if (std.c.getenv("TF_DSV41_VISION_MAX_IMAGES")) |value| std.mem.span(value) else null;
+    return legacy(null, raw, max);
 }
 
-/// The old placeholder/reject choices leave native images disabled; only native enables the tower.
-pub fn legacy(explicit: ?VisionOpen, raw: ?[]const u8) !?VisionOpen {
+/// Only native enables the tower, with its own images a request (TF_DSV41_VISION_MAX_IMAGES, default 8).
+pub fn legacy(explicit: ?VisionOpen, raw: ?[]const u8, max_images: ?[]const u8) !?VisionOpen {
     if (explicit != null) return explicit;
-    return if (try @import("image_mode.zig").enabled(raw)) @as(VisionOpen, .{}) else null;
+    if (!try @import("image_mode.zig").enabled(raw)) return null;
+    var limits: VisionOpen = .{ .max_images = (@import("vision/prep.zig").Settings{}).max_images };
+    if (max_images) |text| {
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        if (trimmed.len > 0) limits.max_images = std.fmt.parseInt(u32, trimmed, 10) catch return error.BadVisionBootSettings;
+    }
+    if (limits.max_images == 0) return error.BadVisionBootSettings;
+    return limits;
 }
