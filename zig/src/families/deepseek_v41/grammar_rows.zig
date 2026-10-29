@@ -20,6 +20,15 @@ pub fn maskRows(logits: []f32, width: u32, indices: []const u32, bits: []const u
 
 pub const Row = struct { index: ?u32, bits: []const u32 };
 
+/// TF_DSV41_GRAMMAR: unset, empty or 1 (the default) serves structured output; 0 refuses it. Every rank must agree.
+pub fn enabled() !bool {
+    const v = std.c.getenv("TF_DSV41_GRAMMAR") orelse return true;
+    const s = std.mem.span(v);
+    if (std.mem.eql(u8, s, "0")) return false;
+    if (s.len == 0 or std.mem.eql(u8, s, "1")) return true;
+    return error.BadGrammarKnob;
+}
+
 /// Whether `bits` allows every token below `vocab`: masking a row with it changes no logit on any rank.
 pub fn free(bits: []const u32, vocab: u32) bool {
     const full = vocab / 32;

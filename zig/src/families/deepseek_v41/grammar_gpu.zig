@@ -6,6 +6,7 @@ const rows = @import("grammar_rows.zig");
 const iface = @import("draft/iface.zig");
 const Allocator = std.mem.Allocator;
 pub const Row = rows.Row;
+pub const enabled = rows.enabled;
 
 pub const Masks = struct {
     gpa: Allocator,
