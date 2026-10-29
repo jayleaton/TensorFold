@@ -25,22 +25,6 @@ const routerGroupRot = pk.routerGroupRot;
 const streamRb = pk.streamRb;
 const x3ldEpi = pk.x3ldEpi;
 const idx_split = @import("idx_split.zig");
-const graphs = @import("graphs.zig");
-
-/// TF_DSV41_IDX_SPLIT: one mode on both ranks, else no start (a rank splitting alone pairs its gather with another).
-fn idxSplitAgreed(f: *Forward) !void {
-    var ag = try graphs.Agreement.init(f.runner.d, f.comm, f.runner.stream);
-    defer ag.deinit();
-    const h = ag.host.slice(i32);
-    h[0] = @backingInt(f.opts.idx_split);
-    try ag.dev.uploadAsync(0, std.mem.sliceAsBytes(h[0..1]), ag.stream.handle);
-    try f.comm.allGather(ag.dev.ptr, ag.dev.ptr + 4, 1, .i32, ag.stream.handle);
-    try ag.dev.downloadAsync(4, std.mem.sliceAsBytes(h[1..3]), ag.stream.handle);
-    try ag.stream.synchronize();
-    if (h[1] == h[2]) return;
-    std.log.scoped(.dsv41).err("TF_DSV41_IDX_SPLIT differs between the ranks (modes {d} and {d}; 0 off, 1 auto, 2 all): set it alike", .{ h[1], h[2] });
-    return error.BadKnob;
-}
 
 /// The knobs onto a forward before its buffer plan, on every rank; R1 is read where the forward is made (`r1`).
 pub fn apply(f: *Forward, a: std.mem.Allocator, io: std.Io, rank: u32) !void {
@@ -67,8 +51,8 @@ pub fn apply(f: *Forward, a: std.mem.Allocator, io: std.Io, rank: u32) !void {
     f.opts.pf_tbo = try pfTbo(&env);
     f.opts.stream_rb = try streamRb(&env);
     f.opts.index_bound = try indexBound(&env);
+    // TF_DSV41_IDX_SPLIT: the ranks agreed on it at the TP bootstrap (cuda_model.zig: tp.Config.family)
     f.opts.idx_split = try idx_split.mode(&env);
-    if (f.comm.world() == 2) try idxSplitAgreed(f);
     // TF_DSV41_BRANCHES: the side stream exists before any capture
     if (f.branches == null) f.branches = try @import("branches.zig").install(f.gpa, f, rank);
     // TF_DSV41_PF_OVERLAP: the pieces' exchanges go on the branches' side stream (one peer: TP=2)

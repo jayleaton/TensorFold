@@ -113,15 +113,15 @@ fn fullStep(e: *E, nvis: i64) i64 {
     return if (e.n * nvis * 12 <= e.o.index_budget) e.n else step(e, nvis * 12);
 }
 
-/// TF_DSV41_IDX_SPLIT: layer `L`'s cut, from what every rank holds (null: every row here); reindex follows its source.
-fn cutOf(s: *const Seg, L: u32, streamed: bool, reindexing: bool) ?idx_split.Cut {
+/// TF_DSV41_IDX_SPLIT: layer `L`'s cut (null: every row here); reindex follows its source.
+fn cutOf(s: *const Seg, L: u32, reindexing: bool) ?idx_split.Cut {
     const e = s.e;
     const src: u32 = if (reindexing) @intCast(e.cfg.candidate_source) else L;
     const ratio: i64 = e.cfg.compressRatio(src);
     const nvis = @max(@divFloor(e.end(), ratio), 1);
+    // only agreed inputs (the bootstrap's mode, world, the program's rows and end): no rank-local budget or step
     if (!idx_split.engages(e.o.idx_split, e.o.world, e.o.rows, e.n, nvis)) return null;
-    const st = if (streamed) longpf.plan(e.n, nvis, e.cfg.index_topk) else fullStep(e, nvis);
-    const c = idx_split.Cut.of(e.n, st);
+    const c = idx_split.Cut.of(e.n);
     return if (c.valid()) c else null;
 }
 
@@ -159,8 +159,8 @@ pub fn select(s: *Seg, L: u32) !void {
         if (e.cfg.isCandidateSource(L)) s.cand = true;
         return;
     }
-    // TF_DSV41_IDX_SPLIT: only this rank's rows [lo, hi), in row blocks stepped as the replicated loop steps them
-    const cut = cutOf(s, L, streamed, reindexing);
+    // TF_DSV41_IDX_SPLIT: only this rank's rows [lo, hi), in this rank's own row blocks (the budget stays local)
+    const cut = cutOf(s, L, reindexing);
     const mine: [2]i64 = if (cut) |c| c.mine(e.o.rank) else .{ 0, n };
     if (reindexing) {
         // backend.reindex: the row's own scores over its candidates' positions, in row blocks under the budget

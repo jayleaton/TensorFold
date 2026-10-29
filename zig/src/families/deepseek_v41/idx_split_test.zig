@@ -32,6 +32,27 @@ test "TF_DSV41_IDX_SPLIT: unset / empty / 0 / off off, auto the threshold, 1 / o
     }
 }
 
+test "TF_DSV41_IDX_SPLIT agreement: off adds nothing; auto, 1 and any refused value each carry their own bytes" {
+    defer Fake.pairs = &.{};
+    Fake.pairs = &.{};
+    try testing.expect(xs.agreement(&Fake.get) == null);
+    for ([_][]const u8{ "", "0", "off", " OFF " }) |v| {
+        Fake.pairs = &.{.{ "TF_DSV41_IDX_SPLIT", v }};
+        try testing.expect(xs.agreement(&Fake.get) == null);
+    }
+    var got: [6][32]u8 = undefined;
+    for ([_][]const u8{ "auto", "1", "on", "yes", "2", "auto1" }, &got) |v, *g| {
+        Fake.pairs = &.{.{ "TF_DSV41_IDX_SPLIT", v }};
+        g.* = xs.agreement(&Fake.get).?;
+    }
+    // 1 and on agree; every refused value agrees with every other (both ranks then refuse at apply)
+    try testing.expectEqualSlices(u8, &got[1], &got[2]);
+    try testing.expectEqualSlices(u8, &got[3], &got[4]);
+    try testing.expectEqualSlices(u8, &got[3], &got[5]);
+    // auto, all and refused differ pairwise: a mixed pair fails the bootstrap's agreement on both ranks
+    for ([_][2]usize{ .{ 0, 1 }, .{ 0, 3 }, .{ 1, 3 } }) |p| try testing.expect(!std.mem.eql(u8, &got[p[0]], &got[p[1]]));
+}
+
 test "idx split: every cut gives each rank whole rows, equal gather counts, and both ranks every row's bytes back" {
     const k = 3;
     var ref: [3 * 4200]i32 = undefined;
@@ -39,14 +60,18 @@ test "idx split: every cut gives each rank whole rows, equal gather counts, and 
     var tmp: [2 * 3 * 4200]i32 = undefined;
     for (&ref, 0..) |*v, i| v.* = @intCast(i * 7 + 1);
     var n: i64 = xs.min_rows;
-    while (n <= 4200) : (n += 1) for ([_]i64{ 16, 21, 64, 300, n - 1, n, n + 5 }) |st| {
-        const c = xs.Cut.of(n, st);
-        try testing.expect(c.valid());
-        // the replicated loop's boundary, or the 64-row grid's; never far from even
-        try testing.expect((st < n and @mod(c.h0, st) == 0) or @mod(c.h0, xs.grid) == 0);
-        try testing.expect(2 * c.big() - n <= 4 * xs.grid);
+    while (n <= 4200) : (n += 1) {
+        const c = xs.Cut.of(n);
+        try testing.expect(c.valid() and @mod(c.h0, xs.grid) == 0);
+        try testing.expect(2 * c.big() - n <= 2 * xs.grid);
         const un: usize = @intCast(n);
         const big: usize = @intCast(c.big());
+        // the glue's checks: the cut, two ranks, contiguous rows, a gather buffer of two `big` parts
+        try testing.expectEqual(c, try xs.glueCut(2, n, c.h0, k, k, 2 * big * k));
+        try testing.expectError(error.BadGlue, xs.glueCut(2, n, c.h0, k, k, 2 * big * k - 1));
+        try testing.expectError(error.BadGlue, xs.glueCut(1, n, c.h0, k, k, 2 * big * k));
+        try testing.expectError(error.BadGlue, xs.glueCut(2, n, c.h0, k, k + 1, 2 * big * k));
+        try testing.expectError(error.BadGlue, xs.glueCut(2, n, 0, k, k, 2 * big * k));
         // a rank holds its own rows' selection; the rest of its buffer is another layer's (stale) rows
         for (0..2) |r| {
             const mi = c.mine(@intCast(r));
@@ -55,18 +80,20 @@ test "idx split: every cut gives each rank whole rows, equal gather counts, and 
                 const own = row >= m[0] and row < m[1];
                 local[r][row * k + j] = if (own) ref[row * k + j] else -7;
             };
-            const s0: usize = @intCast(c.sendRow(@intCast(r)));
+            const p = c.plan(@intCast(r));
+            const s0: usize = @intCast(p.send);
+            try testing.expectEqual(c.big(), p.count);
             try testing.expect(s0 + big <= un and s0 <= m[0] and m[1] <= s0 + big);
             @memcpy(tmp[r * big * k ..][0 .. big * k], local[r][s0 * k ..][0 .. big * k]);
         }
         for (0..2) |r| {
-            const t = c.take(@intCast(r));
-            const src: usize, const dst: usize, const rows: usize = .{ @intCast(t.src), @intCast(t.dst), @intCast(t.rows) };
+            const p = c.plan(@intCast(r));
+            const src: usize, const dst: usize, const rows: usize = .{ @intCast(p.src), @intCast(p.dst), @intCast(p.rows) };
             try testing.expect(src + rows <= 2 * big);
             @memcpy(local[r][dst * k ..][0 .. rows * k], tmp[src * k ..][0 .. rows * k]);
             try testing.expectEqualSlices(i32, ref[0 .. un * k], local[r][0 .. un * k]);
         }
-    };
+    }
 }
 
 fn roleEq(x: calls.Role, y: calls.Role) bool {
@@ -308,6 +335,45 @@ test "idx split: the candidate source and its reindex layers take one cut, so ca
         // layers 2 / 8 / 14, the candidate source and its four reindex layers
         try testing.expectEqual(@as(usize, 8), gathers[0]);
         try testing.expectEqual(gathers[0], gathers[1]);
+    };
+}
+
+test "idx split: ranks with unequal index budgets still cut alike, issue the same collectives and own each row once" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const fx = try Fix.init(aa);
+    var layers: [40]u32 = undefined;
+    for (&layers, 0..) |*l, i| l.* = @intCast(i);
+    const k: i64 = fx.cfg.index_topk;
+    const n: i64 = 2048;
+    for ([_][2]i64{ .{ 32 << 20, 64 << 20 }, .{ 64 << 20, 1 << 20 } }) |budget| for ([_]xs.Mode{ .auto, .all }) |md| {
+        var cs: [2][]const calls.Call = undefined;
+        for (0..2) |rank| {
+            var o = longOpts(n);
+            o.idx_split = md;
+            o.rank = @intCast(rank);
+            o.index_budget = budget[rank];
+            cs[rank] = try bp.emitPrefill(aa, &fx.cfg, &fx.w, o, &layers, n, 131072, false);
+        }
+        const c0 = try collectives(aa, cs[0]);
+        const c1 = try collectives(aa, cs[1]);
+        try testing.expectEqual(c0.len, c1.len);
+        for (c0, c1) |x, y| try testing.expectEqual(x, y);
+        // each split layer: one cut (the rows' canonical one) on both ranks, every row selected on exactly one
+        var gathers: usize = 0;
+        for (cs[0]) |c| if (std.mem.eql(u8, c.name, "glue.ix_gather")) {
+            gathers += 1;
+            const role = roleName(c.args[0].arg);
+            const L = try std.fmt.parseInt(u32, role["w.sel".len..], 10);
+            const cut = xs.Cut.of(n);
+            try testing.expectEqual(cut.h0, c.args[2].arg.i);
+            const seen = try aa.alloc(u8, @intCast(n));
+            @memset(seen, 0);
+            for (cs, 0..) |r, rank| try markRows(r, L, k, seen, cut.mine(@intCast(rank)));
+            for (seen) |v| try testing.expectEqual(@as(u8, 1), v);
+        };
+        try testing.expectEqual(@as(usize, 8), gathers);
     };
 }
 
