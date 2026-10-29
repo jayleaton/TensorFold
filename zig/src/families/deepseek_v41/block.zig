@@ -107,6 +107,8 @@ pub const Options = struct {
     index_budget: i64 = 256 << 20,
     /// a row-mode program (batch.zig, rowmode.zig): row blocks score the context bucket's keys; no streamed top-k
     rows: bool = false,
+    /// TF_DSV41_IDX_SPLIT (idx_split.zig): a TP2 prefill's index selection split by rows, the int32 rows gathered
+    idx_split: @import("idx_split.zig").Mode = .off,
 
     /// TF_DSV41_MHC_DEFER_AT(_ROWS): a program of `rows` rows issues its deferred launches at the next exchange.
     pub fn holdsDeferred(o: Options, rows: i64) bool {

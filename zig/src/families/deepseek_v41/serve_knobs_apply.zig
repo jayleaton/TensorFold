@@ -24,6 +24,23 @@ const prefillRows = pk.prefillRows;
 const routerGroupRot = pk.routerGroupRot;
 const streamRb = pk.streamRb;
 const x3ldEpi = pk.x3ldEpi;
+const idx_split = @import("idx_split.zig");
+const graphs = @import("graphs.zig");
+
+/// TF_DSV41_IDX_SPLIT: one mode on both ranks, else no start (a rank splitting alone pairs its gather with another).
+fn idxSplitAgreed(f: *Forward) !void {
+    var ag = try graphs.Agreement.init(f.runner.d, f.comm, f.runner.stream);
+    defer ag.deinit();
+    const h = ag.host.slice(i32);
+    h[0] = @backingInt(f.opts.idx_split);
+    try ag.dev.uploadAsync(0, std.mem.sliceAsBytes(h[0..1]), ag.stream.handle);
+    try f.comm.allGather(ag.dev.ptr, ag.dev.ptr + 4, 1, .i32, ag.stream.handle);
+    try ag.dev.downloadAsync(4, std.mem.sliceAsBytes(h[1..3]), ag.stream.handle);
+    try ag.stream.synchronize();
+    if (h[1] == h[2]) return;
+    std.log.scoped(.dsv41).err("TF_DSV41_IDX_SPLIT differs between the ranks (modes {d} and {d}; 0 off, 1 auto, 2 all): set it alike", .{ h[1], h[2] });
+    return error.BadKnob;
+}
 
 /// The knobs onto a forward before its buffer plan, on every rank; R1 is read where the forward is made (`r1`).
 pub fn apply(f: *Forward, a: std.mem.Allocator, io: std.Io, rank: u32) !void {
@@ -50,6 +67,8 @@ pub fn apply(f: *Forward, a: std.mem.Allocator, io: std.Io, rank: u32) !void {
     f.opts.pf_tbo = try pfTbo(&env);
     f.opts.stream_rb = try streamRb(&env);
     f.opts.index_bound = try indexBound(&env);
+    f.opts.idx_split = try idx_split.mode(&env);
+    if (f.comm.world() == 2) try idxSplitAgreed(f);
     // TF_DSV41_BRANCHES: the side stream exists before any capture
     if (f.branches == null) f.branches = try @import("branches.zig").install(f.gpa, f, rank);
     // TF_DSV41_PF_OVERLAP: the pieces' exchanges go on the branches' side stream (one peer: TP=2)
@@ -96,6 +115,7 @@ pub fn apply(f: *Forward, a: std.mem.Allocator, io: std.Io, rank: u32) !void {
     log.info("router grouping/rotation fusion: {s}", .{if (f.opts.router_group_rot) "on" else "off"});
     if (f.opts.index_bound) log.info("index bound: decode index scores stop at each row's own keys (_scores_b)", .{});
     if (f.opts.x3ld_epi) log.info("x3ld epilogues: gateup_epilogue / down_combine fused into the decode expert streamer (TF_DSV41_X3LD_EPI)", .{});
+    if (f.opts.idx_split != .off) log.info("index split: prefill selections split by rows over the two ranks ({t}: {s}), int32 rows gathered", .{ f.opts.idx_split, if (f.opts.idx_split == .auto) "rows x keys past 4,096 x 65,536" else "every segment of 256 rows or more" });
     if (f.opts.stream_rb == 1) log.info("stream top-k: _stream_pf (the next tile's key loads issued ahead)", .{});
     if (f.opts.stream_rb > 1) log.info("stream top-k: {d} rows a program (_stream_rb{d})", .{ f.opts.stream_rb, f.opts.stream_rb });
     if (f.opts.pf_tbo) log.info("prefill tbo: encoder segments two at a time on two streams, x3gm on at most {d} SMs (0: all){s}", .{ dk.exl3.gm_sms_cap, if (f.opts.pf_overlap > 0) "; TF_DSV41_PF_OVERLAP is off under it" else "" });

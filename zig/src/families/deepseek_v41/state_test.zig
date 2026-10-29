@@ -17,6 +17,7 @@ test {
     _ = @import("pftbo_test.zig");
     _ = @import("pfovl_test.zig");
     _ = @import("streamrb_test.zig");
+    _ = @import("idx_split_test.zig");
 }
 fn force(comptime T: type) void {
     inline for (comptime std.meta.declarations(T)) |name| {

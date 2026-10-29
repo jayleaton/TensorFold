@@ -8,6 +8,7 @@ const run = @import("run.zig");
 const hs = @import("host_stage.zig");
 const fwd = @import("forward.zig");
 const hooks = @import("forward_hooks.zig");
+const idx_split = @import("idx_split.zig");
 const Error = fwd.Error;
 const Forward = fwd.Forward;
 
@@ -129,6 +130,21 @@ pub fn glueFn(ctx: *anyopaque, r: *run.Runner, c: *const calls.Call) anyerror!vo
         const base = try r.tensorAddr(into);
         for (0..W) |q| try r.d.check(r.d.api.cuMemcpyDtoDAsync_v2(base + ((q * n + r0) * D) * 2, tmp + q * m * D * 2, m * D * 2, s), "cuMemcpyDtoDAsync");
         return;
+    }
+    if (std.mem.eql(u8, step, "ix_gather")) {
+        // TF_DSV41_IDX_SPLIT: each rank's int32 selection rows all-gathered, the other's copied into place
+        const sel = c.args[0].arg.t;
+        const cut: idx_split.Cut = .{ .n = sel.shape[0], .h0 = c.args[2].arg.i };
+        const cols: usize = @intCast(sel.shape[1]);
+        if (W != 2 or !cut.valid() or sel.stride[0] != sel.shape[1] or numel(c.args[1].arg.t) < 2 * @as(usize, @intCast(cut.big())) * cols) return error.BadGlue;
+        const row = 4 * cols;
+        const base = try r.tensorAddr(sel);
+        const tmp = try r.tensorAddr(c.args[1].arg.t);
+        const me = f.comm.rank();
+        try f.comm.allGather(base + @as(usize, @intCast(cut.sendRow(me))) * row, tmp, @as(usize, @intCast(cut.big())) * cols, .i32, s);
+        const t = cut.take(me);
+        const src: usize, const dst: usize, const rows: usize = .{ @intCast(t.src), @intCast(t.dst), @intCast(t.rows) };
+        return r.d.check(r.d.api.cuMemcpyDtoDAsync_v2(base + dst * row, tmp + src * row, rows * row, s), "cuMemcpyDtoDAsync");
     }
     if (std.mem.eql(u8, step, "exchange_f32")) {
         // the MoE's fp32 partial rounded to bf16, then gathered

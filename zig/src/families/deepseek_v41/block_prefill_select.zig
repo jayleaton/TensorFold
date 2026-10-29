@@ -2,6 +2,7 @@
 
 const calls = @import("block_calls.zig");
 const longpf = @import("longpf.zig");
+const idx_split = @import("idx_split.zig");
 const prefill = @import("block_prefill.zig");
 const E = prefill.E;
 const Arg = calls.Arg;
@@ -107,6 +108,29 @@ fn step(e: *E, per_row: i64) i64 {
     return if (e.n > 16) @max(16, @divFloor(e.o.index_budget, @max(1, per_row))) else e.n;
 }
 
+/// The rows a materialised full-mode loop steps over `nvis` keys (the whole segment when it fits the budget).
+fn fullStep(e: *E, nvis: i64) i64 {
+    return if (e.n * nvis * 12 <= e.o.index_budget) e.n else step(e, nvis * 12);
+}
+
+/// TF_DSV41_IDX_SPLIT: layer `L`'s cut, from what every rank holds (null: every row here); reindex follows its source.
+fn cutOf(s: *const Seg, L: u32, streamed: bool, reindexing: bool) ?idx_split.Cut {
+    const e = s.e;
+    const src: u32 = if (reindexing) @intCast(e.cfg.candidate_source) else L;
+    const ratio: i64 = e.cfg.compressRatio(src);
+    const nvis = @max(@divFloor(e.end(), ratio), 1);
+    if (!idx_split.engages(e.o.idx_split, e.o.world, e.o.rows, e.n, nvis)) return null;
+    const st = if (streamed) longpf.plan(e.n, nvis, e.cfg.index_topk) else fullStep(e, nvis);
+    const c = idx_split.Cut.of(e.n, st);
+    return if (c.valid()) c else null;
+}
+
+/// This rank's rows of a split selection, then the other rank's int32 rows into place (no arithmetic).
+fn gather(e: *E, sel: Arg, c: idx_split.Cut) !void {
+    const k: i64 = e.cfg.index_topk;
+    try e.glue("ix_gather", &.{ sel, try e.buf("L.ix.gather", .{}, .i32, &.{ 2, c.big(), k }), .{ .i = c.h0 } });
+}
+
 /// An index layer's selection (blocks._select over backend.select / select_cand / reindex).
 pub fn select(s: *Seg, L: u32) !void {
     const e = s.e;
@@ -135,18 +159,21 @@ pub fn select(s: *Seg, L: u32) !void {
         if (e.cfg.isCandidateSource(L)) s.cand = true;
         return;
     }
-    if (md == .reindex and e.cfg.usesCandidates(L) and s.cand) {
+    // TF_DSV41_IDX_SPLIT: only this rank's rows [lo, hi), in row blocks stepped as the replicated loop steps them
+    const cut = cutOf(s, L, streamed, reindexing);
+    const mine: [2]i64 = if (cut) |c| c.mine(e.o.rank) else .{ 0, n };
+    if (reindexing) {
         // backend.reindex: the row's own scores over its candidates' positions, in row blocks under the budget
         const NK = cb * cbs;
-        const whole = n * NK * 16 <= e.o.index_budget;
-        const st = if (whole) n else step(e, NK * 16);
-        var a: i64 = 0;
+        const whole = cut == null and n * NK * 16 <= e.o.index_budget;
+        const st = if (n * NK * 16 <= e.o.index_budget) n else step(e, NK * 16);
+        var a: i64 = mine[0];
         var j: usize = 0;
-        while (a < n) : ({
+        while (a < mine[1]) : ({
             a += st;
             j += 1;
         }) {
-            const rows = @min(st, n - a);
+            const rows = @min(st, mine[1] - a);
             const p = if (whole) try pos(e) else try s.blockPos(j, a);
             const ck = try e.buf("L.ix.ckeys", .{}, .i32, &.{ rows, NK });
             try e.glue("cand_keys", &.{ try rowsOf(e, try cands(e), .i32, a, rows, cb), ck, .{ .i = cbs } });
@@ -157,19 +184,20 @@ pub fn select(s: *Seg, L: u32) !void {
         const cand = e.cfg.isCandidateSource(L);
         // backend.select's stream path (full-mode layers without the candidates' scores): stream_topk.select
         if (streamed) {
-            try s.streamSelect(src, ratio, topk, sel[0]);
+            try s.streamSelect(src, ratio, topk, sel[0], mine);
+            if (cut) |c| try gather(e, sel[0], c);
             try e.glue("counts", &.{ sel[0], sel[1], try e.buf("w.pos64", .{}, .i64, &.{n}), .{ .i = ratio } });
             return;
         }
-        const whole = n * nvis * 12 <= e.o.index_budget;
-        const st = if (whole) n else step(e, nvis * 12);
-        var a: i64 = 0;
+        const whole = cut == null and n * nvis * 12 <= e.o.index_budget;
+        const st = fullStep(e, nvis);
+        var a: i64 = mine[0];
         var j: usize = 0;
-        while (a < n) : ({
+        while (a < mine[1]) : ({
             a += st;
             j += 1;
         }) {
-            const rows = @min(st, n - a);
+            const rows = @min(st, mine[1] - a);
             const p = if (whole) try pos(e) else try s.blockPos(j, a);
             const nk = if (whole) nvis else @max(@divFloor(e.start + a + rows, ratio), 1);
             const sc = try s.scores(src, ratio, a, rows, p, nk, null, 0);
@@ -178,25 +206,27 @@ pub fn select(s: *Seg, L: u32) !void {
         }
         if (cand) s.cand = true;
     }
+    // a split's candidates stay on their rank: its reindex layers take the same cut (cutOf), only selections move
+    if (cut) |c| try gather(e, sel[0], c);
     try e.glue("counts", &.{ sel[0], sel[1], try e.buf("w.pos64", .{}, .i64, &.{n}), .{ .i = ratio } });
 }
 
-/// Stream top-k in row blocks within its scratch budget: each block's `_stream`, then the merge glue.
-pub fn streamSelect(s: *Seg, src: u32, ratio: i64, topk: i64, out: Arg) !void {
+/// Stream top-k over rows `mine` in row blocks within its scratch budget: each block's `_stream`, then the merge glue.
+pub fn streamSelect(s: *Seg, src: u32, ratio: i64, topk: i64, out: Arg, mine: [2]i64) !void {
     const e = s.e;
     const n = e.n;
     const IH: i64 = e.cfg.index_heads;
     const ID: i64 = e.cfg.index_dim;
     const st = longpf.plan(n, @max(@divFloor(e.end(), ratio), 1), topk);
     const spg = try e.paging(ratio, false);
-    var a: i64 = 0;
+    var a: i64 = mine[0];
     var j: usize = 0;
-    while (a < n) : ({
+    while (a < mine[1]) : ({
         a += st;
         j += 1;
     }) {
-        const rows = @min(st, n - a);
-        const p = if (st >= n) try pos(e) else try s.blockPos(j, a);
+        const rows = @min(st, mine[1] - a);
+        const p = if (st >= n and mine[1] - mine[0] == n) try pos(e) else try s.blockPos(j, a);
         const nk = @max(@divFloor(e.start + a + rows, ratio), 1);
         const ns = longpf.splits(nk);
         const buf = try e.buf("L.ix.stream", .{}, .i64, &.{ rows, ns, 2 * topk });
