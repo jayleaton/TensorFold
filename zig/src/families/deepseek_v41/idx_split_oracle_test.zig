@@ -39,8 +39,8 @@ const Mem = struct {
         return (try m.role(try m.name(t.role), base + ext))[base..];
     }
 
-    fn role(m: *Mem, key: []const u8, len: usize) ![]i64 {
-        const g = try m.roles.getOrPut(m.a, key);
+    fn role(m: *Mem, nm: []const u8, len: usize) ![]i64 {
+        const g = try m.roles.getOrPut(m.a, nm);
         if (!g.found_existing) g.value_ptr.* = &nothing;
         if (g.value_ptr.len < len) {
             const grown = try m.a.alloc(i64, len);
@@ -163,7 +163,7 @@ const Model = struct {
         const gather = arg(c, "GATHER").b;
         const cbs = arg(c, "CBS").i;
         const ks: usize = @intCast(arg(c, "k_stride").i);
-        const keys: []const i64 = if (gather) try m.view(arg(c, "KEYS").t) else &nothing;
+        const gk: []const i64 = if (gather) try m.view(arg(c, "KEYS").t) else &nothing;
         const q0 = o.qRow(c);
         for (0..rows) |r| {
             const ri: i64 = @intCast(r);
@@ -173,9 +173,9 @@ const Model = struct {
             for (0..nk) |j| {
                 const ji: i64 = @intCast(j);
                 const kp: i64 = if (!gather) ji else if (cbs > 0) blk: {
-                    const b = keys[r * ks + j / @as(usize, @intCast(cbs))];
+                    const b = gk[r * ks + j / @as(usize, @intCast(cbs))];
                     break :blk if (b < 0) -1 else b * cbs + @mod(ji, cbs);
-                } else keys[r * ks + j];
+                } else gk[r * ks + j];
                 const ok = kp >= 0 and kp < vis;
                 out[r * os + j] = if (ok) score(salt, q0 + ri, kp) else none;
                 if (ok) {

@@ -135,11 +135,11 @@ pub fn glueFn(ctx: *anyopaque, r: *run.Runner, c: *const calls.Call) anyerror!vo
         // TF_DSV41_IDX_SPLIT: each rank's int32 selection rows all-gathered, the other's copied into place
         const sel = c.args[0].arg.t;
         const cut = try idx_split.glueCut(W, sel.shape[0], c.args[2].arg.i, sel.shape[1], sel.stride[0], numel(c.args[1].arg.t));
-        const p = cut.plan(f.comm.rank());
+        const xp = cut.plan(f.comm.rank());
         const row: usize = @intCast(4 * sel.shape[1]);
         const base = try r.tensorAddr(sel);
         const tmp = try r.tensorAddr(c.args[1].arg.t);
-        const send: usize, const count: usize, const src: usize, const dst: usize, const rows: usize = .{ @intCast(p.send), @intCast(p.count), @intCast(p.src), @intCast(p.dst), @intCast(p.rows) };
+        const send: usize, const count: usize, const src: usize, const dst: usize, const rows: usize = .{ @intCast(xp.send), @intCast(xp.count), @intCast(xp.src), @intCast(xp.dst), @intCast(xp.rows) };
         try f.comm.allGather(base + send * row, tmp, count * row / 4, .i32, s);
         return r.d.check(r.d.api.cuMemcpyDtoDAsync_v2(base + dst * row, tmp + src * row, rows * row, s), "cuMemcpyDtoDAsync");
     }

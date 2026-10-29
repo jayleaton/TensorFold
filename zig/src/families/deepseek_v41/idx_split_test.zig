@@ -373,7 +373,14 @@ test "idx split: ranks with unequal index budgets still cut alike, issue the sam
             for (cs, 0..) |r, rank| try markRows(r, L, k, seen, cut.mine(@intCast(rank)));
             for (seen) |v| try testing.expectEqual(@as(u8, 1), v);
         };
-        try testing.expectEqual(@as(usize, 8), gathers);
+        // 1: every eligible layer (2 / 8 / 14, the source, its 4 reindex layers); auto: the equal-budget pair's layers
+        var o = longOpts(n);
+        o.idx_split = md;
+        var want: usize = 0;
+        for (try bp.emitPrefill(aa, &fx.cfg, &fx.w, o, &layers, n, 131072, false)) |c| want += @intFromBool(std.mem.eql(u8, c.name, "glue.ix_gather"));
+        if (md == .all) try testing.expectEqual(@as(usize, 8), want);
+        try testing.expect(want > 0);
+        try testing.expectEqual(want, gathers);
     };
 }
 
