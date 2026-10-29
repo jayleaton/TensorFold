@@ -20,6 +20,7 @@ pub const Masks = struct {
     dev: cuda.DeviceBuffer,
     count: u32 = 0,
     message: std.ArrayList(i64) = .empty,
+    kept: []Row,
 
     pub fn init(gpa: Allocator, f: *Forward, max_rows: u32) !*Masks {
         if (f.grammar != null or max_rows == 0) return error.GrammarSetup;
@@ -34,8 +35,10 @@ pub const Masks = struct {
         var module = try cuda.Module.loadPtx(f.runner.d, @embedFile("grammar_mask_ptx"), &log);
         errdefer module.unload();
         const kernel = try module.function(rows.symbol);
+        const kept = try gpa.alloc(Row, max_rows);
+        errdefer gpa.free(kept);
         const x = try gpa.create(Masks);
-        x.* = .{ .gpa = gpa, .f = f, .words = words, .max_rows = max_rows, .lo = part.lo, .width = part.len, .module = module, .kernel = kernel, .host = host, .dev = dev };
+        x.* = .{ .gpa = gpa, .f = f, .words = words, .max_rows = max_rows, .lo = part.lo, .width = part.len, .module = module, .kernel = kernel, .host = host, .dev = dev, .kept = kept };
         f.grammar = .{ .ptr = x, .follow = follow, .apply = applyFn };
         return x;
     }
@@ -44,6 +47,7 @@ pub const Masks = struct {
         x.f.runner.stream.synchronize() catch {};
         x.f.grammar = null;
         x.message.deinit(x.gpa);
+        x.gpa.free(x.kept);
         x.module.unload();
         x.dev.free();
         x.host.free();
@@ -59,8 +63,10 @@ pub const Masks = struct {
         return @alignCast(std.mem.bytesAsSlice(u32, x.host.bytes[off..]));
     }
 
-    pub fn stage(x: *Masks, list: []const Row) !void {
-        try rows.validate(list, x.words, x.max_rows);
+    pub fn stage(x: *Masks, all: []const Row) !void {
+        try rows.validate(all, x.words, x.max_rows);
+        // Rows allowing every token are no-ops; with none now or staged there is nothing to wait on, apply or send.
+        const list = rows.constraining(all, x.f.cfg.vocab, x.count, x.kept) orelse return;
         // The previous async upload must finish before its pinned source is reused.
         if (x.count != 0) try x.f.runner.stream.synchronize();
         x.count = @intCast(list.len);
@@ -140,15 +146,19 @@ pub fn stage(f: *Forward, list: []const Row) !void {
 pub fn segments(f: *Forward, segs: []const iface.Segment) !void {
     var arena = std.heap.ArenaAllocator.init(f.gpa);
     defer arena.deinit();
+    return stage(f, try segmentRows(arena.allocator(), segs, (f.cfg.vocab + 31) / 32));
+}
+
+/// The windows' masked rows, each at its row of the forward's "w.logits" (the segments in window order).
+pub fn segmentRows(a: Allocator, segs: []const iface.Segment, words: u32) ![]Row {
     var list: std.ArrayList(Row) = .empty;
     var at: u32 = 0;
-    const words = (f.cfg.vocab + 31) / 32;
     for (segs) |s| {
         if (s.masks.len != 0) {
             if (s.masks.len != s.tokens.len * words) return error.GrammarWords;
-            for (0..s.tokens.len) |i| try list.append(arena.allocator(), .{ .index = at + @as(u32, @intCast(i)), .bits = s.masks[i * words ..][0..words] });
+            for (0..s.tokens.len) |i| try list.append(a, .{ .index = at + @as(u32, @intCast(i)), .bits = s.masks[i * words ..][0..words] });
         }
         at += @intCast(s.tokens.len);
     }
-    return stage(f, list.items);
+    return list.items;
 }
