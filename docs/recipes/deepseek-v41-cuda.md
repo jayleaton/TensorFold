@@ -37,6 +37,18 @@ This installs rank zero's `tensorfold-dsv41` and the follower tool `tf-dsv41`. T
 `TF_DSV41_ASSETS/{rope.bin,engram-token-map.bin,aot/}`. Compile-only targets use inert synthetic images and
 cannot produce a serving qualification receipt. Keep generated images and compiler caches outside source control.
 
+## Decode copy-policy experiment
+
+`TF_DSV41_NO_COPIES=1` disables suffix-copy proposals while a DSpark head is loaded. It defaults off and accepts
+`1`/`true`/`on` or `0`/`false`/`off` (case insensitive). It closes the existing lane-core copy gate and disables
+the priced lookup planner's history index; verified head drafts and shared-forward capacity remain available.
+Without a loaded head it preserves lookup behavior. Use the same value on both ranks.
+
+This adapts BLACKFOLD's copy-window experiment; it can help when copies displace better head drafts and hurt
+verbatim continuation workloads. Compare full token arrays against flag-off and `draft:false` on the same
+checkpoint, then alternate throughput measurements with unchanged prompts, clocks and launch settings.
+Host policy tests alone do not establish checkpoint equality or a performance gain.
+
 
 ## Native image input
 

@@ -6,12 +6,14 @@ const ln = @import("lanes.zig");
 const costs_mod = @import("costs.zig");
 const depth = @import("depth.zig");
 const spec_mod = @import("spec.zig");
+const copy_policy = @import("copy_policy.zig");
+const lookup = @import("lookup.zig");
 
 const gpa = std.testing.allocator;
 
 const Case = struct { prompt: []const u32, max_new: u32 = 60, sampling: ?lanes.Sampling = null, drafts: bool = true, copies: bool = false };
 
-const Setup = struct { siblings: u32 = 0, joint: u2 = 1, skip: bool = true, costs: Prices = .served, slots: u32 = 4, dims: twin.Dims = .{}, depth: depth.Settings = .{}, spec: bool = false };
+const Setup = struct { siblings: u32 = 0, joint: u2 = 1, skip: bool = true, costs: Prices = .served, slots: u32 = 4, dims: twin.Dims = .{}, depth: depth.Settings = .{}, spec: bool = false, no_copies: bool = false, priced: bool = false };
 
 const Prices = enum { served, flat, cheap };
 
@@ -66,7 +68,10 @@ fn run(cases: []const Case, setup: Setup) !Run {
     defer x.deinit();
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    var cfg = try lanes.Config.init(gpa, try x.model(arena.allocator(), 64), 16, 15);
+    const copies: copy_policy.Settings = .{ .no_copies = setup.no_copies };
+    var model = try x.model(arena.allocator(), 64);
+    copies.apply(true, &model);
+    var cfg = try lanes.Config.init(gpa, model, 16, 15);
     defer cfg.deinit(gpa);
     var clock: lanes.fake.FixedClock = .{};
     var e = lanes.Engine.init(gpa, &cfg, x.backend(), clock.clock());
@@ -76,13 +81,19 @@ fn run(cases: []const Case, setup: Setup) !Run {
     defer gpa.free(streams);
     const props = try gpa.alloc(lanes.SuffixLookup, cases.len);
     defer gpa.free(props);
-    for (cases, streams, props) |cs, *s, *p| {
+    const priced = try gpa.alloc(?lookup.Proposer, cases.len);
+    defer gpa.free(priced);
+    const planner = lookup.Planner.init(copies.lookup(true, .{ .plan = true }), &c, true);
+    for (cases, streams, props, priced) |cs, *s, *p, *lp| {
         p.* = try lanes.SuffixLookup.init(gpa, .{ .min_match = 4 });
-        s.* = try lanes.Stream.init(gpa, .{ .id = "s", .prompt = cs.prompt, .max_new = cs.max_new, .sampling = cs.sampling, .drafts = cs.drafts, .proposer = if (cs.copies) p.proposer() else null });
+        lp.* = if (setup.priced) try lookup.Proposer.init(&planner, gpa, cs.prompt, &.{}) else null;
+        const proposer = if (lp.*) |*l| l.proposer() else p.proposer();
+        s.* = try lanes.Stream.init(gpa, .{ .id = "s", .prompt = cs.prompt, .max_new = cs.max_new, .sampling = cs.sampling, .drafts = cs.drafts, .proposer = if (cs.copies) proposer else null });
     }
-    defer for (streams, props) |*s, *p| {
+    defer for (streams, props, priced) |*s, *p, *lp| {
         s.deinit(gpa);
         p.deinit();
+        if (lp.*) |*l| l.deinit();
     };
     for (streams) |*s| try e.addStream(s);
     while (e.activeCount() > 0) try e.step();
@@ -260,4 +271,26 @@ test "Draft state: every draft depth preserves plain output and concurrent equal
             if (cap > 0) try std.testing.expect(both.drafted > 0);
         }
     }
+}
+
+test "copy suppression beside DSpark preserves serial tokens through priced and unpriced request paths" {
+    const repeated = p1 ++ p1;
+    for ([_]bool{ false, true }) |priced| for ([_]?lanes.Sampling{ null, hot }) |sampling| {
+        const cases = [_]Case{
+            .{ .prompt = &repeated, .sampling = sampling, .max_new = 48, .copies = true },
+            .{ .prompt = &p3, .sampling = sampling, .max_new = 48, .copies = true },
+            .{ .prompt = &p2, .sampling = sampling, .max_new = 48, .copies = true },
+            .{ .prompt = &p1, .sampling = sampling, .max_new = 48, .drafts = false },
+        };
+        for ([_]usize{ 1, 2, 4 }) |n| {
+            const off = try run(cases[0..n], .{ .priced = priced, .costs = .cheap });
+            defer off.deinit();
+            const on = try run(cases[0..n], .{ .priced = priced, .costs = .cheap, .no_copies = true });
+            defer on.deinit();
+            try expectSerial(cases[0..n], off, .{});
+            try expectSerial(cases[0..n], on, .{});
+            for (off.out, on.out) |a, b| try std.testing.expectEqualSlices(u32, a, b);
+            try std.testing.expect(on.drafted > 0);
+        }
+    };
 }
