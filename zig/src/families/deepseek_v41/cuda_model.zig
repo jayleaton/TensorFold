@@ -338,11 +338,10 @@ pub const Model = struct {
         const nb = @max(o.prefill_rows, m.cfg.dspark_block + 1);
         for (buckets[0..nb], 0..) |*b, i| b.* = @intCast(i + 1);
         var bp = try m.f.plan(buckets[0..nb]);
-        try vision.checkPlan(&m.f, &bp);
         // the pass ingests a prompt's prefilled tail in one call (the drafter's window) with the own prefill
         const ingest_rows: u32 = if (o.own_prefill) @max(nb, m.cfg.window) else nb;
         if (o.drafts) try dspark_gpu.GpuPass.plan(m.f.arena.allocator(), &m.f, &bp, ingest_rows);
-        if (o.own_prefill) try m.f.planPrefill(&bp, @intCast(m.f.opts.prefill_rows));
+        try @import("boot_plan.zig").prefill(&m.f, &bp, o.own_prefill);
         const rows_cap = try batch.capFromEnv();
         if (m.slots > 1) try batch.Batch.plan(&m.f, &bp, m.slots, rows_cap);
         // TF_DSV41_SLOT_DRAFTS=1: DSpark over every live slot (off: drafts are refused with several slots)
