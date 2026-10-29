@@ -109,12 +109,22 @@ test "vision boot propagates link failures and legacy native is root-selectable"
     try t.expectError(error.PeerClosed, boot.select(&failed, null));
     failed.rank = 1;
     try t.expectError(error.PeerClosed, boot.select(&failed, null));
-    const native = (try boot.legacy(null, " Native \n")).?;
+    const native = (try boot.legacy(null, " Native \n", null)).?;
     try t.expect(!native.image_tokens_set);
-    try t.expect(try boot.legacy(null, null) == null);
-    try t.expect(try boot.legacy(null, "reject") == null);
-    try t.expect(try boot.legacy(null, "placeholder") == null);
-    try t.expectError(error.BadImagesMode, boot.legacy(null, "on"));
-    const explicit = (try boot.legacy(.{ .image_tokens = 256 }, "bad setting")).?;
+    try t.expect(try boot.legacy(null, null, null) == null);
+    try t.expect(try boot.legacy(null, "reject", null) == null);
+    try t.expect(try boot.legacy(null, "placeholder", null) == null);
+    try t.expectError(error.BadImagesMode, boot.legacy(null, "on", null));
+    const explicit = (try boot.legacy(.{ .image_tokens = 256 }, "bad setting", "0")).?;
     try t.expectEqual(@as(u32, 256), explicit.image_tokens);
+}
+
+test "vision boot legacy native keeps the published eight images a request and its override" {
+    // The published engine admits 8 images a request under TF_DSV41_IMAGES=native; Open.vision's generic default is 4.
+    try t.expectEqual(@as(u32, 8), (try boot.legacy(null, "native", null)).?.max_images);
+    try t.expectEqual(@as(u32, 8), (try boot.legacy(null, "native", " ")).?.max_images);
+    try t.expectEqual(@as(u32, 2), (try boot.legacy(null, "native", "2")).?.max_images);
+    try t.expectError(error.BadVisionBootSettings, boot.legacy(null, "native", "0"));
+    try t.expectError(error.BadVisionBootSettings, boot.legacy(null, "native", "many"));
+    try t.expect(try boot.legacy(null, "reject", "2") == null);
 }
