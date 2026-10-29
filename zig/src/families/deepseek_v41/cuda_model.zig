@@ -434,7 +434,8 @@ pub const Model = struct {
         // TF_DSV41_SAMPLING=1: keyed sampling (T > 0) on every rank; off: such requests are refused (error.Sampling)
         m.sampler = if (samp.enabled()) try samp.GpuSampler.init(gpa, &m.f) else null;
         m.gt.sampler = m.sampler;
-        m.grammar_masks = try grammar.Masks.init(gpa, &m.f, @max(64, rows_cap));
+        // TF_DSV41_GRAMMAR (default on): structured output's masks on every rank; 0: such requests are refused
+        m.grammar_masks = if (try grammar.enabled()) try grammar.Masks.init(gpa, &m.f, @max(64, rows_cap)) else null;
         if (m.vision_config) |v| try vision.tower(gpa, io, &m.f, &m.pack, &m.driver, m.tcfg.rank, v.shape);
         try m.driver.synchronize();
         tr.step("end", cuda.usage(false));

@@ -150,6 +150,18 @@ test "grammar family: rows allowing every token are not staged; a cleared stage 
     try std.testing.expectEqual(@as(usize, 0), mask_rows.constraining(&.{}, 64, 1, &out).?.len);
 }
 
+test "grammar family: TF_DSV41_GRAMMAR=0 refuses structured output; unset, empty or 1 serve it" {
+    const env = @import("sys").env;
+    defer _ = env.unsetenv("TF_DSV41_GRAMMAR");
+    _ = env.unsetenv("TF_DSV41_GRAMMAR");
+    try std.testing.expect(try grammar_gpu.enabled());
+    const Case = struct { v: [:0]const u8, on: anyerror!bool };
+    for ([_]Case{ .{ .v = "0", .on = false }, .{ .v = "", .on = true }, .{ .v = "1", .on = true }, .{ .v = "yes", .on = error.BadGrammarKnob } }) |c| {
+        _ = env.setenv("TF_DSV41_GRAMMAR", c.v, 1);
+        if (c.on) |on| try std.testing.expectEqual(on, try grammar_gpu.enabled()) else |e| try std.testing.expectError(e, grammar_gpu.enabled());
+    }
+}
+
 test "grammar family: rejected draft prefix rolls back and rejects empty or malformed masks" {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
