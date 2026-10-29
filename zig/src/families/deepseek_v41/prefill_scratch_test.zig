@@ -23,6 +23,8 @@ fn program(a: std.mem.Allocator, o: block.Options, rows: i64, start: i64, part: 
     try check.parseExperts(a, &w, @embedFile("fixtures/expert-k2.txt"));
     const layers = try a.alloc(u32, try layerCount(part));
     for (layers, 0..) |*l, i| l.* = @intCast(i);
+    // The listing supplies expert ranges; legacy and split launches also need the present-width bitsets.
+    for (layers) |layer| try w.gm.put(a, layer, .{ (1 << 4) | (1 << 6) | (1 << 8), (1 << 4) | (1 << 10) });
     const big = rows > o.prefill_rows;
     const plan_options = if (big) ws.k4Options(o) else o;
     const cs = if (part == .encoder)

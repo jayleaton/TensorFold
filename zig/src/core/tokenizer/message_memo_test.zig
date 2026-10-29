@@ -20,7 +20,10 @@ fn fixture(first: bool, normalize: bool) !tok.Tokenizer {
 }
 
 fn body() ![]u8 {
-    return std.mem.concat(a, u8, &([_][]const u8{"ab é漢🙂 "} ** 160));
+    var text: std.ArrayList(u8) = .empty;
+    errdefer text.deinit(a);
+    for (0..160) |_| try text.appendSlice(a, "ab é漢🙂 ");
+    return text.toOwnedSlice(a);
 }
 
 fn equalEncode(fresh: *const tok.Tokenizer, memo: *const tok.Tokenizer, text: []const u8) !void {
