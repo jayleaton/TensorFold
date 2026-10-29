@@ -192,6 +192,7 @@ pub const Served = struct {
         o.pf_overlap_site = o.pf_overlap > 0 and try knobs.pfOverlapSite(&knobs.env); // the site pieces' `_finish_k`
         o.stream_rb = try knobs.streamRb(&knobs.env); // TF_DSV41_STREAM_RB: the twin's variants
         o.index_bound = try knobs.indexBound(&knobs.env); // TF_DSV41_INDEX_BOUND: `_scores_b` / `_dtopk_b` variants
+        o.idx_split = try @import("idx_split.zig").mode(&knobs.env); // TF_DSV41_IDX_SPLIT: each rank's own row blocks
         o.mhc_site_rows = try knobs.mhcSiteRows(&knobs.env); // the site pieces' `_finish_k` rows
         if (o.pf_overlap > 0) o.branches = (try @import("branches.zig").settings()).on;
         if (try knobs.indexBudget(&knobs.env)) |b| o.index_budget = b;
@@ -430,13 +431,7 @@ pub fn enumerate(gpa: std.mem.Allocator, n: *Needs, cfg: *const Config, w: *cons
     }
 }
 
-/// The served prefill rows; under TF_DSV41_PF_4K also the forward's 2,048-row segments (piece fallback, first start).
-pub fn promptPasses(sv: Served) [2]?Served {
-    var two = sv;
-    two.o.pf4k = false;
-    two.o.prefill_rows = (block.Options{}).prefill_rows;
-    return .{ sv, if (sv.o.pf4k) two else null };
-}
+pub const promptPasses = @import("aot_passes.zig").promptPasses;
 
 fn prompts(gpa: std.mem.Allocator, a: std.mem.Allocator, n: *Needs, cfg: *const Config, w: *const block.Widths, sv: Served, layers: []const u32, log: *std.Io.Writer) !void {
     const P = sv.o.prefill_rows; // the full segment's regimes, then every row count at each regime's first start
@@ -578,7 +573,7 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, sigs_path: []const u8, out_path:
     // DSpark's ingest main_proj (a DSpark block's width; its EXL3 linear is CUDA, as slot_drafts_test.zig sets it)
     try w.dense.put(a, "dspark.main_proj", try w.k2("L40.attn.wkv"));
     const sv = try Served.fromEnv();
-    try log.print("aot-needs: limit {d}, {d} slot(s), rows cap {d}, prefill rows {d}, index budget {d} MiB, R1 {}, drafts {}, slot drafts {} (group {d}), world {d}, pool {s}\n", .{ sv.o.limit, sv.slots, sv.cap, sv.o.prefill_rows, sv.o.index_budget >> 20, sv.o.r1, sv.drafts, sv.slot_drafts, sv.group, sv.o.world, if (sv.o.pool) |p| (if (p.split) "split" else "on") else "none (contiguous slot)" });
+    try log.print("aot-needs: limit {d}, {d} slot(s), rows cap {d}, prefill rows {d}, index budget {d} MiB, R1 {}, drafts {}, slot drafts {} (group {d}), world {d}, idx split {t}, pool {s}\n", .{ sv.o.limit, sv.slots, sv.cap, sv.o.prefill_rows, sv.o.index_budget >> 20, sv.o.r1, sv.drafts, sv.slot_drafts, sv.group, sv.o.world, sv.o.idx_split, if (sv.o.pool) |p| (if (p.split) "split" else "on") else "none (contiguous slot)" });
     var n: Needs = .{ .gpa = gpa, .sigs = &parsed.value.kernels };
     defer n.deinit();
     try enumerate(gpa, &n, &cfg, &w, sv, log);

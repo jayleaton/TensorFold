@@ -311,6 +311,21 @@ test "a graph cache switched off on one rank stops both at start; 0 and OFF on t
     try std.testing.expectEqual(@as(?anyerror, error.Mismatch), family[0]);
 }
 
+test "a family setting on one rank only, or a different one, stops both at start; the same or none on both starts" {
+    const a: [32]u8 = @splat(1);
+    const b: [32]u8 = @splat(2);
+    for ([_][2]?[32]u8{ .{ null, a }, .{ a, null }, .{ a, b } }) |p| {
+        const r = try agreeDigests(.{ .family = p[0] }, .{ .family = p[1] });
+        try std.testing.expectEqual(@as(?anyerror, error.Mismatch), r[0]);
+        try std.testing.expectEqual(@as(?anyerror, error.Mismatch), r[1]);
+    }
+    for ([_]?[32]u8{ null, a }) |v| {
+        const r = try agreeDigests(.{ .family = v }, .{ .family = v });
+        try std.testing.expectEqual(@as(?anyerror, null), r[0]);
+        try std.testing.expectEqual(@as(?anyerror, null), r[1]);
+    }
+}
+
 test "Failure boundaries: acceptOn validates the world before touching a descriptor" {
     try std.testing.expectError(error.Protocol, Bootstrap.acceptOn(-1, max_ranks + 1, 0));
 }

@@ -36,6 +36,8 @@ pub fn plan(p: *buffers.Plan, rows: u32, o: block.Options, cfg: *const Config, c
         .{ "L." ++ tag ++ "ix.ckeys", candidate_elements * 4 },
         .{ "L." ++ tag ++ "ix.bkeys", (@divFloor(elements, cfg.candidate_block_size) + rows) * 8 },
         .{ "L." ++ tag ++ "ix.stream", stream_bytes },
+        // TF_DSV41_IDX_SPLIT: a ragged segment's larger part can pass the sampled one's; a part never passes `rows`
+        .{ "L." ++ tag ++ "ix.gather", 2 * @as(i64, rows) * topk * 4 },
     };
     for (sizes) |entry| if (p.sizes.getPtr(entry[0])) |size| {
         size.* = @max(size.*, @as(u64, @intCast(entry[1])));

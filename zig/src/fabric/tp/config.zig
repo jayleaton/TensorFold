@@ -69,6 +69,8 @@ pub const Config = struct {
     graph_cache: ?graph_cache.Settings = null,
     /// TF_GRAPH_CACHE as read (`Cache.init` applies the same value); only its effect on `graph_cache` is compared.
     graph_cache_env: ?[]const u8 = null,
+    /// A family's own settings every rank must share, set before `Session.open` (null: none, the digest unchanged).
+    family: ?[32]u8 = null,
 
     /// Reads every setting from `get` (the environment in `fromEnv`); unset names keep the defaults.
     pub fn parse(get: *const fn ([]const u8) ?[]const u8) Error!Config {
@@ -161,6 +163,7 @@ pub const Config = struct {
         h.update(std.mem.asBytes(&c.roce_wire));
         h.update(std.mem.asBytes(&c.roce_fallback));
         if (c.graph_cache) |g| h.update(&g.effective(c.graph_cache_env).digest());
+        if (c.family) |f| h.update(&f);
         var out: [32]u8 = undefined;
         h.final(&out);
         return out;
@@ -291,4 +294,18 @@ test "the digest holds the graph cache's effective settings: 0, off and OFF agre
     var family_off = upper;
     family_off.graph_cache = family.graph_cache;
     try std.testing.expectEqualSlices(u8, &zero.digest(), &family_off.digest());
+}
+
+test "no family setting leaves the digest the base's, byte for byte; a family setting changes it" {
+    const c: Config = .{ .graph_cache = .{ .max = 8 } };
+    // the pre-family digest's fields, in its order (an off / off family boot agrees on exactly these bytes)
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    inline for (.{ "world", "backend", "mailbox_max_bytes", "roce_chunked_bytes", "failfast", "roce_wire", "roce_fallback" }) |f| h.update(std.mem.asBytes(&@field(c, f)));
+    h.update(&c.graph_cache.?.effective(c.graph_cache_env).digest());
+    var base: [32]u8 = undefined;
+    h.final(&base);
+    try std.testing.expectEqualSlices(u8, &base, &c.digest());
+    var f = c;
+    f.family = @splat(0);
+    try std.testing.expect(!std.mem.eql(u8, &base, &f.digest()));
 }

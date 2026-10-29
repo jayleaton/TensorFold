@@ -46,7 +46,7 @@ pub const Session = struct {
         const cfg = requested.resolved();
         var b = try Bootstrap.open(cfg);
         defer b.close();
-        try b.agree(&cfg.digest(), "settings (TF_TP_WORLD, TF_COMM_BACKEND, TF_TP_MAILBOX_MAX_KB, TF_TP_ROCE_CHUNKED_KB, TF_TP_FAILFAST, TF_TP_ROCE_WIRE / _FALLBACK, TF_GRAPH_CACHE)");
+        try b.agree(&cfg.digest(), "settings (TF_TP_WORLD, TF_COMM_BACKEND, TF_TP_MAILBOX_MAX_KB, TF_TP_ROCE_CHUNKED_KB, TF_TP_FAILFAST, TF_TP_ROCE_WIRE / _FALLBACK, TF_GRAPH_CACHE, family settings)");
         var diag = cuda.p2p_report.begin(cfg.rank, cfg.world);
         defer diag.end();
         var lib = try cuda.nccl.Library.openPath(cfg.nccl_lib);

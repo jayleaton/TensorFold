@@ -38,7 +38,8 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, ref: []con
     defer arena.deinit();
     const a = arena.allocator();
     const cwd = std.Io.Dir.cwd();
-    const tcfg = try tp.Config.fromEnv();
+    var tcfg = try tp.Config.fromEnv();
+    tcfg.family = @import("idx_split.zig").agreement(&@import("serve_knobs.zig").env); // as cuda_model.zig
     const rank = tcfg.rank;
     const world = tcfg.world;
     try cwd.createDirPath(io, out_dir);
