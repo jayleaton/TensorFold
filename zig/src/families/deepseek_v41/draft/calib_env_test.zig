@@ -126,6 +126,18 @@ test "the depth's knobs read as Python's" {
     try std.testing.expectError(error.DepthJoint, calib_env.depthSettings(&Env.get));
 }
 
+test "the round overhead is off unless set and rejects out-of-range values" {
+    Env.pairs = &.{};
+    try std.testing.expectEqual(@as(f64, 0.0), (try calib_env.depthSettings(&Env.get)).overhead_ms);
+    Env.pairs = &.{.{ "TF_DSV41_DEPTH_OVERHEAD_MS", "8" }};
+    try std.testing.expectEqual(@as(f64, 8.0), (try calib_env.depthSettings(&Env.get)).overhead_ms);
+    Env.pairs = &.{.{ "TF_DSV41_DEPTH_OVERHEAD_MS", "-1" }};
+    try std.testing.expectError(error.DepthKnob, calib_env.depthSettings(&Env.get));
+    Env.pairs = &.{.{ "TF_DSV41_DEPTH_OVERHEAD_MS", "101" }};
+    try std.testing.expectError(error.DepthKnob, calib_env.depthSettings(&Env.get));
+    Env.pairs = &.{};
+}
+
 test "TF_DSV41_CALIB=measure / zig: the engine measures; a stored Zig table is read back by zig only" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
