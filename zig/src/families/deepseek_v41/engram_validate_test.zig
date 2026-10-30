@@ -6,13 +6,13 @@ const format = @import("engram_rows.zig");
 const hash = @import("engram_hash.zig");
 const portable = @import("engram_rows_portable.zig");
 
-fn metadata(id: u32) hash.Layer {
+pub fn metadata(id: u32) hash.Layer {
     var meta: hash.Layer = .{ .layer_id = id, .rows = 48, .multipliers = @splat(1), .primes = @splat(2), .offsets = undefined };
     for (&meta.offsets, 0..) |*x, i| x.* = @intCast(2 * i);
     return meta;
 }
 
-fn shard(dir: std.Io.Dir, meta: hash.Layer, rank: u32, lo: u64, hi: u64, total: u64, id: u32) !void {
+pub fn shard(dir: std.Io.Dir, meta: hash.Layer, rank: u32, lo: u64, hi: u64, total: u64, id: u32) !void {
     var bytes: [4096 + 48 * 264]u8 = @splat(0);
     for ([_]u64{ format.magic, id, lo, hi, total, format.row_bytes }, 0..) |x, i|
         std.mem.writeInt(u64, bytes[i * 8 ..][0..8], x, .little);
@@ -111,4 +111,63 @@ test "Engram startup validation checks every layer and refuses truncated files" 
     try t.expectError(error.BadEngramShard, guard.apply(t.io, "1", root, 0, 2, &metas));
     try tmp.dir.writeFile(t.io, .{ .sub_path = "engram-l1-r0of2.bin", .data = "short" });
     try t.expectError(error.BadEngramShard, guard.apply(t.io, "1", root, 0, 2, &metas));
+}
+
+test "Engram refusal diagnostics retain file and expected versus actual geometry" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    var diagnostic: guard.Diagnostic = .{};
+    const meta = metadata(1);
+    try shard(tmp.dir, meta, 0, 0, 24, 47, 1);
+    try t.expectError(error.BadEngramShard, guard.applyDiagnostic(t.io, "1", root, 0, 2, &.{meta}, &diagnostic));
+    for ([_][]const u8{ root, "engram-l1-r0of2.bin", "rank 0 layer 1", "expected total >= 48, rows [0, 24)", "actual layer 1, total 47, rows [0, 24)" }) |part|
+        try t.expect(std.mem.indexOf(u8, diagnostic.text(), part) != null);
+    try shard(tmp.dir, meta, 1, 25, 48, 48, 1);
+    try t.expectError(error.BadEngramShard, guard.applyDiagnostic(t.io, "1", root, 1, 2, &.{meta}, &diagnostic));
+    for ([_][]const u8{ "engram-l1-r1of2.bin", "expected total >= 48, rows [24, 48)", "actual layer 1, total 48, rows [25, 48)" }) |part|
+        try t.expect(std.mem.indexOf(u8, diagnostic.text(), part) != null);
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "engram-l1-r0of2.bin", .data = "short" });
+    try t.expectError(error.BadEngramShard, guard.applyDiagnostic(t.io, "1", root, 0, 2, &.{meta}, &diagnostic));
+    try t.expect(std.mem.indexOf(u8, diagnostic.text(), "engram-l1-r0of2.bin") != null);
+    try t.expect(std.mem.indexOf(u8, diagnostic.text(), "actual unavailable") != null);
+    try t.expectError(error.FileNotFound, guard.applyDiagnostic(t.io, "1", root, 0, 2, &.{metadata(14)}, &diagnostic));
+    try t.expect(std.mem.indexOf(u8, diagnostic.text(), "engram-l14-r0of2.bin") != null);
+    try shard(tmp.dir, meta, 0, 0, 24, 48, 1);
+    const file = try tmp.dir.openFile(t.io, "engram-l1-r0of2.bin", .{ .mode = .read_write });
+    defer file.close(t.io);
+    try file.setLength(t.io, 48);
+    try t.expectError(error.BadEngramShard, guard.applyDiagnostic(t.io, "1", root, 0, 2, &.{meta}, &diagnostic));
+    try t.expect(std.mem.indexOf(u8, diagnostic.text(), "actual layer 1, total 48, rows [0, 24)") != null);
+}
+
+test "canonical Engram unequal buckets accept padding and reject inward edges" {
+    for (hash.layers, 0..) |meta, layer_index| {
+        const tp2_boundary: u64 = if (layer_index == 0) 192001740 else 192007016;
+        try t.expectEqual(tp2_boundary, guard.required(meta, 0, 2).hi);
+        try t.expectEqual(tp2_boundary, guard.required(meta, 1, 2).lo);
+        for ([_]u32{ 2, 5 }) |world| for (0..world) |r| {
+            const rank: u32 = @intCast(r);
+            const first = @min(rank * ((24 + world - 1) / world), 24);
+            const end = @min(first + ((24 + world - 1) / world), 24);
+            var lo: u64 = 0;
+            var hi: u64 = 0;
+            for (meta.primes[0..end], 0..) |prime, col| {
+                hi += prime;
+                if (col < first) lo += prime;
+            }
+            var header: format.Header = .{ .layer = meta.layer_id, .total = meta.rows, .lo = lo, .hi = hi, .row_bytes = format.row_bytes };
+            try guard.coverage(header, meta, rank, world);
+            header.lo = lo -| 1;
+            header.hi = hi + 1;
+            header.total += 1;
+            try guard.coverage(header, meta, rank, world);
+            header.lo = lo + 1;
+            try t.expectError(error.BadEngramShard, guard.coverage(header, meta, rank, world));
+            header.lo = lo;
+            header.hi = hi - 1;
+            try t.expectError(error.BadEngramShard, guard.coverage(header, meta, rank, world));
+        };
+    }
 }
