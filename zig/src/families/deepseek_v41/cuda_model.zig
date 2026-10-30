@@ -173,6 +173,7 @@ pub const Model = struct {
         const a = m.arena.allocator();
         const cwd = std.Io.Dir.cwd();
         m.tcfg = try tp.Config.fromEnv();
+        try @import("engram_validate.zig").fromEnv(io, m.tcfg.rank, m.tcfg.world);
         m.driver = try cuda.Driver.open();
         errdefer if (!keep_owner) m.driver.close();
         try @import("dev_arena.zig").applySchedule(&m.driver, @intCast(m.tcfg.device)); // TF_CUDA_SCHED
