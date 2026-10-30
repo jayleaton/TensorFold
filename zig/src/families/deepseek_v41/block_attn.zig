@@ -339,6 +339,18 @@ pub fn attention(e: *Emitter, L: u32) !void {
         .k = @intCast(gk),
         .n = e.cfg.o_lora,
     };
-    try e.fused("o", po[0..g]);
-    try e.fused("wo_b", &.{.{ .w = try e.fmt("L{d}.attn.wo_b", .{L}), .x = oa, .y = try e.buf("L.part", .{}, .bf16, &.{ n, D }), .k = g * e.cfg.o_lora, .n = @intCast(D) }});
+    // TF_DSV41_ROT_FOLD bit 0: wo_a's epilogue writes wo_b's rot_in rows (L.wo_b.xh), so wo_b has no rot_in launch
+    const wo_b = try e.fmt("L{d}.attn.wo_b", .{L});
+    const kb: i64 = @intCast(g * e.cfg.o_lora);
+    const fold = woFold(e, po[0..g]);
+    const rot: block.Emitter.Rot = if (fold) .{ .out = .{ .suh = try e.weight("{s}.suh", .{wo_b}, .f16, &.{kb}), .xh = try e.buf("L.wo_b.xh", .{}, .f16, &.{n * kb}), .ld = kb } } else .{};
+    try e.fusedRot("o", po[0..g], null, rot);
+    try e.fusedRot("wo_b", &.{.{ .w = wo_b, .x = oa, .y = try e.buf("L.part", .{}, .bf16, &.{ n, D }), .k = @intCast(kb), .n = @intCast(D) }}, null, .{ .in = fold });
+}
+
+/// TF_DSV41_ROT_FOLD bit 0 (3a): wo_a's groups on whole 128-column blocks, so the epilogue rotates as rot_in does
+pub fn woFold(e: *const Emitter, po: []const Proj) bool {
+    if (e.o.rot_fold & 1 == 0) return false;
+    for (po) |p| if (p.col % 128 != 0 or p.n % 128 != 0) return false;
+    return true;
 }

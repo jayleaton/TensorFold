@@ -172,6 +172,18 @@ pub fn idxIota(get: Get) !bool {
     return error.BadKnob;
 }
 
+/// TF_DSV41_ROT_FOLD (unset / 0 off; 1 = bit 0, wo_a -> wo_b): bits 1-2 are reserved for 3b / 3c, refused until built
+pub fn rotFold(get: Get) !u3 {
+    const raw = std.mem.trim(u8, get("TF_DSV41_ROT_FOLD") orelse "0", " ");
+    const m = dk.dense.rotFoldMask(raw) catch null;
+    if (m) |v| if (v & ~rot_fold_built == 0) return v;
+    if (!quiet) std.log.warn("TF_DSV41_ROT_FOLD={s}: 0 or 1 (bit 0 wo_a -> wo_b; bits 1-2 reserved)", .{raw});
+    return error.BadKnob;
+}
+
+/// The TF_DSV41_ROT_FOLD bits this build implements: 3a (wo_a -> wo_b) alone.
+pub const rot_fold_built: u3 = 0b001;
+
 /// TF_DSV41_PREFETCH_AHEAD (0 by default): the next prompt segment's Engram reads before this one runs.
 pub fn prefetchAhead(get: Get) bool {
     const v = get("TF_DSV41_PREFETCH_AHEAD") orelse return false;

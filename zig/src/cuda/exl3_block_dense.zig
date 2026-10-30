@@ -3,6 +3,7 @@
 const std = @import("std");
 const cuda = @import("root.zig");
 const lin2 = @import("exl3_block_lin2.zig");
+const rot = @import("exl3_block_rot.zig");
 
 pub const DType = enum(c_int) { f16 = 0, bf16 = 1, f32 = 2 };
 
@@ -246,6 +247,12 @@ pub const lin2Mode = lin2.lin2Mode;
 pub const lin2ModeWk = lin2.lin2ModeWk;
 pub const twoTile = lin2.twoTile;
 pub const Lin2 = lin2.Lin2;
+pub const Rot = rot.Rot;
+pub const RotOut = rot.RotOut;
+pub const rot_cfgs = rot.rot_cfgs;
+pub const rotFoldMask = rot.rotFoldMask;
+pub const rotOut = rot.rotOut;
+pub const launchCols = rot.launchCols;
 
 /// x3seg's (WK, MINB) instances (TF_SEG_WIDTH: WK 8 takes any minb) and dense3's (TF_D3_WIDTH).
 pub const seg_cfgs = [_][2]u32{ .{ 4, 3 }, .{ 4, 2 }, .{ 8, 1 } };
@@ -263,10 +270,13 @@ pub const Functions = struct {
     to_strips: cuda.Function,
     /// TF_DSV41_LIN2: the two-tile variants, set by Kernels.load when the knob asks for them
     lin2: ?Lin2 = null,
+    /// TF_DSV41_ROT_FOLD: dense3's rotated-output variants, set by Kernels.load when the knob asks for them
+    rot: ?Rot = null,
 
     pub fn resolveBase(linear: cuda.Module) !Functions {
         var f: Functions = undefined;
         f.lin2 = null;
+        f.rot = null;
         f.rot_in = try linear.function("_ZN14tf_exl3_linear13rot_in_kernelEPKviPK6__halfPS2_i");
         inline for (linear_k2s, 0..) |k2, i| {
             inline for (.{ 2, 4, 8 }, 0..) |wk, j| f.linear[i][j] = try linear.function(linearSymbol(k2, wk));
@@ -428,6 +438,8 @@ pub const Ops = struct {
         };
         try o.tableLaunch(f, tab, y_dtype, M, programs, wk, pdl);
     }
+
+    pub const lanesRotLinear = rot.lanesRotLinear;
 
     fn tableLaunch(o: Ops, f: cuda.Function, tab: LinTable, y_dtype: DType, M: usize, programs: usize, wk: usize, pdl: bool) !void {
         if (M < 1 or M > rows_max or tab.n < 1 or tab.n > max_seg) return error.Shape;

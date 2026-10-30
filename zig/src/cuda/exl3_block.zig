@@ -2,4 +2,5 @@
 pub const dense = @import("exl3_block_dense.zig");
 pub const experts = @import("exl3_block_exl3.zig");
 pub const lin2 = @import("exl3_block_lin2.zig");
+pub const rot = @import("exl3_block_rot.zig");
 pub const x3gm = @import("exl3_block_x3gm.zig");

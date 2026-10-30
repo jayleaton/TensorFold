@@ -154,6 +154,7 @@ test {
     _ = exl3.block.dense;
     _ = exl3.block.experts;
     _ = exl3.block.lin2;
+    _ = exl3.block.rot;
     _ = exl3.block.x3gm;
 }
 

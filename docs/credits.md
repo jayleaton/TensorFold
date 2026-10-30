@@ -245,5 +245,8 @@ Some opt-in DeepSeek-V4.1 decode settings follow mechanisms in Bertholomus's (Al
 - `TF_DSV41_IDX_IOTA` skips an index layer's query and scores when its top-k must take every entry it reads, as
   his round selects all visible entries without scoring them (`idx_all` and `iotaVis` in
   `zig/src/families/dsv41/round.zig`). Here the existing top-k launch stays, so its output bytes are unchanged.
+- `TF_DSV41_ROT_FOLD=1` has wo_a's linear epilogue write wo_b's rotated input rows, so wo_b needs no rotation
+  launch, as his grouped linear's `RotOut` fold does (`zig/src/families/dsv41/exl3_linear.zig`, `round.zig`).
+  Here it is a new dense3 kernel beside the existing one, and its rows equal the rotation launch's bytes.
 
 [bert-dsv41]: https://github.com/bertholomus/TensorFold/tree/a57deb9d470b27e1e3fab2a9494915a0049415aa

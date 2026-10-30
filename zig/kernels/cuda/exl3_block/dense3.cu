@@ -281,6 +281,8 @@ __global__ void __launch_bounds__(32) lanes_unpack_kernel(const uint32_t* __rest
 
 }  // namespace dsv41_dense3
 
+#include "dense3_rot.cuh"
+
 #ifndef DSV41_DENSE3_NO_TORCH
 
 using namespace dsv41_dense3;
@@ -405,3 +407,24 @@ template __global__ void dsv41_dense3::lanes_linear_kernel<12, 2, 8, 1>(const ds
 template __global__ void dsv41_dense3::lanes_linear_kernel<12, 2, 8, 2>(const dsv41_x3seg::LinTable, int, int);
 template __global__ void dsv41_dense3::lanes_unpack_kernel<12, 2>(const uint32_t* __restrict__, half* __restrict__, int,
     int64_t, int64_t);
+// TF_DSV41_ROT_FOLD's instances (exl3_block_rot.zig rot_cfgs): block.fusedNorm's two (WK, MINB) pairs a width.
+template __global__ void dsv41_dense3::lanes_rot_kernel<4, 2, 4, 3>(const dsv41_x3seg::LinTable, int, int,
+    const dsv41_dense3::RotOut);
+template __global__ void dsv41_dense3::lanes_rot_kernel<4, 2, 8, 1>(const dsv41_x3seg::LinTable, int, int,
+    const dsv41_dense3::RotOut);
+template __global__ void dsv41_dense3::lanes_rot_kernel<6, 2, 4, 3>(const dsv41_x3seg::LinTable, int, int,
+    const dsv41_dense3::RotOut);
+template __global__ void dsv41_dense3::lanes_rot_kernel<6, 2, 8, 1>(const dsv41_x3seg::LinTable, int, int,
+    const dsv41_dense3::RotOut);
+template __global__ void dsv41_dense3::lanes_rot_kernel<8, 2, 4, 3>(const dsv41_x3seg::LinTable, int, int,
+    const dsv41_dense3::RotOut);
+template __global__ void dsv41_dense3::lanes_rot_kernel<8, 2, 8, 1>(const dsv41_x3seg::LinTable, int, int,
+    const dsv41_dense3::RotOut);
+template __global__ void dsv41_dense3::lanes_rot_kernel<10, 2, 4, 3>(const dsv41_x3seg::LinTable, int, int,
+    const dsv41_dense3::RotOut);
+template __global__ void dsv41_dense3::lanes_rot_kernel<10, 2, 8, 1>(const dsv41_x3seg::LinTable, int, int,
+    const dsv41_dense3::RotOut);
+template __global__ void dsv41_dense3::lanes_rot_kernel<12, 2, 4, 3>(const dsv41_x3seg::LinTable, int, int,
+    const dsv41_dense3::RotOut);
+template __global__ void dsv41_dense3::lanes_rot_kernel<12, 2, 8, 1>(const dsv41_x3seg::LinTable, int, int,
+    const dsv41_dense3::RotOut);

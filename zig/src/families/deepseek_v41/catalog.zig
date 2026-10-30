@@ -63,6 +63,7 @@ pub fn collectWithLimit(optin: u32) !void {
     for (&m, 0..) |*mod, i| mod.* = .{ .d = &driver, .handle = @ptrFromInt(i + 1) };
     @import("catalog_geometry.zig").experts(try dk.exl3.Functions.resolve(m[0], m[1], m[2], m[3], m[19], m[24], m[26], m[28], optin));
     @import("catalog_geometry.zig").dense(try dk.dense.Functions.resolve(m[4], m[5], m[6]));
+    @import("catalog_geometry.zig").rot(try dk.dense.Rot.resolve(m[6]));
     @import("catalog_geometry.zig").lin2(try dk.dense.Lin2.resolve(m[30], .{ .lanes = true, .linear = true, .cluster = true }));
     @import("catalog_geometry.zig").lin2(try dk.dense.Lin2.resolve(m[30], .{ .lanes = true, .linear = true, .cluster = true, .pf = false }));
     @import("catalog_geometry.zig").operators(try dk.ops.Functions.resolve(m[7], m[8], m[9], m[10], m[11], .{ m[12], m[13], m[14], m[15] }, m[16], m[17], m[18], m[20], m[21], m[22], m[23], m[25], m[29], 262144));
