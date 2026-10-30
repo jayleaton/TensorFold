@@ -194,6 +194,14 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     @import("runtime_libraries.zig").tests(b, step);
     const host = b.graph.host;
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/build/check_fatbins.zig"), .target = host }) })).step);
+    const sandbox_exe = b.addExecutable(.{ .name = "compute-sandbox", .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/core/compute_sandbox_main.zig"), .target = host, .optimize = .Debug, .link_libc = true }) });
+    const compute_options = b.addOptions();
+    compute_options.addOptionPath("sandbox_exe", sandbox_exe.getEmittedBin());
+    const compute_tests = b.createModule(.{ .root_source_file = b.path("zig/src/core/compute_lane_test.zig"), .target = host, .optimize = .Debug, .link_libc = true });
+    compute_tests.addOptions("compute_lane_options", compute_options);
+    const compute_lane = b.addRunArtifact(b.addTest(.{ .root_module = compute_tests }));
+    b.step("test-compute-lane-host", "Sandboxed compute lane jobs: Landlock, seccomp, limits and result text").dependOn(&compute_lane.step);
+    step.dependOn(&compute_lane.step);
     const cuda = runtime(b, host, .debug, &.{});
     b.step("test-nccl-version-host", "Shared NCCL minimum without a communicator or GPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cuda, .filters = &.{"NCCL minimum:"} })).step);
     // H3's library opens its checkpoint with mmap: not Windows
