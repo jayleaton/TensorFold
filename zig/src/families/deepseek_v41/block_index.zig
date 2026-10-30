@@ -45,8 +45,12 @@ pub fn index(e: *Emitter, L: u32, qn: Arg, iw: Arg, qnorm: ?Norm) !void {
     const IH: i64 = e.cfg.index_heads;
     const ID: i64 = e.cfg.index_dim;
     const qi = try e.buf("L.qi", .{}, .bf16, &.{ n, IH * ID });
-    try e.fusedNorm("qi", &.{.{ .w = try e.fmt("L{d}.attn.ix_wq_b", .{L}), .x = qn, .y = qi, .k = e.cfg.q_lora, .n = @intCast(IH * ID) }}, qnorm);
-    try e.rope(qi, IH, ID, ID - 64);
+    // TF_DSV41_IDX_IOTA: no query, rope or scores where the top-k's bytes cannot depend on them (iotaSelects)
+    const iota = iotaSelects(e, L);
+    if (!iota) {
+        try e.fusedNorm("qi", &.{.{ .w = try e.fmt("L{d}.attn.ix_wq_b", .{L}), .x = qn, .y = qi, .k = e.cfg.q_lora, .n = @intCast(IH * ID) }}, qnorm);
+        try e.rope(qi, IH, ID, ID - 64);
+    }
     const reindex = e.cfg.mode(L) == .reindex;
     const src = if (reindex) e.cfg.kvSource(L).? else L;
     const ratio: i64 = e.cfg.compressRatio(src);
@@ -62,8 +66,37 @@ pub fn index(e: *Emitter, L: u32, qn: Arg, iw: Arg, qnorm: ?Norm) !void {
         if (n * nvis * 12 > e.o.index_budget) return e.blocked(L, qi, iw, src, ratio, nvis);
     }
     const sc = try e.buf("L.scores", .{}, .f32, &.{ n, nk });
-    try e.scoreRows(qi, iw, src, ratio, 0, n, try e.pos(), nk, sc, if (reindex) cand else null);
+    if (!iota) try e.scoreRows(qi, iw, src, ratio, 0, n, try e.pos(), nk, sc, if (reindex) cand else null);
     try e.topkOf(L, sc, cand, nk, ratio, e.o.index_bound);
+}
+
+/// Layer L's dense top-k (`topkOf`, not row blocks) reads at most K entries, and its candidate blocks fit their K.
+fn denseAll(e: *const Emitter, L: u32) bool {
+    if (e.cfg.mode(L) != .full) return false;
+    const k: i64 = e.cfg.index_topk;
+    const nk = @divFloor(e.end(), @as(i64, e.cfg.compressRatio(L)));
+    if (nk > k or e.n * @max(nk, 1) * 12 > e.o.index_budget or topkPlan(nk, null)[1] > topk_max_ept) return false;
+    if (!e.cfg.isCandidateSource(L)) return true;
+    const nb = std.math.divCeil(i64, nk, e.cfg.candidate_block_size) catch return false;
+    return nb <= @as(i64, e.cfg.candidate_blocks) and topkPlan(nb, null)[1] <= topk_max_ept;
+}
+
+/// TF_DSV41_IDX_IOTA: L's top-k selects every valid entry, so its output is the same for any score values.
+pub fn iotaSelects(e: *const Emitter, L: u32) bool {
+    if (!e.o.idx_iota) return false;
+    return switch (e.cfg.mode(L)) {
+        .full => denseAll(e, L),
+        .reindex => blk: {
+            // mode 3's valid entries: the candidate source's blocks, all its visible ones under denseAll, x block size
+            if (!e.cfg.usesCandidates(L)) break :blk false;
+            const c: u32 = @intCast(e.cfg.candidate_source);
+            if (!denseAll(e, c)) break :blk false;
+            const cbs: i64 = e.cfg.candidate_block_size;
+            const nkc = @divFloor(e.end(), @as(i64, e.cfg.compressRatio(c)));
+            break :blk cbs * (std.math.divCeil(i64, nkc, cbs) catch break :blk false) <= @as(i64, e.cfg.index_topk);
+        },
+        else => false,
+    };
 }
 
 /// index.scores over rows [a, a + rows) into `out` [rows, nk]: dense, or over candidate blocks `cand` (Reindex).

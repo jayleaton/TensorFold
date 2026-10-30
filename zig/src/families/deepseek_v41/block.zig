@@ -83,6 +83,8 @@ pub const Options = struct {
     stream_rb: i64 = 0,
     /// TF_DSV41_INDEX_BOUND: decode index scores and top-k as row-bounded twins that stop at each row's visible end
     index_bound: bool = false,
+    /// TF_DSV41_IDX_IOTA: an index layer whose top-k takes every entry it reads skips its query and scores (same bits)
+    idx_iota: bool = false,
     /// decode knob set (same bits): ATTN_SPLIT, ATTN_ROPE, MHC_TAIL, MHC_DEFER, RG_PRUNE, PRUNE_KIT, MOE_BF16, RMS_FOLD
     r1: bool = false,
     /// TF_DSV41_ROUTER_GROUP_ROT: wide grouping and expert input rotation in one launch (default off).

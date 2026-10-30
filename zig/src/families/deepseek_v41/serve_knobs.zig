@@ -163,6 +163,15 @@ pub fn indexBound(get: Get) !bool {
     return error.BadKnob;
 }
 
+/// TF_DSV41_IDX_IOTA (unset / 0 off, 1 on, else refused): block_index.iotaSelects' layers skip their index scores.
+pub fn idxIota(get: Get) !bool {
+    const raw = std.mem.trim(u8, get("TF_DSV41_IDX_IOTA") orelse "0", " ");
+    if (std.mem.eql(u8, raw, "0")) return false;
+    if (std.mem.eql(u8, raw, "1")) return true;
+    if (!quiet) std.log.warn("TF_DSV41_IDX_IOTA={s}: 0 or 1", .{raw});
+    return error.BadKnob;
+}
+
 /// TF_DSV41_PREFETCH_AHEAD (0 by default): the next prompt segment's Engram reads before this one runs.
 pub fn prefetchAhead(get: Get) bool {
     const v = get("TF_DSV41_PREFETCH_AHEAD") orelse return false;

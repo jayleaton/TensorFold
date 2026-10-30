@@ -242,5 +242,8 @@ Some opt-in DeepSeek-V4.1 decode settings follow mechanisms in Bertholomus's (Al
 
 - `TF_DSV41_DEPTH_OVERHEAD_MS` prices a fixed round overhead into the draft depth's rate, as his lane allocator
   divides expected tokens by a round's table cost plus its observed overhead (`zig/src/core/lanes/allocate.zig`).
+- `TF_DSV41_IDX_IOTA` skips an index layer's query and scores when its top-k must take every entry it reads, as
+  his round selects all visible entries without scoring them (`idx_all` and `iotaVis` in
+  `zig/src/families/dsv41/round.zig`). Here the existing top-k launch stays, so its output bytes are unchanged.
 
 [bert-dsv41]: https://github.com/bertholomus/TensorFold/tree/a57deb9d470b27e1e3fab2a9494915a0049415aa

@@ -8,6 +8,7 @@ const env = pk.env;
 const gmGu2 = pk.gmGu2;
 const indexBound = pk.indexBound;
 const indexBudget = pk.indexBudget;
+const idxIota = pk.idxIota;
 const kvNormStore = pk.kvNormStore;
 const mhcPfRows = pk.mhcPfRows;
 const mhcSiteRows = pk.mhcSiteRows;
@@ -50,6 +51,7 @@ pub fn apply(f: *Forward, a: std.mem.Allocator, io: std.Io, rank: u32) !void {
     f.opts.pf_tbo = try pfTbo(&env);
     f.opts.stream_rb = try streamRb(&env);
     f.opts.index_bound = try indexBound(&env);
+    f.opts.idx_iota = try idxIota(&env);
     // TF_DSV41_BRANCHES: the side stream exists before any capture
     if (f.branches == null) f.branches = try @import("branches.zig").install(f.gpa, f, rank);
     // TF_DSV41_PF_OVERLAP: the pieces' exchanges go on the branches' side stream (one peer: TP=2)
@@ -95,6 +97,7 @@ pub fn apply(f: *Forward, a: std.mem.Allocator, io: std.Io, rank: u32) !void {
     log.info("KV norm/store fusion: {s}", .{if (f.opts.kv_norm_store) "on" else "off"});
     log.info("router grouping/rotation fusion: {s}", .{if (f.opts.router_group_rot) "on" else "off"});
     if (f.opts.index_bound) log.info("index bound: decode index scores stop at each row's own keys (_scores_b)", .{});
+    if (f.opts.idx_iota) log.info("index iota: an index layer whose top-k takes all its entries skips its query and scores", .{});
     if (f.opts.x3ld_epi) log.info("x3ld epilogues: gateup_epilogue / down_combine fused into the decode expert streamer (TF_DSV41_X3LD_EPI)", .{});
     if (f.opts.stream_rb == 1) log.info("stream top-k: _stream_pf (the next tile's key loads issued ahead)", .{});
     if (f.opts.stream_rb > 1) log.info("stream top-k: {d} rows a program (_stream_rb{d})", .{ f.opts.stream_rb, f.opts.stream_rb });
