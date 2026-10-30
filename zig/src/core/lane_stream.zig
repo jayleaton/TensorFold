@@ -70,6 +70,7 @@ pub fn open(h: *LaneHost, job: *Job) bool {
         .untaught = r.untaught,
         .images = r.images,
         .key = r.cache_key,
+        .hold_eos = r.hold_eos and r.structure == null and r.logprobs == null, // forced rows would leave the grammar
     }) catch {
         freeProposer(h, job);
         recalls.release(job);

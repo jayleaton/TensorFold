@@ -85,6 +85,13 @@ pub const Engine = struct {
         e.arena.deinit();
     }
 
+    /// Streams the next step decodes: a paused (held) stream waits outside the rounds.
+    pub fn runnableCount(e: *const Engine) usize {
+        var n: usize = 0;
+        for (e.live.items) |s| n += @intFromBool(!s.finished and !s.paused);
+        return n;
+    }
+
     /// Streams holding or about to hold a row (paused ones included).
     pub fn activeCount(e: *const Engine) usize {
         var n: usize = 0;
@@ -416,6 +423,7 @@ pub const Engine = struct {
         const landed = try s.commit(e.gpa, committed.items, committed_rows);
         const got = committed.items[0..landed];
         if (s.finished and got.len < path.len) path = path[0 .. got.len + 1];
+        if (s.held and got.len < path.len) path = path[0..got.len]; // a held EOS stays pending: its row runs again
         const keep = path.len;
         s.cache_len += keep;
         s.pending = committed.items[keep - 1];

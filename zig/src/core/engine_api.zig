@@ -116,6 +116,8 @@ pub const Request = struct {
     images: []const Image = &.{},
     /// The prompt as the prompt cache matches it (each image's placeholders by its content); empty: ``prompt``.
     cache_key: []const u32 = &.{},
+    /// At an EOS the stream holds for ``Engine.resumeHeld`` (a built-in tool's result) instead of finishing.
+    hold_eos: bool = false,
 
     /// The prompt as the prompt cache matches it: an image request's placeholders stand for their images.
     pub fn cacheKey(r: *const Request) []const u32 {
@@ -241,6 +243,7 @@ pub const Info = struct {
     slide_conversations: bool = false,
     /// Whether a request's caches fit beside the running streams' now (null: a free lane does); else it waits in order.
     admit: ?Admit = null,
+    compute: ?compute_lane.Config = null, // the family's built-in code execution: replies hold at EOS for its results
 
     /// What a lane engine's streams enforce themselves (core/lanes/stream.zig): loop guards and answer limits.
     pub fn ofLanes(i: Info) Info {
@@ -251,6 +254,9 @@ pub const Info = struct {
     }
 };
 
+pub const compute_lane = @import("compute_lane.zig");
+/// A held reply's result tokens (empty: it ends at its EOS), forced after the EOS between rounds.
+pub const Resume = lanes.hold.Resume;
 pub const Admit = struct {
     ctx: *anyopaque,
     fits: *const fn (ctx: *anyopaque, prompt: u32, max_tokens: u32) bool,
@@ -442,6 +448,8 @@ pub const Engine = struct {
         imprint: ?*const fn (ctx: *anyopaque, ask: *ImprintAsk) bool = null,
         /// A planned stop's first half: no more work, disk writes finished under a deadline, the engine thread joined.
         drain: ?*const fn (ctx: *anyopaque) void = null,
+        /// Continues a ``hold_eos`` request held at its EOS, once; an id that is not held is ignored.
+        resume_held: ?*const fn (ctx: *anyopaque, id: Id, r: Resume) void = null,
     };
 
     pub fn info(e: Engine) Info {
@@ -465,6 +473,11 @@ pub const Engine = struct {
     }
     pub fn cancel(e: Engine, id: Id) void {
         e.vtable.cancel(e.ctx, id);
+    }
+    pub fn resumeHeld(e: Engine, id: Id, r: Resume) bool {
+        const f = e.vtable.resume_held orelse return false;
+        f(e.ctx, id, r);
+        return true;
     }
     pub fn status(e: Engine, out: *Status, stream_tokens: []u32) void {
         e.vtable.status(e.ctx, out, stream_tokens);

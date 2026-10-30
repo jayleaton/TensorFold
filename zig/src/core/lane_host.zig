@@ -10,6 +10,7 @@ const fill = @import("lane_host_fill.zig");
 const admit = @import("lane_host_admit.zig");
 const recalls = @import("lane_host_recall.zig");
 const ends = @import("lane_host_end.zig");
+const holds = @import("lane_host_hold.zig");
 const rows_host = @import("lane_host_rows.zig");
 const pressure = @import("lane_host_pressure.zig");
 const Allocator = std.mem.Allocator;
@@ -43,6 +44,7 @@ pub const LaneHost = struct {
     admitted: std.ArrayList(*Job) = .empty,
     filling: std.ArrayList(*Job) = .empty, // admitted jobs whose prompt is still going in, a chunk a round, oldest first
     cancels: std.ArrayList(Id) = .empty,
+    resumes: std.ArrayList(holds.Pending) = .empty, // results for held replies (lane_host_hold.zig)
     closing: bool = false,
     stale: bool = false, // the learner's last step: a put-back has not reached the device, so replies are refused
     /// `halt`'s reason: what is left finishes failed with it (null: a stop cancels what is left)
@@ -114,6 +116,7 @@ pub const LaneHost = struct {
         h.admitted.deinit(h.gpa);
         h.filling.deinit(h.gpa);
         h.cancels.deinit(h.gpa);
+        holds.close(h);
         h.decoded.deinit(h.gpa);
         h.live_tokens.deinit(h.gpa);
         h.pieces.deinit(h.gpa);
@@ -132,6 +135,7 @@ pub const LaneHost = struct {
         .info = infoFn,
         .submit = submitFn,
         .cancel = cancelFn,
+        .resume_held = holds.resumeFn,
         .status = status.read,
         .memory = memoryFn,
         .keepalive = keepaliveFn,
@@ -220,17 +224,6 @@ pub const LaneHost = struct {
     /// A foreground request is queued (they queue ahead of every background one); the caller holds the lock.
     pub fn foregroundWaiting(h: *const LaneHost) bool {
         return h.queued.items.len > 0 and !h.queued.items[0].request.background;
-    }
-
-    /// Waits `warm_quiet` for other work (a request, a decoding stream, a cancel): true if none came.
-    fn quiet(h: *LaneHost, job: *const Job) bool {
-        const until: std.Io.Timeout = .{ .deadline = .fromNow(h.io, .{ .raw = .fromNanoseconds(h.warm_quiet), .clock = .awake }) };
-        h.lock();
-        defer h.unlock();
-        while (!h.closing and !h.foregroundWaiting() and h.core.activeCount() == 0 and std.mem.indexOfScalar(Id, h.cancels.items, job.id) == null) {
-            h.wake.waitTimeout(h.io, &h.mutex, until) catch |e| return e == error.Timeout;
-        }
-        return false;
     }
 
     /// Hands a stream the tokens its rounds committed since the last delivery (their logprob rows first).
@@ -324,7 +317,7 @@ pub const LaneHost = struct {
     /// A taken job's stream, set up to start; null when the job ended instead (dropped or cancelled).
     pub fn setup(h: *LaneHost, job: *Job) ?i96 {
         const r = job.request;
-        if (r.background and r.max_tokens == 0 and h.warm_quiet > 0 and !h.quiet(job)) return h.ended(h.cancel(job)); // other work came first
+        if (r.background and r.max_tokens == 0 and h.warm_quiet > 0 and !admit.quiet(h, job)) return h.ended(h.cancel(job)); // other work came first
         if (!lane_stream.open(h, job)) return null; // the job was finished instead
         return job.began;
     }
@@ -538,6 +531,7 @@ pub const LaneHost = struct {
             var activity = Activity.enter(h.activity);
             defer activity.end();
             ends.takeCancels(h);
+            holds.take(h);
             pressure.step(h);
             rows_host.answer(h);
             scoring.answer(h);
@@ -562,7 +556,7 @@ pub const LaneHost = struct {
                 ends.closeAll(h);
                 continue;
             }
-            if (h.core.activeCount() == 0) {
+            if (h.core.runnableCount() == 0) {
                 if (h.filling.items.len > 0) {
                     h.unlock();
                     continue;

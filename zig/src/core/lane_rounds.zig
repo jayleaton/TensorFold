@@ -156,7 +156,7 @@ fn round(h: *LaneHost, rd: Rounds) bool {
         did = true;
         runFinals(h);
     }
-    if (h.core.activeCount() > 0) {
+    if (h.core.runnableCount() > 0) {
         did = true;
         h.core.step() catch |e| {
             ends.failAll(h, h.words(e));
@@ -266,6 +266,7 @@ pub fn run(h: *LaneHost, rd: Rounds) void {
         var activity = LaneHost.Activity.enter(h.activity);
         defer activity.end();
         ends.takeCancels(h);
+        @import("lane_host_hold.zig").take(h);
         pressure.step(h);
         rows_host.answer(h);
         @import("lane_host_score.zig").answer(h);

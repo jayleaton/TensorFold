@@ -33,7 +33,7 @@ pub fn Wrapper(comptime Rows: type) type {
         }
 
         pub fn engine(e: *Self) api.Engine {
-            return .{ .ctx = e, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory } };
+            return .{ .ctx = e, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory, .resume_held = resumeHeld } };
         }
 
         fn self(ctx: *anyopaque) *Self {
@@ -47,6 +47,9 @@ pub fn Wrapper(comptime Rows: type) type {
         }
         fn cancel(ctx: *anyopaque, id: api.Id) void {
             self(ctx).inner.cancel(id);
+        }
+        fn resumeHeld(ctx: *anyopaque, id: api.Id, r: api.Resume) void {
+            _ = self(ctx).inner.resumeHeld(id, r);
         }
         fn status(ctx: *anyopaque, out: *api.Status, tokens: []u32) void {
             self(ctx).inner.status(out, tokens);

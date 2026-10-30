@@ -135,7 +135,7 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
     var input: chat.Input = .{ .fields = undefined };
     if (is_chat) {
         input.messages = try messages.normalizeWith(cx, body.get("messages"), "system", srv.needs_user_after_tool, .of(srv.info.vision));
-        input.tools = try tool_specs.active(cx, body.get("tools"), body.get("tool_choice"));
+        input.tools = try @import("compute_turns.zig").tools(srv, cx, body.get("tools"), body.get("tool_choice"));
     } else if (body.get("messages")) |m| if (m == .array and m.array.len > 0) {
         input.messages = try messages.normalizeWith(cx, m, "system", srv.needs_user_after_tool, .of(srv.info.vision));
     };

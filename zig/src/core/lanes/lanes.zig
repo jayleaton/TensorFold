@@ -28,6 +28,7 @@ pub const events = @import("events.zig");
 pub const windows = @import("windows.zig");
 pub const trail = @import("trail.zig");
 pub const engine = @import("engine.zig");
+pub const hold = @import("hold.zig");
 pub const fake = @import("fake.zig");
 pub const drafter = @import("drafter.zig");
 pub const drafted = @import("drafted.zig");
@@ -53,6 +54,7 @@ test {
     _ = @import("long_loop_test.zig");
     _ = @import("loop_stop_test.zig");
     _ = @import("handover_test.zig");
+    _ = @import("hold_test.zig");
     _ = @import("open_first_test.zig");
     _ = @import("recorder_test.zig");
     _ = @import("gpu_full_test.zig");

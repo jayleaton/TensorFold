@@ -133,6 +133,8 @@ pub const Served = struct {
         s.x.attach(&s.core);
         const window: u32 = @intCast(@min(context orelse m.f.opts.limit, m.f.opts.limit));
         s.host = api.LaneHost.init(gpa, io, &s.core, .{ .name = "dsv41-cuda", .lanes = m.slots, .context_window = window, .prefill_step = m.gt.prefill_rows, .structures = m.grammar_masks != null });
+        // TF_DSV41_COMPUTE_LANE=1: built-in code runs on the CPU while its reply holds at EOS (core/compute_lane.zig)
+        s.host.info_.compute = try api.compute_lane.Config.parse(&@import("serve_knobs.zig").env, "TF_DSV41_COMPUTE_LANE");
         // the lanes run on LaneHost's thread: the model's CUDA context must be current there
         s.host.on_thread = .{ .ctx = m, .run = bindContext };
         // /metrics' device memory: bytes this rank holds in cuda.DeviceBuffers (weights, KV pool, staging), peak
@@ -317,7 +319,7 @@ pub const Recorder = struct {
 
     pub fn engine(r: *Recorder) api.Engine {
         if (r.path == null) return r.inner;
-        return .{ .ctx = r, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory } };
+        return .{ .ctx = r, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory, .resume_held = resumeHeld } };
     }
 
     fn self(ctx: *anyopaque) *Recorder {
@@ -328,6 +330,9 @@ pub const Recorder = struct {
     }
     fn cancel(ctx: *anyopaque, id: api.Id) void {
         self(ctx).inner.cancel(id);
+    }
+    fn resumeHeld(ctx: *anyopaque, id: api.Id, r: api.Resume) void {
+        _ = self(ctx).inner.resumeHeld(id, r);
     }
     fn status(ctx: *anyopaque, out: *api.Status, stream_tokens: []u32) void {
         self(ctx).inner.status(out, stream_tokens);

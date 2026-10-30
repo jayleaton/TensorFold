@@ -1,4 +1,5 @@
 //! Which queued request a lane host admits next: the head, or one behind a head that waits for pool room.
+const std = @import("std");
 const api = @import("engine_api.zig");
 const LaneHost = @import("lane_host.zig").LaneHost;
 const Job = LaneHost.Job;
@@ -6,6 +7,17 @@ const lanes = @import("lanes");
 const prefix = @import("lane_host_prefix.zig");
 const fetch = @import("lane_host_fetch.zig");
 const pressure = @import("lane_host_pressure.zig");
+
+/// Waits `warm_quiet` for other work (a request, a decoding stream, a cancel): true if none came.
+pub fn quiet(h: *LaneHost, job: *const Job) bool {
+    const until: std.Io.Timeout = .{ .deadline = .fromNow(h.io, .{ .raw = .fromNanoseconds(h.warm_quiet), .clock = .awake }) };
+    h.lock();
+    defer h.unlock();
+    while (!h.closing and !h.foregroundWaiting() and h.core.activeCount() == 0 and std.mem.indexOfScalar(api.Id, h.cancels.items, job.id) == null) {
+        h.wake.waitTimeout(h.io, &h.mutex, until) catch |e| return e == error.Timeout;
+    }
+    return false;
+}
 
 /// The queued job to admit (its index), or null to hold; the caller holds the lock.
 pub fn pick(h: *LaneHost) ?usize {

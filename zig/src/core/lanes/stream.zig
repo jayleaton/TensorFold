@@ -144,6 +144,7 @@ pub const Spec = struct {
     decode_spans: []const [2]u32 = &.{}, // prompt rows an earlier reply decoded (Request.decode_spans), for backends that keep their bits
     images: []const Image = &.{}, // in prompt order; the backend's tower fills their rows
     key: []const u32 = &.{}, // the prompt as the cache matches it (image rows by their image); empty: the prompt
+    hold_eos: bool = false, // an EOS holds the stream for a server tool's result (hold.zig) instead of ending it
 };
 
 pub const Stream = struct {
@@ -226,6 +227,8 @@ pub const Stream = struct {
     min_rows: u32 = 0,
     gpu_seconds: ?f64 = null, // a timed backend's passes this stream ran in (TF_Q27_PROFILE); null: untimed
     paused: bool = false,
+    hold_eos: bool = false,
+    held: bool = false, // paused at a committed EOS, which stays pending until hold.zig resumes or ends the stream
     depth: ?State = null,
     mode: ?Mode = null,
     next: ?Held = null,
@@ -270,6 +273,7 @@ pub const Stream = struct {
             .decode_spans = spec.decode_spans,
             .images = spec.images,
             .key = spec.key,
+            .hold_eos = spec.hold_eos,
         };
         // under a grammar a forced close ends at the think end: the grammar takes the reply from the next token
         if (spec.grammar) |g| if (g.after) |end| if (std.mem.indexOfScalar(u32, s.think_close, end)) |at| {
@@ -467,7 +471,11 @@ pub const Stream = struct {
             }
             const guarded = s.loop_guard and s.think_open and s.think_end >= 0 and s.loop_period == null;
             const fire = if (guarded) detectLoop(s.emitted()) orelse s.longCycle() else null;
-            if (s.isEos(t) or s.stopped()) {
+            if (s.isEos(t) and s.hold_eos) {
+                s.held = true;
+                s.paused = true;
+                break;
+            } else if (s.isEos(t) or s.stopped()) {
                 s.finished = true;
                 s.reason = .stop;
             } else if (fire) |period| {
