@@ -232,3 +232,15 @@ credited here.
 ## Fluid Subgraph Residency
 
 TensorFold's exact residency implementation follows published techniques: EdgeMoE's storage-backed weights and memory index, MoE-Infinity and Fiddler's expert locality/popularity caching and prefetch, and Fate's cross-layer gate prefetch. These are re-implementations of proven techniques, with no novelty claim. The frozen TensorFold Python engine provides the implementation ancestry for native expert slots and PLE row streaming. Slotstream is an outside comparison for published SSD streaming memory/speed trade-offs, not the design or code source. See [the exact residency design](design/fluid-subgraph-residency.md) for scope and qualification.
+
+## DeepSeek-V4.1 decode
+
+Some opt-in DeepSeek-V4.1 decode settings follow mechanisms in Bertholomus's (Albert Lee, @bertholomus) native
+`families/dsv41` family on [bertholomus/TensorFold](https://github.com/bertholomus/TensorFold) branch
+`deepseek-v41-zig-tp2` at [a57deb9d4][bert-dsv41] (Apache-2.0). They are re-implemented in
+`zig/src/families/deepseek_v41`, off unless set, and their commits name him as co-author.
+
+- `TF_DSV41_DEPTH_OVERHEAD_MS` prices a fixed round overhead into the draft depth's rate, as his lane allocator
+  divides expected tokens by a round's table cost plus its observed overhead (`zig/src/core/lanes/allocate.zig`).
+
+[bert-dsv41]: https://github.com/bertholomus/TensorFold/tree/a57deb9d470b27e1e3fab2a9494915a0049415aa
