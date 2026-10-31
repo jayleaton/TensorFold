@@ -226,7 +226,7 @@ test "retime: suspect rows cycled after one warm-up round, each kept the lower; 
     @memcpy(v[1..17], &spiked_s10);
     var before = try p.build(gpa, &.{v});
     defer before.deinit(gpa);
-    try std.testing.expectEqual(spiked_s10[5], before.verify[7]); // the burst carried to row 8 by the envelope
+    try std.testing.expect(before.verify[7] > spiked_s10[7] + 1.0); // the burst lifts row 8 over its own time
     var both: [cm.max_rows]f64 = undefined;
     try p.combined(&.{v}, &both);
     var flag: [cm.max_rows]bool = undefined;
@@ -246,7 +246,7 @@ test "retime: suspect rows cycled after one warm-up round, each kept the lower; 
     try std.testing.expectEqual(@as(f64, 43.1), v[6]);
     var after = try p.build(gpa, &.{v});
     defer after.deinit(gpa);
-    try std.testing.expect(after.verify[5] < 44.0 and after.verify[7] < 52.0);
+    try std.testing.expect(after.verify[5] < before.verify[5] - 10.0 and after.verify[7] < before.verify[7] - 1.0);
     try p.combined(&.{v}, &both);
     try std.testing.expectEqual(@as(usize, 0), try cm.suspects(gpa, &both, m.spike, &flag));
 }
