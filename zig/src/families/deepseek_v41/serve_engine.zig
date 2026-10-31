@@ -18,6 +18,7 @@ const ph = @import("phases.zig");
 const timed = @import("phases_timed.zig");
 const Allocator = std.mem.Allocator;
 const sched_host = @import("sched_host.zig");
+const pf = @import("forward_prefill.zig");
 
 pub const backends: []const []const u8 = &.{"cuda"};
 pub const families: []const api.Family = &.{.{ .model_type = "deepseek_v41", .formats = &.{"exl3"}, .raw_text = false }};
@@ -132,7 +133,8 @@ pub const Served = struct {
         s.core = lanes.Engine.init(gpa, &s.cfg, s.x.backend(), s.clock.clock());
         s.x.attach(&s.core);
         const window: u32 = @intCast(@min(context orelse m.f.opts.limit, m.f.opts.limit));
-        s.host = api.LaneHost.init(gpa, io, &s.core, .{ .name = "dsv41-cuda", .lanes = m.slots, .context_window = window, .prefill_step = m.gt.prefill_rows, .structures = m.grammar_masks != null });
+        const decoded = pf.state(&m.f).decoded_rows; // TF_DSV41_DECODED_ROWS
+        s.host = api.LaneHost.init(gpa, io, &s.core, .{ .name = "dsv41-cuda", .lanes = m.slots, .context_window = window, .prefill_step = m.gt.prefill_rows, .structures = m.grammar_masks != null, .open_replies = decoded != .off });
         // TF_DSV41_COMPUTE_LANE=1: built-in code runs on the CPU while its reply holds at EOS (core/compute_lane.zig)
         s.host.info_.compute = try api.compute_lane.Config.parse(&@import("serve_knobs.zig").env, "TF_DSV41_COMPUTE_LANE");
         // the lanes run on LaneHost's thread: the model's CUDA context must be current there
@@ -156,6 +158,15 @@ pub const Served = struct {
                 std.log.info("dsv41 rounds: {s}", .{sh.describe(&buf)});
             }
         } else std.log.info("dsv41 rounds: whole prompts at admission (TF_DSV41_PREFILL_PIECES=1: the reference server's pieces between decode rounds)", .{});
+        if (decoded != .off) {
+            // reply rows run as decode windows inside the pieces; a whole prompt has no pieces to cut
+            if (s.sched == null) {
+                std.log.scoped(.dsv41).err("TF_DSV41_DECODED_ROWS needs the pieces path (TF_DSV41_PREFILL_PIECES=1, TF_DSV41_OWN_PREFILL=1, TF_DSV41_PROMPT_TAIL=verify)", .{});
+                return error.BadKnob;
+            }
+            s.host.decoded_rows = true;
+            std.log.info("dsv41 decoded rows: {s} as decode windows", .{if (decoded == .replies) "reply spans" else "every row from the first reply on"});
+        }
         s.lookup = null;
         const ls = copy_policy.lookup(m.pass != null, try lookup.Settings.fromEnv());
         if (copy_policy.suppressed(m.pass != null)) std.log.info("dsv41 copies: disabled beside the loaded draft head", .{});

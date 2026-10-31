@@ -20,6 +20,7 @@ test {
     _ = @import("idx_iota_test.zig"); // TF_DSV41_IDX_IOTA on the decode emitter and the top-k twin
     _ = @import("rot_fold_test.zig"); // TF_DSV41_ROT_FOLD on the decode emitter and the rotation twin
     _ = @import("rot_fold_attn_test.zig"); // TF_DSV41_ROT_FOLD bit 1: the merge fold and its rows' twin
+    _ = @import("decoded_rows.zig"); // TF_DSV41_DECODED_ROWS: the rows that run as decode windows
 }
 
 const Fake = struct {
@@ -29,6 +30,23 @@ const Fake = struct {
         return null;
     }
 };
+
+test "decoded rows: off unless set to 1 or 2, anything else refused" {
+    Fake.pairs = &.{};
+    try testing.expectEqual(pk.DecodedRows.off, try pk.decodedRows(&Fake.get));
+    for ([_][]const u8{ "0", " 0 " }) |v| {
+        Fake.pairs = &.{.{ "TF_DSV41_DECODED_ROWS", v }};
+        try testing.expectEqual(pk.DecodedRows.off, try pk.decodedRows(&Fake.get));
+    }
+    Fake.pairs = &.{.{ "TF_DSV41_DECODED_ROWS", "1" }};
+    try testing.expectEqual(pk.DecodedRows.replies, try pk.decodedRows(&Fake.get));
+    Fake.pairs = &.{.{ "TF_DSV41_DECODED_ROWS", "2" }};
+    try testing.expectEqual(pk.DecodedRows.after, try pk.decodedRows(&Fake.get));
+    for ([_][]const u8{ "3", "on", "true", "12", "-1" }) |v| {
+        Fake.pairs = &.{.{ "TF_DSV41_DECODED_ROWS", v }};
+        try testing.expectError(error.BadKnob, pk.decodedRows(&Fake.get));
+    }
+}
 
 test "router grouping/rotation fusion is explicitly opt-in" {
     Fake.pairs = &.{};

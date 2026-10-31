@@ -44,6 +44,7 @@ pub fn apply(f: *Forward, a: std.mem.Allocator, io: std.Io, rank: u32) !void {
     f.opts.gm_v2 = try @import("gm2pf.zig").mode(&env);
     f.opts.mhc_pf_rows = try mhcPfRows(&env);
     pf.state(f).mode = try prefillMode(&env);
+    pf.state(f).decoded_rows = try pk.decodedRows(&env);
     pf.state(f).k4 = big;
     // 4K needs x3gm v2 (v1's 4K tuning is not emitted) and replay (the workspace is released at the CED finish)
     if (big and (f.opts.gm_v2 == .off or pf.state(f).mode != .replay)) {

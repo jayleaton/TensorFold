@@ -48,6 +48,8 @@ pub const Target = struct {
         replays: ?*const fn (ptr: *anyopaque, list: []const Final) anyerror!void = null,
         /// Engram reads ahead of the next window (TF_DSV41_ENGRAM_WARM); reads only, window bits are unaffected.
         warm: ?*const fn (ptr: *anyopaque, asks: []const Warm) void = null,
+        /// TF_DSV41_DECODED_ROWS: a slot's next prompt's reply spans (Request.decode_spans), before its `begin`.
+        spans: ?*const fn (ptr: *anyopaque, slot: u32, spans: []const [2]u32, ids: []const u32) anyerror!void = null,
     };
 
     /// A slot's whole prompt whose rows but the last are in (its `finish` / `tail` follows).
@@ -68,6 +70,9 @@ pub const Target = struct {
 
     pub fn pieces(t: Target) bool {
         return t.vtable.begin != null and t.vtable.piece != null and t.vtable.finish != null;
+    }
+    pub fn setSpans(t: Target, slot: u32, spans: []const [2]u32, ids: []const u32) !void {
+        if (t.vtable.spans) |f| return f(t.ptr, slot, spans, ids);
     }
     pub fn begin(t: Target, slot: u32, ids: []const u32) !Begun {
         return (t.vtable.begin orelse return error.NoPieces)(t.ptr, slot, ids);

@@ -409,7 +409,9 @@ pub const Sessions = struct {
 
     /// The entries' tag (sessions.Tag's CED field): replay entries never resume full ones, nor full ones replay's.
     fn tag(s: *const Sessions) u32 {
-        return if (pf.state(s.f).mode == .replay) ced.tag else ced.tag_fast;
+        const t: u32 = if (pf.state(s.f).mode == .replay) ced.tag else ced.tag_fast;
+        // TF_DSV41_DECODED_ROWS: its entries hold reply rows as decoded, so they never resume the knob's other modes
+        return t | @as(u32, @backingInt(pf.state(s.f).decoded_rows)) << ced.tag_decoded_shift;
     }
 
     /// The slot empty, its pages back (a session entry may hold them), its reservation gone.

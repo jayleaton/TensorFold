@@ -227,6 +227,7 @@ pub const Info = struct {
     startup: []const u8 = "",
     /// A prompt-only request (max_tokens 0) keeps its end state: the server prefills each reply for the next turn.
     warm_turns: bool = false,
+    open_replies: bool = false, // a prompt that ends inside a reply (opener, no end token) counts those rows as a span
     /// The engine decodes plain whatever a request asks: no drafter loaded, or this chip is faster plain.
     plain_only: bool = false,
     /// The immutable retained-prefix plan applied at startup, not a process memory limit or current cache occupancy.

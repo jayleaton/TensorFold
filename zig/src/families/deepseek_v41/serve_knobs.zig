@@ -291,6 +291,17 @@ pub fn promptTail(get: Get) !PromptTail {
     };
 }
 
+/// TF_DSV41_DECODED_ROWS: a prompt's reply rows as decode windows (decoded_rows.zig), so they hold decoding's bits.
+pub const DecodedRows = enum(u2) { off = 0, replies = 1, after = 2 };
+
+/// Unset / 0 off; 1 each reply span; 2 from the first reply span to the prompt's end (inserted rows too); else refused.
+pub fn decodedRows(get: Get) !DecodedRows {
+    const raw = std.mem.trim(u8, get("TF_DSV41_DECODED_ROWS") orelse "0", " ");
+    if (raw.len == 1 and raw[0] >= '0' and raw[0] <= '2') return @fromBackingInt(@intCast(raw[0] - '0'));
+    if (!quiet) std.log.warn("TF_DSV41_DECODED_ROWS={s}: 0, 1 (reply spans) or 2 (from the first reply on)", .{raw});
+    return error.BadKnob;
+}
+
 /// A prompt of `n` rows in `tail`'s shape: the rows through the prefill, then the rows of one decode window.
 pub fn promptSplit(n: usize, tail: PromptTail) struct { prefill: usize, window: usize } {
     return switch (tail) {

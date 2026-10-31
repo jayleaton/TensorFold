@@ -222,6 +222,7 @@ pub const Lanes = struct {
         x.pass.reset(slot);
         x.policy.depth.reset(slot);
         x.target.admit(slot, s.max_new);
+        try x.target.setSpans(slot, s.decode_spans, s.prompt());
         const b = try x.target.begin(slot, s.prompt());
         try x.streams.put(x.gpa, s, st);
         x.by_slot[slot] = st;

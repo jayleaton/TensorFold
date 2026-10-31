@@ -96,7 +96,11 @@ pub fn replySpans(srv: *Server, cx: *Cx, prompt: []const u32) errors.Refused![]c
             start = at + o.len;
         };
         const first = start orelse break;
-        const end = std.mem.indexOfAnyPos(u32, prompt, first, srv.eos) orelse break;
+        const end = std.mem.indexOfAnyPos(u32, prompt, first, srv.eos) orelse {
+            // a reply the prompt continues (Info.open_replies): its rows so far, as decoding wrote them
+            if (srv.info.open_replies and first < prompt.len) try spans.append(cx.a, .{ @intCast(first), @intCast(prompt.len) });
+            break;
+        };
         try spans.append(cx.a, .{ @intCast(first), @intCast(end + 1) });
         i = end + 1;
     }

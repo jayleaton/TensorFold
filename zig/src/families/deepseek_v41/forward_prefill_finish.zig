@@ -191,7 +191,13 @@ pub fn finish(f: *Forward) !void {
     if (st.mode != .replay) return;
     if (f.slot.pending != null) return error.BadWindow;
     const end = f.slot.pos;
-    const t = ced.tailOf(end);
+    var t = ced.tailOf(end);
+    if (st.decoded_rows != .off) {
+        // decode windows ran the rows after the stash (none to replay) or before its first row (they stay as decoded)
+        if (f.slot.ced.hi != end) return;
+        const lo = f.slot.ced.lo();
+        if (lo > t.r0) t = .{ .r0 = lo, .m = @intCast(end - lo) };
+    }
     if (t.m == 0) return;
     if (!f.slot.ced.covers(t.r0, end)) {
         log.err("CED replay of [{d}, {d}), but the stash holds [{d}, {d})", .{ t.r0, end, f.slot.ced.lo(), f.slot.ced.hi });

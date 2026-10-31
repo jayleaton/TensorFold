@@ -15,6 +15,8 @@ pub const session_min: u64 = 64;
 pub const tag_fast: u32 = 1 << 8;
 /// with the CED field (replay mode index << 4): replay entries never resume full ones
 pub const tag: u32 = tag_fast | 1 << 4;
+/// TF_DSV41_DECODED_ROWS's mode in the session tag (0 off: the tags above, unchanged)
+pub const tag_decoded_shift: u5 = 9;
 
 pub const Error = error{ NoDecoder, EngramInDecoder, StashGap };
 

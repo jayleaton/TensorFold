@@ -17,7 +17,7 @@ pub const TimedTarget = struct {
         return .{ .ptr = t, .vtable = &vtable };
     }
 
-    const vtable: iface.Target.VTable = .{ .prompt_mask = promptMask, .prefill = prefill, .window = window, .keep = keep, .taps = taps, .release = release, .admit = admit, .begin = begin, .piece = piece, .finish = finish, .tail = tail, .pieces = pieces, .replays = replays, .warm = warm };
+    const vtable: iface.Target.VTable = .{ .prompt_mask = promptMask, .prefill = prefill, .window = window, .keep = keep, .taps = taps, .release = release, .admit = admit, .begin = begin, .piece = piece, .finish = finish, .tail = tail, .pieces = pieces, .replays = replays, .warm = warm, .spans = spans };
 
     fn promptMask(p: *anyopaque, slot: u32, mask: []const u32) anyerror!void {
         return self(p).inner.promptMask(slot, mask);
@@ -32,6 +32,10 @@ pub const TimedTarget = struct {
         const tm = ph.start(t.p, .prefill);
         defer tm.stop();
         return t.inner.begin(slot, ids);
+    }
+
+    fn spans(p: *anyopaque, slot: u32, sp: []const [2]u32, ids: []const u32) anyerror!void {
+        return self(p).inner.setSpans(slot, sp, ids);
     }
 
     fn replays(p: *anyopaque, list: []const iface.Target.Final) anyerror!void {

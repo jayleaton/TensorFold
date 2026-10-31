@@ -55,6 +55,8 @@ pub const State = struct {
     next: std.ArrayList(u32) = .empty,
     /// TF_DSV41_PREFILL: `.replay` = CED (segments are encoder passes, `finish` runs the decoder); `.full`: every layer
     mode: serve_knobs.PrefillMode = .full,
+    /// TF_DSV41_DECODED_ROWS: decode windows may precede the replay (it starts at the stash's first row, or none runs)
+    decoded_rows: serve_knobs.DecodedRows = .off,
     /// the decoder replay's ids (the glue reads them through Forward.ids while it runs)
     tail_ids: [ced.keep]u32 = undefined,
     /// what "w.taps" holds after the prompt: positions [taps_at, taps_at + taps_rows) at rows 0 ..: the DSpark hand-off
