@@ -66,6 +66,7 @@ pub fn collectWithLimit(optin: u32) !void {
     @import("catalog_geometry.zig").rot(try dk.dense.Rot.resolve(m[6]));
     @import("catalog_geometry.zig").lin2(try dk.dense.Lin2.resolve(m[30], .{ .lanes = true, .linear = true, .cluster = true }));
     @import("catalog_geometry.zig").lin2(try dk.dense.Lin2.resolve(m[30], .{ .lanes = true, .linear = true, .cluster = true, .pf = false }));
+    @import("catalog_geometry.zig").attnRot(try dk.attn_rot.Rot.resolve(m[7], 262144));
     @import("catalog_geometry.zig").operators(try dk.ops.Functions.resolve(m[7], m[8], m[9], m[10], m[11], .{ m[12], m[13], m[14], m[15] }, m[16], m[17], m[18], m[20], m[21], m[22], m[23], m[25], m[29], 262144));
     const kv = try dk.kv_glue.Functions.resolve(m[27]);
     entries[@intFromPtr(kv.norm_store.handle.?) - 1].threads = 128;

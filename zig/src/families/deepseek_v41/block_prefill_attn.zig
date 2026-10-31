@@ -102,6 +102,7 @@ pub fn compress(s: *Seg, L: u32, projection: Arg) !void {
         .{ .name = "c_stride", .arg = .{ .i = 0 } },                                      .{ .name = "SPLIT", .arg = .{ .b = false } },
     });
     try s.kvStore(lat, try pool(e, L), ratio);
+    try e.mirrorStore(lat, L, ratio); // TF_DSV41_KV_MIRROR: the prompt's rows into the mirror too (decode reads them)
     const kp = try e.buf("L.ix_k", .{}, .bf16, &.{ n, ID });
     try s.proj(try e.fmt("L{d}.attn.ix_wk", .{L}), .strips, lat, hd, ID, kp);
     const kpg = try e.paging(ratio, false);

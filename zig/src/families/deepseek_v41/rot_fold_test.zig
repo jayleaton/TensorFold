@@ -18,7 +18,7 @@ const Fake = struct {
     }
 };
 
-test "TF_DSV41_ROT_FOLD: unset and 0 off, 1 bit 0, the reserved bits and anything else refused" {
+test "TF_DSV41_ROT_FOLD: unset and 0 off, 1-3 bits 0-1, the reserved bit 2 and anything else refused" {
     defer Fake.pairs = &.{};
     Fake.pairs = &.{};
     try testing.expectEqual(@as(u3, 0), try pk.rotFold(&Fake.get));
@@ -26,8 +26,12 @@ test "TF_DSV41_ROT_FOLD: unset and 0 off, 1 bit 0, the reserved bits and anythin
     try testing.expectEqual(@as(u3, 0), try pk.rotFold(&Fake.get));
     Fake.pairs = &.{.{ "TF_DSV41_ROT_FOLD", " 1 " }};
     try testing.expectEqual(@as(u3, 1), try pk.rotFold(&Fake.get));
-    // 3b (bit 1) and 3c (bit 2) are reserved: a mask naming them is refused until they are built
-    for ([_][]const u8{ "2", "3", "4", "5", "7", "8", "-1", "on", "0x1", "1,2" }) |v| {
+    Fake.pairs = &.{.{ "TF_DSV41_ROT_FOLD", "2" }};
+    try testing.expectEqual(@as(u3, 2), try pk.rotFold(&Fake.get));
+    Fake.pairs = &.{.{ "TF_DSV41_ROT_FOLD", "3" }};
+    try testing.expectEqual(@as(u3, 3), try pk.rotFold(&Fake.get));
+    // 3c (bit 2) is reserved: a mask naming it is refused until it is built
+    for ([_][]const u8{ "4", "5", "6", "7", "8", "-1", "on", "0x1", "1,2" }) |v| {
         Fake.pairs = &.{.{ "TF_DSV41_ROT_FOLD", v }};
         try testing.expectError(error.BadKnob, pk.rotFold(&Fake.get));
     }
@@ -58,14 +62,14 @@ fn argKey(a: std.mem.Allocator, out: *std.ArrayList(u8), x: calls.Arg) !void {
     }
 }
 
-fn oneKey(a: std.mem.Allocator, x: calls.Arg) ![]const u8 {
+pub fn oneKey(a: std.mem.Allocator, x: calls.Arg) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     try argKey(a, &out, x);
     return out.items;
 }
 
 /// A call as compared here: name, grid, scope, streams and marks, and its first `upto` arguments.
-fn key(a: std.mem.Allocator, c: calls.Call, upto: usize) ![]const u8 {
+pub fn key(a: std.mem.Allocator, c: calls.Call, upto: usize) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     try out.print(a, "{s} {any} {t} side={any} fork={any} join={any} mark={d} wait={d} dside={any} djoin={any}", .{ c.name, c.grid, c.begin, c.side, c.fork, c.join, c.mark, c.wait, c.defer_side, c.defer_join });
     for (c.args[0..@min(upto, c.args.len)]) |x| {
@@ -75,7 +79,7 @@ fn key(a: std.mem.Allocator, c: calls.Call, upto: usize) ![]const u8 {
     return out.items;
 }
 
-fn firstRole(x: calls.Arg) ?[]const u8 {
+pub fn firstRole(x: calls.Arg) ?[]const u8 {
     return switch (x) {
         .t => |t| switch (t.role) {
             .buf => |r| r,
@@ -94,7 +98,7 @@ fn woBRotIn(c: calls.Call) bool {
 }
 
 /// A dense3 linear writing `role` (its first output).
-fn writes(c: calls.Call, role: []const u8) bool {
+pub fn writes(c: calls.Call, role: []const u8) bool {
     if (!std.mem.eql(u8, c.name, "tf_dsv41_dense3_v1.linear")) return false;
     const r = firstRole(c.args[3].arg) orelse return false;
     return std.mem.eql(u8, r, role);
@@ -225,29 +229,29 @@ test "TF_DSV41_ROT_FOLD: woFold takes only whole 128-column groups; the knob's o
 
 // -- the epilogue's rotation against rot_in's, on the host --------------------------------------------------------
 
-const had: f32 = 0.08838834764831845; // exl3_decode.cuh HAD_SCALE
+pub const had: f32 = 0.08838834764831845; // exl3_decode.cuh HAD_SCALE
 
 /// __float2bfloat16_rn (cvt.rn.bf16.f32): nearest even, a NaN as the canonical 0x7fff.
-fn bf16Bits(x: f32) u16 {
+pub fn bf16Bits(x: f32) u16 {
     if (std.math.isNan(x)) return 0x7fff;
     const u: u32 = @bitCast(x);
     return @truncate((u +% 0x7fff +% ((u >> 16) & 1)) >> 16);
 }
 
-fn widenBf16(b: u16) f32 {
+pub fn widenBf16(b: u16) f32 {
     return @bitCast(@as(u32, b) << 16);
 }
 
-fn widenF16(b: u16) f32 {
+pub fn widenF16(b: u16) f32 {
     return @as(f16, @bitCast(b));
 }
 
-fn f16Bits(x: f32) u16 {
+pub fn f16Bits(x: f32) u16 {
     return @bitCast(@as(f16, @floatCast(x)));
 }
 
 /// exl3_decode.cuh fwht128: each lane's 4-point transform, then the xor-shuffle butterflies (lane bit m: o - v).
-fn fwht128(v: *[32][4]f32) void {
+pub fn fwht128(v: *[32][4]f32) void {
     for (v) |*l| {
         const a = l[0] + l[1];
         const b = l[0] - l[1];
@@ -325,7 +329,7 @@ fn foldAll(a: std.mem.Allocator, segs: []const dense.Seg, y: []const f32, suh: [
 }
 
 /// y's edge classes: signed zeros, infinities, NaNs, f32's largest, subnormals, bf16 ties, fp16 overflow.
-const y_edges = [_]u32{ 0x00000000, 0x80000000, 0x7f800000, 0xff800000, 0x7fc00000, 0xffc00123, 0x7f7fffff, 0xff7fffff, 0x00000001, 0x807fffff, 0x3f808000, 0x3f818000, 0x3f80ffff, 0x477fe000, 0x47800000, 0xc7801000 };
+pub const y_edges = [_]u32{ 0x00000000, 0x80000000, 0x7f800000, 0xff800000, 0x7fc00000, 0xffc00123, 0x7f7fffff, 0xff7fffff, 0x00000001, 0x807fffff, 0x3f808000, 0x3f818000, 0x3f80ffff, 0x477fe000, 0x47800000, 0xc7801000 };
 const suh_edges = [_]u16{ 0x3c00, 0xbc00, 0x0000, 0x8000, 0x7bff, 0xfbff, 0x0001, 0x8001, 0x3555 };
 
 fn randomY(r: std.Random, y: []f32) void {
@@ -337,7 +341,7 @@ fn randomY(r: std.Random, y: []f32) void {
     };
 }
 
-fn randomSuh(r: std.Random, suh: []u16) void {
+pub fn randomSuh(r: std.Random, suh: []u16) void {
     for (suh) |*s| s.* = switch (r.uintLessThan(u8, 6)) {
         0 => suh_edges[r.uintLessThan(usize, suh_edges.len)],
         1, 2 => 0x3c00,

@@ -4,6 +4,7 @@ pub const sessions = @import("sessions");
 pub const layout = @import("layout.zig");
 pub const Layout = layout.Layout;
 pub const split = @import("split.zig");
+pub const mirror = @import("mirror.zig");
 pub const budget = @import("budget.zig");
 pub const device = @import("device.zig");
 pub const DevicePool = device.DevicePool;
@@ -15,6 +16,7 @@ test {
     _ = @import("resume_host_test.zig");
     _ = layout;
     _ = split;
+    _ = mirror;
     _ = budget;
     _ = device;
     _ = @import("split_test.zig");

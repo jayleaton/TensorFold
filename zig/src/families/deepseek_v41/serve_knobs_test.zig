@@ -19,6 +19,7 @@ test {
     _ = @import("streamrb_test.zig");
     _ = @import("idx_iota_test.zig"); // TF_DSV41_IDX_IOTA on the decode emitter and the top-k twin
     _ = @import("rot_fold_test.zig"); // TF_DSV41_ROT_FOLD on the decode emitter and the rotation twin
+    _ = @import("rot_fold_attn_test.zig"); // TF_DSV41_ROT_FOLD bit 1: the merge fold and its rows' twin
 }
 
 const Fake = struct {

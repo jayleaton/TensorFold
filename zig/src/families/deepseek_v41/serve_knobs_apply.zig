@@ -102,6 +102,7 @@ pub fn apply(f: *Forward, a: std.mem.Allocator, io: std.Io, rank: u32) !void {
     log.info("KV norm/store fusion: {s}", .{if (f.opts.kv_norm_store) "on" else "off"});
     log.info("router grouping/rotation fusion: {s}", .{if (f.opts.router_group_rot) "on" else "off"});
     if (f.opts.rot_fold & 1 != 0) log.info("rot fold: wo_a's epilogue writes wo_b's rotated rows (no wo_b rot_in launch)", .{});
+    if (f.opts.rot_fold & 2 != 0) log.info("rot fold: {s}", .{if (f.opts.r1) "R1's attention merge writes wo_a's rotated rows (no wo_a rot_in launch)" else "bit 1 folds R1's split attention only; without R1 wo_a keeps its rot_in launch"});
     if (f.opts.index_bound) log.info("index bound: decode index scores stop at each row's own keys (_scores_b)", .{});
     if (f.opts.idx_iota) log.info("index iota: an index layer whose top-k takes all its entries skips its query and scores", .{});
     if (f.opts.x3ld_epi) log.info("x3ld epilogues: gateup_epilogue / down_combine fused into the decode expert streamer (TF_DSV41_X3LD_EPI)", .{});

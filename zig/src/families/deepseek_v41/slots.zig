@@ -77,6 +77,7 @@ pub const SlotSet = struct {
         const tb: u64 = 4 * @as(u64, k.dev.pts);
         try ss.roles.put(ss.gpa, "s.kv.pt", .{ .base = k.dev.table.ptr, .bytes = tb });
         try ss.roles.put(ss.gpa, "s.kv.ct", .{ .base = k.dev.local.ptr, .bytes = tb });
+        if (k.mirror) |m| try ss.roles.put(ss.gpa, "s.kv.mt", .{ .base = m.table.ptr, .bytes = tb });
     }
 
     /// After Runner.bind: `roles` (planned ones) become per-slot by swapping, each slot's copy in its own buffer.

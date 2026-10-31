@@ -9,6 +9,8 @@ pub const dense = @import("cuda").qlinear.block.dense;
 pub const kv_glue = @import("kernels_kv_glue.zig");
 pub const replay = @import("kernels_replay.zig");
 pub const ops = @import("kernels_ops.zig");
+/// TF_DSV41_ROT_FOLD bit 1: the R1 attention whose merge writes wo_a's rot_in rows (attn_rot.cuh)
+pub const attn_rot = @import("kernels_attn_rot.zig");
 pub const vision = @import("vision_kernels.zig");
 /// sampling.cu (its own module, loaded by the keyed sampler)
 pub const sampling = @import("sampling_kernels.zig");
@@ -102,8 +104,10 @@ pub const Kernels = struct {
             lm.cluster = try dense.lin2Cluster(env("TF_DSV41_LIN2_CLUSTER"));
             break :blk lm;
         });
-        // TF_DSV41_ROT_FOLD bit 0: dense3's rotated-output instances, resolved only then (an older image still loads)
-        if ((try dense.rotFoldMask(env("TF_DSV41_ROT_FOLD"))) & 1 != 0) k.dense.rot = try dense.Rot.resolve(k.mods[6]);
+        // TF_DSV41_ROT_FOLD: each bit's instances resolved only when set (an older image still loads)
+        const fold = try dense.rotFoldMask(env("TF_DSV41_ROT_FOLD"));
+        if (fold & 1 != 0) k.dense.rot = try dense.Rot.resolve(k.mods[6]); // bit 0: dense3's rotated-output linears
+        if (fold & 2 != 0) k.ops.attn_rot = try attn_rot.Rot.resolve(k.mods[7], optin); // bit 1: the folded merge
         return k;
     }
 
@@ -157,6 +161,7 @@ test {
     std.testing.refAllDecls(ops);
     std.testing.refAllDecls(ops.Ops);
     std.testing.refAllDecls(ops.Functions);
+    std.testing.refAllDecls(attn_rot);
 }
 
 test {
@@ -166,6 +171,7 @@ test {
     _ = exl3;
     _ = kv_glue;
     _ = @import("kernels_shapes.zig");
+    _ = attn_rot;
 }
 
 test "DeepSeek refuses pre-cluster GPUs before loading any image" {

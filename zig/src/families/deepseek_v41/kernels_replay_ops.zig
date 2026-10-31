@@ -1,6 +1,7 @@
 //! Replays the other kernels' extension calls: attention, top-k, mHC, router, prefill dense GEMM and L2 prefetch.
 
 const ops = @import("kernels_ops.zig");
+const attn_rot = @import("kernels_attn_rot.zig");
 const replay = @import("kernels_replay.zig");
 
 const Call = replay.Call;
@@ -23,7 +24,7 @@ fn stride0(t: Tensor) i64 {
 // tf_dsv41_attn_cuda_v1 (csa2/attn_cuda.cpp): attn and topk as dsv41_attn_run_cuda / dsv41_topk_run_cuda fill Args
 pub fn attnExt(o: ops.Ops, func: []const u8, args: []const Arg, kwargs: []const Kw) !bool {
     if (is(func, "attn")) {
-        const c: Call = .{ .args = args, .kwargs = kwargs, .names = &.{ "q", "cv", "csc", "tok", "cnt", "sv", "ssc", "lo", "hi", "pos", "sl", "pt", "sink", "cs", "po", "pm", "pl", "out", "ticket", "ring", "psh", "pts", "kw", "split", "qrope" } };
+        const c: Call = .{ .args = args, .kwargs = kwargs, .names = &.{ "q", "cv", "csc", "tok", "cnt", "sv", "ssc", "lo", "hi", "pos", "sl", "pt", "sink", "cs", "po", "pm", "pl", "out", "ticket", "ring", "psh", "pts", "kw", "split", "qrope", "rsuh", "rxh", "rxh_off" } };
         const q = try c.tensor(0);
         const cv = try c.tensor(1);
         const csc = try c.tensor(2);
@@ -76,11 +77,35 @@ pub fn attnExt(o: ops.Ops, func: []const u8, args: []const Arg, kwargs: []const 
             else => return error.WrongArgument,
         } else 0;
         b.qrope = @intFromBool(qrope != 0 and split > 0);
+        // TF_DSV41_ROT_FOLD bit 1: the merge also writes wo_a's rot_in rows, group s at its offset of rxh
+        if ((try c.opt(25)) != null) {
+            const ro = try rotIn(c, b);
+            try attn_rot.launch(o, b, ro, try c.u(22), numel(sl) > 0, numel(hi) > 0, split);
+            return true;
+        }
         try o.attention(b, try c.u(22), numel(sl) > 0, numel(hi) > 0, split);
         return true;
     }
     if (is(func, "topk")) return topkCall(o, args, kwargs, false);
     return false;
+}
+
+/// The attention call's rsuh (each wo_a group's suh), rxh (fp16) and rxh_off: rot_in's arguments for the same rows.
+fn rotIn(c: Call, a: ops.attn.Args) !attn_rot.RotIn {
+    const suh = try c.list(25);
+    const offs = try c.list(27);
+    const xh = try c.tensor(26);
+    if (suh.len < 1 or suh.len > attn_rot.max_groups or offs.len != suh.len) return error.WrongArgument;
+    var sp: [attn_rot.max_groups]u64 = undefined;
+    var op: [attn_rot.max_groups]usize = undefined;
+    const gk: i64 = if (suh[0] == .tensor) numel(suh[0].tensor) else return error.WrongArgument;
+    for (suh, offs, 0..) |sa, oa, i| {
+        if (sa != .tensor or oa != .int or oa.int < 0 or numel(sa.tensor) != gk) return error.WrongArgument;
+        if (oa.int + @as(i64, a.R) * gk > numel(xh)) return error.WrongArgument; // group i's R rows inside rxh
+        sp[i] = sa.tensor.ptr;
+        op[i] = @intCast(oa.int);
+    }
+    return attn_rot.rotIn(@intCast(a.H), sp[0..suh.len], @intCast(gk), xh.ptr, op[0..suh.len]) catch return error.Unsupported;
 }
 
 /// tf_dsv41_attn_cuda_v1.topk, or with `bounded` tf_dsv41_topk_b_v1.topk (TF_DSV41_INDEX_BOUND, same arguments)

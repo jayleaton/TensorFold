@@ -103,6 +103,9 @@ pub fn rot(f: dk.dense.Rot) void {
         note(fun, wk * 32, wk * 4096, 1);
     };
 }
+pub fn attnRot(f: dk.attn_rot.Rot) void {
+    for (f.split, 0..) |row, pi| for (row) |fun| note(fun, dk.ops.attn.NT, dk.ops.attn.splitSmem(if (pi == 0) 1 else 4), if (pi == 0) 1 else 4);
+}
 pub fn lin2(f: dk.dense.Lin2) void {
     for (f.lanes) |row| for (row, 0..) |fun, i| {
         const wk: u32 = if (i == 0) 4 else 8;

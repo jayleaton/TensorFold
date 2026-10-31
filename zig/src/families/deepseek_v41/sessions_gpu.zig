@@ -499,6 +499,7 @@ pub const Sessions = struct {
             return false;
         }
         try s.kx.dev.syncTables();
+        try s.kx.mirrorFill(); // TF_DSV41_KV_MIRROR: the restored rows were stored, not computed here
         return true;
     }
 
