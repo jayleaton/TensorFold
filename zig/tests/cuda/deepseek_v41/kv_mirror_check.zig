@@ -129,11 +129,12 @@ fn runCase(gpu: Gpu, o: dsv41.ops.Ops, stream: cuda.Stream, rnd: std.Random, c: 
     }
     const qh = try a.alloc(u16, R * H * D);
     for (qh) |*x| x.* = bf16(rnd.float(f32) - 0.5);
-    const swa = try a.alloc(u8, ring * rb);
-    for (0..ring) |i| kvRow(rnd, swa[i * rb ..][0..rb]);
-    const sv = try a.alloc(u8, ring * 576);
-    const ssc = try a.alloc(u8, ring * 8);
-    for (0..ring) |i| {
+    const nring: usize = if (c.stacked) @as(usize, c.slots) * ring else ring; // row mode reads (p % ring) + slot * ring
+    const swa = try a.alloc(u8, nring * rb);
+    for (0..nring) |i| kvRow(rnd, swa[i * rb ..][0..rb]);
+    const sv = try a.alloc(u8, nring * 576);
+    const ssc = try a.alloc(u8, nring * 8);
+    for (0..nring) |i| {
         @memcpy(sv[i * 576 ..][0..576], swa[i * rb ..][0..576]);
         @memcpy(ssc[i * 8 ..][0..8], swa[i * rb + 576 ..][0..8]);
     }
@@ -254,6 +255,9 @@ fn runCase(gpu: Gpu, o: dsv41.ops.Ops, stream: cuda.Stream, rnd: std.Random, c: 
     const got_wrong = try check.download(gpu, outs[2]);
     defer gpu.gpa.free(got_wrong);
     try check.expect(std.mem.indexOfNone(u8, got_split, &.{0}) != null, "kv-mirror: an all-zero output", .{});
+    for (std.mem.bytesAsSlice(u16, got_split)) |x| {
+        try check.expect(x & 0x7f80 != 0x7f80, "kv-mirror: a NaN or Inf in the split output", .{});
+    }
     try check.sameBytes("kv-mirror attention: mirror vs split KV's exchanged rows", got_mir, got_split);
     try check.expect(!std.mem.eql(u8, got_wrong, got_split), "kv-mirror: the planted wrong table gave the same bytes", .{});
 
