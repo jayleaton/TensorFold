@@ -1,6 +1,7 @@
 const std = @import("std");
 const dk = @import("dsv41_kernels");
 test {
+    _ = @import("engram_preflight_test.zig");
     _ = @import("load_test.zig");
     _ = @import("load_chunk_test.zig");
     _ = @import("boot_plan_test.zig");

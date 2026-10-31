@@ -46,6 +46,13 @@ pub const Session = struct {
         const cfg = requested.resolved();
         var b = try Bootstrap.open(cfg);
         defer b.close();
+        try s.openBootstrapped(d, cfg, kernel_image, &b);
+    }
+
+    /// Uses the caller-owned CPU bootstrap; unclaimed sockets remain the caller's responsibility.
+    pub fn openBootstrapped(s: *Session, d: *const cuda.Driver, requested: Config, kernel_image: []const u8, b: *Bootstrap) !void {
+        const cfg = requested.resolved();
+        if (b.rank != cfg.rank or b.world != cfg.world) return error.Mismatch;
         try b.agree(&cfg.digest(), "settings (TF_TP_WORLD, TF_COMM_BACKEND, TF_TP_MAILBOX_MAX_KB, TF_TP_ROCE_CHUNKED_KB, TF_TP_FAILFAST, TF_TP_ROCE_WIRE / _FALLBACK, TF_GRAPH_CACHE, family settings)");
         var diag = cuda.p2p_report.begin(cfg.rank, cfg.world);
         defer diag.end();
@@ -64,15 +71,15 @@ pub const Session = struct {
         errdefer if (s.roce_multi) |rr| rr.deinit();
         switch (cfg.backend) {
             .nccl => {},
-            .mailbox => if (try mailboxPossible(&b, kernel_image)) {
-                s.mail = try mailbox.Mailbox.init(d, &b, kernel_image, cfg.mailbox_max_bytes, cfg.mailbox_timeout_ns);
+            .mailbox => if (try mailboxPossible(b, kernel_image)) {
+                s.mail = try mailbox.Mailbox.init(d, b, kernel_image, cfg.mailbox_max_bytes, cfg.mailbox_timeout_ns);
                 s.route = .{ .small = .{ .mailbox = &s.mail.? }, .nccl = &s.nccl, .max_bytes = cfg.mailbox_max_bytes };
             } else if (cfg.rank == 0) {
                 log.warn("[tensorfold] tp: TF_COMM_BACKEND=mailbox needs two ranks on one host and the kernel; every rank uses NCCL", .{});
             },
-            .roce => if (cfg.world == 2) try s.openRoce(d, &b, kernel_image) else try @import("roce_multi_session.zig").open(s, d, &b, kernel_image),
+            .roce => if (cfg.world == 2) try s.openRoce(d, b, kernel_image) else try @import("roce_multi_session.zig").open(s, d, b, kernel_image),
         }
-        try s.agreeVar(&b);
+        try s.agreeVar(b);
         cuda.p2p_report.afterInit(&diag, .{ .lib = &s.lib, .comm = s.nccl.comm, .d = d }); // after the probes' NCCL calls
         s.plan = planlink.PlanLink.init(cfg.rank, cfg.world, b.releasePlan());
         errdefer s.plan.close();

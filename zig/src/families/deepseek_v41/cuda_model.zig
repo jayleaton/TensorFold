@@ -174,6 +174,8 @@ pub const Model = struct {
         const cwd = std.Io.Dir.cwd();
         m.tcfg = try tp.Config.fromEnv();
         m.tcfg.family = @import("idx_split.zig").agreement(&@import("serve_knobs.zig").env); // ranks refuse a mixed split
+        var preflight = try @import("engram_preflight.zig").fromEnv(io, m.tcfg);
+        defer if (preflight) |*b| b.close();
         m.driver = try cuda.Driver.open();
         errdefer if (!keep_owner) m.driver.close();
         try @import("dev_arena.zig").applySchedule(&m.driver, @intCast(m.tcfg.device)); // TF_CUDA_SCHED
@@ -186,7 +188,10 @@ pub const Model = struct {
             try cwd.readFileAllocOptions(io, std.mem.span(p), a, .limited(1 << 26), .@"16", null)
         else
             &.{};
-        try m.session.open(&m.driver, m.tcfg, image);
+        if (preflight) |*b|
+            try m.session.openBootstrapped(&m.driver, m.tcfg, image, b)
+        else
+            try m.session.open(&m.driver, m.tcfg, image);
         m.supervisor = .{ .io = io, .ctx = m, .healthy = @import("model_health.zig").context, .fail = @import("model_health.zig").failed, .progress = &m.progress, .stall_ns = stall_ns };
         m.supervisor.?.start() catch |err| {
             m.session.bootFailed(err);
