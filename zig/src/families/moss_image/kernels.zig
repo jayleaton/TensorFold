@@ -171,3 +171,76 @@ test "every MOSS-Image pipeline compiles and loads on this GPU" {
     var k = try Kernels.load(std.testing.allocator, device);
     k.deinit();
 }
+
+test "M5 repro: mi_attention (tfp::attention_nax, bf16) output gain against float64" {
+    const pool = mtl.objc.Pool.push();
+    defer pool.pop();
+    const device = mtl.Device.init() catch return error.SkipZigTest;
+    defer device.deinit();
+    if (!device.tensorUnits()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var k = try Kernels.load(a, device);
+    defer k.deinit();
+    const L: usize = 4096;
+    const H: usize = 4;
+    const d: usize = 128;
+    const n = H * L * d;
+    const opts = mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked;
+    var bufs: [4]mtl.Buffer = undefined;
+    for (&bufs) |*b| b.* = try device.buffer(n * 2, opts);
+    const q: [*]u16 = @ptrCast(@alignCast(bufs[0].contents()));
+    const kk: [*]u16 = @ptrCast(@alignCast(bufs[1].contents()));
+    const v: [*]u16 = @ptrCast(@alignCast(bufs[2].contents()));
+    const o: [*]u16 = @ptrCast(@alignCast(bufs[3].contents()));
+    const bf = struct {
+        fn to(x: f32) u16 {
+            const u: u32 = @bitCast(x);
+            return @intCast((u +% 0x7FFF +% ((u >> 16) & 1)) >> 16);
+        }
+        fn from(x: u16) f64 {
+            return @as(f32, @bitCast(@as(u32, x) << 16));
+        }
+    };
+    var prng = std.Random.DefaultPrng.init(1);
+    const r = prng.random();
+    for (0..n) |i| {
+        q[i] = bf.to(r.floatNorm(f32));
+        kk[i] = bf.to(r.floatNorm(f32));
+        v[i] = bf.to(0.5 + r.float(f32));
+    }
+    const queue = try device.queue();
+    const cb = queue.commandBuffer();
+    const e = cb.compute(.serial);
+    k.attention(e, .{ .buf = bufs[0] }, .{ .buf = bufs[1] }, .{ .buf = bufs[2] }, .{ .buf = bufs[3] }, L, H);
+    e.end();
+    cb.commit();
+    cb.wait();
+    var num: f64 = 0;
+    var den: f64 = 0;
+    const s = try a.alloc(f64, L);
+    defer a.free(s);
+    const scale = 1.0 / @sqrt(@as(f64, d));
+    for (0..2) |h| for (0..64) |i| {
+        var m: f64 = -1e300;
+        for (0..L) |j| {
+            var dot: f64 = 0;
+            for (0..d) |c| dot += bf.from(q[(h * L + i) * d + c]) * bf.from(kk[(h * L + j) * d + c]);
+            s[j] = dot * @as(f32, @floatCast(scale));
+            m = @max(m, s[j]);
+        }
+        var l: f64 = 0;
+        var out: [128]f64 = @splat(0);
+        for (0..L) |j| {
+            const pj = @exp(s[j] - m);
+            l += pj;
+            for (0..d) |c| out[c] += pj * bf.from(v[(h * L + j) * d + c]);
+        }
+        for (0..d) |c| {
+            const want = out[c] / l;
+            const got = bf.from(o[i * H * d + h * d + c]);
+            num += got * want;
+            den += want * want;
+        }
+    };
+    std.debug.print("M5 repro: mi_attention L={d}, head 128, V in [0.5, 1.5): output gain - 1 against float64 = {e:.3} (bf16 half-ulp at 1: {e:.3})\n", .{ L, num / den - 1, std.math.pow(f64, 2, -8) });
+}

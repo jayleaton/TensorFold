@@ -345,3 +345,66 @@ test "every tower pipeline compiles and loads on this GPU" {
     var k = try Kernels.load(std.testing.allocator, device);
     k.deinit();
 }
+
+fn reproRound(x: f32, mode: u8) f64 {
+    return switch (mode) {
+        0 => x,
+        1 => @as(f16, @floatCast(x)),
+        2 => @as(f32, @bitCast(@as(u32, @bitCast(x)) & 0xFFFFE000)), // 10 mantissa bits, toward zero
+        3 => @as(f32, @bitCast((@as(u32, @bitCast(x)) +% 0x7FFF +% ((@as(u32, @bitCast(x)) >> 16) & 1)) & 0xFFFF0000)), // bf16
+        else => @as(f32, @bitCast((@as(u32, @bitCast(x)) +% 0xFFF +% ((@as(u32, @bitCast(x)) >> 13) & 1)) & 0xFFFFE000)), // tf32
+    };
+}
+
+test "M5 repro: qwv_gemm_f32_nt against float64" {
+    const pool = mtl.objc.Pool.push();
+    defer pool.pop();
+    const device = mtl.Device.init() catch return error.SkipZigTest;
+    defer device.deinit();
+    if (!device.tensorUnits()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var k = try Kernels.load(a, device);
+    defer k.release(1000);
+    const M: usize = 256;
+    const N: usize = 256;
+    const K: usize = 1024;
+    const opts = mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked;
+    const ba = try device.buffer(M * K * 4, opts);
+    const bb = try device.buffer(N * K * 4, opts);
+    const bd = try device.buffer(M * N * 4, opts);
+    const A: [*]f32 = @ptrCast(@alignCast(ba.contents()));
+    const B: [*]f32 = @ptrCast(@alignCast(bb.contents()));
+    const D: [*]f32 = @ptrCast(@alignCast(bd.contents()));
+    var prng = std.Random.DefaultPrng.init(3);
+    for (0..M * K) |i| A[i] = prng.random().floatNorm(f32);
+    for (0..N * K) |i| B[i] = prng.random().floatNorm(f32);
+    const queue = try device.queue();
+    const cb = queue.commandBuffer();
+    const e = cb.compute(.serial);
+    e.setPipeline(k.gemm[1][1][1]);
+    e.setBuffer(ba, 0, 0);
+    e.setBuffer(bb, 0, 1);
+    var p: [16]i32 = @splat(0);
+    const tn = (N + 127) / 128;
+    const tm = (M + 63) / 64;
+    const vals = [_]usize{ M, N, K, K, K, N, tn, tm, 2, K / 256, 0, 0, 0, 0, 0 };
+    for (vals, 0..) |x, i| p[i] = @intCast(x);
+    e.setBytes(std.mem.asBytes(&p), 2);
+    e.setBuffer(bd, 0, 3);
+    e.dispatchThreads(mtl.Size.of(tn * 4 * 32, (tm + 3) / 4 * 4, 2), mtl.Size.of(32, 4, 2));
+    e.end();
+    cb.commit();
+    cb.wait();
+    const labels = [_][]const u8{ "fp32 inputs", "inputs rounded to fp16", "inputs truncated to 10 mantissa bits (TF32 width, toward zero)", "inputs rounded to bf16", "inputs rounded to tf32" };
+    for (0..5) |mode| {
+        var num: f64 = 0;
+        var den: f64 = 0;
+        for (0..M) |i| for (0..N) |j| {
+            var s: f64 = 0;
+            for (0..K) |c| s += reproRound(A[i * K + c], @intCast(mode)) * reproRound(B[j * K + c], @intCast(mode));
+            num += (D[i * N + j] - s) * (D[i * N + j] - s);
+            den += s * s;
+        };
+        std.debug.print("M5 repro: qwv_gemm_f32_nt {d}x{d}x{d} relative L2 error against float64 of {s}: {e:.3}\n", .{ M, N, K, labels[mode], @sqrt(num / den) });
+    }
+}
