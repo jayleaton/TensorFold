@@ -217,13 +217,14 @@ pub fn isCarry(b: []const u8) bool {
     return std.mem.startsWith(u8, b, "s.L") and std.mem.endsWith(u8, b, ".carry");
 }
 
-/// "s.kv.pt" / "s.kv.ct": a slot's page table / split table
+/// "s.kv.pt" / "s.kv.ct" / "s.kv.mt": a slot's page table / split table / mirror table (TF_DSV41_KV_MIRROR)
 pub fn isTable(b: []const u8) bool {
-    return eq(b, "s.kv.pt") or eq(b, "s.kv.ct");
+    return eq(b, "s.kv.pt") or eq(b, "s.kv.ct") or eq(b, "s.kv.mt");
 }
 
 test "rowmode: stacked roles by name" {
     try std.testing.expect(isRing("s.L7.swa.v") and isRing("s.L7.swa.s") and !isRing("s.L7.comp.v"));
     try std.testing.expect(isCarry("s.L2.carry") and !isCarry("w.L2.comp"));
-    try std.testing.expect(isTable("s.kv.pt") and isTable("s.kv.ct") and !isTable("s.kv.comp.L2"));
+    try std.testing.expect(isTable("s.kv.pt") and isTable("s.kv.ct") and isTable("s.kv.mt") and !isTable("s.kv.comp.L2"));
+    try std.testing.expect(!isTable("s.kv.mc.L2"));
 }

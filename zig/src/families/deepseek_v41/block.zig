@@ -130,6 +130,9 @@ pub const Pool = struct {
     early: bool = false,
     /// split's union cap (TF_DSV41_KV_SPLIT_UNION_MIB): the prefill receive buffer's bytes
     union_cap: i64 = 128 << 20,
+    /// TF_DSV41_KV_MIRROR (split): positions each slot keeps whole on every rank (0: off), its tensors' pages
+    mirror: i64 = 0,
+    mirror_pages: i64 = 0,
     pub const page: i64 = 256;
     pub const row_bytes: i64 = 584;
     pub const ik_bytes: i64 = 132;
@@ -470,6 +473,10 @@ pub const Emitter = struct {
 
     pub const received = block_attn.received;
     pub const exchange = block_attn.exchange;
+    pub const mirrorReads = block_attn.mirrorReads;
+    pub const mirrorRows = block_attn.mirrorRows;
+    pub const mirrorPaging = block_attn.mirrorPaging;
+    pub const mirrorStore = block_attn.mirrorStore;
     pub const selection = block_index.selection;
     pub const ticketLen = block_index.ticketLen;
     pub const attnSplit = block_index.attnSplit;

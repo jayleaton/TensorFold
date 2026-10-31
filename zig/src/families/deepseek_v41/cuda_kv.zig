@@ -12,6 +12,7 @@ const run = @import("run.zig");
 const Config = @import("config.zig").Config;
 
 const sessions = kv.sessions;
+const Mirror = @import("cuda_kv_mirror.zig").Mirror;
 
 pub const Error = error{ PoolTooSmall, BadGlue, NoPool };
 
@@ -30,6 +31,8 @@ pub const Options = struct {
     resident: u64 = 0,
     /// TF_DSV41_PF_4K / TF_DSV41_PF_TBO: a long prompt's prefill workspace; worst MemAvailable minus it clears floor
     workspace: u64 = 0,
+    /// TF_DSV41_KV_MIRROR (split only): positions each slot also keeps whole on every rank (0: off)
+    mirror: u64 = 0,
 };
 
 /// TF_DSV41_POOL_TOKENS / TF_DSV41_KV_SPLIT / TF_DSV41_KV_SPLIT_UNION_MIB (null: no pool, the contiguous slot).
@@ -38,10 +41,12 @@ pub fn optionsFromEnv(capacity: u64, world: u32) !?Options {
     const tokens = try std.fmt.parseInt(u64, std.mem.span(t), 10);
     const split = if (std.c.getenv("TF_DSV41_KV_SPLIT")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
     if (split and world < 2) return error.SplitNeedsTp;
+    const mirror = try kv.mirror.fromEnv(256, world);
+    if (mirror > 0 and !split) return error.MirrorNeedsSplit;
     const mib: u64 = if (std.c.getenv("TF_DSV41_KV_SPLIT_UNION_MIB")) |v| try std.fmt.parseInt(u64, std.mem.span(v), 10) else 128;
     // pool settings: rounded up to whole pages of every residue
     const unit: u64 = 256 * @as(u64, world);
-    return .{ .tokens = (tokens + unit - 1) / unit * unit, .split = split, .capacity = capacity, .union_cap = mib << 20 };
+    return .{ .tokens = (tokens + unit - 1) / unit * unit, .split = split, .capacity = capacity, .union_cap = mib << 20, .mirror = @min(mirror, (capacity + unit - 1) / unit * unit) };
 }
 
 /// The boot check's figures for the measured check at the end of boot (`afterBoot`).
@@ -68,7 +73,7 @@ pub fn bootCheck(ctx: *const cuda.Context, cfg: *const Config, o: Options, rank:
     var layout = try kv.Layout.fromConfig(cfg, .{ .split = o.split and world > 1 });
     // Zig's terms, not the reference's: its plan holds from boot what a caching allocator takes while serving
     var terms = try budget.zigFromEnv();
-    terms.growth += @as(f64, @floatFromInt(o.resident)) / budget.GiB;
+    terms.growth += @as(f64, @floatFromInt(o.resident + mirrorBytes(&layout, o, world))) / budget.GiB;
     const r = budget.serveCheck(knobs, .{ .rank = rank, .avail_gib = @as(f64, @floatFromInt(mi.available)) / budget.GiB, .terms = terms }, layout.pool(), world, o.tokens);
     var buf: [1024]u8 = undefined;
     if (!r.ok) {
@@ -77,6 +82,13 @@ pub fn bootCheck(ctx: *const cuda.Context, cfg: *const Config, o: Options, rank:
     }
     std.log.info("kv: before the pool: {s}; the boot's growth is measured at its end", .{r.message(&buf)});
     return .{ .rank = rank, .at_check = r.avail_gib, .pool_gib = r.pool_gib, .pool_tokens = o.tokens, .bytes_a_token = r.bytes_a_token, .reserve = try budget.reserveFromEnv(), .dip = terms.dip, .hard = r.hard, .target = target, .workspace = o.workspace };
+}
+
+/// TF_DSV41_KV_MIRROR's device bytes a rank (kv/mirror.zig), allocated with the pool; 0 when off.
+fn mirrorBytes(layout: *kv.Layout, o: Options, world: u32) u64 {
+    if (o.mirror == 0) return 0;
+    const g = kv.mirror.Geometry.of(o.mirror, 256, @max(o.slots, 1), world);
+    return g.bytes(layout.families(), 256, @intCast((o.capacity + 255) / 256));
 }
 
 /// At boot's end: idle - dip >= the hard floor or the pool is refused; a 4K workspace past it warns (wsAgreed).
@@ -131,6 +143,8 @@ pub const Kv = struct {
     /// a union's pinned staging: the selection read back, the tokens and rows sent up (reused after the next drain)
     pin_sel: ?cuda.HostBuffer = null,
     pin_up: ?cuda.HostBuffer = null,
+    /// TF_DSV41_KV_MIRROR: each slot's first positions of every source whole on this rank (null: off)
+    mirror: ?Mirror = null,
 
     pub const Stats = struct { dense: u64 = 0, unions: u64 = 0, union_rows_max: u64 = 0, bytes: u64 = 0 };
 
@@ -148,6 +162,11 @@ pub const Kv = struct {
         k.dev = try kv.DevicePool.init(gpa, d, ctx, &k.pool, runner.stream, @intCast(k.slots.len), k.slot.max_pages);
         errdefer k.dev.deinit();
         k.ops = .{ .r = runner };
+        if (o.mirror > 0 and k.layout.opts.split) {
+            k.mirror = try Mirror.init(gpa, d, k, o.mirror);
+            if (k.rank == 0) std.log.info("[tensorfold] KV mirror: the first {d} positions of each slot whole on every rank, {d} MiB", .{ o.mirror, k.mirror.?.bytes() >> 20 });
+        }
+        errdefer if (k.mirror) |*m| m.deinit();
         if (k.layout.opts.split) {
             k.lens = try cuda.DeviceBuffer.alloc(d, 4 * @as(usize, world));
             // the compact mode's transport agreement happens here, once, outside any graph
@@ -198,6 +217,7 @@ pub const Kv = struct {
         if (k.dedup) |*b| b.free();
         if (k.pin_sel) |*b| b.free();
         if (k.pin_up) |*b| b.free();
+        if (k.mirror) |*m| m.deinit();
         k.dev.deinit();
         k.pool.deinit();
         k.gpa.free(k.slots);
@@ -219,6 +239,8 @@ pub const Kv = struct {
             .split = k.layout.opts.split,
             .early = k.layout.opts.split and kv.split.earlyOn(),
             .union_cap = @intCast(k.opts.union_cap),
+            .mirror = if (k.mirror) |m| @intCast(m.positions) else 0,
+            .mirror_pages = if (k.mirror) |m| m.geo.tensorPages() else 0,
         };
     }
 
@@ -232,9 +254,15 @@ pub const Kv = struct {
         }
         try k.external(r, plan, "s.kv.pt", k.dev.table);
         try k.external(r, plan, "s.kv.ct", k.dev.local);
+        if (k.mirror) |*m| try m.bind(k, r, plan);
     }
 
-    fn external(_: *Kv, r: *run.Runner, plan: *const buffers.Plan, role: []const u8, b: cuda.DeviceBuffer) !void {
+    /// After a restore (every rank, the leader's order): the slot's mirror from its owners' pages; nothing when off.
+    pub fn mirrorFill(k: *Kv) !void {
+        if (k.mirror) |*m| try m.fill(k);
+    }
+
+    pub fn external(_: *Kv, r: *run.Runner, plan: *const buffers.Plan, role: []const u8, b: cuda.DeviceBuffer) !void {
         if (plan.sizes.get(role)) |need| if (need > b.len) return error.PoolTooSmall;
         try r.external(role, b.ptr);
     }

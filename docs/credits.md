@@ -252,5 +252,8 @@ Some opt-in DeepSeek-V4.1 decode settings follow mechanisms in Bertholomus's (Al
   launch either, as his merge's `rot` does (`Rot` in `zig/src/families/dsv41/tri_attn.zig`, `round.zig`). Here it
   is a copy of the R1 split attention kernel whose merge re-reads its stored rows and rotates them as the rotation
   launch's compiled code does.
+- `TF_DSV41_KV_MIRROR=<positions>` keeps each slot's first compressed KV rows whole on every rank, as his engine keeps
+  all compressed rows replicated in one shared plane with no exchange (`zig/src/families/dsv41/model.zig`). Here split
+  KV stays on, and windows ending inside the mirror read it instead of exchanging rows; the rows are the same bytes.
 
 [bert-dsv41]: https://github.com/bertholomus/TensorFold/tree/a57deb9d470b27e1e3fab2a9494915a0049415aa

@@ -41,8 +41,11 @@ pub fn pos(e: *Emitter) !Arg {
 
 /// The KV store (_kv_store): the SWA ring or a compressed family (split KV: only the rows this rank owns).
 pub fn kvStore(e: *Emitter, lat: Arg, src: u32, ratio: i64) !void {
-    const rows = try e.pool(src, ratio);
-    const pg = try e.paging(ratio, true);
+    return storeRows(e, lat, try e.pool(src, ratio), try e.paging(ratio, true), ratio);
+}
+
+/// `_kv_store` of the window's rows into `rows` through `pg`: the pool's store and the mirror's are one variant.
+fn storeRows(e: *Emitter, lat: Arg, rows: [2]Arg, pg: Paging, ratio: i64) !void {
     try e.triton("_kv_store", .{ e.n, 1, 1 }, &.{
         .{ .name = "LAT", .arg = lat },                                                          .{ .name = "l_stride", .arg = .{ .i = e.cfg.head_dim } },
         .{ .name = "CS", .arg = try e.ropeTable() },                                             .{ .name = "cs_stride", .arg = .{ .i = 64 } },
@@ -54,6 +57,31 @@ pub fn kvStore(e: *Emitter, lat: Arg, src: u32, ratio: i64) !void {
         .{ .name = "PTS", .arg = .{ .i = 0 } },                                                  .{ .name = "ROWS", .arg = .{ .b = false } },
         .{ .name = "PDL", .arg = .{ .b = false } },
     });
+}
+
+/// TF_DSV41_KV_MIRROR: the window ends inside the mirror (graph programs at their bucket's end), so no exchange.
+pub fn mirrorReads(e: *const Emitter) bool {
+    const p = e.o.pool orelse return false;
+    return p.split and p.mirror > 0 and e.end() <= p.mirror;
+}
+
+/// TF_DSV41_KV_MIRROR: a source's mirror rows (values, scales), every slot's run of pages and the discard page.
+pub fn mirrorRows(e: *Emitter, L: u32, ratio: i64) ![2]Arg {
+    const rows = e.o.pool.?.mirror_pages * @divExact(Pool.page, ratio);
+    const role: calls.Role = .{ .buf = try e.fmt("s.kv.mc.L{d}", .{L}) };
+    return .{ try e.view(role, .u8, &.{ rows, 576 }, &.{ Pool.row_bytes, 1 }, 0), try e.view(role, .u8, &.{ rows, 8 }, &.{ Pool.row_bytes, 1 }, 576) };
+}
+
+/// The mirror's table ("s.kv.mt", fixed at boot): a slot's logical page to its mirror page, past the mirror discard.
+pub fn mirrorPaging(e: *Emitter, ratio: i64) !Paging {
+    return .{ .pt = try e.buf("s.kv.mt", .{}, .i32, &.{e.o.pool.?.pts}), .psh = Pool.shift(ratio), .vs = Pool.row_bytes, .ss = Pool.row_bytes };
+}
+
+/// TF_DSV41_KV_MIRROR: every window and segment also stores its compressed rows into the mirror (both ranks, all rows).
+pub fn mirrorStore(e: *Emitter, lat: Arg, src: u32, ratio: i64) !void {
+    const p = e.o.pool orelse return;
+    if (!p.split or p.mirror == 0) return;
+    return storeRows(e, lat, try e.mirrorRows(src, ratio), try e.mirrorPaging(ratio), ratio);
 }
 
 pub fn paging(e: *Emitter, ratio: i64, store: bool) !Paging {
@@ -254,6 +282,7 @@ pub fn attention(e: *Emitter, L: u32) !void {
             .{ .name = "c_stride", .arg = .{ .i = if (ratio == 2) cw else 0 } },              .{ .name = "SPLIT", .arg = .{ .b = ratio == 2 } },
         });
         try e.kvStore(lat, L, ratio);
+        try e.mirrorStore(lat, L, ratio);
         const kp = try e.buf("L.ix_k", .{}, .bf16, &.{ n, ID });
         try e.upstream(try e.fmt("L{d}.attn.ix_wk", .{L}), lat, hd, ID, kp);
         const kpg = try e.paging(ratio, false);
@@ -269,7 +298,9 @@ pub fn attention(e: *Emitter, L: u32) !void {
         });
     }
     if (indexer) try e.index(L, if (e.o.r1) qa else qn, iw, qnorm);
-    const early: ?Received = if (indexer and e.o.pool != null and e.o.pool.?.split and e.o.pool.?.early and (n <= 16 or e.o.rows))
+    // TF_DSV41_KV_MIRROR: inside the mirror split KV reads as replicated KV does (the mirror's table, no exchange)
+    const mirrored = e.mirrorReads();
+    const early: ?Received = if (indexer and !mirrored and e.o.pool != null and e.o.pool.?.split and e.o.pool.?.early and (n <= 16 or e.o.rows))
         try e.exchange(kv_src.?, e.cfg.compressRatio(kv_src.?), (try e.selection(L))[0])
     else
         null;
@@ -293,19 +324,19 @@ pub fn attention(e: *Emitter, L: u32) !void {
         const src_ratio = e.cfg.compressRatio(kv_src.?);
         const sel = try e.selection(e.cfg.indexSource(L).?);
         cnt = sel[1];
-        if (e.o.pool != null and e.o.pool.?.split) {
+        if (e.o.pool != null and e.o.pool.?.split and !mirrored) {
             // split: an index layer's selection brings its rows over the exchange; its reuse layers read them too
             const got = early orelse if (indexer) try e.exchange(kv_src.?, src_ratio, sel[0]) else try e.received(kv_src.?, src_ratio);
             cv = got.cv;
             cs = got.cs;
             tok = got.tok;
         } else {
-            const p = try e.pool(kv_src.?, src_ratio);
+            const p = if (mirrored) try e.mirrorRows(kv_src.?, src_ratio) else try e.pool(kv_src.?, src_ratio);
             cv = p[0];
             cs = p[1];
             tok = sel[0];
             if (e.o.pool != null) {
-                const pg = try e.paging(src_ratio, false);
+                const pg = if (mirrored) try e.mirrorPaging(src_ratio) else try e.paging(src_ratio, false);
                 apg = .{ .pt = pg.pt, .psh = pg.psh, .vs = 0, .ss = 0 };
             }
         }

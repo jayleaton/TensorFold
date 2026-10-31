@@ -12,6 +12,7 @@ test {
     _ = @import("branches_test.zig");
     _ = @import("aot_needs_test.zig");
     _ = @import("kx_early_test.zig");
+    _ = @import("kv_mirror_test.zig"); // TF_DSV41_KV_MIRROR on the decode and prefill emitters
 }
 
 test {
