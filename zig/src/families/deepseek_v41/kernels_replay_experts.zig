@@ -81,7 +81,7 @@ pub fn segExt(o: dense.Ops, func: []const u8, args: []const Arg, kwargs: []const
         return true;
     }
     if (is(func, "linear")) {
-        const c: Call = .{ .args = args, .kwargs = kwargs, .names = &.{ "xh", "T", "svh", "ys", "Z", "counters", "meta", "programs", "K2", "WK", "minb", "pdl" } };
+        const c: Call = .{ .args = args, .kwargs = kwargs, .names = &.{ "xh", "T", "svh", "ys", "Z", "counters", "meta", "programs", "K2", "WK", "minb", "pdl", "rxh", "rsuh", "rld" } };
         const T = try c.list(1);
         const svh = try c.list(2);
         const ys = try c.list(3);
@@ -97,6 +97,7 @@ pub fn segExt(o: dense.Ops, func: []const u8, args: []const Arg, kwargs: []const
         const y_dtype = try ioType(y0.dtype);
         var tab = std.mem.zeroes(dense.LinTable);
         tab.n = @intCast(n);
+        var cols: [dense.max_seg]usize = undefined;
         for (0..n) |i| {
             var m: [11]i64 = undefined;
             for (&m, meta[11 * i ..][0..11]) |*v, a| v.* = switch (a) {
@@ -105,6 +106,7 @@ pub fn segExt(o: dense.Ops, func: []const u8, args: []const Arg, kwargs: []const
             };
             if (T[i] != .tensor or svh[i] != .tensor or ys[i] != .tensor) return error.WrongArgument;
             const y = ys[i].tensor;
+            cols[i] = @intCast(m[9]);
             tab.s[i] = .{
                 .xh = xh + 2 * @as(u64, @intCast(m[6])),
                 .T = T[i].tensor.ptr,
@@ -127,6 +129,15 @@ pub fn segExt(o: dense.Ops, func: []const u8, args: []const Arg, kwargs: []const
         const wk = try c.usz(9);
         const minb = try c.u(10);
         const pdl = try c.boolean(11, false);
+        // TF_DSV41_ROT_FOLD: each segment's rows also rotated into rxh at its own column (y's row is rxh's k)
+        if ((try c.opt(12)) != null) {
+            const rld = try c.usz(14);
+            if (!lanes) return error.WrongArgument;
+            for (ys) |ya| if (ya.tensor.stride[0] != @as(i64, @intCast(rld))) return error.WrongArgument;
+            const ro = dense.rotOut(cols[0..n], try c.ptr(12), try c.ptr(13), rld) catch return error.Unsupported;
+            try o.lanesRotLinear(tab, ro, y_dtype, M, programs, k2, wk, minb, pdl);
+            return true;
+        }
         if (lanes) try o.lanesLinearRaw(tab, y_dtype, M, programs, k2, wk, minb, pdl) else try o.segLinearRaw(tab, y_dtype, M, programs, k2, wk, minb, pdl);
         return true;
     }

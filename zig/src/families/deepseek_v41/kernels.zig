@@ -102,6 +102,8 @@ pub const Kernels = struct {
             lm.cluster = try dense.lin2Cluster(env("TF_DSV41_LIN2_CLUSTER"));
             break :blk lm;
         });
+        // TF_DSV41_ROT_FOLD bit 0: dense3's rotated-output instances, resolved only then (an older image still loads)
+        if ((try dense.rotFoldMask(env("TF_DSV41_ROT_FOLD"))) & 1 != 0) k.dense.rot = try dense.Rot.resolve(k.mods[6]);
         return k;
     }
 

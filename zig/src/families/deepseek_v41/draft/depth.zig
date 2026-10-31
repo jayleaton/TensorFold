@@ -22,6 +22,7 @@ pub const Settings = struct {
     max_rows: u64 = 64,
     code_accept: bool = false, // TF_DSV41_CODE_ACCEPT: expand high-acceptance short-context chains
     context_bucket: u64 = 2048, // TF_DSV41_GRAPH_BUCKET; short contexts only use its linear buckets
+    overhead_ms: f64 = 0.0, // TF_DSV41_DEPTH_OVERHEAD_MS: a round's unmodelled ms in its rate (bertholomus dsv41)
 };
 
 /// [E(0) .. E(len)]: tokens a round verifying k drafts commits on average, into `out` (len + 1).
@@ -146,7 +147,12 @@ pub const Depth = struct {
             const s = st.rounds.sums();
             return s.tokens / s.ms;
         }
-        return 2.0 / (d.costs.windowMs(2) + d.costs.draft);
+        return 2.0 / d.overhead(d.costs.windowMs(2) + d.costs.draft);
+    }
+
+    /// `ms` with the fixed round overhead added (off: `ms` itself, the same bits).
+    fn overhead(d: *const Depth, ms: f64) f64 {
+        return if (d.set.overhead_ms > 0.0) ms + d.set.overhead_ms else ms;
     }
 
     fn least(d: *const Depth, alone: bool, first: ?u32) usize {
@@ -182,8 +188,8 @@ pub const Depth = struct {
 
     /// Modelled ms of a round: its window of `rows` total rows, each further window's overhead, the pass.
     pub fn roundMs(d: *const Depth, rows: u64, windows: u64, drafted: bool) f64 {
-        return d.costs.rowsMs(@intCast(rows)) + d.costs.slot * @as(f64, @floatFromInt(windows -| 1)) +
-            (if (drafted) d.costs.draft else 0.0) + (if (d.set.joint == 2) d.set.host_ms else 0.0);
+        return d.overhead(d.costs.rowsMs(@intCast(rows)) + d.costs.slot * @as(f64, @floatFromInt(windows -| 1)) +
+            (if (drafted) d.costs.draft else 0.0) + (if (d.set.joint == 2) d.set.host_ms else 0.0));
     }
 
     /// The open round's commits -> one (tokens, modelled ms) of the aggregate rate by its windows.
@@ -372,7 +378,7 @@ pub const Depth = struct {
         }
         var ms = d.costs.windowMs(@intCast(rows)) + (if (st.drafted) d.costs.draft else 0.0);
         if (st.ms) |m| ms = m;
-        st.rounds.push(.{ .tokens = got, .ms = ms });
+        st.rounds.push(.{ .tokens = got, .ms = d.overhead(ms) });
         st.used_len = 0;
         st.drafted = false;
         st.ms = null;
@@ -446,4 +452,24 @@ test "high acceptance fills paid padding and preserves cold, prose, context and 
             try std.testing.expectEqual(@as(u64, 0), d.expanded_rounds);
         }
     }
+}
+
+test "a fixed round overhead in the rate verifies deeper, as Bert's E/(table ms + overhead) does" {
+    const gpa = std.testing.allocator;
+    var verify: [16]f64 = undefined;
+    for (&verify, 0..) |*v, r| v.* = 21.4 + 4.6 * @as(f64, @floatFromInt(r));
+    const c: Costs = .{ .verify = &verify, .draft = 3.52, .slot = 0.65 };
+    const conf = [_]f64{ 0.65, 0.65, 0.65, 0.65, 0.65 };
+    var off = try Depth.init(gpa, c, 5, .{});
+    defer off.deinit();
+    var on = try Depth.init(gpa, c, 5, .{ .overhead_ms = 8.0 });
+    defer on.deinit();
+    // the third draft's 0.27 survival misses the modelled rate's bar and clears the overhead's lower one
+    try std.testing.expectEqual(@as(usize, 2), try off.choose(0, &conf, 5, false, null));
+    try std.testing.expectEqual(@as(usize, 3), try on.choose(0, &conf, 5, false, null));
+    try off.record(0, 3, 3, null);
+    try on.record(0, 4, 3, null);
+    try std.testing.expectEqual(3.0 / (verify[2] + 3.52), try off.rate(0));
+    try std.testing.expectEqual(3.0 / (verify[3] + 3.52 + 8.0), try on.rate(0));
+    try std.testing.expectEqual(off.roundMs(6, 1, true) + 8.0, on.roundMs(6, 1, true));
 }

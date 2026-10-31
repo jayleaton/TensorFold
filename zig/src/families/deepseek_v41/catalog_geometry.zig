@@ -97,6 +97,12 @@ pub fn dense(f: dk.dense.Functions) void {
     note(f.to_lanes, 256, 0, 1);
     note(f.to_strips, 256, 0, 1);
 }
+pub fn rot(f: dk.dense.Rot) void {
+    for (f.lanes) |row| for (row, 0..) |fun, i| {
+        const wk = dk.dense.rot_cfgs[i][0];
+        note(fun, wk * 32, wk * 4096, 1);
+    };
+}
 pub fn lin2(f: dk.dense.Lin2) void {
     for (f.lanes) |row| for (row, 0..) |fun, i| {
         const wk: u32 = if (i == 0) 4 else 8;

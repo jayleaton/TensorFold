@@ -232,3 +232,21 @@ credited here.
 ## Fluid Subgraph Residency
 
 TensorFold's exact residency implementation follows published techniques: EdgeMoE's storage-backed weights and memory index, MoE-Infinity and Fiddler's expert locality/popularity caching and prefetch, and Fate's cross-layer gate prefetch. These are re-implementations of proven techniques, with no novelty claim. The frozen TensorFold Python engine provides the implementation ancestry for native expert slots and PLE row streaming. Slotstream is an outside comparison for published SSD streaming memory/speed trade-offs, not the design or code source. See [the exact residency design](design/fluid-subgraph-residency.md) for scope and qualification.
+
+## DeepSeek-V4.1 decode
+
+Some opt-in DeepSeek-V4.1 decode settings follow mechanisms in Bertholomus's (Albert Lee, @bertholomus) native
+`families/dsv41` family on [bertholomus/TensorFold](https://github.com/bertholomus/TensorFold) branch
+`deepseek-v41-zig-tp2` at [a57deb9d4][bert-dsv41] (Apache-2.0). They are re-implemented in
+`zig/src/families/deepseek_v41`, off unless set, and their commits name him as co-author.
+
+- `TF_DSV41_DEPTH_OVERHEAD_MS` prices a fixed round overhead into the draft depth's rate, as his lane allocator
+  divides expected tokens by a round's table cost plus its observed overhead (`zig/src/core/lanes/allocate.zig`).
+- `TF_DSV41_IDX_IOTA` skips an index layer's query and scores when its top-k must take every entry it reads, as
+  his round selects all visible entries without scoring them (`idx_all` and `iotaVis` in
+  `zig/src/families/dsv41/round.zig`). Here the existing top-k launch stays, so its output bytes are unchanged.
+- `TF_DSV41_ROT_FOLD=1` has wo_a's linear epilogue write wo_b's rotated input rows, so wo_b needs no rotation
+  launch, as his grouped linear's `RotOut` fold does (`zig/src/families/dsv41/exl3_linear.zig`, `round.zig`).
+  Here it is a new dense3 kernel beside the existing one, and its rows equal the rotation launch's bytes.
+
+[bert-dsv41]: https://github.com/bertholomus/TensorFold/tree/a57deb9d470b27e1e3fab2a9494915a0049415aa

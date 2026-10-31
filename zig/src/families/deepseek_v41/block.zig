@@ -83,6 +83,10 @@ pub const Options = struct {
     stream_rb: i64 = 0,
     /// TF_DSV41_INDEX_BOUND: decode index scores and top-k as row-bounded twins that stop at each row's visible end
     index_bound: bool = false,
+    /// TF_DSV41_IDX_IOTA: an index layer whose top-k takes every entry it reads skips its query and scores (same bits)
+    idx_iota: bool = false,
+    /// TF_DSV41_ROT_FOLD mask (same bits): bit 0 wo_a's epilogue writes wo_b's rotated rows (block_attn.woFold)
+    rot_fold: u3 = 0,
     /// decode knob set (same bits): ATTN_SPLIT, ATTN_ROPE, MHC_TAIL, MHC_DEFER, RG_PRUNE, PRUNE_KIT, MOE_BF16, RMS_FOLD
     r1: bool = false,
     /// TF_DSV41_ROUTER_GROUP_ROT: wide grouping and expert input rotation in one launch (default off).
@@ -319,6 +323,16 @@ pub const Emitter = struct {
     }
 
     pub fn fusedNorm(e: *Emitter, tag: []const u8, ps: []const Proj, norm: ?Norm) !void {
+        return e.fusedRot(tag, ps, norm, .{});
+    }
+
+    /// TF_DSV41_ROT_FOLD: the next group's rot_in rows (its suh, xh of row stride `ld`) a linear epilogue writes.
+    pub const RotOut = struct { suh: Arg, xh: Arg, ld: i64 };
+
+    /// `out`: this group's linears also write the next group's rotated rows; `in`: this group's are already written.
+    pub const Rot = struct { out: ?RotOut = null, in: bool = false };
+
+    pub fn fusedRot(e: *Emitter, tag: []const u8, ps: []const Proj, norm: ?Norm, rot: Rot) !void {
         const m: usize = @intCast(e.n);
         const segs = try e.a.alloc(dense.Seg, ps.len);
         for (ps, segs, 0..) |p, *s, i| {
@@ -335,7 +349,9 @@ pub const Emitter = struct {
             o.* = @intCast(lay.xh_off[i]);
         }
         const xh = try e.buf("L.{s}.xh", .{tag}, .f16, &.{@intCast(lay.xh_total)});
-        if (norm) |nm| {
+        if (rot.in) {
+            if (norm != null or rot.out != null) return error.Unsupported; // the rows were rotated without a norm
+        } else if (norm) |nm| {
             const ws = try e.a.alloc(Arg, ps.len);
             @memset(ws, nm.w);
             try e.ext("tf_dsv41_x3seg_v3.rot_in", &.{ .{ .list = xs }, .{ .list = suh }, xh, try e.ints(offs), .{ .b = false }, .{ .list = ws }, .{ .f = nm.eps } });
@@ -356,11 +372,15 @@ pub const Emitter = struct {
                 const st = dense.strides(s.k, s.k2);
                 try meta.appendSlice(e.a, &.{ @intCast(s.k), @intCast(s.n), @intCast(s.sk), @intCast(s.wk), st[0], st[1], @intCast(lay.xh_off[si]), @intCast(lay.z_off[si]), @intCast(lay.c_off[si]), @intCast(s.col), @intCast(l.p0[j]) });
             }
-            try e.ext("tf_dsv41_dense3_v1.linear", &.{
+            const args = [_]Arg{
                 xh,             .{ .list = T },           .{ .list = svh },                  .{ .list = ys },
                 z,              counters,                 try e.ints(meta.items),            .{ .i = @intCast(l.programs) },
                 .{ .i = l.k2 }, .{ .i = @intCast(l.wk) }, .{ .i = if (l.wk == 8) 1 else 3 }, .{ .b = false },
-            });
+            };
+            if (rot.out) |r|
+                try e.ext("tf_dsv41_dense3_v1.linear", &(args ++ [_]Arg{ r.xh, r.suh, .{ .i = r.ld } }))
+            else
+                try e.ext("tf_dsv41_dense3_v1.linear", &args);
         }
     }
 

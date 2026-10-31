@@ -8,6 +8,7 @@ const env = pk.env;
 const gmGu2 = pk.gmGu2;
 const indexBound = pk.indexBound;
 const indexBudget = pk.indexBudget;
+const idxIota = pk.idxIota;
 const kvNormStore = pk.kvNormStore;
 const mhcPfRows = pk.mhcPfRows;
 const mhcSiteRows = pk.mhcSiteRows;
@@ -22,6 +23,7 @@ const prefetchAhead = pk.prefetchAhead;
 const prefillMode = pk.prefillMode;
 const prefillRows = pk.prefillRows;
 const routerGroupRot = pk.routerGroupRot;
+const rotFold = pk.rotFold;
 const streamRb = pk.streamRb;
 const x3ldEpi = pk.x3ldEpi;
 const idx_split = @import("idx_split.zig");
@@ -53,6 +55,8 @@ pub fn apply(f: *Forward, a: std.mem.Allocator, io: std.Io, rank: u32) !void {
     f.opts.index_bound = try indexBound(&env);
     // TF_DSV41_IDX_SPLIT: the ranks agreed on it at the TP bootstrap (cuda_model.zig: tp.Config.family)
     f.opts.idx_split = try idx_split.mode(&env);
+    f.opts.idx_iota = try idxIota(&env);
+    f.opts.rot_fold = try rotFold(&env);
     // TF_DSV41_BRANCHES: the side stream exists before any capture
     if (f.branches == null) f.branches = try @import("branches.zig").install(f.gpa, f, rank);
     // TF_DSV41_PF_OVERLAP: the pieces' exchanges go on the branches' side stream (one peer: TP=2)
@@ -97,7 +101,9 @@ pub fn apply(f: *Forward, a: std.mem.Allocator, io: std.Io, rank: u32) !void {
     const log = std.log.scoped(.dsv41);
     log.info("KV norm/store fusion: {s}", .{if (f.opts.kv_norm_store) "on" else "off"});
     log.info("router grouping/rotation fusion: {s}", .{if (f.opts.router_group_rot) "on" else "off"});
+    if (f.opts.rot_fold & 1 != 0) log.info("rot fold: wo_a's epilogue writes wo_b's rotated rows (no wo_b rot_in launch)", .{});
     if (f.opts.index_bound) log.info("index bound: decode index scores stop at each row's own keys (_scores_b)", .{});
+    if (f.opts.idx_iota) log.info("index iota: an index layer whose top-k takes all its entries skips its query and scores", .{});
     if (f.opts.x3ld_epi) log.info("x3ld epilogues: gateup_epilogue / down_combine fused into the decode expert streamer (TF_DSV41_X3LD_EPI)", .{});
     if (f.opts.idx_split != .off) log.info("index split: prefill selections split by rows over the two ranks ({t}: {s}), int32 rows gathered", .{ f.opts.idx_split, if (f.opts.idx_split == .auto) "rows x keys past 4,096 x 65,536" else "every segment of 256 rows or more" });
     if (f.opts.stream_rb == 1) log.info("stream top-k: _stream_pf (the next tile's key loads issued ahead)", .{});
