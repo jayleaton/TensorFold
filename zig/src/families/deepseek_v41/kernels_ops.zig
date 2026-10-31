@@ -23,6 +23,8 @@ pub const pfd = shapes.pfd;
 pub const Functions = struct {
     attn: [8]cuda.Function,
     attn_split: [2][8]cuda.Function, // [P 1, P 4][instance]
+    /// TF_DSV41_ROT_FOLD bit 1: split_rot_kernel's instances, set by Kernels.load when the knob asks for them
+    attn_rot: ?@import("kernels_attn_rot.zig").Rot = null,
     topk: cuda.Function,
     /// topk_b.cu's row-bounded twin (tf_dsv41_topk_b_v1.topk)
     topk_b: cuda.Function,
@@ -65,6 +67,7 @@ pub const Functions = struct {
     /// `pf`: the four pfdense modules (K2 8, 10, 12, 16).
     pub fn resolve(m_attn: cuda.Module, m_topk: cuda.Module, m_mhc: cuda.Module, m_mhc_pf: cuda.Module, m_rg: cuda.Module, pf: [4]cuda.Module, m_gate: cuda.Module, m_pace: cuda.Module, m_l2pf: cuda.Module, m_keys: cuda.Module, m_pw: cuda.Module, m_kv: cuda.Module, m_glue: cuda.Module, m_pfglue: cuda.Module, m_topk_b: cuda.Module, optin: u32) !Functions {
         var f: Functions = undefined;
+        f.attn_rot = null;
         inline for (0..8) |i| f.attn[i] = try m_attn.function(attn.symbol(if (i >= 4) 4 else 2, (i & 2) != 0, (i & 1) != 0));
         inline for (f.attn, 0..) |fun, i| {
             if (!try fitShared(fun, attn.symbol(if (i >= 4) 4 else 2, (i & 2) != 0, (i & 1) != 0), attn.SMEM, optin)) return error.SharedMemoryTooSmall;

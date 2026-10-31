@@ -404,6 +404,7 @@ cudaError_t launch_one(const Args& a, cudaStream_t stream) {
 }
 
 #include "attn_split.cuh"
+#include "attn_rot.cuh"
 
 template <int KW, bool ROWS, bool HAS_HI, int P>
 cudaError_t launch_split(const Args& a, cudaStream_t stream) {
@@ -539,3 +540,8 @@ template __global__ void dsv41_attn::split_kernel<4, false, false, 4>(dsv41_attn
 template __global__ void dsv41_attn::split_kernel<4, false, true, 4>(dsv41_attn::Args);
 template __global__ void dsv41_attn::split_kernel<4, true, false, 4>(dsv41_attn::Args);
 template __global__ void dsv41_attn::split_kernel<4, true, true, 4>(dsv41_attn::Args);
+// TF_DSV41_ROT_FOLD bit 1's split_rot_kernel<4, ROWS, false, P> (kernels_attn_rot.zig): R1's decode launches
+template __global__ void dsv41_attn::split_rot_kernel<4, false, false, 1>(dsv41_attn::Args, const dsv41_attn::RotIn);
+template __global__ void dsv41_attn::split_rot_kernel<4, true, false, 1>(dsv41_attn::Args, const dsv41_attn::RotIn);
+template __global__ void dsv41_attn::split_rot_kernel<4, false, false, 4>(dsv41_attn::Args, const dsv41_attn::RotIn);
+template __global__ void dsv41_attn::split_rot_kernel<4, true, false, 4>(dsv41_attn::Args, const dsv41_attn::RotIn);

@@ -248,5 +248,9 @@ Some opt-in DeepSeek-V4.1 decode settings follow mechanisms in Bertholomus's (Al
 - `TF_DSV41_ROT_FOLD=1` has wo_a's linear epilogue write wo_b's rotated input rows, so wo_b needs no rotation
   launch, as his grouped linear's `RotOut` fold does (`zig/src/families/dsv41/exl3_linear.zig`, `round.zig`).
   Here it is a new dense3 kernel beside the existing one, and its rows equal the rotation launch's bytes.
+- `TF_DSV41_ROT_FOLD` bit 1 has the attention merge write wo_a's rotated input rows, so wo_a needs no rotation
+  launch either, as his merge's `rot` does (`Rot` in `zig/src/families/dsv41/tri_attn.zig`, `round.zig`). Here it
+  is a copy of the R1 split attention kernel whose merge re-reads its stored rows and rotates them as the rotation
+  launch's compiled code does.
 
 [bert-dsv41]: https://github.com/bertholomus/TensorFold/tree/a57deb9d470b27e1e3fab2a9494915a0049415aa

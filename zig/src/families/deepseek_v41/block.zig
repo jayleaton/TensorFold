@@ -85,7 +85,7 @@ pub const Options = struct {
     index_bound: bool = false,
     /// TF_DSV41_IDX_IOTA: an index layer whose top-k takes every entry it reads skips its query and scores (same bits)
     idx_iota: bool = false,
-    /// TF_DSV41_ROT_FOLD mask (same bits): bit 0 wo_a's epilogue writes wo_b's rotated rows (block_attn.woFold)
+    /// TF_DSV41_ROT_FOLD mask (same bits): bit 0 wo_a writes wo_b's rotated rows, bit 1 the merge wo_a's (block_attn)
     rot_fold: u3 = 0,
     /// decode knob set (same bits): ATTN_SPLIT, ATTN_ROPE, MHC_TAIL, MHC_DEFER, RG_PRUNE, PRUNE_KIT, MOE_BF16, RMS_FOLD
     r1: bool = false,
@@ -348,7 +348,7 @@ pub const Emitter = struct {
         }
         const xh = try e.buf("L.{s}.xh", .{tag}, .f16, &.{@intCast(lay.xh_total)});
         if (rot.in) {
-            if (norm != null or rot.out != null) return error.Unsupported; // the rows were rotated without a norm
+            if (norm != null) return error.Unsupported; // the rows were rotated without a norm
         } else if (norm) |nm| {
             const ws = try e.a.alloc(Arg, ps.len);
             @memset(ws, nm.w);

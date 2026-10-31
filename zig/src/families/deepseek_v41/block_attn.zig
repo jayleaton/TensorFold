@@ -329,6 +329,12 @@ pub fn attention(e: *Emitter, L: u32) !void {
     // o: wo_a's groups over the heads' columns, then wo_b (this rank's partial)
     const g: usize = e.cfg.o_groups / e.o.world;
     const gk: i64 = @divExact(H * hd, @as(i64, @intCast(g)));
+    // TF_DSV41_ROT_FOLD bit 1: the merge also writes wo_a's rot_in rows (L.o.xh), so wo_a has no rot_in launch
+    const merged = attnFold(e, g, gk);
+    if (merged) {
+        const rows = try woaRows(e, L, g, gk);
+        try e.appendLast(&rows);
+    }
     const oa = try e.buf("L.oa", .{}, .bf16, &.{ n, @as(i64, @intCast(g)) * e.cfg.o_lora });
     var po: [8]Proj = undefined;
     for (po[0..g], 0..) |*p, i| p.* = .{
@@ -343,9 +349,27 @@ pub fn attention(e: *Emitter, L: u32) !void {
     const wo_b = try e.fmt("L{d}.attn.wo_b", .{L});
     const kb: i64 = @intCast(g * e.cfg.o_lora);
     const fold = woFold(e, po[0..g]);
-    const rot: block.Emitter.Rot = if (fold) .{ .out = .{ .suh = try e.weight("{s}.suh", .{wo_b}, .f16, &.{kb}), .xh = try e.buf("L.wo_b.xh", .{}, .f16, &.{n * kb}), .ld = kb } } else .{};
+    const rot: block.Emitter.Rot = if (fold) .{ .out = .{ .suh = try e.weight("{s}.suh", .{wo_b}, .f16, &.{kb}), .xh = try e.buf("L.wo_b.xh", .{}, .f16, &.{n * kb}), .ld = kb }, .in = merged } else .{ .in = merged };
     try e.fusedRot("o", po[0..g], null, rot);
     try e.fusedRot("wo_b", &.{.{ .w = wo_b, .x = oa, .y = try e.buf("L.part", .{}, .bf16, &.{ n, D }), .k = @intCast(kb), .n = @intCast(D) }}, null, .{ .in = fold });
+}
+
+/// TF_DSV41_ROT_FOLD bit 1 (3b): R1's split merge, whose warps each store one head's 128-column block, rotates them
+pub fn attnFold(e: *const Emitter, g: usize, gk: i64) bool {
+    if (e.o.rot_fold & 2 == 0 or !e.o.r1) return false;
+    // whole groups of whole blocks (o's columns are wo_a's k), at most the kernel's 8 groups and its 512-wide heads
+    return e.cfg.head_dim == 512 and g >= 1 and g <= 8 and @mod(gk, 128) == 0;
+}
+
+/// The fold's attention arguments as fusedRot lays out wo_a's rot_in: each group's suh, L.o.xh and group i at i n gk.
+pub fn woaRows(e: *Emitter, L: u32, g: usize, gk: i64) ![3]Arg {
+    const suh = try e.a.alloc(Arg, g);
+    const offs = try e.a.alloc(i64, g);
+    for (suh, offs, 0..) |*s, *off, i| {
+        s.* = try e.weight("L{d}.attn.wo_a.{d}.suh", .{ L, i }, .f16, &.{gk});
+        off.* = @as(i64, @intCast(i)) * e.n * gk;
+    }
+    return .{ .{ .list = suh }, try e.buf("L.o.xh", .{}, .f16, &.{@as(i64, @intCast(g)) * e.n * gk}), try e.ints(offs) };
 }
 
 /// TF_DSV41_ROT_FOLD bit 0 (3a): wo_a's groups on whole 128-column blocks, so the epilogue rotates as rot_in does
