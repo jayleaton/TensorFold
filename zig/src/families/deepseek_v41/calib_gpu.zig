@@ -20,9 +20,13 @@ pub const Measured = struct {
     /// rank 0's rows 1..rows as kept (the lower of sweep and recheck), ms
     kept: [cm.max_rows]f64 = @splat(0.0),
     rows: u32 = 0,
-    /// slots the windows used, timed runs
+    /// slots the windows used, timed runs (the retimes included)
     n: u32 = 0,
     runs: usize = 0,
+    /// rows (1-based) timed again as suspect, and their combined ms before
+    retimed: [cm.max_rows]u32 = @splat(0),
+    before: [cm.max_rows]f64 = @splat(0.0),
+    nretimed: usize = 0,
 };
 
 /// The calibration prompt (rank 0): the calibration text's ids over the checkpoint's tokenizer. gpa-owned.
@@ -78,26 +82,76 @@ pub fn measure(gpa: Allocator, m: *model.Model, ids: []const u32, how: cm.Method
         }
     }
     try prefillAll(tgt, gt, pass, ids, lens[0..plan.n], true);
-    // the timed runs, in the plan's order; each between two marks on every rank
-    const samples = try gpa.alloc(i64, plan.runs.items.len);
-    defer gpa.free(samples);
+    const shape = gate_lanes.shapeOf(f);
+    if (shape.block > cm.max_rows) return error.CalibBlock;
     var toks: [4][cm.max_rows]u32 = undefined;
     for (lens[0..plan.n], 0..) |l, i| {
         toks[i][0] = ids[l - 1];
         @memcpy(toks[i][1..rows], conts[i][0 .. rows - 1]);
     }
-    const shape = gate_lanes.shapeOf(f);
-    if (shape.block > cm.max_rows) return error.CalibBlock;
+    const r: Runs = .{ .tgt = tgt, .pass = pass, .lens = lens[0..plan.n], .ids = ids, .toks = &toks, .block = shape.block };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // the timed runs, in the plan's order: each rank's kept values
+    const w: usize = f.comm.world();
+    const vals = try a.alloc([]f64, w);
+    for (vals, try timed(a, gt, f, r, plan.runs.items)) |*v, ms| {
+        v.* = try a.alloc(f64, plan.entries());
+        try plan.values(ms, v.*);
+    }
+    const ranks = try a.alloc([]const f64, w);
+    for (ranks, vals) |*x, v| x.* = v;
+    // suspect rows (a burst prices every wider row) timed again, keeping the lower, until none left or rounds run out
+    var out: Measured = .{ .costs = undefined, .rows = rows, .n = plan.n, .runs = plan.runs.items.len };
+    var both: [cm.max_rows]f64 = undefined;
+    var flag: [cm.max_rows]bool = undefined;
+    for (0..how.retime) |_| {
+        try plan.combined(ranks, both[0..rows]);
+        if (try cm.suspects(gpa, both[0..rows], how.spike, flag[0..rows]) == 0) break;
+        for (flag[0..rows], 0..) |s, i| if (s and std.mem.indexOfScalar(u32, out.retimed[0..out.nretimed], @intCast(i + 1)) == null) {
+            out.retimed[out.nretimed] = @intCast(i + 1);
+            out.before[out.nretimed] = both[i];
+            out.nretimed += 1;
+        };
+        var extra: std.ArrayList(cm.Run) = .empty;
+        try plan.retimeRuns(a, flag[0..rows], &extra);
+        for (vals, try timed(a, gt, f, r, extra.items)) |v, ms| try plan.mergeRetime(extra.items, ms, v);
+        out.runs += extra.items.len;
+    }
+    for (0..plan.n) |i| {
+        const slot: u32 = @intCast(i);
+        tgt.release(slot);
+        if (pass) |p| p.reset(slot);
+    }
+    out.costs = try plan.build(gpa, ranks);
+    @memcpy(out.kept[0..rows], ranks[0][1 .. rows + 1]);
+    return out;
+}
+
+/// What a timed run needs: the slots' texts prefilled (`lens`), each slot's window tokens, the DSpark block.
+const Runs = struct {
+    tgt: iface.Target,
+    pass: ?iface.Pass,
+    lens: []const usize,
+    ids: []const u32,
+    toks: *const [4][cm.max_rows]u32,
+    block: usize,
+};
+
+/// Times `runs` between marks on every rank (a window dropped after each); every rank's ms in run order (`a`-owned).
+fn timed(a: Allocator, gt: anytype, f: anytype, r: Runs, runs: []const cm.Run) ![][]f64 {
+    const samples = try a.alloc(i64, runs.len);
     var drafts: [cm.max_rows]u32 = undefined;
     var conf: [cm.max_rows]f32 = undefined;
     var chosen: [4][cm.max_rows]u32 = undefined;
-    for (plan.runs.items, samples) |run, *x| {
+    for (runs, samples) |run, *x| {
         if (run.what == .draft) {
-            const p0: u64 = lens[0] - 1;
-            const asks = [_]iface.Ask{.{ .slot = 0, .anchor = ids[lens[0] - 1], .start = p0, .params = dspark.Params.of(null, p0) }};
-            var props = [_]iface.Proposal{.{ .drafts = drafts[0..shape.block], .conf = conf[0..shape.block] }};
+            const p0: u64 = r.lens[0] - 1;
+            const asks = [_]iface.Ask{.{ .slot = 0, .anchor = r.ids[r.lens[0] - 1], .start = p0, .params = dspark.Params.of(null, p0) }};
+            var props = [_]iface.Proposal{.{ .drafts = drafts[0..r.block], .conf = conf[0..r.block] }};
             const t0 = try f.calibMark();
-            try pass.?.propose(&asks, &props);
+            try r.pass.?.propose(&asks, &props);
             x.* = @intCast((try f.calibMark()) - t0);
             continue;
         }
@@ -105,41 +159,27 @@ pub fn measure(gpa: Allocator, m: *model.Model, ids: []const u32, how: cm.Method
         var outs: [4][]u32 = undefined;
         const draws: [cm.max_rows]u64 = @splat(0);
         for (run.segments(), segs[0..run.nsegs], outs[0..run.nsegs]) |s, *sg, *o| {
-            if (s.slot >= plan.n) return error.CalibPlan;
-            sg.* = .{ .slot = s.slot, .start = lens[s.slot] - 1, .tokens = toks[s.slot][0..s.rows], .parents = null, .draws = draws[0..s.rows], .sampling = null };
+            if (s.slot >= r.lens.len) return error.CalibPlan;
+            sg.* = .{ .slot = s.slot, .start = r.lens[s.slot] - 1, .tokens = r.toks[s.slot][0..s.rows], .parents = null, .draws = draws[0..s.rows], .sampling = null };
             o.* = chosen[s.slot][0..s.rows];
         }
         const t0 = try f.calibMark();
-        try tgt.window(segs[0..run.nsegs], outs[0..run.nsegs]);
+        try r.tgt.window(segs[0..run.nsegs], outs[0..run.nsegs]);
         x.* = @intCast((try f.calibMark()) - t0);
         for (run.segments()) |s| try gt.dropWindow(s.slot);
     }
-    for (0..plan.n) |i| {
-        const slot: u32 = @intCast(i);
-        tgt.release(slot);
-        if (pass) |p| p.reset(slot);
-    }
-    // every rank's samples; each entry the slower rank's
+    // every rank's samples
     const w: usize = f.comm.world();
-    const all = try gpa.alloc(i64, samples.len * w);
-    defer gpa.free(all);
+    const all = try a.alloc(i64, samples.len * w);
     try f.calibGather(samples, all);
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const ranks = try a.alloc([]const f64, w);
-    for (ranks, 0..) |*r, k| {
-        const ms = try a.alloc(f64, samples.len);
-        for (ms, all[k * samples.len ..][0..samples.len]) |*y, ns| {
+    const out = try a.alloc([]f64, w);
+    for (out, 0..) |*o, k| {
+        o.* = try a.alloc(f64, samples.len);
+        for (o.*, all[k * samples.len ..][0..samples.len]) |*y, ns| {
             if (ns < 0) return error.CalibFollower; // a follower's marks did not pair up with ours
             y.* = @as(f64, @floatFromInt(ns)) / 1e6;
         }
-        const v = try a.alloc(f64, plan.entries());
-        try plan.values(ms, v);
-        r.* = v;
     }
-    var out: Measured = .{ .costs = try plan.build(gpa, ranks), .rows = rows, .n = plan.n, .runs = plan.runs.items.len };
-    @memcpy(out.kept[0..rows], ranks[0][1 .. rows + 1]);
     return out;
 }
 
@@ -164,11 +204,12 @@ pub fn boot(gpa: Allocator, io: std.Io, m: *model.Model, dir: []const u8, k: cal
     var got = try measure(gpa, m, ids, how, rows_cap);
     errdefer got.costs.deinit(gpa);
     const secs = @as(f64, @floatFromInt(ph.nowNs() - t0)) / 1e9;
-    log.info("dsv41 calib method (zig): table {t}, {t} of {d} after {d} warm-up(s), rows 1-{d} cycled, rows 1-{d} rechecked, rows 9+ {d} runs; {d} slots, {d} timed runs, a {d}-token text; rows 1-4 kept {d:.3} / {d:.3} / {d:.3} / {d:.3} ms (rank 0)", .{ how.shape, how.stat, how.reps, how.warm, how.cycle, how.recheck, how.deep, got.n, got.runs, ids.len, got.kept[0], got.kept[1], got.kept[2], got.kept[3] });
+    log.info("dsv41 calib method (zig): table {t}, {t} of {d} after {d} warm-up(s), rows 1-{d} cycled, rows 1-{d} rechecked, rows 9+ {d} runs; {d} slots, {d} timed runs, a {d}-token text; rows 1-4 kept {d:.3} / {d:.3} / {d:.3} / {d:.3} ms (rank 0); {d} suspect row(s) retimed (at most {d} rounds, over {d:.2} of the line)", .{ how.shape, how.stat, how.reps, how.warm, how.cycle, how.recheck, how.deep, got.n, got.runs, ids.len, got.kept[0], got.kept[1], got.kept[2], got.kept[3], got.nretimed, how.retime, how.spike });
+    for (got.retimed[0..got.nretimed], got.before[0..got.nretimed]) |r, ms| log.info("dsv41 calib: row {d} retimed: {d:.3} ms before, {d:.3} ms kept", .{ r, ms, got.costs.verify[r - 1] });
     var path: ?[]u8 = null;
     var db: [std.fs.max_path_bytes]u8 = undefined;
     if (calib_env.dirOf(k, &db)) |d| {
-        path = calib_env.store(gpa, io, d, want, got.costs, .{ .method = how, .seconds = secs, .kept = got.kept[0..got.rows], .tokens = ids.len }, std.Io.Clock.real.now(io).toSeconds()) catch |e| blk: {
+        path = calib_env.store(gpa, io, d, want, got.costs, .{ .method = how, .seconds = secs, .kept = got.kept[0..got.rows], .tokens = ids.len, .retimed = got.retimed[0..got.nretimed], .before = got.before[0..got.nretimed] }, std.Io.Clock.real.now(io).toSeconds()) catch |e| blk: {
             if (!quiet) log.warn("calibration: the table was not stored in {s} ({t})", .{ d, e });
             break :blk null;
         };

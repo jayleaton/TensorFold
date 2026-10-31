@@ -16,7 +16,7 @@ pub const max_samples = 64; // a statistic's runs at most (REPS / DEEP_REPS <= 5
 pub const Shape = enum { raw, fit };
 pub const Stat = enum { median, min };
 
-/// The timing method (TF_DSV41_CALIB_SHAPE / _REPS / _WARM / _STAT / _RECHECK / _CYCLE / _DEEP_REPS).
+/// The timing method (TF_DSV41_CALIB_SHAPE/_REPS/_WARM/_STAT/_RECHECK/_CYCLE/_DEEP_REPS/_RETIME/_SPIKE).
 pub const Method = struct {
     reps: u32 = 5,
     warm: u32 = 3,
@@ -25,6 +25,10 @@ pub const Method = struct {
     shape: Shape = .raw,
     cycle: u32 = 4,
     deep: u32 = 5,
+    /// rounds of timing suspect rows again (0: the reference measurement only)
+    retime: u32 = 2,
+    /// a row this fraction above its segment's line is suspect
+    spike: f64 = 0.15,
 };
 
 /// The defaults by shape (raw: G15; fit: G14, VERSION 3), then the explicit knobs, each range-checked.
@@ -42,7 +46,15 @@ pub fn method(get: *const fn ([*:0]const u8) ?[]const u8) !Method {
         .shape = shape,
         .cycle = try num(get("TF_DSV41_CALIB_CYCLE"), d.cycle, 0, early),
         .deep = try num(get("TF_DSV41_CALIB_DEEP_REPS"), d.deep, 1, 50),
+        .retime = try num(get("TF_DSV41_CALIB_RETIME"), d.retime, 0, 4),
+        .spike = try fraction(get("TF_DSV41_CALIB_SPIKE"), d.spike, 0.02, 2.0),
     };
+}
+
+fn fraction(raw: ?[]const u8, default: f64, lo: f64, hi: f64) !f64 {
+    const v = if (trimmed(raw)) |s| try std.fmt.parseFloat(f64, s) else default;
+    if (!(v >= lo and v <= hi)) return error.CalibKnob;
+    return v;
 }
 
 fn num(raw: ?[]const u8, default: u32, lo: u32, hi: u32) !u32 {
@@ -76,8 +88,10 @@ fn median(xs: []f64) f64 {
     return if (xs.len % 2 == 1) xs[m] else (xs[m - 1] + xs[m]) / 2.0;
 }
 
+pub const Line = struct { base: f64, slope: f64 };
+
 /// The median of pairwise slopes, then the median intercept.
-pub fn fitLine(gpa: Allocator, rows: []const f64, ys: []const f64) !struct { base: f64, slope: f64 } {
+pub fn fitLine(gpa: Allocator, rows: []const f64, ys: []const f64) !Line {
     var slopes: std.ArrayList(f64) = .empty;
     defer slopes.deinit(gpa);
     for (0..rows.len) |i| for (i + 1..rows.len) |j| try slopes.append(gpa, (ys[j] - ys[i]) / (rows[j] - rows[i]));
@@ -116,6 +130,30 @@ pub fn fit(gpa: Allocator, v: []const f64) ![]f64 {
     return out;
 }
 
+/// Marks rows over `spike` above their segment's line (2..8, 9+), or 9+ over 2*spike above 2..8's; returns the count.
+pub fn suspects(gpa: Allocator, times: []const f64, spike: f64, out: []bool) !usize {
+    if (out.len != times.len or times.len > max_rows) return error.BadSamples;
+    @memset(out, false);
+    var xs: [max_rows]f64 = undefined;
+    var early_line: ?Line = null;
+    const segs = [_][2]usize{ .{ 2, @min(times.len, deep_from) }, .{ deep_from + 1, times.len } };
+    for (segs, 0..) |s, k| {
+        if (s[1] < s[0] + 2) continue;
+        for (s[0]..s[1] + 1, 0..) |r, i| xs[i] = @floatFromInt(r);
+        const l = try fitLine(gpa, xs[0 .. s[1] - s[0] + 1], times[s[0] - 1 .. s[1]]);
+        if (k == 0) early_line = l;
+        for (s[0]..s[1] + 1) |r| {
+            const line = l.base + l.slope * @as(f64, @floatFromInt(r));
+            if (line > 0.0 and times[r - 1] > line * (1.0 + spike)) out[r - 1] = true;
+        }
+    }
+    if (early_line) |l| if (times.len > deep_from) for (deep_from + 1..times.len + 1) |r| {
+        const line = l.base + l.slope * @as(f64, @floatFromInt(r));
+        if (line > 0.0 and times[r - 1] > line * (1.0 + 2.0 * spike)) out[r - 1] = true;
+    };
+    return std.mem.count(bool, out, &.{true});
+}
+
 /// `raw` = monotone, `fit` = fit.
 pub fn tableOf(gpa: Allocator, times: []const f64, shape: Shape) ![]f64 {
     if (shape == .fit) return fit(gpa, times);
@@ -148,7 +186,7 @@ fn ceilDiv(a: u32, b: u32) u32 {
 
 /// One timed run's segments (slot, rows), a DSpark pass when `draft`.
 pub const Seg = struct { slot: u32, rows: u32 };
-pub const What = union(enum) { sweep: u32, recheck: u32, shared: u32, draft };
+pub const What = union(enum) { sweep: u32, recheck: u32, shared: u32, draft, retime: u32 };
 pub const Run = struct {
     segs: [4]Seg = undefined,
     nsegs: u8 = 0,
@@ -260,14 +298,39 @@ pub const Plan = struct {
     }
 
     fn stat(p: *const Plan, samples: []const f64, what: What, buf: *[max_samples]f64) !?f64 {
-        var n: usize = 0;
-        for (p.runs.items, samples) |r, x| if (!r.warm and std.meta.eql(r.what, what)) {
-            if (n == buf.len) return error.TooManyRuns;
-            buf[n] = x;
-            n += 1;
+        return statOf(p.runs.items, samples, what, p.m.stat, buf);
+    }
+
+    /// Rows 1..rows as `build` combines them (the slower rank's, at microsecond resolution), from values' layout.
+    pub fn combined(p: *const Plan, ranks: []const []const f64, out: []f64) !void {
+        if (out.len != p.rows) return error.BadSamples;
+        for (out, 0..) |*o, i| {
+            var hi: i64 = std.math.minInt(i64);
+            for (ranks) |v| {
+                if (v.len != p.entries()) return error.BadSamples;
+                hi = @max(hi, costs_mod.roundEven(v[1 + i] * 1000.0));
+            }
+            o.* = @as(f64, @floatFromInt(hi)) / 1000.0;
+        }
+    }
+
+    /// Runs timing the `flagged` rows again: a warm-up round and `reps` rounds, rows cycled so a burst spreads out.
+    pub fn retimeRuns(p: *const Plan, gpa: Allocator, flagged: []const bool, out: *std.ArrayList(Run)) !void {
+        if (flagged.len != p.rows) return error.BadSamples;
+        for (0..1 + p.m.reps) |k| for (flagged, 0..) |f, i| if (f) {
+            var x = one(@intCast(i + 1), k == 0, false);
+            x.what = .{ .retime = @intCast(i + 1) };
+            try out.append(gpa, x);
         };
-        if (n == 0) return null;
-        return try statistic(buf[0..n], p.m.stat);
+    }
+
+    /// One rank's `v` (values' layout) with each retimed row the lower of its value and the retime's statistic.
+    pub fn mergeRetime(p: *const Plan, runs: []const Run, samples: []const f64, v: []f64) !void {
+        if (samples.len != runs.len or v.len != p.entries()) return error.BadSamples;
+        var buf: [max_samples]f64 = undefined;
+        for (0..p.rows) |i| if (try statOf(runs, samples, .{ .retime = @intCast(i + 1) }, p.m.stat, &buf)) |x| {
+            v[1 + i] = @min(v[1 + i], x);
+        };
     }
 
     /// The shared table: per-rank microsecond ints, max over ranks, table_of, Costs.slot, wide buckets, extended.
@@ -296,6 +359,18 @@ pub const Plan = struct {
         return .{ .verify = try costs_mod.extend(gpa, table, pts[0..p.nwide]), .draft = both[0], .slot = per_slot };
     }
 };
+
+/// `what`'s timed (not warm-up) samples of `runs` under `s`; null: none.
+fn statOf(runs: []const Run, samples: []const f64, what: What, s: Stat, buf: *[max_samples]f64) !?f64 {
+    var n: usize = 0;
+    for (runs, samples) |r, x| if (!r.warm and std.meta.eql(r.what, what)) {
+        if (n == buf.len) return error.TooManyRuns;
+        buf[n] = x;
+        n += 1;
+    };
+    if (n == 0) return null;
+    return try statistic(buf[0..n], s);
+}
 
 /// The calibration text (prose, a numbered explanation and code); calib_gpu.zig tokenizes it, first PROMPT_MAX ids.
 pub const text =

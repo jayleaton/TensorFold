@@ -166,6 +166,9 @@ pub const Record = struct {
     kept: []const f64 = &.{},
     /// the calibration prompt's ids (rank 0's text, before the slot cuts)
     tokens: usize = 0,
+    /// rows (1-based) timed again as suspect, and their combined ms before (the method's retime rounds)
+    retimed: []const u32 = &.{},
+    before: []const f64 = &.{},
 };
 
 /// Writes `c` for `want` into `dir` as zigName atomically; returns its path (gpa-owned); `now_s` stamps meta.time.
@@ -191,9 +194,11 @@ pub fn store(gpa: Allocator, io: std.Io, dir: []const u8, want: Shape, c: Costs,
         .meta = .{
             .shape = .{ .slots = want.slots, .world = want.world, .dspark = want.dspark, .context = want.context },
             .time = time,
-            .method = .{ .reps = m.reps, .warm = m.warm, .stat = @tagName(m.stat), .recheck = m.recheck, .shape = @tagName(m.shape), .cycle = m.cycle, .deep = m.deep },
+            .method = .{ .reps = m.reps, .warm = m.warm, .stat = @tagName(m.stat), .recheck = m.recheck, .shape = @tagName(m.shape), .cycle = m.cycle, .deep = m.deep, .retime = m.retime, .spike = m.spike },
             .seconds = rec.seconds,
             .kept_rank0 = rec.kept,
+            .retimed_rows = rec.retimed,
+            .retimed_before = rec.before,
             .prompt_tokens = rec.tokens,
             .engine = "zig",
         },
