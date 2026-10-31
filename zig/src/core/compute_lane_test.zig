@@ -59,6 +59,27 @@ test "compute sandbox: self test passes (Landlock and seccomp present)" {
     try pool.selfTest(j.arena.allocator());
 }
 
+test "compute sandbox: a job from a thread at nice 19 runs and keeps that niceness" {
+    try ready();
+    const Run = struct {
+        status: lane.Status = .unavailable,
+        out: []const u8 = "",
+        fn go(r: *@This(), j: *Job) void {
+            _ = linux.syscall3(.setpriority, 0, 0, 19); // this thread only: the job inherits it
+            const o = j.expectStatus(.{}, "import os\nos.nice(0)", .ok) catch return;
+            r.status = o.status;
+            r.out = o.stdout;
+        }
+    };
+    var j: Job = .{};
+    defer j.deinit();
+    var r: Run = .{};
+    const t = try std.Thread.spawn(.{}, Run.go, .{ &r, &j });
+    t.join();
+    try expectEqual(lane.Status.ok, r.status);
+    try expectEqualStrings("19\n", r.out);
+}
+
 test "compute sandbox: final expression prints its repr" {
     try ready();
     var j: Job = .{};

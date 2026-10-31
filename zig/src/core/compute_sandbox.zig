@@ -78,7 +78,9 @@ fn confine(argv: []const [:0]const u8) noreturn {
     limit("RLIMIT_CORE", .CORE, 0);
     limit("RLIMIT_NOFILE", .NOFILE, 64);
     if (root) limit("RLIMIT_NPROC", .NPROC, 512);
-    check("setpriority", linux.syscall3(.setpriority, 0, 0, 10));
+    // nice 10 at least, never less than the engine's own: lowering it needs a privilege the job no longer has
+    const inherited = 20 - @as(isize, @bitCast(linux.syscall2(.getpriority, 0, 0)));
+    if (inherited < 10) check("setpriority", linux.syscall3(.setpriority, 0, 0, 10));
     if (job.cpus.len > 0) {
         var set: [16]u64 = undefined;
         if (!cpuList(job.cpus, &set)) die("cpu list", code(.INVAL));
