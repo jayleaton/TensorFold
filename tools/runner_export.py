@@ -11,6 +11,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from runner_isolate import build_isolatable, isolate_blocks
+
 MAGIC = b"TFIMR001"
 HEADER = struct.Struct("<8sIIQII32s")
 UPSTREAM = "bec1a0c9654ac8151b6f36ed0154a19c53141384"
@@ -166,8 +168,9 @@ def build_document(qwenputer, elf_path=None, expr=None):
             addr = calc.CALC_IN + i
             wi, shift = addr >> 2, 8 * (addr & 3)
             m.ram[wi] = (m.ram[wi] & ~(255 << shift)) | b << shift
-    c = core.build()
+    c = build_isolatable(core, ir)
     core.snapshot(c, m)
+    isolate_blocks(c, ir)
     families = [{"name": n, "base": int(S.FAMILIES[n][0]), "size": int(S.FAMILIES[n][1])}
                 if n in S.FAMILIES else {"name": n, "base": S.CONTROLS[n], "size": 1}
                 for n in core.OUT_NAMES[:-1]]

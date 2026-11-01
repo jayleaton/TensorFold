@@ -11,6 +11,7 @@ from pathlib import Path
 
 from runner_circuit import read_circuit
 from runner_export import feature_value
+from runner_isolate import build_isolatable, isolate_blocks
 
 
 def restore(doc, ir, np):
@@ -134,8 +135,9 @@ def main():
               "ram_hex": struct.pack(f"<{len(m.ram)}I", *m.ram).hex(), "drom_hex": m.drom.hex()}
     if program["entry"] != m.pc or any(program[k] != value for k, value in images.items()):
         raise ValueError("serialized program image differs from reference boot state")
-    original = core.build()
+    original = build_isolatable(core, ir)
     core.snapshot(original, m)
+    isolate_blocks(original, ir)
     restored = restore(doc, ir, np)
     initial_matrices = compare_initial_states(original, restored, ir, np)
     toks = m.run(10**7)
@@ -165,7 +167,7 @@ def main():
                       "initial_matrices": initial_matrices,
                       "outcome": "machine_limit" if limited else "ok",
                       "stdout": m.out.decode(), "trace_sha256": hashlib.sha256(token_bytes).hexdigest(),
-                      "residuals": "all dimensions byte-equal to upstream IR", "chunk": args.chunk}))
+                      "residuals": "all dimensions byte-equal to isolated upstream IR", "chunk": args.chunk}))
 
 
 if __name__ == "__main__":
