@@ -6,6 +6,9 @@ pub const Machine = @import("runner_graph_machine.zig").Machine;
 pub const Packet = @import("runner_graph_packet.zig").Packet;
 pub const Op = @import("runner_graph_packet.zig").Op;
 pub const Plan = @import("runner_graph_packet.zig").Plan;
+pub const Print = @import("runner_graph_packet.zig").Print;
+pub const PrintStyle = @import("runner_graph_packet.zig").Style;
+pub const PrintEnding = @import("runner_graph_packet.zig").Ending;
 pub const Builder = @import("runner_graph_packet.zig").Builder;
 pub const id = "graph";
 

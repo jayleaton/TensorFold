@@ -22,7 +22,7 @@ BYTE = sum(size for _, size in LAYOUT[:6])
 HALT = sum(size for _, size in LAYOUT[:17])
 RUNTIME_FILES = ("runner_graph.zig", "runner_graph_bank.zig", "runner_graph_machine.zig",
                  "runner_graph_binary.zig", "runner_graph_packet.zig", "runner_graph_algorithms.zig",
-                 "runner_graph_state_cache.zig")
+                 "runner_graph_state_cache.zig", "runner_graph_print.zig")
 
 
 def require(condition, message):
@@ -135,7 +135,7 @@ def negative_controls(cases, manifest):
     require(text and text[-1] in "0123456789", "control seed is not signed decimal")
     bad_operand["values"][0] = text[:-1] + ("1" if text[-1] == "0" else "0")
     bad_literal = copy.deepcopy(seed["packet"])
-    bad_literal["values"][0] = "0" * 63
+    bad_literal["values"][0] = "0" * 129
     override = copy.deepcopy(seed["packet"])
     override["ops"] = [{"op": "add", "width": 4, "a": 0, "b": 1}]
     missing = "__graph_verify_missing_plan__"

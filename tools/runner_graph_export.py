@@ -18,9 +18,10 @@ from runner_export import write_circuit
 from runner_graph_ir import BUCKETS, build_template
 from runner_graph_plans import plan_catalog
 from runner_graph_algorithms import OPERATIONS as INTEGER_KERNELS, catalog
+from runner_graph_whole import OPERATIONS as WHOLE_KERNELS, plans as whole_plans
 
 
-OPERATIONS = ("add", "sub", "mul", "divstep", "divfinal", *INTEGER_KERNELS)
+OPERATIONS = ("add", "sub", "mul", "divstep", "divfinal", *INTEGER_KERNELS, *WHOLE_KERNELS)
 
 
 def bridge(doc, baseline):
@@ -34,7 +35,7 @@ def bridge(doc, baseline):
 def export(args):
     args.output.mkdir(parents=True, exist_ok=args.resume)
     sources = ("runner_graph_ir.py", "runner_graph_algorithms.py", "runner_graph_div.py",
-               "runner_graph_export.py", "runner_graph_plans.py")
+               "runner_graph_export.py", "runner_graph_plans.py", "runner_graph_whole.py", "runner_graph_format.py")
     identity = {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest() for name in sources}
     identity["widths"] = args.widths
     legacy = json.loads(Path(__file__).with_name("runner-graph-legacy.json").read_text())
@@ -52,9 +53,9 @@ def export(args):
     selections = [(op, width) for op in OPERATIONS for width in args.widths if op != "meta" or width >= 8]
     if any(width < 8 for width in args.widths) and 8 not in args.widths:
         selections.append(("meta", 8))
-    selections += [("emit", 62)]
-    if 128 in args.widths:
-        selections.append(("emit", 128))
+    if ("meta", 128) not in selections:
+        selections.append(("meta", 128))
+    selections += [(op, width) for op in ("emit", "format") for width in (62, 128)]
     selections += [(op, width) for op in ("emit_first", "emit_last") for width in (62, 128)
                    if width == 62 or width in args.widths]
     for op, width in selections:
@@ -109,6 +110,7 @@ def export(args):
     plans = [plan for plan in plans if all(call["op"] == "bind" or (call["op"], call["width"]) in allowed
                                          for call in plan["ops"])]
     plans += catalog(args.widths)
+    plans += whole_plans(args.widths)
     manifest = {"version": 1, "templates": descriptors, "plans": plans}
     (args.output / "bank.json").write_text(json.dumps(manifest, separators=(",", ":")) + "\n")
     (args.output / "Qwenputer-MIT.txt").write_text(baseline["source"]["license_text"])

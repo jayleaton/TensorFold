@@ -1,6 +1,7 @@
 //! Native graph evidence: evaluator tokens, exact stdout, prepared-bank boot and backend lifecycle.
 const std = @import("std");
 const graph = @import("runner_graph.zig");
+const packet = @import("runner_graph_packet.zig");
 const state_cache = @import("runner_graph_state_cache.zig");
 const api = @import("runner_api.zig");
 const Allocator = std.mem.Allocator;
@@ -228,9 +229,7 @@ fn runCase(a: Allocator, keep: Allocator, bank: *const graph.Bank, c: Case, budg
     row.steps = m.steps;
     if (end) |e| row.status = @tagName(e.end);
     const halted = std.mem.eql(u8, row.status, "halted");
-    if (m.algorithm != null) {
-        row.alu_halts = std.mem.count(u32, trace.items, &.{halt}) - @as(usize, @intFromBool(halted));
-    }
+    row.alu_halts = std.mem.count(u32, trace.items, &.{halt}) - @as(usize, @intFromBool(halted));
     try audit(keep, &row, trace.items, out.items, halted, all_raw, all_visible);
     row.actual_output = try keep.dupe(u8, out.items);
     row.output_equal = std.mem.eql(u8, out.items, c.expected_output);
@@ -240,7 +239,9 @@ fn runCase(a: Allocator, keep: Allocator, bank: *const graph.Bank, c: Case, budg
     if (!row.pass) row.reason = "status, output or generated token trace differs";
     if (row.pass and halted and !c.expect_mismatch and seeds.items.len < 4) {
         const op = m.algorithm orelse if (m.ops.len > 0) m.ops[0].op else "identity";
-        const eligible = if (seeds.items.len < 2) m.algorithm == null else m.algorithm != null;
+        const simple_output = m.prints.len == 0 or (m.prints.len == 1 and m.prints[0].style == .integer and
+            m.prints[0].ending == .newline and !m.prints[0].prefix and m.prints[0].precision == 0);
+        const eligible = if (seeds.items.len < 2) m.algorithm == null and simple_output else m.algorithm != null;
         const distinct = for (seeds.items) |seed| {
             if (std.mem.eql(u8, op, seed.op)) break false;
         } else true;
@@ -394,18 +395,26 @@ fn lifecycle(a: Allocator, bank: *const graph.Bank, seeds: []const Seed, budget:
     try require((try complete.run(budget, &out, null)).end == .halted);
     const entries = complete.states.entries.items;
     var template = entries[entries.len - 1].template.*;
-    try require(std.mem.eql(u8, template.name, "emit") and out.items.len > 0);
+    const formatted = std.mem.eql(u8, template.name, "format");
+    try require((formatted or std.mem.eql(u8, template.name, "emit")) and out.items.len > 0);
+    const result_ref = if (complete.prints.len == 1) complete.prints[0].ref else complete.result;
+    var replay = [2]packet.Value{ complete.values[result_ref], try packet.literal("0") };
+    const original_values = complete.values;
+    complete.values = &replay;
+    defer complete.values = original_values;
+    const emitter_args = [_]u32{ 0, 1 };
+    const emitter_refs = emitter_args[0..(if (formatted) @as(usize, 2) else 1)];
     template.circuit.fault_family = template.circuit.byte_family;
     out.clearRetainingCapacity();
-    const fault_end = try complete.invoke(&template, &.{complete.result}, 0, std.math.maxInt(u64), &out, null, true);
+    const fault_end = try complete.invoke(&template, emitter_refs, 0, std.math.maxInt(u64), &out, null, true);
     try require(fault_end == .fault and cacheClean(&complete.states));
     template.circuit.fault_family = null;
-    if (complete.invoke(&template, &.{complete.result}, 0, std.math.maxInt(u64), &out, null, false)) |_|
+    if (complete.invoke(&template, emitter_refs, 0, std.math.maxInt(u64), &out, null, false)) |_|
         return error.MissingUnexpectedByte
     else |err|
         try require(err == error.GraphUnexpectedByte);
     try require(cacheClean(&complete.states));
-    try require((try complete.invoke(&template, &.{complete.result}, 0, std.math.maxInt(u64), &out, null, true)) == .halted);
+    try require((try complete.invoke(&template, emitter_refs, 0, std.math.maxInt(u64), &out, null, true)) == .halted);
     try require(std.mem.eql(u8, out.items, seeds[0].output) and cacheClean(&complete.states));
     checks.* += 1;
     if (seeds.len == 4) {
