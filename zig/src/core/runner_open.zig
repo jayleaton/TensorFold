@@ -38,14 +38,14 @@ pub fn open(gpa: Allocator, cfg: Config) !*Runner {
     const back = try @import("runner_circuit_backend.zig").placed(gpa, &o.circuit, cfg.workers, &o.placer);
     var frontend = @import("runner_frontend.zig").frontend();
     var backend = back;
-    // backend graph: T1's bank loads once here; one integer operation runs on it, calc and ELF on the circuit
+    // backend graph: T1's bank loads once here; pure-integer calc programs run on it, the rest on the circuit
     if (cfg.backend == .graph) {
         const t0 = nowNs();
         o.bank = graph.Bank.load(gpa, cfg.graph_bank) catch |e| {
             log.err("TF_DSV41_RUNNER_GRAPH_BANK={s}: {t}", .{ cfg.graph_bank, e });
             return e;
         };
-        o.routed = .{ .inner = frontend };
+        o.routed = .{ .inner = frontend, .bank = &o.bank };
         o.dispatch = .{ .circuit = back, .graph = try graph.backend(gpa, &o.bank, cfg.workers) };
         frontend = o.routed.frontend();
         backend = o.dispatch.backend();
