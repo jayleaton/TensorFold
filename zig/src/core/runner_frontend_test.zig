@@ -3,7 +3,7 @@ const f = @import("runner_frontend.zig");
 const t = std.testing;
 
 test "frontend accepts model multiply and REPL power without computing the answer" {
-    var exact: f.Context = .{ .io = t.io, .exact_python = true };
+    var exact: f.Context = .{ .io = t.io, .exact_tags = true };
     const cases = [_][3][]const u8{
         .{ "python", "print(123456789012345678901234567890 * 987654321098765432109876543210)", "123456789012345678901234567890*987654321098765432109876543210" },
         .{ "py", "2**100", "2**100" },
@@ -52,6 +52,7 @@ test {
     _ = @import("runner_frontend_program.zig");
     _ = @import("runner_frontend_reference_test.zig");
     _ = @import("runner_frontend_coverage_test.zig");
+    _ = @import("runner_frontend_notation_test.zig");
     _ = @import("runner_frontend_boot.zig");
     _ = @import("runner_frontend_boot_main.zig");
 }
@@ -123,11 +124,11 @@ test "inline typographic operators normalize without changing Python syntax or t
     const result = try front.translate(null, t.allocator, .{ .form = .inline_expr, .lang = "python", .code = "47 × 83 − 1" });
     try t.expect(result == .program);
     defer t.allocator.free(result.program.bytes);
-    try t.expectEqualStrings("47*83-1", result.program.bytes);
+    try t.expectEqualStrings("((47*83)-1)", result.program.bytes);
     for ([_][]const u8{ "47 × 83", "47 − 83" }) |code| {
         try t.expect((try front.translate(null, t.allocator, .{ .form = .fence, .lang = "python", .code = code })) == .abstain);
     }
-    for ([_][]const u8{ "1,000 + 2", "2*3,18", "2^10", "1.18 × 0.82", "7 ÷ 2", "gcd(2,4)" }) |code| {
+    for ([_][]const u8{ "1,000 + 2", "2*3,18", "2^10", "gcd(2,4)" }) |code| {
         try t.expect((try front.translate(null, t.allocator, .{ .form = .inline_expr, .lang = "python", .code = code })) == .abstain);
     }
 }

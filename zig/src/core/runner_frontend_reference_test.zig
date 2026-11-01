@@ -13,6 +13,7 @@ const reference =
     \\else:
     \\    m = ref.Machine.from_program(elf.program(sys.argv[3]))
     \\m.run(100000)
+    \\assert m.halted and m.fault is None and m.exit_code == 0, (m.halted, m.fault, m.exit_code)
     \\sys.stdout.buffer.write(bytes(m.out))
 ;
 
@@ -51,7 +52,7 @@ test "accepted arithmetic executes in the firmware reference with exact output" 
         std.debug.print("SKIP firmware reference: set TF_RUNNER_QWENPUTER to its source checkout\n", .{});
         return error.SkipZigTest;
     };
-    var context: @import("runner_frontend.zig").Context = .{ .io = t.io, .exact_python = true };
+    var context: @import("runner_frontend.zig").Context = .{ .io = t.io, .exact_tags = true };
     const frontend = context.frontend();
     const cases = [_][3][]const u8{
         .{ "python", "print(123456789012345*987654321098765)", "121932631137021071359549253925\n" },
