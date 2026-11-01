@@ -122,6 +122,7 @@ pub const Engine = struct {
     /// One round for every live stream (Python `_family_step`).
     pub fn step(e: *Engine) !void {
         _ = e.arena.reset(.retain_capacity);
+        if (@import("round_trace.zig").on()) @import("round_trace.zig").before(e);
         const a = e.arena.allocator();
         try trail.event(e, &.{ f("ev", str("step")), f("index", int(e.steps)) });
         e.steps += 1;
@@ -160,6 +161,7 @@ pub const Engine = struct {
             }
         }
         try trail.resolve(e);
+        if (@import("round_trace.zig").on()) @import("round_trace.zig").after(e);
         try e.sweep();
         try trail.state(e);
     }

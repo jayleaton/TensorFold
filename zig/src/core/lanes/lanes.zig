@@ -29,6 +29,7 @@ pub const windows = @import("windows.zig");
 pub const trail = @import("trail.zig");
 pub const engine = @import("engine.zig");
 pub const hold = @import("hold.zig");
+pub const round_trace = @import("round_trace.zig");
 pub const fake = @import("fake.zig");
 pub const drafter = @import("drafter.zig");
 pub const drafted = @import("drafted.zig");

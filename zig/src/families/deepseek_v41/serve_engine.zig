@@ -131,6 +131,7 @@ pub const Served = struct {
         s.clock = .{ .io = io };
         s.core = lanes.Engine.init(gpa, &s.cfg, s.x.backend(), s.clock.clock());
         s.x.attach(&s.core);
+        try @import("runner_trace.zig").open(gpa, m.rows, s.x, m.f.engram_rows);
         const window: u32 = @intCast(@min(context orelse m.f.opts.limit, m.f.opts.limit));
         s.host = api.LaneHost.init(gpa, io, &s.core, .{ .name = "dsv41-cuda", .lanes = m.slots, .context_window = window, .prefill_step = m.gt.prefill_rows, .structures = m.grammar_masks != null });
         // TF_DSV41_COMPUTE_LANE=1: built-in code runs on the CPU while its reply holds at EOS (core/compute_lane.zig)
