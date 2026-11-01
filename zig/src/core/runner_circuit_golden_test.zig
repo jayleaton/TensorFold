@@ -1,4 +1,4 @@
-//! T1's reference traces against the CPU circuit: every token, step count and output byte (TF_RUNNER_CIRCUIT/GOLDENS).
+//! T1 reference traces vs the CPU circuit: TF_RUNNER_CIRCUIT, _GOLDENS, optional _GOLDEN_LIMIT, _GOLDEN_SHARD=i/n.
 const std = @import("std");
 const rc = @import("runner_circuit.zig");
 
@@ -63,6 +63,13 @@ test "golden: the CPU circuit reproduces every reference trace token, step count
         return error.SkipZigTest;
     };
     const limit = if (env("TF_RUNNER_GOLDEN_LIMIT")) |l| try std.fmt.parseInt(u64, l, 10) else std.math.maxInt(u64);
+    var shard: [2]u64 = .{ 0, 1 };
+    if (env("TF_RUNNER_GOLDEN_SHARD")) |sh| {
+        var parts = std.mem.splitScalar(u8, sh, '/');
+        shard[0] = try std.fmt.parseInt(u64, parts.first(), 10);
+        shard[1] = try std.fmt.parseInt(u64, parts.next() orelse return error.GoldenShard, 10);
+        if (shard[0] >= shard[1]) return error.GoldenShard;
+    }
     var circuit = try rc.Circuit.load(gpa, circuit_path);
     defer circuit.deinit(gpa);
     const manifest_bytes = try readFile(dir, "manifest.json");
@@ -80,7 +87,9 @@ test "golden: the CPU circuit reproduces every reference trace token, step count
     var totals: struct { cases: u64 = 0, steps: u64 = 0, ns: u64 = 0, skipped: u64 = 0 } = .{};
     var it = std.mem.tokenizeScalar(u8, lines, '\n');
     var calc_seen: u64 = 0;
-    while (it.next()) |line| {
+    var index: u64 = 0;
+    while (it.next()) |line| : (index += 1) {
+        if (index % shard[1] != shard[0]) continue;
         var parsed = try std.json.parseFromSlice(Case, gpa, line, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
         const case = parsed.value;
