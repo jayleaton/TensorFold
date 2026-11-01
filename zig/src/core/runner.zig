@@ -131,6 +131,8 @@ pub const Session = struct {
     owned_n: u32 = 0,
     abstained_n: u32 = 0,
     held_ms: u64 = 0, // summed over the reply's holds
+    forcing: ?struct { at: u64, left: usize, cell: u32 } = null, // an owned result's forced tokens still to commit
+    resume_ms: u64 = 0, // summed: an owned result's settling to the model's first token after it
     broken: bool = false, // out of memory once: no more cells, no more holds
 
     pub fn hook(s: *Session) lanes.stream.RunnerHook {
@@ -148,6 +150,15 @@ pub const Session = struct {
 
     fn feed(s: *Session, token: u32, think_open: bool, can_hold: bool) Allocator.Error!bool {
         const tx = s.r.text.?;
+        if (s.forcing) |*r| {
+            // the forced tokens commit first; the next token is the model's own, one round after the result settled
+            if (r.left > 0) r.left -= 1 else {
+                const ms = (nowNs() -| r.at) / std.time.ns_per_ms;
+                s.resume_ms += ms;
+                log.info("reply {d} cell {d}: model's next token {d} ms after its result", .{ s.id, r.cell, ms });
+                s.forcing = null;
+            }
+        }
         const ev = try s.scan.feed(s.r.gpa, tx.bytes(tx.ctx, token), think_open);
         if (ev.closed) |c| try s.open(c);
         const t = ev.trigger orelse return false;
@@ -226,6 +237,7 @@ pub const Session = struct {
         s.owned_n += 1;
         c.told = .owned;
         c.owned_tokens = @intCast(ids.len);
+        s.forcing = .{ .at = nowNs(), .left = ids.len, .cell = w.index };
         log.info("reply {d} cell {d} ({s} {t}): owned {d} tokens, {t} after {d} steps, run {d} ms, held {d} ms", .{ s.id, w.index, c.lang, c.form, ids.len, res.status, res.steps, res.exec_ns / std.time.ns_per_ms, held_ms });
         return ids;
     }
@@ -242,6 +254,7 @@ pub const Session = struct {
                 s.owned_n += 1;
                 c.told = .owned;
                 c.owned_tokens = @intCast(ids.len);
+                s.forcing = .{ .at = nowNs(), .left = ids.len, .cell = index };
                 const res = c.result.?;
                 log.info("reply {d} cell {d} (trace): owned {d} tokens, {d} steps, run {d} ms, held {d} ms", .{ s.id, index, ids.len, res.steps, res.exec_ns / std.time.ns_per_ms, held_ms });
                 return ids;
@@ -360,7 +373,7 @@ pub const Session = struct {
         w.writeByte('{') catch return "";
         for (forms, [_][]const u8{ "fence", "repl", "inline", "trace" }) |f, name|
             w.print("\"{s}\":{{\"closed\":{d},\"owned\":{d},\"abstained\":{d},\"owned_tokens\":{d}}},", .{ name, f[0], f[1], f[2], f[3] }) catch return "";
-        w.print("\"owned_by\":{{\"calc\":{d},\"elf\":{d},\"graph\":{d}}},\"held_ms\":{d}}}", .{ kinds[0], kinds[1], kinds[2], s.held_ms }) catch return "";
+        w.print("\"owned_by\":{{\"calc\":{d},\"elf\":{d},\"graph\":{d}}},\"held_ms\":{d},\"resume_ms\":{d}}}", .{ kinds[0], kinds[1], kinds[2], s.held_ms, s.resume_ms }) catch return "";
         return w.buffered();
     }
 
