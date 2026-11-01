@@ -12,6 +12,7 @@ pub const State = struct {
     gpa: std.mem.Allocator,
     circuit: *const model.Circuit,
     tables: [][]Scalar,
+    owned: []bool,
     present: []u128,
     history: []Scalar,
     steps: u64 = 0,
@@ -27,6 +28,9 @@ pub const State = struct {
             s.* = if (t.writable) try gpa.dupe(Scalar, t.rows) else @constCast(t.rows);
             copied += 1;
         }
+        const owned = try gpa.alloc(bool, c.tables.len);
+        errdefer gpa.free(owned);
+        for (c.tables, owned) |t, *o| o.* = t.writable;
         const present = try gpa.alloc(u128, c.tables.len);
         errdefer gpa.free(present);
         for (c.tables, present) |t, *p| p.* = t.present;
@@ -36,12 +40,13 @@ pub const State = struct {
         const x = try gpa.alloc(Scalar, c.dims);
         errdefer gpa.free(x);
         const work = try gpa.alloc(Scalar, workSize(c));
-        return .{ .gpa = gpa, .circuit = c, .tables = tables, .present = present, .history = hist, .x = x, .work = work };
+        return .{ .gpa = gpa, .circuit = c, .tables = tables, .owned = owned, .present = present, .history = hist, .x = x, .work = work };
     }
 
     pub fn deinit(s: *State) void {
-        for (s.circuit.tables, s.tables) |t, rows| if (t.writable) s.gpa.free(rows);
+        for (s.owned, s.tables) |o, rows| if (o) s.gpa.free(rows);
         s.gpa.free(s.tables);
+        s.gpa.free(s.owned);
         s.gpa.free(s.present);
         s.gpa.free(s.history);
         s.gpa.free(s.x);
@@ -61,16 +66,23 @@ pub const State = struct {
         return s.present[table] >> @intCast(r) & 1 == 1;
     }
 
-    /// Replaces one row (the RAM op's write); only tables the circuit can change are writable.
+    /// Copies a shared table into this machine before the host rewrites it (an ELF boot's ROM and DROM).
+    pub fn own(s: *State, table: u32) !void {
+        if (s.owned[table]) return;
+        s.tables[table] = try s.gpa.dupe(Scalar, s.tables[table]);
+        s.owned[table] = true;
+    }
+
+    /// Replaces one row (the RAM op's write) of a table this machine owns.
     pub fn writeRow(s: *State, table: u32, r: u32, values: []const Scalar) !void {
-        if (!s.writable(table)) return error.CircuitTableReadOnly;
+        if (!s.owned[table]) return error.CircuitTableReadOnly;
         if (r >= hd or values.len != hd) return error.CircuitIndex;
         @memcpy(s.row(table, r), values);
         s.present[table] |= @as(u128, 1) << @intCast(r);
     }
 
     pub fn clearRow(s: *State, table: u32, r: u32) !void {
-        if (!s.writable(table)) return error.CircuitTableReadOnly;
+        if (!s.owned[table]) return error.CircuitTableReadOnly;
         if (r >= hd) return error.CircuitIndex;
         @memset(s.row(table, r), 0);
         s.present[table] &= ~(@as(u128, 1) << @intCast(r));
@@ -84,7 +96,7 @@ pub const State = struct {
     /// Bytes this machine owns beyond the shared circuit (copied tables, history, scratch), for admission.
     pub fn ownedBytes(s: *const State) usize {
         var n: usize = (s.history.len + s.x.len + s.work.len) * @sizeOf(Scalar);
-        for (s.circuit.tables) |t| n += if (t.writable) table_floats * @sizeOf(Scalar) else 0;
+        for (s.owned) |o| n += if (o) table_floats * @sizeOf(Scalar) else 0;
         return n;
     }
 

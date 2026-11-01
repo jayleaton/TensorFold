@@ -58,7 +58,9 @@ fn heads(s: *State, h: *const model.Heads) !void {
         const past = s.channelHistory(h.first_channel + @as(u32, @intCast(i)));
         const now = e.*;
         e.* = @max(t[0] * now + t[1] * past[0] + t[2] * past[1] + t[3] * past[2], 0);
-        past.* = .{ now, past[0], past[1] };
+        past[2] = past[1];
+        past[1] = past[0];
+        past[0] = now;
     }
     for (h.heads) |*head| {
         scatter(head.k, p, keys, false);

@@ -13,7 +13,8 @@ pub const dims = struct {
     pub const t1 = 33;
     pub const t2 = 34;
     pub const lagout = 35;
-    pub const count = 36;
+    pub const lag3out = 36;
+    pub const count = 37;
 };
 pub const family_bits = 3;
 
@@ -40,6 +41,8 @@ pub fn build(a: std.mem.Allocator, variant: Variant) ![]u8 {
     try w.s("],\"format\":\"tensorfold.runner.p2\",\"nodes\":[");
     try lagHead(w);
     try w.s(",");
+    try lag3Head(w);
+    try w.s(",");
     try ramHead(w, variant);
     try w.s(",{\"kind\":\"ffn\",\"name\":\"h1\",\"out\":33,\"into\":false,\"terms\":[[1.0,[[0,1.0]],[[2,1.0]]]]}");
     try w.s(",{\"kind\":\"ffn\",\"name\":\"h2\",\"out\":34,\"into\":false,\"terms\":[[1.0,[[33,1.0]],[[0,1.0]]]]}");
@@ -48,7 +51,12 @@ pub fn build(a: std.mem.Allocator, variant: Variant) ![]u8 {
     for (0..family_bits + 16) |i| try w.f("{s}{d}", .{ if (i == 0) "" else ",", dims.code + i });
     try w.f("],\"family_bits\":{d},\"families\":", .{family_bits});
     try families(w);
-    try w.s(",\"payload_bits\":16},\"program\":{\"input_address\":256,\"input_capacity\":256,\"kind\":\"calc\"},");
+    try w.s(",\"payload_bits\":16},\"program\":{\"input_address\":256,\"input_capacity\":256,\"kind\":\"calc\",\"entry\":262144,");
+    try w.s("\"rom_le_hex\":\"");
+    for (0..1 << 16) |_| try w.s("00000000");
+    try w.s("\",\"drom_hex\":\"\",\"ram_hex\":\"");
+    for (0..1 << 13) |_| try w.s("00000000");
+    try w.s("\"},");
     try w.f("\"stats\":{{\"dims\":{d}}},\"tokens\":{{\"byte_family\":4,\"families\":", .{dims.count});
     try families(w);
     try w.f(",\"go\":0,\"halt\":{d},\"vocab\":{d}}},\"version\":1}}", .{ token(5, 0), token(5, 0) + 1 });
@@ -103,6 +111,15 @@ fn lagHead(w: Writer) !void {
     try w.s("\"value_heads\":[{\"v\":[[0,{\"expr\":[[0," ++ a_ref ++ "]],\"taps\":[1.0,0.0,0.0,0.0]}],[1,{\"expr\":[[0," ++ a_ref ++ "]],\"taps\":[1.0,0.0,0.0,0.0]}],");
     try w.s("[2,{\"expr\":[[0,128.0]],\"taps\":[1.0,0.0,0.0,0.0]}]],\"a\":[[5,238.0]],\"beta\":null,\"z\":[[2,[[0,1.0]]]],");
     try w.s("\"out\":[[2,35,16384.0]],\"into\":false,\"init\":[]}]}");
+}
+
+/// A key from the token three back being W (taps 0,0,0,1), read on A, output to lag3out.
+fn lag3Head(w: Writer) !void {
+    try w.s("{\"kind\":\"head\",\"name\":\"lag3\",\"n_cols\":128,\"levels\":\"bit\",\"tiny\":0.0,");
+    try w.s("\"q\":[[0,{\"expr\":[[2,1.0]],\"taps\":[1.0,0.0,0.0,0.0]}]],\"k\":[[0,{\"expr\":[[3,1.0]],\"taps\":[0.0,0.0,0.0,1.0]}]],");
+    try w.s("\"value_heads\":[{\"v\":[[0,{\"expr\":[[0," ++ a_ref ++ "]],\"taps\":[1.0,0.0,0.0,0.0]}],[1,{\"expr\":[[0," ++ a_ref ++ "]],\"taps\":[1.0,0.0,0.0,0.0]}],");
+    try w.s("[2,{\"expr\":[[0,128.0]],\"taps\":[1.0,0.0,0.0,0.0]}]],\"a\":[],\"beta\":null,\"z\":[[2,[[0,1.0]]]],");
+    try w.s("\"out\":[[2,36,16384.0]],\"into\":false,\"init\":[]}]}");
 }
 
 /// ram0: W writes row (payload bits 0-1) with data bit 2 in column 2; R reads its row into rd. Row 3 starts at 1.
