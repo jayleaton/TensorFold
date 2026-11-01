@@ -165,7 +165,7 @@ class Builder:
                 "order": "lsd_first", "sign_col": 126 if offset == 0 else None,
                 "error_col": 127 if offset == 0 else None}
 
-    def input(self, index):
+    def input(self, index, preserve_sign=False):
         if index in self.inputs:
             return self.inputs[index]
         digits, sign, error = [], self.zero, self.zero
@@ -189,16 +189,19 @@ class Builder:
                 digits.append(self.choose(bad, self.zero, digit))
             if offset == 0:
                 sign, error = bits[-2:]
-        value = self.normalize(Value(digits, sign, self.any([error, *invalid])))
+        value = Value(digits, sign, self.any([error, *invalid]))
+        if not preserve_sign:
+            value = self.normalize(value)
         self.inputs[index] = value
         return value
 
-    def _latch(self, index, value):
+    def _latch(self, index, value, preserve_sign=False):
         from chipformer.q35.prims import thead
 
         overflow = self.nz(value.digits[self.width:])
-        value = self.normalize(Value(self._pad(value.digits, self.width), value.sign,
-                                     self.any([value.error, overflow])))
+        value = Value(self._pad(value.digits, self.width), value.sign, self.any([value.error, overflow]))
+        if not preserve_sign:
+            value = self.normalize(value)
         stored, sign, error = [], self.zero, self.zero
         for offset in range(0, self.width, 31):
             group = value.digits[offset:offset + 31]
@@ -277,12 +280,12 @@ class Builder:
             payload.append(self.choose(value.error, error, normal))
         self._exit(halt, payload)
 
-    def finish(self, outputs, emit=False, prefix=b"", suffix=b"\n"):
+    def finish(self, outputs, emit=False, prefix=b"", suffix=b"\n", preserve_sign=False):
         if isinstance(outputs, Value):
             outputs = [outputs]
         if not outputs or (emit and len(outputs) != 1):
             raise ValueError("finish requires outputs; emit requires exactly one Value")
-        latched = [self._latch(index, value) for index, value in enumerate(outputs)]
+        latched = [self._latch(index, value, preserve_sign=preserve_sign) for index, value in enumerate(outputs)]
         if emit:
             self._emit(latched[0], prefix, suffix)
         else:
@@ -294,10 +297,13 @@ class Builder:
 def build_template(root, op, width):
     if width not in BUCKETS:
         raise ValueError(f"template width must be one of {BUCKETS}")
-    if op not in ("add", "sub", "mul", "select", "emit", "emit_first", "emit_last", "divstep", "divfinal", "meta", "half", "digit_sum", "mulmodstep"):
+    whole = ("format", "round_div", "decimal_mul", "compare", "min", "max", "scale10", "float_exact")
+    if op not in ("add", "sub", "mul", "select", "emit", "emit_first", "emit_last", "divstep", "divfinal", "meta", "half", "digit_sum", "mulmodstep", *whole):
         raise ValueError(f"unsupported ALU operation: {op}")
     if op == "meta" and width < 8:
         raise ValueError("meta template requires at least 8 digits")
+    if op == "format" and width not in (62, 128):
+        raise ValueError("format template requires width 62 or 128")
     root = Path(root).resolve()
     load_upstream(root)
     dirty = subprocess.check_output(["git", "-C", str(root), "status", "--porcelain", "--untracked-files=no"],
@@ -309,7 +315,12 @@ def build_template(root, op, width):
     from chipformer.rv import core, spec
 
     builder = Builder(width, core, ir, np)
-    if op in ("meta", "half", "digit_sum", "mulmodstep"):
+    if op == "format":
+        outputs = [builder.input(i, preserve_sign=True) for i in range(2)]
+    elif op in whole:
+        module = importlib.import_module("runner_graph_whole")
+        outputs = module.build(builder, op)
+    elif op in ("meta", "half", "digit_sum", "mulmodstep"):
         module = importlib.import_module("runner_graph_algorithms")
         outputs = module.build(builder, op)
     elif op.startswith("div"):
@@ -327,7 +338,11 @@ def build_template(root, op, width):
         else:
             outputs = getattr(builder, f"signed_{op}")(a, b)
     prefix, suffix = {"emit_first": (b"(", b", "), "emit_last": (b"", b")\n")}.get(op, (b"", b"\n"))
-    metadata = builder.finish(outputs, emit=op.startswith("emit"), prefix=prefix, suffix=suffix)
+    if op == "format":
+        metadata = importlib.import_module("runner_graph_format").finish(builder, outputs)
+    else:
+        metadata = builder.finish(outputs, emit=op.startswith("emit"), prefix=prefix, suffix=suffix,
+                                  preserve_sign=op in ("round_div", "decimal_mul", "scale10", "float_exact"))
     metadata.update(op=op, input_arity=len(builder.inputs))
     c = builder.c
     families = [{"name": name, "base": int(spec.FAMILIES[name][0]), "size": int(spec.FAMILIES[name][1])}

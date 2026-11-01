@@ -6,6 +6,8 @@ const state_cache = @import("runner_graph_state_cache.zig");
 const eval = @import("steps_v1/runner_circuit_eval.zig");
 const bank_mod = @import("runner_graph_bank.zig");
 const packet = @import("runner_graph_packet.zig");
+const algorithms = @import("runner_graph_algorithms.zig");
+const printing = @import("runner_graph_print.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Machine = struct {
@@ -24,6 +26,8 @@ pub const Machine = struct {
     adaptive_widths: bool = true,
     algorithm: ?[]const u8 = null,
     width: u8 = 62,
+    precision: u8 = 0,
+    prints: []const packet.Print = &.{},
 
     pub fn boot(a: Allocator, bank: *const bank_mod.Bank, bytes: []const u8) !Machine {
         if (bytes.len > packet.max_packet) return error.GraphPacketSize;
@@ -37,8 +41,9 @@ pub const Machine = struct {
         var prepared_count: ?usize = null;
         var algorithm: ?[]const u8 = null;
         var width: u8 = 62;
+        var precision: u8 = 0;
         if (p.plan) |name| {
-            if (p.ops.len != 0 or p.result != 0) return error.GraphNamedPlanOverride;
+            if (p.ops.len != 0 or p.result != 0 or p.prints.len != 0) return error.GraphNamedPlanOverride;
             const plan = bank.plan(name) orelse return error.GraphPlan;
             if (p.values.len != plan.inputs) return error.GraphSlotArity;
             ops = plan.ops;
@@ -47,16 +52,18 @@ pub const Machine = struct {
             prepared_count = plan.total_values;
             algorithm = plan.algorithm;
             width = plan.width;
+            precision = plan.precision;
         }
         if (constants.len > packet.max_values - p.values.len) return error.GraphPlanSize;
         const initial = p.values.len + constants.len;
         const count = prepared_count orelse try bank.validate(initial, ops, result);
+        try bank.validatePrints(p.prints, count);
         const values = try a.alloc(packet.Value, count);
         errdefer a.free(values);
         for (p.values, values[0..p.values.len]) |text, *v| v.* = try packet.literal(text);
         if (algorithm != null) for (values[0..p.values.len]) |*v| try fits(v, width);
         @memcpy(values[p.values.len..initial], constants);
-        return .{ .gpa = a, .bank = bank, .parsed = parsed, .values = values, .ops = ops, .result = result, .initial = initial, .algorithm = algorithm, .width = width };
+        return .{ .gpa = a, .bank = bank, .parsed = parsed, .values = values, .ops = ops, .result = result, .initial = initial, .algorithm = algorithm, .width = width, .precision = precision, .prints = p.prints };
     }
 
     pub fn deinit(m: *Machine) void {
@@ -69,7 +76,7 @@ pub const Machine = struct {
     pub fn run(m: *Machine, budget: u64, out: *std.ArrayList(u8), cancel: ?*const std.atomic.Value(bool)) !api.RunEnd {
         if (m.used) return error.GraphMachineAlreadyRun;
         m.used = true;
-        if (m.algorithm) |kind| return @import("runner_graph_algorithms.zig").run(m, kind, m.width, budget, out, cancel);
+        if (m.algorithm) |kind| return algorithms.run(m, kind, m.width, budget, out, cancel);
         var count = m.initial;
         for (m.ops) |op| {
             if (cancelled(cancel)) return .{ .end = .cancelled, .steps = m.steps };
@@ -79,17 +86,31 @@ pub const Machine = struct {
                 if (op.flags) |ref| @memcpy(v[0][126..128], m.values[ref][0][126..128]);
                 m.values[count] = v;
             } else {
-                const t = m.bank.find(op.op, op.width).?;
+                const family = std.meta.stringToEnum(packet.Algorithm, op.op);
+                const t = if (family == null) m.bank.find(op.op, op.width).? else null;
+                const arity = if (family) |f| packet.algorithmArity(f) else t.?.inputs;
                 var refs: [packet.max_arity]u32 = undefined;
                 const args = if (op.args) |args| args else blk: {
                     refs[0] = op.a;
                     if (op.b) |b| refs[1] = b;
-                    break :blk refs[0..t.inputs];
+                    break :blk refs[0..arity];
                 };
-                const end = try m.invoke(t, args, count, budget, out, cancel, false);
+                const end = if (family != null) try algorithms.compute(m, op.op, op.width, op.precision, args, count, budget, out, cancel) else try m.invoke(t.?, args, count, budget, out, cancel, false);
                 if (end != .halted) return .{ .end = end, .steps = m.steps };
             }
+            if (op.checked) for (m.values[count .. count + op.outputs]) |value| {
+                const flag = value[0][127];
+                if (flag == packet.bit_scale) return error.GraphArithmetic;
+                if (flag != 0) return error.GraphPredicate;
+            };
             count += op.outputs;
+        }
+        if (m.prints.len != 0) {
+            for (m.prints) |p| {
+                const end = try printing.emit(m, p, budget, out, cancel);
+                if (end != .halted) return .{ .end = end, .steps = m.steps };
+            }
+            return .{ .end = .halted, .steps = m.steps };
         }
         const width: u8 = blk: {
             fits(&m.values[m.result], 62) catch break :blk 128;
@@ -131,7 +152,7 @@ pub const Machine = struct {
             if (t.circuit.fault_family) |fault| if (fam == fault) return .fault;
             if (fam == t.circuit.byte_family) {
                 if (!emit or payload > 255) return error.GraphUnexpectedByte;
-                if (out.items.len >= 256) return error.GraphOutputSize;
+                if (out.items.len >= packet.max_output) return error.GraphOutputSize;
                 try out.append(m.gpa, @intCast(payload));
             }
         }
