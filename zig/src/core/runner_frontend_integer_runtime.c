@@ -426,18 +426,44 @@ static void tf_wprint(const struct tf_wint *a) {
     for (int i = 0; i < len; ++i) putchar(text[i]);
 }
 
+// Fixed Decimal formatting inserts the proved scale into a runtime coefficient.
+static void tf_wfixed(const struct tf_wint *value, int scale) {
+    char text[79];
+    int length = tf_wformat(*value, text);
+    int start = text[0] == '-', digits = length - start;
+    if (start) putchar('-');
+    if (!scale) {
+        for (int i = start; i < length; ++i) putchar(text[i]);
+    } else if (digits <= scale) {
+        putchar('0'); putchar('.');
+        for (int i = digits; i < scale; ++i) putchar('0');
+        for (int i = start; i < length; ++i) putchar(text[i]);
+    } else {
+        for (int i = start; i < length; ++i) {
+            if (i == length - scale) putchar('.');
+            putchar(text[i]);
+        }
+    }
+}
+
 // Evaluate every node before printing any ordered root; volatile reads retain the requested runtime arithmetic.
-int tf_run_prints(const volatile struct tf_node *nodes, int n, const volatile int *roots,
-                  const volatile unsigned char *endings, int count) {
+int tf_run_formatted(const volatile struct tf_node *nodes, int n, const volatile int *roots,
+                     const volatile unsigned char *endings, const volatile unsigned char *styles,
+                     const volatile unsigned char *scales, int count) {
     tf_wbad = 0;
     if (!nodes || n < 1 || n > 64 || !roots || count < 1 || count > 8) return 1;
     int outputs[8];
-    unsigned char separators[8];
+    unsigned char separators[8], formats[8], precision[8];
     for (int j = 0; j < count; ++j) {
         outputs[j] = roots[j];
         if (outputs[j] < 0 || outputs[j] >= n) return 1;
         separators[j] = endings ? endings[j] : '\n';
         if (separators[j] != ' ' && separators[j] != '\n') return 1;
+        formats[j] = styles ? styles[j] : 0;
+        precision[j] = scales ? scales[j] : 0;
+        if (formats[j] > 2 || precision[j] > 6) return 1;
+        int op = nodes[outputs[j]].op;
+        if (formats[j] && (op == 10 || (op >= 16 && op <= 21))) return 1;
     }
     for (int i = 0; i < n; ++i) {
         const volatile struct tf_node *node = &nodes[i];
@@ -507,7 +533,11 @@ int tf_run_prints(const volatile struct tf_node *nodes, int n, const volatile in
     for (int j = 0; j < count; ++j) {
         int root = outputs[j], op = nodes[root].op;
         struct tf_wint value = tf_wvalues[root];
-        if (op >= 16 && op <= 21) {
+        if (formats[j] >= 2) {
+            tf_wfixed(&value, precision[j]);
+        } else if (formats[j] == 1) {
+            tf_wprint(&value); putchar('.'); putchar('0');
+        } else if (op >= 16 && op <= 21) {
             const char *text = tf_wused(&value) ? "True" : "False";
             while (*text) putchar(*text++);
         } else {
@@ -524,6 +554,12 @@ int tf_run_prints(const volatile struct tf_node *nodes, int n, const volatile in
         putchar(separators[j]);
     }
     return 0;
+}
+
+int tf_run_prints(const volatile struct tf_node *nodes, int n, const volatile int *roots,
+                  const volatile unsigned char *endings, int count) {
+    return tf_run_formatted(nodes, n, roots, endings, (const volatile unsigned char *)0,
+                            (const volatile unsigned char *)0, count);
 }
 
 int tf_run_many(const volatile struct tf_node *nodes, int n, const volatile int *roots, int count) {

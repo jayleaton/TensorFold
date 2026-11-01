@@ -56,9 +56,21 @@ pub fn lowerParsers(a: std.mem.Allocator, parser: *ast.Parser, roots: []const us
 
 // A space continues a grouped print and a newline ends it; all roots share their original runtime nodes.
 pub fn lowerPrints(a: std.mem.Allocator, parser: *ast.Parser, roots: []const usize, endings: []const u8) std.mem.Allocator.Error![]u8 {
+    const defaults: [8]u8 = @splat(0);
+    return lowerFormatted(a, parser, roots, endings, defaults[0..roots.len], defaults[0..roots.len]);
+}
+
+// Styles: 0 ordinary integer/bool/tuple, 1 exact integral float, 2 fixed Decimal.
+pub fn lowerFormatted(a: std.mem.Allocator, parser: *ast.Parser, roots: []const usize, endings: []const u8, styles: []const u8, scales: []const u8) std.mem.Allocator.Error![]u8 {
     std.debug.assert(roots.len > 0 and roots.len <= 8 and endings.len == roots.len);
     for (endings) |ending| std.debug.assert(ending == ' ' or ending == '\n');
-    if (roots.len == 1 and endings[0] == '\n') return lowerParser(a, parser, roots[0]);
+    std.debug.assert(styles.len == roots.len and scales.len == roots.len);
+    var formatted = false;
+    for (styles, scales) |style, scale| {
+        std.debug.assert(style <= 2 and scale <= 6);
+        formatted = formatted or style != 0;
+    }
+    if (!formatted and roots.len == 1 and endings[0] == '\n') return lowerParser(a, parser, roots[0]);
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(a);
     try out.appendSlice(a, @embedFile("runner_frontend_integer_runtime.c"));
@@ -70,9 +82,18 @@ pub fn lowerPrints(a: std.mem.Allocator, parser: *ast.Parser, roots: []const usi
     for (refs[0..roots.len]) |ref| try out.print(a, "{d},", .{ref});
     try out.appendSlice(a, "};\nstatic const unsigned char tf_endings[] = {");
     for (endings) |ending| try out.print(a, "{d},", .{ending});
-    try out.print(a, "}};\nint main(void) {{ return tf_run_prints(tf_nodes, {d}, tf_roots, tf_endings, {d}); }}\n", .{
-        emitter.count, roots.len,
-    });
+    if (formatted) {
+        try out.appendSlice(a, "};\nstatic const unsigned char tf_styles[] = {");
+        for (styles) |style| try out.print(a, "{d},", .{style});
+        try out.appendSlice(a, "};\nstatic const unsigned char tf_scales[] = {");
+        for (scales) |scale| try out.print(a, "{d},", .{scale});
+        try out.print(a, "}};\nint main(void) {{ return tf_run_formatted(tf_nodes, {d}, tf_roots, tf_endings, " ++
+            "tf_styles, tf_scales, {d}); }}\n", .{ emitter.count, roots.len });
+    } else {
+        try out.print(a, "}};\nint main(void) {{ return tf_run_prints(tf_nodes, {d}, tf_roots, tf_endings, {d}); }}\n", .{
+            emitter.count, roots.len,
+        });
+    }
     return try out.toOwnedSlice(a);
 }
 

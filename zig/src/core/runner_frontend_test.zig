@@ -17,6 +17,9 @@ test {
     _ = @import("runner_frontend_script_test.zig");
     _ = @import("runner_frontend_python_assert_test.zig");
     _ = @import("runner_frontend_tool_script_test.zig");
+    _ = @import("runner_frontend_decimal_test.zig");
+    _ = @import("runner_frontend_fraction_test.zig");
+    _ = @import("runner_frontend_digit_reverse_test.zig");
 }
 
 test "complete integer assignment requests use firmware with original inputs and no compiler" {

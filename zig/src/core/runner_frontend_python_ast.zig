@@ -18,6 +18,7 @@ pub const Tag = enum {
     floor,
     modulo,
     neg,
+    reverse_digits,
     logical_not,
     eq,
     ne,
