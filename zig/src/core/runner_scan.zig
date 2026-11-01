@@ -88,8 +88,8 @@ pub const Scanner = struct {
             },
             .prose, .after => {
                 if (s.state == .after and allowed) {
+                    // a header line only: a bare output fence is no handoff (T6 census)
                     if (header(raw)) return s.fire(false);
-                    if (resultFence(raw)) return s.fire(true);
                 }
                 if (s.cfg.fence) if (fenceOpen(raw)) |lang| {
                     s.lang.clearRetainingCapacity();
@@ -151,13 +151,6 @@ const result_tags = [_][]const u8{ "output", "text", "console", "stdout", "plain
 fn isResultTag(tag: []const u8) bool {
     for (result_tags) |r| if (std.ascii.eqlIgnoreCase(tag, r)) return true;
     return false;
-}
-
-/// "```output" / "```text" / …: the model opening a block for the output.
-fn resultFence(line: []const u8) bool {
-    const t = indentOk(line) orelse return false;
-    if (!std.mem.startsWith(u8, t, "```")) return false;
-    return isResultTag(std.mem.trim(u8, t[3..], " \t"));
 }
 
 const header_words = [_][]const u8{
@@ -294,13 +287,13 @@ test "runner scan: cell code and lang are kept exactly" {
     try std.testing.expectEqualStrings("x = 3\nprint(x*x)\n", e.closed.?.code);
 }
 
-test "runner scan: a result fence after a cell triggers fenced; a header inside prose without a cell does not" {
+test "runner scan: a bare result fence after a cell is no trigger; nor is a header in prose without a cell" {
     const a = std.testing.allocator;
     var s: Scanner = .{ .cfg = .{} };
     defer s.deinit(a);
     try std.testing.expectEqual(@as(?Trigger, null), (try s.feed(a, "Result:\n", true)).trigger);
     _ = try s.feed(a, "```python\nprint(1)\n```\n", true);
-    try std.testing.expectEqual(Trigger{ .index = 0, .fenced = true }, (try s.feed(a, "```text\n", true)).trigger.?);
+    try std.testing.expectEqual(@as(?Trigger, null), (try s.feed(a, "```text\n", true)).trigger);
 }
 
 test "runner scan: a REPL line is a cell and its own trigger; a block opener is not" {

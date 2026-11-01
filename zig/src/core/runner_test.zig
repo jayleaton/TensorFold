@@ -228,11 +228,11 @@ test "runner: a loop cell's result is 285; a REPL line's next line is its value"
     try std.testing.expectEqualStrings(repl ++ "1267650600228229401496703205376\nDone.", r);
 }
 
-test "runner: a fenced result block is filled and closed" {
+test "runner: a bare result fence with no header keeps the model's own text" {
     const lead = "```python\nprint(2**100)\n```\n```text\n";
     const got = try one(lead, .{});
     defer gpa.free(got);
-    try std.testing.expectEqualStrings(lead ++ "1267650600228229401496703205376\n```\nDone.", got);
+    try std.testing.expectEqualStrings(lead ++ "42\nDone.", got);
 }
 
 test "runner: a run that ends late gives the same reply as one that ends early" {
