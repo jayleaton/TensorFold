@@ -1,4 +1,3 @@
-zig/src/core/runner_circuit_rom.zig
 //! Qwenputer's pre-decoded ROM word (ref.rom_word): the circuit's view of an RV32 instruction, as data.
 const std = @import("std");
 
