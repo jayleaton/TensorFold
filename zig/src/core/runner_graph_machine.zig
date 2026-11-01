@@ -2,6 +2,7 @@
 const std = @import("std");
 const api = @import("runner_api.zig");
 const State = @import("steps_v1/runner_circuit_state.zig").State;
+const state_cache = @import("runner_graph_state_cache.zig");
 const eval = @import("steps_v1/runner_circuit_eval.zig");
 const bank_mod = @import("runner_graph_bank.zig");
 const packet = @import("runner_graph_packet.zig");
@@ -18,6 +19,11 @@ pub const Machine = struct {
     steps: u64 = 0,
     used: bool = false,
     trace: ?*std.ArrayList(u32) = null,
+    states: state_cache.Cache = .{},
+    reuse_states: bool = true,
+    adaptive_widths: bool = true,
+    algorithm: ?[]const u8 = null,
+    width: u8 = 62,
 
     pub fn boot(a: Allocator, bank: *const bank_mod.Bank, bytes: []const u8) !Machine {
         if (bytes.len > packet.max_packet) return error.GraphPacketSize;
@@ -29,6 +35,8 @@ pub const Machine = struct {
         var result = p.result;
         var constants: []const packet.Value = &.{};
         var prepared_count: ?usize = null;
+        var algorithm: ?[]const u8 = null;
+        var width: u8 = 62;
         if (p.plan) |name| {
             if (p.ops.len != 0 or p.result != 0) return error.GraphNamedPlanOverride;
             const plan = bank.plan(name) orelse return error.GraphPlan;
@@ -37,6 +45,8 @@ pub const Machine = struct {
             result = plan.result;
             constants = plan.constants;
             prepared_count = plan.total_values;
+            algorithm = plan.algorithm;
+            width = plan.width;
         }
         if (constants.len > packet.max_values - p.values.len) return error.GraphPlanSize;
         const initial = p.values.len + constants.len;
@@ -44,11 +54,13 @@ pub const Machine = struct {
         const values = try a.alloc(packet.Value, count);
         errdefer a.free(values);
         for (p.values, values[0..p.values.len]) |text, *v| v.* = try packet.literal(text);
+        if (algorithm != null) for (values[0..p.values.len]) |*v| try fits(v, width);
         @memcpy(values[p.values.len..initial], constants);
-        return .{ .gpa = a, .bank = bank, .parsed = parsed, .values = values, .ops = ops, .result = result, .initial = initial };
+        return .{ .gpa = a, .bank = bank, .parsed = parsed, .values = values, .ops = ops, .result = result, .initial = initial, .algorithm = algorithm, .width = width };
     }
 
     pub fn deinit(m: *Machine) void {
+        m.states.deinit(m.gpa);
         m.gpa.free(m.values);
         m.parsed.deinit();
         m.* = undefined;
@@ -57,6 +69,7 @@ pub const Machine = struct {
     pub fn run(m: *Machine, budget: u64, out: *std.ArrayList(u8), cancel: ?*const std.atomic.Value(bool)) !api.RunEnd {
         if (m.used) return error.GraphMachineAlreadyRun;
         m.used = true;
+        if (m.algorithm) |kind| return @import("runner_graph_algorithms.zig").run(m, kind, m.width, budget, out, cancel);
         var count = m.initial;
         for (m.ops) |op| {
             if (cancelled(cancel)) return .{ .end = .cancelled, .steps = m.steps };
@@ -78,19 +91,27 @@ pub const Machine = struct {
             }
             count += op.outputs;
         }
-        const emitter = m.bank.find("emit", 62) orelse return error.GraphEmitMissing;
+        const width: u8 = blk: {
+            fits(&m.values[m.result], 62) catch break :blk 128;
+            break :blk 62;
+        };
+        const emitter = m.bank.find("emit", width) orelse return error.GraphEmitMissing;
         const end = try m.invoke(emitter, &.{m.result}, 0, budget, out, cancel, true);
         return .{ .end = end, .steps = m.steps };
     }
 
-    fn invoke(m: *Machine, t: *const bank_mod.Template, refs: []const u32, dest: usize, budget: u64, out: *std.ArrayList(u8), cancel: ?*const std.atomic.Value(bool), emit: bool) !End {
+    pub fn invoke(m: *Machine, t: *const bank_mod.Template, refs: []const u32, dest: usize, budget: u64, out: *std.ArrayList(u8), cancel: ?*const std.atomic.Value(bool), emit: bool) !End {
         if (refs.len != t.inputs) return error.GraphSlotArity;
         if (m.steps >= budget) return .budget;
         if (cancelled(cancel)) return .cancelled;
         for (refs) |ref| try fits(&m.values[ref], t.width);
-        var state = try State.init(m.gpa, &t.circuit);
-        defer state.deinit();
-        const groups: usize = if (t.width > 31) 2 else 1;
+        var fresh: State = undefined;
+        const state = if (m.reuse_states) try m.states.get(m.gpa, t) else blk: {
+            fresh = try State.init(m.gpa, &t.circuit);
+            break :blk &fresh;
+        };
+        defer if (m.reuse_states) state_cache.reset(state) else state.deinit();
+        const groups = (@as(usize, t.width) + 30) / 31;
         for (refs, 0..) |ref, logical| for (0..groups) |group| {
             const table = t.in_slots[logical][group];
             try state.own(table);
@@ -103,7 +124,7 @@ pub const Machine = struct {
         while (token != t.circuit.halt) {
             if (cancelled(cancel)) return .cancelled;
             if (m.steps >= budget) return .budget;
-            token = try eval.step(&state, token);
+            token = try eval.step(state, token);
             m.steps += 1;
             if (m.trace) |trace| try trace.append(m.gpa, token);
             const fam, const payload = t.circuit.split(token) orelse return error.GraphOutputToken;
@@ -136,7 +157,7 @@ fn cancelled(flag: ?*const std.atomic.Value(bool)) bool {
 }
 
 fn fits(v: *const packet.Value, width: u8) !void {
-    for (width..62) |digit| {
+    for (width..packet.max_digits) |digit| {
         const bits = v[digit / 31][2 + digit % 31 * 4 ..][0..4];
         for (bits) |bit| if (bit != 0) return error.GraphNarrowBinding;
     }
