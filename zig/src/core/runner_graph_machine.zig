@@ -1,0 +1,143 @@
+//! A fresh binding machine replays immutable template calls and transfers raw typed tensor rows.
+const std = @import("std");
+const api = @import("runner_api.zig");
+const State = @import("runner_circuit_state.zig").State;
+const eval = @import("runner_circuit_eval.zig");
+const bank_mod = @import("runner_graph_bank.zig");
+const packet = @import("runner_graph_packet.zig");
+const Allocator = std.mem.Allocator;
+
+pub const Machine = struct {
+    gpa: Allocator,
+    bank: *const bank_mod.Bank,
+    parsed: std.json.Parsed(packet.Packet),
+    values: []packet.Value,
+    ops: []const packet.Op,
+    result: u32,
+    initial: usize,
+    steps: u64 = 0,
+    used: bool = false,
+    trace: ?*std.ArrayList(u32) = null,
+
+    pub fn boot(a: Allocator, bank: *const bank_mod.Bank, bytes: []const u8) !Machine {
+        if (bytes.len > packet.max_packet) return error.GraphPacketSize;
+        const parsed = try std.json.parseFromSlice(packet.Packet, a, bytes, .{});
+        errdefer parsed.deinit();
+        const p = parsed.value;
+        if (p.version != 1 or p.values.len > packet.max_values) return error.GraphPacket;
+        var ops = p.ops;
+        var result = p.result;
+        var constants: []const packet.Value = &.{};
+        var prepared_count: ?usize = null;
+        if (p.plan) |name| {
+            if (p.ops.len != 0 or p.result != 0) return error.GraphNamedPlanOverride;
+            const plan = bank.plan(name) orelse return error.GraphPlan;
+            if (p.values.len != plan.inputs) return error.GraphSlotArity;
+            ops = plan.ops;
+            result = plan.result;
+            constants = plan.constants;
+            prepared_count = plan.total_values;
+        }
+        if (constants.len > packet.max_values - p.values.len) return error.GraphPlanSize;
+        const initial = p.values.len + constants.len;
+        const count = prepared_count orelse try bank.validate(initial, ops, result);
+        const values = try a.alloc(packet.Value, count);
+        errdefer a.free(values);
+        for (p.values, values[0..p.values.len]) |text, *v| v.* = try packet.literal(text);
+        @memcpy(values[p.values.len..initial], constants);
+        return .{ .gpa = a, .bank = bank, .parsed = parsed, .values = values, .ops = ops, .result = result, .initial = initial };
+    }
+
+    pub fn deinit(m: *Machine) void {
+        m.gpa.free(m.values);
+        m.parsed.deinit();
+        m.* = undefined;
+    }
+
+    pub fn run(m: *Machine, budget: u64, out: *std.ArrayList(u8), cancel: ?*const std.atomic.Value(bool)) !api.RunEnd {
+        if (m.used) return error.GraphMachineAlreadyRun;
+        m.used = true;
+        var count = m.initial;
+        for (m.ops) |op| {
+            if (cancelled(cancel)) return .{ .end = .cancelled, .steps = m.steps };
+            if (std.mem.eql(u8, op.op, "bind")) {
+                var v: packet.Value = @splat(@splat(0));
+                for (op.copies) |c| packet.copyBits(&v, &m.values[c.ref], c);
+                if (op.flags) |ref| @memcpy(v[0][126..128], m.values[ref][0][126..128]);
+                m.values[count] = v;
+            } else {
+                const t = m.bank.find(op.op, op.width).?;
+                var refs: [packet.max_arity]u32 = undefined;
+                const args = if (op.args) |args| args else blk: {
+                    refs[0] = op.a;
+                    if (op.b) |b| refs[1] = b;
+                    break :blk refs[0..t.inputs];
+                };
+                const end = try m.invoke(t, args, count, budget, out, cancel, false);
+                if (end != .halted) return .{ .end = end, .steps = m.steps };
+            }
+            count += op.outputs;
+        }
+        const emitter = m.bank.find("emit", 62) orelse return error.GraphEmitMissing;
+        const end = try m.invoke(emitter, &.{m.result}, 0, budget, out, cancel, true);
+        return .{ .end = end, .steps = m.steps };
+    }
+
+    fn invoke(m: *Machine, t: *const bank_mod.Template, refs: []const u32, dest: usize, budget: u64, out: *std.ArrayList(u8), cancel: ?*const std.atomic.Value(bool), emit: bool) !End {
+        if (refs.len != t.inputs) return error.GraphSlotArity;
+        if (m.steps >= budget) return .budget;
+        if (cancelled(cancel)) return .cancelled;
+        for (refs) |ref| try fits(&m.values[ref], t.width);
+        var state = try State.init(m.gpa, &t.circuit);
+        defer state.deinit();
+        const groups: usize = if (t.width > 31) 2 else 1;
+        for (refs, 0..) |ref, logical| for (0..groups) |group| {
+            const table = t.in_slots[logical][group];
+            try state.own(table);
+            var row: [128]f32 = undefined;
+            @memcpy(&row, state.row(table, 0));
+            @memcpy(row[2..128], m.values[ref][group][2..128]);
+            try state.writeRow(table, 0, &row);
+        };
+        var token = t.circuit.go;
+        while (token != t.circuit.halt) {
+            if (cancelled(cancel)) return .cancelled;
+            if (m.steps >= budget) return .budget;
+            token = try eval.step(&state, token);
+            m.steps += 1;
+            if (m.trace) |trace| try trace.append(m.gpa, token);
+            const fam, const payload = t.circuit.split(token) orelse return error.GraphOutputToken;
+            if (t.circuit.fault_family) |fault| if (fam == fault) return .fault;
+            if (fam == t.circuit.byte_family) {
+                if (!emit or payload > 255) return error.GraphUnexpectedByte;
+                if (out.items.len >= 256) return error.GraphOutputSize;
+                try out.append(m.gpa, @intCast(payload));
+            }
+        }
+        if (!emit) {
+            for (0..t.outputs) |logical| {
+                var v: packet.Value = @splat(@splat(0));
+                for (0..groups) |group| {
+                    const table = t.out_slots[logical][group];
+                    if (!state.rowPresent(table, 0)) return error.GraphOutputAbsent;
+                    @memcpy(&v[group], state.row(table, 0));
+                }
+                m.values[dest + logical] = v;
+            }
+        }
+        return .halted;
+    }
+};
+
+const End = @FieldType(api.RunEnd, "end");
+
+fn cancelled(flag: ?*const std.atomic.Value(bool)) bool {
+    return if (flag) |f| f.load(.acquire) else false;
+}
+
+fn fits(v: *const packet.Value, width: u8) !void {
+    for (width..62) |digit| {
+        const bits = v[digit / 31][2 + digit % 31 * 4 ..][0..4];
+        for (bits) |bit| if (bit != 0) return error.GraphNarrowBinding;
+    }
+}
