@@ -20,7 +20,7 @@ pub fn frontend() Frontend {
     return .{ .translate = translate };
 }
 
-// Exact decimal and rational expressions use an explicit language until Python output can be preserved exactly.
+// The integrator sets exact_python only from TF_DSV41_RUNNER_EXACT, which defaults off.
 fn language(lang: []const u8) enum { python, exact, c, unsupported } {
     if (std.mem.eql(u8, lang, "python") or std.mem.eql(u8, lang, "python3") or std.mem.eql(u8, lang, "py"))
         return .python;
@@ -33,6 +33,7 @@ fn translate(raw: ?*anyopaque, a: std.mem.Allocator, cell: Cell) std.mem.Allocat
     const context: ?*Context = if (raw) |ptr| @ptrCast(@alignCast(ptr)) else null;
     const lang = language(cell.lang);
     if (lang == .unsupported) return .{ .abstain = .language };
+    if (lang == .exact and (context == null or !context.?.exact_python)) return .{ .abstain = .unsupported };
     if (cell.prior.len != 0) return .{ .abstain = .unsupported };
     if (cell.code.len > 4096) return .{ .abstain = .too_long };
     if (lang == .python or lang == .exact) {

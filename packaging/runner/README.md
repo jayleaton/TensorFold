@@ -1,0 +1,20 @@
+# Circuit frontend image layer
+
+Build `zig build runner-frontend-check` with the repository's pinned Zig. Then run:
+
+```sh
+packaging/runner/build.sh BASE_IMAGE TAG zig-out/bin/tf-runner-frontend-check
+packaging/runner/check-image.sh TAG
+```
+
+Use a derived serving base that already contains the engine and its lane Python layer. The layer adds Ubuntu 24.04's clang-18 and lld-18, with `/usr/bin/clang` and `/usr/bin/ld.lld` aliases. No cross libc, RISC-V emulator or Python dependency is added for compilation. Host Python is used only to prepare the build context and report image sizes. The builder preserves the base image's entrypoint arguments and CMD; it does not replace engine binaries. Source provenance can be set with `TF_RUNNER_FRONTEND_TREE`; `TF_RUNNER_BUILD_ID` labels task-owned build containers for the shared-node pause guard.
+
+At every container boot, `tf-runner-frontend-check` compiles a tiny freestanding C program through the production frontend and validates its RV32IM+Zba ELF. It never runs that ELF on the host. The Docker build runs the same check with `--require` so an image without a functioning RISC-V toolchain is rejected.
+
+At runtime, a missing or broken compiler/linker reports unavailable and allows ordinary boot when `TF_DSV41_RUNNER` is unset, empty, 0, false, off or no. Any other runner value requires a successful check and fails boot otherwise. `TF_RUNNER_CLANG` and `TF_RUNNER_LLD` override compiler/linker paths for deployment and diagnostics. The production frontend also independently abstains if compilation is unavailable; boot does not turn a missing optional dependency into model output.
+
+Exact decimal/fraction arithmetic is separately gated by `TF_DSV41_RUNNER_EXACT` (default off), through the engine's frontend context. Default Python output remains CPython-identical: unsupported floating, decimal and rational output abstains. Installing the toolchain does not enable either runner knob.
+
+Build on a CPU node at nice 19. On shared nodes, stop the build session and pause its labelled Docker build containers while QUIET exists; stopping only the Docker client does not stop daemon-owned build work. No GPU access is needed. `check-image.sh` uses the runc runtime, no network and no GPU mounts, and checks normal/required boot, missing clang/LLD, successful compiler without ELF, and argument preservation. It never launches the engine.
+
+The builder emits a JSON receipt with tag, immutable image/base IDs, sizes and size delta reported by `docker image inspect .Size`. Docker storage backends may report additional unpacked disk usage in `docker image ls`; record that separately when budgeting local storage. The base engine revision label is inherited; the frontend source tree is recorded separately.
