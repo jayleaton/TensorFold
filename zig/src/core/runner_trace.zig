@@ -27,14 +27,14 @@ pub const Tracer = struct {
         t.scratch.deinit();
     }
 
-    /// The source owned once: the same statement never fires twice in a reply.
-    pub fn fire(t: *Tracer, source: []const u8) Allocator.Error!void {
+    /// The displayed line owned once: a restatement through names (other source, same display) never fires again.
+    pub fn fire(t: *Tracer, display: []const u8) Allocator.Error!void {
         const a = t.keep.allocator();
-        try t.fired.append(a, try a.dupe(u8, source));
+        try t.fired.append(a, try a.dupe(u8, display));
     }
 
-    fn firedHas(t: *const Tracer, source: []const u8) bool {
-        for (t.fired.items) |f| if (std.mem.eql(u8, f, source)) return true;
+    fn firedHas(t: *const Tracer, display: []const u8) bool {
+        for (t.fired.items) |f| if (std.mem.eql(u8, f, display)) return true;
         return false;
     }
 
@@ -100,7 +100,7 @@ pub const Tracer = struct {
             try t.names.append(a, .{ .name = try a.dupe(u8, n), .expr = kept });
             // a first wide definition with nothing after it states that computation ("N = A*2^64 + B.")
             if (hasArith(e.source) and e.bound >= 12 and e.bound <= max_digits and text.sentenceEndsAt(clean, txt_end) and
-                !t.firedHas(e.source)) define.* = .{ .source = e.source, .display = e.display };
+                !t.firedHas(e.display)) define.* = .{ .source = e.source, .display = e.display };
         }
     }
 
@@ -134,7 +134,7 @@ pub const Tracer = struct {
                 bound = expr.sat(@max(parts[0].bound, parts[1].bound) + 1);
             },
         }
-        if (t.firedHas(f.source) or bound > max_digits) return null;
+        if (t.firedHas(f.display) or bound > max_digits) return null;
         // a bare sentence counts only when it is plainly a computation: a power or a six-digit literal
         if (h.bare and std.mem.indexOf(u8, f.source, "**") == null and !hasDigitRun(f.source, 6)) return null;
         return f;
