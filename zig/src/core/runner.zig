@@ -18,7 +18,7 @@ pub const Config = struct {
     graph_bank: []const u8 = "", // PREFIX_GRAPH_BANK: T1's bank manifest, loaded at boot (backend graph)
     exact: bool = false, // `calc` / `exact` cells (firmware exact rationals, not any language's print) run
     place: place.Config = .{}, // PREFIX_CPUS / PREFIX_NICE: where the runner's threads run (core/runner_place.zig)
-    guide: bool = false, // PREFIX_GUIDE=1: chats get RUNNER-GUIDE.md in their system message (server/runner_guide.zig)
+    guide: []const u8 = "", // PREFIX_GUIDE: "1" RUNNER-GUIDE.md, else a file, as chats' default guide (server/runner_guide.zig)
 
     /// PREFIX "1" enables (unset, "" or "0": null); PREFIX_* knobs override defaults; a bad value is error.BadKnob.
     pub fn parse(get: *const fn ([]const u8) ?[]const u8, comptime prefix: []const u8) error{BadKnob}!?Config {
@@ -40,7 +40,8 @@ pub const Config = struct {
         c.max_steps = try knob(u64, get, prefix ++ "_MAX_STEPS", c.max_steps, 1, 1 << 40);
         c.max_tokens = try knob(u32, get, prefix ++ "_MAX_TOKENS", c.max_tokens, 1, 1 << 20);
         c.exact = try knob(u1, get, prefix ++ "_EXACT", 0, 0, 1) == 1;
-        c.guide = try knob(u1, get, prefix ++ "_GUIDE", 0, 0, 1) == 1;
+        c.guide = get(prefix ++ "_GUIDE") orelse "";
+        if (std.mem.eql(u8, c.guide, "0")) c.guide = "";
         c.place = try place.Config.parse(get, prefix);
         c.scan.lookahead = try knob(u32, get, prefix ++ "_LOOKAHEAD", c.scan.lookahead, 1, 4096);
         c.scan.float_window = try knob(u32, get, prefix ++ "_FLOAT_WINDOW", c.scan.float_window, 0, 65536);
@@ -111,6 +112,8 @@ const Cell = struct {
     job: ?api.JobId = null,
     result: ?api.Result = null, // out copied into the arena
     abstained: bool = false,
+    told: enum { none, owned, abstained } = .none, // what its result header got
+    owned_tokens: u32 = 0,
 };
 
 /// One reply's cells, runs and the trigger it waits on; every method runs on the engine thread.
@@ -123,6 +126,7 @@ pub const Session = struct {
     held_at: u64 = 0, // monotonic ns when the stream began to wait (the serving log's latency, never a result)
     owned_n: u32 = 0,
     abstained_n: u32 = 0,
+    held_ms: u64 = 0, // summed over the reply's holds
     broken: bool = false, // out of memory once: no more cells, no more holds
 
     pub fn hook(s: *Session) lanes.stream.RunnerHook {
@@ -195,14 +199,18 @@ pub const Session = struct {
         const held_ms = (nowNs() -| s.held_at) / std.time.ns_per_ms;
         // an inline value is owned only when the run halted with a one-line value
         if (!c.abstained and w.inline_space != null and (c.result.?.status != .ok or std.mem.indexOfScalar(u8, std.mem.trimEnd(u8, c.result.?.out, "\n"), '\n') != null)) c.abstained = true;
+        s.held_ms += held_ms;
         if (c.abstained) {
             s.abstained_n += 1;
+            c.told = .abstained;
             log.info("reply {d} cell {d} ({s} {t}): abstain ({s}), held {d} ms", .{ s.id, w.index, c.lang, c.form, why(c), held_ms });
             return try s.r.gpa.alloc(u32, 0);
         }
         const res = c.result.?;
         const ids = try s.owned(res, w);
         s.owned_n += 1;
+        c.told = .owned;
+        c.owned_tokens = @intCast(ids.len);
         log.info("reply {d} cell {d} ({s} {t}): owned {d} tokens, {t} after {d} steps, run {d} ms, held {d} ms", .{ s.id, w.index, c.lang, c.form, ids.len, res.status, res.steps, res.exec_ns / std.time.ns_per_ms, held_ms });
         return ids;
     }
@@ -289,6 +297,31 @@ pub const Session = struct {
     /// Whether the session waits on a run (its stream is held at a trigger).
     pub fn awaiting(s: *const Session) bool {
         return s.waiting != null;
+    }
+
+    /// The reply's cells per form, owned cells by program kind and the summed hold, as JSON in `buf` (runtime.runner).
+    pub fn summary(s: *const Session, buf: []u8) []const u8 {
+        var forms = std.mem.zeroes([3][4]u32);
+        var kinds = std.mem.zeroes([3]u32);
+        for (s.cells.items) |c| {
+            const f = &forms[@backingInt(c.form)];
+            f[0] += 1;
+            switch (c.told) {
+                .none => {},
+                .owned => {
+                    f[1] += 1;
+                    f[3] += c.owned_tokens;
+                    if (c.translation == .program) kinds[@backingInt(c.translation.program.kind)] += 1;
+                },
+                .abstained => f[2] += 1,
+            }
+        }
+        var w: std.Io.Writer = .fixed(buf);
+        w.writeByte('{') catch return "";
+        for (forms, [_][]const u8{ "fence", "repl", "inline" }) |f, name|
+            w.print("\"{s}\":{{\"closed\":{d},\"owned\":{d},\"abstained\":{d},\"owned_tokens\":{d}}},", .{ name, f[0], f[1], f[2], f[3] }) catch return "";
+        w.print("\"owned_by\":{{\"calc\":{d},\"elf\":{d},\"graph\":{d}}},\"held_ms\":{d}}}", .{ kinds[0], kinds[1], kinds[2], s.held_ms }) catch return "";
+        return w.buffered();
     }
 
     /// Cancels runs, joins translations and frees the session; the backend drops the stream's machines.

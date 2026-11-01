@@ -123,6 +123,7 @@ pub const Server = struct {
     text: model_text.Text,
     config: Config,
     voices: []const @import("drama_voice.zig").Voice = &.{},
+    guides: @import("runner_guide.zig").Set = .{},
     keys: ?*auth.Store,
     late_system: []const u8 = "system",
     needs_user_after_tool: bool = false,
@@ -187,7 +188,11 @@ pub const Server = struct {
             return srv;
         }
         if (srv.info.compute) |c| srv.compute = try @import("compute_turns.zig").open(srv, c);
-        if (srv.info.runner) |r| try @import("runner_text.zig").attach(srv.arena.allocator(), text, r);
+        if (srv.info.runner) |r| {
+            try @import("runner_text.zig").attach(srv.arena.allocator(), text, r);
+            srv.guides = try @import("runner_guide.zig").Set.load(srv.arena.allocator(), io, r.cfg.guide);
+            srv.guides.describe();
+        }
         if (config.cortheon) srv.cortheon = try cortheon.State.init(gpa, io, "TensorFold-Cortheon (+https://github.com/ashhart/TensorFold)", config.cortheon_search_key);
         if (config.keep_warm_s > 0) if (engine.keepaliveTarget()) |target| {
             srv.keepalive = api.keepalive.Keepalive.start(gpa, io, target, @as(i64, config.keep_warm_s) * std.time.ns_per_s) catch |e| blk: {

@@ -90,6 +90,7 @@ pub const Prepared = struct {
     sampled: bool, // a sampling config, which the reply labels "exact"; greedy otherwise
     drafts: bool,
     token_ids: bool,
+    guide: ?[]const u8 = null,
     stops: fields_mod.Stops,
     preparing: bool,
 };
@@ -98,9 +99,12 @@ pub const Prepared = struct {
 pub fn prepare(srv: *Server, cx: *Cx, given: Input, gone: anytype) Failure!Prepared {
     const a = cx.a;
     var input = given;
-    if (srv.info.runner) |r| if (r.cfg.guide and input.prompt == null) {
-        input.messages = try @import("runner_guide.zig").with(a, input.messages);
+    // the runner guide (runner_guide.zig): the request's "runner_guide" or the boot default, with the runner on
+    const guided = @import("runner_guide.zig").apply(a, if (srv.info.runner != null and input.prompt == null) &srv.guides else null, input.fields.get("runner_guide"), input.messages) catch |e| switch (e) {
+        error.BadGuide => return cx.refuse("runner_guide must be a string of at most 512 bytes"),
+        error.OutOfMemory => return error.OutOfMemory,
     };
+    input.messages = guided.messages;
     const io = srv.io;
     const received = nowNs(io);
     const f = input.fields;
@@ -181,7 +185,7 @@ pub fn prepare(srv: *Server, cx: *Cx, given: Input, gone: anytype) Failure!Prepa
     request.hold_eos = stops_opt.strings.len == 0 and @import("compute_turns.zig").arms(srv, input, &request);
     // the in-model runner (TF_DSV41_RUNNER): code cells this reply writes run, their results owned in place
     request.run_cells = srv.info.runner != null;
-    return .{ .input = input, .request = request, .prompt_len = rendered.ids.len, .received = received, .thinking = thinking, .effort = effort, .sampled = sampling != null, .drafts = drafts, .token_ids = flag(f, "return_token_ids") orelse false, .stops = stops_opt, .preparing = preparing };
+    return .{ .input = input, .request = request, .prompt_len = rendered.ids.len, .received = received, .thinking = thinking, .effort = effort, .sampled = sampling != null, .drafts = drafts, .token_ids = flag(f, "return_token_ids") orelse false, .stops = stops_opt, .preparing = preparing, .guide = guided.guide };
 }
 
 /// Submit a prepared request and collect its reply; ``sink`` hears the stream (null: not streamed).
@@ -227,7 +231,7 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
     preparing = false;
     var filter: @import("compute_turns.zig").Filter = .{ .a = a, .inner = if (sink) |s| s else undefined };
     const shown: ?Sink = if (request.hold_eos and sink != null) filter.sink() else sink; // built-in calls stay hidden
-    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .seed = if (request.sampling) |v| v.seed else null, .sink = shown, .hold = request.hold_eos, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .token_ids = prepared.token_ids, .lp = if (request.logprobs != null) .{} else null, .loop_stop = request.loop_stop };
+    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .seed = if (request.sampling) |v| v.seed else null, .sink = shown, .hold = request.hold_eos, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .token_ids = prepared.token_ids, .guide = prepared.guide, .lp = if (request.logprobs != null) .{} else null, .loop_stop = request.loop_stop };
     defer srv.noteRequest(prepared.prompt_len, box.cached orelse 0, gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
     const result: Failure!Reply = blk: {

@@ -182,7 +182,7 @@ pub const Event = union(enum) {
     tokens: []const u32,
     audio: usize,
     /// The reply ended; nothing follows. ``message`` says why a failed reply failed.
-    finished: struct { reason: Reason, stats: Stats = .{}, message: []const u8 = "" },
+    finished: struct { reason: Reason, stats: Stats = .{}, message: []const u8 = "", runner: []const u8 = "" },
 };
 
 /// Where a request's events go. Called on the engine's thread: it must return at once and not re-enter the engine.

@@ -21,6 +21,7 @@ pub const Mailbox = struct {
     widths: []u32 = &.{},
     raised: []bool = &.{},
     telemetry: []u8 = "",
+    runner: []u8 = "",
     message: []u8 = "",
 
     pub fn onEvent(ctx: *anyopaque, _: api.Id, event: *const api.Event) void {
@@ -46,6 +47,7 @@ pub const Mailbox = struct {
                 m.widths = m.gpa.dupe(u32, f.stats.prefill_widths) catch &.{};
                 m.raised = m.gpa.dupe(bool, f.stats.prefill_raised) catch &.{};
                 m.telemetry = m.gpa.dupe(u8, f.stats.telemetry_json) catch "";
+                m.runner = m.gpa.dupe(u8, f.runner) catch "";
                 m.message = m.gpa.dupe(u8, f.message) catch "";
             },
         }
@@ -60,6 +62,7 @@ pub const Mailbox = struct {
         m.gpa.free(m.widths);
         m.gpa.free(m.raised);
         m.gpa.free(m.telemetry);
+        m.gpa.free(m.runner);
         m.gpa.free(m.message);
     }
 };

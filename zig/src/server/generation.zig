@@ -36,6 +36,7 @@ pub const Generation = struct {
     ignore_eos: bool,
     max_tokens: u32,
     token_ids: bool, // "return_token_ids": the response's tensorfold block carries the reply's token ids
+    guide: ?[]const u8 = null, // the runner guide text the chat got ("" none); null: the runner is off
     tools: []const Value,
     calls: ?tool_stream.Streamer = null,
     collected: std.ArrayList(u32) = .empty,
@@ -311,6 +312,19 @@ pub const Generation = struct {
             try loop_field.put(a, "period", try json.intValue(a, period));
             if (stopped != null) try loop_field.put(a, "stopped", .{ .bool = true });
             try runtime.put(a, "loop", .{ .object = loop_field });
+        }
+        const cells = try a.dupe(u8, m.runner);
+        if (cells.len > 0) switch (try json.parse(a, cells)) {
+            .ok => |v| try runtime.put(a, "runner", v),
+            .err => {},
+        };
+        if (g.guide) |given| {
+            const guide = try json.newObject(a);
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(given, &digest, .{});
+            try guide.put(a, "sha256", .{ .string = try a.dupe(u8, &std.fmt.bytesToHex(digest, .lower)) });
+            try guide.put(a, "bytes", try json.intValue(a, given.len));
+            try runtime.put(a, "runner_guide", .{ .object = guide });
         }
         const s = m.stats;
         const spec = try json.newObject(a);

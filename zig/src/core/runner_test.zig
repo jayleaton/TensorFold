@@ -126,13 +126,19 @@ const Box = struct {
     mutex: std.Io.Mutex = .init,
     tokens: std.ArrayList(u32) = .empty,
     done: ?Reason = null,
+    cells: [512]u8 = undefined, // the finished event's runner summary
+    cells_len: usize = 0,
     fn event(ctx: *anyopaque, _: api.Id, e: *const api.Event) void {
         const b: *@This() = @ptrCast(@alignCast(ctx));
         b.mutex.lockUncancelable(std.testing.io);
         defer b.mutex.unlock(std.testing.io);
         switch (e.*) {
             .tokens => |t| b.tokens.appendSlice(gpa, t) catch {},
-            .finished => |f| b.done = f.reason,
+            .finished => |f| {
+                @memcpy(b.cells[0..f.runner.len], f.runner);
+                b.cells_len = f.runner.len;
+                b.done = f.reason;
+            },
             else => {},
         }
     }
@@ -151,7 +157,7 @@ const Box = struct {
 };
 
 /// `frontend`/`backend`: real ones in place of the fakes (the proof test).
-pub const Opts = struct { runner: bool = true, run_cells: bool = true, delay: u32 = 0, planner: bool = false, streams: usize = 1, frontend: ?rapi.Frontend = null, backend: ?rapi.Backend = null, wait_s: u32 = 20, exact: bool = false, inline_math: bool = false, placer: ?*runner.place.Placer = null };
+pub const Opts = struct { runner: bool = true, run_cells: bool = true, delay: u32 = 0, planner: bool = false, streams: usize = 1, frontend: ?rapi.Frontend = null, backend: ?rapi.Backend = null, wait_s: u32 = 20, exact: bool = false, inline_math: bool = false, placer: ?*runner.place.Placer = null, summaries: ?[][]u8 = null };
 
 /// Runs `models` (one request each, concurrently) on one host; the reply texts.
 pub fn replies(models: []Model, o: Opts, back: *Back) ![][]u8 {
@@ -188,6 +194,9 @@ pub fn replies(models: []Model, o: Opts, back: *Back) ![][]u8 {
         try std.testing.expectEqual(Reason.stop, try b.wait(o.wait_s));
         text.* = try decode(gpa, b.tokens.items);
         b.tokens.deinit(gpa);
+    }
+    for (boxes, 0..) |*b, i| {
+        if (o.summaries) |s| s[i] = try gpa.dupe(u8, b.cells[0..b.cells_len]);
     }
     return out;
 }
@@ -362,6 +371,24 @@ test "runner: an inline value earlier in the reply is not notebook state for a l
     try std.testing.expectEqualStrings(lead ++ "633825300114114700748351602688\nDone.", got);
 }
 
+test "runner: a reply's runtime block counts its cells by form, owned tokens and program kind" {
+    var back: Back = .{};
+    defer back.deinit();
+    var m = [_]Model{ .{ .lead = mul_cell }, .{ .lead = "Check:\n```python\nprint(undefined_x)\n```\nResult:\n" } };
+    var sums: [2][]u8 = undefined;
+    const texts = try replies(&m, .{ .summaries = &sums }, &back);
+    freeAll(texts);
+    defer for (sums) |s| gpa.free(s);
+    // the product and its newline: one token a character
+    try std.testing.expectEqualStrings("{\"fence\":{\"closed\":1,\"owned\":1,\"abstained\":0,\"owned_tokens\":61},\"repl\":{\"closed\":0,\"owned\":0,\"abstained\":0,\"owned_tokens\":0},\"inline\":{\"closed\":0,\"owned\":0,\"abstained\":0,\"owned_tokens\":0},\"owned_by\":{\"calc\":1,\"elf\":0,\"graph\":0},\"held_ms\":", sums[0][0 .. std.mem.lastIndexOf(u8, sums[0], "\"held_ms\":").? + 10]);
+    try std.testing.expect(std.mem.startsWith(u8, sums[1], "{\"fence\":{\"closed\":1,\"owned\":0,\"abstained\":1,\"owned_tokens\":0}"));
+    var off: [1][]u8 = undefined;
+    var lone = [_]Model{.{ .lead = mul_cell }};
+    freeAll(try replies(&lone, .{ .runner = false, .summaries = &off }, &back));
+    defer gpa.free(off[0]);
+    try std.testing.expectEqualStrings("", off[0]);
+}
+
 test "runner: knobs parse; off unless the flag is 1 with a circuit" {
     const K = struct {
         var set: []const [2][]const u8 = &.{};
@@ -390,7 +417,11 @@ test "runner: knobs parse; off unless the flag is 1 with a circuit" {
     try std.testing.expectError(error.BadKnob, runner.Config.parse(&K.get, "TF_R"));
     K.set = &.{ .{ "TF_R", "1" }, .{ "TF_R_CIRCUIT", "/c.bin" }, .{ "TF_R_BACKEND", "graph" }, .{ "TF_R_GRAPH_BANK", "/b/bank.json" }, .{ "TF_R_GUIDE", "1" } };
     const g = (try runner.Config.parse(&K.get, "TF_R")).?;
-    try std.testing.expect(g.backend == .graph and std.mem.eql(u8, g.graph_bank, "/b/bank.json") and g.guide and !c.guide);
+    try std.testing.expect(g.backend == .graph and std.mem.eql(u8, g.graph_bank, "/b/bank.json") and std.mem.eql(u8, g.guide, "1") and c.guide.len == 0);
+    K.set = &.{ .{ "TF_R", "1" }, .{ "TF_R_CIRCUIT", "/c.bin" }, .{ "TF_R_GUIDE", "/g/a.md" } };
+    try std.testing.expectEqualStrings("/g/a.md", (try runner.Config.parse(&K.get, "TF_R")).?.guide);
+    K.set = &.{ .{ "TF_R", "1" }, .{ "TF_R_CIRCUIT", "/c.bin" }, .{ "TF_R_GUIDE", "0" } };
+    try std.testing.expectEqualStrings("", (try runner.Config.parse(&K.get, "TF_R")).?.guide);
 }
 
 test {
