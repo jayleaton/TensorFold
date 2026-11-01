@@ -12,15 +12,20 @@ const Range = struct { start: i64, stop: i64, step: i64, count: i64, bounds: Exp
 const Invalid = error{Unsupported};
 
 /// Returns an owned C main body, or abstains; this function neither compiles nor executes the source.
+pub const Lowered = statements.Lowered;
 pub fn lowerPython(a: Allocator, code: []const u8) Allocator.Error!?[]u8 {
-    if (try statements.lowerPython(a, code)) |body| return body;
+    const result = try lowerWithCost(a, code) orelse return null;
+    return result.source;
+}
+pub fn lowerWithCost(a: Allocator, code: []const u8) Allocator.Error!?Lowered {
+    if (try statements.lowerWithCost(a, code)) |result| return result;
     return lower(a, code) catch |err| switch (err) {
         error.Unsupported => null,
         error.OutOfMemory => error.OutOfMemory,
     };
 }
 
-fn lower(a: Allocator, code: []const u8) (Allocator.Error || Invalid)![]u8 {
+fn lower(a: Allocator, code: []const u8) (Allocator.Error || Invalid)!Lowered {
     if (code.len > 4096 or std.mem.indexOfScalar(u8, code, '\r') != null) return error.Unsupported;
     const src = std.mem.trim(u8, code, "\n");
     if (src.len == 0 or src[0] == ' ' or src[0] == '\t') return error.Unsupported;
@@ -95,20 +100,25 @@ fn lower(a: Allocator, code: []const u8) (Allocator.Error || Invalid)![]u8 {
         !Expr.fits(initial + range.count * @max(bounds.hi, 0))) return error.Unsupported;
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(a);
-    try out.print(a, "int tf_acc = {d};\nfor (int tf_i = {d}; tf_i {s} {d}; tf_i += {d}) {{\n", .{
-        initial, range.start, if (range.step > 0) "<" else ">", range.stop, range.step,
+    try out.print(a, "static volatile int tf_range[]={{ {d},{d},{d},{d} }};\nvolatile int tf_acc=tf_range[0];\nint tf_start=tf_range[1],tf_stop=tf_range[2],tf_step=tf_range[3];\nfor (int tf_i=tf_start; (tf_step>0 ? tf_i < tf_stop : tf_i > tf_stop); tf_i+=tf_step) {{\n", .{
+        initial, range.start, range.stop, range.step,
     });
     try p.emit(a, &out);
     try out.print(a, "tf_acc += tf_e{d};\n}}\ntf_print_int(tf_acc);\nreturn 0;\n", .{root});
-    return out.toOwnedSlice(a);
+    var per_iteration: usize = 16;
+    for (p.nodes[0..p.len]) |n| {
+        per_iteration += 10;
+        if (n.op == .power) per_iteration += @as(usize, @intCast(n.value)) * 6;
+    }
+    return .{ .source = try out.toOwnedSlice(a), .estimated_steps = 500 + @as(usize, @intCast(range.count)) * per_iteration };
 }
 
 fn validName(s: []const u8) bool {
     const reserved = [_][]const u8{
-        "print", "sum",    "range",  "for",      "in",     "True",      "False",   "None",  "and",   "or",       "not",
-        "if",    "else",   "def",    "class",    "import", "from",      "return",  "while", "break", "continue", "pass",
-        "yield", "lambda", "global", "nonlocal", "try",    "except",    "finally", "with",  "as",    "assert",   "del",
-        "raise", "is",     "async",  "await",    "elif",   "__debug__",
+        "print", "sum",    "range",  "for",      "in",     "True",      "False",        "None",  "and",   "or",       "not",
+        "if",    "else",   "def",    "class",    "import", "from",      "return",       "while", "break", "continue", "pass",
+        "yield", "lambda", "global", "nonlocal", "try",    "except",    "finally",      "with",  "as",    "assert",   "del",
+        "raise", "is",     "async",  "await",    "elif",   "__debug__", "__builtins__",
     };
     for (reserved) |name| if (std.mem.eql(u8, name, s)) return false;
     return true;
@@ -145,9 +155,9 @@ fn parseRange(p: *Expr.Parser) Invalid!Range {
 
 test "sum squares 285 is lowered as circuit loop operations" {
     const a = std.testing.allocator;
-    const body = try lower(a, "print(sum(i*i for i in range(10)))");
+    const body = (try lower(a, "print(sum(i*i for i in range(10)))")).source;
     defer a.free(body);
-    try std.testing.expect(std.mem.indexOf(u8, body, "tf_i < 10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "tf_i < tf_stop") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "tf_e0 * tf_e1") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "tf_acc += tf_e2") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "285") == null);
@@ -155,15 +165,15 @@ test "sum squares 285 is lowered as circuit loop operations" {
 
 test "accumulator and descending stepped ranges" {
     const a = std.testing.allocator;
-    const body = try lower(a, "total = 0\nfor i in range(10):\n    total += i**2\nprint(total)");
+    const body = (try lower(a, "total = 0\nfor i in range(10):\n    total += i**2\nprint(total)")).source;
     defer a.free(body);
-    try std.testing.expect(std.mem.indexOf(u8, body, "tf_i < 10") != null);
-    const assigned = try lower(a, "total = 0\nfor i in range(10):\n    total = total + i*i\nprint(total)");
+    try std.testing.expect(std.mem.indexOf(u8, body, "tf_i < tf_stop") != null);
+    const assigned = (try lower(a, "total = 0\nfor i in range(10):\n    total = total + i*i\nprint(total)")).source;
     defer a.free(assigned);
     try std.testing.expect(std.mem.indexOf(u8, assigned, "tf_acc += tf_e2") != null);
     const descending = (try lowerPython(a, "sum(x*x for x in range(9, -1, -1))")).?;
     defer a.free(descending);
-    try std.testing.expect(std.mem.indexOf(u8, descending, "tf_i > -1; tf_i += -1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, descending, "tf_i > tf_stop") != null);
 }
 
 test "unsupported code and unsafe Python integer operations abstain" {

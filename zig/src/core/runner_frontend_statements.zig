@@ -3,7 +3,8 @@ const std = @import("std");
 const E = @import("runner_frontend_statements_expr.zig");
 const Allocator = std.mem.Allocator;
 const Failure = Allocator.Error || E.Invalid;
-const Kind = enum { assign, list, loop, print };
+const Kind = enum { assign, list, loop, while_loop, print };
+const Condition = enum { truth, eq, ne, lt, le, gt, ge };
 const Statement = struct {
     kind: Kind = .assign,
     first: usize,
@@ -12,6 +13,7 @@ const Statement = struct {
     targets: [32]usize = undefined,
     count: usize = 0,
     body_end: usize = 0,
+    condition: Condition = .truth,
 };
 
 const Program = struct {
@@ -60,6 +62,23 @@ const Program = struct {
                 try parser.need(")");
                 try parser.need(":");
                 stmt.targets[0] = try p.g.bind(name, null);
+                loop = p.len;
+            } else if (parser.eat("while")) {
+                if (indented) return error.Unsupported;
+                stmt.kind = .while_loop;
+                stmt.roots[0] = try parser.expression();
+                stmt.condition = if (parser.eat("==")) .eq else if (parser.eat("!=")) .ne else if (parser.eat("<="))
+                    .le
+                else if (parser.eat(">="))
+                    .ge
+                else if (parser.eat("<"))
+                    .lt
+                else if (parser.eat(">"))
+                    .gt
+                else
+                    .truth;
+                if (stmt.condition != .truth) stmt.roots[1] = try parser.expression();
+                try parser.need(":");
                 loop = p.len;
             } else if (parser.eat("print")) {
                 if (indented) return error.Unsupported;
@@ -173,8 +192,31 @@ const Program = struct {
                     }
                     i = stmt.body_end - 1;
                 },
+                .while_loop => {
+                    while (try p.condition(stmt, s)) {
+                        if (iterations.* == 10000) return error.Unsupported;
+                        iterations.* += 1;
+                        try p.prove(s, i + 1, stmt.body_end, iterations);
+                    }
+                    i = stmt.body_end - 1;
+                },
             }
         }
+    }
+
+    fn condition(p: *const Program, stmt: Statement, s: *E.State) E.Invalid!bool {
+        const lhs = try p.g.eval(stmt.roots[0], s);
+        if (stmt.condition == .truth) return lhs != 0;
+        const rhs = try p.g.eval(stmt.roots[1], s);
+        return switch (stmt.condition) {
+            .eq => lhs == rhs,
+            .ne => lhs != rhs,
+            .lt => lhs < rhs,
+            .le => lhs <= rhs,
+            .gt => lhs > rhs,
+            .ge => lhs >= rhs,
+            .truth => unreachable,
+        };
     }
 
     fn emit(p: *const Program, a: Allocator, out: *std.ArrayList(u8), begin: usize, end: usize) Allocator.Error!void {
@@ -182,6 +224,28 @@ const Program = struct {
         while (i < end) : (i += 1) {
             const stmt = p.statements[i];
             try out.appendSlice(a, "{\n");
+            if (stmt.kind == .while_loop) {
+                try out.appendSlice(a, "while (1) {\n");
+                try p.g.emit(a, out, stmt.first, stmt.end);
+                if (stmt.condition == .truth) {
+                    try out.print(a, "if (!tf_e{d}) break;\n", .{stmt.roots[0]});
+                } else {
+                    const op = switch (stmt.condition) {
+                        .eq => "==",
+                        .ne => "!=",
+                        .lt => "<",
+                        .le => "<=",
+                        .gt => ">",
+                        .ge => ">=",
+                        .truth => unreachable,
+                    };
+                    try out.print(a, "if (!(tf_e{d} {s} tf_e{d})) break;\n", .{ stmt.roots[0], op, stmt.roots[1] });
+                }
+                try p.emit(a, out, i + 1, stmt.body_end);
+                try out.appendSlice(a, "}\n}\n");
+                i = stmt.body_end - 1;
+                continue;
+            }
             try p.g.emit(a, out, stmt.first, stmt.end);
             switch (stmt.kind) {
                 .assign => for (0..stmt.count) |j| {
@@ -200,6 +264,7 @@ const Program = struct {
                     try out.appendSlice(a, "}\n");
                     i = stmt.body_end - 1;
                 },
+                .while_loop => unreachable,
             }
             try out.appendSlice(a, "}\n");
         }
@@ -207,14 +272,19 @@ const Program = struct {
 };
 
 /// Returns a caller-owned C body, or null outside the proved subset; no compiler or host execution.
+pub const Lowered = struct { source: []u8, estimated_steps: usize };
 pub fn lowerPython(a: Allocator, code: []const u8) Allocator.Error!?[]u8 {
+    const result = try lowerWithCost(a, code) orelse return null;
+    return result.source;
+}
+pub fn lowerWithCost(a: Allocator, code: []const u8) Allocator.Error!?Lowered {
     return lower(a, code) catch |err| switch (err) {
         error.Unsupported => null,
         error.OutOfMemory => error.OutOfMemory,
     };
 }
 
-fn lower(a: Allocator, code: []const u8) Failure![]u8 {
+fn lower(a: Allocator, code: []const u8) Failure!Lowered {
     const p = try a.create(Program);
     defer a.destroy(p);
     p.* = .{};
@@ -231,7 +301,7 @@ fn lower(a: Allocator, code: []const u8) Failure![]u8 {
     }
     try p.emit(a, &out, 0, p.len);
     try out.appendSlice(a, "return 0;\n");
-    return out.toOwnedSlice(a);
+    return .{ .source = try out.toOwnedSlice(a), .estimated_steps = state.estimated_steps + iterations * 12 + 300 };
 }
 
 test "bounded factorial retains multiplication and runtime loop" {
@@ -322,4 +392,45 @@ test "range and induction values are captured before body mutations" {
         try std.testing.expect(std.mem.indexOf(u8, body, "for (int tf_r") != null);
         try std.testing.expect(std.mem.indexOf(u8, body, " += tf_e") != null);
     }
+}
+
+test "while conditions and signed floor operations are reevaluated after every body" {
+    const cases = [_]struct { code: []const u8, name: []const u8, value: i64 }{
+        .{ .code = "n = 123456789\ns = 0\nwhile n > 0:\n    s += n % 10\n    n //= 10\nprint(s)", .name = "s", .value = 45 },
+        .{ .code = "a = 462\nb = 1071\nwhile b:\n    a, b = b, a % b\nprint(a)", .name = "a", .value = 21 },
+        .{ .code = "n = -7\ns = 0\nwhile n < 0:\n    s += n // 3\n    n += 1\nprint(s)", .name = "s", .value = -12 },
+        .{ .code = "n = 0\nwhile n != 0:\n    n -= 1\nprint(n)", .name = "n", .value = 0 },
+        .{ .code = "n = 0\nwhile n <= 4:\n    n += 1\nprint(n)", .name = "n", .value = 5 },
+        .{ .code = "n = 3\nwhile n >= 1:\n    n -= 1\nprint(n)", .name = "n", .value = 0 },
+        .{ .code = "n = 1\nwhile n == 1:\n    n = 2\nprint(n)", .name = "n", .value = 2 },
+    };
+    const a = std.testing.allocator;
+    for (cases) |case| {
+        const p = try a.create(Program);
+        defer a.destroy(p);
+        p.* = .{};
+        try p.parse(case.code);
+        var state: E.State = .{};
+        var iterations: usize = 0;
+        try p.prove(&state, 0, p.len, &iterations);
+        try std.testing.expectEqual(case.value, state.values[p.g.find(case.name).?][0]);
+        const body = (try lowerPython(a, case.code)).?;
+        defer a.free(body);
+        const loop = std.mem.indexOf(u8, body, "while (1)") orelse return error.MissingRuntimeLoop;
+        const condition_load = std.mem.indexOf(u8, body[loop..], "= tf_v") orelse return error.MissingConditionLoad;
+        const condition_check = std.mem.indexOf(u8, body[loop..], "break;") orelse return error.MissingConditionCheck;
+        try std.testing.expect(condition_load < condition_check);
+    }
+}
+
+test "unbounded unsafe and unproved while executions abstain" {
+    for ([_][]const u8{
+        "n = 1\nwhile n:\n    n = n\nprint(n)",
+        "n = 0\nwhile n < 10001:\n    n += 1\nprint(n)",
+        "n = 1\nwhile n > 0:\n    n //= 0\nprint(n)",
+        "n = 2147483647\nwhile n:\n    n += 1\nprint(n)",
+        "while 0:\n    x = 1\nprint(x)",
+        "n = 1\nwhile n:\n    while n:\n        n -= 1\nprint(n)",
+        "n = 1\nwhile missing:\n    n -= 1\nprint(n)",
+    }) |code| try std.testing.expectEqual(@as(?[]u8, null), try lowerPython(std.testing.allocator, code));
 }
