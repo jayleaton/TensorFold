@@ -65,16 +65,18 @@ pub const Text = struct {
     encode: *const fn (ctx: ?*anyopaque, a: Allocator, text: []const u8) Allocator.Error![]u32,
 };
 
-/// The server-wide runner: one frontend, one backend, the tokenizer; sessions are per reply.
+/// The server-wide runner: a frontend, a backend and the server's tokenizer (set at its start); sessions are per reply.
 pub const Runner = struct {
     gpa: Allocator,
     cfg: Config,
     frontend: api.Frontend,
     backend: api.Backend,
-    text: Text,
+    text: ?Text = null,
     next_id: u64 = 1,
 
-    pub fn session(r: *Runner) Allocator.Error!*Session {
+    /// A reply's session; null until the server has given the runner its tokenizer.
+    pub fn session(r: *Runner) Allocator.Error!?*Session {
+        if (r.text == null) return null;
         const s = try r.gpa.create(Session);
         s.* = .{ .r = r, .id = r.next_id, .scan = .{ .cfg = r.cfg.scan } };
         r.next_id += 1;
@@ -118,7 +120,8 @@ pub const Session = struct {
     }
 
     fn feed(s: *Session, token: u32, think_open: bool, can_hold: bool) Allocator.Error!bool {
-        const ev = try s.scan.feed(s.r.gpa, s.r.text.bytes(s.r.text.ctx, token), think_open);
+        const tx = s.r.text.?;
+        const ev = try s.scan.feed(s.r.gpa, tx.bytes(tx.ctx, token), think_open);
         if (ev.closed) |c| try s.open(c);
         const t = ev.trigger orelse return false;
         if (!can_hold or t.index >= s.cells.items.len) return false;
@@ -197,6 +200,7 @@ pub const Session = struct {
     /// The owned text for a settled run (INTERFACES.md §5), as token ids within the token cap.
     fn owned(s: *Session, res: api.Result, fenced: bool) Allocator.Error![]u32 {
         const gpa = s.r.gpa;
+        const tx = s.r.text.?;
         var body: std.ArrayList(u8) = .empty;
         defer body.deinit(gpa);
         const out = if (std.mem.endsWith(u8, res.out, "\n")) res.out[0 .. res.out.len - 1] else res.out;
@@ -206,11 +210,11 @@ pub const Session = struct {
             .budget => try body.print(gpa, "\n[stopped after {d} steps]", .{res.steps}),
             .fault => try body.appendSlice(gpa, "\n[machine fault]"),
         }
-        const ids = try s.r.text.encode(s.r.text.ctx, gpa, body.items);
+        const ids = try tx.encode(tx.ctx, gpa, body.items);
         defer gpa.free(ids);
-        const tail = try s.r.text.encode(s.r.text.ctx, gpa, if (fenced) "\n```\n" else "\n");
+        const tail = try tx.encode(tx.ctx, gpa, if (fenced) "\n```\n" else "\n");
         defer gpa.free(tail);
-        const note = if (ids.len > s.r.cfg.max_tokens) try s.r.text.encode(s.r.text.ctx, gpa, "\n[output cut]") else try gpa.alloc(u32, 0);
+        const note = if (ids.len > s.r.cfg.max_tokens) try tx.encode(tx.ctx, gpa, "\n[output cut]") else try gpa.alloc(u32, 0);
         defer gpa.free(note);
         const keep = ids[0..@min(ids.len, s.r.cfg.max_tokens)];
         return std.mem.concat(gpa, u32, &.{ keep, note, tail });

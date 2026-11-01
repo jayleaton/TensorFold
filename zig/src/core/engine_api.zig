@@ -198,13 +198,11 @@ pub const Info = struct {
     embeddings: ?lanes.embedding.Info = null,
     speech: ?SpeechInfo = null,
     lanes: u32 = 1,
-    /// Prompt plus reply tokens one request may use (0: no limit).
-    context_window: u32 = 0,
+    context_window: u32 = 0, // prompt plus reply tokens one request may use (0: no limit)
     context_fitted: bool = false,
     /// What the engine enforces; the server refuses requests that need more.
     call_gates: bool = false,
-    /// The engine observes loop_guard requests in its lane stream.
-    loop_guard: bool = false,
+    loop_guard: bool = false, // the engine observes loop_guard requests in its lane stream
     /// The engine enforces a token budget while the think block is open.
     thinking_budget: bool = true,
     /// The engine stops the reply after the think block at Request.answer_max (every lane engine: Info.ofLanes).
@@ -245,6 +243,7 @@ pub const Info = struct {
     /// Whether a request's caches fit beside the running streams' now (null: a free lane does); else it waits in order.
     admit: ?Admit = null,
     compute: ?compute_lane.Config = null, // the family's built-in code execution: replies hold at EOS for its results
+    runner: ?*runner.Runner = null, // the in-model runner: the server gives it the tokenizer and chats set run_cells
 
     /// What a lane engine's streams enforce themselves (core/lanes/stream.zig): loop guards and answer limits.
     pub fn ofLanes(i: Info) Info {
@@ -254,6 +253,7 @@ pub const Info = struct {
         return out;
     }
 };
+pub const runner = @import("runner_open.zig");
 pub const compute_lane = @import("compute_lane.zig");
 /// A held reply's result tokens (empty: it ends at its EOS), forced after the EOS between rounds.
 pub const Resume = lanes.hold.Resume;

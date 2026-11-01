@@ -175,6 +175,8 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
     request.prompt_logprobs = input.prompt_logprobs;
     // the compute lane: a reply offered the built-in tool holds at each EOS for its results (not with stop strings)
     request.hold_eos = stops_opt.strings.len == 0 and @import("compute_turns.zig").arms(srv, input, &request);
+    // the in-model runner (TF_DSV41_RUNNER): code cells this reply writes run, their results owned in place
+    request.run_cells = srv.info.runner != null;
     return .{ .input = input, .request = request, .prompt_len = rendered.ids.len, .received = received, .thinking = thinking, .effort = effort, .sampled = sampling != null, .drafts = drafts, .token_ids = flag(f, "return_token_ids") orelse false, .stops = stops_opt, .preparing = preparing };
 }
 

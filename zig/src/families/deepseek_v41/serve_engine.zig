@@ -135,6 +135,11 @@ pub const Served = struct {
         s.host = api.LaneHost.init(gpa, io, &s.core, .{ .name = "dsv41-cuda", .lanes = m.slots, .context_window = window, .prefill_step = m.gt.prefill_rows, .structures = m.grammar_masks != null });
         // TF_DSV41_COMPUTE_LANE=1: built-in code runs on the CPU while its reply holds at EOS (core/compute_lane.zig)
         s.host.info_.compute = try api.compute_lane.Config.parse(&@import("serve_knobs.zig").env, "TF_DSV41_COMPUTE_LANE");
+        // TF_DSV41_RUNNER=1: code cells a reply writes run on the compiled circuit, results in place (core/runner.zig)
+        if (try api.runner.Config.parse(&@import("serve_knobs.zig").env, "TF_DSV41_RUNNER")) |rc| {
+            s.host.runner = try api.runner.open(gpa, rc);
+            s.host.info_.runner = s.host.runner;
+        }
         // the lanes run on LaneHost's thread: the model's CUDA context must be current there
         s.host.on_thread = .{ .ctx = m, .run = bindContext };
         // /metrics' device memory: bytes this rank holds in cuda.DeviceBuffers (weights, KV pool, staging), peak
