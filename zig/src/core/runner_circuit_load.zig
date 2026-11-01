@@ -235,7 +235,7 @@ const Builder = struct {
 
     fn ffnDims(b: *Builder, n: *const JNode, reads: *std.ArrayList(u32), writes: *std.ArrayList(u32)) !void {
         const out = n.out orelse return error.CircuitNode;
-        if (out >= b.dims or n.into == null) return error.CircuitIndex;
+        if (out == 0 or out >= b.dims or n.into == null) return error.CircuitIndex;
         for (n.terms orelse return error.CircuitNode) |t| {
             _ = try exact(t[0]);
             try b.check(t[1], reads);
@@ -260,7 +260,7 @@ const Builder = struct {
             for (mine.items) |d| for (writes.items[0..own]) |w| if (d == w) return error.CircuitHazard;
             try reads.appendSlice(b.tmp, mine.items);
             for (vh.out) |t| {
-                if (t[0] >= hd or t[1] >= b.dims) return error.CircuitIndex;
+                if (t[0] >= hd or t[1] == 0 or t[1] >= b.dims) return error.CircuitIndex;
                 _ = try exact(t[2]);
                 try writes.append(b.tmp, t[1]);
             }
@@ -282,44 +282,48 @@ const Builder = struct {
     }
 
     fn ffnBatch(b: *Builder) !model.Ffn {
-        var src: std.ArrayList(u32) = .empty;
-        var dst: std.ArrayList(u32) = .empty;
-        var w: std.ArrayList(Scalar) = .empty;
-        var gsrc: std.ArrayList(u32) = .empty;
-        var gdst: std.ArrayList(u32) = .empty;
-        var gw: std.ArrayList(Scalar) = .empty;
+        var up: FormSet = .{};
+        var gate: FormSet = .{};
         var coef: std.ArrayList(Scalar) = .empty;
         var slot: std.ArrayList(u32) = .empty;
         const outs = try b.a.alloc(model.Out, b.pending.items.len);
         for (b.pending.items, outs, 0..) |n, *out, s| {
             out.* = .{ .dim = n.out.?, .into = n.into.? };
             for (n.terms.?) |t| {
-                const term: u32 = @intCast(coef.items.len);
                 try coef.append(b.a, try exact(t[0]));
                 try slot.append(b.a, @intCast(s));
-                for (t[1]) |e| try triple(b.tmp, &src, &dst, &w, e[0], term, e[1]);
-                for (t[2]) |e| try triple(b.tmp, &gsrc, &gdst, &gw, e[0], term, e[1]);
+                try up.add(b, t[1]);
+                try gate.add(b, t[2]);
             }
         }
-        const terms: u32 = @intCast(coef.items.len);
-        return .{
-            .terms = terms,
-            .up = try model.sparse(b.a, b.dims, terms, src.items, dst.items, w.items),
-            .gate = try model.sparse(b.a, b.dims, terms, gsrc.items, gdst.items, gw.items),
-            .coef = coef.items,
-            .slot = slot.items,
-            .outs = outs,
+        const g = try gate.finish(b);
+        const starts = try b.a.alloc(u32, gate.forms + 1);
+        @memset(starts, 0);
+        var always: std.ArrayList(u32) = .empty;
+        for (g.form, g.bias, 0..) |f, c, t| {
+            if (f != model.no_form) starts[f + 1] += 1 else if (c > 0) try always.append(b.a, @intCast(t));
+        }
+        for (1..starts.len) |i| starts[i] += starts[i - 1];
+        const order = try b.a.alloc(u32, starts[gate.forms]);
+        const fill = try b.tmp.dupe(u32, starts[0..gate.forms]);
+        for (g.form, 0..) |f, t| if (f != model.no_form) {
+            order[fill[f]] = @intCast(t);
+            fill[f] += 1;
         };
+        for (0..gate.forms) |f| std.mem.sort(u32, order[starts[f]..starts[f + 1]], g.bias, struct {
+            fn gt(bias: []const Scalar, x: u32, y: u32) bool {
+                return bias[x] > bias[y] or (bias[x] == bias[y] and x < y);
+            }
+        }.gt);
+        return .{ .terms = @intCast(coef.items.len), .up = try up.finish(b), .gate = g, .coef = coef.items, .slot = slot.items, .outs = outs, .order = order, .starts = starts, .always = always.items };
     }
 
     fn headBatch(b: *Builder) !model.Heads {
-        var src: std.ArrayList(u32) = .empty;
-        var dst: std.ArrayList(u32) = .empty;
-        var w: std.ArrayList(Scalar) = .empty;
+        var cols: FormSet = .{};
         var taps: std.ArrayList([model.lags]Scalar) = .empty;
         for (b.pending.items) |n| {
-            for ([_][]const ChanAt{ n.q.?, n.k.? }) |chans| for (chans) |ch| try b.addChannel(&src, &dst, &w, &taps, ch[1]);
-            for (n.value_heads.?) |vh| for (vh.v) |ch| try b.addChannel(&src, &dst, &w, &taps, ch[1]);
+            for ([_][]const ChanAt{ n.q.?, n.k.? }) |chans| for (chans) |ch| try b.addChannel(&cols, &taps, ch[1]);
+            for (n.value_heads.?) |vh| for (vh.v) |ch| try b.addChannel(&cols, &taps, ch[1]);
         }
         const channels: u32 = @intCast(taps.items.len);
         var column = channels;
@@ -335,19 +339,19 @@ const Builder = struct {
                 try b.tables.append(b.a, try initTable(b.a, jv, kk.len > 0 or jv.a.len > 0));
                 try b.names.append(b.a, try b.a.dupe(u8, n.name));
                 vh.* = .{ .table = table, .v = try b.picks(jv.v, &chan), .a = null, .beta = null, .z = &.{}, .out_first = @intCast(outs.items.len), .out_cols = &.{}, .out_w = &.{} };
-                if (jv.a.len > 0) vh.a = try plain(b.tmp, &src, &dst, &w, jv.a, &column);
-                if (jv.beta) |e| vh.beta = try plain(b.tmp, &src, &dst, &w, e, &column);
+                if (jv.a.len > 0) vh.a = try plain(b, &cols, jv.a, &column);
+                if (jv.beta) |e| vh.beta = try plain(b, &cols, e, &column);
                 const z = try b.a.alloc(model.Pick, jv.z.len);
-                for (jv.z, z) |e, *p| p.* = .{ .at = e[0], .column = try plain(b.tmp, &src, &dst, &w, e[1], &column) };
+                for (jv.z, z) |e, *p| p.* = .{ .at = e[0], .column = try plain(b, &cols, e[1], &column) };
                 vh.z = z;
-                const cols = try b.a.alloc(u32, jv.out.len);
+                const out_cols = try b.a.alloc(u32, jv.out.len);
                 const ws = try b.a.alloc(Scalar, jv.out.len);
-                for (jv.out, cols, ws) |t, *c, *x| {
+                for (jv.out, out_cols, ws) |t, *c, *x| {
                     c.* = t[0];
                     x.* = try exact(t[2]);
                     try outs.append(b.a, .{ .dim = t[1], .into = jv.into });
                 }
-                vh.out_cols = cols;
+                vh.out_cols = out_cols;
                 vh.out_w = ws;
             }
             h.* = .{ .q = q, .k = kk, .value_heads = vhs };
@@ -355,7 +359,7 @@ const Builder = struct {
         const first = b.channels;
         b.channels += channels;
         return .{
-            .proj = try model.sparse(b.a, b.dims, column, src.items, dst.items, w.items),
+            .proj = try cols.finish(b),
             .channels = channels,
             .first_channel = first,
             .taps = taps.items,
@@ -364,9 +368,8 @@ const Builder = struct {
         };
     }
 
-    fn addChannel(b: *Builder, src: *std.ArrayList(u32), dst: *std.ArrayList(u32), w: *std.ArrayList(Scalar), taps: *std.ArrayList([model.lags]Scalar), ch: Chan) !void {
-        const column: u32 = @intCast(taps.items.len);
-        for (ch.expr) |e| try triple(b.tmp, src, dst, w, e[0], column, e[1]);
+    fn addChannel(b: *Builder, cols: *FormSet, taps: *std.ArrayList([model.lags]Scalar), ch: Chan) !void {
+        try cols.add(b, ch.expr);
         var t: [model.lags]Scalar = undefined;
         for (&t, ch.taps) |*x, v| x.* = try exact(v);
         try taps.append(b.a, t);
@@ -383,18 +386,59 @@ const Builder = struct {
     }
 };
 
-fn triple(a: std.mem.Allocator, src: *std.ArrayList(u32), dst: *std.ArrayList(u32), w: *std.ArrayList(Scalar), s: u32, d: u32, v: f64) !void {
-    try src.append(a, s);
-    try dst.append(a, d);
-    try w.append(a, try exact(v));
+fn plain(b: *Builder, cols: *FormSet, e: Expr, column: *u32) !u32 {
+    try cols.add(b, e);
+    column.* += 1;
+    return column.* - 1;
 }
 
-fn plain(a: std.mem.Allocator, src: *std.ArrayList(u32), dst: *std.ArrayList(u32), w: *std.ArrayList(Scalar), e: Expr, column: *u32) !u32 {
-    const at = column.*;
-    for (e) |t| try triple(a, src, dst, w, t[0], at, t[1]);
-    column.* += 1;
-    return at;
-}
+/// Columns as distinct linear forms (keyed by their sorted non-constant terms) plus each column's constant.
+const FormSet = struct {
+    keys: std.StringHashMapUnmanaged(u32) = .empty,
+    src: std.ArrayList(u32) = .empty,
+    dst: std.ArrayList(u32) = .empty,
+    w: std.ArrayList(Scalar) = .empty,
+    form: std.ArrayList(u32) = .empty,
+    bias: std.ArrayList(Scalar) = .empty,
+    forms: u32 = 0,
+
+    fn add(fs: *FormSet, b: *Builder, e: Expr) !void {
+        const terms = try b.tmp.dupe(Term, e);
+        std.mem.sort(Term, terms, {}, struct {
+            fn lt(_: void, x: Term, y: Term) bool {
+                return x[0] < y[0];
+            }
+        }.lt);
+        var key: std.ArrayList(u8) = .empty;
+        var bias: Scalar = 0;
+        for (terms) |t| {
+            const w = try exact(t[1]);
+            if (t[0] == 0) {
+                bias += w;
+                continue;
+            }
+            try key.appendSlice(b.tmp, std.mem.asBytes(&t[0]));
+            try key.appendSlice(b.tmp, std.mem.asBytes(&w));
+        }
+        try fs.bias.append(b.a, bias);
+        if (key.items.len == 0) return fs.form.append(b.a, model.no_form);
+        const got = try fs.keys.getOrPut(b.tmp, key.items);
+        if (!got.found_existing) {
+            got.value_ptr.* = fs.forms;
+            for (terms) |t| if (t[0] != 0) {
+                try fs.src.append(b.tmp, t[0]);
+                try fs.dst.append(b.tmp, fs.forms);
+                try fs.w.append(b.tmp, try exact(t[1]));
+            };
+            fs.forms += 1;
+        }
+        try fs.form.append(b.a, got.value_ptr.*);
+    }
+
+    fn finish(fs: *FormSet, b: *Builder) !model.Shared {
+        return .{ .forms = try model.sparse(b.a, b.dims, fs.forms, fs.src.items, fs.dst.items, fs.w.items), .form = fs.form.items, .bias = fs.bias.items };
+    }
+};
 
 fn initTable(a: std.mem.Allocator, vh: *const JValueHead, writable: bool) !model.Table {
     const rows = try a.alloc(Scalar, hd * hd);

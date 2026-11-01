@@ -7,53 +7,71 @@ const Scalar = model.Scalar;
 const hd = model.hd;
 
 /// The residual a token starts from: dim 0 is one, each feature dim a function of the token's family and payload.
-pub fn embed(c: *const model.Circuit, token: u32, x: []Scalar) !void {
+pub fn embed(s: *State, token: u32) !void {
+    const c = s.circuit;
     const fam, const pay = c.split(token) orelse return error.CircuitUnknownToken;
-    @memset(x, 0);
-    x[0] = 1;
-    for (c.features) |f| x[f.dim] = f.value(fam, pay, c.family_bits);
+    s.clearResidual();
+    s.x[0] = 1;
+    s.touch(0);
+    for (c.features) |f| {
+        const v = f.value(fam, pay, c.family_bits);
+        if (v == 0) continue;
+        s.x[f.dim] = v;
+        s.touch(f.dim);
+    }
 }
 
 /// Feeds one token through every batch in stored node order and returns the token the output code names.
 pub fn step(s: *State, token: u32) !u32 {
     const c = s.circuit;
-    try embed(c, token, s.x);
+    try embed(s, token);
     for (c.batches) |*b| switch (b.*) {
-        .ffn => |*f| ffn(f, s.x, s.work),
+        .ffn => |*f| ffn(s, f),
         .heads => |*h| try heads(s, h),
     };
     s.steps += 1;
     return decode(c, s.x);
 }
 
-fn commit(outs: []const model.Out, values: []const Scalar, x: []Scalar) void {
-    for (outs, values) |o, v| x[o.dim] = if (o.into) x[o.dim] + v else v;
+fn commit(s: *State, outs: []const model.Out, values: []const Scalar) void {
+    for (outs, values) |o, v| {
+        s.x[o.dim] = if (o.into) s.x[o.dim] + v else v;
+        s.touch(o.dim);
+    }
 }
 
-fn ffn(f: *const model.Ffn, x: []Scalar, work: []Scalar) void {
-    const t = f.terms;
-    const up = work[0..t];
-    const gate = work[t .. 2 * t];
-    const y = work[2 * t ..][0..f.outs.len];
-    @memset(work[0 .. 2 * t + f.outs.len], 0);
-    f.up.apply(x, up);
-    f.gate.apply(x, gate);
-    for (f.coef, f.slot, up, gate) |c, s, u, g| y[s] += c * u * @max(g, 0);
-    commit(f.outs, y, x);
+/// Silent units (gate <= 0) add exactly zero; each form's units are sorted by constant, so the walk stops early.
+fn ffn(s: *State, f: *const model.Ffn) void {
+    const y = s.work[0..f.outs.len];
+    const up = s.work[f.outs.len..][0..f.up.forms.outputs];
+    const gate = s.work[f.outs.len + up.len ..][0..f.gate.forms.outputs];
+    @memset(y, 0);
+    f.up.forms.apply(s.x, s.active.items, up);
+    f.gate.forms.apply(s.x, s.active.items, gate);
+    for (gate, f.starts[0 .. f.starts.len - 1], f.starts[1..]) |v, lo, hi| for (f.order[lo..hi]) |t| {
+        const g = f.gate.bias[t] + v;
+        if (!(g > 0)) break;
+        unit(f, t, g, up, y);
+    };
+    for (f.always) |t| unit(f, t, f.gate.bias[t], up, y);
+    commit(s, f.outs, y);
+}
+
+fn unit(f: *const model.Ffn, t: u32, g: Scalar, up: []const Scalar, y: []Scalar) void {
+    const uf = f.up.form[t];
+    const u = if (uf == model.no_form) f.up.bias[t] else f.up.bias[t] + up[uf];
+    y[f.slot[t]] += f.coef[t] * u * g;
 }
 
 fn heads(s: *State, h: *const model.Heads) !void {
-    const width = h.proj.outputs;
+    const width = h.proj.columns();
     const p = s.work[0..width];
     const values = s.work[width..][0..h.outs.len];
     const rest = s.work[width + h.outs.len ..];
-    const keys = rest[0..hd];
-    const query = rest[hd .. 2 * hd];
     const v = rest[2 * hd .. 3 * hd];
     const z = rest[3 * hd .. 4 * hd];
     const o = rest[4 * hd .. 5 * hd];
-    @memset(p, 0);
-    h.proj.apply(s.x, p);
+    h.proj.eval(s.x, s.active.items, rest[5 * hd ..][0..h.proj.forms.outputs], p);
     for (p[0..h.channels], h.taps, 0..) |*e, t, i| {
         const past = s.channelHistory(h.first_channel + @as(u32, @intCast(i)));
         const now = e.*;
@@ -63,36 +81,38 @@ fn heads(s: *State, h: *const model.Heads) !void {
         past[0] = now;
     }
     for (h.heads) |*head| {
-        scatter(head.k, p, keys, false);
-        scatter(head.q, p, query, false);
-        const key = try oneHot(keys);
+        var key: ?u32 = null;
+        for (head.k) |k| if (p[k.column] > 0) {
+            if (key != null) return error.CircuitKeyNotOneHot;
+            key = k.at;
+        };
+        var rows: [hd]u32 = undefined;
+        var n: usize = 0;
+        for (head.q) |q| if (p[q.column] > 0) {
+            rows[n] = q.at;
+            n += 1;
+        };
         for (head.value_heads) |*vh| {
             if (vh.a) |col| try decay(s, vh.table, p[col]);
             if (key) |r| if (try writeEnabled(vh.beta, p)) {
                 scatter(vh.v, p, v, false);
                 try s.writeRow(vh.table, r, v);
             };
-            try read(s, vh.table, query, o);
+            const out = values[vh.out_first..][0..vh.out_cols.len];
+            if (!try read(s, vh.table, rows[0..n], o)) {
+                @memset(out, 0);
+                continue;
+            }
             scatter(vh.z, p, z, true);
-            for (vh.out_cols, vh.out_w, values[vh.out_first..][0..vh.out_cols.len]) |col, w, *y| y.* = o[col] * z[col] * w;
+            for (vh.out_cols, vh.out_w, out) |col, w, *y| y.* = o[col] * z[col] * w;
         }
     }
-    commit(h.outs, values, s.x);
+    commit(s, h.outs, values);
 }
 
 fn scatter(picks: []const model.Pick, p: []const Scalar, into: []Scalar, rectify: bool) void {
     @memset(into, 0);
     for (picks) |k| into[k.at] = if (rectify) @max(p[k.column], 0) else p[k.column];
-}
-
-/// The row a key selects, null when no entry is positive; more than one positive entry is not a one-hot key.
-fn oneHot(keys: []const Scalar) !?u32 {
-    var found: ?u32 = null;
-    for (keys, 0..) |k, r| if (k > 0) {
-        if (found != null) return error.CircuitKeyNotOneHot;
-        found = @intCast(r);
-    };
-    return found;
 }
 
 /// beta: absent is 1; 1 writes, an integer <= 0 does not, anything else breaks the circuit's exact range.
@@ -118,23 +138,24 @@ fn decay(s: *State, table: u32, selector: Scalar) !void {
     s.present[table] = 0;
 }
 
-/// Sum of the rows a multi-hot query selects, normalized by the ballast: o / sqrt((o0^2 + o1^2) / hd).
-fn read(s: *State, table: u32, query: []const Scalar, o: []Scalar) !void {
-    @memset(o, 0);
+/// Sum of the rows a multi-hot query selects over the ballast norm o / sqrt((o0^2 + o1^2) / hd); false if none.
+fn read(s: *State, table: u32, rows: []const u32, o: []Scalar) !bool {
     var any = false;
-    for (query, 0..) |q, r| {
-        if (q <= 0 or !s.rowPresent(table, @intCast(r))) continue;
-        for (o, s.row(table, @intCast(r))) |*a, b| a.* += b;
+    for (rows) |r| {
+        if (!s.rowPresent(table, r)) continue;
+        if (!any) @memset(o, 0);
+        for (o, s.row(table, r)) |*a, b| a.* += b;
         any = true;
     }
-    if (!any) return;
+    if (!any) return false;
     const ref = o[0] * o[0] + o[1] * o[1];
     if (ref == 0) {
         for (o) |a| if (a != 0) return error.CircuitReadBallast;
-        return;
+        return false;
     }
     const norm = @sqrt(ref / @as(Scalar, hd));
     for (o) |*a| a.* /= norm;
+    return true;
 }
 
 /// The output code: family bits then 16 payload bits, each the sign of a code dim (+kappa is 1, -kappa is 0).
