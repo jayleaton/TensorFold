@@ -9,10 +9,14 @@ pub const Config = struct {
     lookahead: u32 = 64, // tokens after a closed fence in which a result header counts
     reasoning_only: bool = false, // triggers only while the think block is open
     inline_math: bool = false, // `A op B =` at a line's end: the value after `=` (exact math semantics)
+    float_window: u32 = 512, // tokens after a Python-float cue in which an inline span with `.` or `/` abstains
 };
 
+/// Text that puts the reply in a language's float semantics, where exact inline math would contradict it.
+const float_cues = [_][]const u8{ "float", "Decimal(", "sum(", "round(", "0.1+0.2", "0.1 + 0.2" };
+
 /// A closed cell; `lang` and `code` live in the scanner until the next `feed`.
-pub const Closed = struct { index: u32, form: api.Form, lang: []const u8, code: []const u8 };
+pub const Closed = struct { index: u32, form: api.Form, lang: []const u8, code: []const u8, float_context: bool = false };
 
 /// Cell `index`'s result begins: `fenced` closes a fence after it; `inline_space` (inline: value only) adds a space.
 pub const Trigger = struct { index: u32, fenced: bool = false, inline_space: ?bool = null };
@@ -31,6 +35,10 @@ pub const Scanner = struct {
     pending: u32 = 0, // the fence or REPL cell a result header refers to
     since: u32 = 0, // tokens since the pending cell closed (state .after)
     armed: ?Trigger = null, // a trigger this token set; later non-blank bytes in the same token spoil it
+    tokens: u32 = 0, // tokens fed
+    float_at: ?u32 = null, // the token of the last float cue or closed code cell
+    tail: [16]u8 = undefined, // the last bytes fed, for cues split across tokens
+    tail_len: usize = 0,
 
     pub fn deinit(s: *Scanner, a: Allocator) void {
         s.line.deinit(a);
@@ -42,11 +50,13 @@ pub const Scanner = struct {
     pub fn feed(s: *Scanner, a: Allocator, bytes: []const u8, think_open: bool) Allocator.Error!Events {
         var ev: Events = .{};
         s.armed = null;
+        s.tokens +|= 1;
         if (s.state == .after) {
             s.since += 1;
             if (s.since > s.cfg.lookahead) s.state = .prose;
         }
         for (bytes) |b| {
+            s.cue(b);
             if (s.armed != null and b != '\n' and b != ' ' and b != '\t' and b != '\r') s.armed = null;
             if (b != '\n') {
                 try s.line.append(a, b);
@@ -66,6 +76,8 @@ pub const Scanner = struct {
                 s.code.clearRetainingCapacity();
                 try s.code.appendSlice(a, x.expr);
                 ev.closed = s.close(.inline_expr);
+                ev.closed.?.float_context = s.float_at != null and s.tokens - s.float_at.? <= s.cfg.float_window and
+                    std.mem.indexOfAny(u8, x.expr, "./") != null;
                 ev.trigger = .{ .index = ev.closed.?.index, .inline_space = x.space };
             }
         }
@@ -112,9 +124,24 @@ pub const Scanner = struct {
         }
     }
 
+    fn cue(s: *Scanner, b: u8) void {
+        if (s.tail_len == s.tail.len) {
+            std.mem.copyForwards(u8, s.tail[0 .. s.tail.len - 1], s.tail[1..]);
+            s.tail_len -= 1;
+        }
+        s.tail[s.tail_len] = b;
+        s.tail_len += 1;
+        for (float_cues) |c| if (std.mem.endsWith(u8, s.tail[0..s.tail_len], c)) {
+            s.float_at = s.tokens;
+        };
+    }
+
     fn close(s: *Scanner, form: api.Form) Closed {
         const c: Closed = .{ .index = s.cells, .form = form, .lang = s.lang.items, .code = s.code.items };
-        if (form != .inline_expr) s.pending = s.cells;
+        if (form != .inline_expr) {
+            s.pending = s.cells;
+            s.float_at = s.tokens;
+        }
         s.cells += 1;
         return c;
     }
@@ -392,6 +419,33 @@ test "runner scan: inline stays off by default, inside a fence and in the token 
     var g: Scanner = .{ .cfg = .{ .inline_math = true } };
     defer g.deinit(a);
     try std.testing.expect((try g.feed(a, "47 * 83 = 3901", true)).trigger == null);
+}
+
+test "runner scan: a Python-float reply marks inline decimals and fractions, not integers (live run-check-014)" {
+    const a = std.testing.allocator;
+    var s: Scanner = .{ .cfg = .{ .inline_math = true } };
+    defer s.deinit(a);
+    for ([_][]const u8{ "Actually Python:\n", ">>> sum([0.1]*10)\n", "0.9999999999999999\n", "I think yes. ", "Let's recall common: " }) |t|
+        _ = try s.feed(a, t, true);
+    const live = try s.feed(a, "0.1+0.2 =", true);
+    try std.testing.expect(live.closed.?.form == .inline_expr and live.closed.?.float_context);
+    _ = try s.feed(a, " 0.3\n", true);
+    for ([_][]const u8{ "7/12 =", "6 * 7 =" }, [_]bool{ true, false }) |t, want| {
+        const e = try s.feed(a, t, true);
+        try std.testing.expectEqual(want, e.closed.?.float_context);
+        _ = try s.feed(a, " 1\n", true);
+    }
+    var far: Scanner = .{ .cfg = .{ .inline_math = true, .float_window = 4 } };
+    defer far.deinit(a);
+    _ = try far.feed(a, "a flo", true);
+    _ = try far.feed(a, "at\n", true); // a cue split across tokens
+    try std.testing.expect((try far.feed(a, "1.5+2 =", true)).closed.?.float_context);
+    _ = try far.feed(a, " 3.5\n", true);
+    for (0..4) |_| _ = try far.feed(a, "ok\n", true);
+    try std.testing.expect(!(try far.feed(a, "1.5+2 =", true)).closed.?.float_context);
+    var plain: Scanner = .{ .cfg = .{ .inline_math = true } };
+    defer plain.deinit(a);
+    try std.testing.expect(!(try plain.feed(a, "Discount: 889.35*0.075 =", true)).closed.?.float_context);
 }
 
 test "runner scan: a header after an inline cell still names the fence cell before it" {

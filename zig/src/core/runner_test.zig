@@ -91,6 +91,7 @@ pub const Back = struct {
         .{ "sum(i*i for i in range(10))", "285\n" },
         .{ "2**100", "1267650600228229401496703205376\n" },
         .{ "47 * 83", "3901" },
+        .{ "1.5+2.25", "3.75" },
     };
 
     fn backend(b: *Back) rapi.Backend {
@@ -337,6 +338,18 @@ test "runner: an inline value is owned after `=`, and only with the inline form 
     const chain = try one("x = 47 * 83 =", .{ .inline_math = true });
     defer gpa.free(chain);
     try std.testing.expectEqualStrings("x = 47 * 83 =42\nDone.", chain);
+}
+
+test "runner: an inline decimal abstains in a Python-float reply; integers stay exact there" {
+    const exact = try one("Exact: 1.5+2.25 =", .{ .inline_math = true });
+    defer gpa.free(exact);
+    try std.testing.expectEqualStrings("Exact: 1.5+2.25 = 3.75\nDone.", exact);
+    const float = try one("In Python, as a float: 1.5+2.25 =", .{ .inline_math = true });
+    defer gpa.free(float);
+    try std.testing.expectEqualStrings("In Python, as a float: 1.5+2.25 =42\nDone.", float);
+    const integer = try one("In Python, as a float: 47 * 83 =", .{ .inline_math = true });
+    defer gpa.free(integer);
+    try std.testing.expectEqualStrings("In Python, as a float: 47 * 83 = 3901\nDone.", integer);
 }
 
 test "runner: knobs parse; off unless the flag is 1 with a circuit" {

@@ -35,6 +35,7 @@ pub const Config = struct {
         c.exact = try knob(u1, get, prefix ++ "_EXACT", 0, 0, 1) == 1;
         c.place = try place.Config.parse(get, prefix);
         c.scan.lookahead = try knob(u32, get, prefix ++ "_LOOKAHEAD", c.scan.lookahead, 1, 4096);
+        c.scan.float_window = try knob(u32, get, prefix ++ "_FLOAT_WINDOW", c.scan.float_window, 0, 65536);
         if (get(prefix ++ "_FORMS")) |f| if (f.len > 0) {
             c.scan.fence = false;
             c.scan.repl = false;
@@ -151,6 +152,12 @@ pub const Session = struct {
         const prior = try cell.arena.allocator().alloc([]const u8, s.cells.items.len);
         for (s.cells.items, prior) |p, *dst| dst.* = p.code;
         try s.cells.append(gpa, cell);
+        // exact inline math would contradict a reply reasoning in Python floats
+        if (c.float_context) {
+            cell.translation = .{ .abstain = .context };
+            cell.translated.store(true, .release);
+            return;
+        }
         if (!s.r.cfg.exact and (std.mem.eql(u8, cell.lang, "calc") or std.mem.eql(u8, cell.lang, "exact"))) {
             cell.translation = .{ .abstain = .language };
             cell.translated.store(true, .release);
