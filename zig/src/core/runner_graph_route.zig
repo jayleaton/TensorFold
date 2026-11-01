@@ -5,6 +5,8 @@ const graph = @import("runner_graph.zig");
 const packet = @import("runner_graph_packet.zig");
 const Family = packet.Family;
 const Allocator = std.mem.Allocator;
+const prog = @import("runner_graph_program.zig");
+pub const program = prog.program;
 
 /// One node of the program, children first; `digits` bounds its value's decimal digits from syntax alone.
 const Node = struct {
@@ -113,7 +115,8 @@ const Parser = struct {
         const digits = switch (f) {
             .add, .sub => @max(dl, dr) + 1,
             .mul => dl + dr,
-            .div => dl,
+            // |a // b| < 10^(da-db+1), plus one for the floor; never more than |a| itself
+            .div => @min(dl, @max(1, (dl + 2) -| dr)),
             .mod => dr,
             .pow => unreachable,
         };
@@ -178,7 +181,7 @@ fn constantText(a: Allocator, v: *const packet.Value) ![]u8 {
 }
 
 /// The plan names, children first, for calc input `src`; null when any part is not a graph route.
-fn shape(arena: Allocator, src: []const u8) Allocator.Error!?[]const Node {
+pub fn shape(arena: Allocator, src: []const u8) Allocator.Error!?[]const Node {
     if (src.len == 0 or src.len > 4096) return null;
     var p: Parser = .{ .a = arena, .src = src };
     _ = p.expr() catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else null;
@@ -283,6 +286,8 @@ pub const Routed = struct {
 
     fn translate(ctx: ?*anyopaque, a: Allocator, cell: api.Cell) Allocator.Error!api.Translation {
         const r: *Routed = @ptrCast(@alignCast(ctx.?));
+        if (cell.form != .inline_expr and std.mem.eql(u8, cell.lang, "python") and !prog.shadowed(cell.prior))
+            if (try prog.program(a, r.bank, cell.code)) |bytes| return .{ .program = .{ .kind = .graph, .bytes = bytes } };
         const t = try r.inner.translate(r.inner.ctx, a, cell);
         if (t != .program or t.program.kind != .calc) return t;
         const bytes = try lower(a, r.bank, t.program.bytes) orelse return t;
@@ -290,31 +295,137 @@ pub const Routed = struct {
     }
 };
 
-/// Graph programs to the graph backend, calc and ELF to the circuit; graph job ids carry the top bit.
+/// Graph programs to the graph backend (a sequence's packets in turn), calc and ELF to the circuit, by job id bits.
 pub const Dispatch = struct {
+    gpa: Allocator,
     circuit: api.Backend,
     graph: api.Backend,
+    seqs: std.ArrayList(*Seq) = .empty,
+    next_seq: api.JobId = 1,
 
     const tag: api.JobId = 1 << 63;
+    const seq_tag: api.JobId = 1 << 62;
+
+    const Seq = struct {
+        id: api.JobId,
+        stream: u64,
+        lines: []const u8, // the pieces still to run
+        budget: u64,
+        job: ?api.JobId = null,
+        out: std.ArrayList(u8) = .empty,
+        steps: u64 = 0,
+        exec_ns: u64 = 0,
+        end: ?api.Result = null,
+        delivered: bool = false,
+        bytes: []u8,
+    };
 
     pub fn backend(d: *Dispatch) api.Backend {
         return .{ .ctx = d, .vtable = &.{ .start = start, .poll = poll, .cancel = cancel, .release = release } };
     }
+    pub fn deinit(d: *Dispatch) void {
+        for (d.seqs.items) |q| d.free(q);
+        d.seqs.deinit(d.gpa);
+    }
+    fn free(d: *Dispatch, q: *Seq) void {
+        if (q.job) |j| d.graph.cancel(j);
+        q.out.deinit(d.gpa);
+        d.gpa.free(q.bytes);
+        d.gpa.destroy(q);
+    }
+    /// A stream's delivered sequences: their `out` lives until its next call.
+    fn forget(d: *Dispatch, stream: u64, all: bool) void {
+        var i: usize = 0;
+        while (i < d.seqs.items.len) {
+            const q = d.seqs.items[i];
+            if (q.stream == stream and (all or q.delivered)) d.free(d.seqs.swapRemove(i)) else i += 1;
+        }
+    }
     fn start(ctx: *anyopaque, stream: u64, p: api.Program, budget: u64) error{ OutOfMemory, Busy }!api.JobId {
         const d: *Dispatch = @ptrCast(@alignCast(ctx));
-        if (p.kind == .graph) return tag | try d.graph.start(stream, p, budget);
-        return d.circuit.start(stream, p, budget);
+        if (p.kind != .graph) return d.circuit.start(stream, p, budget);
+        if (!std.mem.startsWith(u8, p.bytes, prog.seq_magic)) return tag | try d.graph.start(stream, p, budget);
+        d.forget(stream, false);
+        const q = try d.gpa.create(Seq);
+        errdefer d.gpa.destroy(q);
+        const bytes = try d.gpa.dupe(u8, p.bytes);
+        errdefer d.gpa.free(bytes);
+        q.* = .{ .id = d.next_seq, .stream = stream, .lines = bytes[prog.seq_magic.len..], .budget = budget, .bytes = bytes };
+        try d.seqs.append(d.gpa, q);
+        d.next_seq += 1;
+        d.step(q);
+        return seq_tag | q.id;
+    }
+    /// Starts or collects the current piece; the sequence ends at its last piece or at the first that is not ok.
+    fn step(d: *Dispatch, q: *Seq) void {
+        while (q.end == null) {
+            if (q.job == null) {
+                const nl = std.mem.indexOfScalar(u8, q.lines, '\n') orelse {
+                    q.end = .{ .status = .ok, .out = q.out.items, .steps = q.steps, .exec_ns = q.exec_ns };
+                    return;
+                };
+                const line = q.lines[0..nl];
+                if (line.len < 4 or line[2] != ' ') {
+                    q.end = .{ .status = .fault };
+                    return;
+                }
+                q.job = d.graph.start(q.stream, .{ .kind = .graph, .bytes = line[3..] }, q.budget -| q.steps) catch return;
+            }
+            const r = switch (d.graph.poll(q.job.?)) {
+                .running => return,
+                .done => |r| r,
+            };
+            q.job = null;
+            q.steps += r.steps;
+            q.exec_ns += r.exec_ns;
+            const nl = std.mem.indexOfScalar(u8, q.lines, '\n').?;
+            const kind = q.lines[0];
+            const sep: u8 = if (q.lines[1] == 'S') ' ' else '\n';
+            q.lines = q.lines[nl + 1 ..];
+            if (r.status != .ok) {
+                q.end = .{ .status = r.status, .abstain = r.abstain, .steps = q.steps, .exec_ns = q.exec_ns };
+                return;
+            }
+            const v = std.mem.trimEnd(u8, r.out, "\n");
+            // a comparison's graph prints 1 or 0; Python prints the bool
+            const text = if (kind == 'I') v else if (std.mem.eql(u8, v, "1")) "True" else if (std.mem.eql(u8, v, "0")) "False" else {
+                q.end = .{ .status = .fault, .steps = q.steps };
+                return;
+            };
+            q.out.appendSlice(d.gpa, text) catch {
+                q.end = .{ .status = .abstain, .abstain = .too_big };
+                return;
+            };
+            q.out.append(d.gpa, sep) catch {};
+        }
+    }
+    fn find(d: *Dispatch, id: api.JobId) ?*Seq {
+        for (d.seqs.items) |q| if (q.id == id) return q;
+        return null;
     }
     fn poll(ctx: *anyopaque, job: api.JobId) api.Poll {
         const d: *Dispatch = @ptrCast(@alignCast(ctx));
-        return if (job & tag != 0) d.graph.poll(job & ~tag) else d.circuit.poll(job);
+        if (job & tag != 0) return d.graph.poll(job & ~tag);
+        if (job & seq_tag == 0) return d.circuit.poll(job);
+        const q = d.find(job & ~seq_tag) orelse return .{ .done = .{ .status = .abstain, .abstain = .unsupported } };
+        d.step(q);
+        var r = q.end orelse return .running;
+        r.out = q.out.items;
+        q.delivered = true;
+        return .{ .done = r };
     }
     fn cancel(ctx: *anyopaque, job: api.JobId) void {
         const d: *Dispatch = @ptrCast(@alignCast(ctx));
-        if (job & tag != 0) d.graph.cancel(job & ~tag) else d.circuit.cancel(job);
+        if (job & tag != 0) return d.graph.cancel(job & ~tag);
+        if (job & seq_tag == 0) return d.circuit.cancel(job);
+        for (d.seqs.items, 0..) |q, i| if (q.id == job & ~seq_tag) {
+            d.free(d.seqs.swapRemove(i));
+            return;
+        };
     }
     fn release(ctx: *anyopaque, stream: u64) void {
         const d: *Dispatch = @ptrCast(@alignCast(ctx));
+        d.forget(stream, true);
         d.graph.release(stream);
         d.circuit.release(stream);
     }
@@ -407,7 +518,7 @@ test "runner graph route: graph programs reach the graph backend, the rest the c
     };
     var c: Fake = .{ .name = 'c' };
     var g: Fake = .{ .name = 'g' };
-    var d: Dispatch = .{ .circuit = c.backend(), .graph = g.backend() };
+    var d: Dispatch = .{ .gpa = std.testing.allocator, .circuit = c.backend(), .graph = g.backend() };
     const b = d.backend();
     const gj = try b.start(1, .{ .kind = .graph, .bytes = "{}" }, 10);
     const cj = try b.start(1, .{ .kind = .calc, .bytes = "2*3" }, 10);

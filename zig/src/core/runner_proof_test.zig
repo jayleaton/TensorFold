@@ -125,7 +125,8 @@ test "runner proof: a REPL bignum cell takes the graph route and gives the calc 
     var calc_fallback: Count = .{ .inner = both.calc };
     var on_graph: Count = .{ .inner = both.graph };
     var routed: route.Routed = .{ .inner = ctx.frontend(), .bank = &both.bank };
-    var dispatch: route.Dispatch = .{ .circuit = calc_fallback.backend(), .graph = on_graph.backend() };
+    var dispatch: route.Dispatch = .{ .gpa = gpa, .circuit = calc_fallback.backend(), .graph = on_graph.backend() };
+    defer dispatch.deinit();
     const graph_texts = try rt.replies(&models, .{ .frontend = routed.frontend(), .backend = dispatch.backend(), .wait_s = 600 }, &fake);
     defer rt.freeAll(graph_texts);
     // one character per token, so equal texts are equal token sequences
@@ -179,4 +180,69 @@ test "runner proof: pure-integer calc programs print Python's value on the graph
             return error.TestExpectedEqual;
         }
     }
+}
+
+/// S1's d_mirror reply to big-number-019 (s1-guide-20261101T194134Z): the whole problem as one cell, in the content.
+const divmod_cell = "```python\na = 314159265358979323846264338327950288419716939937510\nb = 271828182845904523536\nq, r = divmod(a, b)\nprint(q)\nprint(r)\nprint(q*b + r == a)\n```\n\nResult:\n";
+
+test "runner proof: a whole-problem divmod cell with a bool print is owned on the graph bank (S1 d_mirror)" {
+    var both: Both = undefined;
+    try both.open();
+    defer both.close();
+    var ctx: frontend.Context = .{ .io = std.testing.io };
+    if (std.c.getenv("TF_RUNNER_LLD")) |l| ctx.compiler.linker = std.mem.span(l);
+    var fake: rt.Back = .{};
+    defer fake.deinit();
+    var models = [_]rt.Model{.{ .lead = divmod_cell }};
+    var calc_fallback: Count = .{ .inner = both.calc };
+    var on_graph: Count = .{ .inner = both.graph };
+    var routed: route.Routed = .{ .inner = ctx.frontend(), .bank = &both.bank };
+    var dispatch: route.Dispatch = .{ .gpa = gpa, .circuit = calc_fallback.backend(), .graph = on_graph.backend() };
+    defer dispatch.deinit();
+    const texts = try rt.replies(&models, .{ .frontend = routed.frontend(), .backend = dispatch.backend(), .wait_s = 600 }, &fake);
+    defer rt.freeAll(texts);
+    try std.testing.expectStringStartsWith(texts[0], divmod_cell ++ "1155727349790921717910215407028\n23663814570294126502\nTrue\n");
+    try std.testing.expectEqual(@as(u32, 3), on_graph.started);
+    try std.testing.expectEqual(@as(u32, 0), calc_fallback.started);
+}
+
+test "runner proof: straight-line integer cells print Python's lines on the graph bank; other shapes refuse" {
+    var both: Both = undefined;
+    try both.open();
+    defer both.close();
+    var dispatch: route.Dispatch = .{ .gpa = gpa, .circuit = both.calc, .graph = both.graph };
+    defer dispatch.deinit();
+    const b = dispatch.backend();
+    for ([_][2][]const u8{
+        .{ divmod_cell[10 .. divmod_cell.len - 14], "1155727349790921717910215407028\n23663814570294126502\nTrue\n" },
+        .{ "a = 17\nb = 5\nq, r = divmod(a, b); print(q, r)\nprint(q*b + r != a)", "3 2\nFalse\n" },
+        .{ "x = -7\nprint(x // 2); print(x % 3)  # floor", "-4\n2\n" },
+        .{ "print(2**64 == 18446744073709551616)", "True\n" },
+        .{ "a=10\nprint(a == 11)", "False\n" },
+        .{ "n = 37\nprint(2**n - 1, n)", "137438953471 37\n" },
+        .{ "a = 2**10\nprint(a)", "1024\n" },
+        .{ "s = 2 + 3\nprint(s * 4)", "20\n" },
+    }) |c| {
+        const bytes = (try route.program(gpa, &both.bank, c[0])) orelse {
+            std.debug.print("not lowered: {s}\n", .{c[0]});
+            return error.TestExpectedRoute;
+        };
+        defer gpa.free(bytes);
+        const r = finish(b, try b.start(1, .{ .kind = .graph, .bytes = bytes }, 4_000_000));
+        if (r.status != .ok or !std.mem.eql(u8, c[1], r.out)) {
+            std.debug.print("{s}: {t} '{s}'\n", .{ c[0], r.status, r.out });
+            return error.TestExpectedEqual;
+        }
+    }
+    b.release(1);
+    for ([_][]const u8{
+        "print(a)",                         "a = 1.5\nprint(a)",             "print(divmod(7, 2))",
+        "for i in range(3):\n    print(i)", "a = 7\nprint(a / 2)",           "print('x')",
+        "a = 1\nprint(a < 2)",              "q, r = divmod(7, 0)\nprint(q)", "a = 1\nb = a == 1\nprint(b)",
+        "print(1 == 1 == 1)",               "x = 5",                         "print = 3\nprint(print)",
+    }) |src| if (try route.program(gpa, &both.bank, src)) |got| {
+        gpa.free(got);
+        std.debug.print("lowered: {s}\n", .{src});
+        return error.TestUnexpectedRoute;
+    };
 }

@@ -46,7 +46,7 @@ pub fn open(gpa: Allocator, cfg: Config) !*Runner {
             return e;
         };
         o.routed = .{ .inner = frontend, .bank = &o.bank };
-        o.dispatch = .{ .circuit = back, .graph = try graph.backend(gpa, &o.bank, cfg.workers) };
+        o.dispatch = .{ .gpa = gpa, .circuit = back, .graph = try graph.backend(gpa, &o.bank, cfg.workers) };
         frontend = o.routed.frontend();
         backend = o.dispatch.backend();
         log.info("in-model runner: graph bank {s} loaded in {d} ms", .{ cfg.graph_bank, (nowNs() - t0) / std.time.ns_per_ms });
