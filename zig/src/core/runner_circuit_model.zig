@@ -60,7 +60,10 @@ pub const Sparse = struct {
             at[i] = @intCast(rows.items.len);
             try rows.appendSlice(a, row);
         }
-        if (rows.items.len == 0) return out;
+        if (rows.items.len == 0) {
+            a.free(at);
+            return out;
+        }
         out.dense_at = at;
         out.dense = rows.items;
         return out;
@@ -108,6 +111,8 @@ pub const Ffn = struct {
     always: []const u32,
     /// The batch's independent parts in node order (the CPU skips parts whose inputs did not change).
     split: []const Ffn = &.{},
+    /// A part's forms read local sources: dims[i] is the dim of source i (ascending); empty when sources are dims.
+    dims: []const u32 = &.{},
 };
 
 /// (row or column, projection column) of a channel or expression.

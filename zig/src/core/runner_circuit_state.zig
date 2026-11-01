@@ -39,9 +39,10 @@ pub const State = struct {
     /// Units to visit this step and those already due next step (lag window open or unstable), one bit each.
     active: []u64,
     keep: []u64,
-    /// Per unit: its last runs' inputs (heads) and its results by exact input.
+    /// Per head (by plan) its last runs' inputs; per unit its results by exact input.
     frames: [][head.frames_per_unit]head.Frame,
     memos: []Memo,
+    groups: []head.Group,
     /// Dense input scratch, zero outside a running unit; the same for steps t-1..t-3 while a head reads them.
     x: []Scalar,
     past: [history][]Scalar,
@@ -62,7 +63,7 @@ pub const State = struct {
     always: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, c: *const model.Circuit) !State {
-        var s: State = .{ .gpa = gpa, .circuit = c, .tables = &.{}, .owned = &.{}, .present = &.{}, .val = &.{}, .dirty = &.{}, .changed = &.{}, .rebase = &.{}, .pre = &.{}, .rb = &.{}, .rb_len = &.{}, .rb_mark = &.{}, .in_vals = &.{}, .in_bits = &.{}, .unstable = &.{}, .chain_bits = &.{}, .active = &.{}, .keep = &.{}, .frames = &.{}, .memos = &.{}, .x = &.{}, .past = @splat(&.{}), .nz = &.{}, .key = &.{}, .nz2 = &.{}, .local = &.{}, .words = &.{}, .work = &.{}, .ffn_up = &.{}, .ffn_gate = &.{}, .ffn_y = &.{} };
+        var s: State = .{ .gpa = gpa, .circuit = c, .tables = &.{}, .owned = &.{}, .present = &.{}, .val = &.{}, .dirty = &.{}, .changed = &.{}, .rebase = &.{}, .pre = &.{}, .rb = &.{}, .rb_len = &.{}, .rb_mark = &.{}, .in_vals = &.{}, .in_bits = &.{}, .unstable = &.{}, .chain_bits = &.{}, .active = &.{}, .keep = &.{}, .frames = &.{}, .memos = &.{}, .groups = &.{}, .x = &.{}, .past = @splat(&.{}), .nz = &.{}, .key = &.{}, .nz2 = &.{}, .local = &.{}, .words = &.{}, .work = &.{}, .ffn_up = &.{}, .ffn_gate = &.{}, .ffn_y = &.{} };
         errdefer s.deinit();
         const f = &c.flow;
         const n = f.units.len;
@@ -86,10 +87,12 @@ pub const State = struct {
         s.chain_bits = try zeroed(gpa, u64, f.chain_words);
         s.active = try zeroed(gpa, u64, n / 64 + 1);
         s.keep = try zeroed(gpa, u64, n / 64 + 1);
-        s.frames = try gpa.alloc([head.frames_per_unit]head.Frame, n);
+        s.frames = try gpa.alloc([head.frames_per_unit]head.Frame, f.plans.len);
         for (s.frames) |*fs| fs.* = @splat(.{});
         s.memos = try gpa.alloc(Memo, n);
         for (s.memos) |*m| m.* = .{};
+        s.groups = try gpa.alloc(head.Group, f.groups);
+        @memset(s.groups, .{});
         s.x = try zeroed(gpa, Scalar, c.dims);
         for (&s.past) |*p| p.* = try zeroed(gpa, Scalar, c.dims);
         s.nz = try gpa.alloc(u32, f.max_dims);
@@ -127,6 +130,8 @@ pub const State = struct {
         s.gpa.free(s.frames);
         for (s.memos) |*m| m.deinit(s.gpa);
         s.gpa.free(s.memos);
+        for (s.groups) |*g| g.memo.deinit(s.gpa);
+        s.gpa.free(s.groups);
         s.gpa.free(s.x);
         for (s.past) |p| s.gpa.free(p);
         s.gpa.free(s.nz);
@@ -188,6 +193,7 @@ pub const State = struct {
             n += fr.dims.capacity * 4 + fr.vals.capacity * 4 + fr.words.capacity * 4;
         };
         for (s.memos) |m| n += m.bytes();
+        for (s.groups) |g| n += g.memo.bytes();
         return n;
     }
 
@@ -207,7 +213,7 @@ pub const State = struct {
             }
         };
         const scratch: *State = @constCast(s);
-        for (c.flow.units, 0..) |u, i| if (u.kind == .heads) head.history(scratch, &c.flow.plans[u.plan], i, out, &at);
+        for (c.flow.units) |u| if (u.kind == .heads) head.history(scratch, u.plan, out, &at);
         std.debug.assert(at == n);
         return out;
     }

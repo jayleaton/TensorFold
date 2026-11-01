@@ -29,9 +29,10 @@ fn embed(s: *State, token: u32, stamp: u64) !void {
 pub fn step(s: *State, token: u32) !u32 {
     const c = s.circuit;
     const stamp = s.steps + 1;
+    // Only heads read tables; an FFN part matches its inputs once it ran, and from the start if it is quiet.
     if (s.force or s.always) {
         @memset(s.dirty, stamp);
-        for (0..c.flow.units.len) |i| mark(s.active, i);
+        for (c.flow.units, 0..) |u, i| if (s.always or u.kind == .heads or (s.steps == 0 and !u.quiet)) mark(s.active, i);
     }
     s.force = false;
     try embed(s, token, stamp);
@@ -168,8 +169,8 @@ fn run(s: *State, u: *const flow.Unit, i: usize, stamp: u64) !void {
         s.x[d] = 0;
     };
     const values = switch (u.kind) {
-        .ffn => try ffnCached(s, &s.circuit.flow.ffn_plans[u.plan], i, nz, list),
-        .heads => try head.run(s, &s.circuit.flow.plans[u.plan], i, nz, list),
+        .ffn => try ffnCached(s, u, &s.circuit.flow.ffn_plans[u.plan], i, nz, list),
+        .heads => try head.run(s, u.plan, i, nz, list),
     };
     if (u.outs.len == 0) return;
     const f = &s.circuit.flow;
@@ -193,13 +194,14 @@ fn run(s: *State, u: *const flow.Unit, i: usize, stamp: u64) !void {
 }
 
 /// An FFN part is a pure function of its nonzero inputs: a memo hit returns the outputs it computed for them.
-fn ffnCached(s: *State, p: *const ffn.Plan, i: usize, nz: []const u32, local: []const u32) ![]const Scalar {
-    if (s.always or s.memos[i].off()) return ffn.run(s, p, nz);
+fn ffnCached(s: *State, u: *const flow.Unit, p: *const ffn.Plan, i: usize, nz: []const u32, local: []const u32) ![]const Scalar {
+    const x, const ids = if (p.f.dims.len > 0) .{ s.in_vals[u.in_off..][0..u.dims.len], local } else .{ s.x, nz };
+    if (s.always or s.memos[i].off() or s.memos[i].cold()) return ffn.run(s, p, x, ids);
     const key = s.key[0..nz.len];
     for (key, nz, local) |*k, d, j| k.* = @as(u64, j) << 32 | @as(u32, @bitCast(s.x[d]));
     const h = Memo.hash(key);
     if (s.memos[i].find(key, h)) |words| return @ptrCast(words);
-    const y = ffn.run(s, p, nz);
+    const y = ffn.run(s, p, x, ids);
     try s.memos[i].put(s.gpa, key, h, @ptrCast(y));
     return y;
 }

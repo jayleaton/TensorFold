@@ -52,6 +52,9 @@ pub const Frame = struct {
     }
 };
 
+/// A selection group's step key: its first member to run in a step looks it up once and names its generation.
+pub const Group = struct { memo: Memo = .{}, stamp: u64 = 0, hash: u64 = 0, gen: u64 = 0, next: u64 = 0 };
+
 /// The last four runs cover steps t-3..t: a unit runs every step its lag window is open, else its inputs held.
 pub const frames_per_unit = 4;
 
@@ -299,21 +302,19 @@ fn positives(p: *const Plan, frames: []const Frame, t: u64, which: u1, out: []u3
 }
 
 /// One head at step s.steps: the frame, selection, then per value head decay, write, read and its outputs.
-pub fn run(s: *State, p: *const Plan, unit: usize, nz: []const u32, local: []const u32) ![]const Scalar {
+pub fn run(s: *State, plan: u32, unit: usize, nz: []const u32, local: []const u32) ![]const Scalar {
+    const p = &s.circuit.flow.plans[plan];
     const t = s.steps;
-    const frames = s.frames[unit][0..];
-    var n_key: usize = 0;
-    for (nz, local) |d, j| if (p.sel_dim[j]) {
-        s.key[n_key] = @as(u64, j) << 32 | @as(u32, @bitCast(s.x[d]));
-        s.nz2[n_key] = d;
-        n_key += 1;
-    };
-    const key = s.key[0..n_key];
-    const sel_nz = s.nz2[0..n_key];
-    const h = Memo.hash(key);
+    const frames = s.frames[plan][0..];
     const memo = &s.memos[unit];
-    const words = (if (s.always or memo.off()) null else memo.find(key, h)) orelse blk: {
-        const w = select(s, p, sel_nz);
+    const gi = s.circuit.flow.plan_group[plan];
+    const words = if (gi != none and !s.always) try grouped(s, p, &s.groups[gi], memo, nz, local) else blk: {
+        const n_key = selKey(s, p, nz, local);
+        const key = s.key[0..n_key];
+        const h = Memo.hash(key);
+        const hit = if (s.always or memo.off() or memo.cold()) null else memo.find(key, h);
+        if (hit) |w| break :blk w;
+        const w = select(s, p, s.nz2[0..n_key]);
         if (!memo.off()) try memo.put(s.gpa, key, h, w);
         break :blk w;
     };
@@ -386,6 +387,38 @@ pub fn run(s: *State, p: *const Plan, unit: usize, nz: []const u32, local: []con
     return values;
 }
 
+/// The memo key (input index, value bits) and dims of a run's nonzero selecting inputs, in s.key and s.nz2.
+fn selKey(s: *State, p: *const Plan, nz: []const u32, local: []const u32) usize {
+    var n: usize = 0;
+    for (nz, local) |d, j| if (p.sel_dim[j]) {
+        s.key[n] = @as(u64, j) << 32 | @as(u32, @bitCast(s.x[d]));
+        s.nz2[n] = d;
+        n += 1;
+    };
+    return n;
+}
+
+/// A grouped head's selection: a member keeps its words per group generation, so its hit is a one-word compare.
+fn grouped(s: *State, p: *const Plan, g: *Group, memo: *Memo, nz: []const u32, local: []const u32) ![]const u32 {
+    if (g.stamp != s.steps + 1) {
+        g.stamp = s.steps + 1;
+        g.gen = 0;
+        if (!(g.memo.off() or g.memo.cold())) {
+            const key = s.key[0..selKey(s, p, nz, local)];
+            g.hash = Memo.hash(key);
+            if (g.memo.find(key, g.hash)) |w| g.gen = @as(u64, w[1]) << 32 | w[0] else {
+                g.next += 1;
+                try g.memo.put(s.gpa, key, g.hash, &[_]u32{ @truncate(g.next), @intCast(g.next >> 32) });
+                g.gen = g.next;
+            }
+        }
+    }
+    if (g.gen != 0 and !memo.off()) if (memo.find(&[_]u64{g.gen}, g.hash)) |w| return w;
+    const w = select(s, p, s.nz2[0..selKey(s, p, nz, local)]);
+    if (g.gen != 0 and !memo.off()) try memo.put(s.gpa, &[_]u64{g.gen}, g.hash, w);
+    return w;
+}
+
 /// beta: absent is 1; 1 writes, an integer <= 0 does not, anything else breaks the circuit's exact range.
 fn writeEnabled(b: Scalar) !bool {
     if (b == 1) return true;
@@ -432,8 +465,9 @@ fn readNorm(s: *State, table: u32, rows: []const u32) !?Scalar {
 }
 
 /// Canonical history of this head's channels at step `t`: projections of steps t-1, t-2, t-3, newest first.
-pub fn history(s: *State, p: *const Plan, unit: usize, out: []u8, at: *usize) void {
-    var views: Views = .{ .s = s, .frames = s.frames[unit][0..], .t = s.steps };
+pub fn history(s: *State, plan: u32, out: []u8, at: *usize) void {
+    const p = &s.circuit.flow.plans[plan];
+    var views: Views = .{ .s = s, .frames = s.frames[plan][0..], .t = s.steps };
     defer views.clear();
     for (0..p.h.channels) |c| for (1..model.lags) |lag| {
         const v: Scalar = if (views.dense(@intCast(lag)) == null) 0 else views.proj(p, @intCast(c), @intCast(lag));

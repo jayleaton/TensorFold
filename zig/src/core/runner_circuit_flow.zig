@@ -23,6 +23,8 @@ pub const Unit = struct {
     plan: u32 = no_slot,
     /// Where the unit's inputs start in the per-machine input arrays.
     in_off: u32 = 0,
+    /// An FFN part whose outputs are all +0 at all-zero inputs: a fresh machine need not run it until an input moves.
+    quiet: bool = false,
 };
 
 pub const Flow = struct {
@@ -64,6 +66,9 @@ pub const Flow = struct {
     chain_pos: []const u32,
     chain_bits_at: []const u32,
     chain_words: u32,
+    /// Per head plan: its group of heads with the same input slots and selecting dims (one key per step), or no_slot.
+    plan_group: []const u32,
+    groups: u32,
 };
 
 /// Dims a set of forms reads: the union of their sources, ascending.
@@ -78,6 +83,26 @@ fn reads(a: std.mem.Allocator, sets: []const *const model.Sparse) ![]u32 {
         n += 1;
     }
     return out.items[0..n];
+}
+
+/// Heads reading the same slots through the same selecting dims see one selection key per step (the RAM banks).
+fn selectionGroups(a: std.mem.Allocator, units: []const Unit, plans: []const head.Plan) !struct { []u32, u32 } {
+    const group = try a.alloc(u32, plans.len);
+    @memset(group, no_slot);
+    var n: u32 = 0;
+    for (units, 0..) |u, i| if (u.kind == .heads and !plans[u.plan].general) {
+        for (units[0..i]) |v| if (v.kind == .heads and !plans[v.plan].general and std.mem.eql(u32, u.ins, v.ins) and
+            std.mem.eql(bool, plans[u.plan].sel_dim, plans[v.plan].sel_dim))
+        {
+            if (group[v.plan] == no_slot) {
+                group[v.plan] = n;
+                n += 1;
+            }
+            group[u.plan] = group[v.plan];
+            break;
+        };
+    };
+    return .{ group, n };
 }
 
 fn maxLag(h: *const model.Heads) u32 {
@@ -107,8 +132,10 @@ pub fn build(a: std.mem.Allocator, c: *const model.Circuit) !Flow {
     var max_dims: u32 = 0;
     for (c.batches) |*b| switch (b.*) {
         .ffn => |*whole| for (whole.split) |*f| {
-            var u = try unit(a, .{ .ffn = f }, try reads(a, &.{ &f.up.forms, &f.gate.forms }), f.outs, 0, visible, &slots);
+            const dims = if (f.dims.len > 0) f.dims else try reads(a, &.{ &f.up.forms, &f.gate.forms });
+            var u = try unit(a, .{ .ffn = f }, dims, f.outs, 0, visible, &slots);
             u.plan = @intCast(ffn_plans.items.len);
+            u.quiet = try ffn.quiet(a, f);
             try ffn_plans.append(a, try ffn.build(a, f, &ffn_totals));
             try units.append(a, u);
         },
@@ -130,6 +157,7 @@ pub fn build(a: std.mem.Allocator, c: *const model.Circuit) !Flow {
     const code = try a.alloc(u32, c.code_dims.len);
     for (c.code_dims, code) |d, *s| s.* = visible[d];
     const ch = try chains(a, units.items, slots, visible);
+    const plan_group, const groups = try selectionGroups(a, units.items, plans.items);
     const ins_csr = try readersOf(a, units.items, slots, mark, .ins, ch);
     const base_csr = try readersOf(a, units.items, slots, mark, .base, ch);
     return .{
@@ -152,6 +180,8 @@ pub fn build(a: std.mem.Allocator, c: *const model.Circuit) !Flow {
         .code = code,
         .max_dims = max_dims,
         .total_ins = total_ins,
+        .plan_group = plan_group,
+        .groups = groups,
         .slot_unit = ch.slot_unit,
         .elided = ch.elided,
         .chain_end = ch.end,
