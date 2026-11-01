@@ -16,14 +16,15 @@ const Range = struct { start: i64 = 0, stop: i64, step: i64 = 1 };
 pub fn prove(p: *ast.Program) Error!void {
     p.estimated_steps = 0;
     if (p.functions.items.len > 32) return error.Unsupported;
-    try infer(p, &p.globals, p.body, false);
+    try infer(p, &p.globals, p.body);
     for (p.functions.items) |*f| {
         if (p.globals.find(f.name) != null) return error.Unsupported;
         for (f.params) |name| {
             const id = f.scope.find(name) orelse return error.Unsupported;
             f.scope.symbols.items[id].kind = .scalar;
         }
-        try infer(p, &f.scope, f.body, true);
+        try inferGeneratorParams(p, f, f.body);
+        try infer(p, &f.scope, f.body);
         for (f.scope.symbols.items) |s| if (p.functionId(s.name) != null) return error.Unsupported;
     }
     var v: Validator = .{ .p = p };
@@ -36,19 +37,49 @@ pub fn prove(p: *ast.Program) Error!void {
     p.estimated_steps = r.estimated_steps;
 }
 
-fn infer(p: *ast.Program, scope: *ast.Scope, body: []const ast.Stmt, function: bool) Error!void {
+fn inferGeneratorParams(p: *ast.Program, f: *ast.Function, body: []const ast.Stmt) Error!void {
+    for (body) |s| {
+        switch (s.tag) {
+            .assign, .ret, .assertion, .conditional, .loop, .each => try generatorParams(p, f, s.expr),
+            else => {},
+        }
+        try inferGeneratorParams(p, f, s.body);
+        try inferGeneratorParams(p, f, s.otherwise);
+    }
+}
+
+fn generatorParams(p: *ast.Program, f: *ast.Function, id: usize) Error!void {
+    const e = p.nodes.items[id];
+    if (e.tag == .sum_filtered and p.nodes.items[e.rhs].tag == .name) {
+        const name = p.nodes.items[e.rhs].text;
+        for (f.params) |param| if (std.mem.eql(u8, param, name)) {
+            f.scope.symbols.items[f.scope.find(param).?].kind = .list;
+        };
+    }
+    switch (e.tag) {
+        .integer, .boolean, .name, .string => {},
+        .format, .list, .call => for (e.args) |arg| try generatorParams(p, f, arg),
+        .neg, .logical_not => try generatorParams(p, f, e.lhs),
+        else => {
+            try generatorParams(p, f, e.lhs);
+            try generatorParams(p, f, e.rhs);
+            if (e.filter) |filter| try generatorParams(p, f, filter);
+        },
+    }
+}
+
+fn infer(p: *ast.Program, scope: *ast.Scope, body: []const ast.Stmt) Error!void {
     for (body) |s| {
         if (s.tag == .assign or s.tag == .each) {
             const id = scope.find(s.name) orelse return error.Unsupported;
             const kind: ast.Kind = if (s.tag == .assign and p.nodes.items[s.expr].tag == .list) .list else .scalar;
             const previous = scope.symbols.items[id].kind;
             if (previous != .unknown and previous != kind) return error.Unsupported;
-            if (function and kind == .list) return error.Unsupported;
             scope.symbols.items[id].kind = kind;
         }
         if (s.tag != .function) {
-            try infer(p, scope, s.body, function);
-            try infer(p, scope, s.otherwise, function);
+            try infer(p, scope, s.body);
+            try infer(p, scope, s.otherwise);
         }
     }
 }
@@ -106,8 +137,22 @@ const Validator = struct {
                     const callee = v.p.functionId(e.text) orelse return error.Unsupported;
                     if (e.args.len != v.p.functions.items[callee].params.len) return error.Unsupported;
                     if (fun) |caller| v.edges[caller] |= @as(u32, 1) << @intCast(callee);
-                    for (e.args) |arg| try v.scalar(scope, fun, arg, gen);
+                    const f = &v.p.functions.items[callee];
+                    for (e.args, f.params) |arg, param| {
+                        if (try v.expr(scope, fun, arg, gen) != f.scope.symbols.items[f.scope.find(param).?].kind)
+                            return error.Unsupported;
+                    }
                 }
+            },
+            .sum_filtered => {
+                if (!ast.validName(e.text) or v.p.functionId(e.text) != null) return error.Unsupported;
+                const seq = v.p.nodes.items[e.rhs];
+                if (seq.tag == .call and std.mem.eql(u8, seq.text, "range")) {
+                    try v.range(scope, fun, e.rhs, gen);
+                } else if (try v.expr(scope, fun, e.rhs, gen) != .list) return error.Unsupported;
+                const local: Binding = .{ .name = e.text, .parent = gen };
+                if (e.filter) |filter| try v.scalar(scope, fun, filter, &local);
+                try v.scalar(scope, fun, e.lhs, &local);
             },
             .all_range => {
                 if (!ast.validName(e.text) or v.p.functionId(e.text) != null) return error.Unsupported;
@@ -153,12 +198,18 @@ const Validator = struct {
                         return error.Unsupported;
                     if (scope.symbols.items[id].kind == .list and v.p.nodes.items[s.expr].tag != .list)
                         return error.Unsupported;
+                    if (fun) |function| {
+                        if (scope.symbols.items[id].kind == .list) {
+                            for (v.p.functions.items[function].params) |param|
+                                if (std.mem.eql(u8, param, s.name)) return error.Unsupported;
+                        }
+                    }
                 },
                 .append => {
                     if (fun != null or try v.symbol(scope, s.name, null) != .list) return error.Unsupported;
                     try v.scalar(scope, fun, s.expr, null);
                 },
-                .conditional, .loop => try v.scalar(scope, fun, s.expr, null),
+                .conditional, .loop, .assertion => try v.scalar(scope, fun, s.expr, null),
                 .each => {
                     const e = v.p.nodes.items[s.expr];
                     if (e.tag == .list) {
@@ -296,6 +347,7 @@ const Runtime = struct {
                 return .{ .scalar = l.items[@intCast(i)] };
             },
             .call => return .{ .scalar = try r.call(frame, e, gen) },
+            .sum_filtered => return .{ .scalar = try r.sumFiltered(frame, e, gen) },
             .all_range => {
                 const bounds = try r.range(frame, e.rhs, gen);
                 var i = bounds.start;
@@ -335,6 +387,26 @@ const Runtime = struct {
             else => return error.Unsupported,
         };
         return .{ .scalar = result };
+    }
+
+    fn sumFiltered(r: *Runtime, frame: *Frame, e: ast.Expr, gen: ?*const Binding) Error!Scalar {
+        r.charge(20);
+        const seq = r.p.nodes.items[e.rhs];
+        const is_range = seq.tag == .call and std.mem.eql(u8, seq.text, "range");
+        const l = if (is_range) null else try r.list(frame, e.rhs, gen);
+        if (seq.tag == .list) r.charge(128 * 6);
+        const bounds = if (is_range) try r.range(frame, e.rhs, gen) else Range{ .stop = @intCast(l.?.len) };
+        var sum: i64 = 0;
+        var i = bounds.start;
+        while (if (bounds.step > 0) i < bounds.stop else i > bounds.stop) : (i += bounds.step) {
+            try r.tick();
+            const value = if (l) |items| items.items[@intCast(i)] else try number(i, false);
+            const local: Binding = .{ .name = e.text, .value = value, .parent = gen };
+            if (e.filter) |filter| if ((try r.scalar(frame, filter, &local)).n == 0) continue;
+            r.charge(12);
+            sum = (try number(sum + (try r.scalar(frame, e.lhs, &local)).n, false)).n;
+        }
+        return number(sum, false);
     }
 
     fn range(r: *Runtime, frame: *Frame, id: usize, gen: ?*const Binding) Error!Range {
@@ -382,7 +454,10 @@ const Runtime = struct {
         if (!r.declared[id] or r.depth >= 8 or r.active & mask != 0) return error.Unsupported;
         const f = &r.p.functions.items[id];
         var local: Frame = .{ .scope = &f.scope, .function = id };
-        for (f.params, e.args) |param, arg| try put(&local, param, .{ .scalar = try r.scalar(frame, arg, gen) });
+        for (f.params, e.args) |param, arg| {
+            if (r.p.nodes.items[arg].tag == .list) r.charge(128 * 6);
+            try put(&local, param, try r.expr(frame, arg, gen));
+        }
         r.depth += 1;
         r.active |= mask;
         defer {
@@ -462,6 +537,10 @@ const Runtime = struct {
                         try r.printed(frame, arg);
                     }
                     r.output(1);
+                },
+                .assertion => {
+                    r.charge(4);
+                    if ((try r.scalar(frame, s.expr, null)).n == 0) return error.Unsupported;
                 },
                 .raise => return error.Unsupported,
                 .math_import => r.gcd_imported = true,

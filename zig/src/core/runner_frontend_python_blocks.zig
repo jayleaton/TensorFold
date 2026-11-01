@@ -154,6 +154,9 @@ const Parser = struct {
             if (!in_function) return error.Unsupported;
             return .{ .tag = .ret, .expr = try expr.parse(s.p, trim(text[7..])) };
         }
+        if (std.mem.startsWith(u8, text, "assert ")) {
+            return .{ .tag = .assertion, .expr = try expr.parse(s.p, trim(text[7..])) };
+        }
         if (std.mem.startsWith(u8, text, "raise ")) {
             const id = try expr.parse(s.p, trim(text[6..]));
             const call = s.p.nodes.items[id];

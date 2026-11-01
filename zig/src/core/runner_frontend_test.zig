@@ -14,6 +14,29 @@ test {
     _ = @import("runner_frontend_budget_test.zig");
     _ = @import("runner_frontend_optimization_test.zig");
     _ = @import("runner_frontend_calc_cost_test.zig");
+    _ = @import("runner_frontend_script_test.zig");
+    _ = @import("runner_frontend_python_assert_test.zig");
+    _ = @import("runner_frontend_tool_script_test.zig");
+}
+
+test "complete integer assignment requests use firmware with original inputs and no compiler" {
+    var context: f.Context = .{ .io = t.io, .compiler = .{ .clang = "/nonexistent-frontend-test-clang" } };
+    const front = context.frontend();
+    const code = "a=264278028996235349740985471434\nb=771565915835769397012014492734\nprint(a+b)";
+    const result = try front.translate(front.ctx, t.allocator, .{ .form = .fence, .lang = "python", .code = code });
+    try t.expect(result == .program);
+    defer t.allocator.free(result.program.bytes);
+    try t.expectEqual(.calc, result.program.kind);
+    try t.expectEqualStrings("(264278028996235349740985471434+771565915835769397012014492734)", result.program.bytes);
+    try t.expect(std.mem.indexOf(u8, result.program.bytes, "1035843944832004746752999964168") == null);
+    for ([_][]const u8{
+        "a=1//0\nprint(3)", "a=10**62\nprint(3)", "import os\nprint(3)",
+        "a=1.25\nprint(a)", "a=1/2\nprint(a)",    "a=2\nprint(a)\nassert False",
+    }) |bad| {
+        const refused = try front.translate(front.ctx, t.allocator, .{ .form = .fence, .lang = "python", .code = bad });
+        defer if (refused == .program) t.allocator.free(refused.program.bytes);
+        try t.expect(refused == .abstain);
+    }
 }
 
 test "frontend accepts model multiply and REPL power without computing the answer" {

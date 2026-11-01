@@ -20,17 +20,49 @@ pub fn lowerWithCost(a: Allocator, code: []const u8, budget: usize) Allocator.Er
 }
 
 fn checked(a: Allocator, code: []const u8, budget: usize) Failure!integer.Lowered {
+    var script = try parseOutputs(code, true);
+    const parser = &script.parser;
+    var steps: ?usize = null;
+    const roots = script.roots[0..script.count];
+    if (budget != 0) steps = cost.estimateMany(parser, roots, budget) orelse return error.Unsupported;
+    return .{ .source = try integer.lowerPrints(a, parser, roots, script.endings[0..script.count]), .estimated_steps = steps };
+}
+
+// Shares whole-script validation with the RV32 path, including unused assignments and import gates.
+pub fn lowerCalc(a: Allocator, code: []const u8) Allocator.Error!?[]u8 {
+    var script = parseScript(code) catch return null;
+    return @import("runner_frontend_integer_calc.zig").lower(a, &script.parser, script.root);
+}
+
+pub const Script = struct { parser: ast.Parser, root: usize };
+
+pub fn parseScript(code: []const u8) ast.Invalid!Script {
+    const script = try parseOutputs(code, false);
+    return .{ .parser = script.parser, .root = script.roots[0] };
+}
+
+const Outputs = struct {
+    parser: ast.Parser,
+    roots: [8]usize = undefined,
+    endings: [8]u8 = undefined,
+    count: usize = 0,
+};
+const statements = @import("runner_frontend_integer_statements.zig");
+
+fn parseOutputs(code: []const u8, multiple: bool) ast.Invalid!Outputs {
     if (code.len == 0 or code.len > 4096 or std.mem.indexOfScalar(u8, code, '\r') != null)
         return error.Unsupported;
     var parser: ast.Parser = .{ .source = "", .require_math_import = true };
-    var lines = std.mem.splitScalar(u8, code, '\n');
-    var output: ?usize = null;
+    var lines = statements.Iterator{ .code = code };
+    var outputs = Outputs{ .parser = undefined };
+    var expression_only = false;
     var started = false;
-    while (lines.next()) |raw| {
-        const comment = std.mem.indexOfScalar(u8, raw, '#') orelse raw.len;
-        var line = std.mem.trimEnd(u8, raw[0..comment], " \t");
+    while (try lines.next()) |raw| {
+        var line = std.mem.trimEnd(u8, raw.text, " \t");
+        if (raw.after_semicolon) line = std.mem.trimStart(u8, line, " \t");
         if (line.len == 0) continue;
-        if (output != null or line[0] == ' ' or line[0] == '\t') return error.Unsupported;
+        if (((!multiple or expression_only) and outputs.count != 0) or line[0] == ' ' or line[0] == '\t')
+            return error.Unsupported;
         if (std.mem.startsWith(u8, line, ">>> ")) line = line[4..];
         if (std.mem.eql(u8, line, "import math")) {
             if (started) return error.Unsupported;
@@ -54,33 +86,59 @@ fn checked(a: Allocator, code: []const u8, budget: usize) Failure!integer.Lowere
             continue;
         }
         started = true;
-        var target: ?[]const u8 = null;
-        var printed = false;
-        if (std.mem.indexOfScalar(u8, line, '=')) |equal| {
-            const name = std.mem.trim(u8, line[0..equal], " ");
-            if (!validBinding(name)) return error.Unsupported;
-            target = name;
-            line = std.mem.trim(u8, line[equal + 1 ..], " ");
-        } else if (std.mem.startsWith(u8, line, "print")) {
-            printed = true;
-            line = std.mem.trimStart(u8, line[5..], " ");
+        const printed = std.mem.startsWith(u8, line, "print") and line.len > 5 and
+            (line[5] == '(' or line[5] == ' ' or line[5] == '\t');
+        if (printed) {
+            line = std.mem.trimStart(u8, line[5..], " \t");
             if (line.len < 3 or line[0] != '(' or line[line.len - 1] != ')') return error.Unsupported;
-            line = line[1 .. line.len - 1];
+            try printRoots(&parser, &outputs, line[1 .. line.len - 1], multiple);
+        } else if (statements.separator(line, '=')) |equal| {
+            try assignment(&parser, std.mem.trim(u8, line[0..equal], " \t"), line[equal + 1 ..]);
+        } else {
+            if (outputs.count != 0 or parser.binding_count != 0 or parser.math_module or parser.math_imports != 0)
+                return error.Unsupported;
+            try printRoots(&parser, &outputs, line, false);
+            expression_only = true;
         }
-        if (target == null and !printed and
-            (parser.binding_count != 0 or parser.math_module or parser.math_imports != 0)) return error.Unsupported;
-        parser.source = line;
-        parser.pos = 0;
-        const root = try parser.parse();
-        if (target) |name| {
-            if (parser.nodes[root].op == .divmod) return error.Unsupported;
-            try parser.bind(name, root);
-        } else output = root;
     }
-    const root = output orelse return error.Unsupported;
-    var steps: ?usize = null;
-    if (budget != 0) steps = cost.estimate(&parser, root, budget) orelse return error.Unsupported;
-    return .{ .source = try integer.lowerParser(a, &parser, root), .estimated_steps = steps };
+    if (outputs.count == 0) return error.Unsupported;
+    outputs.parser = parser;
+    return outputs;
+}
+
+fn expression(parser: *ast.Parser, text: []const u8) ast.Invalid!usize {
+    parser.source = std.mem.trim(u8, text, " \t");
+    parser.pos = 0;
+    return parser.parse();
+}
+
+fn assignment(parser: *ast.Parser, names: []const u8, rhs: []const u8) ast.Invalid!void {
+    if (statements.separator(names, ',')) |comma| {
+        const first = std.mem.trim(u8, names[0..comma], " \t");
+        const second = std.mem.trim(u8, names[comma + 1 ..], " \t");
+        if (!validBinding(first) or !validBinding(second)) return error.Unsupported;
+        const pair = try parser.divisionPair(try expression(parser, rhs));
+        try parser.bind(first, pair[0]);
+        try parser.bind(second, pair[1]);
+    } else {
+        if (!validBinding(names)) return error.Unsupported;
+        const root = try expression(parser, rhs);
+        if (parser.nodes[root].op == .divmod) return error.Unsupported;
+        try parser.bind(names, root);
+    }
+}
+
+fn printRoots(parser: *ast.Parser, outputs: *Outputs, text: []const u8, multiple: bool) ast.Invalid!void {
+    var rest = text;
+    while (true) {
+        const comma = statements.separator(rest, ',');
+        if (comma != null and !multiple) return error.Unsupported;
+        if (outputs.count == outputs.roots.len) return error.Unsupported;
+        outputs.roots[outputs.count] = try expression(parser, rest[0 .. comma orelse rest.len]);
+        outputs.endings[outputs.count] = if (comma != null) ' ' else '\n';
+        outputs.count += 1;
+        if (comma) |i| rest = rest[i + 1 ..] else break;
+    }
 }
 
 pub fn compile(a: Allocator, io: std.Io, code: []const u8, config: compiler.Config) Allocator.Error!?[]u8 {
@@ -120,10 +178,18 @@ test "wide assignment bindings preserve requests and validate unused expressions
         try std.testing.expect(std.mem.indexOf(u8, source, "tf_run(tf_nodes,") != null);
     }
     for ([_][]const u8{
-        "x = 1//0\nprint(3)",                    "x = 10**62\nprint(3)", "x = x+1\nprint(x)",
-        "print(math.gcd(48,18))",                "print(gcd(48,18))",    "from math import *\nprint(3)",
-        "import math as m\nprint(m.gcd(48,18))", "pow = 2\nprint(pow)",  "a = divmod(7,3)\nprint(a)",
-        "x = 2\nprint(x)\nprint(x)",             "import os\nprint(3)",  "x = 1.25\nprint(x)",
-        "__builtins__ = 0\nprint(3)",            "x = 3\nx*2",
+        "x = 1//0\nprint(3)",
+        "x = 10**62\nprint(3)",
+        "x = x+1\nprint(x)",
+        "print(math.gcd(48,18))",
+        "print(gcd(48,18))",
+        "from math import *\nprint(3)",
+        "import math as m\nprint(m.gcd(48,18))",
+        "pow = 2\nprint(pow)",
+        "a = divmod(7,3)\nprint(a)",
+        "import os\nprint(3)",
+        "x = 1.25\nprint(x)",
+        "__builtins__ = 0\nprint(3)",
+        "x = 3\nx*2",
     }) |code| try std.testing.expectEqual(@as(?[]u8, null), try lower(a, code));
 }

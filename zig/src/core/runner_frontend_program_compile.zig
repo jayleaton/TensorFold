@@ -298,7 +298,9 @@ fn normalize(a: Allocator, source: []const u8) Allocator.Error!?[]u8 {
 }
 
 fn normalizeWithTrust(a: Allocator, source: []const u8, trusted: bool) Allocator.Error!?[]u8 {
-    if (source.len == 0 or source.len > 16384 or std.mem.indexOfScalar(u8, source, 0) != null) return null;
+    // Fixed integer support plus bounded DAG data may exceed the raw-cell source limit.
+    const max_source: usize = if (trusted) 32768 else 16384;
+    if (source.len == 0 or source.len > max_source or std.mem.indexOfScalar(u8, source, 0) != null) return null;
     if (std.mem.indexOf(u8, source, "\\\n") != null or std.mem.indexOf(u8, source, "\\\r\n") != null) return null;
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(a);
@@ -477,4 +479,20 @@ pub fn hasMain(s: []const u8) bool {
         } else i += 1;
     }
     return false;
+}
+
+test "generated support has a bounded size allowance while raw cells retain their limit" {
+    const a = std.testing.allocator;
+    const padding = try a.alloc(u8, 17000);
+    defer a.free(padding);
+    @memset(padding, ' ');
+    const support = try std.fmt.allocPrint(a, "{s}int main(void) {{ return 0; }}", .{padding});
+    defer a.free(support);
+    try std.testing.expectEqual(@as(?[]u8, null), try normalizeWithTrust(a, support, false));
+    const result = (try normalizeWithTrust(a, support, true)).?;
+    defer a.free(result);
+    const oversized = try a.alloc(u8, 32769);
+    defer a.free(oversized);
+    @memset(oversized, ' ');
+    try std.testing.expectEqual(@as(?[]u8, null), try normalizeWithTrust(a, oversized, true));
 }

@@ -76,6 +76,10 @@ fn translateImpl(raw: ?*anyopaque, a: std.mem.Allocator, cell: Cell) std.mem.All
         }
     }
     if (lang == .python) {
+        if (try integer_python.lowerCalc(a, cell.code)) |bytes| {
+            const result = calcProgram(a, context, bytes);
+            if (result == .program) return result;
+        }
         const result = try integerProgram(a, context, cell.code, true);
         if (result == .program) return result;
     }

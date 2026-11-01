@@ -195,15 +195,25 @@ const Parser = struct {
         if (!p.eat(")")) while (true) {
             if (args.items.len >= 128) return error.Unsupported;
             const arg = try p.expression();
-            if (args.items.len == 0 and std.mem.eql(u8, name, "all") and p.eat("for")) {
+            if (args.items.len == 0 and (std.mem.eql(u8, name, "all") or std.mem.eql(u8, name, "sum")) and p.eat("for")) {
+                if (p.pos < 4 or p.source[p.pos - 4] != ' ') return error.Unsupported;
                 const variable = try p.identifier();
                 if (!ast.validName(variable)) return error.Unsupported;
                 try p.need("in");
                 const range = try p.expression();
                 const iterable = p.program.nodes.items[range];
-                if (iterable.tag != .call or !std.mem.eql(u8, iterable.text, "range")) return error.Unsupported;
+                const all = std.mem.eql(u8, name, "all");
+                if (all and (iterable.tag != .call or !std.mem.eql(u8, iterable.text, "range")))
+                    return error.Unsupported;
+                const filter: ?usize = if (!all and p.eat("if")) try p.expression() else null;
                 try p.need(")");
-                return p.program.node(.{ .tag = .all_range, .text = variable, .lhs = arg, .rhs = range });
+                return p.program.node(.{
+                    .tag = if (all) .all_range else .sum_filtered,
+                    .text = variable,
+                    .lhs = arg,
+                    .rhs = range,
+                    .filter = filter,
+                });
             }
             try args.append(p.program.a, arg);
             if (p.eat(")")) break;
@@ -330,6 +340,7 @@ pub fn boundedDepth(program: *const ast.Program, id: usize, depth: usize) ast.In
         else => {
             try boundedDepth(program, node.lhs, depth + 1);
             try boundedDepth(program, node.rhs, depth + 1);
+            if (node.filter) |filter| try boundedDepth(program, filter, depth + 1);
         },
     }
 }

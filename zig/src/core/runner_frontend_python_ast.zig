@@ -11,6 +11,7 @@ pub const Tag = enum {
     call,
     index,
     all_range,
+    sum_filtered,
     add,
     sub,
     mul,
@@ -33,6 +34,7 @@ pub const Expr = struct {
     text: []const u8 = "",
     lhs: usize = 0,
     rhs: usize = 0,
+    filter: ?usize = null,
     args: []const usize = &.{},
 };
 pub const Kind = enum { unknown, scalar, list };
@@ -51,7 +53,7 @@ pub const Scope = struct {
         return s.symbols.items.len - 1;
     }
 };
-pub const StmtTag = enum { assign, append, conditional, loop, each, function, ret, print, raise, math_import };
+pub const StmtTag = enum { assign, append, conditional, loop, each, function, ret, print, assertion, raise, math_import };
 pub const Stmt = struct {
     tag: StmtTag,
     name: []const u8 = "",

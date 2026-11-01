@@ -2,7 +2,7 @@ const std = @import("std");
 
 pub const Invalid = error{Unsupported};
 pub const limit: i512 = std.math.pow(i512, 10, 62);
-pub const Op = enum(u8) { literal, neg, add, sub, mul, floor, mod, pow, powmod, digits, divmod, gcd, isqrt, factorial, range_product, digit_sum };
+pub const Op = enum(u8) { literal, neg, add, sub, mul, floor, mod, pow, powmod, digits, divmod, gcd, isqrt, factorial, range_product, digit_sum, eq, ne, lt, le, gt, ge };
 pub const Node = struct {
     op: Op,
     l: usize = 0,
@@ -50,6 +50,19 @@ pub const Parser = struct {
         return root;
     }
 
+    // Project both results from the original operands; proof values never become literal nodes.
+    pub fn divisionPair(self: *Parser, root: usize) Invalid![2]usize {
+        if (root >= self.count or self.nodes[root].op != .divmod or self.count > self.nodes.len - 2)
+            return error.Unsupported;
+        _ = try self.prove(root, root);
+        const n = self.nodes[root];
+        const q = try self.add(.{ .op = .floor, .l = n.l, .r = n.r });
+        const r = try self.add(.{ .op = .mod, .l = n.l, .r = n.r });
+        _ = try self.prove(q, q);
+        _ = try self.prove(r, r);
+        return .{ q, r };
+    }
+
     fn space(self: *Parser) void {
         while (self.pos < self.source.len and (self.source[self.pos] == ' ' or self.source[self.pos] == '\t'))
             self.pos += 1;
@@ -73,7 +86,24 @@ pub const Parser = struct {
         return self.count - 1;
     }
 
+    fn comparison(self: *Parser) ?Op {
+        const tokens = [_][]const u8{ "==", "!=", "<", "<=", ">", ">=" };
+        const ops = [_]Op{ .eq, .ne, .lt, .le, .gt, .ge };
+        for ([_]usize{ 0, 1, 3, 5, 2, 4 }) |i| {
+            if (self.take(tokens[i])) return ops[i];
+        }
+        return null;
+    }
+
     fn expr(self: *Parser, depth: usize) Invalid!usize {
+        const left = try self.sum(depth);
+        const op = self.comparison() orelse return left;
+        const right = try self.sum(depth);
+        if (self.comparison() != null) return error.Unsupported;
+        return self.add(.{ .op = op, .l = left, .r = right });
+    }
+
+    fn sum(self: *Parser, depth: usize) Invalid!usize {
         if (depth > 12) return error.Unsupported;
         var left = try self.term(depth);
         while (true) {
@@ -103,9 +133,20 @@ pub const Parser = struct {
         return left;
     }
 
+    fn boolean(self: *const Parser, index: usize) bool {
+        return switch (self.nodes[index].op) {
+            .eq, .ne, .lt, .le, .gt, .ge => true,
+            else => false,
+        };
+    }
+
     fn factor(self: *Parser, depth: usize) Invalid!usize {
         if (depth > 12) return error.Unsupported;
-        if (self.take("+")) return self.factor(depth + 1);
+        if (self.take("+")) {
+            const child = try self.factor(depth + 1);
+            if (self.boolean(child)) return error.Unsupported;
+            return child;
+        }
         if (self.take("-")) return self.add(.{ .op = .neg, .l = try self.factor(depth + 1) });
         const left = try self.atom(depth);
         if (self.take("**")) return self.add(.{ .op = .pow, .l = left, .r = try self.factor(depth + 1) });
@@ -303,6 +344,7 @@ pub const Parser = struct {
 
     fn prove(self: *Parser, index: usize, root: usize) Invalid!i512 {
         const n = self.nodes[index];
+        if (n.op == .divmod and index != root) return error.Unsupported;
         if (self.proved[index]) return n.value;
         if (n.op == .literal) return n.value;
         const a = try self.prove(n.l, root);
@@ -316,6 +358,12 @@ pub const Parser = struct {
             .add => a + b,
             .sub => a - b,
             .mul => a * b,
+            .eq => @intFromBool(a == b),
+            .ne => @intFromBool(a != b),
+            .lt => @intFromBool(a < b),
+            .le => @intFromBool(a <= b),
+            .gt => @intFromBool(a > b),
+            .ge => @intFromBool(a >= b),
             .floor, .mod, .divmod => blk: {
                 if (b == 0 or (n.op == .divmod and index != root)) return error.Unsupported;
                 if (n.op == .mod) break :blk @mod(a, b);
@@ -378,13 +426,14 @@ pub const Parser = struct {
                 break :blk result;
             },
             .digit_sum => blk: {
-                if (a < 0) return error.Unsupported;
+                if (self.boolean(n.l) or a < 0) return error.Unsupported;
                 var x = a;
                 var result: i512 = 0;
                 while (x != 0) : (x = @divTrunc(x, 10)) result += @mod(x, 10);
                 break :blk result;
             },
             .digits => blk: {
+                if (self.boolean(n.l)) return error.Unsupported;
                 var magnitude = if (a < 0) -a else a;
                 var count: i512 = if (a < 0) 2 else 1;
                 while (magnitude >= 10) : (magnitude = @divTrunc(magnitude, 10)) count += 1;

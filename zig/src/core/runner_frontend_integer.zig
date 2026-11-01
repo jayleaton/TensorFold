@@ -48,6 +48,34 @@ pub fn lowerParser(a: std.mem.Allocator, parser: *ast.Parser, root: usize) std.m
     return try out.toOwnedSlice(a);
 }
 
+// All ordered print roots share one original DAG and are evaluated before the first output.
+pub fn lowerParsers(a: std.mem.Allocator, parser: *ast.Parser, roots: []const usize) std.mem.Allocator.Error![]u8 {
+    const endings: [8]u8 = @splat('\n');
+    return lowerPrints(a, parser, roots, endings[0..roots.len]);
+}
+
+// A space continues a grouped print and a newline ends it; all roots share their original runtime nodes.
+pub fn lowerPrints(a: std.mem.Allocator, parser: *ast.Parser, roots: []const usize, endings: []const u8) std.mem.Allocator.Error![]u8 {
+    std.debug.assert(roots.len > 0 and roots.len <= 8 and endings.len == roots.len);
+    for (endings) |ending| std.debug.assert(ending == ' ' or ending == '\n');
+    if (roots.len == 1 and endings[0] == '\n') return lowerParser(a, parser, roots[0]);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    try out.appendSlice(a, @embedFile("runner_frontend_integer_runtime.c"));
+    try out.appendSlice(a, "\nstatic const struct tf_node tf_nodes[] = {\n");
+    var emitter = Emitter{ .a = a, .parser = parser, .out = &out };
+    var refs: [8]usize = undefined;
+    for (roots, 0..) |root, i| refs[i] = try emitter.node(root);
+    try out.appendSlice(a, "};\nstatic const int tf_roots[] = {");
+    for (refs[0..roots.len]) |ref| try out.print(a, "{d},", .{ref});
+    try out.appendSlice(a, "};\nstatic const unsigned char tf_endings[] = {");
+    for (endings) |ending| try out.print(a, "{d},", .{ending});
+    try out.print(a, "}};\nint main(void) {{ return tf_run_prints(tf_nodes, {d}, tf_roots, tf_endings, {d}); }}\n", .{
+        emitter.count, roots.len,
+    });
+    return try out.toOwnedSlice(a);
+}
+
 pub fn compile(a: std.mem.Allocator, io: std.Io, code: []const u8, config: compiler.Config) std.mem.Allocator.Error!?[]u8 {
     const result = try lowerWithCost(a, code, config.step_budget) orelse return null;
     defer a.free(result.source);
@@ -82,7 +110,20 @@ const Emitter = struct {
                 n.base, if (n.value < 0) "-" else "", n.text,
             });
         } else {
-            try self.out.print(self.a, "{{{d},{d},{d},{d},0}},\n", .{ @backingInt(n.op), l, r, k });
+            var op: u8 = @backingInt(n.op);
+            if (n.op == .mod) {
+                for (self.parser.nodes[0..self.parser.count], 0..) |prior, j| {
+                    if ((prior.op == .floor or prior.op == .divmod) and prior.l == n.l and prior.r == n.r) {
+                        if (self.mapped[j]) |ref| {
+                            op = 22;
+                            l = ref;
+                            r = 0;
+                            break;
+                        }
+                    }
+                }
+            }
+            try self.out.print(self.a, "{{{d},{d},{d},{d},0}},\n", .{ op, l, r, k });
         }
         const result = self.count;
         self.count += 1;

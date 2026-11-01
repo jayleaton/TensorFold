@@ -4,17 +4,34 @@ const Refused = error{Refused};
 
 // Source-based RV32 instruction weights need calibration against the selected compiler and optimization mode.
 pub fn estimate(parser: *const ast.Parser, root: usize, budget: usize) ?usize {
-    if (parser.count == 0 or parser.count > 64 or root >= parser.count) return null;
-    var counter = Counter{ .parser = parser, .root = root, .budget = budget };
+    return estimateMany(parser, &.{root}, budget);
+}
+
+// One shared traversal charges arithmetic once and formatting separately for every ordered output.
+pub fn estimateMany(parser: *const ast.Parser, roots: []const usize, budget: usize) ?usize {
+    if (parser.count == 0 or parser.count > 64 or roots.len == 0 or roots.len > 8) return null;
+    var counter = Counter{ .parser = parser, .root = 0, .budget = budget };
     counter.charge(200) catch return null;
-    const value = counter.visit(root) catch return null;
-    counter.charge(formatCost(value, true) + 16) catch return null;
-    if (parser.nodes[root].op == .divmod) {
-        const n = parser.nodes[root];
-        const remainder = @mod(parser.nodes[n.l].value, parser.nodes[n.r].value);
-        counter.charge(formatCost(remainder, true) + 64) catch return null;
+    for (roots) |root| {
+        if (root >= parser.count) return null;
+        counter.root = root;
+        const value = counter.visit(root) catch return null;
+        const op = parser.nodes[root].op;
+        counter.charge(if (isComparison(op)) 160 else formatCost(value, true) + 16) catch return null;
+        if (op == .divmod) {
+            const n = parser.nodes[root];
+            const remainder = @mod(parser.nodes[n.l].value, parser.nodes[n.r].value);
+            counter.charge(formatCost(remainder, true) + 64) catch return null;
+        }
     }
     return counter.total;
+}
+
+fn isComparison(op: ast.Op) bool {
+    return switch (op) {
+        .eq, .ne, .lt, .le, .gt, .ge => true,
+        else => false,
+    };
 }
 
 const Counter = struct {
@@ -34,6 +51,7 @@ const Counter = struct {
 
     fn child(self: *Counter, index: usize, parent: usize) Refused!i512 {
         if (index >= parent) return error.Refused;
+        if (self.parser.nodes[index].op == .divmod) return error.Refused;
         return self.visit(index);
     }
 
@@ -49,9 +67,10 @@ const Counter = struct {
             if (n.text.len == 0 or n.text.len > 4096 or (n.base != 2 and n.base != 10 and n.base != 16))
                 return error.Refused;
             const digit_cost: usize = if (n.base == 16) 132 else 128;
-            try self.charge(48 + n.text.len * digit_cost);
+            try self.charge(if (n.base == 10) 80 + n.text.len * 8 else 48 + n.text.len * digit_cost);
             var value: i512 = 0;
-            for (n.text) |c| {
+            for (n.text, 0..) |c, i| {
+                if (n.base == 10 and i % 4 == 0) try self.charge(40 + @max(words(value), 1) * 20);
                 const digit: u8 = switch (c) {
                     '0'...'9' => c - '0',
                     'a'...'f' => c - 'a' + 10,
@@ -67,9 +86,11 @@ const Counter = struct {
         }
         if (!self.parser.proved[index] or (n.op == .divmod and index != self.root)) return error.Refused;
         const a = try self.child(n.l, index);
+        if ((n.op == .digits or n.op == .digit_sum) and isComparison(self.parser.nodes[n.l].op))
+            return error.Refused;
         const b: i512 = switch (n.op) {
             .neg, .digits, .isqrt, .factorial, .digit_sum => 0,
-            .add, .sub, .mul, .floor, .mod, .pow, .powmod, .divmod, .gcd, .range_product => try self.child(n.r, index),
+            .add, .sub, .mul, .floor, .mod, .pow, .powmod, .divmod, .gcd, .range_product, .eq, .ne, .lt, .le, .gt, .ge => try self.child(n.r, index),
             else => return error.Refused,
         };
         const k: i512 = switch (n.op) {
@@ -91,8 +112,27 @@ const Counter = struct {
             },
             .floor, .mod, .divmod => blk: {
                 if (b == 0) return error.Refused;
-                try self.charge(divisionCost(a, b) + 140);
+                var cached = false;
+                if (n.op == .mod) {
+                    for (self.parser.nodes[0..self.parser.count], 0..) |prior, j| {
+                        if ((prior.op == .floor or prior.op == .divmod) and prior.l == n.l and prior.r == n.r and
+                            self.seen & (@as(u64, 1) << @intCast(j)) != 0) cached = true;
+                    }
+                }
+                try self.charge(if (cached) 80 else divisionCost(a, b) + 140);
                 break :blk if (n.op == .mod) @mod(a, b) else @divFloor(a, b);
+            },
+            .eq, .ne, .lt, .le, .gt, .ge => blk: {
+                try self.charge(180);
+                break :blk @intFromBool(switch (n.op) {
+                    .eq => a == b,
+                    .ne => a != b,
+                    .lt => a < b,
+                    .le => a <= b,
+                    .gt => a > b,
+                    .ge => a >= b,
+                    else => unreachable,
+                });
             },
             .pow, .powmod => try self.power(a, b, if (n.op == .powmod) k else null),
             .digits => blk: {
@@ -271,7 +311,7 @@ fn decimalDigits(value: i512) usize {
     return count;
 }
 
-// All eight limbs are visited even for narrow values; conversion uses two halfword divisions per limb.
+// Charge the supplied limb span; small divisors use two native halfword divisions per limb.
 fn smallDivisionCost(value: u512, limbs: usize, divisor: u32) usize {
     if (divisor <= 65535) return 24 + limbs * 20;
     var cost: usize = 24;
@@ -287,8 +327,44 @@ fn smallDivisionCost(value: u512, limbs: usize, divisor: u32) usize {
 }
 
 fn divisionCost(a: i512, b: i512) usize {
-    if (words(b) == 1) return 120 + smallDivisionCost(@intCast(positive(a)), 8, @intCast(positive(b)));
-    return 160 + bits(a) * 224;
+    const numerator = positive(a);
+    const divisor = positive(b);
+    if (numerator < divisor) return 160;
+    if (divisor <= 65535) return 120 + smallDivisionCost(@intCast(numerator), words(a), @intCast(divisor));
+    return longDivisionCost(numerator, divisor);
+}
+
+// Replay only quotient estimation for cost admission; the emitter still retains all original arithmetic nodes.
+fn longDivisionCost(a: i512, b: i512) usize {
+    const na = (bits(a) + 15) / 16;
+    const nb = (bits(b) + 15) / 16;
+    const shift: u9 = @intCast(16 * nb - bits(b));
+    const divisor = b << shift;
+    var remaining = a << shift;
+    const top_shift: u9 = @intCast(16 * (nb - 1));
+    const second_shift: u9 = @intCast(16 * (nb - 2));
+    const top = divisor >> top_shift;
+    const second = (divisor >> second_shift) & 65535;
+    var total: usize = 240 + (na + nb) * 20;
+    var position = na - nb + 1;
+    while (position != 0) {
+        position -= 1;
+        const digit_shift: u9 = @intCast(16 * position);
+        const window = remaining >> digit_shift;
+        const prefix = window >> top_shift;
+        var digit = @min(@divTrunc(prefix, top), 65535);
+        var rem = prefix - digit * top;
+        total += 112 + nb * 20;
+        while (rem < 65536 and digit * second > rem * 65536 + ((window >> second_shift) & 65535)) {
+            digit -= 1;
+            rem += top;
+            total += 24;
+        }
+        const exact = @divTrunc(window, divisor);
+        if (digit > exact) total += 24 + nb * 16;
+        remaining -= (exact * divisor) << digit_shift;
+    }
+    return total;
 }
 
 fn productCost(a: i512, b: i512) usize {
@@ -302,6 +378,12 @@ fn multiplyCost(a: i512, b: i512) usize {
 fn formatCost(value: i512, print: bool) usize {
     const digits = decimalDigits(value);
     const sign: usize = @intFromBool(value < 0);
-    const format = 64 + digits * (smallDivisionCost(0, 8, 10) + 42 + 8) + sign * 12;
+    var magnitude = positive(value);
+    var format: usize = 64 + digits * 12 + sign * 12;
+    while (true) {
+        format += smallDivisionCost(@intCast(magnitude), words(magnitude), 10000) + 24;
+        magnitude = @divTrunc(magnitude, 10000);
+        if (magnitude == 0) break;
+    }
     return format + (if (print) 48 + (digits + sign) * 16 else @as(usize, 0));
 }

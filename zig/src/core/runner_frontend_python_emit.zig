@@ -6,6 +6,10 @@ const runtime =
     \\typedef struct { int n; int b; } py_value;
     \\typedef struct { py_value items[128]; volatile int len; } py_list;
     \\__attribute__((always_inline)) static inline py_value py_hold(py_value v) { __asm__ volatile("" : "+r"(v.n)); return v; }
+    \\__attribute__((noreturn)) static void py_assert_fail(void) {
+    \\ register int a0 __asm__("a0")=1; register int a7 __asm__("a7")=93;
+    \\ __asm__ volatile("ecall" : "+r"(a0) : "r"(a7) : "memory"); for(;;) {}
+    \\}
     \\static py_value py_int(int n) { py_value r = {n,0}; return r; }
     \\static py_value py_bool(int n) { py_value r = {!!n,1}; return r; }
     \\static py_value py_add(py_value a,py_value b) { return py_int(a.n+b.n); }
@@ -75,19 +79,23 @@ pub fn emit(a: Allocator, p: *const ast.Program) Allocator.Error![]u8 {
     }
     for (p.functions.items, 0..) |f, id| {
         e.scope = &p.functions.items[id].scope;
+        e.params = f.params;
         try e.signature(f, id, true);
         try e.put(" {\n");
         for (f.scope.symbols.items, 0..) |s, i| {
-            try e.out.print(a, "{s} py_l{d};\n", .{ typeName(s.kind), i });
+            try e.out.print(a, "{s} py_l{d};\n", .{ if (s.kind == .list and e.isParam(s.name)) "const py_list *" else typeName(s.kind), i });
         }
         for (f.params, 0..) |name, i| {
-            try e.variable(name);
+            if (f.scope.symbols.items[f.scope.find(name).?].kind == .list) {
+                try e.out.print(a, "py_l{d}", .{f.scope.find(name).?});
+            } else try e.variable(name);
             try e.out.print(a, "=py_p{d};\n", .{i});
         }
         try e.statements(f.body);
         try e.put("return py_int(0);\n}\n");
     }
     e.scope = null;
+    e.params = &.{};
     try e.put("int main(void) {\n");
     try e.statements(p.body);
     try e.put("return 0;\n}\n");
@@ -104,9 +112,15 @@ const Emitter = struct {
     p: *const ast.Program,
     out: std.ArrayList(u8) = .empty,
     scope: ?*const ast.Scope = null,
+    params: []const []const u8 = &.{},
     next_id: usize = 0,
     generators: [8]Generator = undefined,
     generators_len: usize = 0,
+
+    fn isParam(e: *const Emitter, name: []const u8) bool {
+        for (e.params) |param| if (std.mem.eql(u8, param, name)) return true;
+        return false;
+    }
 
     fn put(e: *Emitter, s: []const u8) Allocator.Error!void {
         try e.out.appendSlice(e.a, s);
@@ -121,9 +135,9 @@ const Emitter = struct {
     fn signature(e: *Emitter, f: ast.Function, id: usize, names: bool) Allocator.Error!void {
         try e.out.print(e.a, "static py_value py_f{d}(", .{id});
         if (f.params.len == 0) try e.put("void");
-        for (f.params, 0..) |_, i| {
+        for (f.params, 0..) |param, i| {
             if (i != 0) try e.put(",");
-            try e.put("py_value");
+            try e.put(if (f.scope.symbols.items[f.scope.find(param).?].kind == .list) "const py_list *" else "py_value");
             if (names) try e.out.print(e.a, " py_p{d}", .{i});
         }
         try e.put(")");
@@ -140,7 +154,10 @@ const Emitter = struct {
         }
         if (e.scope) |scope| {
             if (scope.find(name)) |id| {
-                try e.out.print(e.a, "py_l{d}", .{id});
+                if (scope.symbols.items[id].kind == .list and e.isParam(name))
+                    try e.out.print(e.a, "(*py_l{d})", .{id})
+                else
+                    try e.out.print(e.a, "py_l{d}", .{id});
                 return;
             }
         }
@@ -174,9 +191,21 @@ const Emitter = struct {
 
     fn listPointer(e: *Emitter, id: usize) Allocator.Error!void {
         const n = e.p.nodes.items[id];
-        std.debug.assert(n.tag == .name);
-        try e.put("&");
-        try e.variable(n.text);
+        if (n.tag == .name) {
+            try e.put("&");
+            return e.variable(n.text);
+        }
+        std.debug.assert(n.tag == .list);
+        try e.put("&(py_list){");
+        if (n.args.len != 0) {
+            try e.put(".items={");
+            for (n.args, 0..) |arg, i| {
+                if (i != 0) try e.put(",");
+                try e.expr(arg);
+            }
+            try e.put("},");
+        }
+        try e.out.print(e.a, ".len={d}}}", .{n.args.len});
     }
 
     fn listCall(e: *Emitter, helper: []const u8, list: usize, index: ?usize) Allocator.Error!void {
@@ -255,14 +284,45 @@ const Emitter = struct {
                     if (std.mem.eql(u8, n.text, "gcd")) try e.put("py_gcd(") else try e.out.print(e.a, "py_f{d}(", .{e.p.functionId(n.text).?});
                     for (n.args, 0..) |arg, i| {
                         if (i != 0) try e.put(",");
-                        try e.expr(arg);
+                        if (e.kind(arg) == .list) try e.listPointer(arg) else try e.expr(arg);
                     }
                 }
                 try e.put(")");
             },
+            .sum_filtered => try e.sumFiltered(n),
             .all_range => try e.allRange(n),
             .string, .format, .list => unreachable,
         }
+    }
+
+    fn sumFiltered(e: *Emitter, n: ast.Expr) Allocator.Error!void {
+        const id = e.fresh();
+        const seq = e.p.nodes.items[n.rhs];
+        const is_range = seq.tag == .call and std.mem.eql(u8, seq.text, "range");
+        try e.out.print(e.a, "({{py_value py_sum{d}=py_int(0);", .{id});
+        if (is_range) {
+            try e.rangeParts(seq, id);
+            try e.rangeHead(id);
+            try e.out.print(e.a, "py_value py_gen{d}=py_hold(py_int((int)py_i{d}));", .{ id, id });
+        } else {
+            try e.out.print(e.a, "const py_list *py_seq{d}=", .{id});
+            try e.listPointer(n.rhs);
+            try e.out.print(e.a, ";for(int py_i{d}=0;py_i{d}<py_seq{d}->len;++py_i{d}){{", .{ id, id, id, id });
+            try e.out.print(e.a, "py_value py_gen{d}=py_hold(py_seq{d}->items[py_i{d}]);", .{ id, id, id });
+        }
+        e.generators[e.generators_len] = .{ .name = n.text, .id = id };
+        e.generators_len += 1;
+        if (n.filter) |filter| {
+            try e.put("if(");
+            try e.truth(filter);
+            try e.put("){");
+        }
+        try e.out.print(e.a, "py_sum{d}=py_hold(py_add(py_sum{d},", .{ id, id });
+        try e.expr(n.lhs);
+        e.generators_len -= 1;
+        try e.put("));");
+        if (n.filter != null) try e.put("}");
+        try e.out.print(e.a, "}}py_sum{d};}})", .{id});
     }
 
     fn rangeParts(e: *Emitter, n: ast.Expr, id: usize) Allocator.Error!void {
@@ -390,6 +450,11 @@ const Emitter = struct {
                     try e.printPart(arg);
                 }
                 try e.put("printf(\"%s\",\"\\n\");\n");
+            },
+            .assertion => {
+                try e.put("if(!(");
+                try e.truth(s.expr);
+                try e.put("))py_assert_fail();\n");
             },
             .raise => try e.put(if (e.scope == null) "return 1;\n" else "return py_int(0);\n"),
             .function, .math_import => {},
