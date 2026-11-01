@@ -357,6 +357,7 @@ test "runner scan: an inline expression at a line's end is a cell and its own tr
         .{ "3 * -4 =", "3 * -4" },
         .{ "43210 − 98765 + 1 =", "43210 − 98765 + 1" },
         .{ "So 9876 - 4321 =", "9876 - 4321" },         .{ "9876-4321=", "9876-4321" },
+        .{ "2^100 - 3^50 =", "2^100 - 3^50" },
     }) |c| {
         const got = inlineOf(c[0]) orelse return error.TestExpectedInline;
         defer a.free(got);

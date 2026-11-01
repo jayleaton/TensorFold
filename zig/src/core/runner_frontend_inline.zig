@@ -7,6 +7,8 @@ const Failure = Allocator.Error || ast.Invalid;
 // Proof values select a format and admission only; emitted expressions retain source arithmetic.
 pub fn lower(a: Allocator, code: []const u8, exact: bool) Allocator.Error!?[]u8 {
     if (code.len == 0 or code.len > 1024) return null;
+    // `^` is a power in math notation (Python's XOR), so only exact inline math takes it
+    if (!exact and std.mem.indexOfScalar(u8, code, '^') != null) return null;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
@@ -48,11 +50,11 @@ fn normalize(a: Allocator, code: []const u8) Allocator.Error!?[]u8 {
     var pos: usize = 0;
     while (pos < code.len) {
         var replaced = false;
-        const symbols = [_][]const u8{ "×", "÷", "−" };
-        const operators = "*/-";
+        const symbols = [_][]const u8{ "×", "÷", "−", "^" };
+        const operators = [_][]const u8{ "*", "/", "-", "**" };
         for (symbols, operators) |symbol, op| {
             if (std.mem.startsWith(u8, code[pos..], symbol)) {
-                try out.append(a, op);
+                try out.appendSlice(a, op);
                 pos += symbol.len;
                 replaced = true;
                 break;

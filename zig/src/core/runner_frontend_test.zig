@@ -128,7 +128,7 @@ test "inline typographic operators normalize without changing Python syntax or t
     for ([_][]const u8{ "47 × 83", "47 − 83" }) |code| {
         try t.expect((try front.translate(null, t.allocator, .{ .form = .fence, .lang = "python", .code = code })) == .abstain);
     }
-    for ([_][]const u8{ "1,000 + 2", "2*3,18", "2^10", "gcd(2,4)" }) |code| {
+    for ([_][]const u8{ "1,000 + 2", "2*3,18", "gcd(2,4)" }) |code| {
         try t.expect((try front.translate(null, t.allocator, .{ .form = .inline_expr, .lang = "python", .code = code })) == .abstain);
     }
 }

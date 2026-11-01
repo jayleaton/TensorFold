@@ -42,6 +42,9 @@ test "inline exact notation prints finite decimals or natural fractions through 
         .{ "7//-3", "-3\n" },
         .{ "7÷-3", "-7/3\n" },
         .{ "(2+3)/8", "5/8\n" },
+        .{ "2^10", "1024\n" },
+        .{ "2^3^2", "512\n" },
+        .{ "2^100 - 3^50", "1267649882330241709644114435127\n" },
     };
     for (cases) |case| {
         const result = try front.translate(null, t.allocator, .{ .form = .inline_expr, .lang = "python", .code = case[0] });
@@ -60,7 +63,8 @@ test "inline math declines incomplete ambiguous repeating and unsafe notation" {
         "1,000+2",    "2*3,18",  "1+2=3",      "1=1=1",   "1/",      "(2+3",    "1+",    "...",       "2.",
         "print(1/2)", ">>> 1/2", "gcd(48,18)", "7%3",     "20%%",    "+1/3",
         "×2",
-        "2\n3",       "3/0",     "1.0/3",      "0.1+1/3", "0.01//2", "10**100", "2**-1", "0.1/(2-2)",
+        "2\n3",       "3/0",     "1.0/3",      "0.1+1/3", "0.01//2", "10**100", "2**-1", "0.1/(2-2)", "10^100",
+        "2^-1",       "2^",      "^2",
     };
     for (bad) |source| {
         const result = try front.translate(null, t.allocator, .{ .form = .inline_expr, .lang = "python", .code = source });
@@ -103,6 +107,36 @@ test "inline defaults and explicit override never change Python code cell semant
     });
     try t.expect(independent == .program);
     defer t.allocator.free(independent.program.bytes);
+}
+
+test "inline `^` is a power like `**`; Python code cells never read it as one" {
+    var context: f.Context = .{ .io = t.io, .exact_tags = true, .exact_inline = true };
+    const front = context.frontend();
+    for ([_][2][]const u8{ .{ "2^10", "2**10" }, .{ "2^100 - 3^50", "2**100 - 3**50" }, .{ "(3+4)^2", "(3+4)**2" } }) |pair| {
+        const caret = try front.translate(front.ctx, t.allocator, .{ .form = .inline_expr, .lang = "python", .code = pair[0] });
+        if (caret == .abstain) std.debug.print("inline abstained: {s}\n", .{pair[0]});
+        try t.expect(caret == .program);
+        defer t.allocator.free(caret.program.bytes);
+        const star = try front.translate(front.ctx, t.allocator, .{ .form = .inline_expr, .lang = "python", .code = pair[1] });
+        try t.expect(star == .program);
+        defer t.allocator.free(star.program.bytes);
+        try t.expectEqualSlices(u8, star.program.bytes, caret.program.bytes);
+    }
+    for ([_]f.Cell{
+        .{ .form = .fence, .lang = "python", .code = "print(2^10)" },
+        .{ .form = .repl, .lang = "python", .code = "2^10" },
+        .{ .form = .repl, .lang = "python", .code = "6 ^ 3" },
+    }) |cell| {
+        const power = try front.translate(front.ctx, t.allocator, .{ .form = cell.form, .lang = "python", .code = "2**10" });
+        defer if (power == .program) t.allocator.free(power.program.bytes);
+        const got = try front.translate(front.ctx, t.allocator, cell);
+        if (got == .program) {
+            defer t.allocator.free(got.program.bytes);
+            try t.expect(power != .program or !std.mem.eql(u8, power.program.bytes, got.program.bytes));
+        }
+    }
+    context.exact_inline = false;
+    try t.expect((try front.translate(front.ctx, t.allocator, .{ .form = .inline_expr, .lang = "python", .code = "2^10" })) == .abstain);
 }
 
 test "firmware type checks operate on intermediate values" {
