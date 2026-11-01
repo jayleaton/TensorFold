@@ -2,6 +2,10 @@ const std = @import("std");
 const f = @import("runner_frontend.zig");
 const t = std.testing;
 
+test {
+    _ = @import("runner_frontend_integer_test.zig");
+}
+
 test "frontend accepts model multiply and REPL power without computing the answer" {
     var exact: f.Context = .{ .io = t.io, .exact_tags = true };
     const cases = [_][3][]const u8{

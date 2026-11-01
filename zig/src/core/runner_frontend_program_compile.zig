@@ -6,6 +6,7 @@ pub const Config = struct {
     clang: []const u8 = "/usr/bin/clang",
     linker: ?[]const u8 = null,
     scratch_root: []const u8 = "/tmp",
+    optimize: bool = false,
 };
 
 pub const linker_script =
@@ -127,12 +128,12 @@ pub fn compile(a: Allocator, io: std.Io, source: []const u8, config: Config) All
     defer a.free(linker_arg);
     const result = std.process.run(a, io, .{
         .argv = &.{
-            config.clang,          "--target=riscv32-unknown-elf",    "-march=rv32im_zba", "-mabi=ilp32",
-            "-O0",                 "-ffreestanding",                  "-fno-builtin",      "-nostdinc",
-            "-nostdlib",           "-fno-stack-protector",            "-fno-pic",          "-mno-relax",
-            "-fno-unwind-tables",  "-fno-asynchronous-unwind-tables", linker_arg,          "-Wl,--no-relax",
-            "-Wl,--build-id=none", "-Wl,-T",                          link_path,           "-x",
-            "c",                   src,                               "-o",                elf,
+            config.clang,                          "--target=riscv32-unknown-elf",    "-march=rv32im_zba", "-mabi=ilp32",
+            if (config.optimize) "-O2" else "-O0", "-ffreestanding",                  "-fno-builtin",      "-nostdinc",
+            "-nostdlib",                           "-fno-stack-protector",            "-fno-pic",          "-mno-relax",
+            "-fno-unwind-tables",                  "-fno-asynchronous-unwind-tables", linker_arg,          "-Wl,--no-relax",
+            "-Wl,--build-id=none",                 "-Wl,-T",                          link_path,           "-x",
+            "c",                                   src,                               "-o",                elf,
         },
         .stdout_limit = .limited(4096),
         .stderr_limit = .limited(16384),
