@@ -4,6 +4,16 @@ const t = std.testing;
 
 test {
     _ = @import("runner_frontend_integer_test.zig");
+    _ = @import("runner_frontend_integer_python.zig");
+    _ = @import("runner_frontend_algorithm_test.zig");
+    _ = @import("runner_frontend_cwide_test.zig");
+    _ = @import("runner_frontend_blocks_test.zig");
+    _ = @import("runner_frontend_c_cost_test.zig");
+    _ = @import("runner_frontend_c_inputs_test.zig");
+    _ = @import("runner_frontend_integer_cost_test.zig");
+    _ = @import("runner_frontend_budget_test.zig");
+    _ = @import("runner_frontend_optimization_test.zig");
+    _ = @import("runner_frontend_calc_cost_test.zig");
 }
 
 test "frontend accepts model multiply and REPL power without computing the answer" {
@@ -77,6 +87,8 @@ test "real compiler emits circuit ELF for loops and C with negative controls" {
         .{ "python", "print(sum(i*i for i in range(10)))", "squares.elf", "285\n" },
         .{ "python", "print(sum(i+i for i in range(10)))", "addition.elf", "90\n" },
         .{ "python", "s = 0\nfor i in range(10):\n    s += i*i\nprint(s)", "loop.elf", "285\n" },
+        .{ "python", "n = 123456789\ns = 0\nwhile n > 0:\n    s += n % 10\n    n //= 10\nprint(s)", "digits.elf", "45\n" },
+        .{ "python", "a = 462\nb = 1071\nwhile b:\n    a, b = b, a % b\nprint(a)", "gcd-loop.elf", "21\n" },
         .{ "c", "#include <stdio.h>\nint main(void) { int s=0; for(int i=0;i<10;i++) s+=i*i; printf(\"%d\\n\",s); return 0; }", "c.elf", "285\n" },
         .{ "c", "int main(void) { puts(\"circuit\"); return 0; }", "puts.elf", "circuit\n" },
         .{ "c", "int s=0; for(int i=0;i<10;i++) s+=i*i; printf(\"%d\\n\",s);", "snippet.elf", "285\n" },
@@ -123,6 +135,37 @@ test "prior cells cannot silently shadow Python builtins" {
     try t.expect(result == .abstain);
 }
 
+test "independent arithmetic cells accept safe earlier cells and refuse hidden builtin rebinding" {
+    const front = f.frontend();
+    for ([_][]const u8{ "314159 * 271828", "n = 7", "print(3)" }) |prior| {
+        const result = try front.translate(null, t.allocator, .{
+            .form = .repl,
+            .lang = "python",
+            .code = "2**100 - 3**50",
+            .prior = &.{prior},
+        });
+        try t.expect(result == .program);
+        defer t.allocator.free(result.program.bytes);
+        try t.expectEqual(.calc, result.program.kind);
+    }
+    for ([_][]const u8{ "__builtins__ = 0", "print = 1", "len = 1", "import builtins", "import os" }) |prior| {
+        const result = try front.translate(null, t.allocator, .{
+            .form = .repl,
+            .lang = "python",
+            .code = "print(314159*271828)",
+            .prior = &.{prior},
+        });
+        try t.expect(result == .abstain);
+    }
+    const dependent = try front.translate(null, t.allocator, .{
+        .form = .repl,
+        .lang = "python",
+        .code = "print(n+1)",
+        .prior = &.{"n = 7"},
+    });
+    try t.expect(dependent == .abstain);
+}
+
 test "inline typographic operators normalize without changing Python syntax or tuple semantics" {
     const front = f.frontend();
     const result = try front.translate(null, t.allocator, .{ .form = .inline_expr, .lang = "python", .code = "47 × 83 − 1" });
@@ -132,7 +175,7 @@ test "inline typographic operators normalize without changing Python syntax or t
     for ([_][]const u8{ "47 × 83", "47 − 83" }) |code| {
         try t.expect((try front.translate(null, t.allocator, .{ .form = .fence, .lang = "python", .code = code })) == .abstain);
     }
-    for ([_][]const u8{ "1,000 + 2", "2*3,18", "2^10", "gcd(2,4)" }) |code| {
+    for ([_][]const u8{ "1,000 + 2", "2*3,18", "2^10", "unknown(2,4)" }) |code| {
         try t.expect((try front.translate(null, t.allocator, .{ .form = .inline_expr, .lang = "python", .code = code })) == .abstain);
     }
 }

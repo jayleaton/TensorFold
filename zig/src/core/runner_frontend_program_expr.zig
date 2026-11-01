@@ -164,10 +164,24 @@ pub const Parser = struct {
     }
 
     pub fn emit(p: *const Parser, a: std.mem.Allocator, out: *std.ArrayList(u8)) std.mem.Allocator.Error!void {
+        try out.appendSlice(a, "static volatile int tf_literals[]={");
+        var inputs: usize = 0;
+        for (p.nodes[0..p.len]) |n| {
+            if (n.op == .literal or n.op == .power) {
+                try out.print(a, "{d},", .{n.value});
+                inputs += 1;
+            }
+        }
+        if (inputs == 0) try out.appendSlice(a, "0");
+        try out.appendSlice(a, "};\n");
+        inputs = 0;
         for (p.nodes[0..p.len], 0..) |n, id| {
             try out.print(a, "int tf_e{d} = ", .{id});
             switch (n.op) {
-                .literal => try out.print(a, "{d}", .{n.value}),
+                .literal => {
+                    try out.print(a, "tf_literals[{d}]", .{inputs});
+                    inputs += 1;
+                },
                 .variable => try out.appendSlice(a, "tf_i"),
                 .neg => try out.print(a, "-tf_e{d}", .{n.lhs}),
                 .add, .sub, .mul => try out.print(a, "tf_e{d} {s} tf_e{d}", .{
@@ -187,12 +201,13 @@ pub const Parser = struct {
                     }
                 },
                 .power => {
-                    try out.appendSlice(a, "1");
-                    var i: i64 = 0;
-                    while (i < n.value) : (i += 1) try out.print(a, " * tf_e{d}", .{n.lhs});
+                    try out.print(a, "1;\nint tf_exp{d}=tf_literals[{d}];\nfor(int tf_p{d}=0;tf_p{d}<tf_exp{d};++tf_p{d}) tf_e{d} *= tf_e{d}", .{
+                        id, inputs, id, id, id, id, id, n.lhs,
+                    });
+                    inputs += 1;
                 },
             }
-            try out.appendSlice(a, ";\n");
+            try out.print(a, ";\n__asm__ volatile(\"\" : \"+r\"(tf_e{d}));\n", .{id});
         }
     }
 };

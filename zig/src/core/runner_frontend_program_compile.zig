@@ -1,12 +1,19 @@
 //! Freestanding RV32 compilation; the host compiles source but never executes the resulting program.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const inputs = @import("runner_frontend_c_inputs.zig");
+const cost = @import("runner_frontend_c_cost.zig");
 
 pub const Config = struct {
     clang: []const u8 = "/usr/bin/clang",
     linker: ?[]const u8 = null,
     scratch_root: []const u8 = "/tmp",
-    optimize: bool = false,
+    optimize: enum { O0, O1, O2 } = .O1,
+    stack_limit: usize = 0,
+    opaque_inputs: bool = false,
+    estimated_steps: ?usize = null,
+    step_budget: usize = 10522,
+    deadline: ?std.Io.Timestamp = null,
 };
 
 pub const linker_script =
@@ -41,6 +48,16 @@ const runtime =
     \\#define true 1
     \\#define false 0
     \\#define NULL ((void*)0)
+    \\void *memset(void *destination, int value, size_t count) {
+    \\ unsigned char *d = destination;
+    \\ for(size_t i=0;i<count;++i) d[i]=(unsigned char)value;
+    \\ return destination;
+    \\}
+    \\void *memcpy(void *destination, const void *source, size_t count) {
+    \\ unsigned char *d = destination; const unsigned char *s = source;
+    \\ for(size_t i=0;i<count;++i) d[i]=s[i];
+    \\ return destination;
+    \\}
     \\static unsigned int tf_output_count;
     \\static int putchar(int c) {
     \\ ++tf_output_count;
@@ -58,15 +75,41 @@ const runtime =
     \\ if(n < 0) { putchar('-'); tf_unsigned(0u - (unsigned int)n); }
     \\ else tf_unsigned((unsigned int)n);
     \\}
+    \\static unsigned long long tf_div10(unsigned long long n, unsigned int *remainder) {
+    \\ unsigned long long q = 0; unsigned int r = 0;
+    \\ for(int bit = 0; bit < 64; ++bit) {
+    \\  r = (r << 1) | (unsigned int)(n >> 63); n <<= 1; q <<= 1;
+    \\  if(r >= 10) { r -= 10; q |= 1; }
+    \\ }
+    \\ *remainder = r; return q;
+    \\}
+    \\static void tf_unsigned_wide(unsigned long long n) {
+    \\ if(n <= 0xffffffffULL) { tf_unsigned((unsigned int)n); return; }
+    \\ char digits[20]; int len = 0; unsigned int remainder;
+    \\ do { n = tf_div10(n, &remainder); digits[len++] = (char)('0' + remainder); } while(n);
+    \\ while(len) putchar(digits[--len]);
+    \\}
+    \\static void tf_signed_wide(long long n) {
+    \\ unsigned long long magnitude = (unsigned long long)n;
+    \\ if(n < 0) { putchar('-'); magnitude = 0ULL - magnitude; }
+    \\ tf_unsigned_wide(magnitude);
+    \\}
     \\static void tf_print_int(int n) { tf_signed(n); putchar('\n'); }
     \\static int puts(const char *s) { while(*s) putchar(*s++); putchar('\n'); return 0; }
+    \\static int printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
     \\static int printf(const char *fmt, ...) {
     \\ unsigned int before = tf_output_count;
     \\ __builtin_va_list args; __builtin_va_start(args, fmt);
     \\ while(*fmt) {
     \\  if(*fmt != '%') { putchar(*fmt++); continue; }
     \\  ++fmt;
-    \\  if(*fmt == 'd' || *fmt == 'i') tf_signed(__builtin_va_arg(args, int));
+    \\  if(fmt[0] == 'l' && fmt[1] == 'l') {
+    \\   fmt += 2;
+    \\   if(*fmt == 'd' || *fmt == 'i') tf_signed_wide(__builtin_va_arg(args, long long));
+    \\   else if(*fmt == 'u') tf_unsigned_wide(__builtin_va_arg(args, unsigned long long));
+    \\   else { __builtin_va_end(args); return -1; }
+    \\  }
+    \\  else if(*fmt == 'd' || *fmt == 'i') tf_signed(__builtin_va_arg(args, int));
     \\  else if(*fmt == 'u') tf_unsigned(__builtin_va_arg(args, unsigned int));
     \\  else if(*fmt == 'c') putchar(__builtin_va_arg(args, int));
     \\  else if(*fmt == 's') { const char *s = __builtin_va_arg(args, const char*); while(*s) putchar(*s++); }
@@ -87,7 +130,8 @@ pub fn wrapBody(a: Allocator, body: []const u8) Allocator.Error![]u8 {
 
 /// Returns owned ELF32 bytes, or abstains on invalid source, unavailable toolchain or compilation failure.
 pub fn compile(a: Allocator, io: std.Io, source: []const u8, config: Config) Allocator.Error!?[]u8 {
-    const normalized = try normalize(a, source) orelse return null;
+    if (config.deadline) |end| if (std.Io.Clock.awake.now(io).toNanoseconds() >= end.toNanoseconds()) return null;
+    const normalized = try normalizeWithTrust(a, source, config.opaque_inputs) orelse return null;
     defer a.free(normalized);
     if (!std.fs.path.isAbsolute(config.scratch_root)) return null;
     const parent = std.Io.Dir.cwd().openDir(io, config.scratch_root, .{}) catch return null;
@@ -126,18 +170,61 @@ pub fn compile(a: Allocator, io: std.Io, source: []const u8, config: Config) All
     else
         try a.dupe(u8, "-fuse-ld=lld");
     defer a.free(linker_arg);
+    if (config.step_budget != 0) {
+        if (config.estimated_steps) |steps| if (steps > config.step_budget) return null;
+    }
+    if (!config.opaque_inputs or (config.step_budget != 0 and config.estimated_steps == null)) {
+        const ast = std.process.run(a, io, .{
+            .argv = &.{ config.clang, "--target=riscv32-unknown-elf", "-march=rv32im_zba", "-mabi=ilp32", "-ffreestanding", "-fno-builtin", "-nostdinc", "-Werror=format", "-fsyntax-only", "-Xclang", "-ast-dump=json", "-x", "c", src },
+            .stdout_limit = .limited(4 * 1024 * 1024),
+            .stderr_limit = .limited(16384),
+            .timeout = .{ .duration = .{ .raw = remaining(io, config, 500) orelse return null, .clock = .awake } },
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        };
+        defer a.free(ast.stdout);
+        defer a.free(ast.stderr);
+        if (!ast.term.success()) return null;
+        var instrumented: ?[]u8 = null;
+        var restoration_steps: usize = 0;
+        defer if (instrumented) |text| a.free(text);
+        if (!config.opaque_inputs) {
+            const lowered = try inputs.lowerWithCost(a, normalized, ast.stdout, runtime.len + 1) orelse return null;
+            instrumented = lowered.source;
+            restoration_steps = lowered.restoration_steps;
+        }
+        if (config.step_budget != 0 and config.estimated_steps == null) {
+            const startup = restoration_steps;
+            if (startup >= config.step_budget) return null;
+            _ = try cost.estimate(a, ast.stdout, runtime.len + 1, config.step_budget - startup) orelse return null;
+        }
+        if (instrumented) |text| {
+            const rewritten = try std.fmt.allocPrint(a, "{s}\n{s}\n", .{ runtime, text });
+            defer a.free(rewritten);
+            const file = dir.createFile(io, "program.c", .{ .truncate = true, .permissions = .fromMode(0o600) }) catch return null;
+            defer file.close(io);
+            file.writeStreamingAll(io, rewritten) catch return null;
+        }
+    }
     const result = std.process.run(a, io, .{
         .argv = &.{
-            config.clang,                          "--target=riscv32-unknown-elf",    "-march=rv32im_zba", "-mabi=ilp32",
-            if (config.optimize) "-O2" else "-O0", "-ffreestanding",                  "-fno-builtin",      "-nostdinc",
-            "-nostdlib",                           "-fno-stack-protector",            "-fno-pic",          "-mno-relax",
-            "-fno-unwind-tables",                  "-fno-asynchronous-unwind-tables", linker_arg,          "-Wl,--no-relax",
-            "-Wl,--build-id=none",                 "-Wl,-T",                          link_path,           "-x",
-            "c",                                   src,                               "-o",                elf,
+            config.clang,           "--target=riscv32-unknown-elf", "-march=rv32im_zba",   "-mabi=ilp32",
+            switch (config.optimize) {
+                .O0 => "-O0",
+                .O1 => "-O1",
+                .O2 => "-O2",
+            },
+            "-ffreestanding",       "-fno-builtin",                 "-nostdinc",           "-nostdlib",
+            "-fno-stack-protector", "-fno-pic",                     "-mno-relax",          "-Werror=format",
+            "-Wno-format-security", "-fstack-usage",                "-fno-unwind-tables",  "-fno-asynchronous-unwind-tables",
+            linker_arg,             "-Wl,--no-relax",               "-Wl,--build-id=none", "-Wl,-T",
+            link_path,              "-x",                           "c",                   src,
+            "-o",                   elf,
         },
         .stdout_limit = .limited(4096),
         .stderr_limit = .limited(16384),
-        .timeout = .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } },
+        .timeout = .{ .duration = .{ .raw = remaining(io, config, 1000) orelse return null, .clock = .awake } },
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
@@ -145,6 +232,14 @@ pub fn compile(a: Allocator, io: std.Io, source: []const u8, config: Config) All
     defer a.free(result.stdout);
     defer a.free(result.stderr);
     if (!result.term.success()) return null;
+    if (config.stack_limit != 0) {
+        const usage = dir.readFileAlloc(io, "program.su", a, .limited(65536)) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        };
+        defer a.free(usage);
+        if (!safeStackUsage(usage, config.stack_limit)) return null;
+    }
     const bytes = dir.readFileAlloc(io, "program.elf", a, .limited(1 << 20)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
@@ -156,6 +251,41 @@ pub fn compile(a: Allocator, io: std.Io, source: []const u8, config: Config) All
     return bytes;
 }
 
+fn remaining(io: std.Io, config: Config, milliseconds: i64) ?std.Io.Duration {
+    const cap = std.Io.Duration.fromMilliseconds(milliseconds);
+    const end = config.deadline orelse return cap;
+    const left = std.Io.Clock.awake.now(io).durationTo(end);
+    if (left.toNanoseconds() <= 0) return null;
+    return .fromNanoseconds(@min(left.toNanoseconds(), cap.toNanoseconds()));
+}
+
+// Summed static frames bound every call chain in the trusted, recursion-free Python lowering.
+pub fn safeStackUsage(report: []const u8, limit: usize) bool {
+    var total: usize = 0;
+    var functions: usize = 0;
+    var lines = std.mem.splitScalar(u8, report, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, "\r");
+        if (line.len == 0) continue;
+        var fields = std.mem.splitScalar(u8, line, '\t');
+        _ = fields.next() orelse return false;
+        const size = std.fmt.parseInt(usize, fields.next() orelse return false, 10) catch return false;
+        const kind = fields.next() orelse return false;
+        if (fields.next() != null or !std.mem.eql(u8, kind, "static") or size > limit - total) return false;
+        total += size;
+        functions += 1;
+    }
+    return functions != 0;
+}
+
+test "trusted Python stack admission sums static frames and rejects unbounded reports" {
+    try std.testing.expect(safeStackUsage("p.c:1:main\t128\tstatic\np.c:2:f\t256\tstatic\n", 384));
+    try std.testing.expect(!safeStackUsage("p.c:1:main\t128\tstatic\np.c:2:f\t256\tstatic\n", 383));
+    try std.testing.expect(!safeStackUsage("p.c:1:main\t32\tdynamic\n", 4096));
+    try std.testing.expect(!safeStackUsage("p.c:1:main\tbad\tstatic\n", 4096));
+    try std.testing.expect(!safeStackUsage("", 4096));
+}
+
 fn write(io: std.Io, dir: std.Io.Dir, name: []const u8, bytes: []const u8) bool {
     const f = dir.createFile(io, name, .{ .exclusive = true, .permissions = .fromMode(0o600) }) catch return false;
     defer f.close(io);
@@ -164,6 +294,10 @@ fn write(io: std.Io, dir: std.Io.Dir, name: []const u8, bytes: []const u8) bool 
 }
 
 fn normalize(a: Allocator, source: []const u8) Allocator.Error!?[]u8 {
+    return normalizeWithTrust(a, source, false);
+}
+
+fn normalizeWithTrust(a: Allocator, source: []const u8, trusted: bool) Allocator.Error!?[]u8 {
     if (source.len == 0 or source.len > 16384 or std.mem.indexOfScalar(u8, source, 0) != null) return null;
     if (std.mem.indexOf(u8, source, "\\\n") != null or std.mem.indexOf(u8, source, "\\\r\n") != null) return null;
     var out: std.ArrayList(u8) = .empty;
@@ -181,12 +315,22 @@ fn normalize(a: Allocator, source: []const u8) Allocator.Error!?[]u8 {
             if (!ok) return null;
             continue;
         }
-        if (std.mem.indexOfScalar(u8, line, '#') != null) return null;
+        if (std.mem.startsWith(u8, trimmed, "#define ")) {
+            var fields = std.mem.tokenizeAny(u8, trimmed[8..], " \t");
+            const name = fields.next() orelse return null;
+            const value = fields.next() orelse return null;
+            if (fields.next() != null or name.len == 0 or !(std.ascii.isAlphabetic(name[0]) or name[0] == '_')) return null;
+            for (name) |c| if (!std.ascii.isAlphanumeric(c) and c != '_') return null;
+            _ = std.fmt.parseInt(u32, value, 0) catch return null;
+        } else if (std.mem.indexOfScalar(u8, line, '#') != null) return null;
         try out.appendSlice(a, line);
         try out.append(a, '\n');
     }
     const forbidden = [_][]const u8{ "__", "asm", "_Pragma", "??", "%:", "\\\n", "\\\r" };
-    for (forbidden) |token| if (std.mem.indexOf(u8, out.items, token) != null) return null;
+    for (forbidden) |token| {
+        if (trusted and (std.mem.eql(u8, token, "__") or std.mem.eql(u8, token, "asm"))) continue;
+        if (std.mem.indexOf(u8, out.items, token) != null) return null;
+    }
     if (!safeFormats(out.items)) return null;
     return try out.toOwnedSlice(a);
 }
@@ -233,12 +377,13 @@ test "missing toolchain abstains" {
 }
 
 test "source cannot access host includes or inject assembly" {
-    const bad = [_][]const u8{ "#include </etc/passwd>", "#define X 1", "asm(\".incbin x\");", "_Pragma(\"x\")", "int x = __FILE__;", "%:include </etc/passwd>", "pri\\\nntf(\"%f\", 1.0);" };
+    const bad = [_][]const u8{ "#include </etc/passwd>", "#define X(x) x", "asm(\".incbin x\");", "_Pragma(\"x\")", "int x = __FILE__;", "%:include </etc/passwd>", "pri\\\nntf(\"%f\", 1.0);" };
     for (bad) |s| try std.testing.expectEqual(@as(?[]u8, null), try normalize(std.testing.allocator, s));
     try std.testing.expect(!validElf("not an ELF"));
 }
 
-fn safeFormats(s: []const u8) bool {
+/// Checks literal printf conversion syntax; Clang checks argument types during compilation.
+pub fn safeFormats(s: []const u8) bool {
     var i: usize = 0;
     while (i < s.len) {
         if (std.mem.startsWith(u8, s[i..], "//")) {
@@ -276,7 +421,10 @@ fn safeFormats(s: []const u8) bool {
                     if (i == s.len or std.mem.indexOfScalar(u8, "nrtvabf\\\"?", s[i]) == null) return false;
                 } else if (s[i] == '%') {
                     i += 1;
-                    if (i == s.len or std.mem.indexOfScalar(u8, "diucs%", s[i]) == null) return false;
+                    if (std.mem.startsWith(u8, s[i..], "ll")) {
+                        i += 2;
+                        if (i == s.len or std.mem.indexOfScalar(u8, "diu", s[i]) == null) return false;
+                    } else if (i == s.len or std.mem.indexOfScalar(u8, "diucs%", s[i]) == null) return false;
                 }
             }
             if (i == s.len) return false;

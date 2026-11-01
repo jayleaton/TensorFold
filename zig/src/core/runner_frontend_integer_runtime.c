@@ -1,4 +1,4 @@
-// Freestanding RV32 integer library; runner_frontend_program_compile supplies putchar and process startup.
+// RV32 integer library; program_compile supplies memory operations, putchar and startup.
 typedef unsigned int tf_wu;
 typedef unsigned long long tf_wd;
 struct tf_wint { tf_wu v[8]; int neg; };
@@ -6,24 +6,11 @@ struct tf_wint { tf_wu v[8]; int neg; };
 // ABI: nodes are topological, child indices precede parents, n <= 64, and node n-1 is the output root.
 struct tf_node { int op, l, r, k; const char *text; };
 
-// Ops: 0 literal, 1 neg, 2 add, 3 sub, 4 mul, 5 floor-div, 6 mod, 7 pow, 8 powmod, 9 str-len, 10 divmod.
+// Ops 0..10 are stable; append 11 gcd, 12 isqrt, 13 factorial, 14 range-product, 15 digit-sum.
 static struct tf_wint tf_wvalues[64];
 
 // The parent proves every admitted input and node result has magnitude below 10^62; scratch products use 512 bits.
 static int tf_wbad;
-
-void *memcpy(void *dst, const void *src, unsigned int n) {
-    unsigned char *d = (unsigned char *)dst;
-    const unsigned char *s = (const unsigned char *)src;
-    for (unsigned int i = 0; i < n; ++i) d[i] = s[i];
-    return dst;
-}
-
-void *memset(void *dst, int value, unsigned int n) {
-    unsigned char *d = (unsigned char *)dst;
-    for (unsigned int i = 0; i < n; ++i) d[i] = (unsigned char)value;
-    return dst;
-}
 
 static struct tf_wint tf_wsmall(tf_wu x) {
     struct tf_wint a;
@@ -48,6 +35,11 @@ static int tf_wcmp(const struct tf_wint *a, const struct tf_wint *b) {
         if (a->v[i] != b->v[i]) return a->v[i] > b->v[i] ? 1 : -1;
     }
     return 0;
+}
+
+static void tf_wbound(const struct tf_wint *a) {
+    const struct tf_wint limit = { { 0u, 1073741824u, 4155282634u, 576837993u, 895677624u, 3947553080u, 15930u, 0u }, 0 };
+    if (tf_wcmp(a, &limit) >= 0) tf_wbad = 1;
 }
 
 static struct tf_wint tf_waddmag(const struct tf_wint *a, const struct tf_wint *b) {
@@ -114,6 +106,7 @@ static struct tf_wint tf_wmul(const struct tf_wint *a, const struct tf_wint *b) 
     }
     c.neg = a->neg != b->neg;
     tf_wnormalize(&c);
+    tf_wbound(&c);
     return c;
 }
 
@@ -243,6 +236,83 @@ static struct tf_wint tf_wpow(struct tf_wint a, const struct tf_wint *e,
     return result;
 }
 
+static struct tf_wint tf_wgcd(struct tf_wint a, struct tf_wint b) {
+    a.neg = b.neg = 0;
+    while (tf_wused(&b) && !tf_wbad) {
+        struct tf_wint q, r;
+        tf_wdivmag(&a, &b, &q, &r);
+        a = b;
+        b = r;
+    }
+    return a;
+}
+
+static struct tf_wint tf_wisqrt(const struct tf_wint *a) {
+    struct tf_wint x = tf_wsmall(0), q, r;
+    if (a->neg) { tf_wbad = 1; return x; }
+    int bits = tf_wbits(a->v, 8);
+    if (!bits) return x;
+    int shift = (bits + 1) / 2;
+    x.v[shift / 32] = 1u << (shift % 32);
+    tf_wdivmag(a, &x, &q, &r);
+    struct tf_wint y = tf_waddmag(&x, &q);
+    tf_wdivsmall(y.v, 8, 2);
+    while (tf_wcmp(&y, &x) < 0 && !tf_wbad) {
+        x = y;
+        tf_wdivmag(a, &x, &q, &r);
+        y = tf_waddmag(&x, &q);
+        tf_wdivsmall(y.v, 8, 2);
+    }
+    return x;
+}
+
+static struct tf_wint tf_wfactorial(const struct tf_wint *a) {
+    struct tf_wint result = tf_wsmall(1), maximum = tf_wsmall(48);
+    if (a->neg || tf_wcmp(a, &maximum) > 0) { tf_wbad = 1; return result; }
+    for (tf_wu i = 2; i <= a->v[0] && !tf_wbad; ++i) {
+        struct tf_wint factor = tf_wsmall(i);
+        result = tf_wmul(&result, &factor);
+    }
+    return result;
+}
+
+static int tf_wsignedcmp(const struct tf_wint *a, const struct tf_wint *b) {
+    if (a->neg != b->neg) return a->neg ? -1 : 1;
+    return a->neg ? -tf_wcmp(a, b) : tf_wcmp(a, b);
+}
+
+static struct tf_wint tf_wrange(struct tf_wint a, const struct tf_wint *stop,
+                               const struct tf_wint *step) {
+    struct tf_wint result = tf_wsmall(1);
+    if (!tf_wused(step)) { tf_wbad = 1; return result; }
+    if (step->neg ? tf_wsignedcmp(&a, stop) <= 0 : tf_wsignedcmp(&a, stop) >= 0) return result;
+    struct tf_wint negative = step->neg ? *stop : a;
+    negative.neg = !negative.neg;
+    struct tf_wint distance = tf_wadd(step->neg ? a : *stop, negative);
+    struct tf_wint stride = *step, length, remainder;
+    stride.neg = 0;
+    tf_wdivmod(&distance, &stride, &length, &remainder);
+    if (tf_wused(&remainder)) length = tf_wadd(length, tf_wsmall(1));
+    struct tf_wint maximum = tf_wsmall(10000);
+    if (tf_wbad || tf_wcmp(&length, &maximum) > 0) { tf_wbad = 1; return result; }
+    int count = 0;
+    while (!tf_wbad && (step->neg ? tf_wsignedcmp(&a, stop) > 0 : tf_wsignedcmp(&a, stop) < 0)) {
+        if (++count > 10000) { tf_wbad = 1; break; }
+        tf_wbound(&a);
+        result = tf_wmul(&result, &a);
+        if (!tf_wused(&result)) return result;
+        a = tf_wadd(a, *step);
+    }
+    return result;
+}
+
+static struct tf_wint tf_wdigitsum(struct tf_wint a) {
+    tf_wu sum = 0;
+    if (a.neg) tf_wbad = 1;
+    while (tf_wused(&a)) sum += tf_wdivsmall(a.v, 8, 10);
+    return tf_wsmall(sum);
+}
+
 // Literal text contains signed digits without a radix prefix; k is radix 2, 10, or 16, not a child index.
 static struct tf_wint tf_wparse(const char *s, int base) {
     struct tf_wint a = tf_wsmall(0);
@@ -294,12 +364,12 @@ int tf_run(const volatile struct tf_node *nodes, int n) {
         const volatile struct tf_node *node = &nodes[i];
         struct tf_wint a = tf_wsmall(0), b = tf_wsmall(0), c;
         int op = node->op;
-        if (op < 0 || op > 10) return 1;
+        if (op < 0 || op > 15) return 1;
         if (op) {
             if (node->l < 0 || node->l >= i) return 1;
             a = tf_wvalues[node->l];
         }
-        if ((op >= 2 && op <= 8) || op == 10) {
+        if ((op >= 2 && op <= 8) || op == 10 || op == 11 || op == 14) {
             if (node->r < 0 || node->r >= i) return 1;
             b = tf_wvalues[node->r];
         }
@@ -331,8 +401,17 @@ int tf_run(const volatile struct tf_node *nodes, int n) {
             c = tf_wsmall((tf_wu)tf_wformat(a, text));
             break;
         }
+        case 11: c = tf_wgcd(a, b); break;
+        case 12: c = tf_wisqrt(&a); break;
+        case 13: c = tf_wfactorial(&a); break;
+        case 14:
+            if (node->k < 0 || node->k >= i) return 1;
+            c = tf_wrange(a, &b, &tf_wvalues[node->k]);
+            break;
+        case 15: c = tf_wdigitsum(a); break;
         default: return 1;
         }
+        tf_wbound(&c);
         if (tf_wbad) return 1;
         tf_wvalues[i] = c;
     }
