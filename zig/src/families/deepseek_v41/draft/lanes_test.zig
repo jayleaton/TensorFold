@@ -344,3 +344,55 @@ test "copy suppression survives cancellation after speculation and reuses the sa
     defer gpa.free(want);
     try std.testing.expectEqualSlices(u32, want, reused.emitted());
 }
+
+/// The twin's target as a pieces target (stub begin / piece / finish) whose `spans` hook counts reply-span hand-offs.
+const SpanCount = struct {
+    var calls: u32 = 0;
+
+    fn spans(_: *anyopaque, _: u32, _: []const [2]u32, _: []const u32) anyerror!void {
+        calls += 1;
+    }
+    fn begin(_: *anyopaque, _: u32, _: []const u32) anyerror!@import("iface.zig").Target.Begun {
+        return .{};
+    }
+    fn piece(_: *anyopaque, _: u32, _: []const u32, _: u64, _: u64, _: bool) anyerror!void {}
+    fn finish(_: *anyopaque, _: u32, _: []const u32, _: ?lanes.Sampling, _: u64) anyerror!u32 {
+        return 0;
+    }
+};
+
+test "decoded rows off: a pieces begin hands the target no reply spans; on: one hand-off a stream" {
+    for ([_]bool{ false, true }) |on| {
+        const t = try twin.Twin.init(gpa, .{}, 1);
+        defer t.deinit();
+        const d = try twin.Drafter.init(gpa, t, 1);
+        defer d.deinit();
+        var c = try servedCosts(gpa);
+        defer c.deinit(gpa);
+        const base = t.target();
+        var vt = base.vtable.*;
+        vt.spans = SpanCount.spans;
+        vt.begin = SpanCount.begin;
+        vt.piece = SpanCount.piece;
+        vt.finish = SpanCount.finish;
+        const x = try ln.Lanes.init(gpa, .{ .ptr = base.ptr, .vtable = &vt }, d.pass(), c, .{ .shape = d.shape, .slots = 1 });
+        defer x.deinit();
+        x.decoded_rows = on;
+        SpanCount.calls = 0;
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        var cfg = try lanes.Config.init(gpa, try x.model(arena.allocator(), 64), 16, 15);
+        defer cfg.deinit(gpa);
+        var clock: lanes.fake.FixedClock = .{};
+        var e = lanes.Engine.init(gpa, &cfg, x.backend(), clock.clock());
+        defer e.deinit();
+        x.attach(&e);
+        var s = try lanes.Stream.init(gpa, .{ .id = "s", .prompt = &p1, .max_new = 8, .decode_spans = &.{.{ 4, 9 }} });
+        defer s.deinit(gpa);
+        const be = x.backend();
+        try std.testing.expect(be.vtable.begin != null); // the pieces backend, where the hand-off lives
+        _ = try be.vtable.begin.?(be.ptr, &s);
+        be.vtable.release(be.ptr, &s);
+        try std.testing.expectEqual(@as(u32, @intFromBool(on)), SpanCount.calls);
+    }
+}

@@ -165,6 +165,7 @@ pub const Served = struct {
                 return error.BadKnob;
             }
             s.host.decoded_rows = true;
+            s.x.decoded_rows = true;
             std.log.info("dsv41 decoded rows: {s} as decode windows", .{if (decoded == .replies) "reply spans" else "every row from the first reply on"});
         }
         s.lookup = null;

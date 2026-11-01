@@ -56,8 +56,8 @@ pub const GpuTarget = struct {
     /// TF_DSV41_REPLAY_RUNS: slots whose decoder replay a batched run did (`finish` / `tail` skip it), and the runs
     replayed: [16]bool = @splat(false),
     replay_runs: u64 = 0,
-    /// TF_DSV41_DECODED_ROWS: each slot's prompt rows that run as decode windows (decoded_rows.zig; empty: none)
-    decoded: [16][]dr.Region = @splat(&.{}),
+    /// TF_DSV41_DECODED_ROWS: each slot's prompt rows that run as decode windows (decoded_rows.zig); null: knob off
+    decoded: ?*[16][]dr.Region = null,
 
     /// A request's admission (kv/sched.zig Admission + the round's spills, with its first admission).
     pub const Planned = struct { need: u32, hit: ?@import("kv").sessions.store.Hit, spills: []const u32 = &.{} };
@@ -79,7 +79,7 @@ pub const GpuTarget = struct {
 
     pub fn deinitGrammar(t: *GpuTarget) void {
         for (&t.prompt_masks) |*mask| mask.deinit(t.f.gpa);
-        for (&t.decoded) |*r| dr.clear(t, r);
+        dr.deinit(t);
     }
 
     fn stagePrompt(t: *GpuTarget, slot: u32) !void {
@@ -203,11 +203,11 @@ pub const GpuTarget = struct {
         if (start == end and save) {
             // a leaving prompt's finished rows kept as they stand (the lane host: its client left mid-prompt)
             if (t.f.slot.pos != start or start < ced.session_min or end + 1 > ids.len) return error.NotAChain;
-            if (!dr.savable(t, slot)) return; // its last rows are decode windows: no replay point to keep
+            if (t.decoded != null and !dr.savable(t, slot)) return; // its last rows are decode windows: no replay point
             if (t.sessions) |ss| _ = try ss.savePrompt();
             return;
         }
-        if (dr.touches(dr.regionsOf(t, slot), start, end)) return dr.piece(t, slot, ids, start, end, save);
+        if (t.decoded != null and dr.touches(dr.regionsOf(t, slot), start, end)) return dr.piece(t, slot, ids, start, end, save);
         return t.prefillPiece(slot, ids, start, end, save);
     }
 
@@ -256,7 +256,7 @@ pub const GpuTarget = struct {
     /// A round's pieces of several slots (TF_DSV41_PIECE_RUNS): their encoder passes in one run, then each snapshot.
     fn pieces(p: *anyopaque, list: []const iface.Target.Piece) anyerror!void {
         const t = self_(p);
-        if (list.len > 1 and list.len <= 16 and pf.state(t.f).mode == .replay and t.f.pf_switch != null and !dr.anyIn(t, list)) {
+        if (list.len > 1 and list.len <= 16 and pf.state(t.f).mode == .replay and t.f.pf_switch != null and (t.decoded == null or !dr.anyIn(t, list))) {
             var segs: [16]pf.MultiSeg = undefined;
             for (list, segs[0..list.len]) |q, *seg| {
                 if (q.start >= q.end or q.end + 1 > q.ids.len) return error.NotAChain;
@@ -394,7 +394,7 @@ pub const GpuTarget = struct {
         var segs: [16]pf.MultiSeg = undefined;
         var n: usize = 0;
         for (list) |q| {
-            if (q.ids.len < 2 or n == segs.len or dr.regionsOf(t, q.slot).len != 0) continue;
+            if (q.ids.len < 2 or n == segs.len or (t.decoded != null and dr.regionsOf(t, q.slot).len != 0)) continue;
             const end: u64 = q.ids.len - 1;
             const tl = ced.tailOf(end);
             if (tl.m <= 32) continue;

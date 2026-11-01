@@ -13,7 +13,8 @@ pub const touches = rows.touches;
 const max_window = 64;
 
 pub fn regionsOf(t: *const GpuTarget, slot: u32) []const Region {
-    return if (slot < t.decoded.len) t.decoded[slot] else &.{};
+    const d = t.decoded orelse return &.{};
+    return if (slot < d.len) d[slot] else &.{};
 }
 
 pub fn clear(t: *GpuTarget, r: *[]Region) void {
@@ -21,13 +22,28 @@ pub fn clear(t: *GpuTarget, r: *[]Region) void {
     r.* = &.{};
 }
 
+/// The slots' regions and their table freed (the target's teardown); knob off: nothing was allocated.
+pub fn deinit(t: *GpuTarget) void {
+    const d = t.decoded orelse return;
+    for (d) |*r| clear(t, r);
+    t.f.gpa.destroy(d);
+    t.decoded = null;
+}
+
 /// Iface.Target.spans: the slot's next prompt's regions from its reply spans; regions with an image's rows prefill.
 pub fn spans(p: *anyopaque, slot: u32, sp: []const [2]u32, ids: []const u32) anyerror!void {
     const t: *GpuTarget = @ptrCast(@alignCast(p));
-    if (slot >= t.decoded.len) return error.Slots;
-    clear(t, &t.decoded[slot]);
     const mode = pf.state(t.f).decoded_rows;
-    if (mode == .off or sp.len == 0 or ids.len == 0) return;
+    if (mode == .off) return; // the table stays null, so the knob-off paths never look a region up
+    if (slot >= 16) return error.Slots;
+    const d = t.decoded orelse made: {
+        const fresh = try t.f.gpa.create([16][]Region);
+        fresh.* = @splat(&.{});
+        t.decoded = fresh;
+        break :made fresh;
+    };
+    clear(t, &d[slot]);
+    if (sp.len == 0 or ids.len == 0) return;
     const all = try rows.regions(t.f.gpa, mode, sp, ids.len - 1);
     var n: usize = 0;
     for (all) |r| if (!@import("image_opts.zig").hasImage(ids[@intCast(r[0])..@intCast(r[1])])) {
@@ -35,7 +51,7 @@ pub fn spans(p: *anyopaque, slot: u32, sp: []const [2]u32, ids: []const u32) any
         n += 1;
     };
     if (n == 0) return t.f.gpa.free(all);
-    t.decoded[slot] = if (n == all.len) all else blk: {
+    d[slot] = if (n == all.len) all else blk: {
         defer t.f.gpa.free(all);
         break :blk try t.f.gpa.dupe(Region, all[0..n]);
     };

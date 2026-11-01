@@ -72,6 +72,7 @@ pub const Lanes = struct {
     by_slot: []?*St,
     retired: [16]bool = @splat(false),
     release_requested: [16]bool = @splat(false),
+    decoded_rows: bool = false, // TF_DSV41_DECODED_ROWS: begin hands each stream's reply spans to the target
 
     pub const init = @import("lane_owner.zig").init;
     pub const deinit = @import("lane_owner.zig").deinit;
@@ -222,7 +223,7 @@ pub const Lanes = struct {
         x.pass.reset(slot);
         x.policy.depth.reset(slot);
         x.target.admit(slot, s.max_new);
-        try x.target.setSpans(slot, s.decode_spans, s.prompt());
+        if (x.decoded_rows) try x.target.setSpans(slot, s.decode_spans, s.prompt());
         const b = try x.target.begin(slot, s.prompt());
         try x.streams.put(x.gpa, s, st);
         x.by_slot[slot] = st;
