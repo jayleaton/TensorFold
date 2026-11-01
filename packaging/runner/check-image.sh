@@ -15,4 +15,11 @@ rc=0
 run -e TF_RUNNER_CLANG=/bin/true -e TF_DSV41_RUNNER=1 "$tag" /bin/true || rc=$?
 [[ $rc != 0 ]] || { echo 'FAIL: compiler success without an ELF was accepted' >&2; exit 1; }
 run "$tag" /bin/sh -c 'test "$1" = "hello world"' sh 'hello world'
-echo 'RUNNER_IMAGE_CHECK: compile/ELF validation, optional fallback, required failure, and argv preservation PASS'
+circuit=/opt/tensorfold/share/runner/calc.tfpc
+probed=no
+if run "$tag" test -f "$circuit"; then
+ run --entrypoint /opt/tensorfold/bin/tf-runner-frontend-check "$tag" --require --circuit "$circuit" ||
+  { echo "FAIL: the image's circuit route (compiled probe cells on $circuit) is wrong" >&2; exit 1; }
+ probed=yes
+fi
+echo "RUNNER_IMAGE_CHECK: compile/ELF validation, optional fallback, required failure, argv preservation, circuit route ($probed) PASS"

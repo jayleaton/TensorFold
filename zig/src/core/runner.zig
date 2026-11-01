@@ -473,4 +473,5 @@ test {
     _ = @import("runner_api.zig");
     _ = @import("runner_trace_test.zig");
     _ = @import("runner_settle_test.zig");
+    _ = @import("runner_probe.zig");
 }
