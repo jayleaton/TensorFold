@@ -3,6 +3,7 @@ const api = @import("runner_api.zig");
 const calc = @import("runner_frontend_calc.zig");
 const program = @import("runner_frontend_program.zig");
 const inline_math = @import("runner_frontend_inline.zig");
+const integer = @import("runner_frontend_integer.zig");
 
 pub const Frontend = api.Frontend;
 pub const Cell = api.Cell;
@@ -39,9 +40,13 @@ fn translate(raw: ?*anyopaque, a: std.mem.Allocator, cell: Cell) std.mem.Allocat
     if (cell.code.len > 4096) return .{ .abstain = .too_long };
     if (cell.form == .inline_expr) {
         if (lang != .python) return .{ .abstain = .unsupported };
+        if (try integer.ambiguousPercent(a, cell.code)) return .{ .abstain = .unsupported };
+        const source = std.mem.trim(u8, cell.code, " \t\r\n");
+        if (std.mem.startsWith(u8, source, "print") or std.mem.startsWith(u8, source, ">>>"))
+            return .{ .abstain = .unsupported };
         if (try inline_math.lower(a, cell.code, if (context) |ctx| ctx.exact_inline else true)) |bytes|
             return .{ .program = .{ .kind = .calc, .bytes = bytes } };
-        return .{ .abstain = .unsupported };
+        return integerProgram(a, context, cell.code);
     }
     if (cell.prior.len != 0) return .{ .abstain = .unsupported };
     if (lang == .python or lang == .exact) {
@@ -50,6 +55,10 @@ fn translate(raw: ?*anyopaque, a: std.mem.Allocator, cell: Cell) std.mem.Allocat
         if (!exact_only or lang == .exact) {
             if (try calc.lower(a, cell.code)) |bytes| return .{ .program = .{ .kind = .calc, .bytes = bytes } };
         }
+    }
+    if (lang == .python) {
+        const result = try integerProgram(a, context, cell.code);
+        if (result == .program) return result;
     }
     if (lang == .exact) return .{ .abstain = .unsupported };
     var source: []const u8 = cell.code;
@@ -73,6 +82,17 @@ fn translate(raw: ?*anyopaque, a: std.mem.Allocator, cell: Cell) std.mem.Allocat
     };
     if (bytes) |elf| return .{ .program = .{ .kind = .elf, .bytes = elf } };
     return .{ .abstain = .unsupported };
+}
+
+fn integerProgram(a: std.mem.Allocator, context: ?*Context, code: []const u8) std.mem.Allocator.Error!Translation {
+    const bytes = if (context) |ctx|
+        try integer.compile(a, ctx.io, code, ctx.compiler)
+    else blk: {
+        var threaded = std.Io.Threaded.init(a, .{});
+        defer threaded.deinit();
+        break :blk try integer.compile(a, threaded.io(), code, .{});
+    };
+    return if (bytes) |elf| .{ .program = .{ .kind = .elf, .bytes = elf } } else .{ .abstain = .unsupported };
 }
 
 fn containsDivision(code: []const u8) bool {
