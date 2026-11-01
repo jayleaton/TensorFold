@@ -10,8 +10,8 @@ const Reason = api.Reason;
 const gpa = std.testing.allocator;
 const EOS: u32 = 96;
 const prompt = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6, 5, 3 };
-const product = "121932631137021795226185032733622923332237463801111263526900";
-const mul_cell = "Let me check.\n```python\nprint(123456789012345678901234567890 * 987654321098765432109876543210)\n```\nResult:\n";
+pub const product = "121932631137021795226185032733622923332237463801111263526900";
+pub const mul_cell = "Let me check.\n```python\nprint(123456789012345678901234567890 * 987654321098765432109876543210)\n```\nResult:\n";
 
 /// Character tokens: printable ASCII 32..126 are 0..94, newline 95, EOS 96 (the fake's vocab is 97).
 fn id(c: u8) u32 {
@@ -47,7 +47,7 @@ fn decode(a: std.mem.Allocator, tokens: []const u32) ![]u8 {
 }
 
 /// A model that writes `lead`, then its own guess on one line, then `tail` and EOS, whatever the guess line became.
-const Model = struct {
+pub const Model = struct {
     lead: []const u8,
     guess: []const u8 = "42",
     tail: []const u8 = "Done.",
@@ -80,7 +80,7 @@ fn translate(_: ?*anyopaque, a: std.mem.Allocator, cell: rapi.Cell) std.mem.Allo
 }
 
 /// Answers from a table after `delay` polls, or only once `gate` opens.
-const Back = struct {
+pub const Back = struct {
     delay: u32 = 0,
     gate: std.atomic.Value(bool) = .init(true),
     jobs: std.ArrayList(struct { prog: []u8, polls: u32 }) = .empty,
@@ -111,7 +111,7 @@ const Back = struct {
     }
     fn cancel(_: *anyopaque, _: rapi.JobId) void {}
     fn release(_: *anyopaque, _: u64) void {}
-    fn deinit(b: *Back) void {
+    pub fn deinit(b: *Back) void {
         for (b.jobs.items) |j| gpa.free(j.prog);
         b.jobs.deinit(gpa);
     }
@@ -136,8 +136,8 @@ const Box = struct {
         defer b.mutex.unlock(std.testing.io);
         return b.done != null;
     }
-    fn wait(b: *@This()) !Reason {
-        for (0..20_000) |_| {
+    fn wait(b: *@This(), seconds: u32) !Reason {
+        for (0..@as(usize, seconds) * 1000) |_| {
             if (b.finished()) return b.done.?;
             std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
         }
@@ -145,10 +145,11 @@ const Box = struct {
     }
 };
 
-const Opts = struct { runner: bool = true, run_cells: bool = true, delay: u32 = 0, planner: bool = false, streams: usize = 1 };
+/// `frontend`/`backend`: real ones in place of the fakes (the proof test).
+pub const Opts = struct { runner: bool = true, run_cells: bool = true, delay: u32 = 0, planner: bool = false, streams: usize = 1, frontend: ?rapi.Frontend = null, backend: ?rapi.Backend = null, wait_s: u32 = 20 };
 
 /// Runs `models` (one request each, concurrently) on one host; the reply texts.
-fn replies(models: []Model, o: Opts, back: *Back) ![][]u8 {
+pub fn replies(models: []Model, o: Opts, back: *Back) ![][]u8 {
     var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
     defer cfg.deinit(gpa);
     var target: lanes.fake.Fake = .{ .gpa = gpa };
@@ -160,7 +161,7 @@ fn replies(models: []Model, o: Opts, back: *Back) ![][]u8 {
     defer core.deinit();
     var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 4 });
     back.delay = o.delay;
-    var run: runner.Runner = .{ .gpa = gpa, .cfg = .{ .circuit = "test" }, .frontend = .{ .translate = translate }, .backend = back.backend(), .text = .{ .bytes = tokenBytes, .encode = encode } };
+    var run: runner.Runner = .{ .gpa = gpa, .cfg = .{ .circuit = "test" }, .frontend = o.frontend orelse .{ .translate = translate }, .backend = o.backend orelse back.backend(), .text = .{ .bytes = tokenBytes, .encode = encode } };
     if (o.runner) host.runner = &run;
     const boxes = try gpa.alloc(Box, models.len);
     defer gpa.free(boxes);
@@ -179,7 +180,7 @@ fn replies(models: []Model, o: Opts, back: *Back) ![][]u8 {
     }
     const out = try gpa.alloc([]u8, models.len);
     for (boxes, out) |*b, *text| {
-        try std.testing.expectEqual(Reason.stop, try b.wait());
+        try std.testing.expectEqual(Reason.stop, try b.wait(o.wait_s));
         text.* = try decode(gpa, b.tokens.items);
         b.tokens.deinit(gpa);
     }
@@ -195,7 +196,7 @@ const Router = struct {
     }
 };
 
-fn freeAll(texts: [][]u8) void {
+pub fn freeAll(texts: [][]u8) void {
     for (texts) |t| gpa.free(t);
     gpa.free(texts);
 }
@@ -268,14 +269,14 @@ test "runner: a held stream waits while another stream decodes to its end" {
     defer host.stop();
     try e.submit(1, &r0, .{ .ctx = &boxes[0], .event = Box.event });
     try e.submit(2, &r1, .{ .ctx = &boxes[1], .event = Box.event });
-    try std.testing.expectEqual(Reason.stop, try boxes[1].wait());
+    try std.testing.expectEqual(Reason.stop, try boxes[1].wait(20));
     std.Io.sleep(std.testing.io, .fromMilliseconds(50), .awake) catch {};
     try std.testing.expect(!boxes[0].finished());
     const held = try decode(gpa, boxes[0].tokens.items);
     defer gpa.free(held);
     try std.testing.expectEqualStrings(mul_cell, held); // it stopped exactly at its trigger
     back.gate.store(true, .release);
-    try std.testing.expectEqual(Reason.stop, try boxes[0].wait());
+    try std.testing.expectEqual(Reason.stop, try boxes[0].wait(20));
     const got = try decode(gpa, boxes[0].tokens.items);
     defer gpa.free(got);
     try std.testing.expectEqualStrings(mul_cell ++ product ++ "\nDone.", got);
