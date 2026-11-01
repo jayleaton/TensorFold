@@ -149,8 +149,15 @@ pub const Session = struct {
         errdefer gpa.free(cell.lang);
         cell.code = try gpa.dupe(u8, c.code);
         errdefer gpa.free(cell.code);
-        const prior = try cell.arena.allocator().alloc([]const u8, s.cells.items.len);
-        for (s.cells.items, prior) |p, *dst| dst.* = p.code;
+        // earlier code cells are the notebook; inline values define nothing
+        var n: usize = 0;
+        for (s.cells.items) |p| n += @intFromBool(p.form != .inline_expr);
+        const prior = try cell.arena.allocator().alloc([]const u8, n);
+        n = 0;
+        for (s.cells.items) |p| if (p.form != .inline_expr) {
+            prior[n] = p.code;
+            n += 1;
+        };
         try s.cells.append(gpa, cell);
         // exact inline math would contradict a reply reasoning in Python floats
         if (c.float_context) {

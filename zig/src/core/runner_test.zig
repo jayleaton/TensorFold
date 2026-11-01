@@ -74,6 +74,8 @@ pub const Model = struct {
 /// `print(X)` and REPL `X` become calc X; code naming `undefined_` abstains.
 fn translate(_: ?*anyopaque, a: std.mem.Allocator, cell: rapi.Cell) std.mem.Allocator.Error!rapi.Translation {
     if (std.mem.indexOf(u8, cell.code, "undefined_") != null) return .{ .abstain = .name };
+    // like T5's frontend: a cell after earlier code cells abstains
+    if (std.mem.eql(u8, cell.code, "2**99") and cell.prior.len != 0) return .{ .abstain = .unsupported };
     var code = std.mem.trim(u8, cell.code, " \n");
     if (std.mem.startsWith(u8, code, "print(") and std.mem.endsWith(u8, code, ")")) code = code[6 .. code.len - 1];
     return .{ .program = .{ .kind = .calc, .bytes = try a.dupe(u8, code) } };
@@ -92,6 +94,7 @@ pub const Back = struct {
         .{ "2**100", "1267650600228229401496703205376\n" },
         .{ "47 * 83", "3901" },
         .{ "1.5+2.25", "3.75" },
+        .{ "2**99", "633825300114114700748351602688\n" },
     };
 
     fn backend(b: *Back) rapi.Backend {
@@ -350,6 +353,13 @@ test "runner: an inline decimal abstains in a Python-float reply; integers stay 
     const integer = try one("In Python, as a float: 47 * 83 =", .{ .inline_math = true });
     defer gpa.free(integer);
     try std.testing.expectEqualStrings("In Python, as a float: 47 * 83 = 3901\nDone.", integer);
+}
+
+test "runner: an inline value earlier in the reply is not notebook state for a later REPL cell" {
+    const lead = "First 47 * 83 = 3901\nThen:\n>>> 2**99\n";
+    const got = try one(lead, .{ .inline_math = true });
+    defer gpa.free(got);
+    try std.testing.expectEqualStrings(lead ++ "633825300114114700748351602688\nDone.", got);
 }
 
 test "runner: knobs parse; off unless the flag is 1 with a circuit" {

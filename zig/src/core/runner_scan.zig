@@ -39,6 +39,8 @@ pub const Scanner = struct {
     float_at: ?u32 = null, // the token of the last float cue or closed code cell
     tail: [16]u8 = undefined, // the last bytes fed, for cues split across tokens
     tail_len: usize = 0,
+    think: bool = false, // the think block was open at the last token
+    code_cells: u32 = 0, // fence and REPL cells closed so far
 
     pub fn deinit(s: *Scanner, a: Allocator) void {
         s.line.deinit(a);
@@ -51,6 +53,12 @@ pub const Scanner = struct {
         var ev: Events = .{};
         s.armed = null;
         s.tokens +|= 1;
+        // the think block's end has no bytes of its own, yet the answer starts on a new line
+        if (s.think and !think_open and s.line.items.len > 0) {
+            try s.endLine(a, &ev, true);
+            s.line.clearRetainingCapacity();
+        }
+        s.think = think_open;
         if (s.state == .after) {
             s.since += 1;
             if (s.since > s.cfg.lookahead) s.state = .prose;
@@ -90,7 +98,11 @@ pub const Scanner = struct {
         switch (s.state) {
             .fence => {
                 if (fenceClose(raw)) {
+                    const prev = s.pending;
+                    const had = s.code_cells > 0;
                     ev.closed = s.close(.fence);
+                    // `gcc x.c -o x && ./x` runs the cell before it: a header after it names that cell
+                    if (had and runsPrevious(ev.closed.?.lang, ev.closed.?.code)) s.pending = prev;
                     s.state = .after;
                     s.since = 0;
                 } else {
@@ -141,6 +153,7 @@ pub const Scanner = struct {
         if (form != .inline_expr) {
             s.pending = s.cells;
             s.float_at = s.tokens;
+            s.code_cells += 1;
         }
         s.cells += 1;
         return c;
@@ -151,6 +164,32 @@ pub const Scanner = struct {
         s.state = .prose;
     }
 };
+
+/// A shell fence whose every command compiles or runs a program (no defines, pipes or redirects).
+fn runsPrevious(lang: []const u8, code: []const u8) bool {
+    const shells = [_][]const u8{ "bash", "sh", "shell", "zsh", "console" };
+    for (shells) |sh| {
+        if (std.mem.eql(u8, lang, sh)) break;
+    } else return false;
+    const tools = [_][]const u8{ "gcc ", "g++ ", "cc ", "clang ", "clang++ ", "tcc ", "./", "python ", "python3 ", "node " };
+    var any = false;
+    var lines = std.mem.splitScalar(u8, code, '\n');
+    while (lines.next()) |raw| {
+        var line = std.mem.trim(u8, raw, " \t\r");
+        if (std.mem.startsWith(u8, line, "$ ")) line = line[2..];
+        if (line.len == 0 or line[0] == '#') continue;
+        if (std.mem.indexOfAny(u8, line, "|<>;`") != null or std.mem.indexOf(u8, line, "-D") != null) return false;
+        var parts = std.mem.splitSequence(u8, line, "&&");
+        while (parts.next()) |part| {
+            const cmd = std.mem.trim(u8, part, " \t");
+            for (tools) |t| {
+                if (std.mem.startsWith(u8, cmd, t)) break;
+            } else return false;
+            any = true;
+        }
+    }
+    return any;
+}
 
 fn indentOk(line: []const u8) ?[]const u8 {
     var i: usize = 0;
@@ -446,6 +485,36 @@ test "runner scan: a Python-float reply marks inline decimals and fractions, not
     var plain: Scanner = .{ .cfg = .{ .inline_math = true } };
     defer plain.deinit(a);
     try std.testing.expect(!(try plain.feed(a, "Discount: 889.35*0.075 =", true)).closed.?.float_context);
+}
+
+test "runner scan: an answer's first fence opens a cell when the reasoning ended mid-line (live run-check-004)" {
+    const a = std.testing.allocator;
+    var s: Scanner = .{ .cfg = .{} };
+    defer s.deinit(a);
+    _ = try s.feed(a, "Let's craft.", true);
+    _ = try s.feed(a, "", true); // the think block's end: no bytes
+    for ([_][]const u8{ "```python\n", "print(2**100)\n" }) |t| _ = try s.feed(a, t, false);
+    const closed = (try s.feed(a, "```\n", false)).closed.?;
+    try std.testing.expectEqualStrings("python", closed.lang);
+    try std.testing.expectEqualStrings("print(2**100)\n", closed.code);
+    try std.testing.expectEqual(@as(u32, 0), (try s.feed(a, "Output:\n", false)).trigger.?.index);
+}
+
+test "runner scan: a header after a compile-and-run shell fence names the program cell" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "```bash\ngcc -Wall -o gcd gcd.c\n./gcd\n```\n",
+        "```sh\n$ cc fib.c -o fib && ./fib\n```\n",
+        "```bash\necho 42\n```\n",
+        "```bash\ngcc -DN=5 x.c -o x && ./x\n```\n",
+        "```bash\n./x | head\n```\n",
+    }, [_]u32{ 0, 0, 1, 1, 1 }) |shell, want| {
+        var s: Scanner = .{ .cfg = .{} };
+        defer s.deinit(a);
+        _ = try s.feed(a, "```c\nint main(void) { return 0; }\n```\n", false);
+        _ = try s.feed(a, shell, false);
+        try std.testing.expectEqual(want, (try s.feed(a, "Output:\n", false)).trigger.?.index);
+    }
 }
 
 test "runner scan: a header after an inline cell still names the fence cell before it" {
