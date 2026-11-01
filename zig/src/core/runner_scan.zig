@@ -8,13 +8,14 @@ pub const Config = struct {
     repl: bool = true, // `>>> ` lines
     lookahead: u32 = 64, // tokens after a closed fence in which a result header counts
     reasoning_only: bool = false, // triggers only while the think block is open
+    inline_math: bool = false, // `A op B =` at a line's end: the value after `=` (exact math semantics)
 };
 
 /// A closed cell; `lang` and `code` live in the scanner until the next `feed`.
 pub const Closed = struct { index: u32, form: api.Form, lang: []const u8, code: []const u8 };
 
-/// The model began cell `index`'s result: the runner owns what follows; `fenced`: it opened a fence to close.
-pub const Trigger = struct { index: u32, fenced: bool };
+/// Cell `index`'s result begins: `fenced` closes a fence after it; `inline_space` (inline: value only) adds a space.
+pub const Trigger = struct { index: u32, fenced: bool = false, inline_space: ?bool = null };
 
 pub const Events = struct { closed: ?Closed = null, trigger: ?Trigger = null };
 
@@ -27,6 +28,7 @@ pub const Scanner = struct {
     lang: std.ArrayList(u8) = .empty,
     code: std.ArrayList(u8) = .empty,
     cells: u32 = 0, // cells closed so far; the next one's index
+    pending: u32 = 0, // the fence or REPL cell a result header refers to
     since: u32 = 0, // tokens since the pending cell closed (state .after)
     armed: ?Trigger = null, // a trigger this token set; later non-blank bytes in the same token spoil it
 
@@ -54,6 +56,19 @@ pub const Scanner = struct {
             s.line.clearRetainingCapacity();
         }
         ev.trigger = s.armed;
+        const allowed = think_open or !s.cfg.reasoning_only;
+        if (s.cfg.inline_math and allowed and s.state != .fence and ev.closed == null and ev.trigger == null and
+            std.mem.indexOfScalar(u8, bytes, '=') != null)
+        {
+            if (inlineExpr(s.line.items)) |x| {
+                s.lang.clearRetainingCapacity();
+                try s.lang.appendSlice(a, "python");
+                s.code.clearRetainingCapacity();
+                try s.code.appendSlice(a, x.expr);
+                ev.closed = s.close(.inline_expr);
+                ev.trigger = .{ .index = ev.closed.?.index, .inline_space = x.space };
+            }
+        }
         return ev;
     }
 
@@ -99,12 +114,13 @@ pub const Scanner = struct {
 
     fn close(s: *Scanner, form: api.Form) Closed {
         const c: Closed = .{ .index = s.cells, .form = form, .lang = s.lang.items, .code = s.code.items };
+        if (form != .inline_expr) s.pending = s.cells;
         s.cells += 1;
         return c;
     }
 
     fn fire(s: *Scanner, fenced: bool) void {
-        s.armed = .{ .index = s.cells - 1, .fenced = fenced };
+        s.armed = .{ .index = s.pending, .fenced = fenced };
         s.state = .prose;
     }
 };
@@ -160,6 +176,84 @@ fn header(line: []const u8) bool {
     const low = std.ascii.lowerString(&buf, t);
     for (header_words) |w| if (std.mem.eql(u8, low, w)) return true;
     return false;
+}
+
+/// A whole arithmetic expression ending the line at `=` or `= ` (no chain, comparison, word, list or gap).
+fn inlineExpr(line: []const u8) ?struct { expr: []const u8, space: bool } {
+    var t = line;
+    var space = true;
+    if (std.mem.endsWith(u8, t, " ")) {
+        t = t[0 .. t.len - 1];
+        space = false;
+    }
+    if (t.len < 4 or t[t.len - 1] != '=') return null;
+    const before = t[0 .. t.len - 1];
+    if (std.mem.indexOfAny(u8, before, "=<>!") != null) return null;
+    var start = before.len;
+    while (start > 0) {
+        const b = before[start - 1];
+        if (std.ascii.isDigit(b) or std.mem.indexOfScalar(u8, " \t+-*/^().", b) != null) {
+            start -= 1;
+        } else if (start >= 2 and before[start - 2] == 0xC3 and (b == 0x97 or b == 0xB7)) {
+            start -= 2; // × ÷
+        } else if (start >= 3 and before[start - 3] == 0xE2 and before[start - 2] == 0x88 and b == 0x92) {
+            start -= 3; // −
+        } else break;
+    }
+    const lead = before[0..start];
+    const expr = std.mem.trim(u8, before[start..], " \t");
+    if (expr.len < 3 or expr.len > 120 or std.mem.indexOf(u8, expr, "..") != null) return null;
+    if (lead.len > 0) {
+        const stop = lead[lead.len - 1];
+        // a word glued to the expression (x3, f(2), $5) or a list (1673, +10) is not a whole expression
+        if (stop == ',' or stop == '$' or stop == '%' or stop == '_' or std.ascii.isAlphanumeric(stop)) {
+            if (before[start] != ' ' and before[start] != '\t') return null;
+            if (stop == ',') return null;
+        }
+    }
+    const first = expr[0];
+    if (!(std.ascii.isDigit(first) or first == '(' or first == '-')) return null;
+    if (first == '-' and std.mem.trimEnd(u8, lead, " \t").len > 0 and !std.mem.endsWith(u8, std.mem.trimEnd(u8, lead, " \t"), ":")) return null;
+    const last = expr[expr.len - 1];
+    if (!(std.ascii.isDigit(last) or last == ')')) return null;
+    var depth: i32 = 0;
+    var ops: u32 = 0;
+    var prev: enum { none, num, op, open, close } = .none;
+    var gap = false;
+    var i: usize = 0;
+    while (i < expr.len) : (i += 1) {
+        const c = expr[i];
+        if (c == ' ' or c == '\t') {
+            gap = true;
+            continue;
+        }
+        defer gap = false;
+        if (std.ascii.isDigit(c) or c == '.') {
+            if ((prev == .num and gap) or prev == .close) return null;
+            prev = .num;
+        } else if (c == '(') {
+            if (prev == .num or prev == .close) return null;
+            depth += 1;
+            prev = .open;
+        } else if (c == ')') {
+            depth -= 1;
+            if (depth < 0 or prev == .op or prev == .open) return null;
+            prev = .close;
+        } else {
+            const n: usize = if (c == 0xC3) 2 else if (c == 0xE2) 3 else 1;
+            const unary = c == '-' and (prev == .none or prev == .open or prev == .op);
+            const power = c == '*' and i + 1 < expr.len and expr[i + 1] == '*';
+            if (!unary) {
+                if (prev != .num and prev != .close) return null;
+                ops += 1;
+            }
+            i += n - 1;
+            if (power) i += 1;
+            prev = .op;
+        }
+    }
+    if (depth != 0 or ops == 0) return null;
+    return .{ .expr = expr, .space = space };
 }
 
 /// ">>> code" (one line, not opening a block): the code, else null.
@@ -242,4 +336,68 @@ test "runner scan: reasoning_only ignores headers outside the think block" {
     defer s.deinit(a);
     _ = try s.feed(a, "```python\nprint(1)\n```\n", false);
     try std.testing.expectEqual(@as(?Trigger, null), (try s.feed(a, "Output:\n", false)).trigger);
+}
+
+fn inlineOf(line: []const u8) ?[]const u8 {
+    const a = std.testing.allocator;
+    var s: Scanner = .{ .cfg = .{ .inline_math = true } };
+    defer s.deinit(a);
+    const e = s.feed(a, line, true) catch return null;
+    const t = e.trigger orelse return null;
+    if (t.inline_space == null or e.closed == null or e.closed.?.form != .inline_expr) return null;
+    return a.dupe(u8, e.closed.?.code) catch null;
+}
+
+test "runner scan: an inline expression at a line's end is a cell and its own trigger" {
+    const a = std.testing.allocator;
+    for ([_][2][]const u8{
+        .{ "So 47 * 83 =", "47 * 83" },                 .{ "15*16*17 = ", "15*16*17" },
+        .{ "47 × 83 =", "47 × 83" },
+        .{ "Compute: -3 * (4 + 5) =", "-3 * (4 + 5)" }, .{ "2**10 =", "2**10" },
+        .{ "3 * -4 =", "3 * -4" },
+        .{ "43210 − 98765 + 1 =", "43210 − 98765 + 1" },
+    }) |c| {
+        const got = inlineOf(c[0]) orelse return error.TestExpectedInline;
+        defer a.free(got);
+        try std.testing.expectEqualStrings(c[1], got);
+    }
+}
+
+test "runner scan: inline refuses chains, comparisons, words, lists and incomplete expressions" {
+    for ([_][]const u8{
+        "a = 3*4 =",   "15*16 = 240*17 =", "3*4 ==",    "x <= 3*4 =",    "2x + 3 =",  "x3*4 =",   "f(2)*3 =",
+        "1673, +10 =", "1,234 + 5 =",      "a - 3*4 =", "3 + 4 + ... =", "3 4 + 5 =", "(3 + 4 =", "3 + =",
+        "42 =",        "$5 + 3 =",         "50% * 2 =", "3 *",           "**3*4** =", "2(3+4) =", "3*4 = 12",
+    }) |line| {
+        if (inlineOf(line)) |got| {
+            std.testing.allocator.free(got);
+            std.debug.print("accepted: {s}\n", .{line});
+            return error.TestUnexpectedInline;
+        }
+    }
+}
+
+test "runner scan: inline stays off by default, inside a fence and in the token after the value" {
+    const a = std.testing.allocator;
+    var s: Scanner = .{ .cfg = .{} };
+    defer s.deinit(a);
+    try std.testing.expect((try s.feed(a, "47 * 83 =", true)).trigger == null);
+    var f: Scanner = .{ .cfg = .{ .inline_math = true } };
+    defer f.deinit(a);
+    _ = try f.feed(a, "```python\n", true);
+    try std.testing.expect((try f.feed(a, "x = 47 * 83 =", true)).trigger == null);
+    var g: Scanner = .{ .cfg = .{ .inline_math = true } };
+    defer g.deinit(a);
+    try std.testing.expect((try g.feed(a, "47 * 83 = 3901", true)).trigger == null);
+}
+
+test "runner scan: a header after an inline cell still names the fence cell before it" {
+    const a = std.testing.allocator;
+    var s: Scanner = .{ .cfg = .{ .inline_math = true } };
+    defer s.deinit(a);
+    _ = try s.feed(a, "```python\nprint(1)\n```\n", true);
+    const e = try s.feed(a, "Note 2 + 2 =", true);
+    try std.testing.expectEqual(@as(u32, 1), e.trigger.?.index);
+    _ = try s.feed(a, " 4\n", true);
+    try std.testing.expectEqual(Trigger{ .index = 0, .fenced = false }, (try s.feed(a, "Output:\n", true)).trigger.?);
 }

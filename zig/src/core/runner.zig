@@ -35,9 +35,10 @@ pub const Config = struct {
         if (get(prefix ++ "_FORMS")) |f| if (f.len > 0) {
             c.scan.fence = false;
             c.scan.repl = false;
+            c.scan.inline_math = false;
             var it = std.mem.splitScalar(u8, f, ',');
             while (it.next()) |form| {
-                if (std.mem.eql(u8, form, "fence")) c.scan.fence = true else if (std.mem.eql(u8, form, "repl")) c.scan.repl = true else return bad(prefix ++ "_FORMS", f);
+                if (std.mem.eql(u8, form, "fence")) c.scan.fence = true else if (std.mem.eql(u8, form, "repl")) c.scan.repl = true else if (std.mem.eql(u8, form, "inline")) c.scan.inline_math = true else return bad(prefix ++ "_FORMS", f);
             }
         };
         if (get(prefix ++ "_SPANS")) |sp| if (sp.len > 0) {
@@ -166,13 +167,15 @@ pub const Session = struct {
         if (!c.abstained and c.result == null) return null;
         s.waiting = null;
         const held_ms = (nowNs() -| s.held_at) / std.time.ns_per_ms;
+        // an inline value is owned only when the run halted with a one-line value
+        if (!c.abstained and w.inline_space != null and (c.result.?.status != .ok or std.mem.indexOfScalar(u8, std.mem.trimEnd(u8, c.result.?.out, "\n"), '\n') != null)) c.abstained = true;
         if (c.abstained) {
             s.abstained_n += 1;
             log.info("reply {d} cell {d} ({s} {t}): abstain ({s}), held {d} ms", .{ s.id, w.index, c.lang, c.form, why(c), held_ms });
             return try s.r.gpa.alloc(u32, 0);
         }
         const res = c.result.?;
-        const ids = try s.owned(res, w.fenced);
+        const ids = try s.owned(res, w);
         s.owned_n += 1;
         log.info("reply {d} cell {d} ({s} {t}): owned {d} tokens, {t} after {d} steps, run {d} ms, held {d} ms", .{ s.id, w.index, c.lang, c.form, ids.len, res.status, res.steps, res.exec_ns / std.time.ns_per_ms, held_ms });
         return ids;
@@ -182,7 +185,8 @@ pub const Session = struct {
         if (c.translation == .abstain) return @tagName(c.translation.abstain);
         const res = c.result orelse return "backend start";
         if (res.status == .abstain) return if (res.abstain) |a| @tagName(a) else "backend";
-        return "empty output";
+        if (res.status != .ok) return @tagName(res.status); // inline: budget or fault
+        return if (res.out.len == 0) "empty output" else "multi-line inline value";
     }
 
     fn advance(s: *Session, c: *Cell) void {
@@ -225,12 +229,21 @@ pub const Session = struct {
     }
 
     /// The owned text for a settled run (INTERFACES.md §5), as token ids within the token cap.
-    fn owned(s: *Session, res: api.Result, fenced: bool) Allocator.Error![]u32 {
+    fn owned(s: *Session, res: api.Result, w: scan.Trigger) Allocator.Error![]u32 {
         const gpa = s.r.gpa;
         const tx = s.r.text.?;
         var body: std.ArrayList(u8) = .empty;
         defer body.deinit(gpa);
         const out = if (std.mem.endsWith(u8, res.out, "\n")) res.out[0 .. res.out.len - 1] else res.out;
+        if (w.inline_space) |space| {
+            // only the value after `=`; past the cap it is the model's own text again
+            try body.appendSlice(gpa, if (space) " " else "");
+            try body.appendSlice(gpa, out);
+            const ids = try tx.encode(tx.ctx, gpa, body.items);
+            if (ids.len <= s.r.cfg.max_tokens) return ids;
+            gpa.free(ids);
+            return try gpa.alloc(u32, 0);
+        }
         try body.appendSlice(gpa, out);
         switch (res.status) {
             .ok, .abstain => {},
@@ -239,7 +252,7 @@ pub const Session = struct {
         }
         const ids = try tx.encode(tx.ctx, gpa, body.items);
         defer gpa.free(ids);
-        const tail = try tx.encode(tx.ctx, gpa, if (fenced) "\n```\n" else "\n");
+        const tail = try tx.encode(tx.ctx, gpa, if (w.fenced) "\n```\n" else "\n");
         defer gpa.free(tail);
         const note = if (ids.len > s.r.cfg.max_tokens) try tx.encode(tx.ctx, gpa, "\n[output cut]") else try gpa.alloc(u32, 0);
         defer gpa.free(note);
