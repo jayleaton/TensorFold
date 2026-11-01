@@ -235,6 +235,25 @@ test "banks sharing an address share one selection key per step but keep their o
     try std.testing.expect(lazy.groups[0].memo.hits > 0);
 }
 
+test "a bank skipped on a step its group selects nothing still sees that step's inputs one step later" {
+    var c = try tinyCircuit(.banks);
+    defer c.deinit(gpa);
+    var lazy = try rc.State.init(gpa, &c);
+    defer lazy.deinit();
+    var full = try rc.State.init(gpa, &c);
+    defer full.deinit();
+    full.always = true;
+    // An A token selects no row in either bank: from the second cycle the mirror skips it, then a write reads it back.
+    for (0..3) |_| for ([_]u32{ tok(2, 1 | 4), tok(1, 0), tok(2, 2), tok(3, 2), tok(3, 1), tok(1, 0), tok(2, 3), tok(3, 3) }) |t| {
+        try std.testing.expectEqual(try eval.step(&full, t), try eval.step(&lazy, t));
+        const want = try full.canonical(gpa);
+        defer gpa.free(want);
+        const got = try lazy.canonical(gpa);
+        defer gpa.free(got);
+        try std.testing.expectEqualSlices(u8, want, got);
+    };
+}
+
 test "a node that reads a dim written earlier in stored order sees the write" {
     var c = try tinyCircuit(.good);
     defer c.deinit(gpa);

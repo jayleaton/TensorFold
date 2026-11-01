@@ -32,28 +32,52 @@ pub const Plan = struct {
     zstart: []const u32,
     /// A query or key with several nonzero taps: selection is computed from the frames, not cached.
     general: bool,
+    /// Queries and keys read only the running step: an empty selection then depends on nothing older.
+    lag0: bool = false,
+    /// The plan whose frames hold this head's inputs (the first head of its selection group), and its member index.
+    owner: u32 = none,
+    member: u32 = 0,
 
     fn head(p: *const Plan) *const model.Head {
         return &p.h.heads[0];
     }
 };
 
-/// A run's inputs (nonzero dims ascending) and its selecting results, stamped with step + 1.
+/// A run's inputs (nonzero dims ascending), stamped with step + 1; heads reading the same slots share one ring.
 pub const Frame = struct {
     stamp: u64 = 0,
     dims: std.ArrayList(u32) = .empty,
     vals: std.ArrayList(Scalar) = .empty,
-    words: std.ArrayList(u32) = .empty,
 
     pub fn deinit(f: *Frame, gpa: std.mem.Allocator) void {
         f.dims.deinit(gpa);
         f.vals.deinit(gpa);
+    }
+};
+
+/// One head's selecting results of a run, stamped with step + 1.
+pub const Picks = struct {
+    stamp: u64 = 0,
+    words: std.ArrayList(u32) = .empty,
+
+    pub fn deinit(f: *Picks, gpa: std.mem.Allocator) void {
         f.words.deinit(gpa);
     }
 };
 
 /// A selection group's step key: its first member to run in a step looks it up once and names its generation.
-pub const Group = struct { memo: Memo = .{}, stamp: u64 = 0, hash: u64 = 0, gen: u64 = 0, next: u64 = 0 };
+pub const Group = struct {
+    memo: Memo = .{},
+    stamp: u64 = 0,
+    hash: u64 = 0,
+    gen: u64 = 0,
+    next: u64 = 0,
+    /// Per memo slot, the members whose selection under that slot's generation is empty (bit = member index).
+    slot_gen: [memo_slots]u64 = @splat(0),
+    empty: [memo_slots]u64 = @splat(0),
+};
+
+const memo_slots = @import("runner_circuit_memo.zig").slots_per_unit;
 
 /// The last four runs cover steps t-3..t: a unit runs every step its lag window is open, else its inputs held.
 pub const frames_per_unit = 4;
@@ -145,6 +169,11 @@ pub fn build(a: std.mem.Allocator, h: *const model.Heads, dims: []const u32) !Pl
         .zrep = zrep.items,
         .zstart = zstart,
         .general = general,
+        .lag0 = !general and for (q) |x| {
+            if (x.lag != 0) break false;
+        } else for (k) |x| {
+            if (x.lag != 0) break false;
+        } else true,
     };
 }
 
@@ -179,10 +208,10 @@ fn lagMask(list: []const Sel) u8 {
     return m;
 }
 
-/// The run that holds step `step`'s inputs: the latest run at or before it (null before the first step).
-fn frameAt(frames: []const Frame, step: i64) ?*const Frame {
+/// The run that holds step `step`'s inputs or picks: the latest run at or before it (null before the first step).
+fn frameAt(comptime T: type, frames: []const T, step: i64) ?*const T {
     if (step < 0) return null;
-    var best: ?*const Frame = null;
+    var best: ?*const T = null;
     for (frames) |*f| {
         if (f.stamp == 0 or f.stamp - 1 > @as(u64, @intCast(step))) continue;
         if (best == null or f.stamp > best.?.stamp) best = f;
@@ -190,7 +219,7 @@ fn frameAt(frames: []const Frame, step: i64) ?*const Frame {
     return best;
 }
 
-fn oldest(frames: []Frame) *Frame {
+fn oldest(comptime T: type, frames: []T) *T {
     var o = &frames[0];
     for (frames[1..]) |*f| if (f.stamp < o.stamp) {
         o = f;
@@ -207,7 +236,7 @@ const Views = struct {
 
     fn dense(v: *Views, lag: u32) ?[]const Scalar {
         if (lag == 0) return v.s.x;
-        const f = frameAt(v.frames, @as(i64, @intCast(v.t)) - lag) orelse return null;
+        const f = frameAt(Frame, v.frames, @as(i64, @intCast(v.t)) - lag) orelse return null;
         const x = v.s.past[lag - 1];
         if (v.filled[lag] != f) {
             if (v.filled[lag]) |old| for (old.dims.items) |d| {
@@ -280,13 +309,13 @@ fn select(s: *State, p: *const Plan, nz: []const u32) []const u32 {
 }
 
 /// Indices of the positive channels of one list at step t, ascending, from the frames at their lags.
-fn positives(p: *const Plan, frames: []const Frame, t: u64, which: u1, out: []u32) usize {
+fn positives(p: *const Plan, frames: []const Picks, t: u64, which: u1, out: []u32) usize {
     const list = if (which == 0) p.q else p.k;
     const mask = if (which == 0) p.lags_q else p.lags_k;
     var n: usize = 0;
     for (0..frames_per_unit) |lag| {
         if (mask >> @intCast(lag) & 1 == 0) continue;
-        const f = frameAt(frames, @as(i64, @intCast(t)) - @as(i64, @intCast(lag))) orelse continue;
+        const f = frameAt(Picks, frames, @as(i64, @intCast(t)) - @as(i64, @intCast(lag))) orelse continue;
         const w = f.words.items;
         var at: usize = 0;
         if (which == 1) at = 1 + 2 * w[0];
@@ -305,7 +334,7 @@ fn positives(p: *const Plan, frames: []const Frame, t: u64, which: u1, out: []u3
 pub fn run(s: *State, plan: u32, unit: usize, nz: []const u32, local: []const u32) ![]const Scalar {
     const p = &s.circuit.flow.plans[plan];
     const t = s.steps;
-    const frames = s.frames[plan][0..];
+    const frames = s.frames[p.owner][0..];
     const memo = &s.memos[unit];
     const gi = s.circuit.flow.plan_group[plan];
     const words = if (gi != none and !s.always) try grouped(s, p, &s.groups[gi], memo, nz, local) else blk: {
@@ -318,14 +347,22 @@ pub fn run(s: *State, plan: u32, unit: usize, nz: []const u32, local: []const u3
         if (!memo.off()) try memo.put(s.gpa, key, h, w);
         break :blk w;
     };
-    const f = oldest(frames);
+    var newest: u64 = 0;
+    for (frames) |fr| newest = @max(newest, fr.stamp);
+    if (newest != t + 1) {
+        const in = oldest(Frame, frames);
+        in.stamp = 0;
+        in.dims.clearRetainingCapacity();
+        try in.dims.appendSlice(s.gpa, nz);
+        try in.vals.resize(s.gpa, nz.len);
+        for (nz, in.vals.items) |d, *v| v.* = s.x[d];
+        in.stamp = t + 1;
+    }
+    const picks = s.picks[plan][0..];
+    const f = oldest(Picks, picks);
     f.stamp = 0;
     f.words.clearRetainingCapacity();
     try f.words.appendSlice(s.gpa, words);
-    f.dims.clearRetainingCapacity();
-    try f.dims.appendSlice(s.gpa, nz);
-    f.vals.clearRetainingCapacity();
-    for (nz) |d| try f.vals.append(s.gpa, s.x[d]);
     f.stamp = t + 1;
     var views: Views = .{ .s = s, .frames = frames, .t = t };
     defer views.clear();
@@ -344,10 +381,10 @@ pub fn run(s: *State, plan: u32, unit: usize, nz: []const u32, local: []const u3
         };
     } else {
         var idx: [hd]u32 = undefined;
-        const nk = positives(p, frames, t, 1, &idx);
+        const nk = positives(p, picks, t, 1, &idx);
         if (nk > 1) return error.CircuitKeyNotOneHot;
         if (nk == 1) key_row = p.k[idx[0]].at;
-        n_rows = positives(p, frames, t, 0, &idx);
+        n_rows = positives(p, picks, t, 0, &idx);
         for (idx[0..n_rows], rows[0..n_rows]) |i, *r| r.* = p.q[i].at;
     }
     const gates = f.words.items[f.words.items.len - 2 * hd0.value_heads.len ..];
@@ -413,10 +450,50 @@ fn grouped(s: *State, p: *const Plan, g: *Group, memo: *Memo, nz: []const u32, l
             }
         }
     }
-    if (g.gen != 0 and !memo.off()) if (memo.find(&[_]u64{g.gen}, g.hash)) |w| return w;
-    const w = select(s, p, s.nz2[0..selKey(s, p, nz, local)]);
-    if (g.gen != 0 and !memo.off()) try memo.put(s.gpa, &[_]u64{g.gen}, g.hash, w);
+    const hit = if (g.gen != 0 and !memo.off()) memo.find(&[_]u64{g.gen}, g.hash) else null;
+    const w = hit orelse select(s, p, s.nz2[0..selKey(s, p, nz, local)]);
+    if (g.gen == 0) return w;
+    if (hit == null and !memo.off()) try memo.put(s.gpa, &[_]u64{g.gen}, g.hash, w);
+    if (p.member < 64 and emptyWords(p, w)) {
+        const slot = g.hash % memo_slots;
+        if (g.slot_gen[slot] != g.gen) {
+            g.slot_gen[slot] = g.gen;
+            g.empty[slot] = 0;
+        }
+        g.empty[slot] |= @as(u64, 1) << @intCast(p.member);
+    }
     return w;
+}
+
+/// No query, no key and no decay: the run reads and writes nothing, and every output is +0.
+fn emptyWords(p: *const Plan, w: []const u32) bool {
+    if (w[0] != 0 or w[1] != 0) return false;
+    for (p.a, 0..) |ai, j| {
+        const sel_a: Scalar = @bitCast(w[2 + 2 * j]);
+        if (ai != none and sel_a != model.keep_selector) return false;
+    }
+    return true;
+}
+
+/// A grouped head skips a run that changes nothing: outputs all +0, no selection now or reaching now from older runs.
+pub fn skips(s: *State, plan: u32, unit: usize) !bool {
+    const p = &s.circuit.flow.plans[plan];
+    const gi = s.circuit.flow.plan_group[plan];
+    if (gi == none or s.always or p.member >= 64 or s.unstable[unit] or !s.rest[unit]) return false;
+    const g = &s.groups[gi];
+    if (g.stamp != s.steps + 1 or g.gen == 0 or g.slot_gen[g.hash % memo_slots] != g.gen) return false;
+    if (g.empty[g.hash % memo_slots] >> @intCast(p.member) & 1 == 0) return false;
+    if (p.lag0) return true;
+    // A lagged query or key reads an older run's picks: skip only if none reaches this step, and record empty picks.
+    const picks = s.picks[plan][0..];
+    var idx: [hd]u32 = undefined;
+    if (positives(p, picks, s.steps, 0, &idx) + positives(p, picks, s.steps, 1, &idx) > 0) return false;
+    const f = oldest(Picks, picks);
+    f.stamp = 0;
+    f.words.clearRetainingCapacity();
+    try f.words.appendSlice(s.gpa, &.{ 0, 0 });
+    f.stamp = s.steps + 1;
+    return true;
 }
 
 /// beta: absent is 1; 1 writes, an integer <= 0 does not, anything else breaks the circuit's exact range.
@@ -467,7 +544,7 @@ fn readNorm(s: *State, table: u32, rows: []const u32) !?Scalar {
 /// Canonical history of this head's channels at step `t`: projections of steps t-1, t-2, t-3, newest first.
 pub fn history(s: *State, plan: u32, out: []u8, at: *usize) void {
     const p = &s.circuit.flow.plans[plan];
-    var views: Views = .{ .s = s, .frames = s.frames[plan][0..], .t = s.steps };
+    var views: Views = .{ .s = s, .frames = s.frames[p.owner][0..], .t = s.steps };
     defer views.clear();
     for (0..p.h.channels) |c| for (1..model.lags) |lag| {
         const v: Scalar = if (views.dense(@intCast(lag)) == null) 0 else views.proj(p, @intCast(c), @intCast(lag));

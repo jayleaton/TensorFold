@@ -41,7 +41,8 @@ pub fn step(s: *State, token: u32) !u32 {
         const i = w * 64 + bit;
         const u = &c.flow.units[i];
         if (s.dirty[i] == stamp) s.changed[i] = stamp;
-        if ((s.changed[i] != 0 and stamp - s.changed[i] <= u.lag) or s.unstable[i]) {
+        const due = (s.changed[i] != 0 and stamp - s.changed[i] <= u.lag) or s.unstable[i];
+        if (due and !(u.kind == .heads and try head.skips(s, u.plan, i))) {
             try run(s, u, i, stamp);
         } else finish(s, u, i, stamp);
         // A unit's own outputs may re-mark it while it runs; clearing after the run drops that.
@@ -172,6 +173,9 @@ fn run(s: *State, u: *const flow.Unit, i: usize, stamp: u64) !void {
         .ffn => try ffnCached(s, u, &s.circuit.flow.ffn_plans[u.plan], i, nz, list),
         .heads => try head.run(s, u.plan, i, nz, list),
     };
+    if (u.kind == .heads) s.rest[i] = for (values) |v| {
+        if (@as(u32, @bitCast(v)) != 0) break false;
+    } else true;
     if (u.outs.len == 0) return;
     const f = &s.circuit.flow;
     const first = u.outs[0];

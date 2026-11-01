@@ -85,8 +85,8 @@ fn reads(a: std.mem.Allocator, sets: []const *const model.Sparse) ![]u32 {
     return out.items[0..n];
 }
 
-/// Heads reading the same slots through the same selecting dims see one selection key per step (the RAM banks).
-fn selectionGroups(a: std.mem.Allocator, units: []const Unit, plans: []const head.Plan) !struct { []u32, u32 } {
+/// Heads reading the same slots through the same selecting dims share one key per step and one input-frame ring.
+fn selectionGroups(a: std.mem.Allocator, units: []const Unit, plans: []head.Plan) !struct { []u32, u32 } {
     const group = try a.alloc(u32, plans.len);
     @memset(group, no_slot);
     var n: u32 = 0;
@@ -99,8 +99,16 @@ fn selectionGroups(a: std.mem.Allocator, units: []const Unit, plans: []const hea
                 n += 1;
             }
             group[u.plan] = group[v.plan];
+            plans[u.plan].owner = plans[v.plan].owner;
             break;
         };
+    };
+    const size = try a.alloc(u32, n);
+    defer a.free(size);
+    @memset(size, 0);
+    for (plans, group) |*p, g| if (g != no_slot) {
+        p.member = size[g];
+        size[g] += 1;
     };
     return .{ group, n };
 }
@@ -142,7 +150,9 @@ pub fn build(a: std.mem.Allocator, c: *const model.Circuit) !Flow {
         .heads => |*hs| for (hs.split) |*h| {
             var u = try unit(a, .{ .heads = h }, try reads(a, &.{&h.proj.forms}), h.outs, maxLag(h), visible, &slots);
             u.plan = @intCast(plans.items.len);
-            try plans.append(a, try head.build(a, h, u.dims));
+            var plan = try head.build(a, h, u.dims);
+            plan.owner = u.plan;
+            try plans.append(a, plan);
             try units.append(a, u);
         },
     };
