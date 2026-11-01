@@ -5,6 +5,7 @@ const sm = @import("stream.zig");
 const fake = @import("fake.zig");
 const hold = @import("hold.zig");
 const shared = @import("engine_test.zig");
+const round_trace = @import("round_trace.zig");
 
 const gpa = std.testing.allocator;
 const fires = [_]usize{ 20, 47, 75 };
@@ -35,6 +36,15 @@ const Replay = struct {
 };
 
 fn replay(on: bool, width: ?u32, owned: Owned) !Replay {
+    return replayTraced(on, width, owned, null);
+}
+
+/// The fake target's verify count as a trace's backend counter.
+fn verifies(ctx: *anyopaque, out: []u64) void {
+    out[0] = @as(*fake.Fake, @ptrCast(@alignCast(ctx))).rounds;
+}
+
+fn replayTraced(on: bool, width: ?u32, owned: Owned, trace: ?c_int) !Replay {
     var cfg = try shared.modelWith(true);
     defer cfg.deinit(gpa);
     cfg.forced_drafts = on;
@@ -44,6 +54,8 @@ fn replay(on: bool, width: ?u32, owned: Owned) !Replay {
     var clock: fake.FixedClock = .{};
     var engine = Engine.init(gpa, &cfg, target.backend(), clock.clock());
     defer engine.deinit();
+    if (trace) |fd| round_trace.open(fd, 4, .{ .ctx = &target, .names = &.{"verifies"}, .read = verifies });
+    defer if (trace != null) round_trace.close();
     var hook: Hook = .{};
     var s = try sm.Stream.init(gpa, .{ .id = "s", .prompt = &shared.p1, .max_new = 100, .drafts = true, .runner = .{ .ptr = &hook, .token = Hook.token } });
     defer s.deinit(gpa);
@@ -135,4 +147,43 @@ test "fire replay: drafts past forced results keep every token; a guessed result
         try std.testing.expect(on.kept_before and off.kept_before);
         try std.testing.expect(on.trigger_drafts > 0);
     }
+}
+
+test "fire replay traced: each fire's rounds before, its trigger, hold, resume and rounds after; the same tokens" {
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    const plain = try replay(true, null, .{ .echo = 2 });
+    defer gpa.free(plain.tokens);
+    const traced = try replayTraced(true, null, .{ .echo = 2 }, fds[1]);
+    defer gpa.free(traced.tokens);
+    _ = std.c.close(fds[1]);
+    try std.testing.expectEqualSlices(u32, plain.tokens, traced.tokens);
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    var chunk: [4096]u8 = undefined;
+    while (true) {
+        const n = std.c.read(fds[0], &chunk, chunk.len);
+        if (n <= 0) break;
+        try text.appendSlice(gpa, chunk[0..@intCast(n)]);
+    }
+    const names = [_][]const u8{ "open", "hold", "resume", "trigger", "pre", "post" };
+    var counts: [names.len]usize = @splat(0);
+    var lines = std.mem.splitScalar(u8, text.items, '\n');
+    var after_resume = false;
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const p = try std.json.parseFromSlice(struct { rt: []const u8, phase: []const u8 = "", since: i64 = 0, kind: []const u8 = "", verifies: u64 = 1 }, gpa, line, .{ .ignore_unknown_fields = true });
+        defer p.deinit();
+        const v = p.value;
+        const key = if (std.mem.eql(u8, v.rt, "round")) v.phase else v.rt;
+        for (names, &counts) |n, *c| c.* += @intFromBool(std.mem.eql(u8, n, key));
+        try std.testing.expectEqual(@as(u64, 1), v.verifies); // a lone stream's step: one verify
+        // the first round after a resume feeds the result: since 1, forced
+        if (after_resume) try std.testing.expect(v.since == 1 and std.mem.eql(u8, v.kind, "forced"));
+        after_resume = std.mem.eql(u8, v.rt, "resume");
+    }
+    try std.testing.expectEqualSlices(usize, &.{ 1, fires.len, fires.len, fires.len }, counts[0..4]);
+    try std.testing.expect(counts[4] >= fires.len and counts[4] <= fires.len * 4); // before: up to 4 a fire
+    try std.testing.expect(counts[5] > 0 and counts[5] <= fires.len * 4); // after: up to 4 a fire, while the reply lasts
 }

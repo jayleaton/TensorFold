@@ -381,6 +381,11 @@ pub const Lanes = struct {
         return w.held == 0 and w.parents == null and w.tokens.len <= st.n and std.mem.eql(u32, w.tokens, st.held[0..w.tokens.len]);
     }
 
+    /// A window feeding the last of a forced result (the model draws after it): its next pass can start now.
+    fn fedResult(w: be.Window) bool {
+        return w.forced > 0 and w.held == 0 and w.parents == null and w.stream.force.items.len == 0;
+    }
+
     /// Collects a speculative pass still running (before any other pass, target or ingest work).
     pub fn settle(x: *Lanes) !void {
         if (x.spec) |*sp| try sp.settle(x.pass);
@@ -398,17 +403,21 @@ pub const Lanes = struct {
         if (!sp.roundAllowed(tree_round, nucleus)) return sp.clear();
         const cands = try a.alloc(spec_mod.Candidate, windows.len);
         var n: usize = 0;
+        var fed: usize = 0;
         for (windows, segs, choices) |w, g, c| {
             const st = try x.get(w.stream);
-            // a DSpark round only (dsparkRound counts chain rounds read back as host tokens)
-            if (!dsparkRound(st, w)) continue;
-            var acc: u32 = 0;
+            // a DSpark round (dsparkRound counts chain rounds read back as host tokens), or the hold knob's fed one
+            const feeds = sp.settings.hold and fedResult(w);
+            if (!feeds and !dsparkRound(st, w)) continue;
+            var acc: u32 = if (feeds) w.forced else 0; // forced rows land whole, drafts past them by the choices
             while (acc + 1 < g.tokens.len and g.tokens[acc + 1] == c[acc]) acc += 1;
             cands[n] = .{ .slot = st.slot, .start = g.start, .accepted = acc, .bonus = c[acc], .sampling = g.sampling };
             n += 1;
+            fed += @intFromBool(feeds);
         }
         const asks = sp.launch(cands[0..n]);
         if (asks.len == 0) return;
+        if (fed > 0) sp.stats.fed += 1;
         const rows = try a.alloc(u32, lanes_max_rows);
         for (rows, 0..) |*r, i| r.* = @intCast(i);
         for (asks) |ask| {
@@ -437,6 +446,7 @@ pub const Lanes = struct {
         const asks = try a.alloc(iface.Ask, requests.len);
         const whose = try a.alloc(*St, requests.len);
         const depths = try a.alloc(u32, requests.len);
+        const holds = try a.alloc(bool, requests.len); // the stream is held (a runner trigger or EOS)
         const row0 = try a.alloc(iface.Warm, requests.len);
         const row0_ids = try a.alloc(u32, requests.len);
         var n_row0: usize = 0;
@@ -466,6 +476,7 @@ pub const Lanes = struct {
             asks[n] = .{ .slot = st.slot, .anchor = anchor, .start = at, .params = dspark.Params.of(r.stream.sampling, at) };
             whose[n] = st;
             depths[n] = r.depth;
+            holds[n] = r.stream.held;
             n += 1;
         }
         x.target.warm(row0[0..n_row0]);
@@ -480,8 +491,10 @@ pub const Lanes = struct {
             .cand = if (markov != null) x.cand[i * b * c ..][0 .. b * c] else null,
             .base = if (markov != null) x.base[i * b * c ..][0 .. b * c] else null,
         };
-        const took = if (x.spec) |*sp| sp.take(asks[0..n], props) else false;
-        if (!took) try x.pass.propose(asks[0..n], props);
+        // the hold knob: a held stream's slot leaves the speculation unscored; its ask (put last) is drafted apart
+        const live = if (x.spec) |*sp| (if (sp.settings.hold) heldLast(sp, asks[0..n], whose[0..n], depths[0..n], holds[0..n]) else n) else n;
+        const took = live > 0 and (if (x.spec) |*sp| sp.take(asks[0..live], props[0..live]) else false);
+        if (!took) try x.pass.propose(asks[0..n], props) else if (live < n) try x.pass.propose(asks[live..n], props[live..n]);
         // draft-end warm: the pending row and every drafted one, before the depth cuts them
         if (x.target.vtable.warm != null) {
             const ws = try a.alloc(iface.Warm, n);
@@ -499,6 +512,23 @@ pub const Lanes = struct {
             for (st.conf[0..st.n], p.conf[0..st.n]) |*q, f| q.* = f;
             if (markov) |m| try x.siblings(a, st, m, p, ask);
         }
+    }
+
+    /// Releases held streams' slots from the speculation and moves their asks last; returns the asks before them.
+    fn heldLast(sp: *spec_mod.Spec, asks: []iface.Ask, whose: []*St, depths: []u32, holds: []bool) usize {
+        var live: usize = 0;
+        for (0..asks.len) |i| {
+            if (holds[i]) {
+                sp.release(asks[i].slot);
+                continue;
+            }
+            std.mem.swap(iface.Ask, &asks[live], &asks[i]);
+            std.mem.swap(*St, &whose[live], &whose[i]);
+            std.mem.swap(u32, &depths[live], &depths[i]);
+            std.mem.swap(bool, &holds[live], &holds[i]);
+            live += 1;
+        }
+        return live;
     }
 
     /// The siblings after the pending token: the draft distribution's next first tokens and their Markov chains.
