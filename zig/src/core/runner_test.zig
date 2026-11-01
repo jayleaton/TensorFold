@@ -146,7 +146,7 @@ const Box = struct {
 };
 
 /// `frontend`/`backend`: real ones in place of the fakes (the proof test).
-pub const Opts = struct { runner: bool = true, run_cells: bool = true, delay: u32 = 0, planner: bool = false, streams: usize = 1, frontend: ?rapi.Frontend = null, backend: ?rapi.Backend = null, wait_s: u32 = 20 };
+pub const Opts = struct { runner: bool = true, run_cells: bool = true, delay: u32 = 0, planner: bool = false, streams: usize = 1, frontend: ?rapi.Frontend = null, backend: ?rapi.Backend = null, wait_s: u32 = 20, exact: bool = false };
 
 /// Runs `models` (one request each, concurrently) on one host; the reply texts.
 pub fn replies(models: []Model, o: Opts, back: *Back) ![][]u8 {
@@ -161,7 +161,7 @@ pub fn replies(models: []Model, o: Opts, back: *Back) ![][]u8 {
     defer core.deinit();
     var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 4 });
     back.delay = o.delay;
-    var run: runner.Runner = .{ .gpa = gpa, .cfg = .{ .circuit = "test" }, .frontend = o.frontend orelse .{ .translate = translate }, .backend = o.backend orelse back.backend(), .text = .{ .bytes = tokenBytes, .encode = encode } };
+    var run: runner.Runner = .{ .gpa = gpa, .cfg = .{ .circuit = "test", .exact = o.exact }, .frontend = o.frontend orelse .{ .translate = translate }, .backend = o.backend orelse back.backend(), .text = .{ .bytes = tokenBytes, .encode = encode } };
     if (o.runner) host.runner = &run;
     const boxes = try gpa.alloc(Box, models.len);
     defer gpa.free(boxes);
@@ -314,6 +314,16 @@ test "runner: an abstained cell, a cell with no header, and the runner off all k
     }
 }
 
+test "runner: an exact (calc) cell keeps the model's text unless TF_DSV41_RUNNER_EXACT is on" {
+    const lead = "```calc\n2**100\n```\nResult:\n";
+    const off = try one(lead, .{});
+    defer gpa.free(off);
+    try std.testing.expectEqualStrings(lead ++ "42\nDone.", off);
+    const on = try one(lead, .{ .exact = true });
+    defer gpa.free(on);
+    try std.testing.expectEqualStrings(lead ++ "1267650600228229401496703205376\nDone.", on);
+}
+
 test "runner: knobs parse; off unless the flag is 1 with a circuit" {
     const K = struct {
         var set: []const [2][]const u8 = &.{};
@@ -328,7 +338,11 @@ test "runner: knobs parse; off unless the flag is 1 with a circuit" {
     try std.testing.expectError(error.BadKnob, runner.Config.parse(&K.get, "TF_R"));
     K.set = &.{ .{ "TF_R", "1" }, .{ "TF_R_CIRCUIT", "/c.bin" }, .{ "TF_R_FORMS", "repl" }, .{ "TF_R_SPANS", "reasoning" }, .{ "TF_R_MAX_STEPS", "99" } };
     const c = (try runner.Config.parse(&K.get, "TF_R")).?;
-    try std.testing.expect(!c.scan.fence and c.scan.repl and c.scan.reasoning_only and c.max_steps == 99);
+    try std.testing.expect(!c.scan.fence and c.scan.repl and c.scan.reasoning_only and c.max_steps == 99 and !c.exact);
+    K.set = &.{ .{ "TF_R", "1" }, .{ "TF_R_CIRCUIT", "/c.bin" }, .{ "TF_R_EXACT", "1" } };
+    try std.testing.expect((try runner.Config.parse(&K.get, "TF_R")).?.exact);
+    K.set = &.{ .{ "TF_R", "1" }, .{ "TF_R_CIRCUIT", "/c.bin" }, .{ "TF_R_EXACT", "2" } };
+    try std.testing.expectError(error.BadKnob, runner.Config.parse(&K.get, "TF_R"));
     K.set = &.{ .{ "TF_R", "1" }, .{ "TF_R_CIRCUIT", "/c.bin" }, .{ "TF_R_BACKEND", "sandbox" } };
     try std.testing.expectError(error.BadKnob, runner.Config.parse(&K.get, "TF_R"));
 }

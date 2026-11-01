@@ -13,6 +13,7 @@ pub const Config = struct {
     workers: u8 = 2,
     device: enum { cpu, cuda } = .cpu,
     circuit: []const u8 = "",
+    exact: bool = false, // `calc` / `exact` cells (firmware exact rationals, not any language's print) run
 
     /// PREFIX "1" enables (unset, "" or "0": null); PREFIX_* knobs override defaults; a bad value is error.BadKnob.
     pub fn parse(get: *const fn ([]const u8) ?[]const u8, comptime prefix: []const u8) error{BadKnob}!?Config {
@@ -29,6 +30,7 @@ pub const Config = struct {
         c.workers = try knob(u8, get, prefix ++ "_WORKERS", c.workers, 1, 64);
         c.max_steps = try knob(u64, get, prefix ++ "_MAX_STEPS", c.max_steps, 1, 1 << 40);
         c.max_tokens = try knob(u32, get, prefix ++ "_MAX_TOKENS", c.max_tokens, 1, 1 << 20);
+        c.exact = try knob(u1, get, prefix ++ "_EXACT", 0, 0, 1) == 1;
         c.scan.lookahead = try knob(u32, get, prefix ++ "_LOOKAHEAD", c.scan.lookahead, 1, 4096);
         if (get(prefix ++ "_FORMS")) |f| if (f.len > 0) {
             c.scan.fence = false;
@@ -140,6 +142,11 @@ pub const Session = struct {
         const prior = try cell.arena.allocator().alloc([]const u8, s.cells.items.len);
         for (s.cells.items, prior) |p, *dst| dst.* = p.code;
         try s.cells.append(gpa, cell);
+        if (!s.r.cfg.exact and (std.mem.eql(u8, cell.lang, "calc") or std.mem.eql(u8, cell.lang, "exact"))) {
+            cell.translation = .{ .abstain = .language };
+            cell.translated.store(true, .release);
+            return;
+        }
         const task: Translate = .{ .cell = cell, .fe = s.r.frontend, .prior = prior };
         cell.thread = std.Thread.spawn(.{}, Translate.run, .{task}) catch blk: {
             task.run();

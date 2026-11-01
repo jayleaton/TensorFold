@@ -22,7 +22,10 @@ fn prove(leads: []const []const u8, wants: []const []const u8) !void {
     const models = try gpa.alloc(rt.Model, leads.len);
     defer gpa.free(models);
     for (models, leads) |*m, l| m.* = .{ .lead = l };
-    const texts = try rt.replies(models, .{ .frontend = frontend.frontend(), .backend = b, .wait_s = 600 }, &fake);
+    // TF_RUNNER_LLD: an absolute ld.lld for hosts without lld beside clang (the image installs lld-18 there)
+    var ctx: frontend.Context = .{ .io = std.testing.io };
+    if (std.c.getenv("TF_RUNNER_LLD")) |l| ctx.compiler.linker = std.mem.span(l);
+    const texts = try rt.replies(models, .{ .frontend = ctx.frontend(), .backend = b, .wait_s = 600 }, &fake);
     defer rt.freeAll(texts);
     try std.testing.expectEqual(@as(u32, 0), fake.started);
     for (texts, leads, wants) |got, l, w| {
