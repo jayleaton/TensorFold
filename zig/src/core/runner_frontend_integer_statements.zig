@@ -10,6 +10,7 @@ pub const Iterator = struct {
     continuation: bool = false,
 
     pub fn next(self: *Iterator) Invalid!?Statement {
+        if (self.pos == 0 and std.mem.indexOfScalar(u8, self.code, 0) != null) return error.Unsupported;
         if (self.pos == self.code.len) return null;
         const start = self.pos;
         const continuation = self.continuation;

@@ -16,6 +16,9 @@ const runtime =
     \\static py_value py_sub(py_value a,py_value b) { return py_int(a.n-b.n); }
     \\static py_value py_mul(py_value a,py_value b) { return py_int(a.n*b.n); }
     \\static py_value py_neg(py_value a) { return py_int(-a.n); }
+    \\static py_value py_reverse_digits(py_value a) {
+    \\ int n=a.n,r=0; while(n) { r=r*10+n%10; n/=10; } return py_int(r);
+    \\}
     \\static py_value py_floor(py_value a,py_value b) {
     \\ int q=a.n/b.n,r=a.n%b.n; if(r && ((r<0)!=(b.n<0))) --q; return py_int(q);
     \\}
@@ -248,8 +251,8 @@ const Emitter = struct {
                 });
             },
             .name => try e.variable(n.text),
-            .neg => {
-                try e.put("py_neg(");
+            .neg, .reverse_digits => {
+                try e.out.print(e.a, "py_{s}(", .{@tagName(n.tag)});
                 try e.expr(n.lhs);
                 try e.put(")");
             },

@@ -185,6 +185,20 @@ const Parser = struct {
     }
 
     fn call(p: *Parser, name: []const u8) ast.Error!usize {
+        if (std.mem.eql(u8, name, "int")) {
+            try p.need("str");
+            try p.need("(");
+            const operand = try p.expression();
+            try p.need(")");
+            try p.need("[");
+            try p.need(":");
+            try p.need(":");
+            try p.need("-");
+            try p.need("1");
+            try p.need("]");
+            try p.need(")");
+            return p.program.node(.{ .tag = .reverse_digits, .lhs = operand });
+        }
         const builtins = [_][]const u8{ "len", "sum", "range", "gcd", "all", "print", "ValueError" };
         var allowed = ast.validName(name);
         for (builtins) |builtin| {
@@ -336,7 +350,7 @@ pub fn boundedDepth(program: *const ast.Program, id: usize, depth: usize) ast.In
     switch (node.tag) {
         .integer, .boolean, .name, .string => {},
         .format, .list, .call => for (node.args) |arg| try boundedDepth(program, arg, depth + 1),
-        .neg, .logical_not => try boundedDepth(program, node.lhs, depth + 1),
+        .neg, .logical_not, .reverse_digits => try boundedDepth(program, node.lhs, depth + 1),
         else => {
             try boundedDepth(program, node.lhs, depth + 1);
             try boundedDepth(program, node.rhs, depth + 1);

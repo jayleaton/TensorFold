@@ -59,7 +59,7 @@ fn generatorParams(p: *ast.Program, f: *ast.Function, id: usize) Error!void {
     switch (e.tag) {
         .integer, .boolean, .name, .string => {},
         .format, .list, .call => for (e.args) |arg| try generatorParams(p, f, arg),
-        .neg, .logical_not => try generatorParams(p, f, e.lhs),
+        .neg, .logical_not, .reverse_digits => try generatorParams(p, f, e.lhs),
         else => {
             try generatorParams(p, f, e.lhs);
             try generatorParams(p, f, e.rhs);
@@ -125,7 +125,7 @@ const Validator = struct {
                 try v.scalar(scope, fun, e.rhs, gen);
                 return .scalar;
             },
-            .neg, .logical_not => try v.scalar(scope, fun, e.lhs, gen),
+            .neg, .logical_not, .reverse_digits => try v.scalar(scope, fun, e.lhs, gen),
             .call => {
                 if (std.mem.eql(u8, e.text, "len") or std.mem.eql(u8, e.text, "sum")) {
                     if (e.args.len != 1 or try v.expr(scope, fun, e.args[0], gen) != .list)
@@ -362,6 +362,17 @@ const Runtime = struct {
             else => {},
         }
         const x = try r.scalar(frame, e.lhs, gen);
+        if (e.tag == .reverse_digits) {
+            if (x.boolean or x.n < 0) return error.Unsupported;
+            r.charge(20);
+            var remaining = x.n;
+            var reversed: i64 = 0;
+            while (remaining != 0) : (remaining = @divTrunc(remaining, 10)) {
+                r.charge(40);
+                reversed = (try number(reversed * 10 + @mod(remaining, 10), false)).n;
+            }
+            return .{ .scalar = try number(reversed, false) };
+        }
         if (e.tag == .neg) return .{ .scalar = try number(-x.n, false) };
         if (e.tag == .logical_not) return .{ .scalar = try number(@intFromBool(x.n == 0), true) };
         if (e.tag == .logical_and and x.n == 0) return .{ .scalar = x };

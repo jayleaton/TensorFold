@@ -56,6 +56,8 @@ fn translateImpl(raw: ?*anyopaque, a: std.mem.Allocator, cell: Cell) std.mem.All
     if (lang == .unsupported) return .{ .abstain = .language };
     if (lang == .exact and (context == null or !context.?.exact_tags)) return .{ .abstain = .unsupported };
     if (cell.code.len > 4096) return .{ .abstain = .too_long };
+    if (std.mem.indexOfScalar(u8, cell.code, 0) != null) return .{ .abstain = .syntax };
+    for (cell.prior) |prior| if (std.mem.indexOfScalar(u8, prior, 0) != null) return .{ .abstain = .syntax };
     if (cell.form == .inline_expr) {
         if (lang != .python) return .{ .abstain = .unsupported };
         if (try integer.ambiguousPercent(a, cell.code)) return .{ .abstain = .unsupported };
@@ -82,6 +84,11 @@ fn translateImpl(raw: ?*anyopaque, a: std.mem.Allocator, cell: Cell) std.mem.All
         }
         const result = try integerProgram(a, context, cell.code, true);
         if (result == .program) return result;
+        const budget = if (context) |ctx| ctx.compiler.step_budget else 10522;
+        const decimal = try @import("runner_frontend_decimal.zig").lowerWithCost(a, cell.code, budget);
+        if (decimal) |lowered| return compileNumeric(a, context.?, lowered);
+        const fraction = try @import("runner_frontend_fraction.zig").lowerWithCost(a, cell.code, budget);
+        if (fraction) |lowered| return compileNumeric(a, context.?, lowered);
     }
     if (lang == .exact) return .{ .abstain = .unsupported };
     var source: []const u8 = cell.code;
@@ -123,6 +130,16 @@ fn translateImpl(raw: ?*anyopaque, a: std.mem.Allocator, cell: Cell) std.mem.All
     };
     if (bytes) |elf| return .{ .program = .{ .kind = .elf, .bytes = elf } };
     return .{ .abstain = .unsupported };
+}
+
+fn compileNumeric(a: std.mem.Allocator, ctx: *Context, lowered: integer.Lowered) std.mem.Allocator.Error!Translation {
+    defer a.free(lowered.source);
+    var settings = ctx.compiler;
+    settings.opaque_inputs = true;
+    settings.estimated_steps = lowered.estimated_steps;
+    if (settings.optimize != .O0) settings.optimize = .O2;
+    const bytes = try program.compile(a, ctx.io, lowered.source, settings) orelse return .{ .abstain = .unsupported };
+    return .{ .program = .{ .kind = .elf, .bytes = bytes } };
 }
 
 fn calcProgram(a: std.mem.Allocator, context: ?*Context, bytes: []u8) Translation {
