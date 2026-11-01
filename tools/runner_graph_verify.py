@@ -21,7 +21,8 @@ LAYOUT = (("V", 32768), ("F0", 32768), ("F1", 32768), ("F2", 4),
 BYTE = sum(size for _, size in LAYOUT[:6])
 HALT = sum(size for _, size in LAYOUT[:17])
 RUNTIME_FILES = ("runner_graph.zig", "runner_graph_bank.zig", "runner_graph_machine.zig",
-                 "runner_graph_binary.zig", "runner_graph_packet.zig")
+                 "runner_graph_binary.zig", "runner_graph_packet.zig", "runner_graph_algorithms.zig",
+                 "runner_graph_state_cache.zig")
 
 
 def require(condition, message):
@@ -77,7 +78,10 @@ def structural_audit(source_root, probe_source, manifest, cwd):
         path = cwd / template["path"]
         require(path.suffix == ".tfgp", "runtime template is not an offline prepared pack")
         packs.append({"name": template["name"], "width": template["width"], "sha256": digest_file(path)})
+    frozen = {f"steps_v1/runner_circuit_{name}.zig": digest_file(source_root / "steps_v1" / f"runner_circuit_{name}.zig")
+              for name in ("model", "load", "state", "eval")}
     return {"pass": True, "sources": {path.name: digest_file(path) for path in paths}, "packs": packs,
+            "pinned_evaluator_sources": frozen,
             "scope": "direct runtime entrypoints; model loader methods are unused, not dynamically instrumented"}
 
 

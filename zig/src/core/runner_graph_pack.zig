@@ -1,8 +1,8 @@
 //! Offline CLI: runner-graph-pack INPUT.tfimr OUTPUT.tfgp; runtime never uses this compiler path.
 const std = @import("std");
-const model = @import("runner_circuit_model.zig");
+const model = @import("steps_v1/runner_circuit_model.zig");
 const binary = @import("runner_graph_binary.zig");
-const loader = @import("runner_circuit_load.zig");
+const loader = @import("steps_v1/runner_circuit_load.zig");
 const Identity = struct { experimental: struct { kind: []const u8, contract: struct { op: []const u8, width: u8 } } };
 
 pub fn main(init: std.process.Init) !void {
@@ -18,7 +18,7 @@ pub fn main(init: std.process.Init) !void {
         !@import("runner_graph_packet.zig").widthValid(contract.width)) return error.ExpectedGraphTemplate;
     var circuit = try loader.fromBytes(init.gpa, source);
     defer circuit.deinit(init.gpa);
-    try requireGraph(&circuit);
+    try requireGraph(&circuit, contract.width);
     circuit.program.image.rom = &.{};
     circuit.program.image.drom = &.{};
     circuit.program.image.ram = &.{};
@@ -31,18 +31,18 @@ pub fn main(init: std.process.Init) !void {
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = args[2], .data = bytes });
 }
 
-fn requireGraph(c: *const model.Circuit) !void {
+fn requireGraph(c: *const model.Circuit, width: u8) !void {
     var input = false;
     var output = false;
     for (c.table_names) |name| {
-        if (std.mem.eql(u8, name, "output.cursor")) continue;
+        if (std.mem.startsWith(u8, name, "output.cursor")) continue;
         if (std.mem.eql(u8, name, "in0.0")) input = true;
         if (std.mem.eql(u8, name, "out0.0")) output = true;
         const prefix: usize = if (std.mem.startsWith(u8, name, "in")) 2 else if (std.mem.startsWith(u8, name, "out")) 3 else continue;
         const dot = std.mem.indexOfScalarPos(u8, name, prefix, '.') orelse return error.ExpectedGraphTemplate;
         const logical = std.fmt.parseInt(u32, name[prefix..dot], 10) catch return error.ExpectedGraphTemplate;
         const offset = std.fmt.parseInt(u32, name[dot + 1 ..], 10) catch return error.ExpectedGraphTemplate;
-        if (logical >= 16 or (offset != 0 and offset != 31)) return error.ExpectedGraphTemplate;
+        if (logical >= 16 or offset % 31 != 0 or offset >= width) return error.ExpectedGraphTemplate;
     }
     if (!input or !output) return error.ExpectedGraphTemplate;
 }

@@ -1,7 +1,7 @@
 //! Offline prepared circuit encoding; boot restores exact runtime fields without compiling graph IR.
 const std = @import("std");
 const builtin = @import("builtin");
-const model = @import("runner_circuit_model.zig");
+const model = @import("steps_v1/runner_circuit_model.zig");
 const Allocator = std.mem.Allocator;
 const Hash = std.crypto.hash.sha2.Sha256;
 const header = 80;
@@ -53,9 +53,9 @@ pub fn schemaHash() [32]u8 {
     var h = Hash.init(.{});
     h.update("runner-graph-prepared-v1-rle:");
     h.update(builtin.zig_version_string);
-    h.update(@embedFile("runner_circuit_model.zig"));
-    h.update(@embedFile("runner_circuit_state.zig"));
-    h.update(@embedFile("runner_circuit_eval.zig"));
+    h.update(@embedFile("steps_v1/runner_circuit_model.zig"));
+    h.update(@embedFile("steps_v1/runner_circuit_state.zig"));
+    h.update(@embedFile("steps_v1/runner_circuit_eval.zig"));
     schema(Prepared, &h);
     return h.finalResult();
 }
