@@ -1,8 +1,8 @@
 //! Offline CLI: runner-graph-pack INPUT.tfimr OUTPUT.tfgp; runtime never uses this compiler path.
 const std = @import("std");
-const model = @import("runner_circuit_model.zig");
+const model = @import("steps_v1/runner_circuit_model.zig");
 const binary = @import("runner_graph_binary.zig");
-const loader = @import("runner_circuit_load.zig");
+const loader = @import("steps_v1/runner_circuit_load.zig");
 const Identity = struct { experimental: struct { kind: []const u8, contract: struct { op: []const u8, width: u8 } } };
 
 pub fn main(init: std.process.Init) !void {

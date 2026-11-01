@@ -1,8 +1,8 @@
 //! A fresh binding machine replays immutable template calls and transfers raw typed tensor rows.
 const std = @import("std");
 const api = @import("runner_api.zig");
-const State = @import("runner_circuit_state.zig").State;
-const eval = @import("runner_circuit_eval.zig");
+const State = @import("steps_v1/runner_circuit_state.zig").State;
+const eval = @import("steps_v1/runner_circuit_eval.zig");
 const bank_mod = @import("runner_graph_bank.zig");
 const packet = @import("runner_graph_packet.zig");
 const Allocator = std.mem.Allocator;

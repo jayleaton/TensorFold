@@ -36,6 +36,7 @@ pub const Machine = struct {
                 try patchInput(&s, program.bytes);
             },
             .elf => try elf.load(&s, program.bytes),
+            .graph => return error.CircuitProgramKind, // graph packets run on the graph backend (T1)
         }
         return .{ .state = s, .next = c.go };
     }

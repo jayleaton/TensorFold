@@ -13,9 +13,12 @@ pub const Config = struct {
     max_tokens: u32 = 512, // owned result tokens before the cut note
     workers: u8 = 2,
     device: enum { cpu, cuda } = .cpu,
-    circuit: []const u8 = "",
+    circuit: []const u8 = "", // calc and ELF programs run here (with the graph backend too)
+    backend: enum { circuit, graph } = .circuit,
+    graph_bank: []const u8 = "", // PREFIX_GRAPH_BANK: T1's bank manifest, loaded at boot (backend graph)
     exact: bool = false, // `calc` / `exact` cells (firmware exact rationals, not any language's print) run
     place: place.Config = .{}, // PREFIX_CPUS / PREFIX_NICE: where the runner's threads run (core/runner_place.zig)
+    guide: bool = false, // PREFIX_GUIDE=1: chats get RUNNER-GUIDE.md in their system message (server/runner_guide.zig)
 
     /// PREFIX "1" enables (unset, "" or "0": null); PREFIX_* knobs override defaults; a bad value is error.BadKnob.
     pub fn parse(get: *const fn ([]const u8) ?[]const u8, comptime prefix: []const u8) error{BadKnob}!?Config {
@@ -23,7 +26,11 @@ pub const Config = struct {
         if (on.len == 0 or std.mem.eql(u8, on, "0")) return null;
         if (!std.mem.eql(u8, on, "1")) return bad(prefix, on);
         var c: Config = .{};
-        if (get(prefix ++ "_BACKEND")) |b| if (b.len > 0 and !std.mem.eql(u8, b, "circuit")) return bad(prefix ++ "_BACKEND", b);
+        if (get(prefix ++ "_BACKEND")) |b| if (b.len > 0) {
+            c.backend = std.meta.stringToEnum(@TypeOf(c.backend), b) orelse return bad(prefix ++ "_BACKEND", b);
+        };
+        c.graph_bank = get(prefix ++ "_GRAPH_BANK") orelse "";
+        if (c.backend == .graph and c.graph_bank.len == 0) return bad(prefix ++ "_GRAPH_BANK", "(unset)");
         c.circuit = get(prefix ++ "_CIRCUIT") orelse "";
         if (c.circuit.len == 0) return bad(prefix ++ "_CIRCUIT", "(unset)");
         if (get(prefix ++ "_DEVICE")) |d| if (d.len > 0) {
@@ -33,6 +40,7 @@ pub const Config = struct {
         c.max_steps = try knob(u64, get, prefix ++ "_MAX_STEPS", c.max_steps, 1, 1 << 40);
         c.max_tokens = try knob(u32, get, prefix ++ "_MAX_TOKENS", c.max_tokens, 1, 1 << 20);
         c.exact = try knob(u1, get, prefix ++ "_EXACT", 0, 0, 1) == 1;
+        c.guide = try knob(u1, get, prefix ++ "_GUIDE", 0, 0, 1) == 1;
         c.place = try place.Config.parse(get, prefix);
         c.scan.lookahead = try knob(u32, get, prefix ++ "_LOOKAHEAD", c.scan.lookahead, 1, 4096);
         c.scan.float_window = try knob(u32, get, prefix ++ "_FLOAT_WINDOW", c.scan.float_window, 0, 65536);

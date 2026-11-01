@@ -386,6 +386,11 @@ test "runner: knobs parse; off unless the flag is 1 with a circuit" {
     try std.testing.expectError(error.BadKnob, runner.Config.parse(&K.get, "TF_R"));
     K.set = &.{ .{ "TF_R", "1" }, .{ "TF_R_CIRCUIT", "/c.bin" }, .{ "TF_R_BACKEND", "sandbox" } };
     try std.testing.expectError(error.BadKnob, runner.Config.parse(&K.get, "TF_R"));
+    K.set = &.{ .{ "TF_R", "1" }, .{ "TF_R_CIRCUIT", "/c.bin" }, .{ "TF_R_BACKEND", "graph" } };
+    try std.testing.expectError(error.BadKnob, runner.Config.parse(&K.get, "TF_R"));
+    K.set = &.{ .{ "TF_R", "1" }, .{ "TF_R_CIRCUIT", "/c.bin" }, .{ "TF_R_BACKEND", "graph" }, .{ "TF_R_GRAPH_BANK", "/b/bank.json" }, .{ "TF_R_GUIDE", "1" } };
+    const g = (try runner.Config.parse(&K.get, "TF_R")).?;
+    try std.testing.expect(g.backend == .graph and std.mem.eql(u8, g.graph_bank, "/b/bank.json") and g.guide and !c.guide);
 }
 
 test {

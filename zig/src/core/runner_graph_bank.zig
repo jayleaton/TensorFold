@@ -1,6 +1,6 @@
 //! Boot-loaded immutable prepared weights, logical table slots and validated named binding plans.
 const std = @import("std");
-const model = @import("runner_circuit_model.zig");
+const model = @import("steps_v1/runner_circuit_model.zig");
 const binary = @import("runner_graph_binary.zig");
 const packet = @import("runner_graph_packet.zig");
 const Allocator = std.mem.Allocator;

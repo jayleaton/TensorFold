@@ -18,7 +18,7 @@ pub const Cell = struct {
 
 /// What the circuit runs. calc: an ASCII expression for the calc firmware. elf: an rv32im_zba ELF image.
 pub const Program = struct {
-    kind: enum { calc, elf },
+    kind: enum { calc, elf, graph },
     bytes: []const u8,
 };
 

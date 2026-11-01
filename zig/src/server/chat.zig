@@ -95,8 +95,12 @@ pub const Prepared = struct {
 };
 
 /// Render ``input`` and run every check that can refuse it, before anything reaches the client or the engine.
-pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepared {
+pub fn prepare(srv: *Server, cx: *Cx, given: Input, gone: anytype) Failure!Prepared {
     const a = cx.a;
+    var input = given;
+    if (srv.info.runner) |r| if (r.cfg.guide and input.prompt == null) {
+        input.messages = try @import("runner_guide.zig").with(a, input.messages);
+    };
     const io = srv.io;
     const received = nowNs(io);
     const f = input.fields;
