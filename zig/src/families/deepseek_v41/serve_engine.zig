@@ -136,7 +136,9 @@ pub const Served = struct {
         // TF_DSV41_COMPUTE_LANE=1: built-in code runs on the CPU while its reply holds at EOS (core/compute_lane.zig)
         s.host.info_.compute = try api.compute_lane.Config.parse(&@import("serve_knobs.zig").env, "TF_DSV41_COMPUTE_LANE");
         // TF_DSV41_RUNNER=1: code cells a reply writes run on the compiled circuit, results in place (core/runner.zig)
-        if (try api.runner.Config.parse(&@import("serve_knobs.zig").env, "TF_DSV41_RUNNER")) |rc| {
+        if (try api.runner.Config.parse(&@import("serve_knobs.zig").env, "TF_DSV41_RUNNER")) |parsed| {
+            var rc = parsed;
+            rc.place.engine = engineCpus; // TF_DSV41_RUNNER_CPUS=auto keeps the runner's threads off these
             s.host.runner = try api.runner.open(gpa, rc);
             s.host.info_.runner = s.host.runner;
         }
@@ -205,6 +207,17 @@ pub const Served = struct {
     fn executionFailed(ctx: *anyopaque, err: anyerror) void {
         const m: *model.Model = @ptrCast(@alignCast(ctx));
         if (@import("lockstep.zig").isFatal(err)) if (m.supervisor) |*s| s.report(err);
+    }
+
+    /// The CPUs this rank's own threads are pinned to: the TP plan link's (TF_TP_PLAN_PIN) and the RoCE proxy's.
+    fn engineCpus(set: *api.runner.place.Set) void {
+        const tp = @import("tp");
+        const pinned = tp.planlink.pinned_cpu.load(.acquire);
+        if (pinned >= 0) api.runner.place.add(set, @intCast(pinned));
+        for ([_][:0]const u8{ "TF_TP_PLAN_PIN", "TF_TP_ROCE_CPU" }) |name| {
+            const v = std.c.getenv(name) orelse continue;
+            if (std.fmt.parseInt(u32, std.mem.span(v), 10)) |cpu| api.runner.place.add(set, cpu) else |_| {}
+        }
     }
 
     fn bindContext(ctx: *anyopaque) anyerror!void {

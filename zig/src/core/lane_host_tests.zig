@@ -32,4 +32,5 @@ test {
     _ = @import("lane_host_hold_test.zig");
     _ = @import("runner_test.zig");
     _ = @import("runner_proof_test.zig");
+    _ = @import("runner_place_test.zig");
 }

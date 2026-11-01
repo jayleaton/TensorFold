@@ -8,8 +8,9 @@ const log = std.log.scoped(.runner);
 pub const Config = runner.Config;
 pub const Runner = runner.Runner;
 pub const Text = runner.Text;
+pub const place = runner.place;
 
-const Opened = struct { runner: Runner, circuit: circuit.Circuit };
+const Opened = struct { runner: Runner, circuit: circuit.Circuit, placer: runner.place.Placer };
 
 /// The runner for `cfg` (from Config.parse); lives as long as the engine. CUDA waits for its backend (DESIGN T4).
 pub fn open(gpa: Allocator, cfg: Config) !*Runner {
@@ -24,8 +25,9 @@ pub fn open(gpa: Allocator, cfg: Config) !*Runner {
         return e;
     };
     errdefer o.circuit.deinit(gpa);
-    const back = try @import("runner_circuit_backend.zig").backend(gpa, &o.circuit, cfg.workers);
-    o.runner = .{ .gpa = gpa, .cfg = cfg, .frontend = @import("runner_frontend.zig").frontend(), .backend = back };
+    o.placer = .{ .cfg = cfg.place };
+    const back = try @import("runner_circuit_backend.zig").placed(gpa, &o.circuit, cfg.workers, &o.placer);
+    o.runner = .{ .gpa = gpa, .cfg = cfg, .frontend = @import("runner_frontend.zig").frontend(), .backend = back, .placer = &o.placer };
     log.info("in-model runner: circuit {s}, cpu, {d} workers, {d} steps a run", .{ cfg.circuit, cfg.workers, cfg.max_steps });
     return &o.runner;
 }

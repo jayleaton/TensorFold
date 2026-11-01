@@ -3,6 +3,7 @@ const std = @import("std");
 const lanes = @import("lanes");
 const api = @import("runner_api.zig");
 const scan = @import("runner_scan.zig");
+pub const place = @import("runner_place.zig");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.runner);
 
@@ -14,6 +15,7 @@ pub const Config = struct {
     device: enum { cpu, cuda } = .cpu,
     circuit: []const u8 = "",
     exact: bool = false, // `calc` / `exact` cells (firmware exact rationals, not any language's print) run
+    place: place.Config = .{}, // PREFIX_CPUS / PREFIX_NICE: where the runner's threads run (core/runner_place.zig)
 
     /// PREFIX "1" enables (unset, "" or "0": null); PREFIX_* knobs override defaults; a bad value is error.BadKnob.
     pub fn parse(get: *const fn ([]const u8) ?[]const u8, comptime prefix: []const u8) error{BadKnob}!?Config {
@@ -31,6 +33,7 @@ pub const Config = struct {
         c.max_steps = try knob(u64, get, prefix ++ "_MAX_STEPS", c.max_steps, 1, 1 << 40);
         c.max_tokens = try knob(u32, get, prefix ++ "_MAX_TOKENS", c.max_tokens, 1, 1 << 20);
         c.exact = try knob(u1, get, prefix ++ "_EXACT", 0, 0, 1) == 1;
+        c.place = try place.Config.parse(get, prefix);
         c.scan.lookahead = try knob(u32, get, prefix ++ "_LOOKAHEAD", c.scan.lookahead, 1, 4096);
         if (get(prefix ++ "_FORMS")) |f| if (f.len > 0) {
             c.scan.fence = false;
@@ -76,6 +79,7 @@ pub const Runner = struct {
     backend: api.Backend,
     text: ?Text = null,
     next_id: u64 = 1,
+    placer: ?*place.Placer = null, // the backend's job threads and the translations run placed
 
     /// A reply's session; null until the server has given the runner its tokenizer.
     pub fn session(r: *Runner) Allocator.Error!?*Session {
@@ -152,8 +156,8 @@ pub const Session = struct {
             cell.translated.store(true, .release);
             return;
         }
-        const task: Translate = .{ .cell = cell, .fe = s.r.frontend, .prior = prior };
-        cell.thread = std.Thread.spawn(.{}, Translate.run, .{task}) catch blk: {
+        const task: Translate = .{ .cell = cell, .fe = s.r.frontend, .prior = prior, .placer = s.r.placer };
+        cell.thread = std.Thread.spawn(.{}, Translate.spawned, .{task}) catch blk: {
             task.run();
             break :blk null;
         };
@@ -295,6 +299,13 @@ const Translate = struct {
     cell: *Cell,
     fe: api.Frontend,
     prior: []const []const u8,
+    placer: ?*place.Placer = null,
+
+    /// On its own thread: placed first. The inline fallback (no thread) stays on the engine thread's CPU and niceness.
+    fn spawned(t: Translate) void {
+        if (t.placer) |p| p.enter();
+        t.run();
+    }
 
     fn run(t: Translate) void {
         const c = t.cell;

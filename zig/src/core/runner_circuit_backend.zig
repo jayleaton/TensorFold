@@ -2,6 +2,7 @@
 const std = @import("std");
 const api = @import("runner_api.zig");
 const rc = @import("runner_circuit.zig");
+const place = @import("runner_place.zig");
 
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.runner_circuit);
@@ -24,6 +25,7 @@ const Cpu = struct {
     gpa: Allocator,
     circuit: *const rc.Circuit,
     workers: u8,
+    placer: ?*place.Placer = null,
     next_id: api.JobId = 1,
     jobs: std.ArrayList(*Job) = .empty,
     dropped: std.ArrayList(*Job) = .empty,
@@ -83,6 +85,7 @@ const Cpu = struct {
 
 fn work(c: *Cpu, j: *Job) void {
     defer j.done.store(true, .release);
+    if (c.placer) |p| p.enter();
     const t0 = rc.nowNs();
     var m = rc.Machine.boot(c.gpa, c.circuit, .{ .kind = j.kind, .bytes = j.program }) catch |e| {
         j.result = .{ .status = .abstain, .abstain = switch (e) {
@@ -168,9 +171,14 @@ const vtable: api.Backend.VTable = .{ .start = start, .poll = poll, .cancel = ca
 
 /// A CPU backend running at most `workers` machines at once over a circuit the caller keeps alive.
 pub fn backend(gpa: Allocator, circuit: *const rc.Circuit, workers: u8) !api.Backend {
+    return placed(gpa, circuit, workers, null);
+}
+
+/// As `backend`, each job's thread placed by `placer` (which the caller keeps alive) before it boots a machine.
+pub fn placed(gpa: Allocator, circuit: *const rc.Circuit, workers: u8, placer: ?*place.Placer) !api.Backend {
     if (workers == 0) return error.NoWorkers;
     const c = try gpa.create(Cpu);
-    c.* = .{ .gpa = gpa, .circuit = circuit, .workers = workers };
+    c.* = .{ .gpa = gpa, .circuit = circuit, .workers = workers, .placer = placer };
     return .{ .ctx = c, .vtable = &vtable };
 }
 
