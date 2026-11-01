@@ -1,6 +1,7 @@
 //! The in-model runner's scanner: closed code cells and the model's own result headers, from committed reply bytes.
 const std = @import("std");
 const api = @import("runner_api.zig");
+const trace = @import("runner_trace.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Config = struct {
@@ -10,16 +11,25 @@ pub const Config = struct {
     reasoning_only: bool = false, // triggers only while the think block is open
     inline_math: bool = false, // `A op B =` at a line's end: the value after `=` (exact math semantics)
     float_window: u32 = 512, // tokens after a Python-float cue in which an inline span with `.` or `/` abstains
+    trace: bool = false, // a computation the reasoning states, owned as `[exact: …]` where its hand trace starts
+    trace_window: u32 = 512, // tokens after a stated computation's line in which a hand-trace cue counts
 };
+
+/// Trace ownerships per reply, and trace cells (stated computations) a reply may open.
+const trace_owned_max = 16;
+const trace_cells_max = 32;
 
 /// Text that puts the reply in a language's float semantics, where exact inline math would contradict it.
 const float_cues = [_][]const u8{ "float", "Decimal(", "sum(", "round(", "0.1+0.2", "0.1 + 0.2" };
 
 /// A closed cell; `lang` and `code` live in the scanner until the next `feed`.
-pub const Closed = struct { index: u32, form: api.Form, lang: []const u8, code: []const u8, float_context: bool = false };
+pub const Closed = struct { index: u32, form: api.Form, lang: []const u8, code: []const u8, float_context: bool = false, trace: ?Stated = null };
+
+/// A trace cell's line text: what `[exact: … = value]` shows, and whether the value is a (quotient, remainder) pair.
+pub const Stated = struct { display: []const u8, divmod: bool };
 
 /// Cell `index`'s result begins: `fenced` closes a fence after it; `inline_space` (inline: value only) adds a space.
-pub const Trigger = struct { index: u32, fenced: bool = false, inline_space: ?bool = null };
+pub const Trigger = struct { index: u32, fenced: bool = false, inline_space: ?bool = null, trace: bool = false }; // trace: `[exact: …]` line
 
 pub const Events = struct { closed: ?Closed = null, trigger: ?Trigger = null };
 
@@ -41,11 +51,23 @@ pub const Scanner = struct {
     tail_len: usize = 0,
     think: bool = false, // the think block was open at the last token
     code_cells: u32 = 0, // fence and REPL cells closed so far
+    tracer: ?trace.Tracer = null, // names and owned statements (form trace; made at the first reasoning line)
+    trace_src: std.ArrayList(u8) = .empty, // the pending statement's Python source
+    trace_disp: std.ArrayList(u8) = .empty,
+    trace_armed: std.ArrayList(u8) = .empty, // the source of the trace cell armed in this token
+    trace_cell: ?u32 = null, // the stated computation waiting for its cue
+    trace_at: u32 = 0, // the token its line ended at
+    trace_cells: u32 = 0,
+    trace_owned: u32 = 0,
 
     pub fn deinit(s: *Scanner, a: Allocator) void {
         s.line.deinit(a);
         s.lang.deinit(a);
         s.code.deinit(a);
+        s.trace_src.deinit(a);
+        s.trace_disp.deinit(a);
+        s.trace_armed.deinit(a);
+        if (s.tracer) |*t| t.deinit();
     }
 
     /// One committed token's bytes; `think_open`: the think block is open at this token.
@@ -63,6 +85,7 @@ pub const Scanner = struct {
             s.since += 1;
             if (s.since > s.cfg.lookahead) s.state = .prose;
         }
+        if (s.trace_cell != null and s.tokens - s.trace_at > s.cfg.trace_window) s.trace_cell = null;
         for (bytes) |b| {
             s.cue(b);
             if (s.armed != null and b != '\n' and b != ' ' and b != '\t' and b != '\r') s.armed = null;
@@ -74,6 +97,7 @@ pub const Scanner = struct {
             s.line.clearRetainingCapacity();
         }
         ev.trigger = s.armed;
+        if (ev.trigger) |t| if (t.trace) try s.traceSpent(t.index);
         const allowed = think_open or !s.cfg.reasoning_only;
         if (s.cfg.inline_math and allowed and s.state != .fence and ev.closed == null and ev.trigger == null and
             std.mem.indexOfScalar(u8, bytes, '=') != null)
@@ -132,8 +156,46 @@ pub const Scanner = struct {
                     if (allowed) s.fire(false);
                     return;
                 };
+                if (s.cfg.trace and allowed) try s.traceLine(a, ev, raw);
             },
         }
+    }
+
+    /// A reasoning prose line: a pending statement's cue fires it; the line's own statement opens a trace cell.
+    fn traceLine(s: *Scanner, a: Allocator, ev: *Events, raw: []const u8) Allocator.Error!void {
+        if (s.tracer == null) s.tracer = trace.Tracer.init(a);
+        const t = &s.tracer.?;
+        var fired = false;
+        if (s.trace_cell != null and trace.cue(raw)) fired = try s.traceArm(a);
+        const found = try t.line(raw) orelse return;
+        if (s.trace_cell != null and std.mem.eql(u8, found.source, s.trace_src.items)) return;
+        if (ev.closed != null or s.trace_cells >= trace_cells_max or s.trace_owned >= trace_owned_max) return;
+        s.trace_src.clearRetainingCapacity();
+        try s.trace_src.appendSlice(a, found.source);
+        s.trace_disp.clearRetainingCapacity();
+        try s.trace_disp.appendSlice(a, found.display);
+        ev.closed = .{ .index = s.cells, .form = .repl, .lang = "python", .code = s.trace_src.items, .trace = .{ .display = s.trace_disp.items, .divmod = found.divmod } };
+        s.trace_cell = s.cells;
+        s.trace_at = s.tokens;
+        s.cells += 1;
+        s.trace_cells += 1;
+        if (found.same_line and !fired) _ = try s.traceArm(a);
+    }
+
+    /// Arms the pending trace cell's trigger at this line's end, unless another form's trigger is armed.
+    fn traceArm(s: *Scanner, a: Allocator) Allocator.Error!bool {
+        if (s.armed != null) return false;
+        s.armed = .{ .index = s.trace_cell.?, .trace = true };
+        s.trace_armed.clearRetainingCapacity();
+        try s.trace_armed.appendSlice(a, s.trace_src.items);
+        return true;
+    }
+
+    /// The armed trace trigger survived its token: that statement is owned once, and no longer pending.
+    fn traceSpent(s: *Scanner, index: u32) Allocator.Error!void {
+        if (s.tracer) |*t| try t.fire(s.trace_armed.items);
+        if (s.trace_cell == index) s.trace_cell = null;
+        s.trace_owned += 1;
     }
 
     fn cue(s: *Scanner, b: u8) void {

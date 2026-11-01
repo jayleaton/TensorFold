@@ -157,7 +157,7 @@ const Box = struct {
 };
 
 /// `frontend`/`backend`: real ones in place of the fakes (the proof test).
-pub const Opts = struct { runner: bool = true, run_cells: bool = true, delay: u32 = 0, planner: bool = false, streams: usize = 1, frontend: ?rapi.Frontend = null, backend: ?rapi.Backend = null, wait_s: u32 = 20, exact: bool = false, inline_math: bool = false, placer: ?*runner.place.Placer = null, summaries: ?[][]u8 = null };
+pub const Opts = struct { runner: bool = true, run_cells: bool = true, delay: u32 = 0, planner: bool = false, streams: usize = 1, frontend: ?rapi.Frontend = null, backend: ?rapi.Backend = null, wait_s: u32 = 20, exact: bool = false, inline_math: bool = false, trace: bool = false, placer: ?*runner.place.Placer = null, summaries: ?[][]u8 = null };
 
 /// Runs `models` (one request each, concurrently) on one host; the reply texts.
 pub fn replies(models: []Model, o: Opts, back: *Back) ![][]u8 {
@@ -172,7 +172,7 @@ pub fn replies(models: []Model, o: Opts, back: *Back) ![][]u8 {
     defer core.deinit();
     var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 4 });
     back.delay = o.delay;
-    var run: runner.Runner = .{ .gpa = gpa, .cfg = .{ .circuit = "test", .exact = o.exact, .scan = .{ .inline_math = o.inline_math } }, .frontend = o.frontend orelse .{ .translate = translate }, .backend = o.backend orelse back.backend(), .text = .{ .bytes = tokenBytes, .encode = encode }, .placer = o.placer };
+    var run: runner.Runner = .{ .gpa = gpa, .cfg = .{ .circuit = "test", .exact = o.exact, .scan = .{ .inline_math = o.inline_math, .trace = o.trace } }, .frontend = o.frontend orelse .{ .translate = translate }, .backend = o.backend orelse back.backend(), .text = .{ .bytes = tokenBytes, .encode = encode }, .placer = o.placer };
     if (o.runner) host.runner = &run;
     const boxes = try gpa.alloc(Box, models.len);
     defer gpa.free(boxes);
@@ -380,7 +380,7 @@ test "runner: a reply's runtime block counts its cells by form, owned tokens and
     freeAll(texts);
     defer for (sums) |s| gpa.free(s);
     // the product and its newline: one token a character
-    try std.testing.expectEqualStrings("{\"fence\":{\"closed\":1,\"owned\":1,\"abstained\":0,\"owned_tokens\":61},\"repl\":{\"closed\":0,\"owned\":0,\"abstained\":0,\"owned_tokens\":0},\"inline\":{\"closed\":0,\"owned\":0,\"abstained\":0,\"owned_tokens\":0},\"owned_by\":{\"calc\":1,\"elf\":0,\"graph\":0},\"held_ms\":", sums[0][0 .. std.mem.lastIndexOf(u8, sums[0], "\"held_ms\":").? + 10]);
+    try std.testing.expectEqualStrings("{\"fence\":{\"closed\":1,\"owned\":1,\"abstained\":0,\"owned_tokens\":61},\"repl\":{\"closed\":0,\"owned\":0,\"abstained\":0,\"owned_tokens\":0},\"inline\":{\"closed\":0,\"owned\":0,\"abstained\":0,\"owned_tokens\":0},\"trace\":{\"closed\":0,\"owned\":0,\"abstained\":0,\"owned_tokens\":0},\"owned_by\":{\"calc\":1,\"elf\":0,\"graph\":0},\"held_ms\":", sums[0][0 .. std.mem.lastIndexOf(u8, sums[0], "\"held_ms\":").? + 10]);
     try std.testing.expect(std.mem.startsWith(u8, sums[1], "{\"fence\":{\"closed\":1,\"owned\":0,\"abstained\":1,\"owned_tokens\":0}"));
     var off: [1][]u8 = undefined;
     var lone = [_]Model{.{ .lead = mul_cell }};

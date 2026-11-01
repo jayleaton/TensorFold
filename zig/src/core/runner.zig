@@ -3,6 +3,7 @@ const std = @import("std");
 const lanes = @import("lanes");
 const api = @import("runner_api.zig");
 const scan = @import("runner_scan.zig");
+const trace = @import("runner_trace.zig");
 pub const place = @import("runner_place.zig");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.runner);
@@ -45,13 +46,15 @@ pub const Config = struct {
         c.place = try place.Config.parse(get, prefix);
         c.scan.lookahead = try knob(u32, get, prefix ++ "_LOOKAHEAD", c.scan.lookahead, 1, 4096);
         c.scan.float_window = try knob(u32, get, prefix ++ "_FLOAT_WINDOW", c.scan.float_window, 0, 65536);
+        c.scan.trace_window = try knob(u32, get, prefix ++ "_TRACE_WINDOW", c.scan.trace_window, 1, 65536);
         if (get(prefix ++ "_FORMS")) |f| if (f.len > 0) {
             c.scan.fence = false;
             c.scan.repl = false;
             c.scan.inline_math = false;
+            c.scan.trace = false;
             var it = std.mem.splitScalar(u8, f, ',');
             while (it.next()) |form| {
-                if (std.mem.eql(u8, form, "fence")) c.scan.fence = true else if (std.mem.eql(u8, form, "repl")) c.scan.repl = true else if (std.mem.eql(u8, form, "inline")) c.scan.inline_math = true else return bad(prefix ++ "_FORMS", f);
+                if (std.mem.eql(u8, form, "fence")) c.scan.fence = true else if (std.mem.eql(u8, form, "repl")) c.scan.repl = true else if (std.mem.eql(u8, form, "inline")) c.scan.inline_math = true else if (std.mem.eql(u8, form, "trace")) c.scan.trace = true else return bad(prefix ++ "_FORMS", f);
             }
         };
         if (get(prefix ++ "_SPANS")) |sp| if (sp.len > 0) {
@@ -114,6 +117,7 @@ const Cell = struct {
     abstained: bool = false,
     told: enum { none, owned, abstained } = .none, // what its result header got
     owned_tokens: u32 = 0,
+    stated: ?scan.Stated = null, // form trace: the `[exact: …]` line's expression (text in the arena)
 };
 
 /// One reply's cells, runs and the trigger it waits on; every method runs on the engine thread.
@@ -161,16 +165,26 @@ pub const Session = struct {
         errdefer gpa.free(cell.lang);
         cell.code = try gpa.dupe(u8, c.code);
         errdefer gpa.free(cell.code);
-        // earlier code cells are the notebook; inline values define nothing
+        // earlier code cells are the notebook; inline values and stated computations define nothing
         var n: usize = 0;
-        for (s.cells.items) |p| n += @intFromBool(p.form != .inline_expr);
+        for (s.cells.items) |p| n += @intFromBool(p.form != .inline_expr and p.stated == null);
         const prior = try cell.arena.allocator().alloc([]const u8, n);
         n = 0;
-        for (s.cells.items) |p| if (p.form != .inline_expr) {
+        for (s.cells.items) |p| if (p.form != .inline_expr and p.stated == null) {
             prior[n] = p.code;
             n += 1;
         };
         try s.cells.append(gpa, cell);
+        // a stated computation is literals only: no notebook names to shadow
+        if (c.trace) |st| {
+            cell.stated = .{ .display = try cell.arena.allocator().dupe(u8, st.display), .divmod = st.divmod };
+            const task: Translate = .{ .cell = cell, .fe = s.r.frontend, .prior = &.{}, .placer = s.r.placer };
+            cell.thread = std.Thread.spawn(.{}, Translate.spawned, .{task}) catch blk: {
+                task.run();
+                break :blk null;
+            };
+            return;
+        }
         // exact inline math would contradict a reply reasoning in Python floats
         if (c.float_context) {
             cell.translation = .{ .abstain = .context };
@@ -197,9 +211,10 @@ pub const Session = struct {
         if (!c.abstained and c.result == null) return null;
         s.waiting = null;
         const held_ms = (nowNs() -| s.held_at) / std.time.ns_per_ms;
+        s.held_ms += held_ms;
+        if (w.trace) return try s.ownTrace(c, w.index, held_ms);
         // an inline value is owned only when the run halted with a one-line value
         if (!c.abstained and w.inline_space != null and (c.result.?.status != .ok or std.mem.indexOfScalar(u8, std.mem.trimEnd(u8, c.result.?.out, "\n"), '\n') != null)) c.abstained = true;
-        s.held_ms += held_ms;
         if (c.abstained) {
             s.abstained_n += 1;
             c.told = .abstained;
@@ -213,6 +228,31 @@ pub const Session = struct {
         c.owned_tokens = @intCast(ids.len);
         log.info("reply {d} cell {d} ({s} {t}): owned {d} tokens, {t} after {d} steps, run {d} ms, held {d} ms", .{ s.id, w.index, c.lang, c.form, ids.len, res.status, res.steps, res.exec_ns / std.time.ns_per_ms, held_ms });
         return ids;
+    }
+
+    /// Form trace: one `[exact: <expr> = <value>]` line, or nothing (abstain) unless the run printed one integer value.
+    fn ownTrace(s: *Session, c: *Cell, index: u32, held_ms: u64) Allocator.Error![]u32 {
+        const gpa = s.r.gpa;
+        const tx = s.r.text.?;
+        const line = if (!c.abstained and c.result.?.status == .ok) try trace.owned(gpa, c.stated.?.display, c.stated.?.divmod, c.result.?.out) else null;
+        if (line) |text| {
+            defer gpa.free(text);
+            const ids = try tx.encode(tx.ctx, gpa, text);
+            if (ids.len <= s.r.cfg.max_tokens) {
+                s.owned_n += 1;
+                c.told = .owned;
+                c.owned_tokens = @intCast(ids.len);
+                const res = c.result.?;
+                log.info("reply {d} cell {d} (trace): owned {d} tokens, {d} steps, run {d} ms, held {d} ms", .{ s.id, index, ids.len, res.steps, res.exec_ns / std.time.ns_per_ms, held_ms });
+                return ids;
+            }
+            gpa.free(ids);
+        }
+        c.abstained = true;
+        s.abstained_n += 1;
+        c.told = .abstained;
+        log.info("reply {d} cell {d} (trace): abstain ({s}), held {d} ms", .{ s.id, index, if (c.result != null and c.result.?.status == .ok) "not one value" else why(c), held_ms });
+        return try gpa.alloc(u32, 0);
     }
 
     fn why(c: *const Cell) []const u8 {
@@ -301,10 +341,10 @@ pub const Session = struct {
 
     /// The reply's cells per form, owned cells by program kind and the summed hold, as JSON in `buf` (runtime.runner).
     pub fn summary(s: *const Session, buf: []u8) []const u8 {
-        var forms = std.mem.zeroes([3][4]u32);
+        var forms = std.mem.zeroes([4][4]u32);
         var kinds = std.mem.zeroes([3]u32);
         for (s.cells.items) |c| {
-            const f = &forms[@backingInt(c.form)];
+            const f = &forms[if (c.stated != null) 3 else @backingInt(c.form)];
             f[0] += 1;
             switch (c.told) {
                 .none => {},
@@ -318,7 +358,7 @@ pub const Session = struct {
         }
         var w: std.Io.Writer = .fixed(buf);
         w.writeByte('{') catch return "";
-        for (forms, [_][]const u8{ "fence", "repl", "inline" }) |f, name|
+        for (forms, [_][]const u8{ "fence", "repl", "inline", "trace" }) |f, name|
             w.print("\"{s}\":{{\"closed\":{d},\"owned\":{d},\"abstained\":{d},\"owned_tokens\":{d}}},", .{ name, f[0], f[1], f[2], f[3] }) catch return "";
         w.print("\"owned_by\":{{\"calc\":{d},\"elf\":{d},\"graph\":{d}}},\"held_ms\":{d}}}", .{ kinds[0], kinds[1], kinds[2], s.held_ms }) catch return "";
         return w.buffered();
@@ -373,4 +413,5 @@ const Translate = struct {
 test {
     _ = @import("runner_scan.zig");
     _ = @import("runner_api.zig");
+    _ = @import("runner_trace_test.zig");
 }
