@@ -34,6 +34,7 @@ pub const Who = struct {
     draft_room: i64,
     finished: bool,
     forced: bool,
+    forced_tail: u32 = 0, // queued forced tokens the next window takes whole, drafts after them (forced_drafts.zig)
     granted: ?u32 = null,
     stream: ?*anyopaque = null,
     sampled: bool = false, // keyed draws: host work a row that a greedy round does not have
@@ -198,9 +199,16 @@ pub const Rule = struct {
             @min(@as(i64, r.most_drafts), @max(1, who.draft_room - 1))
         else
             try r.depth(who.*);
-        if (who.forced) return 0;
+        if (who.forced) return forcedDepth(r, who, d);
         if (d != 0 and probe.copy(probe.ptr, who)) return 1;
         return d;
+    }
+
+    /// Drafts past a forced tail the next window takes whole: the tail's own positions are drafted too, then left.
+    fn forcedDepth(r: *const Rule, who: *const Who, d: i64) i64 {
+        const most = @min(@as(i64, r.most_drafts), @max(1, who.draft_room - 1));
+        if (who.forced_tail == 0 or d == 0 or who.forced_tail >= most) return 0;
+        return @min(d + who.forced_tail, most);
     }
 
     /// Head drafts for the streams of a shared round, sized by allocation over their chain chances.

@@ -72,6 +72,7 @@ pub fn plan(e: *Engine, s: *Stream, copied: ?Copy) !Plan {
         p.kind = .forced;
         p.forced = forced;
         p.tokens = forced;
+        try @import("forced_drafts.zig").extend(e, s, &p, queued);
     } else {
         var copy: Copy = .{};
         if (copied) |c| copy = c else if (s.drafts) copy = try copyProposal(e, s);
