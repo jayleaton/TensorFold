@@ -1,169 +1,188 @@
 //! Exact CPU evaluation of one circuit step: token features, SwiGLU units, one-hot DeltaNet heads, output code.
 const std = @import("std");
 const model = @import("runner_circuit_model.zig");
-const State = @import("runner_circuit_state.zig").State;
+const state = @import("runner_circuit_state.zig");
+const flow = @import("runner_circuit_flow.zig");
+const head = @import("runner_circuit_head.zig");
+const ffn = @import("runner_circuit_ffn.zig");
+const Memo = @import("runner_circuit_memo.zig").Memo;
+const State = state.State;
 
 const Scalar = model.Scalar;
 const hd = model.hd;
 
-/// The residual a token starts from: dim 0 is one, each feature dim a function of the token's family and payload.
-pub fn embed(s: *State, token: u32) !void {
+/// The token's feature values: a feature dim holds its last nonzero feature, else zero.
+fn embed(s: *State, token: u32, stamp: u64) !void {
     const c = s.circuit;
     const fam, const pay = c.split(token) orelse return error.CircuitUnknownToken;
-    s.clearResidual();
-    s.x[0] = 1;
-    s.touch(0);
     for (c.features) |f| {
         const v = f.value(fam, pay, c.family_bits);
-        if (v == 0) continue;
-        s.x[f.dim] = v;
-        s.touch(f.dim);
+        if (v != 0) s.x[f.dim] = v;
+    }
+    for (c.flow.feature_dims, c.flow.feature_slots) |d, slot| {
+        set(s, slot, s.x[d], stamp);
+        s.x[d] = 0;
     }
 }
 
-/// Feeds one token through every batch in stored node order and returns the token the output code names.
+/// One token through the circuit in node order; only units marked active run or finish, the rest keep their outputs.
 pub fn step(s: *State, token: u32) !u32 {
     const c = s.circuit;
-    try embed(s, token);
-    for (c.batches) |*b| switch (b.*) {
-        .ffn => |*f| ffn(s, f),
-        .heads => |*h| try heads(s, h),
+    const stamp = s.steps + 1;
+    if (s.force or s.always) {
+        @memset(s.dirty, stamp);
+        for (0..c.flow.units.len) |i| mark(s.active, i);
+    }
+    s.force = false;
+    try embed(s, token, stamp);
+    for (s.active, 0..) |*word, w| while (word.* != 0) {
+        const bit = @ctz(word.*);
+        const i = w * 64 + bit;
+        const u = &c.flow.units[i];
+        if (s.dirty[i] == stamp) s.changed[i] = stamp;
+        if ((s.changed[i] != 0 and stamp - s.changed[i] <= u.lag) or s.unstable[i]) {
+            try run(s, u, i, stamp);
+        } else finish(s, u, i, stamp);
+        // A unit's own outputs may re-mark it while it runs; clearing after the run drops that.
+        word.* &= ~(@as(u64, 1) << @intCast(bit));
+        if ((s.changed[i] != 0 and stamp + 1 - s.changed[i] <= u.lag) or s.unstable[i]) mark(s.keep, i);
     };
+    std.mem.swap([]u64, &s.active, &s.keep);
     s.steps += 1;
-    return decode(c, s.x);
+    return decode(c, s);
 }
 
-fn commit(s: *State, outs: []const model.Out, values: []const Scalar) void {
-    for (outs, values) |o, v| {
-        s.x[o.dim] = if (o.into) s.x[o.dim] + v else v;
-        s.touch(o.dim);
+fn mark(bits: []u64, i: usize) void {
+    bits[i / 64] |= @as(u64, 1) << @intCast(i % 64);
+}
+
+/// A slot takes a new value; units reading it rerun this step when its bits change and keep their nonzero inputs.
+fn set(s: *State, slot: u32, v: Scalar, stamp: u64) void {
+    if (@as(u32, @bitCast(v)) == @as(u32, @bitCast(s.val[slot]))) return;
+    s.val[slot] = v;
+    const f = &s.circuit.flow;
+    const lo = f.reader_starts[slot];
+    const hi = f.reader_starts[slot + 1];
+    for (f.readers[lo..hi], f.reader_local[lo..hi], f.reader_off[lo..hi]) |r, j, off| {
+        s.dirty[r] = stamp;
+        mark(s.active, r);
+        const was = s.in_vals[off + j] != 0;
+        s.in_vals[off + j] = v;
+        if (was != (v != 0)) s.in_bits[(off + j) / 64] ^= @as(u64, 1) << @intCast((off + j) % 64);
+    }
+    const blo = f.base_starts[slot];
+    const bhi = f.base_starts[slot + 1];
+    for (f.base_readers[blo..bhi], f.base_out[blo..bhi], f.base_first[blo..bhi]) |r, k, first| queue(s, r, first, k, stamp);
+}
+
+/// Queues output k of unit r (first output slot `first`) to be finished this step: its value or base changed.
+fn queue(s: *State, r: u32, first: u32, k: u32, stamp: u64) void {
+    if (s.rb_mark[first + k] == stamp) return;
+    s.rb_mark[first + k] = stamp;
+    mark(s.active, r);
+    if (s.rebase[r] != stamp) {
+        s.rebase[r] = stamp;
+        s.rb_len[r] = 0;
+    }
+    s.rb[first + s.rb_len[r]] = k;
+    s.rb_len[r] += 1;
+}
+
+/// Sets every queued output of unit i: its value plus its base, or for a chain end the fold of its links in order.
+fn finish(s: *State, u: *const flow.Unit, i: usize, stamp: u64) void {
+    if (s.rebase[i] != stamp) return;
+    const f = &s.circuit.flow;
+    const first = u.outs[0];
+    var at: usize = 0;
+    while (at < s.rb_len[i]) : (at += 1) {
+        const k = s.rb[first + at];
+        const sl = first + k;
+        var v: Scalar = undefined;
+        if (f.chain_len[sl] > 0) {
+            const links = f.chain_links[f.chain_start[sl]..][0..f.chain_len[sl]];
+            const b = f.chain_base[sl];
+            v = if (b == flow.no_slot) s.pre[links[0]] else s.val[b] + s.pre[links[0]];
+            for (links[1..]) |l| v = v + s.pre[l];
+        } else {
+            const b = u.base[k];
+            v = if (b == flow.no_slot) s.pre[sl] else s.val[b] + s.pre[sl];
+        }
+        set(s, sl, v, stamp);
     }
 }
 
-/// Silent units (gate <= 0) add exactly zero; each form's units are sorted by constant, so the walk stops early.
-fn ffn(s: *State, f: *const model.Ffn) void {
-    const y = s.work[0..f.outs.len];
-    const up = s.work[f.outs.len..][0..f.up.forms.outputs];
-    const gate = s.work[f.outs.len + up.len ..][0..f.gate.forms.outputs];
-    @memset(y, 0);
-    f.up.forms.apply(s.x, s.active.items, up);
-    f.gate.forms.apply(s.x, s.active.items, gate);
-    for (gate, f.starts[0 .. f.starts.len - 1], f.starts[1..]) |v, lo, hi| for (f.order[lo..hi]) |t| {
-        const g = f.gate.bias[t] + v;
-        if (!(g > 0)) break;
-        unit(f, t, g, up, y);
-    };
-    for (f.always) |t| unit(f, t, f.gate.bias[t], up, y);
-    commit(s, f.outs, y);
-}
-
-fn unit(f: *const model.Ffn, t: u32, g: Scalar, up: []const Scalar, y: []Scalar) void {
-    const uf = f.up.form[t];
-    const u = if (uf == model.no_form) f.up.bias[t] else f.up.bias[t] + up[uf];
-    y[f.slot[t]] += f.coef[t] * u * g;
-}
-
-fn heads(s: *State, h: *const model.Heads) !void {
-    const width = h.proj.columns();
-    const p = s.work[0..width];
-    const values = s.work[width..][0..h.outs.len];
-    const rest = s.work[width + h.outs.len ..];
-    const v = rest[2 * hd .. 3 * hd];
-    const z = rest[3 * hd .. 4 * hd];
-    const o = rest[4 * hd .. 5 * hd];
-    h.proj.eval(s.x, s.active.items, rest[5 * hd ..][0..h.proj.forms.outputs], p);
-    for (p[0..h.channels], h.taps, 0..) |*e, t, i| {
-        const past = s.channelHistory(h.first_channel + @as(u32, @intCast(i)));
-        const now = e.*;
-        e.* = @max(t[0] * now + t[1] * past[0] + t[2] * past[1] + t[3] * past[2], 0);
-        past[2] = past[1];
-        past[1] = past[0];
-        past[0] = now;
-    }
-    for (h.heads) |*head| {
-        var key: ?u32 = null;
-        for (head.k) |k| if (p[k.column] > 0) {
-            if (key != null) return error.CircuitKeyNotOneHot;
-            key = k.at;
-        };
-        var rows: [hd]u32 = undefined;
-        var n: usize = 0;
-        for (head.q) |q| if (p[q.column] > 0) {
-            rows[n] = q.at;
+/// Gathers a unit's nonzero inputs, ascending, into s.x, s.nz (dims) and s.local (input indices); returns their count.
+fn nonzeros(s: *State, u: *const flow.Unit) usize {
+    const lo = u.in_off;
+    const hi = lo + u.dims.len;
+    var n: usize = 0;
+    var w = lo / 64;
+    while (w * 64 < hi) : (w += 1) {
+        var bits = s.in_bits[w];
+        if (w * 64 < lo) bits &= ~@as(u64, 0) << @intCast(lo % 64);
+        if ((w + 1) * 64 > hi) bits &= (@as(u64, 1) << @intCast(hi % 64)) - 1;
+        while (bits != 0) : (bits &= bits - 1) {
+            const j: u32 = @intCast(w * 64 + @ctz(bits) - lo);
+            const d = u.dims[j];
+            s.x[d] = s.in_vals[lo + j];
+            s.nz[n] = d;
+            s.local[n] = j;
             n += 1;
-        };
-        for (head.value_heads) |*vh| {
-            if (vh.a) |col| try decay(s, vh.table, p[col]);
-            if (key) |r| if (try writeEnabled(vh.beta, p)) {
-                scatter(vh.v, p, v, false);
-                try s.writeRow(vh.table, r, v);
-            };
-            const out = values[vh.out_first..][0..vh.out_cols.len];
-            if (!try read(s, vh.table, rows[0..n], o)) {
-                @memset(out, 0);
-                continue;
-            }
-            scatter(vh.z, p, z, true);
-            for (vh.out_cols, vh.out_w, out) |col, w, *y| y.* = o[col] * z[col] * w;
         }
     }
-    commit(s, h.outs, values);
+    return n;
 }
 
-fn scatter(picks: []const model.Pick, p: []const Scalar, into: []Scalar, rectify: bool) void {
-    @memset(into, 0);
-    for (picks) |k| into[k.at] = if (rectify) @max(p[k.column], 0) else p[k.column];
-}
-
-/// beta: absent is 1; 1 writes, an integer <= 0 does not, anything else breaks the circuit's exact range.
-fn writeEnabled(beta: ?u32, p: []const Scalar) !bool {
-    const b = p[beta orelse return true];
-    if (b == 1) return true;
-    if (b <= 0 and b == @round(b)) return false;
-    return error.CircuitWriteGate;
-}
-
-fn decay(s: *State, table: u32, selector: Scalar) !void {
-    if (selector == model.keep_selector) return;
-    if (!s.writable(table)) return error.CircuitTableReadOnly;
-    if (selector == model.halve_selector) {
-        var live = s.present[table];
-        while (live != 0) : (live &= live - 1) {
-            for (s.row(table, @ctz(live))) |*e| e.* *= 0.5;
+fn run(s: *State, u: *const flow.Unit, i: usize, stamp: u64) !void {
+    const n = nonzeros(s, u);
+    const list = s.local[0..n];
+    const nz = s.nz[0..n];
+    defer for (nz) |d| {
+        s.x[d] = 0;
+    };
+    const values = switch (u.kind) {
+        .ffn => try ffnCached(s, &s.circuit.flow.ffn_plans[u.plan], i, nz, list),
+        .heads => try head.run(s, &s.circuit.flow.plans[u.plan], i, nz, list),
+    };
+    if (u.outs.len == 0) return;
+    const f = &s.circuit.flow;
+    const first = u.outs[0];
+    const pre = s.pre[first..][0..u.outs.len];
+    if (!std.mem.eql(u32, @ptrCast(pre), @ptrCast(values))) for (values, pre, 0..) |v, *p, k| {
+        if (@as(u32, @bitCast(v)) == @as(u32, @bitCast(p.*))) continue;
+        p.* = v;
+        const sl = first + @as(u32, @intCast(k));
+        if (!f.elided[sl]) {
+            queue(s, @intCast(i), first, @intCast(k), stamp);
+            continue;
         }
-        return;
-    }
-    if (selector != model.clear_selector) return error.CircuitDecaySelector;
-    @memset(s.tables[table], 0);
-    s.present[table] = 0;
+        const end = f.chain_end[sl];
+        const r = f.slot_unit[end];
+        const end_first = f.units[r].outs[0];
+        queue(s, r, end_first, end - end_first, stamp);
+    };
+    finish(s, u, i, stamp);
 }
 
-/// Sum of the rows a multi-hot query selects over the ballast norm o / sqrt((o0^2 + o1^2) / hd); false if none.
-fn read(s: *State, table: u32, rows: []const u32, o: []Scalar) !bool {
-    var any = false;
-    for (rows) |r| {
-        if (!s.rowPresent(table, r)) continue;
-        if (!any) @memset(o, 0);
-        for (o, s.row(table, r)) |*a, b| a.* += b;
-        any = true;
-    }
-    if (!any) return false;
-    const ref = o[0] * o[0] + o[1] * o[1];
-    if (ref == 0) {
-        for (o) |a| if (a != 0) return error.CircuitReadBallast;
-        return false;
-    }
-    const norm = @sqrt(ref / @as(Scalar, hd));
-    for (o) |*a| a.* /= norm;
-    return true;
+/// An FFN part is a pure function of its nonzero inputs: a memo hit returns the outputs it computed for them.
+fn ffnCached(s: *State, p: *const ffn.Plan, i: usize, nz: []const u32, local: []const u32) ![]const Scalar {
+    if (s.always) return ffn.run(s, p, nz);
+    const key = s.key[0..nz.len];
+    for (key, nz, local) |*k, d, j| k.* = @as(u64, j) << 32 | @as(u32, @bitCast(s.x[d]));
+    const h = Memo.hash(key);
+    if (s.memos[i].find(key, h)) |words| return @ptrCast(words);
+    const y = ffn.run(s, p, nz);
+    try s.memos[i].put(s.gpa, key, h, @ptrCast(y));
+    return y;
 }
 
 /// The output code: family bits then 16 payload bits, each the sign of a code dim (+kappa is 1, -kappa is 0).
-pub fn decode(c: *const model.Circuit, x: []const Scalar) !u32 {
+pub fn decode(c: *const model.Circuit, s: *const State) !u32 {
     var code: u64 = 0;
-    for (c.code_dims, 0..) |d, i| {
-        if (x[d] == 0 or !std.math.isFinite(x[d])) return error.CircuitOutputCode;
-        code |= @as(u64, @intFromBool(x[d] > 0)) << @intCast(i);
+    for (c.flow.code, 0..) |slot, i| {
+        const v = s.val[slot];
+        if (v == 0 or !std.math.isFinite(v)) return error.CircuitOutputCode;
+        code |= @as(u64, @intFromBool(v > 0)) << @intCast(i);
     }
     const mask = (@as(u64, 1) << @intCast(c.family_bits)) - 1;
     const fam = code & mask;

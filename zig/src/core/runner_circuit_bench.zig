@@ -1,4 +1,4 @@
-//! CPU steps/s of the circuit evaluator: boots a calc expression and runs it to HALT, repeated.
+//! CPU steps/s of the circuit evaluator: boots a calc expression (or an .elf file) and runs it to HALT, repeated.
 const std = @import("std");
 const rc = @import("runner_circuit.zig");
 
@@ -6,7 +6,7 @@ pub fn main(init: std.process.Init) !u8 {
     const gpa = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     if (argv.len < 3) {
-        std.debug.print("usage: runner-circuit-bench <circuit> <expression> [repeats]\n", .{});
+        std.debug.print("usage: runner-circuit-bench <circuit> <expression | image.elf> [repeats]\n", .{});
         return 2;
     }
     const repeats = if (argv.len > 3) try std.fmt.parseInt(u32, argv[3], 10) else 3;
@@ -15,9 +15,11 @@ pub fn main(init: std.process.Init) !u8 {
     defer c.deinit(gpa);
     std.debug.print("loaded {d} dims, {d} nodes, {d} batches, {d} tables, {d} nonzeros in {d} ms\n", .{ c.dims, c.nodes, c.batches.len, c.tables.len, c.nonzeros(), (rc.nowNs() - t_load) / std.time.ns_per_ms });
     var cancel: std.atomic.Value(bool) = .init(false);
+    const is_elf = std.mem.endsWith(u8, argv[2], ".elf");
+    const bytes = if (is_elf) try std.Io.Dir.cwd().readFileAlloc(init.io, argv[2], init.arena.allocator(), .limited(1 << 26)) else argv[2];
     for (0..repeats) |_| {
         const t0 = rc.nowNs();
-        var m = try rc.Machine.boot(gpa, &c, .{ .kind = .calc, .bytes = argv[2] });
+        var m = try rc.Machine.boot(gpa, &c, .{ .kind = if (is_elf) .elf else .calc, .bytes = bytes });
         defer m.deinit(gpa);
         const t1 = rc.nowNs();
         var out: std.ArrayList(u8) = .empty;

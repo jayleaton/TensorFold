@@ -178,3 +178,35 @@ test "golden: booting the circuit's own program image as an ELF reproduces its e
         return error.ImageBootMismatch;
     }
 }
+
+test "golden: on the real circuit, skipping unchanged units equals running every unit, token and snapshot" {
+    const circuit_path = env("TF_RUNNER_CIRCUIT") orelse {
+        std.debug.print("skip skip-equivalence: TF_RUNNER_CIRCUIT unset\n", .{});
+        return error.SkipZigTest;
+    };
+    var circuit = try rc.Circuit.load(gpa, circuit_path);
+    defer circuit.deinit(gpa);
+    if (circuit.program.kind != .calc) return error.SkipZigTest;
+    const expr = "123456789012345678901234567890*987654321098765432109876543210";
+    var lazy = try rc.Machine.boot(gpa, &circuit, .{ .kind = .calc, .bytes = expr });
+    defer lazy.deinit(gpa);
+    var full = try rc.Machine.boot(gpa, &circuit, .{ .kind = .calc, .bytes = expr });
+    defer full.deinit(gpa);
+    full.state.always = true;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var steps: u64 = 0;
+    while (!lazy.halted and steps < 2400) : (steps += 1) {
+        _ = try lazy.run(1, &out, null, &cancel);
+        _ = try full.run(1, &out, null, &cancel);
+        try std.testing.expectEqual(full.next, lazy.next);
+        if (steps % 300 != 7 and !lazy.halted) continue;
+        const want = try full.snapshot(gpa);
+        defer gpa.free(want);
+        const got = try lazy.snapshot(gpa);
+        defer gpa.free(got);
+        try std.testing.expect(std.mem.eql(u8, want, got));
+    }
+    try std.testing.expect(lazy.halted);
+}

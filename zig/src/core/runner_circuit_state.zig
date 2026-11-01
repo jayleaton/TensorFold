@@ -1,6 +1,8 @@
-//! Per-machine circuit state: the DeltaNet tables (the RAM op's rows), per-channel conv history and canonical bytes.
+//! Per-machine circuit state: the DeltaNet tables (the RAM op's rows), slot values, head frames and canonical bytes.
 const std = @import("std");
 const model = @import("runner_circuit_model.zig");
+const head = @import("runner_circuit_head.zig");
+const Memo = @import("runner_circuit_memo.zig").Memo;
 
 const Scalar = model.Scalar;
 const hd = model.hd;
@@ -14,71 +16,130 @@ pub const State = struct {
     tables: [][]Scalar,
     owned: []bool,
     present: []u128,
-    history: []Scalar,
     steps: u64 = 0,
+    /// Each slot's value as of the last step that computed it.
+    val: []Scalar,
+    /// Per unit: the step stamp (step + 1) it was marked dirty, its inputs last changed, an output base changed.
+    dirty: []u64,
+    changed: []u64,
+    rebase: []u64,
+    /// Per output slot: the unit's value before adding its base, so a base change alone just adds again.
+    pre: []Scalar,
+    /// Per unit: the outputs whose base changed this step (stored at the unit's first output slot).
+    rb: []u32,
+    rb_len: []u32,
+    rb_mark: []u64,
+    /// Per unit input (at the unit's in_off): its slot's value and a bit set while the value is nonzero.
+    in_vals: []Scalar,
+    in_bits: []u64,
+    /// Per unit: its last run decayed a table, so the next step must run it again.
+    unstable: []bool,
+    /// Units to visit this step and those already due next step (lag window open or unstable), one bit each.
+    active: []u64,
+    keep: []u64,
+    /// Per unit: its last runs' inputs (heads) and its results by exact input.
+    frames: [][head.frames_per_unit]head.Frame,
+    memos: []Memo,
+    /// Dense input scratch, zero outside a running unit; the same for steps t-1..t-3 while a head reads them.
     x: []Scalar,
-    active: std.ArrayList(u32),
-    seen: []bool,
+    past: [history][]Scalar,
+    /// A running unit's nonzero dims, its memo key, selecting dims and the input index of each nonzero dim.
+    nz: []u32,
+    key: []u64,
+    nz2: []u32,
+    local: []u32,
+    words: []u32,
     work: []Scalar,
+    /// FFN parts' form values and node outputs of their last compute.
+    ffn_up: []Scalar,
+    ffn_gate: []Scalar,
+    ffn_y: []Scalar,
+    /// Run every unit on the next step (a fresh machine or a host edit of the tables).
+    force: bool = true,
+    /// Run every unit on every step without its memo (the reference the skipping is checked against).
+    always: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, c: *const model.Circuit) !State {
-        const tables = try gpa.alloc([]Scalar, c.tables.len);
-        errdefer gpa.free(tables);
-        var copied: usize = 0;
-        errdefer for (c.tables[0..copied], tables[0..copied]) |t, s| if (t.writable) gpa.free(s);
-        for (c.tables, tables) |t, *s| {
-            s.* = if (t.writable) try gpa.dupe(Scalar, t.rows) else @constCast(t.rows);
-            copied += 1;
-        }
-        const owned = try gpa.alloc(bool, c.tables.len);
-        errdefer gpa.free(owned);
-        for (c.tables, owned) |t, *o| o.* = t.writable;
-        const present = try gpa.alloc(u128, c.tables.len);
-        errdefer gpa.free(present);
-        for (c.tables, present) |t, *p| p.* = t.present;
-        const hist = try gpa.alloc(Scalar, @as(usize, c.channels) * history);
-        errdefer gpa.free(hist);
-        @memset(hist, 0);
-        const x = try gpa.alloc(Scalar, c.dims);
-        errdefer gpa.free(x);
-        @memset(x, 0);
-        const seen = try gpa.alloc(bool, c.dims);
-        errdefer gpa.free(seen);
-        @memset(seen, false);
-        var active: std.ArrayList(u32) = .empty;
-        try active.ensureTotalCapacity(gpa, c.dims);
-        errdefer active.deinit(gpa);
-        const work = try gpa.alloc(Scalar, workSize(c));
-        return .{ .gpa = gpa, .circuit = c, .tables = tables, .owned = owned, .present = present, .history = hist, .x = x, .active = active, .seen = seen, .work = work };
+        var s: State = .{ .gpa = gpa, .circuit = c, .tables = &.{}, .owned = &.{}, .present = &.{}, .val = &.{}, .dirty = &.{}, .changed = &.{}, .rebase = &.{}, .pre = &.{}, .rb = &.{}, .rb_len = &.{}, .rb_mark = &.{}, .in_vals = &.{}, .in_bits = &.{}, .unstable = &.{}, .active = &.{}, .keep = &.{}, .frames = &.{}, .memos = &.{}, .x = &.{}, .past = @splat(&.{}), .nz = &.{}, .key = &.{}, .nz2 = &.{}, .local = &.{}, .words = &.{}, .work = &.{}, .ffn_up = &.{}, .ffn_gate = &.{}, .ffn_y = &.{} };
+        errdefer s.deinit();
+        const f = &c.flow;
+        const n = f.units.len;
+        s.owned = try zeroed(gpa, bool, c.tables.len);
+        s.tables = try gpa.alloc([]Scalar, c.tables.len);
+        for (c.tables, s.tables) |t, *rows| rows.* = @constCast(t.rows);
+        s.present = try gpa.alloc(u128, c.tables.len);
+        for (c.tables, s.present) |t, *p| p.* = t.present;
+        for (c.tables, 0..) |t, i| if (t.writable) try s.own(@intCast(i));
+        s.val = try zeroed(gpa, Scalar, f.slots);
+        s.dirty = try zeroed(gpa, u64, n);
+        s.changed = try zeroed(gpa, u64, n);
+        s.rebase = try zeroed(gpa, u64, n);
+        s.pre = try zeroed(gpa, Scalar, f.slots);
+        s.rb = try zeroed(gpa, u32, f.slots);
+        s.rb_len = try zeroed(gpa, u32, n);
+        s.rb_mark = try zeroed(gpa, u64, f.slots);
+        s.in_vals = try zeroed(gpa, Scalar, f.total_ins);
+        s.in_bits = try zeroed(gpa, u64, f.total_ins / 64 + 1);
+        s.unstable = try zeroed(gpa, bool, n);
+        s.active = try zeroed(gpa, u64, n / 64 + 1);
+        s.keep = try zeroed(gpa, u64, n / 64 + 1);
+        s.frames = try gpa.alloc([head.frames_per_unit]head.Frame, n);
+        for (s.frames) |*fs| fs.* = @splat(.{});
+        s.memos = try gpa.alloc(Memo, n);
+        for (s.memos) |*m| m.* = .{};
+        s.x = try zeroed(gpa, Scalar, c.dims);
+        for (&s.past) |*p| p.* = try zeroed(gpa, Scalar, c.dims);
+        s.nz = try gpa.alloc(u32, f.max_dims);
+        s.key = try gpa.alloc(u64, f.max_dims);
+        s.nz2 = try gpa.alloc(u32, f.max_dims);
+        s.local = try gpa.alloc(u32, f.max_dims);
+        s.words = try gpa.alloc(u32, wordsSize(c));
+        s.work = try gpa.alloc(Scalar, workSize(c));
+        s.ffn_up = try zeroed(gpa, Scalar, f.ffn_totals[0]);
+        s.ffn_gate = try zeroed(gpa, Scalar, f.ffn_totals[1]);
+        s.ffn_y = try zeroed(gpa, Scalar, f.ffn_totals[2]);
+        return s;
     }
 
     pub fn deinit(s: *State) void {
-        for (s.owned, s.tables) |o, rows| if (o) s.gpa.free(rows);
+        if (s.owned.len == s.tables.len) for (s.owned, s.tables) |o, rows| if (o) s.gpa.free(rows);
         s.gpa.free(s.tables);
         s.gpa.free(s.owned);
         s.gpa.free(s.present);
-        s.gpa.free(s.history);
+        s.gpa.free(s.val);
+        s.gpa.free(s.dirty);
+        s.gpa.free(s.changed);
+        s.gpa.free(s.rebase);
+        s.gpa.free(s.pre);
+        s.gpa.free(s.rb);
+        s.gpa.free(s.rb_len);
+        s.gpa.free(s.rb_mark);
+        s.gpa.free(s.in_vals);
+        s.gpa.free(s.in_bits);
+        s.gpa.free(s.unstable);
+        s.gpa.free(s.active);
+        s.gpa.free(s.keep);
+        for (s.frames) |*fs| for (fs) |*fr| fr.deinit(s.gpa);
+        s.gpa.free(s.frames);
+        for (s.memos) |*m| m.deinit(s.gpa);
+        s.gpa.free(s.memos);
         s.gpa.free(s.x);
-        s.gpa.free(s.seen);
-        s.active.deinit(s.gpa);
+        for (s.past) |p| s.gpa.free(p);
+        s.gpa.free(s.nz);
+        s.gpa.free(s.key);
+        s.gpa.free(s.nz2);
+        s.gpa.free(s.local);
+        s.gpa.free(s.words);
         s.gpa.free(s.work);
+        s.gpa.free(s.ffn_up);
+        s.gpa.free(s.ffn_gate);
+        s.gpa.free(s.ffn_y);
         s.* = undefined;
     }
 
-    /// Zeroes the residual for a new step; only listed dims can be nonzero.
-    pub fn clearResidual(s: *State) void {
-        for (s.active.items) |d| {
-            s.x[d] = 0;
-            s.seen[d] = false;
-        }
-        s.active.clearRetainingCapacity();
-    }
-
-    /// Lists dim d as possibly nonzero (capacity is the dim count, so this never allocates).
-    pub fn touch(s: *State, d: u32) void {
-        if (s.seen[d]) return;
-        s.seen[d] = true;
-        s.active.appendAssumeCapacity(d);
+    /// Dim d's value at the end of the last step (the residual a dense evaluator would hold).
+    pub fn value(s: *const State, d: u32) Scalar {
+        return s.val[s.circuit.flow.final[d]];
     }
 
     pub fn writable(s: *const State, table: u32) bool {
@@ -115,21 +176,23 @@ pub const State = struct {
         s.present[table] &= ~(@as(u128, 1) << @intCast(r));
     }
 
-    /// The last three pre-convolution projections of global channel i, newest first.
-    pub fn channelHistory(s: *State, i: u32) *[history]Scalar {
-        return s.history[i * history ..][0..history];
-    }
-
-    /// Bytes this machine owns beyond the shared circuit (copied tables, history, scratch), for admission.
+    /// Bytes this machine owns beyond the shared circuit (copied tables, scratch, frames and memos), for admission.
     pub fn ownedBytes(s: *const State) usize {
-        var n: usize = (s.history.len + s.x.len + s.work.len) * @sizeOf(Scalar);
+        var n: usize = (s.x.len * (1 + history) + s.work.len + s.val.len) * @sizeOf(Scalar) + s.dirty.len * 17;
         for (s.owned) |o| n += if (o) table_floats * @sizeOf(Scalar) else 0;
+        for (s.frames) |fs| for (fs) |fr| {
+            n += fr.dims.capacity * 4 + fr.vals.capacity * 4 + fr.words.capacity * 4;
+        };
+        for (s.memos) |m| for (m.entries) |e| {
+            n += e.key.capacity * 8 + e.words.capacity * 4;
+        };
         return n;
     }
 
-    /// Canonical bytes: steps, then every table and every channel history as binary64 LE, absent rows as zeros.
+    /// Canonical bytes: steps, then every table and every channel's last three projections as binary64 LE.
     pub fn canonical(s: *const State, gpa: std.mem.Allocator) ![]u8 {
-        const n = 8 + (s.tables.len * table_floats + s.history.len) * 8;
+        const c = s.circuit;
+        const n = 8 + (s.tables.len * table_floats + @as(usize, c.channels) * history) * 8;
         const out = try gpa.alloc(u8, n);
         std.mem.writeInt(u64, out[0..8], s.steps, .little);
         var at: usize = 8;
@@ -141,20 +204,33 @@ pub const State = struct {
                 at += 8;
             }
         };
-        for (s.history) |v| {
-            const w: f64 = v;
-            std.mem.writeInt(u64, out[at..][0..8], @bitCast(w + 0), .little);
-            at += 8;
-        }
+        const scratch: *State = @constCast(s);
+        for (c.flow.units, 0..) |u, i| if (u.kind == .heads) head.history(scratch, &c.flow.plans[u.plan], i, out, &at);
+        std.debug.assert(at == n);
         return out;
     }
 };
 
+fn zeroed(gpa: std.mem.Allocator, comptime T: type, n: usize) ![]T {
+    const out = try gpa.alloc(T, n);
+    @memset(out, std.mem.zeroes(T));
+    return out;
+}
+
+fn wordsSize(c: *const model.Circuit) usize {
+    var n: usize = 0;
+    for (c.flow.units) |u| n = @max(n, switch (u.kind) {
+        .ffn => |f| f.outs.len,
+        .heads => |h| 2 + 2 * (h.heads[0].q.len + h.heads[0].k.len + h.heads[0].value_heads.len),
+    });
+    return n;
+}
+
 fn workSize(c: *const model.Circuit) usize {
     var n: usize = 0;
-    for (c.batches) |*b| n = @max(n, switch (b.*) {
-        .ffn => |*f| f.outs.len + f.up.forms.outputs + f.gate.forms.outputs,
-        .heads => |*h| h.proj.columns() + h.outs.len + 5 * hd + h.proj.forms.outputs,
+    for (c.flow.units) |u| n = @max(n, switch (u.kind) {
+        .ffn => |f| f.outs.len,
+        .heads => |h| @max(h.outs.len + hd + c.flow.plans[u.plan].zrep.len, c.flow.plans[u.plan].sel.columns() + c.flow.plans[u.plan].sel.forms.outputs),
     });
     return n;
 }

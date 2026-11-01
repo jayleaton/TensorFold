@@ -17,6 +17,7 @@ test {
     _ = @import("runner_circuit_golden_test.zig");
     _ = @import("runner_circuit_backend.zig");
     _ = @import("runner_circuit_rom.zig");
+    _ = @import("runner_circuit_memo.zig");
 }
 
 fn tinyCircuit(variant: tiny.Variant) !model.Circuit {
@@ -74,7 +75,7 @@ test "a one-hot write is the gated delta rule at beta 1, and reads return the ro
     const Read = struct { row: u32, bit: u32 };
     for ([_]Read{ .{ .row = 1, .bit = 1 }, .{ .row = 2, .bit = 0 }, .{ .row = 3, .bit = 1 } }) |r| {
         try std.testing.expectEqual(tok(4, '0' + r.bit), try eval.step(&s, tok(3, r.row)));
-        try std.testing.expectEqual(@as(model.Scalar, @floatFromInt(r.bit)), s.x[tiny.dims.rd]);
+        try std.testing.expectEqual(@as(model.Scalar, @floatFromInt(r.bit)), s.value(tiny.dims.rd));
     }
     _ = try eval.step(&s, tok(2, 3));
     try std.testing.expectEqual(tok(4, '0'), try eval.step(&s, tok(3, 3)));
@@ -121,7 +122,7 @@ test "a lag-1 tap keys on the previous token, a clear decay empties the table, h
     const seq = [_]Step{ .{ .t = tok(1, 0), .lag = 0 }, .{ .t = tok(2, 0), .lag = 0 }, .{ .t = tok(1, 0), .lag = 1 }, .{ .t = tok(1, 0), .lag = 1 }, .{ .t = tok(4, 'h'), .lag = 0 }, .{ .t = tok(1, 0), .lag = 0 } };
     for (seq) |st| {
         _ = try eval.step(&s, st.t);
-        try std.testing.expectEqual(st.lag, s.x[tiny.dims.lagout]);
+        try std.testing.expectEqual(st.lag, s.value(tiny.dims.lagout));
     }
     try std.testing.expectEqual(@as(u128, 0), s.present[0]);
     try std.testing.expectEqual(@as(u128, 1), s.present[1]);
@@ -136,8 +137,50 @@ test "a lag-3 tap sees the projection three steps back, not a newer one" {
     const want = [_]model.Scalar{ 0, 0, 0, 1, 1 };
     for (seq, want) |t, w| {
         _ = try eval.step(&s, t);
-        try std.testing.expectEqual(w, s.x[tiny.dims.lag3out]);
+        try std.testing.expectEqual(w, s.value(tiny.dims.lag3out));
     }
+}
+
+test "skipping units whose inputs did not change gives the tokens and snapshots of running every unit" {
+    var c = try tinyCircuit(.good);
+    defer c.deinit(gpa);
+    var lazy = try rc.State.init(gpa, &c);
+    defer lazy.deinit();
+    var full = try rc.State.init(gpa, &c);
+    defer full.deinit();
+    full.always = true;
+    const seq = [_]u32{ c.go, tok(2, 1 | 4), tok(2, 1 | 4), tok(1, 0), tok(1, 0), tok(1, 0), tok(1, 0), tok(3, 1), tok(3, 1), tok(2, 2), tok(3, 2), tok(4, 'h'), tok(4, 'h'), tok(1, 0), tok(2, 0), tok(2, 0), tok(1, 0), tok(1, 0), tok(1, 0), tok(3, 3), tok(1, 0) };
+    var skipped: usize = 0;
+    for (seq) |t| {
+        try std.testing.expectEqual(try eval.step(&full, t), try eval.step(&lazy, t));
+        for (lazy.dirty, lazy.changed) |d, ch| skipped += @intFromBool(d != lazy.steps and ch != lazy.steps);
+        const want = try full.canonical(gpa);
+        defer gpa.free(want);
+        const got = try lazy.canonical(gpa);
+        defer gpa.free(got);
+        try std.testing.expectEqualSlices(u8, want, got);
+    }
+    try std.testing.expect(skipped > 0);
+}
+
+test "a halving head reruns on unchanged inputs: its table halves every step, as running every unit does" {
+    var c = try tinyCircuit(.halving);
+    defer c.deinit(gpa);
+    var lazy = try rc.State.init(gpa, &c);
+    defer lazy.deinit();
+    var full = try rc.State.init(gpa, &c);
+    defer full.deinit();
+    full.always = true;
+    const seq = [_]u32{ tok(2, 1 | 4), tok(1, 0), tok(1, 0), tok(1, 0), tok(1, 0) };
+    for (seq) |t| {
+        try std.testing.expectEqual(try eval.step(&full, t), try eval.step(&lazy, t));
+        const want = try full.canonical(gpa);
+        defer gpa.free(want);
+        const got = try lazy.canonical(gpa);
+        defer gpa.free(got);
+        try std.testing.expectEqualSlices(u8, want, got);
+    }
+    try std.testing.expectEqual(@as(model.Scalar, 16777216.0 / 16.0), lazy.row(3, 1)[0]);
 }
 
 test "a node that reads a dim written earlier in stored order sees the write" {
@@ -147,8 +190,8 @@ test "a node that reads a dim written earlier in stored order sees the write" {
     var s = try rc.State.init(gpa, &c);
     defer s.deinit();
     _ = try eval.step(&s, tok(1, 0));
-    try std.testing.expectEqual(@as(model.Scalar, 1), s.x[tiny.dims.t1]);
-    try std.testing.expectEqual(@as(model.Scalar, 1), s.x[tiny.dims.t2]);
+    try std.testing.expectEqual(@as(model.Scalar, 1), s.value(tiny.dims.t1));
+    try std.testing.expectEqual(@as(model.Scalar, 1), s.value(tiny.dims.t2));
 }
 
 test "a machine boots the calc input as RAM data and runs to HALT under a step budget and a cancel flag" {

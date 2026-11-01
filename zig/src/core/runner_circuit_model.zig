@@ -72,6 +72,8 @@ pub const Ffn = struct {
     starts: []const u32,
     /// Terms whose gate is a positive constant; terms with a constant gate <= 0 never fire and are dropped.
     always: []const u32,
+    /// The batch's independent parts in node order (the CPU skips parts whose inputs did not change).
+    split: []const Ffn = &.{},
 };
 
 /// (row or column, projection column) of a channel or expression.
@@ -102,6 +104,8 @@ pub const Heads = struct {
     taps: []const [lags]Scalar,
     heads: []const Head,
     outs: []const Out,
+    /// The same heads one per Heads, with their own forms and the batch's channel and table numbers.
+    split: []const Heads = &.{},
 };
 
 pub const Batch = union(enum) { ffn: Ffn, heads: Heads };
@@ -182,6 +186,8 @@ pub const Circuit = struct {
     channels: u32,
     nodes: u32,
     program: Program,
+    /// The CPU evaluator's dataflow over the batches.
+    flow: @import("runner_circuit_flow.zig").Flow,
     payload_sha256: [32]u8,
     arena: std.heap.ArenaAllocator,
 

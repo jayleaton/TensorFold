@@ -109,7 +109,7 @@ fn compile(a: std.mem.Allocator, tmp: std.mem.Allocator, doc: *const Doc) !model
     var b: Builder = .{ .a = a, .tmp = tmp, .dims = dims };
     for (doc.nodes) |*n| try b.node(n);
     try b.flush();
-    return .{
+    var c: model.Circuit = .{
         .dims = dims,
         .batches = b.batches.items,
         .features = try features(a, doc, dims, @intCast(families.len)),
@@ -127,9 +127,12 @@ fn compile(a: std.mem.Allocator, tmp: std.mem.Allocator, doc: *const Doc) !model
         .channels = b.channels,
         .nodes = @intCast(doc.nodes.len),
         .program = try program(a, doc, b.names.items, b.tables.items),
+        .flow = undefined,
         .payload_sha256 = undefined,
         .arena = undefined,
     };
+    c.flow = try @import("runner_circuit_flow.zig").build(a, &c);
+    return c;
 }
 
 fn features(a: std.mem.Allocator, doc: *const Doc, dims: u32, n_families: u32) ![]model.Feature {
@@ -275,19 +278,46 @@ const Builder = struct {
 
     fn flush(b: *Builder) !void {
         if (b.pending.items.len == 0) return;
-        const batch: model.Batch = if (b.pending_heads) .{ .heads = try b.headBatch() } else .{ .ffn = try b.ffnBatch() };
+        const batch: model.Batch = if (b.pending_heads) .{ .heads = try b.headBatch() } else .{ .ffn = try b.ffnSplit() };
         try b.batches.append(b.a, batch);
         b.pending.clearRetainingCapacity();
         b.written.unsetAll();
     }
 
-    fn ffnBatch(b: *Builder) !model.Ffn {
+    /// The batch as one Ffn (the device layout) plus its independent parts: nodes sharing no dim read or written.
+    fn ffnSplit(b: *Builder) !model.Ffn {
+        const nodes = b.pending.items;
+        var whole = try b.ffnBatch(nodes);
+        const root = try b.tmp.alloc(u32, nodes.len);
+        for (root, 0..) |*r, i| r.* = @intCast(i);
+        var owner: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+        for (nodes, 0..) |n, i| {
+            var dims: std.ArrayList(u32) = .empty;
+            try dims.append(b.tmp, n.out.?);
+            for (n.terms.?) |t| for ([_]Expr{ t[1], t[2] }) |e| for (e) |term| if (term[0] != 0) try dims.append(b.tmp, term[0]);
+            for (dims.items) |d| {
+                const got = try owner.getOrPut(b.tmp, d);
+                if (!got.found_existing) got.value_ptr.* = @intCast(i) else join(root, got.value_ptr.*, @intCast(i));
+            }
+        }
+        var parts: std.ArrayList(model.Ffn) = .empty;
+        var part: std.ArrayList(*const JNode) = .empty;
+        for (0..nodes.len) |i| if (find(root, @intCast(i)) == i) {
+            part.clearRetainingCapacity();
+            for (nodes, 0..) |n, j| if (find(root, @intCast(j)) == i) try part.append(b.tmp, n);
+            try parts.append(b.a, try b.ffnBatch(part.items));
+        };
+        whole.split = parts.items;
+        return whole;
+    }
+
+    fn ffnBatch(b: *Builder, nodes: []const *const JNode) !model.Ffn {
         var up: FormSet = .{};
         var gate: FormSet = .{};
         var coef: std.ArrayList(Scalar) = .empty;
         var slot: std.ArrayList(u32) = .empty;
-        const outs = try b.a.alloc(model.Out, b.pending.items.len);
-        for (b.pending.items, outs, 0..) |n, *out, s| {
+        const outs = try b.a.alloc(model.Out, nodes.len);
+        for (nodes, outs, 0..) |n, *out, s| {
             out.* = .{ .dim = n.out.?, .into = n.into.? };
             for (n.terms.?) |t| {
                 try coef.append(b.a, try exact(t[0]));
@@ -318,27 +348,47 @@ const Builder = struct {
         return .{ .terms = @intCast(coef.items.len), .up = try up.finish(b), .gate = g, .coef = coef.items, .slot = slot.items, .outs = outs, .order = order, .starts = starts, .always = always.items };
     }
 
+    /// The batch as one Heads (shared forms, the device layout) plus each head alone (the CPU skips clean heads).
     fn headBatch(b: *Builder) !model.Heads {
+        const first_table: u32 = @intCast(b.tables.items.len);
+        var whole = try b.headsOf(b.pending.items, b.channels, first_table, true);
+        const split = try b.a.alloc(model.Heads, b.pending.items.len);
+        var chan = b.channels;
+        var table = first_table;
+        for (split, 0..) |*one, i| {
+            one.* = try b.headsOf(b.pending.items[i..][0..1], chan, table, false);
+            chan += one.channels;
+            table += @intCast(b.pending.items[i].value_heads.?.len);
+        }
+        whole.split = split;
+        b.channels += whole.channels;
+        return whole;
+    }
+
+    fn headsOf(b: *Builder, nodes: []const *const JNode, first_channel: u32, first_table: u32, create: bool) !model.Heads {
         var cols: FormSet = .{};
         var taps: std.ArrayList([model.lags]Scalar) = .empty;
-        for (b.pending.items) |n| {
+        for (nodes) |n| {
             for ([_][]const ChanAt{ n.q.?, n.k.? }) |chans| for (chans) |ch| try b.addChannel(&cols, &taps, ch[1]);
             for (n.value_heads.?) |vh| for (vh.v) |ch| try b.addChannel(&cols, &taps, ch[1]);
         }
         const channels: u32 = @intCast(taps.items.len);
         var column = channels;
         var chan: u32 = 0;
+        var table = first_table;
         var outs: std.ArrayList(model.Out) = .empty;
-        const heads = try b.a.alloc(model.Head, b.pending.items.len);
-        for (b.pending.items, heads) |n, *h| {
+        const heads = try b.a.alloc(model.Head, nodes.len);
+        for (nodes, heads) |n, *h| {
             const q = try b.picks(n.q.?, &chan);
             const kk = try b.picks(n.k.?, &chan);
             const vhs = try b.a.alloc(model.ValueHead, n.value_heads.?.len);
             for (n.value_heads.?, vhs) |*jv, *vh| {
-                const table: u32 = @intCast(b.tables.items.len);
-                try b.tables.append(b.a, try initTable(b.a, jv, kk.len > 0 or jv.a.len > 0));
-                try b.names.append(b.a, try b.a.dupe(u8, n.name));
+                if (create) {
+                    try b.tables.append(b.a, try initTable(b.a, jv, kk.len > 0 or jv.a.len > 0));
+                    try b.names.append(b.a, try b.a.dupe(u8, n.name));
+                }
                 vh.* = .{ .table = table, .v = try b.picks(jv.v, &chan), .a = null, .beta = null, .z = &.{}, .out_first = @intCast(outs.items.len), .out_cols = &.{}, .out_w = &.{} };
+                table += 1;
                 if (jv.a.len > 0) vh.a = try plain(b, &cols, jv.a, &column);
                 if (jv.beta) |e| vh.beta = try plain(b, &cols, e, &column);
                 const z = try b.a.alloc(model.Pick, jv.z.len);
@@ -356,12 +406,10 @@ const Builder = struct {
             }
             h.* = .{ .q = q, .k = kk, .value_heads = vhs };
         }
-        const first = b.channels;
-        b.channels += channels;
         return .{
             .proj = try cols.finish(b),
             .channels = channels,
-            .first_channel = first,
+            .first_channel = first_channel,
             .taps = taps.items,
             .heads = heads,
             .outs = outs.items,
@@ -393,6 +441,19 @@ fn plain(b: *Builder, cols: *FormSet, e: Expr, column: *u32) !u32 {
 }
 
 /// Columns as distinct linear forms (keyed by their sorted non-constant terms) plus each column's constant.
+fn find(root: []u32, i: u32) u32 {
+    var r = i;
+    while (root[r] != r) r = root[r];
+    return r;
+}
+
+/// Joins two union-find sets under the smaller root, so a part's root is its first node.
+fn join(root: []u32, i: u32, j: u32) void {
+    const x = find(root, i);
+    const y = find(root, j);
+    root[@max(x, y)] = @min(x, y);
+}
+
 const FormSet = struct {
     keys: std.StringHashMapUnmanaged(u32) = .empty,
     src: std.ArrayList(u32) = .empty,

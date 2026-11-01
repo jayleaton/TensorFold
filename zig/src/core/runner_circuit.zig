@@ -115,6 +115,7 @@ pub fn readWord(s: *State, wi: u32) !u32 {
 /// A nonzero word carries the ballast in columns 0 and 1 and A_BIT per set bit in columns 2..33; zero is absent.
 pub fn writeWord(s: *State, wi: u32, word: u32) !void {
     const at = try ramRow(s, wi);
+    s.force = true;
     if (word == 0) return s.clearRow(at.table, at.row);
     var r: [model.hd]model.Scalar = @splat(0);
     r[0] = s.circuit.program.a_ref;

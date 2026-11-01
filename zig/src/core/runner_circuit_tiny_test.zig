@@ -25,7 +25,7 @@ pub fn token(family: u32, payload: u32) u32 {
 }
 
 /// Variants that break one rule, for negative controls.
-pub const Variant = enum { good, two_hot_key, unmapped_go, beta_gated };
+pub const Variant = enum { good, two_hot_key, unmapped_go, beta_gated, halving };
 
 /// The container bytes of the tiny circuit.
 pub fn build(a: std.mem.Allocator, variant: Variant) ![]u8 {
@@ -122,7 +122,7 @@ fn lag3Head(w: Writer) !void {
     try w.s("\"out\":[[2,36,16384.0]],\"into\":false,\"init\":[]}]}");
 }
 
-/// ram0: W writes row (payload bits 0-1), data bit 2 to column 2; R reads to rd; row 3 is 1. beta_gated: data 0.
+/// ram0: W writes row (payload bits 0-1), data bit 2 to column 2; R reads to rd; row 3 is 1. halving: A halves table 2.
 fn ramHead(w: Writer, variant: Variant) !void {
     try w.s("{\"kind\":\"head\",\"name\":\"ram0\",\"n_cols\":128,\"levels\":\"bit\",\"tiny\":0.0,\"q\":[");
     for (0..4) |r| {
@@ -136,12 +136,13 @@ fn ramHead(w: Writer, variant: Variant) !void {
     }
     if (variant == .two_hot_key) try w.s(",[9,{\"expr\":[[3,1.0]],\"taps\":[1.0,0.0,0.0,0.0]}]");
     const v = "\"v\":[[0,{\"expr\":[[3," ++ a_ref ++ "]],\"taps\":[1.0,0.0,0.0,0.0]}],[1,{\"expr\":[[3," ++ a_ref ++
-        "]],\"taps\":[1.0,0.0,0.0,0.0]}],[2,{\"expr\":[[9,128.0]],\"taps\":[1.0,0.0,0.0,0.0]}]],\"a\":[],";
+        "]],\"taps\":[1.0,0.0,0.0,0.0]}],[2,{\"expr\":[[9,128.0]],\"taps\":[1.0,0.0,0.0,0.0]}]],";
     const beta = if (variant == .beta_gated) "\"beta\":[[0,1.0],[9,-1.0]]," else "\"beta\":null,";
-    try w.s("],\"value_heads\":[{" ++ v);
+    try w.s("],\"value_heads\":[{" ++ v ++ "\"a\":[],");
     try w.s(beta);
     try w.s("\"z\":[[2,[[4,1.0]]]],\"out\":[[2,13,16384.0]],\"into\":false,");
     try w.s("\"init\":[[3,[[0," ++ a_ref ++ "],[1," ++ a_ref ++ "],[2,128.0]]]]},{" ++ v);
+    try w.s(if (variant == .halving) "\"a\":[[2,110.0]]," else "\"a\":[],");
     try w.s(beta);
     try w.s("\"z\":[],\"out\":[],\"into\":false,\"init\":[]}]}");
 }
