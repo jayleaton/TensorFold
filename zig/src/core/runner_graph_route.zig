@@ -321,7 +321,7 @@ pub const Dispatch = struct {
     };
 
     pub fn backend(d: *Dispatch) api.Backend {
-        return .{ .ctx = d, .vtable = &.{ .start = start, .poll = poll, .cancel = cancel, .release = release } };
+        return .{ .ctx = d, .vtable = &.{ .start = start, .poll = poll, .cancel = cancel, .release = release, .now = now } };
     }
     pub fn deinit(d: *Dispatch) void {
         for (d.seqs.items) |q| d.free(q);
@@ -429,6 +429,11 @@ pub const Dispatch = struct {
         d.graph.release(stream);
         d.circuit.release(stream);
     }
+    fn now(ctx: *anyopaque, p: api.Program, budget: u64, quick: u64) ?api.Result {
+        const d: *Dispatch = @ptrCast(@alignCast(ctx));
+        // one packet only: a sequence's pieces run as jobs, in turn
+        return if (p.kind == .graph and !std.mem.startsWith(u8, p.bytes, prog.seq_magic)) d.graph.now(p, budget, quick) else null;
+    }
 };
 
 fn planNames(a: Allocator, src: []const u8) !?[]u8 {
@@ -499,7 +504,7 @@ test "runner graph route: graph programs reach the graph backend, the rest the c
         started: u32 = 0,
         released: u32 = 0,
         fn backend(f: *@This()) api.Backend {
-            return .{ .ctx = f, .vtable = &.{ .start = st, .poll = pl, .cancel = cn, .release = rl } };
+            return .{ .ctx = f, .vtable = &.{ .start = st, .poll = pl, .cancel = cn, .release = rl, .now = nw } };
         }
         fn st(ctx: *anyopaque, _: u64, _: api.Program, _: u64) error{ OutOfMemory, Busy }!api.JobId {
             const f: *@This() = @ptrCast(@alignCast(ctx));
@@ -511,6 +516,10 @@ test "runner graph route: graph programs reach the graph backend, the rest the c
             return .{ .done = .{ .status = .ok, .out = if (f.name == 'g') "graph" else "circuit", .steps = job } };
         }
         fn cn(_: *anyopaque, _: api.JobId) void {}
+        fn nw(ctx: *anyopaque, _: api.Program, _: u64, _: u64) ?api.Result {
+            const f: *@This() = @ptrCast(@alignCast(ctx));
+            return .{ .status = .ok, .out = if (f.name == 'g') "graph" else "circuit" };
+        }
         fn rl(ctx: *anyopaque, _: u64) void {
             const f: *@This() = @ptrCast(@alignCast(ctx));
             f.released += 1;
@@ -525,6 +534,9 @@ test "runner graph route: graph programs reach the graph backend, the rest the c
     try std.testing.expectEqualStrings("graph", b.poll(gj).done.out);
     try std.testing.expectEqual(@as(u64, 7), b.poll(gj).done.steps);
     try std.testing.expectEqualStrings("circuit", b.poll(cj).done.out);
+    // a run here (settling holds) is the graph backend's only
+    try std.testing.expectEqualStrings("graph", b.now(.{ .kind = .graph, .bytes = "{}" }, 10, 10).?.out);
+    try std.testing.expectEqual(null, b.now(.{ .kind = .calc, .bytes = "2*3" }, 10, 10));
     b.release(1);
     try std.testing.expect(c.started == 1 and g.started == 1 and c.released == 1 and g.released == 1);
 }
