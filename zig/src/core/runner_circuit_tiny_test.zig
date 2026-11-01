@@ -159,7 +159,7 @@ fn ramHead(w: Writer, variant: Variant) !void {
     try w.s("\"z\":[],\"out\":[],\"into\":false,\"init\":[]}]}");
 }
 
-/// mirror for .banks: ram0's inputs, but row r lives at table row r ^ 1, read to dims.sum (a bank sharing the address).
+/// mirror for .banks: ram0's inputs, row r at table row r ^ 1, read to dims.sum; its data bit is the previous step's.
 fn bankHead(w: Writer) !void {
     try w.s(",{\"kind\":\"head\",\"name\":\"mirror\",\"n_cols\":128,\"levels\":\"bit\",\"tiny\":0.0,\"q\":[");
     for (0..4) |r| {
@@ -172,7 +172,7 @@ fn bankHead(w: Writer) !void {
         try selectAt(w, @intCast(r ^ 1), @intCast(r), dims.is_w, .{ 7, 8 });
     }
     try w.s("],\"value_heads\":[{\"v\":[[0,{\"expr\":[[3," ++ a_ref ++ "]],\"taps\":[1.0,0.0,0.0,0.0]}],[1,{\"expr\":[[3," ++ a_ref);
-    try w.s("]],\"taps\":[1.0,0.0,0.0,0.0]}],[2,{\"expr\":[[9,128.0]],\"taps\":[1.0,0.0,0.0,0.0]}]],\"a\":[],\"beta\":null,");
+    try w.s("]],\"taps\":[1.0,0.0,0.0,0.0]}],[2,{\"expr\":[[9,128.0]],\"taps\":[0.0,1.0,0.0,0.0]}]],\"a\":[],\"beta\":null,");
     try w.f("\"z\":[[2,[[4,1.0]]]],\"out\":[[2,{d},16384.0]],\"into\":false,\"init\":[]}}]}}", .{dims.sum});
 }
 
