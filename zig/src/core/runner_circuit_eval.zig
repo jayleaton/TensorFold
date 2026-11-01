@@ -99,16 +99,43 @@ fn finish(s: *State, u: *const flow.Unit, i: usize, stamp: u64) void {
         const sl = first + k;
         var v: Scalar = undefined;
         if (f.chain_len[sl] > 0) {
-            const links = f.chain_links[f.chain_start[sl]..][0..f.chain_len[sl]];
-            const b = f.chain_base[sl];
-            v = if (b == flow.no_slot) s.pre[links[0]] else s.val[b] + s.pre[links[0]];
-            for (links[1..]) |l| v = v + s.pre[l];
+            v = fold(s, sl);
         } else {
             const b = u.base[k];
             v = if (b == flow.no_slot) s.pre[sl] else s.val[b] + s.pre[sl];
         }
         set(s, sl, v, stamp);
     }
+}
+
+/// base + links in order over links not +0: adding +0 only turns a -0 sum into +0, and -0 is the empty-sum identity.
+fn fold(s: *State, end: u32) Scalar {
+    const f = &s.circuit.flow;
+    const n = f.chain_len[end];
+    const links = f.chain_links[f.chain_start[end]..][0..n];
+    const b = f.chain_base[end];
+    var v: Scalar = if (b == flow.no_slot) -0.0 else s.val[b];
+    var added: usize = 0;
+    for (s.chain_bits[f.chain_bits_at[end]..][0 .. (n + 63) / 64], 0..) |word, w| {
+        var bits = word;
+        while (bits != 0) : (bits &= bits - 1) {
+            v = v + s.pre[links[w * 64 + @ctz(bits)]];
+            added += 1;
+        }
+    }
+    if (added < n and @as(u32, @bitCast(v)) == @as(u32, @bitCast(@as(Scalar, -0.0)))) v = 0;
+    return v;
+}
+
+/// Records whether chain link `sl` now holds something other than +0.
+fn linkBit(s: *State, sl: u32, v: Scalar) void {
+    const f = &s.circuit.flow;
+    const pos = f.chain_pos[sl];
+    if (pos == flow.no_slot) return;
+    const end = if (f.elided[sl]) f.chain_end[sl] else sl;
+    const word = &s.chain_bits[f.chain_bits_at[end] + pos / 64];
+    const bit = @as(u64, 1) << @intCast(pos % 64);
+    if (@as(u32, @bitCast(v)) != 0) word.* |= bit else word.* &= ~bit;
 }
 
 /// Gathers a unit's nonzero inputs, ascending, into s.x, s.nz (dims) and s.local (input indices); returns their count.
@@ -152,6 +179,7 @@ fn run(s: *State, u: *const flow.Unit, i: usize, stamp: u64) !void {
         if (@as(u32, @bitCast(v)) == @as(u32, @bitCast(p.*))) continue;
         p.* = v;
         const sl = first + @as(u32, @intCast(k));
+        linkBit(s, sl, v);
         if (!f.elided[sl]) {
             queue(s, @intCast(i), first, @intCast(k), stamp);
             continue;
@@ -166,7 +194,7 @@ fn run(s: *State, u: *const flow.Unit, i: usize, stamp: u64) !void {
 
 /// An FFN part is a pure function of its nonzero inputs: a memo hit returns the outputs it computed for them.
 fn ffnCached(s: *State, p: *const ffn.Plan, i: usize, nz: []const u32, local: []const u32) ![]const Scalar {
-    if (s.always) return ffn.run(s, p, nz);
+    if (s.always or s.memos[i].off()) return ffn.run(s, p, nz);
     const key = s.key[0..nz.len];
     for (key, nz, local) |*k, d, j| k.* = @as(u64, j) << 32 | @as(u32, @bitCast(s.x[d]));
     const h = Memo.hash(key);

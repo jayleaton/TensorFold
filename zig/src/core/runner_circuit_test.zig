@@ -183,6 +183,21 @@ test "a halving head reruns on unchanged inputs: its table halves every step, as
     try std.testing.expectEqual(@as(model.Scalar, 16777216.0 / 16.0), lazy.row(3, 1)[0]);
 }
 
+test "an into chain no unit reads folds its links in order at its end as each link changes" {
+    var c = try tinyCircuit(.chained);
+    defer c.deinit(gpa);
+    const end = c.flow.final[tiny.dims.sum];
+    try std.testing.expectEqual(@as(u32, 3), c.flow.chain_len[end]);
+    var s = try rc.State.init(gpa, &c);
+    defer s.deinit();
+    const seq = [_]u32{ tok(1, 0), tok(2, 0), tok(3, 0), tok(4, 'h'), tok(1, 0), tok(1, 0) };
+    const want = [_]model.Scalar{ 1, 2, 4, 0, 1, 1 };
+    for (seq, want) |t, w| {
+        _ = try eval.step(&s, t);
+        try std.testing.expectEqual(w, s.value(tiny.dims.sum));
+    }
+}
+
 test "a node that reads a dim written earlier in stored order sees the write" {
     var c = try tinyCircuit(.good);
     defer c.deinit(gpa);

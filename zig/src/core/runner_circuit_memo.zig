@@ -3,26 +3,31 @@ const std = @import("std");
 
 pub const slots_per_unit = 256;
 
-const Entry = struct {
-    used: bool = false,
+/// One entry: its hash beside one block holding the key, then the words (two per u64), so a hit reads two lines.
+const Slot = struct {
     hash: u64 = 0,
-    key: std.ArrayList(u64) = .empty,
-    words: std.ArrayList(u32) = .empty,
+    data: [*]u64 = undefined,
+    cap: u32 = 0,
+    key_len: u32 = 0,
+    words_len: u32 = 0,
+    used: bool = false,
 };
 
 /// Direct-mapped by key hash; a colliding put replaces the older entry, so a lookup only ever misses, never lies.
 pub const Memo = struct {
-    entries: []Entry = &.{},
+    slots: []Slot = &.{},
     hits: u64 = 0,
     misses: u64 = 0,
 
     pub fn deinit(m: *Memo, gpa: std.mem.Allocator) void {
-        for (m.entries) |*e| {
-            e.key.deinit(gpa);
-            e.words.deinit(gpa);
-        }
-        gpa.free(m.entries);
+        for (m.slots) |e| if (e.cap > 0) gpa.free(e.data[0..e.cap]);
+        gpa.free(m.slots);
         m.* = .{};
+    }
+
+    /// A unit that almost never repeats an input stops paying for lookups and copies; results are the same.
+    pub fn off(m: *const Memo) bool {
+        return m.misses >= 256 and m.hits * 32 < m.misses;
     }
 
     pub fn hash(key: []const u64) u64 {
@@ -30,29 +35,45 @@ pub const Memo = struct {
     }
 
     pub fn find(m: *Memo, key: []const u64, h: u64) ?[]const u32 {
-        if (m.entries.len == 0) return null;
-        const e = &m.entries[h % m.entries.len];
-        if (!e.used or e.hash != h or !std.mem.eql(u64, e.key.items, key)) {
+        if (m.slots.len == 0) return null;
+        const e = &m.slots[h % m.slots.len];
+        if (!e.used or e.hash != h or e.key_len != key.len or !std.mem.eql(u64, e.data[0..key.len], key)) {
             m.misses += 1;
             return null;
         }
         m.hits += 1;
-        return e.words.items;
+        const words: [*]const u32 = @ptrCast(e.data + key.len);
+        return words[0..e.words_len];
     }
 
     pub fn put(m: *Memo, gpa: std.mem.Allocator, key: []const u64, h: u64, words: []const u32) !void {
-        if (m.entries.len == 0) {
-            m.entries = try gpa.alloc(Entry, slots_per_unit);
-            for (m.entries) |*e| e.* = .{};
+        if (m.slots.len == 0) {
+            m.slots = try gpa.alloc(Slot, slots_per_unit);
+            @memset(m.slots, .{});
         }
-        const e = &m.entries[h % m.entries.len];
+        const e = &m.slots[h % m.slots.len];
         e.used = false;
-        e.key.clearRetainingCapacity();
-        try e.key.appendSlice(gpa, key);
-        e.words.clearRetainingCapacity();
-        try e.words.appendSlice(gpa, words);
+        const need: u32 = @intCast(key.len + (words.len + 1) / 2);
+        if (need > e.cap) {
+            if (e.cap > 0) gpa.free(e.data[0..e.cap]);
+            e.cap = 0;
+            e.data = (try gpa.alloc(u64, need)).ptr;
+            e.cap = need;
+        }
+        @memcpy(e.data[0..key.len], key);
+        const dst: [*]u32 = @ptrCast(e.data + key.len);
+        @memcpy(dst[0..words.len], words);
+        e.key_len = @intCast(key.len);
+        e.words_len = @intCast(words.len);
         e.hash = h;
         e.used = true;
+    }
+
+    /// Bytes held by the entries, for admission.
+    pub fn bytes(m: *const Memo) usize {
+        var n = m.slots.len * @sizeOf(Slot);
+        for (m.slots) |e| n += e.cap * 8;
+        return n;
     }
 };
 
@@ -63,8 +84,12 @@ test "a memo returns only what was stored under the same key" {
     const k1 = [_]u64{ 1, 2 };
     const k2 = [_]u64{ 1, 3 };
     try std.testing.expect(m.find(&k1, Memo.hash(&k1)) == null);
-    try m.put(gpa, &k1, Memo.hash(&k1), &.{ 7, 8 });
-    try std.testing.expectEqualSlices(u32, &.{ 7, 8 }, m.find(&k1, Memo.hash(&k1)).?);
+    try m.put(gpa, &k1, Memo.hash(&k1), &.{ 7, 8, 9 });
+    try std.testing.expectEqualSlices(u32, &.{ 7, 8, 9 }, m.find(&k1, Memo.hash(&k1)).?);
     try std.testing.expect(m.find(&k2, Memo.hash(&k1)) == null);
     try std.testing.expect(m.find(&k2, Memo.hash(&k2)) == null);
+    try std.testing.expect(m.find(k1[0..1], Memo.hash(&k1)) == null);
+    try m.put(gpa, &k2, Memo.hash(&k1), &.{4});
+    try std.testing.expectEqualSlices(u32, &.{4}, m.find(&k2, Memo.hash(&k1)).?);
+    try std.testing.expect(m.find(&k1, Memo.hash(&k1)) == null);
 }

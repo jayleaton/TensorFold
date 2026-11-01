@@ -129,7 +129,7 @@ pub fn build(a: std.mem.Allocator, h: *const model.Heads, dims: []const u32) !Pl
     zstart[hd0.value_heads.len] = @intCast(zrep.items.len);
     return .{
         .h = h,
-        .sel = .{ .forms = sel_forms, .form = sel_form, .bias = sel_bias },
+        .sel = .{ .forms = try sel_forms.densify(a), .form = sel_form, .bias = sel_bias },
         .sel_dim = sel_dim,
         .q = q,
         .k = k,
@@ -312,9 +312,9 @@ pub fn run(s: *State, p: *const Plan, unit: usize, nz: []const u32, local: []con
     const sel_nz = s.nz2[0..n_key];
     const h = Memo.hash(key);
     const memo = &s.memos[unit];
-    const words = (if (s.always) null else memo.find(key, h)) orelse blk: {
+    const words = (if (s.always or memo.off()) null else memo.find(key, h)) orelse blk: {
         const w = select(s, p, sel_nz);
-        try memo.put(s.gpa, key, h, w);
+        if (!memo.off()) try memo.put(s.gpa, key, h, w);
         break :blk w;
     };
     const f = oldest(frames);

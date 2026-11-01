@@ -1,4 +1,5 @@
 //! An FFN batch part on the CPU: every form by scatter, then every firing unit by the sorted walk.
+const std = @import("std");
 const model = @import("runner_circuit_model.zig");
 const State = @import("runner_circuit_state.zig").State;
 
@@ -7,14 +8,24 @@ const none = model.no_form;
 
 pub const Plan = struct {
     f: *const model.Ffn,
+    /// The part's up and gate forms with dense rows for inputs that reach many forms.
+    up: model.Sparse,
+    gate: model.Sparse,
     /// Where this part's forms and nodes live in the per-machine arrays.
     up_off: u32,
     gate_off: u32,
     node_off: u32,
 };
 
-pub fn build(f: *const model.Ffn, offs: *[3]u32) Plan {
-    const p: Plan = .{ .f = f, .up_off = offs[0], .gate_off = offs[1], .node_off = offs[2] };
+pub fn build(a: std.mem.Allocator, f: *const model.Ffn, offs: *[3]u32) !Plan {
+    const p: Plan = .{
+        .f = f,
+        .up = try f.up.forms.densify(a),
+        .gate = try f.gate.forms.densify(a),
+        .up_off = offs[0],
+        .gate_off = offs[1],
+        .node_off = offs[2],
+    };
     offs[0] += f.up.forms.outputs;
     offs[1] += f.gate.forms.outputs;
     offs[2] += @intCast(f.outs.len);
@@ -28,8 +39,8 @@ pub fn run(s: *State, p: *const Plan, nz: []const u32) []const Scalar {
     const gate = s.ffn_gate[p.gate_off..][0..f.gate.forms.outputs];
     const y = s.ffn_y[p.node_off..][0..f.outs.len];
     @memset(y, 0);
-    f.up.forms.apply(s.x, nz, up);
-    f.gate.forms.apply(s.x, nz, gate);
+    p.up.apply(s.x, nz, up);
+    p.gate.apply(s.x, nz, gate);
     for (gate, f.starts[0 .. f.starts.len - 1], f.starts[1..]) |v, lo, hi| for (f.order[lo..hi]) |t| {
         const g = f.gate.bias[t] + v;
         if (!(g > 0)) break;

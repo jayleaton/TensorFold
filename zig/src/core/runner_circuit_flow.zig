@@ -60,6 +60,10 @@ pub const Flow = struct {
     chain_len: []const u32,
     chain_base: []const u32,
     chain_links: []const u32,
+    /// Per slot: its link index in its chain, or no_slot; per chain end, where its link bits start (one bit per link).
+    chain_pos: []const u32,
+    chain_bits_at: []const u32,
+    chain_words: u32,
 };
 
 /// Dims a set of forms reads: the union of their sources, ascending.
@@ -105,7 +109,7 @@ pub fn build(a: std.mem.Allocator, c: *const model.Circuit) !Flow {
         .ffn => |*whole| for (whole.split) |*f| {
             var u = try unit(a, .{ .ffn = f }, try reads(a, &.{ &f.up.forms, &f.gate.forms }), f.outs, 0, visible, &slots);
             u.plan = @intCast(ffn_plans.items.len);
-            try ffn_plans.append(a, ffn.build(f, &ffn_totals));
+            try ffn_plans.append(a, try ffn.build(a, f, &ffn_totals));
             try units.append(a, u);
         },
         .heads => |*hs| for (hs.split) |*h| {
@@ -155,6 +159,9 @@ pub fn build(a: std.mem.Allocator, c: *const model.Circuit) !Flow {
         .chain_len = ch.len,
         .chain_base = ch.base,
         .chain_links = ch.links,
+        .chain_pos = ch.pos,
+        .chain_bits_at = ch.bits_at,
+        .chain_words = ch.words,
     };
 }
 
@@ -198,7 +205,7 @@ fn readersOf(a: std.mem.Allocator, units: []const Unit, slots: u32, mark: []u32,
     return .{ starts, out[0], out[1], out[2] };
 }
 
-const Chains = struct { slot_unit: []u32, elided: []bool, end: []u32, start: []u32, len: []u32, base: []u32, links: []u32 };
+const Chains = struct { slot_unit: []u32, elided: []bool, end: []u32, start: []u32, len: []u32, base: []u32, links: []u32, pos: []u32, bits_at: []u32, words: u32 };
 
 /// Into-chains: an output slot no unit reads and the step does not end on is elided; its chain end folds the links.
 fn chains(a: std.mem.Allocator, units: []const Unit, slots: u32, visible: []const u32) !Chains {
@@ -234,6 +241,11 @@ fn chains(a: std.mem.Allocator, units: []const Unit, slots: u32, visible: []cons
     ch.base = try a.alloc(u32, slots);
     @memset(ch.base, no_slot);
     var links: std.ArrayList(u32) = .empty;
+    ch.pos = try a.alloc(u32, slots);
+    @memset(ch.pos, no_slot);
+    ch.bits_at = try a.alloc(u32, slots);
+    @memset(ch.bits_at, no_slot);
+    ch.words = 0;
     for (0..slots) |sl| {
         if (ch.slot_unit[sl] == no_slot or ch.elided[sl] or base[sl] == no_slot or !ch.elided[base[sl]]) continue;
         var first: u32 = @intCast(sl);
@@ -248,6 +260,9 @@ fn chains(a: std.mem.Allocator, units: []const Unit, slots: u32, visible: []cons
         }
         ch.len[sl] = @intCast(links.items.len - ch.start[sl]);
         ch.base[sl] = base[first];
+        for (links.items[ch.start[sl]..], 0..) |l, k| ch.pos[l] = @intCast(k);
+        ch.bits_at[sl] = ch.words;
+        ch.words += (ch.len[sl] + 63) / 64;
     }
     ch.links = links.items;
     return ch;

@@ -1,4 +1,4 @@
-//! A hand-built circuit file (store/load RAM, a lagged key, a clear decay, a hazard pair) for evaluator host tests.
+//! A hand-built circuit file (store/load RAM, a lagged key, a clear decay, a hazard pair, variants) for host tests.
 const std = @import("std");
 
 const kappa = "0.00000095367431640625";
@@ -14,7 +14,8 @@ pub const dims = struct {
     pub const t2 = 34;
     pub const lagout = 35;
     pub const lag3out = 36;
-    pub const count = 37;
+    pub const sum = 37;
+    pub const count = 38;
 };
 pub const family_bits = 3;
 
@@ -25,7 +26,7 @@ pub fn token(family: u32, payload: u32) u32 {
 }
 
 /// Variants that break one rule, for negative controls.
-pub const Variant = enum { good, two_hot_key, unmapped_go, beta_gated, halving };
+pub const Variant = enum { good, two_hot_key, unmapped_go, beta_gated, halving, chained };
 
 /// The container bytes of the tiny circuit.
 pub fn build(a: std.mem.Allocator, variant: Variant) ![]u8 {
@@ -46,6 +47,10 @@ pub fn build(a: std.mem.Allocator, variant: Variant) ![]u8 {
     try ramHead(w, variant);
     try w.s(",{\"kind\":\"ffn\",\"name\":\"h1\",\"out\":33,\"into\":false,\"terms\":[[1.0,[[0,1.0]],[[2,1.0]]]]}");
     try w.s(",{\"kind\":\"ffn\",\"name\":\"h2\",\"out\":34,\"into\":false,\"terms\":[[1.0,[[33,1.0]],[[0,1.0]]]]}");
+    if (variant == .chained) for ([_][2]u32{ .{ 1, 2 }, .{ 2, 3 }, .{ 4, 4 } }, 0..) |t, i| {
+        try w.f(",{{\"kind\":\"ffn\",\"name\":\"c{d}\",\"out\":{d},\"into\":{s},", .{ i, dims.sum, if (i == 0) "false" else "true" });
+        try w.f("\"terms\":[[{d}.0,[[0,1.0]],[[{d},1.0]]]]}}", .{ t[0], t[1] });
+    };
     try codeNodes(w, variant);
     try w.s("],\"output\":{\"code_dims\":[");
     for (0..family_bits + 16) |i| try w.f("{s}{d}", .{ if (i == 0) "" else ",", dims.code + i });

@@ -34,6 +34,8 @@ pub const State = struct {
     in_bits: []u64,
     /// Per unit: its last run decayed a table, so the next step must run it again.
     unstable: []bool,
+    /// Per chain end, one bit per link that holds something other than +0 (every pre starts +0).
+    chain_bits: []u64,
     /// Units to visit this step and those already due next step (lag window open or unstable), one bit each.
     active: []u64,
     keep: []u64,
@@ -60,7 +62,7 @@ pub const State = struct {
     always: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, c: *const model.Circuit) !State {
-        var s: State = .{ .gpa = gpa, .circuit = c, .tables = &.{}, .owned = &.{}, .present = &.{}, .val = &.{}, .dirty = &.{}, .changed = &.{}, .rebase = &.{}, .pre = &.{}, .rb = &.{}, .rb_len = &.{}, .rb_mark = &.{}, .in_vals = &.{}, .in_bits = &.{}, .unstable = &.{}, .active = &.{}, .keep = &.{}, .frames = &.{}, .memos = &.{}, .x = &.{}, .past = @splat(&.{}), .nz = &.{}, .key = &.{}, .nz2 = &.{}, .local = &.{}, .words = &.{}, .work = &.{}, .ffn_up = &.{}, .ffn_gate = &.{}, .ffn_y = &.{} };
+        var s: State = .{ .gpa = gpa, .circuit = c, .tables = &.{}, .owned = &.{}, .present = &.{}, .val = &.{}, .dirty = &.{}, .changed = &.{}, .rebase = &.{}, .pre = &.{}, .rb = &.{}, .rb_len = &.{}, .rb_mark = &.{}, .in_vals = &.{}, .in_bits = &.{}, .unstable = &.{}, .chain_bits = &.{}, .active = &.{}, .keep = &.{}, .frames = &.{}, .memos = &.{}, .x = &.{}, .past = @splat(&.{}), .nz = &.{}, .key = &.{}, .nz2 = &.{}, .local = &.{}, .words = &.{}, .work = &.{}, .ffn_up = &.{}, .ffn_gate = &.{}, .ffn_y = &.{} };
         errdefer s.deinit();
         const f = &c.flow;
         const n = f.units.len;
@@ -81,6 +83,7 @@ pub const State = struct {
         s.in_vals = try zeroed(gpa, Scalar, f.total_ins);
         s.in_bits = try zeroed(gpa, u64, f.total_ins / 64 + 1);
         s.unstable = try zeroed(gpa, bool, n);
+        s.chain_bits = try zeroed(gpa, u64, f.chain_words);
         s.active = try zeroed(gpa, u64, n / 64 + 1);
         s.keep = try zeroed(gpa, u64, n / 64 + 1);
         s.frames = try gpa.alloc([head.frames_per_unit]head.Frame, n);
@@ -117,6 +120,7 @@ pub const State = struct {
         s.gpa.free(s.in_vals);
         s.gpa.free(s.in_bits);
         s.gpa.free(s.unstable);
+        s.gpa.free(s.chain_bits);
         s.gpa.free(s.active);
         s.gpa.free(s.keep);
         for (s.frames) |*fs| for (fs) |*fr| fr.deinit(s.gpa);
@@ -183,9 +187,7 @@ pub const State = struct {
         for (s.frames) |fs| for (fs) |fr| {
             n += fr.dims.capacity * 4 + fr.vals.capacity * 4 + fr.words.capacity * 4;
         };
-        for (s.memos) |m| for (m.entries) |e| {
-            n += e.key.capacity * 8 + e.words.capacity * 4;
-        };
+        for (s.memos) |m| n += m.bytes();
         return n;
     }
 
