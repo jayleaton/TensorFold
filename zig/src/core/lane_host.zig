@@ -45,6 +45,7 @@ pub const LaneHost = struct {
     filling: std.ArrayList(*Job) = .empty, // admitted jobs whose prompt is still going in, a chunk a round, oldest first
     cancels: std.ArrayList(Id) = .empty,
     resumes: std.ArrayList(holds.Pending) = .empty, // results for held replies (lane_host_hold.zig)
+    runner: ?*@import("runner.zig").Runner = null, // runs the code cells replies write (Request.run_cells)
     closing: bool = false,
     stale: bool = false, // the learner's last step: a put-back has not reached the device, so replies are refused
     /// `halt`'s reason: what is left finishes failed with it (null: a stop cancels what is left)
@@ -532,6 +533,7 @@ pub const LaneHost = struct {
             defer activity.end();
             ends.takeCancels(h);
             holds.take(h);
+            @import("lane_host_runner.zig").tick(h);
             pressure.step(h);
             rows_host.answer(h);
             scoring.answer(h);

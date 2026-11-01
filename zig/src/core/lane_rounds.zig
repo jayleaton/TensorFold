@@ -267,6 +267,7 @@ pub fn run(h: *LaneHost, rd: Rounds) void {
         defer activity.end();
         ends.takeCancels(h);
         @import("lane_host_hold.zig").take(h);
+        @import("lane_host_runner.zig").tick(h);
         pressure.step(h);
         rows_host.answer(h);
         @import("lane_host_score.zig").answer(h);

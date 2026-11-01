@@ -118,6 +118,7 @@ pub const Request = struct {
     cache_key: []const u32 = &.{},
     /// At an EOS the stream holds for ``Engine.resumeHeld`` (a built-in tool's result) instead of finishing.
     hold_eos: bool = false,
+    run_cells: bool = false, // code cells the reply writes run on the host's in-model runner (core/runner.zig)
 
     /// The prompt as the prompt cache matches it: an image request's placeholders stand for their images.
     pub fn cacheKey(r: *const Request) []const u32 {
@@ -253,7 +254,6 @@ pub const Info = struct {
         return out;
     }
 };
-
 pub const compute_lane = @import("compute_lane.zig");
 /// A held reply's result tokens (empty: it ends at its EOS), forced after the EOS between rounds.
 pub const Resume = lanes.hold.Resume;

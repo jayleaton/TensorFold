@@ -19,7 +19,7 @@ pub const Outcome = enum {
 
 /// Applies one resume on the engine thread between rounds; a stream takes at most one per hold.
 pub fn resumeHeld(s: *Stream, gpa: Allocator, tokens: []const u32, think_open: bool) Allocator.Error!Outcome {
-    if (!s.held or s.finished) return .not_held;
+    if (!s.held or s.finished or s.awaiting) return .not_held;
     // the hold's EOS was drawn, so no forced token was waiting before it
     std.debug.assert(s.force.items.len == 0);
     const room = tokens.len > 0 and @as(i64, @intCast(tokens.len)) < s.budgetLeft();
@@ -35,4 +35,15 @@ pub fn resumeHeld(s: *Stream, gpa: Allocator, tokens: []const u32, think_open: b
     s.paused = false;
     s.think_open = think_open;
     return .resumed;
+}
+
+/// Continues a stream held at a runner trigger: `tokens` (cut to the room left) are forced next, then the model draws.
+pub fn resumeAwaiting(s: *Stream, gpa: Allocator, tokens: []const u32) Allocator.Error!bool {
+    if (!s.awaiting or !s.held or s.finished) return false;
+    const room: usize = @intCast(@max(0, s.budgetLeft() - 1));
+    try s.force.appendSlice(gpa, tokens[0..@min(tokens.len, room)]);
+    s.held = false;
+    s.paused = false;
+    s.awaiting = false;
+    return true;
 }

@@ -30,4 +30,5 @@ test {
 test {
     _ = @import("lane_activity_test.zig");
     _ = @import("lane_host_hold_test.zig");
+    _ = @import("runner_test.zig");
 }

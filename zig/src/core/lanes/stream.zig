@@ -68,6 +68,12 @@ pub fn detectLoop(emitted: []const u32) ?u32 {
     return cycleAt(emitted, &.{}, emitted.len);
 }
 
+/// The in-model runner's view of each committed token (core/runner.zig): true holds the stream for a result here.
+pub const RunnerHook = struct {
+    ptr: *anyopaque,
+    token: *const fn (ptr: *anyopaque, token: u32, think_open: bool, can_hold: bool) bool,
+};
+
 /// A stop-string check over the emitted tokens (the server's StopPolicy decodes their tail).
 pub const StopCheck = struct {
     ptr: *anyopaque,
@@ -145,6 +151,7 @@ pub const Spec = struct {
     images: []const Image = &.{}, // in prompt order; the backend's tower fills their rows
     key: []const u32 = &.{}, // the prompt as the cache matches it (image rows by their image); empty: the prompt
     hold_eos: bool = false, // an EOS holds the stream for a server tool's result (hold.zig) instead of ending it
+    runner: ?RunnerHook = null, // committed tokens go to the in-model runner, which may hold the stream at a token
 };
 
 pub const Stream = struct {
@@ -229,6 +236,8 @@ pub const Stream = struct {
     paused: bool = false,
     hold_eos: bool = false,
     held: bool = false, // paused at a committed EOS, which stays pending until hold.zig resumes or ends the stream
+    runner: ?RunnerHook = null,
+    awaiting: bool = false, // held at a runner trigger (not an EOS): hold.resumeAwaiting continues it
     depth: ?State = null,
     mode: ?Mode = null,
     next: ?Held = null,
@@ -274,6 +283,7 @@ pub const Stream = struct {
             .images = spec.images,
             .key = spec.key,
             .hold_eos = spec.hold_eos,
+            .runner = spec.runner,
         };
         // under a grammar a forced close ends at the think end: the grammar takes the reply from the next token
         if (spec.grammar) |g| if (g.after) |end| if (std.mem.indexOfScalar(u32, s.think_close, end)) |at| {
@@ -471,6 +481,13 @@ pub const Stream = struct {
             }
             const guarded = s.loop_guard and s.think_open and s.think_end >= 0 and s.loop_period == null;
             const fire = if (guarded) detectLoop(s.emitted()) orelse s.longCycle() else null;
+            const can_hold = !s.isEos(t) and s.force.items.len == 0 and s.budgetLeft() > 1;
+            if (s.runner) |r| if (r.token(r.ptr, t, s.think_open, can_hold) and can_hold) {
+                s.held = true;
+                s.awaiting = true;
+                s.paused = true;
+                break;
+            };
             if (s.isEos(t) and s.hold_eos) {
                 s.held = true;
                 s.paused = true;
