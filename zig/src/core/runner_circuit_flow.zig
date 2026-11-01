@@ -23,6 +23,8 @@ pub const Unit = struct {
     plan: u32 = no_slot,
     /// Where the unit's inputs start in the per-machine input arrays.
     in_off: u32 = 0,
+    /// An FFN part whose outputs are all +0 at all-zero inputs: a fresh machine need not run it until an input moves.
+    quiet: bool = false,
 };
 
 pub const Flow = struct {
@@ -107,8 +109,10 @@ pub fn build(a: std.mem.Allocator, c: *const model.Circuit) !Flow {
     var max_dims: u32 = 0;
     for (c.batches) |*b| switch (b.*) {
         .ffn => |*whole| for (whole.split) |*f| {
-            var u = try unit(a, .{ .ffn = f }, try reads(a, &.{ &f.up.forms, &f.gate.forms }), f.outs, 0, visible, &slots);
+            const dims = if (f.dims.len > 0) f.dims else try reads(a, &.{ &f.up.forms, &f.gate.forms });
+            var u = try unit(a, .{ .ffn = f }, dims, f.outs, 0, visible, &slots);
             u.plan = @intCast(ffn_plans.items.len);
+            u.quiet = try ffn.quiet(a, f);
             try ffn_plans.append(a, try ffn.build(a, f, &ffn_totals));
             try units.append(a, u);
         },

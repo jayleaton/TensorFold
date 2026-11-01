@@ -32,22 +32,38 @@ pub fn build(a: std.mem.Allocator, f: *const model.Ffn, offs: *[3]u32) !Plan {
     return p;
 }
 
-/// The part's outputs for the running inputs (nz dims ascending, values in s.x); silent units (gate <= 0) add zero.
-pub fn run(s: *State, p: *const Plan, nz: []const u32) []const Scalar {
+/// The part's outputs for the running inputs (nz sources ascending, values in x); silent units (gate <= 0) add zero.
+pub fn run(s: *State, p: *const Plan, x: []const Scalar, nz: []const u32) []const Scalar {
     const f = p.f;
     const up = s.ffn_up[p.up_off..][0..f.up.forms.outputs];
     const gate = s.ffn_gate[p.gate_off..][0..f.gate.forms.outputs];
     const y = s.ffn_y[p.node_off..][0..f.outs.len];
     @memset(y, 0);
-    p.up.apply(s.x, nz, up);
-    p.gate.apply(s.x, nz, gate);
+    p.up.apply(x, nz, up);
+    p.gate.apply(x, nz, gate);
+    fire(f, up, gate, y);
+    return y;
+}
+
+/// Whether every output is +0 when every input is zero: a fresh machine's zeroed outputs already match the part.
+pub fn quiet(a: std.mem.Allocator, f: *const model.Ffn) !bool {
+    const up = try a.alloc(Scalar, f.up.forms.outputs + f.gate.forms.outputs + f.outs.len);
+    defer a.free(up);
+    @memset(up, 0);
+    const y = up[up.len - f.outs.len ..];
+    fire(f, up[0..f.up.forms.outputs], up[f.up.forms.outputs..][0..f.gate.forms.outputs], y);
+    for (y) |v| if (@as(u32, @bitCast(v)) != 0) return false;
+    return true;
+}
+
+/// Adds every firing unit's output to y from the forms' values.
+fn fire(f: *const model.Ffn, up: []const Scalar, gate: []const Scalar, y: []Scalar) void {
     for (gate, f.starts[0 .. f.starts.len - 1], f.starts[1..]) |v, lo, hi| for (f.order[lo..hi]) |t| {
         const g = f.gate.bias[t] + v;
         if (!(g > 0)) break;
         y[f.slot[t]] += f.coef[t] * upValue(f, t, up) * g;
     };
     for (f.always) |t| y[f.slot[t]] += f.coef[t] * upValue(f, t, up) * f.gate.bias[t];
-    return y;
 }
 
 fn upValue(f: *const model.Ffn, t: u32, up: []const Scalar) Scalar {

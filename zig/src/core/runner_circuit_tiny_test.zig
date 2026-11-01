@@ -26,7 +26,7 @@ pub fn token(family: u32, payload: u32) u32 {
 }
 
 /// Variants that break one rule, for negative controls.
-pub const Variant = enum { good, two_hot_key, unmapped_go, beta_gated, halving, chained };
+pub const Variant = enum { good, two_hot_key, unmapped_go, beta_gated, halving, chained, resting };
 
 /// The container bytes of the tiny circuit.
 pub fn build(a: std.mem.Allocator, variant: Variant) ![]u8 {
@@ -51,6 +51,7 @@ pub fn build(a: std.mem.Allocator, variant: Variant) ![]u8 {
         try w.f(",{{\"kind\":\"ffn\",\"name\":\"c{d}\",\"out\":{d},\"into\":{s},", .{ i, dims.sum, if (i == 0) "false" else "true" });
         try w.f("\"terms\":[[{d}.0,[[0,1.0]],[[{d},1.0]]]]}}", .{ t[0], t[1] });
     };
+    if (variant == .resting) try w.f(",{{\"kind\":\"ffn\",\"name\":\"r\",\"out\":{d},\"into\":false,\"terms\":[[3.0,[[0,1.0]],[[0,2.0]]]]}}", .{dims.sum});
     try codeNodes(w, variant);
     try w.s("],\"output\":{\"code_dims\":[");
     for (0..family_bits + 16) |i| try w.f("{s}{d}", .{ if (i == 0) "" else ",", dims.code + i });

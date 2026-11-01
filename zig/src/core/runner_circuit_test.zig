@@ -198,6 +198,21 @@ test "an into chain no unit reads folds its links in order at its end as each li
     }
 }
 
+test "an FFN part that is not zero at rest runs on a fresh machine's first step and keeps its value after a forced step" {
+    var c = try tinyCircuit(.resting);
+    defer c.deinit(gpa);
+    var quiet: usize = 0;
+    for (c.flow.units) |u| quiet += @intFromBool(u.quiet);
+    try std.testing.expectEqual(c.flow.ffn_plans.len - 1, quiet);
+    var s = try rc.State.init(gpa, &c);
+    defer s.deinit();
+    for ([_]u32{ c.go, tok(1, 0), tok(2, 1 | 4), tok(1, 0) }, 0..) |t, i| {
+        if (i == 2) try rc.writeWord(&s, 0, 5);
+        _ = try eval.step(&s, t);
+        try std.testing.expectEqual(@as(model.Scalar, 6), s.value(tiny.dims.sum));
+    }
+}
+
 test "a node that reads a dim written earlier in stored order sees the write" {
     var c = try tinyCircuit(.good);
     defer c.deinit(gpa);

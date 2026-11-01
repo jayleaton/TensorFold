@@ -299,9 +299,10 @@ fn positives(p: *const Plan, frames: []const Frame, t: u64, which: u1, out: []u3
 }
 
 /// One head at step s.steps: the frame, selection, then per value head decay, write, read and its outputs.
-pub fn run(s: *State, p: *const Plan, unit: usize, nz: []const u32, local: []const u32) ![]const Scalar {
+pub fn run(s: *State, plan: u32, unit: usize, nz: []const u32, local: []const u32) ![]const Scalar {
+    const p = &s.circuit.flow.plans[plan];
     const t = s.steps;
-    const frames = s.frames[unit][0..];
+    const frames = s.frames[plan][0..];
     var n_key: usize = 0;
     for (nz, local) |d, j| if (p.sel_dim[j]) {
         s.key[n_key] = @as(u64, j) << 32 | @as(u32, @bitCast(s.x[d]));
@@ -312,7 +313,7 @@ pub fn run(s: *State, p: *const Plan, unit: usize, nz: []const u32, local: []con
     const sel_nz = s.nz2[0..n_key];
     const h = Memo.hash(key);
     const memo = &s.memos[unit];
-    const words = (if (s.always or memo.off()) null else memo.find(key, h)) orelse blk: {
+    const words = (if (s.always or memo.off() or memo.cold()) null else memo.find(key, h)) orelse blk: {
         const w = select(s, p, sel_nz);
         if (!memo.off()) try memo.put(s.gpa, key, h, w);
         break :blk w;
@@ -432,8 +433,9 @@ fn readNorm(s: *State, table: u32, rows: []const u32) !?Scalar {
 }
 
 /// Canonical history of this head's channels at step `t`: projections of steps t-1, t-2, t-3, newest first.
-pub fn history(s: *State, p: *const Plan, unit: usize, out: []u8, at: *usize) void {
-    var views: Views = .{ .s = s, .frames = s.frames[unit][0..], .t = s.steps };
+pub fn history(s: *State, plan: u32, out: []u8, at: *usize) void {
+    const p = &s.circuit.flow.plans[plan];
+    var views: Views = .{ .s = s, .frames = s.frames[plan][0..], .t = s.steps };
     defer views.clear();
     for (0..p.h.channels) |c| for (1..model.lags) |lag| {
         const v: Scalar = if (views.dense(@intCast(lag)) == null) 0 else views.proj(p, @intCast(c), @intCast(lag));

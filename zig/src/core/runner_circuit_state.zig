@@ -39,7 +39,7 @@ pub const State = struct {
     /// Units to visit this step and those already due next step (lag window open or unstable), one bit each.
     active: []u64,
     keep: []u64,
-    /// Per unit: its last runs' inputs (heads) and its results by exact input.
+    /// Per head (by plan) its last runs' inputs; per unit its results by exact input.
     frames: [][head.frames_per_unit]head.Frame,
     memos: []Memo,
     /// Dense input scratch, zero outside a running unit; the same for steps t-1..t-3 while a head reads them.
@@ -86,7 +86,7 @@ pub const State = struct {
         s.chain_bits = try zeroed(gpa, u64, f.chain_words);
         s.active = try zeroed(gpa, u64, n / 64 + 1);
         s.keep = try zeroed(gpa, u64, n / 64 + 1);
-        s.frames = try gpa.alloc([head.frames_per_unit]head.Frame, n);
+        s.frames = try gpa.alloc([head.frames_per_unit]head.Frame, f.plans.len);
         for (s.frames) |*fs| fs.* = @splat(.{});
         s.memos = try gpa.alloc(Memo, n);
         for (s.memos) |*m| m.* = .{};
@@ -207,7 +207,7 @@ pub const State = struct {
             }
         };
         const scratch: *State = @constCast(s);
-        for (c.flow.units, 0..) |u, i| if (u.kind == .heads) head.history(scratch, &c.flow.plans[u.plan], i, out, &at);
+        for (c.flow.units) |u| if (u.kind == .heads) head.history(scratch, u.plan, out, &at);
         std.debug.assert(at == n);
         return out;
     }
