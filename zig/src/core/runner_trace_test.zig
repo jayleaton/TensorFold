@@ -115,6 +115,15 @@ test "runner trace: a name after an operator is no definition; a redefinition po
     try expectStated(&.{ "Let A = 12,345.", "A = 12345.", "Need compute A*1000003." }, "(12345)*1000003");
 }
 
+test "runner trace: an owned line restated through its names never fires again (live big-number-019)" {
+    var t = trace.Tracer.init(gpa);
+    defer t.deinit();
+    const f = (try t.line(bn019)).?;
+    try t.fire(f.display);
+    const again = "Need divide A by B. A has 6 base1e9 limbs, B 3 limbs. Quotient ~ A/B ~ (3.141e50)/(2.718e20)=1.155e30.";
+    try std.testing.expectEqual(null, try t.line(again));
+}
+
 test "runner trace: negative controls: prose, code and small inline sums state nothing" {
     try expectNone(&.{"We need answer. Need be careful. Let's think about the algorithm."});
     try expectNone(&.{"for i in range(10): total = total * 3"});

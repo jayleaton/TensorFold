@@ -54,7 +54,7 @@ pub const Scanner = struct {
     tracer: ?trace.Tracer = null, // names and owned statements (form trace; made at the first reasoning line)
     trace_src: std.ArrayList(u8) = .empty, // the pending statement's Python source
     trace_disp: std.ArrayList(u8) = .empty,
-    trace_armed: std.ArrayList(u8) = .empty, // the source of the trace cell armed in this token
+    trace_armed: std.ArrayList(u8) = .empty, // the display of the trace cell armed in this token
     trace_cell: ?u32 = null, // the stated computation waiting for its cue
     trace_at: u32 = 0, // the token its line ended at
     trace_cells: u32 = 0,
@@ -168,7 +168,7 @@ pub const Scanner = struct {
         var fired = false;
         if (s.trace_cell != null and trace.cue(raw)) fired = try s.traceArm(a);
         const found = try t.line(raw) orelse return;
-        if (s.trace_cell != null and std.mem.eql(u8, found.source, s.trace_src.items)) return;
+        if (s.trace_cell != null and std.mem.eql(u8, found.display, s.trace_disp.items)) return;
         if (ev.closed != null or s.trace_cells >= trace_cells_max or s.trace_owned >= trace_owned_max) return;
         s.trace_src.clearRetainingCapacity();
         try s.trace_src.appendSlice(a, found.source);
@@ -187,7 +187,7 @@ pub const Scanner = struct {
         if (s.armed != null) return false;
         s.armed = .{ .index = s.trace_cell.?, .trace = true };
         s.trace_armed.clearRetainingCapacity();
-        try s.trace_armed.appendSlice(a, s.trace_src.items);
+        try s.trace_armed.appendSlice(a, s.trace_disp.items);
         return true;
     }
 
