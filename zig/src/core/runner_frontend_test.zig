@@ -3,7 +3,7 @@ const f = @import("runner_frontend.zig");
 const t = std.testing;
 
 test "frontend accepts model multiply and REPL power without computing the answer" {
-    const front = f.frontend();
+    var exact: f.Context = .{ .io = t.io, .exact_python = true };
     const cases = [_][3][]const u8{
         .{ "python", "print(123456789012345678901234567890 * 987654321098765432109876543210)", "123456789012345678901234567890*987654321098765432109876543210" },
         .{ "py", "2**100", "2**100" },
@@ -12,6 +12,10 @@ test "frontend accepts model multiply and REPL power without computing the answe
         .{ "calc", "1.25*2.4", "1.25*2.4" },
     };
     for (cases) |case| {
+        const front = if (std.mem.eql(u8, case[0], "calc") or std.mem.eql(u8, case[0], "exact"))
+            exact.frontend()
+        else
+            f.frontend();
         const result = try front.translate(front.ctx, t.allocator, .{ .form = .repl, .lang = case[0], .code = case[1] });
         try t.expect(result == .program);
         defer t.allocator.free(result.program.bytes);
@@ -26,6 +30,7 @@ test "frontend declines unsupported code and Python output mismatches" {
         .{ "javascript", "2*3" },            .{ "python", "print(missing)" },  .{ "python", "import os" },
         .{ "python", "print(1/3)" },         .{ "python", "print(1.25*2.4)" }, .{ "python", "gcd(2,4)" },
         .{ "python", "print(2); print(3)" }, .{ "python", "10**100" },         .{ "python", "1//0" },
+        .{ "exact", "1/3" },                 .{ "calc", "1.25*2.4" },
     };
     for (cases) |case| {
         const result = try front.translate(front.ctx, t.allocator, .{ .form = .fence, .lang = case[0], .code = case[1] });
@@ -46,6 +51,8 @@ test {
     _ = @import("runner_frontend_calc.zig");
     _ = @import("runner_frontend_program.zig");
     _ = @import("runner_frontend_reference_test.zig");
+    _ = @import("runner_frontend_boot.zig");
+    _ = @import("runner_frontend_boot_main.zig");
 }
 
 test "real compiler emits circuit ELF for loops and C with negative controls" {

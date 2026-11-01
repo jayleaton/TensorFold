@@ -51,7 +51,8 @@ test "accepted arithmetic executes in the firmware reference with exact output" 
         std.debug.print("SKIP firmware reference: set TF_RUNNER_QWENPUTER to its source checkout\n", .{});
         return error.SkipZigTest;
     };
-    const frontend = @import("runner_frontend.zig").frontend();
+    var context: @import("runner_frontend.zig").Context = .{ .io = t.io, .exact_python = true };
+    const frontend = context.frontend();
     const cases = [_][3][]const u8{
         .{ "python", "print(123456789012345*987654321098765)", "121932631137021071359549253925\n" },
         .{ "python", "print(123456789012345678901234567890*987654321098765432109876543210)", "121932631137021795226185032733622923332237463801111263526900\n" },
@@ -64,7 +65,7 @@ test "accepted arithmetic executes in the firmware reference with exact output" 
         .{ "exact", "gcd(48,18)", "6\n" },
     };
     for (cases) |case| {
-        const result = try frontend.translate(null, t.allocator, .{ .form = .repl, .lang = case[0], .code = case[1] });
+        const result = try frontend.translate(frontend.ctx, t.allocator, .{ .form = .repl, .lang = case[0], .code = case[1] });
         try t.expect(result == .program);
         defer t.allocator.free(result.program.bytes);
         try check(root, env.get("TF_RUNNER_REFERENCE_PYTHON") orelse "/usr/bin/python3", result.program, case[2]);
