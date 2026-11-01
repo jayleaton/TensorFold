@@ -51,6 +51,7 @@ test {
     _ = @import("runner_frontend_calc.zig");
     _ = @import("runner_frontend_program.zig");
     _ = @import("runner_frontend_reference_test.zig");
+    _ = @import("runner_frontend_coverage_test.zig");
     _ = @import("runner_frontend_boot.zig");
     _ = @import("runner_frontend_boot_main.zig");
 }
@@ -115,4 +116,18 @@ test "prior cells cannot silently shadow Python builtins" {
         .prior = &.{"print = lambda x: None"},
     });
     try t.expect(result == .abstain);
+}
+
+test "inline typographic operators normalize without changing Python syntax or tuple semantics" {
+    const front = f.frontend();
+    const result = try front.translate(null, t.allocator, .{ .form = .inline_expr, .lang = "python", .code = "47 × 83 − 1" });
+    try t.expect(result == .program);
+    defer t.allocator.free(result.program.bytes);
+    try t.expectEqualStrings("47*83-1", result.program.bytes);
+    for ([_][]const u8{ "47 × 83", "47 − 83" }) |code| {
+        try t.expect((try front.translate(null, t.allocator, .{ .form = .fence, .lang = "python", .code = code })) == .abstain);
+    }
+    for ([_][]const u8{ "1,000 + 2", "2*3,18", "2^10", "1.18 × 0.82", "7 ÷ 2", "gcd(2,4)" }) |code| {
+        try t.expect((try front.translate(null, t.allocator, .{ .form = .inline_expr, .lang = "python", .code = code })) == .abstain);
+    }
 }
