@@ -302,7 +302,7 @@ pub fn run(h: *LaneHost, rd: Rounds) void {
         status.noteLive(h);
         if (!did) {
             h.lock();
-            if (h.cancels.items.len == 0) h.wake.waitTimeout(h.io, &h.mutex, .{ .duration = .{ .raw = .fromMilliseconds(20), .clock = .awake } }) catch {};
+            if (h.cancels.items.len == 0) h.wake.waitTimeout(h.io, &h.mutex, .{ .duration = .{ .raw = .fromMilliseconds(@import("lane_host_runner.zig").idleWait(h, 20)), .clock = .awake } }) catch {};
             h.unlock();
         }
     }

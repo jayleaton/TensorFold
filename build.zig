@@ -62,6 +62,7 @@ pub fn build(b: *std.Build) void {
     @import("zig/build/residency_host.zig").steps(b);
     @import("zig/build/lane_halt_host.zig").steps(b);
     @import("zig/build/runner_place.zig").steps(b);
+    @import("zig/build/runner_cost.zig").steps(b);
     @import("zig/build/dsv41_shared.zig").steps(b);
     @import("zig/build/dsv41_cuda.zig").steps(b);
     @import("zig/build/dsv41_state.zig").steps(b);

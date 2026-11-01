@@ -22,6 +22,19 @@ pub fn tick(h: *LaneHost) void {
     }
 }
 
+/// An idle loop's wait: 1 ms while a stream is held at a runner trigger (its run settles off-thread, waking nothing).
+pub fn idleWait(h: *LaneHost, idle_ms: i64) i64 {
+    if (h.runner == null) return idle_ms;
+    for (h.admitted.items) |job| {
+        if (!job.started) continue;
+        const s = job.runner orelse continue;
+        if (s.awaiting()) return @min(idle_ms, held_poll_ms);
+    }
+    return idle_ms;
+}
+
+const held_poll_ms = 1;
+
 fn fail(job: anytype, words: []const u8) void {
     const st = &job.stream;
     st.held = false;

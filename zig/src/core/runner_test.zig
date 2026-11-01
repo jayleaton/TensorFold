@@ -389,6 +389,19 @@ test "runner: a reply's runtime block counts its cells by form, owned tokens and
     try std.testing.expectEqualStrings("", off[0]);
 }
 
+test "runner: a held stream resumes as soon as its run settles, not after the idle loop's full wait" {
+    var back: Back = .{};
+    defer back.deinit();
+    var m = [_]Model{.{ .lead = mul_cell }};
+    var sums: [1][]u8 = undefined;
+    // the run is done at its 40th poll, one poll a loop turn: most come after the trigger, while the stream is held
+    freeAll(try replies(&m, .{ .summaries = &sums, .delay = 40 }, &back));
+    defer gpa.free(sums[0]);
+    const at = std.mem.lastIndexOf(u8, sums[0], "\"held_ms\":").? + 10;
+    const held = try std.fmt.parseInt(u64, sums[0][at .. sums[0].len - 1], 10);
+    try std.testing.expect(held < 1000);
+}
+
 test "runner: knobs parse; off unless the flag is 1 with a circuit" {
     const K = struct {
         var set: []const [2][]const u8 = &.{};
