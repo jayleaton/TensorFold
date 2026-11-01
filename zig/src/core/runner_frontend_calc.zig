@@ -31,8 +31,6 @@ const Parser = struct {
     atoms: usize = 0,
     numbers: usize = 0,
     rational: bool = false,
-    decimal: bool = false,
-    integer_only: bool = false,
 
     fn space(self: *Parser) void {
         while (self.pos < self.source.len and (self.source[self.pos] == ' ' or self.source[self.pos] == '\t'))
@@ -59,7 +57,6 @@ const Parser = struct {
         while (true) {
             if (try self.take("+") or try self.take("-")) try self.term(depth) else break;
         }
-        if (self.decimal and self.integer_only) return error.Unsupported;
     }
 
     fn term(self: *Parser, depth: usize) Invalid!void {
@@ -68,12 +65,10 @@ const Parser = struct {
             self.space();
             const rest = self.source[self.pos..];
             if (std.mem.startsWith(u8, rest, "**")) return error.Unsupported;
-            if (try self.take("//") or try self.take("%")) {
-                self.integer_only = true;
-            } else if (try self.take("/")) {
-                self.integer_only = true;
-                self.rational = true;
-            } else if (!try self.take("*")) break;
+            const integral = try self.take("//") or try self.take("%");
+            if (!integral) {
+                if (try self.take("/")) self.rational = true else if (!try self.take("*")) break;
+            }
             try self.factor(depth);
         }
     }
@@ -83,7 +78,6 @@ const Parser = struct {
         if (try self.take("+") or try self.take("-")) return self.factor(depth + 1);
         try self.atom(depth);
         if (try self.take("**")) {
-            self.integer_only = true;
             try self.factor(depth + 1);
         }
     }
@@ -94,7 +88,6 @@ const Parser = struct {
         if (self.atoms > 12) return error.Unsupported;
         if (try self.take("gcd")) {
             if (!try self.take("(")) return error.Unsupported;
-            self.integer_only = true;
             try self.expression(depth + 1);
             if (!try self.take(",")) return error.Unsupported;
             try self.expression(depth + 1);
@@ -110,7 +103,6 @@ const Parser = struct {
             if (digits == 0) return error.Unsupported;
             if (self.pos - start > 1 and self.source[start] == '0') return error.Unsupported;
             if (self.pos < self.source.len and self.source[self.pos] == '.') {
-                self.decimal = true;
                 self.pos += 1;
                 const fractional = self.pos;
                 while (self.pos < self.source.len and std.ascii.isDigit(self.source[self.pos])) : (self.pos += 1)

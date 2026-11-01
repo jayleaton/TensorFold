@@ -72,6 +72,7 @@ fn width(v: Value) usize {
 }
 
 fn decimal(op: u8, a: Value, b: Value) Invalid!Value {
+    if (op != '+' and op != '-' and op != '*') return error.Unsupported;
     if (op == '*') {
         const w = width(a) + width(b);
         if (w > 62) return error.Unsupported;
@@ -80,6 +81,8 @@ fn decimal(op: u8, a: Value, b: Value) Invalid!Value {
         v.width = w;
         return v;
     }
+    // Firmware shift() leaves shifted zero untrimmed; reject it before later magnitude comparisons.
+    if ((a.n == 0 and a.scale < b.scale) or (b.n == 0 and b.scale < a.scale)) return error.Unsupported;
     const scale = @max(a.scale, b.scale);
     const wa = width(a) + scale - a.scale;
     const wb = width(b) + scale - b.scale;
@@ -111,6 +114,7 @@ const Parser = struct {
             if (op != '+' and op != '-') break;
             self.pos += 1;
             const b = try self.term();
+            if ((a.scale != 0 or b.scale != 0) and (a.d != 1 or b.d != 1)) return error.Unsupported;
             a = if (a.scale != 0 or b.scale != 0) try decimal(op, a, b) else try rational(op, a, b);
         }
         return a;
@@ -132,6 +136,7 @@ const Parser = struct {
                     return error.Unsupported;
                 a = try checked(if (floor) @divFloor(x, y) else x - @divFloor(x, y) * y, 1);
             } else if (a.scale != 0 or b.scale != 0) {
+                if (op != '*' or a.d != 1 or b.d != 1) return error.Unsupported;
                 a = try decimal(op, a, b);
             } else if (op == '/' or a.d != 1 or b.d != 1) {
                 a = try rational(op, a, b);
