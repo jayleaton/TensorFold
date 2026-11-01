@@ -4,6 +4,7 @@ const trace = @import("runner_trace.zig");
 const scan = @import("runner_scan.zig");
 const rapi = @import("runner_api.zig");
 const rt = @import("runner_test.zig");
+const runner = @import("runner.zig");
 
 const gpa = std.testing.allocator;
 
@@ -76,7 +77,7 @@ test "runner trace: the display line and the owned text" {
     const f = (try t.line(bn019)).?;
     try std.testing.expect(f.divmod);
     try std.testing.expectEqualStrings("314159265358979323846264338327950288419716939937510 ÷ 271828182845904523536", f.display);
-    const line = (try trace.owned(gpa, f.display, true, "(1155727349790921717910215407028, 23663814570294126502)\n")).?;
+    const line = (try trace.owned(gpa, "", f.display, true, "(1155727349790921717910215407028, 23663814570294126502)\n")).?;
     defer gpa.free(line);
     try std.testing.expectEqualStrings("[exact: 314159265358979323846264338327950288419716939937510 ÷ 271828182845904523536 = 1155727349790921717910215407028 remainder 23663814570294126502]\n", line);
     const g = (try t.line(bn008)).?;
@@ -85,8 +86,8 @@ test "runner trace: the display line and the owned text" {
     defer fresh.deinit();
     const h = (try fresh.line(bn015)).?;
     try std.testing.expectEqualStrings("0xFEDCBA9876543210*2^64 + 0x0123456789ABCDEF", h.display);
-    for ([_][]const u8{ "3.75\n", "1\n2\n", "", "(1, 2)\n" }) |out| try std.testing.expectEqual(null, try trace.owned(gpa, "x", false, out));
-    for ([_][]const u8{ "(1, 2, 3)\n", "7\n", "(1,2)\n" }) |out| try std.testing.expectEqual(null, try trace.owned(gpa, "x", true, out));
+    for ([_][]const u8{ "3.75\n", "1\n2\n", "", "(1, 2)\n" }) |out| try std.testing.expectEqual(null, try trace.owned(gpa, "", "x", false, out));
+    for ([_][]const u8{ "(1, 2, 3)\n", "7\n", "(1,2)\n" }) |out| try std.testing.expectEqual(null, try trace.owned(gpa, "", "x", true, out));
 }
 
 test "runner trace: doubts, lists, hypotheticals and two readings abstain" {
@@ -223,12 +224,16 @@ const TraceBack = struct {
 
 /// One reply; `guess` is the model's own line after `lead` (a digit line is itself a cue).
 fn traced(lead: []const u8, guess: []const u8, on: bool, delay: u32, fault: bool) ![]u8 {
+    return tracedAsk(lead, guess, on, delay, fault, .{});
+}
+
+fn tracedAsk(lead: []const u8, guess: []const u8, on: bool, delay: u32, fault: bool, ask: runner.TraceAsk) ![]u8 {
     var back: TraceBack = .{ .delay = delay, .fault = fault };
     defer back.deinit();
     var unused: rt.Back = .{};
     defer unused.deinit();
     var m = [_]rt.Model{.{ .lead = lead, .guess = guess }};
-    const texts = try rt.replies(&m, .{ .trace = on, .backend = back.backend() }, &unused);
+    const texts = try rt.replies(&m, .{ .trace = on, .backend = back.backend(), .trace_ask = ask }, &unused);
     defer gpa.free(texts);
     return texts[0];
 }
@@ -264,6 +269,40 @@ test "runner trace: late runs give the same reply; faults, the form off and no c
     const digits = try traced(quiet, "135308598", true, 0, false); // the model's own digit line is a hand-work cue
     defer gpa.free(digits);
     try std.testing.expectEqualStrings(quiet ++ "135308598\n[exact: 987654 * 137 = 135308598]\n", digits);
+}
+
+test "runner trace: a request's wording frames the owned line; runner_trace false keeps the model's text" {
+    const worded = try tracedAsk(mul_lead, "ok", true, 0, false, .{ .format = "[exact, computed by the engine: {}]" });
+    defer gpa.free(worded);
+    try std.testing.expectEqualStrings(mul_lead ++ "[exact, computed by the engine: 987654 * 137 = 135308598]\nDone.", worded);
+    const noted = try tracedAsk(mul_lead, "ok", true, 0, false, .{ .format = "[exact: {}] (computed exactly by the engine)" });
+    defer gpa.free(noted);
+    try std.testing.expectEqualStrings(mul_lead ++ "[exact: 987654 * 137 = 135308598] (computed exactly by the engine)\nDone.", noted);
+    const default = try tracedAsk(mul_lead, "ok", true, 0, false, .{ .format = trace.default_format });
+    defer gpa.free(default);
+    const plain = try traced(mul_lead, "ok", true, 0, false);
+    defer gpa.free(plain);
+    try std.testing.expectEqualStrings(plain, default);
+    const off = try tracedAsk(mul_lead, "ok", true, 0, false, .{ .off = true, .format = "[engine: {}]" });
+    defer gpa.free(off);
+    try std.testing.expectEqualStrings(mul_lead ++ "ok\nDone.", off);
+}
+
+test "runner trace: wording around divmod's quotient and remainder; a request's wording must be one line with {} once" {
+    const line = (try trace.owned(gpa, "[exact, computed by the engine: {}]", "(10^30 - 1) ÷ 97", true, "(10309278350515463917525773195, 84)\n")).?;
+    defer gpa.free(line);
+    try std.testing.expectEqualStrings("[exact, computed by the engine: (10^30 - 1) ÷ 97 = 10309278350515463917525773195 remainder 84]\n", line);
+    const lead = (try trace.owned(gpa, "{} (exact)", "2^10", false, "1024\n")).?;
+    defer gpa.free(lead);
+    try std.testing.expectEqualStrings("2^10 = 1024 (exact)\n", lead);
+    try std.testing.expect(trace.validFormat("[exact: {}]"));
+    try std.testing.expect(trace.validFormat("{}"));
+    var long: [trace.max_format + 1]u8 = undefined;
+    @memset(&long, 'x');
+    long[0..2].* = "{}".*;
+    try std.testing.expect(trace.validFormat(long[0..trace.max_format]));
+    try std.testing.expect(!trace.validFormat(&long));
+    for ([_][]const u8{ "", "[exact]", "[{} = {}]", "[exact: {}]\nmore", "[exact: {}]\r" }) |bad| try std.testing.expect(!trace.validFormat(bad));
 }
 
 fn env(name: [:0]const u8) ?[]const u8 {

@@ -145,13 +145,26 @@ pub const Tracer = struct {
     }
 };
 
-/// "[exact: <display> = <value>]\n" from a circuit's printed value, or null (abstain: not one integer, or not (q, r)).
-pub fn owned(a: Allocator, display: []const u8, divmod: bool, out: []const u8) Allocator.Error!?[]u8 {
+/// The owned line's default wording: `{}` stands for `<display> = <value>`.
+pub const default_format = "[exact: {}]";
+
+/// The longest wording a request may give (runner_trace_format).
+pub const max_format = 128;
+
+/// A request's wording: one line, at most `max_format` bytes, `{}` exactly once.
+pub fn validFormat(f: []const u8) bool {
+    return f.len <= max_format and std.mem.count(u8, f, "{}") == 1 and std.mem.indexOfAny(u8, f, "\r\n") == null;
+}
+
+/// `format` around "<display> = <value>\n" from a circuit's printed value, or null (not one integer, or not (q, r)).
+pub fn owned(a: Allocator, format: []const u8, display: []const u8, divmod: bool, out: []const u8) Allocator.Error!?[]u8 {
+    const f = if (format.len > 0) format else default_format;
+    const at = std.mem.indexOf(u8, f, "{}").?;
     const v = if (std.mem.endsWith(u8, out, "\n")) out[0 .. out.len - 1] else out;
     if (v.len == 0 or std.mem.indexOfScalar(u8, v, '\n') != null) return null;
     if (!divmod) {
         if (!isInt(v)) return null;
-        return try std.fmt.allocPrint(a, "[exact: {s} = {s}]\n", .{ display, v });
+        return try std.fmt.allocPrint(a, "{s}{s} = {s}{s}\n", .{ f[0..at], display, v, f[at + 2 ..] });
     }
     if (v.len < 6 or v[0] != '(' or v[v.len - 1] != ')') return null;
     const inner = v[1 .. v.len - 1];
@@ -159,7 +172,7 @@ pub fn owned(a: Allocator, display: []const u8, divmod: bool, out: []const u8) A
     const q = inner[0..comma];
     const r = inner[comma + 2 ..];
     if (!isInt(q) or !isInt(r)) return null;
-    return try std.fmt.allocPrint(a, "[exact: {s} = {s} remainder {s}]\n", .{ display, q, r });
+    return try std.fmt.allocPrint(a, "{s}{s} = {s} remainder {s}{s}\n", .{ f[0..at], display, q, r, f[at + 2 ..] });
 }
 
 fn isInt(s: []const u8) bool {

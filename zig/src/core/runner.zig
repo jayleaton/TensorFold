@@ -84,6 +84,12 @@ pub const Text = struct {
     encode: *const fn (ctx: ?*anyopaque, a: Allocator, text: []const u8) Allocator.Error![]u32,
 };
 
+/// A request's say over form trace (chat fields "runner_trace", "runner_trace_format"); defaults change nothing.
+pub const TraceAsk = struct {
+    off: bool = false, // no trace cells in this reply, though the server's forms have trace
+    format: []const u8 = "", // the owned line, `{}` for `<expr> = <value>` (validFormat); "": `[exact: {}]`
+};
+
 /// The server-wide runner: a frontend, a backend and the server's tokenizer (set at its start); sessions are per reply.
 pub const Runner = struct {
     gpa: Allocator,
@@ -95,10 +101,14 @@ pub const Runner = struct {
     placer: ?*place.Placer = null, // the backend's job threads and the translations run placed
 
     /// A reply's session; null until the server has given the runner its tokenizer.
-    pub fn session(r: *Runner) Allocator.Error!?*Session {
+    pub fn session(r: *Runner, ask: TraceAsk) Allocator.Error!?*Session {
         if (r.text == null) return null;
+        const format = try r.gpa.dupe(u8, ask.format);
+        errdefer r.gpa.free(format);
         const s = try r.gpa.create(Session);
-        s.* = .{ .r = r, .id = r.next_id, .scan = .{ .cfg = r.cfg.scan } };
+        var cfg = r.cfg.scan;
+        if (ask.off) cfg.trace = false;
+        s.* = .{ .r = r, .id = r.next_id, .scan = .{ .cfg = cfg }, .format = format };
         r.next_id += 1;
         return s;
     }
@@ -134,6 +144,7 @@ pub const Session = struct {
     forcing: ?struct { at: u64, left: usize, cell: u32 } = null, // an owned result's forced tokens still to commit
     resume_ms: u64 = 0, // summed: an owned result's settling to the model's first token after it
     broken: bool = false, // out of memory once: no more cells, no more holds
+    format: []u8, // TraceAsk.format, owned
 
     pub fn hook(s: *Session) lanes.stream.RunnerHook {
         return .{ .ptr = s, .token = onToken };
@@ -246,7 +257,7 @@ pub const Session = struct {
     fn ownTrace(s: *Session, c: *Cell, index: u32, held_ms: u64) Allocator.Error![]u32 {
         const gpa = s.r.gpa;
         const tx = s.r.text.?;
-        const line = if (!c.abstained and c.result.?.status == .ok) try trace.owned(gpa, c.stated.?.display, c.stated.?.divmod, c.result.?.out) else null;
+        const line = if (!c.abstained and c.result.?.status == .ok) try trace.owned(gpa, s.format, c.stated.?.display, c.stated.?.divmod, c.result.?.out) else null;
         if (line) |text| {
             defer gpa.free(text);
             const ids = try tx.encode(tx.ctx, gpa, text);
@@ -392,6 +403,7 @@ pub const Session = struct {
         s.r.backend.release(s.id);
         s.cells.deinit(gpa);
         s.scan.deinit(gpa);
+        gpa.free(s.format);
         gpa.destroy(s);
     }
 };
