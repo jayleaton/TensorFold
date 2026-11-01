@@ -2,7 +2,7 @@
 const std = @import("std");
 const Invalid = error{Unsupported};
 pub const Bounds = struct { lo: i64, hi: i64 };
-const Op = enum { literal, variable, add, sub, mul, neg, power };
+const Op = enum { literal, variable, add, sub, mul, floor, mod, neg, power };
 const Node = struct { op: Op, lhs: usize = 0, rhs: usize = 0, value: i64 = 0, name: []const u8 = "" };
 
 pub fn fits(n: i64) bool {
@@ -84,8 +84,9 @@ pub const Parser = struct {
         var lhs = try p.unary();
         while (true) {
             p.space();
-            if (std.mem.startsWith(u8, p.src[p.pos..], "**") or !p.eat("*")) break;
-            lhs = try p.node(.{ .op = .mul, .lhs = lhs, .rhs = try p.unary() });
+            if (std.mem.startsWith(u8, p.src[p.pos..], "**")) break;
+            const op: Op = if (p.eat("*")) .mul else if (p.eat("//")) .floor else if (p.eat("%")) .mod else break;
+            lhs = try p.node(.{ .op = op, .lhs = lhs, .rhs = try p.unary() });
         }
         return lhs;
     }
@@ -136,13 +137,14 @@ pub const Parser = struct {
                 const b = try p.bounds(n.lhs);
                 break :blk .{ .lo = -b.hi, .hi = -b.lo };
             },
-            .add, .sub, .mul => blk: {
+            .add, .sub, .mul, .floor, .mod => blk: {
                 const a = try p.bounds(n.lhs);
                 const b = try p.bounds(n.rhs);
                 break :blk switch (n.op) {
                     .add => .{ .lo = a.lo + b.lo, .hi = a.hi + b.hi },
                     .sub => .{ .lo = a.lo - b.hi, .hi = a.hi - b.lo },
                     .mul => multiply(a, b),
+                    .floor, .mod => try divide(a, b, n.op == .mod),
                     else => unreachable,
                 };
             },
@@ -177,6 +179,13 @@ pub const Parser = struct {
                     },
                     n.rhs,
                 }),
+                .floor, .mod => {
+                    if (n.op == .floor) {
+                        try out.print(a, "tf_e{0d} / tf_e{1d} - ((tf_e{0d} % tf_e{1d} != 0) && ((tf_e{0d} < 0) != (tf_e{1d} < 0)))", .{ n.lhs, n.rhs });
+                    } else {
+                        try out.print(a, "tf_e{0d} % tf_e{1d} + (((tf_e{0d} % tf_e{1d} != 0) && ((tf_e{0d} < 0) != (tf_e{1d} < 0))) ? tf_e{1d} : 0)", .{ n.lhs, n.rhs });
+                    }
+                },
                 .power => {
                     try out.appendSlice(a, "1");
                     var i: i64 = 0;
@@ -232,4 +241,29 @@ test "sum squares semantics are 285 with wrong-operator negative control" {
     }
     try std.testing.expectEqual(@as(i64, 285), sum);
     try std.testing.expect(wrong_sum != sum);
+}
+
+fn divide(a: Bounds, b: Bounds, remainder: bool) Invalid!Bounds {
+    if (b.lo <= 0 and b.hi >= 0) return error.Unsupported;
+    if (a.lo == std.math.minInt(i32) and b.lo <= -1 and b.hi >= -1) return error.Unsupported;
+    if (remainder) {
+        if (a.lo == a.hi and b.lo == b.hi) {
+            const value = a.lo - @divFloor(a.lo, b.lo) * b.lo;
+            return .{ .lo = value, .hi = value };
+        }
+        return if (b.lo > 0) .{ .lo = 0, .hi = b.hi - 1 } else .{ .lo = b.lo + 1, .hi = 0 };
+    }
+    const corners = [_]i64{ @divFloor(a.lo, b.lo), @divFloor(a.lo, b.hi), @divFloor(a.hi, b.lo), @divFloor(a.hi, b.hi) };
+    return .{ .lo = std.mem.min(i64, &corners), .hi = std.mem.max(i64, &corners) };
+}
+
+test "Python division and remainder preserve negative operand semantics" {
+    for ([_][3]i64{ .{ -7, 3, -3 }, .{ 7, -3, -3 }, .{ -7, -3, 2 }, .{ 7, 3, 2 } }) |case| {
+        const quotient = try divide(.{ .lo = case[0], .hi = case[0] }, .{ .lo = case[1], .hi = case[1] }, false);
+        try std.testing.expectEqual(case[2], quotient.lo);
+        const remainder = try divide(.{ .lo = case[0], .hi = case[0] }, .{ .lo = case[1], .hi = case[1] }, true);
+        try std.testing.expectEqual(case[0] - case[2] * case[1], remainder.lo);
+    }
+    try std.testing.expectError(error.Unsupported, divide(.{ .lo = -2, .hi = 2 }, .{ .lo = -1, .hi = 1 }, false));
+    try std.testing.expectError(error.Unsupported, divide(.{ .lo = -2147483648, .hi = 0 }, .{ .lo = -1, .hi = -1 }, true));
 }

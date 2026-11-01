@@ -36,12 +36,21 @@ fn translate(raw: ?*anyopaque, a: std.mem.Allocator, cell: Cell) std.mem.Allocat
     if (lang == .exact and (context == null or !context.?.exact_python)) return .{ .abstain = .unsupported };
     if (cell.prior.len != 0) return .{ .abstain = .unsupported };
     if (cell.code.len > 4096) return .{ .abstain = .too_long };
+    var normalized: ?[]u8 = null;
+    defer if (normalized) |bytes| a.free(bytes);
+    var input = cell.code;
+    if (cell.form == .inline_expr and lang == .python) {
+        normalized = try normalizeInline(a, input);
+        input = normalized.?;
+    }
     if (lang == .python or lang == .exact) {
         // Python true division and floats differ from firmware exact arithmetic in both value and print format.
-        const exact_only = std.mem.indexOfScalar(u8, cell.code, '.') != null or
-            containsDivision(cell.code) or std.mem.indexOf(u8, cell.code, "gcd") != null;
-        if (lang == .python and exact_only and (context == null or !context.?.exact_python)) return .{ .abstain = .unsupported };
-        if (try calc.lower(a, cell.code)) |bytes| return .{ .program = .{ .kind = .calc, .bytes = bytes } };
+        const exact_only = std.mem.indexOfScalar(u8, input, '.') != null or
+            containsDivision(input) or std.mem.indexOf(u8, input, "gcd") != null;
+        const allow_calc = !exact_only or lang == .exact or (context != null and context.?.exact_python);
+        if (allow_calc) {
+            if (try calc.lower(a, input)) |bytes| return .{ .program = .{ .kind = .calc, .bytes = bytes } };
+        }
     }
     if (lang == .exact or cell.form == .inline_expr) return .{ .abstain = .unsupported };
     var source: []const u8 = cell.code;
@@ -76,4 +85,24 @@ fn containsDivision(code: []const u8) bool {
         }
     }
     return false;
+}
+
+// Inline math has typographic operators; executable Python keeps its original syntax.
+fn normalizeInline(a: std.mem.Allocator, source: []const u8) std.mem.Allocator.Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    var pos: usize = 0;
+    while (pos < source.len) {
+        if (std.mem.startsWith(u8, source[pos..], "×")) {
+            try out.append(a, '*');
+            pos += "×".len;
+        } else if (std.mem.startsWith(u8, source[pos..], "−")) {
+            try out.append(a, '-');
+            pos += "−".len;
+        } else {
+            try out.append(a, source[pos]);
+            pos += 1;
+        }
+    }
+    return out.toOwnedSlice(a);
 }

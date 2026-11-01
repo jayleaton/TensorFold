@@ -2,6 +2,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Expr = @import("runner_frontend_program_expr.zig");
+const statements = @import("runner_frontend_statements.zig");
 pub const compiler = @import("runner_frontend_program_compile.zig");
 pub const Config = compiler.Config;
 pub const compile = compiler.compile;
@@ -12,6 +13,7 @@ const Invalid = error{Unsupported};
 
 /// Returns an owned C main body, or abstains; this function neither compiles nor executes the source.
 pub fn lowerPython(a: Allocator, code: []const u8) Allocator.Error!?[]u8 {
+    if (try statements.lowerPython(a, code)) |body| return body;
     return lower(a, code) catch |err| switch (err) {
         error.Unsupported => null,
         error.OutOfMemory => error.OutOfMemory,
@@ -31,12 +33,14 @@ fn lower(a: Allocator, code: []const u8) (Allocator.Error || Invalid)![]u8 {
         if (printed) try p.need("(");
         try p.need("sum");
         try p.need("(");
+        const list = p.eat("[");
         root = try p.expression();
         try p.need("for");
         const variable = try p.identifier();
         if (!validName(variable)) return error.Unsupported;
         try p.need("in");
         range = try parseRange(&p);
+        if (list) try p.need("]");
         try p.need(")");
         if (printed) try p.need(")");
         try p.end();
@@ -141,7 +145,7 @@ fn parseRange(p: *Expr.Parser) Invalid!Range {
 
 test "sum squares 285 is lowered as circuit loop operations" {
     const a = std.testing.allocator;
-    const body = (try lowerPython(a, "print(sum(i*i for i in range(10)))")).?;
+    const body = try lower(a, "print(sum(i*i for i in range(10)))");
     defer a.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "tf_i < 10") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "tf_e0 * tf_e1") != null);
@@ -151,10 +155,10 @@ test "sum squares 285 is lowered as circuit loop operations" {
 
 test "accumulator and descending stepped ranges" {
     const a = std.testing.allocator;
-    const body = (try lowerPython(a, "total = 0\nfor i in range(10):\n    total += i**2\nprint(total)")).?;
+    const body = try lower(a, "total = 0\nfor i in range(10):\n    total += i**2\nprint(total)");
     defer a.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "tf_i < 10") != null);
-    const assigned = (try lowerPython(a, "total = 0\nfor i in range(10):\n    total = total + i*i\nprint(total)")).?;
+    const assigned = try lower(a, "total = 0\nfor i in range(10):\n    total = total + i*i\nprint(total)");
     defer a.free(assigned);
     try std.testing.expect(std.mem.indexOf(u8, assigned, "tf_acc += tf_e2") != null);
     const descending = (try lowerPython(a, "sum(x*x for x in range(9, -1, -1))")).?;
@@ -166,18 +170,18 @@ test "unsupported code and unsafe Python integer operations abstain" {
     const bad = [_][]const u8{
         "print(sum(j*j for i in range(10)))",
         "print(sum(i/i for i in range(10)))",
-        "print(sum(i//2 for i in range(10)))",
         "print(sum(i**32 for i in range(10)))",
         "print(sum(i*i for i in range(100000)))",
         "print(sum(i*i for i in range(10000)))",
         "print(sum(i for i in range(10, 0, 0)))",
         "print(sum(i for i in range(n)))",
         "print(sum(i for i in range(10) if i))",
+        "print(sum([i for i in range(10) if i]))",
+        "print(sum([i for i in range(10)))",
         "print(sum(i for i in range(10))); print(2)",
         "import os\nprint(os.getpid())",
         "t = 0\nfor i in range(10):\n    t += unknown\nprint(t)",
         "t = 2147483647\nfor i in range(1):\n    t += 1\nprint(t)",
-        "t = 0\nfor i in range(10):\n    t += t + i\nprint(t)",
         "t = 0\nfor i in range(10):\n    t += i\n    print(t)",
     };
     for (bad) |src| try std.testing.expectEqual(@as(?[]u8, null), try lowerPython(std.testing.allocator, src));
