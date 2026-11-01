@@ -17,6 +17,8 @@ pub const State = struct {
     history: []Scalar,
     steps: u64 = 0,
     x: []Scalar,
+    active: std.ArrayList(u32),
+    seen: []bool,
     work: []Scalar,
 
     pub fn init(gpa: std.mem.Allocator, c: *const model.Circuit) !State {
@@ -39,8 +41,15 @@ pub const State = struct {
         @memset(hist, 0);
         const x = try gpa.alloc(Scalar, c.dims);
         errdefer gpa.free(x);
+        @memset(x, 0);
+        const seen = try gpa.alloc(bool, c.dims);
+        errdefer gpa.free(seen);
+        @memset(seen, false);
+        var active: std.ArrayList(u32) = .empty;
+        try active.ensureTotalCapacity(gpa, c.dims);
+        errdefer active.deinit(gpa);
         const work = try gpa.alloc(Scalar, workSize(c));
-        return .{ .gpa = gpa, .circuit = c, .tables = tables, .owned = owned, .present = present, .history = hist, .x = x, .work = work };
+        return .{ .gpa = gpa, .circuit = c, .tables = tables, .owned = owned, .present = present, .history = hist, .x = x, .active = active, .seen = seen, .work = work };
     }
 
     pub fn deinit(s: *State) void {
@@ -50,8 +59,26 @@ pub const State = struct {
         s.gpa.free(s.present);
         s.gpa.free(s.history);
         s.gpa.free(s.x);
+        s.gpa.free(s.seen);
+        s.active.deinit(s.gpa);
         s.gpa.free(s.work);
         s.* = undefined;
+    }
+
+    /// Zeroes the residual for a new step; only listed dims can be nonzero.
+    pub fn clearResidual(s: *State) void {
+        for (s.active.items) |d| {
+            s.x[d] = 0;
+            s.seen[d] = false;
+        }
+        s.active.clearRetainingCapacity();
+    }
+
+    /// Lists dim d as possibly nonzero (capacity is the dim count, so this never allocates).
+    pub fn touch(s: *State, d: u32) void {
+        if (s.seen[d]) return;
+        s.seen[d] = true;
+        s.active.appendAssumeCapacity(d);
     }
 
     pub fn writable(s: *const State, table: u32) bool {
@@ -126,8 +153,8 @@ pub const State = struct {
 fn workSize(c: *const model.Circuit) usize {
     var n: usize = 0;
     for (c.batches) |*b| n = @max(n, switch (b.*) {
-        .ffn => |*f| 2 * @as(usize, f.terms) + f.outs.len,
-        .heads => |*h| h.proj.outputs + h.outs.len + 5 * hd,
+        .ffn => |*f| f.outs.len + f.up.forms.outputs + f.gate.forms.outputs,
+        .heads => |*h| h.proj.columns() + h.outs.len + 5 * hd + h.proj.forms.outputs,
     });
     return n;
 }

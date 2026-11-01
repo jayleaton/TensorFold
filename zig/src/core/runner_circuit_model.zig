@@ -12,16 +12,21 @@ pub const keep_selector: Scalar = 0;
 pub const halve_selector: Scalar = 110;
 pub const clear_selector: Scalar = 238;
 
-/// y[dst] += x[src] * w over the nonzeros, stored by source so zero inputs cost nothing.
+/// y = x * W over the nonzeros, stored by source so zero inputs cost nothing.
 pub const Sparse = struct {
     sources: u32,
     outputs: u32,
     starts: []const u32,
     dst: []const u32,
     w: []const Scalar,
+    /// Sources with at least one entry, ascending.
+    used: []const u32,
 
-    pub fn apply(m: *const Sparse, x: []const Scalar, y: []Scalar) void {
-        for (x, 0..) |v, i| {
+    /// y = x * W: zeroes y, then scatters the inputs listed in `active` (every other input is zero).
+    pub fn apply(m: *const Sparse, x: []const Scalar, active: []const u32, y: []Scalar) void {
+        @memset(y, 0);
+        for (if (m.used.len < active.len) m.used else active) |i| {
+            const v = x[i];
             if (v == 0) continue;
             for (m.starts[i]..m.starts[i + 1]) |e| y[m.dst[e]] += v * m.w[e];
         }
@@ -35,14 +40,38 @@ pub const Sparse = struct {
 /// Where a node's value lands: x[dim] = value, or x[dim] += value when `into`.
 pub const Out = struct { dim: u32, into: bool };
 
+pub const no_form = std.math.maxInt(u32);
+
+/// A batch's expressions as distinct linear forms: column c = bias[c] + forms[form[c]], the constant dim folded out.
+pub const Shared = struct {
+    forms: Sparse,
+    form: []const u32,
+    bias: []const Scalar,
+
+    pub fn columns(s: *const Shared) usize {
+        return s.form.len;
+    }
+
+    /// `scratch` holds forms.outputs values.
+    pub fn eval(s: *const Shared, x: []const Scalar, active: []const u32, scratch: []Scalar, y: []Scalar) void {
+        s.forms.apply(x, active, scratch);
+        for (y, s.form, s.bias) |*o, f, c| o.* = if (f == no_form) c else c + scratch[f];
+    }
+};
+
 /// Consecutive FFN nodes with no read of a dim written earlier in the batch: y = sum c * up * max(gate, 0).
 pub const Ffn = struct {
     terms: u32,
-    up: Sparse,
-    gate: Sparse,
+    up: Shared,
+    gate: Shared,
     coef: []const Scalar,
     slot: []const u32,
     outs: []const Out,
+    /// Terms grouped by gate form (starts has forms + 1 entries), each group by gate constant, largest first.
+    order: []const u32,
+    starts: []const u32,
+    /// Terms whose gate is a positive constant; terms with a constant gate <= 0 never fire and are dropped.
+    always: []const u32,
 };
 
 /// (row or column, projection column) of a channel or expression.
@@ -67,7 +96,7 @@ pub const Head = struct {
 
 /// Consecutive head nodes. Projection columns [0, channels) are conv channels with taps; the rest are plain exprs.
 pub const Heads = struct {
-    proj: Sparse,
+    proj: Shared,
     channels: u32,
     first_channel: u32,
     taps: []const [lags]Scalar,
@@ -184,8 +213,8 @@ pub const Circuit = struct {
     pub fn nonzeros(c: *const Circuit) usize {
         var n: usize = 0;
         for (c.batches) |*b| n += switch (b.*) {
-            .ffn => |*f| f.up.nonzeros() + f.gate.nonzeros(),
-            .heads => |*h| h.proj.nonzeros(),
+            .ffn => |*f| f.up.forms.nonzeros() + f.gate.forms.nonzeros(),
+            .heads => |*h| h.proj.forms.nonzeros(),
         };
         return n;
     }
@@ -211,16 +240,20 @@ pub fn sparse(a: std.mem.Allocator, sources: u32, outputs: u32, src: []const u32
         w[fill[s]] = v;
         fill[s] += 1;
     }
-    return .{ .sources = sources, .outputs = outputs, .starts = starts, .dst = dst, .w = w };
+    var used: std.ArrayList(u32) = .empty;
+    for (0..sources) |i| if (starts[i + 1] > starts[i]) try used.append(a, @intCast(i));
+    return .{ .sources = sources, .outputs = outputs, .starts = starts, .dst = dst, .w = w, .used = used.items };
 }
 
 test "sparse apply skips zero inputs and adds repeated entries" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const m = try sparse(arena.allocator(), 3, 2, &.{ 0, 2, 2, 1 }, &.{ 1, 0, 0, 1 }, &.{ 2, 3, 4, 5 });
-    var y = [_]Scalar{ 0, 0 };
-    m.apply(&.{ 1, 0, 2 }, &y);
+    var y = [_]Scalar{ 7, 7 };
+    m.apply(&.{ 1, 0, 2 }, &.{ 0, 1, 2 }, &y);
     try std.testing.expectEqualSlices(Scalar, &.{ 14, 2 }, &y);
+    m.apply(&.{ 1, 0, 2 }, &.{2}, &y);
+    try std.testing.expectEqualSlices(Scalar, &.{ 14, 0 }, &y);
     try std.testing.expectError(error.CircuitIndex, sparse(arena.allocator(), 3, 2, &.{3}, &.{0}, &.{1}));
 }
 

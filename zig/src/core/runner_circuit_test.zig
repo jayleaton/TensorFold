@@ -81,6 +81,23 @@ test "a one-hot write is the gated delta rule at beta 1, and reads return the ro
     try std.testing.expect(s.rowPresent(ram, 3));
 }
 
+test "a write gate of 0 leaves the table untouched and a gate of 1 writes" {
+    var c = try tinyCircuit(.beta_gated);
+    defer c.deinit(gpa);
+    var s = try rc.State.init(gpa, &c);
+    defer s.deinit();
+    const ram = c.program.ram_tables[0];
+    const before = try gpa.dupe(model.Scalar, s.tables[ram]);
+    defer gpa.free(before);
+    _ = try eval.step(&s, tok(2, 1 | 4));
+    try std.testing.expect(!s.rowPresent(ram, 1));
+    try std.testing.expectEqualSlices(model.Scalar, before, s.tables[ram]);
+    _ = try eval.step(&s, tok(2, 2));
+    try std.testing.expect(s.rowPresent(ram, 2));
+    try std.testing.expectEqual(tok(4, '0'), try eval.step(&s, tok(3, 2)));
+    try std.testing.expectEqual(tok(4, '0'), try eval.step(&s, tok(3, 1)));
+}
+
 test "a key with two positive rows is refused, and an unmapped output code fails instead of guessing" {
     var two = try tinyCircuit(.two_hot_key);
     defer two.deinit(gpa);

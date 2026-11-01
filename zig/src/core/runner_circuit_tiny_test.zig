@@ -25,7 +25,7 @@ pub fn token(family: u32, payload: u32) u32 {
 }
 
 /// Variants that break one rule, for negative controls.
-pub const Variant = enum { good, two_hot_key, unmapped_go };
+pub const Variant = enum { good, two_hot_key, unmapped_go, beta_gated };
 
 /// The container bytes of the tiny circuit.
 pub fn build(a: std.mem.Allocator, variant: Variant) ![]u8 {
@@ -122,7 +122,7 @@ fn lag3Head(w: Writer) !void {
     try w.s("\"out\":[[2,36,16384.0]],\"into\":false,\"init\":[]}]}");
 }
 
-/// ram0: W writes row (payload bits 0-1) with data bit 2 in column 2; R reads its row into rd. Row 3 starts at 1.
+/// ram0: W writes row (payload bits 0-1), data bit 2 to column 2; R reads to rd; row 3 is 1. beta_gated: data 0.
 fn ramHead(w: Writer, variant: Variant) !void {
     try w.s("{\"kind\":\"head\",\"name\":\"ram0\",\"n_cols\":128,\"levels\":\"bit\",\"tiny\":0.0,\"q\":[");
     for (0..4) |r| {
@@ -136,9 +136,14 @@ fn ramHead(w: Writer, variant: Variant) !void {
     }
     if (variant == .two_hot_key) try w.s(",[9,{\"expr\":[[3,1.0]],\"taps\":[1.0,0.0,0.0,0.0]}]");
     const v = "\"v\":[[0,{\"expr\":[[3," ++ a_ref ++ "]],\"taps\":[1.0,0.0,0.0,0.0]}],[1,{\"expr\":[[3," ++ a_ref ++
-        "]],\"taps\":[1.0,0.0,0.0,0.0]}],[2,{\"expr\":[[9,128.0]],\"taps\":[1.0,0.0,0.0,0.0]}]],\"a\":[],\"beta\":null,";
-    try w.s("],\"value_heads\":[{" ++ v ++ "\"z\":[[2,[[4,1.0]]]],\"out\":[[2,13,16384.0]],\"into\":false,");
-    try w.s("\"init\":[[3,[[0," ++ a_ref ++ "],[1," ++ a_ref ++ "],[2,128.0]]]]},{" ++ v ++ "\"z\":[],\"out\":[],\"into\":false,\"init\":[]}]}");
+        "]],\"taps\":[1.0,0.0,0.0,0.0]}],[2,{\"expr\":[[9,128.0]],\"taps\":[1.0,0.0,0.0,0.0]}]],\"a\":[],";
+    const beta = if (variant == .beta_gated) "\"beta\":[[0,1.0],[9,-1.0]]," else "\"beta\":null,";
+    try w.s("],\"value_heads\":[{" ++ v);
+    try w.s(beta);
+    try w.s("\"z\":[[2,[[4,1.0]]]],\"out\":[[2,13,16384.0]],\"into\":false,");
+    try w.s("\"init\":[[3,[[0," ++ a_ref ++ "],[1," ++ a_ref ++ "],[2,128.0]]]]},{" ++ v);
+    try w.s(beta);
+    try w.s("\"z\":[],\"out\":[],\"into\":false,\"init\":[]}]}");
 }
 
 /// One FFN per code dim: GO->BYTE('h'), BYTE even->+1, BYTE odd->HALT, A->A, W->A, R->BYTE('0'+rd), HALT->HALT.
