@@ -358,3 +358,11 @@ with the common EXL3 and DeepSeek contributor credits preserved.
 recipe commit e1f564eb915bb5272474b6c1c527aec3b9ed3de6. It credits TensorFold Contributors for the expert
 arithmetic and staging design. Copyright (c) 2026 MiaAI-Lab and Copyright (c) 2026 TensorFold contributors.
 The complete original MIT notices and permission text are retained in [Mia-FlashNext-MIT.txt](LICENSES/Mia-FlashNext-MIT.txt).
+
+## Qwenputer P2 circuit export
+
+The optional runner circuit artifacts are compiled from Qwenputer by Divyansh Agrawal,
+https://github.com/divagr18/qwenputer, revision bec1a0c, under the MIT license.
+Copyright (c) 2026 Divyansh Agrawal. The complete license is retained in
+`LICENSES/Qwenputer-MIT.txt`. The development exporter reads a separate upstream
+checkout; it does not bundle Qwen model weights or unrelated CHIP-8 game ROMs.
