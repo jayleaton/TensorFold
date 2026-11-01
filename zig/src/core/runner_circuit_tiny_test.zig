@@ -26,7 +26,7 @@ pub fn token(family: u32, payload: u32) u32 {
 }
 
 /// Variants that break one rule, for negative controls.
-pub const Variant = enum { good, two_hot_key, unmapped_go, beta_gated, halving, chained, resting };
+pub const Variant = enum { good, two_hot_key, unmapped_go, beta_gated, halving, chained, resting, banks };
 
 /// The container bytes of the tiny circuit.
 pub fn build(a: std.mem.Allocator, variant: Variant) ![]u8 {
@@ -45,6 +45,7 @@ pub fn build(a: std.mem.Allocator, variant: Variant) ![]u8 {
     try lag3Head(w);
     try w.s(",");
     try ramHead(w, variant);
+    if (variant == .banks) try bankHead(w);
     try w.s(",{\"kind\":\"ffn\",\"name\":\"h1\",\"out\":33,\"into\":false,\"terms\":[[1.0,[[0,1.0]],[[2,1.0]]]]}");
     try w.s(",{\"kind\":\"ffn\",\"name\":\"h2\",\"out\":34,\"into\":false,\"terms\":[[1.0,[[33,1.0]],[[0,1.0]]]]}");
     if (variant == .chained) for ([_][2]u32{ .{ 1, 2 }, .{ 2, 3 }, .{ 4, 4 } }, 0..) |t, i| {
@@ -103,9 +104,14 @@ fn families(w: Writer) !void {
 
 /// One-hot row select: relu(flag + sum of literals - bits) over the payload bits of a family.
 fn selectChannel(w: Writer, row: u32, flag: u32, bit_dims: [2]u32) !void {
+    return selectAt(w, row, row, flag, bit_dims);
+}
+
+/// Channel `at` fires when the payload bits spell `row`.
+fn selectAt(w: Writer, at: u32, row: u32, flag: u32, bit_dims: [2]u32) !void {
     var flag_coef: i32 = 1;
     for (0..2) |b| flag_coef += @intFromBool(row >> @intCast(b) & 1 == 0);
-    try w.f("[{d},{{\"expr\":[[{d},{d}.0]", .{ row, flag, flag_coef });
+    try w.f("[{d},{{\"expr\":[[{d},{d}.0]", .{ at, flag, flag_coef });
     for (bit_dims, 0..) |d, b| try w.f(",[{d},{s}1.0]", .{ d, if (row >> @intCast(b) & 1 == 1) "" else "-" });
     try w.s(",[0,-2.0]],\"taps\":[1.0,0.0,0.0,0.0]}]");
 }
@@ -151,6 +157,23 @@ fn ramHead(w: Writer, variant: Variant) !void {
     try w.s(if (variant == .halving) "\"a\":[[2,110.0]]," else "\"a\":[],");
     try w.s(beta);
     try w.s("\"z\":[],\"out\":[],\"into\":false,\"init\":[]}]}");
+}
+
+/// mirror for .banks: ram0's inputs, but row r lives at table row r ^ 1, read to dims.sum (a bank sharing the address).
+fn bankHead(w: Writer) !void {
+    try w.s(",{\"kind\":\"head\",\"name\":\"mirror\",\"n_cols\":128,\"levels\":\"bit\",\"tiny\":0.0,\"q\":[");
+    for (0..4) |r| {
+        if (r > 0) try w.s(",");
+        try selectAt(w, @intCast(r ^ 1), @intCast(r), dims.is_r, .{ 10, 11 });
+    }
+    try w.s("],\"k\":[");
+    for (0..4) |r| {
+        if (r > 0) try w.s(",");
+        try selectAt(w, @intCast(r ^ 1), @intCast(r), dims.is_w, .{ 7, 8 });
+    }
+    try w.s("],\"value_heads\":[{\"v\":[[0,{\"expr\":[[3," ++ a_ref ++ "]],\"taps\":[1.0,0.0,0.0,0.0]}],[1,{\"expr\":[[3," ++ a_ref);
+    try w.s("]],\"taps\":[1.0,0.0,0.0,0.0]}],[2,{\"expr\":[[9,128.0]],\"taps\":[1.0,0.0,0.0,0.0]}]],\"a\":[],\"beta\":null,");
+    try w.f("\"z\":[[2,[[4,1.0]]]],\"out\":[[2,{d},16384.0]],\"into\":false,\"init\":[]}}]}}", .{dims.sum});
 }
 
 /// One FFN per code dim: GO->BYTE('h'), BYTE even->+1, BYTE odd->HALT, A->A, W->A, R->BYTE('0'+rd), HALT->HALT.

@@ -66,6 +66,9 @@ pub const Flow = struct {
     chain_pos: []const u32,
     chain_bits_at: []const u32,
     chain_words: u32,
+    /// Per head plan: its group of heads with the same input slots and selecting dims (one key per step), or no_slot.
+    plan_group: []const u32,
+    groups: u32,
 };
 
 /// Dims a set of forms reads: the union of their sources, ascending.
@@ -80,6 +83,26 @@ fn reads(a: std.mem.Allocator, sets: []const *const model.Sparse) ![]u32 {
         n += 1;
     }
     return out.items[0..n];
+}
+
+/// Heads reading the same slots through the same selecting dims see one selection key per step (the RAM banks).
+fn selectionGroups(a: std.mem.Allocator, units: []const Unit, plans: []const head.Plan) !struct { []u32, u32 } {
+    const group = try a.alloc(u32, plans.len);
+    @memset(group, no_slot);
+    var n: u32 = 0;
+    for (units, 0..) |u, i| if (u.kind == .heads and !plans[u.plan].general) {
+        for (units[0..i]) |v| if (v.kind == .heads and !plans[v.plan].general and std.mem.eql(u32, u.ins, v.ins) and
+            std.mem.eql(bool, plans[u.plan].sel_dim, plans[v.plan].sel_dim))
+        {
+            if (group[v.plan] == no_slot) {
+                group[v.plan] = n;
+                n += 1;
+            }
+            group[u.plan] = group[v.plan];
+            break;
+        };
+    };
+    return .{ group, n };
 }
 
 fn maxLag(h: *const model.Heads) u32 {
@@ -134,6 +157,7 @@ pub fn build(a: std.mem.Allocator, c: *const model.Circuit) !Flow {
     const code = try a.alloc(u32, c.code_dims.len);
     for (c.code_dims, code) |d, *s| s.* = visible[d];
     const ch = try chains(a, units.items, slots, visible);
+    const plan_group, const groups = try selectionGroups(a, units.items, plans.items);
     const ins_csr = try readersOf(a, units.items, slots, mark, .ins, ch);
     const base_csr = try readersOf(a, units.items, slots, mark, .base, ch);
     return .{
@@ -156,6 +180,8 @@ pub fn build(a: std.mem.Allocator, c: *const model.Circuit) !Flow {
         .code = code,
         .max_dims = max_dims,
         .total_ins = total_ins,
+        .plan_group = plan_group,
+        .groups = groups,
         .slot_unit = ch.slot_unit,
         .elided = ch.elided,
         .chain_end = ch.end,

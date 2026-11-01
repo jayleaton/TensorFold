@@ -213,6 +213,28 @@ test "an FFN part that is not zero at rest runs on a fresh machine's first step 
     }
 }
 
+test "banks sharing an address share one selection key per step but keep their own rows, as running every unit does" {
+    var c = try tinyCircuit(.banks);
+    defer c.deinit(gpa);
+    try std.testing.expectEqual(@as(u32, 1), c.flow.groups);
+    var lazy = try rc.State.init(gpa, &c);
+    defer lazy.deinit();
+    var full = try rc.State.init(gpa, &c);
+    defer full.deinit();
+    full.always = true;
+    const rows = [_]u32{ 1, 2, 1, 3, 0, 2, 1, 1, 2, 0, 3, 1, 2, 2, 1 };
+    for (0..3) |_| for (rows, 0..) |r, i| {
+        const t = if (i % 3 == 0) tok(2, r | 4) else tok(3, r);
+        try std.testing.expectEqual(try eval.step(&full, t), try eval.step(&lazy, t));
+        const want = try full.canonical(gpa);
+        defer gpa.free(want);
+        const got = try lazy.canonical(gpa);
+        defer gpa.free(got);
+        try std.testing.expectEqualSlices(u8, want, got);
+    };
+    try std.testing.expect(lazy.groups[0].memo.hits > 0);
+}
+
 test "a node that reads a dim written earlier in stored order sees the write" {
     var c = try tinyCircuit(.good);
     defer c.deinit(gpa);
