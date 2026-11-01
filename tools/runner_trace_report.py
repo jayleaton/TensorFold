@@ -65,7 +65,7 @@ def table(rounds, around, split, streams):
     base_wall = mean([r["wall_us"] for r in base])
     base_gpu = mean([r.get("gpu_us", 0) for r in base])
     head = ["phase", "n", "wall ms", "med", "gpu ms", "host ms", "gap ms", "wall %", "gpu %", "rows", "drafted",
-            "kept", "got", "tok/s", "held next", "forced", "spec hit", "spec drop", "drop why", "engram miss",
+            "kept", "got", "tok/s", "held next", "forced", "spec hit", "spec drop", "drop why", "held", "fed", "engram miss",
             "captures", "builds", "evicted", "eager", "lost"]
     out = ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
     for name in order:
@@ -87,6 +87,7 @@ def table(rounds, around, split, streams):
                  f"{got / len(g):.2f}", f"{1e3 * got / span:.1f}" if span else "",
                  f"{mean([r['held_next'] for r in g]):.2f}", sum(r["kind"] == "forced" for r in g),
                  f"{mean([r.get('spec_hit', 0) for r in g]):.2f}", f"{mean([drops(r) for r in g]):.2f}", why(g),
+                 sum(r.get("spec_held", 0) for r in g), sum(r.get("spec_fed", 0) for r in g),
                  f"{mean([r.get('engram_misses', 0) for r in g]):.1f}",
                  sum(r.get("captures", 0) for r in g), sum(r.get("builds", 0) for r in g),
                  sum(r.get("evicted", 0) + r.get("dropped", 0) for r in g),

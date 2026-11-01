@@ -7,7 +7,7 @@ const er = @import("engram_rows.zig");
 const GpuPair = @import("batch_gpu_time.zig").GpuPair;
 
 /// Per step: row windows and graphs, GPU and host time, speculative DSpark passes by outcome, Engram row lookups.
-const names = [_][]const u8{ "windows", "rows", "padded", "builds", "captures", "eager", "replayed", "evicted", "dropped", "gpu_us", "lost", "prep_us", "stage_us", "launch_us", "keep_us", "spec_launched", "spec_hit", "spec_commit", "spec_slots", "spec_unused", "spec_pending", "spec_other", "engram_hits", "engram_misses" };
+const names = [_][]const u8{ "windows", "rows", "padded", "builds", "captures", "eager", "replayed", "evicted", "dropped", "gpu_us", "lost", "prep_us", "stage_us", "launch_us", "keep_us", "spec_launched", "spec_hit", "spec_commit", "spec_slots", "spec_unused", "spec_pending", "spec_other", "spec_held", "spec_fed", "engram_hits", "engram_misses" };
 
 /// What the counters are read from (rank 0's): the row batch, the DSpark lanes, Engram's rows.
 const Src = struct { rows: ?*batch.Batch, x: *ln.Lanes, engram: ?*er.Rows };
@@ -47,12 +47,12 @@ fn read(ctx: *anyopaque, out: []u64) void {
     if (src.x.spec) |sp| {
         const m = sp.stats.miss;
         const other = m.get(.reset) + m.get(.inputs);
-        const v = [_]u64{ sp.stats.launched, sp.stats.hit, m.get(.commit), m.get(.slots), m.get(.unused), m.get(.pending), other };
+        const v = [_]u64{ sp.stats.launched, sp.stats.hit, m.get(.commit), m.get(.slots), m.get(.unused), m.get(.pending), other, sp.stats.held, sp.stats.fed };
         @memcpy(all[15..][0..v.len], &v);
     }
     if (src.engram) |r| {
-        all[22] = r.stats.hits;
-        all[23] = r.stats.misses;
+        all[24] = r.stats.hits;
+        all[25] = r.stats.misses;
     }
     @memcpy(out, all[0..out.len]);
 }
