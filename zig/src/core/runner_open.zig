@@ -46,13 +46,15 @@ pub fn open(gpa: Allocator, cfg: Config) !*Runner {
             return e;
         };
         o.routed = .{ .inner = frontend, .bank = &o.bank };
-        o.dispatch = .{ .gpa = gpa, .circuit = back, .graph = try graph.backend(gpa, &o.bank, cfg.workers) };
+        // settling holds: graph jobs leave the engine thread's CPU as the circuit's do (unplaced, they share its pin)
+        const placer: ?*runner.place.Placer = if (cfg.settle_us > 0) &o.placer else null;
+        o.dispatch = .{ .gpa = gpa, .circuit = back, .graph = try graph.placed(gpa, &o.bank, cfg.workers, placer) };
         frontend = o.routed.frontend();
         backend = o.dispatch.backend();
         log.info("in-model runner: graph bank {s} loaded in {d} ms", .{ cfg.graph_bank, (nowNs() - t0) / std.time.ns_per_ms });
     }
     o.runner = .{ .gpa = gpa, .cfg = cfg, .frontend = frontend, .backend = backend, .placer = &o.placer };
-    log.info("in-model runner: circuit {s}, cpu, {d} workers, {d} steps a run, backend {t}", .{ cfg.circuit, cfg.workers, cfg.max_steps, cfg.backend });
+    log.info("in-model runner: circuit {s}, cpu, {d} workers, {d} steps a run, backend {t}, settle {d} us", .{ cfg.circuit, cfg.workers, cfg.max_steps, cfg.backend, cfg.settle_us });
     return &o.runner;
 }
 

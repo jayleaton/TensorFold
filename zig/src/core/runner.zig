@@ -19,6 +19,7 @@ pub const Config = struct {
     graph_bank: []const u8 = "", // PREFIX_GRAPH_BANK: T1's bank manifest, loaded at boot (backend graph)
     exact: bool = false, // `calc` / `exact` cells (firmware exact rationals, not any language's print) run
     place: place.Config = .{}, // PREFIX_CPUS / PREFIX_NICE: where the runner's threads run (core/runner_place.zig)
+    settle_us: u32 = 0, // PREFIX_SETTLE_US: a held tick waits this long for its cell; 0: one stage per tick (as before)
     guide: []const u8 = "", // PREFIX_GUIDE: "1" RUNNER-GUIDE.md, else a file, as chats' default guide (server/runner_guide.zig)
 
     /// PREFIX "1" enables (unset, "" or "0": null); PREFIX_* knobs override defaults; a bad value is error.BadKnob.
@@ -41,6 +42,7 @@ pub const Config = struct {
         c.max_steps = try knob(u64, get, prefix ++ "_MAX_STEPS", c.max_steps, 1, 1 << 40);
         c.max_tokens = try knob(u32, get, prefix ++ "_MAX_TOKENS", c.max_tokens, 1, 1 << 20);
         c.exact = try knob(u1, get, prefix ++ "_EXACT", 0, 0, 1) == 1;
+        c.settle_us = try knob(u32, get, prefix ++ "_SETTLE_US", c.settle_us, 0, 100_000);
         c.guide = get(prefix ++ "_GUIDE") orelse "";
         if (std.mem.eql(u8, c.guide, "0")) c.guide = "";
         c.place = try place.Config.parse(get, prefix);
@@ -131,6 +133,7 @@ pub const Session = struct {
     owned_n: u32 = 0,
     abstained_n: u32 = 0,
     held_ms: u64 = 0, // summed over the reply's holds
+    held_ticks: u32 = 0, // the current hold's ticks so far (the serving log's)
     forcing: ?struct { at: u64, left: usize, cell: u32 } = null, // an owned result's forced tokens still to commit
     resume_ms: u64 = 0, // summed: an owned result's settling to the model's first token after it
     broken: bool = false, // out of memory once: no more cells, no more holds
@@ -165,6 +168,7 @@ pub const Session = struct {
         if (!can_hold or t.index >= s.cells.items.len) return false;
         s.waiting = t;
         s.held_at = nowNs();
+        s.held_ticks = 0;
         return true;
     }
 
@@ -208,6 +212,8 @@ pub const Session = struct {
             return;
         }
         const task: Translate = .{ .cell = cell, .fe = s.r.frontend, .prior = prior, .placer = s.r.placer };
+        // settling: an inline value (microseconds to translate) waits on no thread's start
+        if (s.r.cfg.settle_us > 0 and c.form == .inline_expr) return task.run();
         cell.thread = std.Thread.spawn(.{}, Translate.spawned, .{task}) catch blk: {
             task.run();
             break :blk null;
@@ -216,9 +222,11 @@ pub const Session = struct {
 
     /// Advances translations and runs; the tokens to force when the awaited cell is settled (caller frees them).
     pub fn tick(s: *Session) Allocator.Error!?[]u32 {
+        if (s.waiting) |w| if (s.r.cfg.settle_us > 0) s.settle(s.cells.items[w.index]);
         for (s.cells.items) |c| s.advance(c);
         const w = s.waiting orelse return null;
         const c = s.cells.items[w.index];
+        s.held_ticks += 1;
         if (!c.abstained and c.result == null) return null;
         s.waiting = null;
         const held_ms = (nowNs() -| s.held_at) / std.time.ns_per_ms;
@@ -229,7 +237,7 @@ pub const Session = struct {
         if (c.abstained) {
             s.abstained_n += 1;
             c.told = .abstained;
-            log.info("reply {d} cell {d} ({s} {t}): abstain ({s}), held {d} ms", .{ s.id, w.index, c.lang, c.form, why(c), held_ms });
+            log.info("reply {d} cell {d} ({s} {t}): abstain ({s}), held {d} ms, ticks {d}", .{ s.id, w.index, c.lang, c.form, why(c), held_ms, s.held_ticks });
             return try s.r.gpa.alloc(u32, 0);
         }
         const res = c.result.?;
@@ -238,7 +246,7 @@ pub const Session = struct {
         c.told = .owned;
         c.owned_tokens = @intCast(ids.len);
         s.forcing = .{ .at = nowNs(), .left = ids.len, .cell = w.index };
-        log.info("reply {d} cell {d} ({s} {t}): owned {d} tokens, {t} after {d} steps, run {d} ms, held {d} ms", .{ s.id, w.index, c.lang, c.form, ids.len, res.status, res.steps, res.exec_ns / std.time.ns_per_ms, held_ms });
+        log.info("reply {d} cell {d} ({s} {t}): owned {d} tokens, {t} after {d} steps, run {d} ms, held {d} ms, ticks {d}", .{ s.id, w.index, c.lang, c.form, ids.len, res.status, res.steps, res.exec_ns / std.time.ns_per_ms, held_ms, s.held_ticks });
         return ids;
     }
 
@@ -256,7 +264,7 @@ pub const Session = struct {
                 c.owned_tokens = @intCast(ids.len);
                 s.forcing = .{ .at = nowNs(), .left = ids.len, .cell = index };
                 const res = c.result.?;
-                log.info("reply {d} cell {d} (trace): owned {d} tokens, {d} steps, run {d} ms, held {d} ms", .{ s.id, index, ids.len, res.steps, res.exec_ns / std.time.ns_per_ms, held_ms });
+                log.info("reply {d} cell {d} (trace): owned {d} tokens, {d} steps, run {d} ms, held {d} ms, ticks {d}", .{ s.id, index, ids.len, res.steps, res.exec_ns / std.time.ns_per_ms, held_ms, s.held_ticks });
                 return ids;
             }
             gpa.free(ids);
@@ -264,7 +272,7 @@ pub const Session = struct {
         c.abstained = true;
         s.abstained_n += 1;
         c.told = .abstained;
-        log.info("reply {d} cell {d} (trace): abstain ({s}), held {d} ms", .{ s.id, index, if (c.result != null and c.result.?.status == .ok) "not one value" else why(c), held_ms });
+        log.info("reply {d} cell {d} (trace): abstain ({s}), held {d} ms, ticks {d}", .{ s.id, index, if (c.result != null and c.result.?.status == .ok) "not one value" else why(c), held_ms, s.held_ticks });
         return try gpa.alloc(u32, 0);
     }
 
@@ -274,6 +282,29 @@ pub const Session = struct {
         if (res.status == .abstain) return if (res.abstain) |a| @tagName(a) else "backend";
         if (res.status != .ok) return @tagName(res.status); // inline: budget or fault
         return if (res.out.len == 0) "empty output" else "multi-line inline value";
+    }
+
+    /// The awaited cell's stages on this tick for up to settle_us: run here if that ends it, else its job waited on.
+    fn settle(s: *Session, c: *Cell) void {
+        const until = nowNs() + @as(u64, s.r.cfg.settle_us) * std.time.ns_per_us;
+        var tried = false;
+        while (true) {
+            if (c.thread) |th| if (c.translated.load(.acquire)) {
+                th.join();
+                c.thread = null;
+            };
+            if (!tried and c.thread == null and c.job == null and c.result == null and !c.abstained and
+                c.translated.load(.acquire) and c.translation == .program)
+            {
+                tried = true;
+                const quick = @as(u64, s.r.cfg.settle_us) * quick_steps_per_us;
+                if (s.r.backend.now(c.translation.program, s.r.cfg.max_steps, quick)) |res| return s.take(c, res);
+            }
+            s.advance(c);
+            if (c.abstained or c.result != null or nowNs() >= until) return;
+            var ts: std.c.timespec = .{ .sec = 0, .nsec = 20 * std.time.ns_per_us };
+            _ = std.c.nanosleep(&ts, null);
+        }
     }
 
     fn advance(s: *Session, c: *Cell) void {
@@ -298,21 +329,32 @@ pub const Session = struct {
                     return;
                 },
             };
+            // settling: a run that is done at once is taken on the tick that started it
+            if (s.r.cfg.settle_us == 0) return;
+            s.poll(c, c.job.?);
             return;
         };
+        s.poll(c, job);
+    }
+
+    fn poll(s: *Session, c: *Cell, job: api.JobId) void {
         switch (s.r.backend.poll(job)) {
             .running => {},
             .done => |res| {
                 c.job = null;
-                var kept = res;
-                kept.out = c.arena.allocator().dupe(u8, res.out) catch {
-                    c.abstained = true;
-                    return;
-                };
-                c.result = kept;
-                if (res.status == .abstain or (res.status == .ok and res.out.len == 0)) c.abstained = true;
+                s.take(c, res);
             },
         }
+    }
+
+    fn take(_: *Session, c: *Cell, res: api.Result) void {
+        var kept = res;
+        kept.out = c.arena.allocator().dupe(u8, res.out) catch {
+            c.abstained = true;
+            return;
+        };
+        c.result = kept;
+        if (res.status == .abstain or (res.status == .ok and res.out.len == 0)) c.abstained = true;
     }
 
     /// The owned text for a settled run (INTERFACES.md §5), as token ids within the token cap.
@@ -396,6 +438,9 @@ pub const Session = struct {
     }
 };
 
+/// Settling's cap on a run on the engine thread: steps per microsecond of settle_us (a graph step is about 20 ns).
+const quick_steps_per_us = 20;
+
 /// Monotonic nanoseconds for the serving log only.
 fn nowNs() u64 {
     var ts: std.c.timespec = undefined;
@@ -427,4 +472,5 @@ test {
     _ = @import("runner_scan.zig");
     _ = @import("runner_api.zig");
     _ = @import("runner_trace_test.zig");
+    _ = @import("runner_settle_test.zig");
 }

@@ -1,6 +1,7 @@
 //! Bounded graph workers over a boot-loaded bank; the engine thread never waits for a running job.
 const std = @import("std");
 const api = @import("runner_api.zig");
+const place = @import("runner_place.zig");
 pub const Bank = @import("runner_graph_bank.zig").Bank;
 pub const Machine = @import("runner_graph_machine.zig").Machine;
 pub const Packet = @import("runner_graph_packet.zig").Packet;
@@ -28,10 +29,12 @@ const Cpu = struct {
     gpa: Allocator,
     bank: *const Bank,
     workers: u8,
+    placer: ?*place.Placer = null,
     next_id: api.JobId = 1,
     jobs: std.ArrayList(*Job) = .empty,
     dropped: std.ArrayList(*Job) = .empty,
     delivered: std.ArrayList(*Job) = .empty,
+    now_out: std.ArrayList(u8) = .empty, // the last run on the engine thread's output
 
     fn live(c: *Cpu) usize {
         return c.jobs.items.len + c.dropped.items.len;
@@ -83,6 +86,7 @@ const Cpu = struct {
 };
 
 fn work(c: *Cpu, j: *Job) void {
+    if (c.placer) |p| p.enter();
     var began: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &began);
     defer {
@@ -100,7 +104,11 @@ fn work(c: *Cpu, j: *Job) void {
         j.result = .{ .status = .abstain, .abstain = .unsupported, .steps = m.steps };
         return;
     };
-    j.result = .{
+    j.result = resultOf(end);
+}
+
+fn resultOf(end: api.RunEnd) api.Result {
+    return .{
         .status = switch (end.end) {
             .halted => .ok,
             .budget => .budget,
@@ -110,6 +118,26 @@ fn work(c: *Cpu, j: *Job) void {
         .steps = end.steps,
         .abstain = if (end.end == .cancelled) .unsupported else null,
     };
+}
+
+/// A job's run here, capped at `quick` steps: one that ends sooner is the job's own result; else (or an error) null.
+fn now(ctx: *anyopaque, program: api.Program, budget: u64, quick: u64) ?api.Result {
+    const c: *Cpu = @ptrCast(@alignCast(ctx));
+    if (!std.mem.eql(u8, @tagName(program.kind), id) or program.bytes.len > @import("runner_graph_packet.zig").max_packet) return null;
+    c.now_out.clearRetainingCapacity();
+    var t0: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &t0);
+    var m = Machine.boot(c.gpa, c.bank, program.bytes) catch return null;
+    defer m.deinit();
+    const cap = @min(budget, quick);
+    const end = m.run(cap, &c.now_out, null) catch return null;
+    if (end.end == .budget and cap < budget) return null;
+    var t1: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &t1);
+    var r = resultOf(end);
+    r.out = c.now_out.items;
+    r.exec_ns = @intCast(@max(0, (t1.sec - t0.sec) * std.time.ns_per_s + t1.nsec - t0.nsec));
+    return r;
 }
 
 fn start(ctx: *anyopaque, stream: u64, program: api.Program, budget: u64) error{ OutOfMemory, Busy }!api.JobId {
@@ -166,14 +194,19 @@ fn release(ctx: *anyopaque, stream: u64) void {
     c.reap();
 }
 
-const vtable: api.Backend.VTable = .{ .start = start, .poll = poll, .cancel = cancel, .release = release };
+const vtable: api.Backend.VTable = .{ .start = start, .poll = poll, .cancel = cancel, .release = release, .now = now };
 
 /// Runs at most workers jobs over a bank the caller keeps alive; gpa must support worker-thread allocations.
 pub fn backend(gpa: Allocator, bank: *const Bank, workers: u8) !api.Backend {
+    return placed(gpa, bank, workers, null);
+}
+
+/// As `backend`, each job's thread placed by `placer` (which the caller keeps alive) before it boots a machine.
+pub fn placed(gpa: Allocator, bank: *const Bank, workers: u8, placer: ?*place.Placer) !api.Backend {
     if (workers == 0) return error.NoWorkers;
     const c = try gpa.create(Cpu);
     errdefer gpa.destroy(c);
-    c.* = .{ .gpa = gpa, .bank = bank, .workers = workers };
+    c.* = .{ .gpa = gpa, .bank = bank, .workers = workers, .placer = placer };
     try c.dropped.ensureTotalCapacity(gpa, workers);
     errdefer c.dropped.deinit(gpa);
     try c.jobs.ensureTotalCapacity(gpa, workers);
@@ -188,5 +221,6 @@ pub fn destroy(b: api.Backend) void {
         for (list.items) |j| c.free(j);
         list.deinit(c.gpa);
     }
+    c.now_out.deinit(c.gpa);
     c.gpa.destroy(c);
 }

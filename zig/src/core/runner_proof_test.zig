@@ -172,6 +172,11 @@ test "runner proof: pure-integer calc programs print Python's value on the graph
         const g = finish(both.graph, try both.graph.start(1, .{ .kind = .graph, .bytes = bytes }, 1_000_000));
         const got = try gpa.dupe(u8, g.out);
         defer gpa.free(got);
+        // TF_DSV41_RUNNER_SETTLE_US: a run here within its steps is the job's result; one step short, a job's again
+        const prog: rapi.Program = .{ .kind = .graph, .bytes = bytes };
+        const here = both.graph.now(prog, 1_000_000, g.steps).?;
+        try std.testing.expect(here.status == g.status and here.steps == g.steps and std.mem.eql(u8, here.out, got));
+        try std.testing.expectEqual(null, both.graph.now(prog, 1_000_000, g.steps - 1));
         const want = try std.mem.concat(gpa, u8, &.{ c[1], "\n" });
         defer gpa.free(want);
         // calc firmware prints `error` past its own width (10**61); there the graph's value is checked alone
