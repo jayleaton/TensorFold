@@ -38,7 +38,7 @@ const Doc = struct {
     nodes: []const JNode,
     tokens: struct { vocab: u32, families: []const JFamily, go: u32, halt: u32, byte_family: u32 },
     output: struct { family_bits: u32, payload_bits: u32, code_dims: []const u32, families: []const JFamily },
-    program: struct { kind: []const u8, input_address: u32, input_capacity: u32 },
+    program: struct { kind: []const u8, input_address: u32, input_capacity: u32, entry: u32, rom_le_hex: []const u8, drom_hex: []const u8, ram_hex: []const u8 },
 };
 
 /// The checked JSON payload of a container: magic, version, sizes, flags and SHA-256 all as the format requires.
@@ -126,7 +126,7 @@ fn compile(a: std.mem.Allocator, tmp: std.mem.Allocator, doc: *const Doc) !model
         .table_names = b.names.items,
         .channels = b.channels,
         .nodes = @intCast(doc.nodes.len),
-        .program = try program(doc, b.names.items, b.tables.items),
+        .program = try program(a, doc, b.names.items, b.tables.items),
         .payload_sha256 = undefined,
         .arena = undefined,
     };
@@ -160,8 +160,21 @@ fn features(a: std.mem.Allocator, doc: *const Doc, dims: u32, n_families: u32) !
     return out;
 }
 
-fn program(doc: *const Doc, names: []const []const u8, tables: []const model.Table) !model.Program {
+fn unhex(a: std.mem.Allocator, text: []const u8, len: usize) ![]u8 {
+    if (text.len % 2 != 0 or text.len / 2 > len) return error.CircuitProgram;
+    const out = try a.alloc(u8, len);
+    @memset(out, 0);
+    _ = std.fmt.hexToBytes(out[0 .. text.len / 2], text) catch return error.CircuitProgram;
+    return out;
+}
+
+fn program(a: std.mem.Allocator, doc: *const Doc, names: []const []const u8, tables: []const model.Table) !model.Program {
     const p = doc.program;
+    const rom_bytes = try unhex(a, p.rom_le_hex, 4 << 16);
+    if (p.rom_le_hex.len != 2 * rom_bytes.len or p.ram_hex.len != 2 * (4 << 13)) return error.CircuitProgram;
+    const rom = try a.alloc(u32, 1 << 16);
+    for (rom, 0..) |*w, i| w.* = std.mem.readInt(u32, rom_bytes[4 * i ..][0..4], .little);
+    a.free(rom_bytes);
     var out: model.Program = .{
         .kind = if (std.mem.eql(u8, p.kind, "calc")) .calc else if (std.mem.eql(u8, p.kind, "elf")) .elf else return error.CircuitProgram,
         .input_address = p.input_address,
@@ -169,6 +182,7 @@ fn program(doc: *const Doc, names: []const []const u8, tables: []const model.Tab
         .ram_tables = @splat(std.math.maxInt(u32)),
         .a_ref = try exact(doc.constants.a_ref),
         .a_bit = try exact(doc.constants.a_bit),
+        .image = .{ .rom = rom, .drom = try unhex(a, p.drom_hex, 4 << 15), .ram = try unhex(a, p.ram_hex, 4 << 13), .entry = p.entry },
     };
     for (names, 0..) |name, t| {
         if (!std.mem.startsWith(u8, name, "ram")) continue;

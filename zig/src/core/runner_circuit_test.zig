@@ -6,6 +6,7 @@ const load = @import("runner_circuit_load.zig");
 const eval = @import("runner_circuit_eval.zig");
 const rc = @import("runner_circuit.zig");
 const tiny = @import("runner_circuit_tiny_test.zig");
+const elf = @import("runner_circuit_elf.zig");
 
 const gpa = std.testing.allocator;
 const tok = tiny.token;
@@ -15,6 +16,7 @@ test {
     _ = model;
     _ = @import("runner_circuit_golden_test.zig");
     _ = @import("runner_circuit_backend.zig");
+    _ = @import("runner_circuit_rom.zig");
 }
 
 fn tinyCircuit(variant: tiny.Variant) !model.Circuit {
@@ -105,6 +107,20 @@ test "a lag-1 tap keys on the previous token, a clear decay empties the table, h
         try std.testing.expectEqual(st.lag, s.x[tiny.dims.lagout]);
     }
     try std.testing.expectEqual(@as(u128, 0), s.present[0]);
+    try std.testing.expectEqual(@as(u128, 1), s.present[1]);
+}
+
+test "a lag-3 tap sees the projection three steps back, not a newer one" {
+    var c = try tinyCircuit(.good);
+    defer c.deinit(gpa);
+    var s = try rc.State.init(gpa, &c);
+    defer s.deinit();
+    const seq = [_]u32{ tok(2, 0), tok(1, 0), tok(1, 0), tok(1, 0), tok(1, 0) };
+    const want = [_]model.Scalar{ 0, 0, 0, 1, 1 };
+    for (seq, want) |t, w| {
+        _ = try eval.step(&s, t);
+        try std.testing.expectEqual(w, s.x[tiny.dims.lag3out]);
+    }
 }
 
 test "a node that reads a dim written earlier in stored order sees the write" {
@@ -180,4 +196,59 @@ test "snapshots are canonical: equal histories give equal bytes, a write or a la
     const sb2 = try b.snapshot(gpa);
     defer gpa.free(sb2);
     try std.testing.expect(!std.mem.eql(u8, sa2, sb2));
+}
+
+const Seg = struct { typ: u32 = 1, vaddr: u32, data: []const u8, memsz: u32 };
+
+/// A static ELF32 RISC-V executable with the given program headers, data after the header table.
+fn elfImage(entry: u32, segs: []const Seg) ![]u8 {
+    var size: usize = 52 + 32 * segs.len;
+    for (segs) |sg| size += sg.data.len;
+    const b = try gpa.alloc(u8, size);
+    @memset(b, 0);
+    @memcpy(b[0..7], "\x7fELF\x01\x01\x01");
+    const w = std.mem.writeInt;
+    w(u16, b[16..18], 2, .little);
+    w(u16, b[18..20], 243, .little);
+    w(u32, b[24..28], entry, .little);
+    w(u32, b[28..32], 52, .little);
+    w(u16, b[42..44], 32, .little);
+    w(u16, b[44..46], @intCast(segs.len), .little);
+    var off: u32 = @intCast(52 + 32 * segs.len);
+    for (segs, 0..) |sg, i| {
+        const p = b[52 + 32 * i ..][0..32];
+        w(u32, p[0..4], sg.typ, .little);
+        w(u32, p[4..8], off, .little);
+        w(u32, p[8..12], sg.vaddr, .little);
+        w(u32, p[16..20], @intCast(sg.data.len), .little);
+        w(u32, p[20..24], sg.memsz, .little);
+        @memcpy(b[off..][0..sg.data.len], sg.data);
+        off += @intCast(sg.data.len);
+    }
+    return b;
+}
+
+test "an ELF's PT_LOAD segments land in ROM words, DROM and zero-filled RAM; bad images are refused" {
+    const code = [_]u8{ 0x13, 0x05, 0x50, 0x00, 0x73, 0x00, 0x00, 0x00 };
+    const good = try elfImage(0x40004, &.{ .{ .vaddr = 0x40000, .data = &code, .memsz = 8 }, .{ .vaddr = 0x100, .data = "hi", .memsz = 8 }, .{ .vaddr = 0x20000, .data = "ro", .memsz = 2 } });
+    defer gpa.free(good);
+    const img = try elf.parse(gpa, good);
+    defer img.deinit(gpa);
+    try std.testing.expectEqual(@as(u32, 0x00500513), img.rom[0]);
+    try std.testing.expectEqual(@as(u32, 0x73), img.rom[1]);
+    try std.testing.expectEqual(@as(u32, 0), img.rom[2]);
+    try std.testing.expectEqualStrings("hi\x00\x00", img.ram[0x100..0x104]);
+    try std.testing.expectEqualStrings("ro", img.drom[0..2]);
+    try std.testing.expectEqual(@as(u32, 0x40004), img.entry);
+    const Bad = struct { entry: u32, seg: Seg, want: anyerror };
+    for ([_]Bad{
+        .{ .entry = 0x40000, .seg = .{ .typ = 3, .vaddr = 0x40000, .data = &code, .memsz = 8 }, .want = error.ElfDynamic },
+        .{ .entry = 0x40000, .seg = .{ .vaddr = 0x7fff, .data = "ab", .memsz = 2 }, .want = error.ElfSegment },
+        .{ .entry = 0x40002, .seg = .{ .vaddr = 0x40000, .data = &code, .memsz = 8 }, .want = error.ElfEntry },
+        .{ .entry = 0x40000, .seg = .{ .vaddr = 0x40000, .data = &code, .memsz = 4 }, .want = error.ElfSegment },
+    }) |bad| {
+        const bytes = try elfImage(bad.entry, &.{bad.seg});
+        defer gpa.free(bytes);
+        try std.testing.expectError(bad.want, elf.parse(gpa, bytes));
+    }
 }

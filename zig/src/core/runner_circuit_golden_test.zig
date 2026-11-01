@@ -144,3 +144,28 @@ test "golden: the CPU circuit reproduces every reference trace token, step count
     std.debug.print("golden: {d} cases token-exact, {d} steps, {d} steps/s, {d} skipped\n", .{ totals.cases, totals.steps, rate, totals.skipped });
     try std.testing.expect(totals.cases > 0);
 }
+
+test "golden: booting the circuit's own program image as an ELF reproduces its exported snapshot" {
+    const circuit_path = env("TF_RUNNER_CIRCUIT") orelse {
+        std.debug.print("skip image boot: TF_RUNNER_CIRCUIT unset\n", .{});
+        return error.SkipZigTest;
+    };
+    var circuit = try rc.Circuit.load(gpa, circuit_path);
+    defer circuit.deinit(gpa);
+    var exported = try rc.State.init(gpa, &circuit);
+    defer exported.deinit();
+    var booted = try rc.State.init(gpa, &circuit);
+    defer booted.deinit();
+    try @import("runner_circuit_elf.zig").boot(&booted, circuit.program.image);
+    const want = try exported.canonical(gpa);
+    defer gpa.free(want);
+    const got = try booted.canonical(gpa);
+    defer gpa.free(got);
+    try std.testing.expectEqual(want.len, got.len);
+    if (std.mem.indexOfDiff(u8, want, got)) |at| {
+        const table = (at - 8) / (8 * 128 * 128);
+        const row = (at - 8) / (8 * 128) % 128;
+        std.debug.print("image boot differs in table {d} ({s}) row {d}\n", .{ table, circuit.table_names[table], row });
+        return error.ImageBootMismatch;
+    }
+}

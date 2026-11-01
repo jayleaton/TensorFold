@@ -112,7 +112,21 @@ pub const Table = struct {
     writable: bool,
 };
 
-/// Where the calc firmware takes its expression, and the RAM tables (ram<h>) the snapshot patch edits.
+/// A static program's memory: ROM instruction words, DROM bytes, RAM bytes and the entry address.
+pub const Image = struct {
+    rom: []u32,
+    drom: []u8,
+    ram: []u8,
+    entry: u32,
+
+    pub fn deinit(img: Image, a: std.mem.Allocator) void {
+        a.free(img.rom);
+        a.free(img.drom);
+        a.free(img.ram);
+    }
+};
+
+/// Where the calc firmware takes its expression, the RAM tables (ram<h>) the patch edits, and the boot image.
 pub const Program = struct {
     kind: enum { calc, elf },
     input_address: u32,
@@ -120,6 +134,7 @@ pub const Program = struct {
     ram_tables: [32]u32,
     a_ref: Scalar,
     a_bit: Scalar,
+    image: Image,
 };
 
 pub const Circuit = struct {
