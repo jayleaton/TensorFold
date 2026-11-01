@@ -21,15 +21,49 @@ pub const Sparse = struct {
     w: []const Scalar,
     /// Sources with at least one entry, ascending.
     used: []const u32,
+    /// Per source: where its dense row (outputs weights, zeros elsewhere) starts in `dense`, or no_row (see densify).
+    dense_at: []const u32 = &.{},
+    dense: []const Scalar = &.{},
 
-    /// y = x * W: zeroes y, then scatters the inputs listed in `active` (every other input is zero).
+    /// y = x * W: zeroes y, then adds the inputs listed in `active` (every other input is zero) in ascending order.
     pub fn apply(m: *const Sparse, x: []const Scalar, active: []const u32, y: []Scalar) void {
         @memset(y, 0);
         for (if (m.used.len < active.len) m.used else active) |i| {
             const v = x[i];
             if (v == 0) continue;
+            if (m.dense_at.len > 0 and m.dense_at[i] != no_row and std.math.isFinite(v)) {
+                axpy(y, v, m.dense[m.dense_at[i]..][0..y.len]);
+                continue;
+            }
             for (m.starts[i]..m.starts[i + 1]) |e| y[m.dst[e]] += v * m.w[e];
         }
+    }
+
+    /// The same sums with dense rows for sources that reach many outputs; bit-identical (see axpy).
+    pub fn densify(m: *const Sparse, a: std.mem.Allocator) !Sparse {
+        var out = m.*;
+        const at = try a.alloc(u32, m.sources);
+        @memset(at, no_row);
+        var rows: std.ArrayList(Scalar) = .empty;
+        for (m.used) |i| {
+            const fan = m.starts[i + 1] - m.starts[i];
+            if (fan < 8 or fan * 8 < m.outputs) continue;
+            const row = try a.alloc(Scalar, m.outputs);
+            defer a.free(row);
+            @memset(row, 0);
+            var repeated = false;
+            for (m.starts[i]..m.starts[i + 1]) |e| {
+                repeated = repeated or row[m.dst[e]] != 0 or m.w[e] == 0;
+                row[m.dst[e]] = m.w[e];
+            }
+            if (repeated) continue;
+            at[i] = @intCast(rows.items.len);
+            try rows.appendSlice(a, row);
+        }
+        if (rows.items.len == 0) return out;
+        out.dense_at = at;
+        out.dense = rows.items;
+        return out;
     }
 
     pub fn nonzeros(m: *const Sparse) usize {
@@ -72,6 +106,8 @@ pub const Ffn = struct {
     starts: []const u32,
     /// Terms whose gate is a positive constant; terms with a constant gate <= 0 never fire and are dropped.
     always: []const u32,
+    /// The batch's independent parts in node order (the CPU skips parts whose inputs did not change).
+    split: []const Ffn = &.{},
 };
 
 /// (row or column, projection column) of a channel or expression.
@@ -102,6 +138,8 @@ pub const Heads = struct {
     taps: []const [lags]Scalar,
     heads: []const Head,
     outs: []const Out,
+    /// The same heads one per Heads, with their own forms and the batch's channel and table numbers.
+    split: []const Heads = &.{},
 };
 
 pub const Batch = union(enum) { ffn: Ffn, heads: Heads };
@@ -182,6 +220,8 @@ pub const Circuit = struct {
     channels: u32,
     nodes: u32,
     program: Program,
+    /// The CPU evaluator's dataflow over the batches.
+    flow: @import("runner_circuit_flow.zig").Flow,
     payload_sha256: [32]u8,
     arena: std.heap.ArenaAllocator,
 
@@ -221,6 +261,22 @@ pub const Circuit = struct {
 };
 
 /// Builds a Sparse from (source, output, weight) triples in any order; a source's entries keep their input order.
+pub const no_row = std.math.maxInt(u32);
+
+/// y += v * row; an unreached output adds v * 0 = ±0 to a y that is never -0 (it starts +0), so it is unchanged.
+fn axpy(y: []Scalar, v: Scalar, row: []const Scalar) void {
+    const L = 8;
+    const V = @Vector(L, Scalar);
+    const vv: V = @splat(v);
+    var k: usize = 0;
+    while (k + L <= y.len) : (k += L) {
+        const yv: V = y[k..][0..L].*;
+        const rv: V = row[k..][0..L].*;
+        y[k..][0..L].* = yv + vv * rv;
+    }
+    while (k < y.len) : (k += 1) y[k] += v * row[k];
+}
+
 pub fn sparse(a: std.mem.Allocator, sources: u32, outputs: u32, src: []const u32, dst_in: []const u32, w_in: []const Scalar) !Sparse {
     if (src.len != dst_in.len or src.len != w_in.len) return error.CircuitSparseShape;
     const starts = try a.alloc(u32, sources + 1);
@@ -255,6 +311,39 @@ test "sparse apply skips zero inputs and adds repeated entries" {
     m.apply(&.{ 1, 0, 2 }, &.{2}, &y);
     try std.testing.expectEqualSlices(Scalar, &.{ 14, 0 }, &y);
     try std.testing.expectError(error.CircuitIndex, sparse(arena.allocator(), 3, 2, &.{3}, &.{0}, &.{1}));
+}
+
+test "dense rows give the scatter's bits: rounding order, signed zeros, repeated entries and non-finite inputs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var prng = std.Random.DefaultPrng.init(7);
+    const r = prng.random();
+    const outs = 37;
+    var src: std.ArrayList(u32) = .empty;
+    var dst: std.ArrayList(u32) = .empty;
+    var w: std.ArrayList(Scalar) = .empty;
+    for (0..6) |i| for (0..outs) |o| if (i == 5 or r.boolean()) {
+        try src.append(a, @intCast(i));
+        try dst.append(a, @intCast(o));
+        try w.append(a, (r.float(Scalar) - 0.5) * 1e3);
+    };
+    for (0..4) |_| {
+        try src.append(a, 4);
+        try dst.append(a, 3);
+        try w.append(a, 0.1);
+    }
+    const m = try sparse(a, 6, outs, src.items, dst.items, w.items);
+    const d = try m.densify(a);
+    try std.testing.expect(d.dense.len > 0 and d.dense_at[4] == no_row);
+    const xs = [_][6]Scalar{ .{ 1e-3, -7.5, 3.25e5, -0.0, 1.1, 2.0 }, .{ std.math.inf(Scalar), 1, -1, 0.3, 9, -4 }, .{ 0, 0, 0, 0, 0, -1e-30 } };
+    for (xs) |x| {
+        var want: [outs]Scalar = undefined;
+        var got: [outs]Scalar = undefined;
+        m.apply(&x, &.{ 0, 1, 2, 3, 4, 5 }, &want);
+        d.apply(&x, &.{ 0, 1, 2, 3, 4, 5 }, &got);
+        try std.testing.expectEqualSlices(u32, @ptrCast(&want), @ptrCast(&got));
+    }
 }
 
 test "features follow the format's token-bus encodings" {

@@ -96,6 +96,7 @@ fn clear(s: *State, t: u32) !void {
 
 /// core.snapshot: the machine's boot state written into the circuit's tables (the heads' initial states).
 pub fn boot(s: *State, img: Image) !void {
+    s.force = true;
     const a_bit = s.circuit.program.a_bit;
     const anchor = (img.entry - rom.rom_base) >> 2;
     var pc = ballast(s);
