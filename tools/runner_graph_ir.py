@@ -297,12 +297,12 @@ class Builder:
 def build_template(root, op, width):
     if width not in BUCKETS:
         raise ValueError(f"template width must be one of {BUCKETS}")
-    whole = ("format", "round_div", "decimal_mul", "compare", "min", "max", "scale10", "float_exact")
-    if op not in ("add", "sub", "mul", "select", "emit", "emit_first", "emit_last", "divstep", "divfinal", "meta", "half", "digit_sum", "mulmodstep", *whole):
+    whole = ("format", "format_f64", "round_div", "decimal_mul", "compare", "min", "max", "scale10", "float_exact", "reverse_decimal", "assert_true")
+    if op not in ("add", "sub", "mul", "select", "emit", "emit_first", "emit_last", "divstep", "divfinal", "meta", "half", "digit_sum", "mulmodstep", "emit_byte", "byte_check", "raw_meta", *whole):
         raise ValueError(f"unsupported ALU operation: {op}")
-    if op == "meta" and width < 8:
+    if op in ("meta", "raw_meta") and width < 8:
         raise ValueError("meta template requires at least 8 digits")
-    if op == "format" and width not in (62, 128):
+    if op in ("format", "format_f64") and width not in (62, 128):
         raise ValueError("format template requires width 62 or 128")
     root = Path(root).resolve()
     load_upstream(root)
@@ -315,12 +315,17 @@ def build_template(root, op, width):
     from chipformer.rv import core, spec
 
     builder = Builder(width, core, ir, np)
-    if op == "format":
+    if op in ("emit_byte", "byte_check"):
+        module = importlib.import_module("runner_graph_byte")
+        outputs = builder.input(0)
+        if op == "byte_check":
+            outputs = module.check(builder, outputs)
+    elif op in ("format", "format_f64"):
         outputs = [builder.input(i, preserve_sign=True) for i in range(2)]
     elif op in whole:
         module = importlib.import_module("runner_graph_whole")
         outputs = module.build(builder, op)
-    elif op in ("meta", "half", "digit_sum", "mulmodstep"):
+    elif op in ("meta", "raw_meta", "half", "digit_sum", "mulmodstep"):
         module = importlib.import_module("runner_graph_algorithms")
         outputs = module.build(builder, op)
     elif op.startswith("div"):
@@ -338,8 +343,11 @@ def build_template(root, op, width):
         else:
             outputs = getattr(builder, f"signed_{op}")(a, b)
     prefix, suffix = {"emit_first": (b"(", b", "), "emit_last": (b"", b")\n")}.get(op, (b"", b"\n"))
-    if op == "format":
-        metadata = importlib.import_module("runner_graph_format").finish(builder, outputs)
+    if op == "emit_byte":
+        metadata = importlib.import_module("runner_graph_byte").finish(builder, outputs)
+    elif op in ("format", "format_f64"):
+        metadata = importlib.import_module("runner_graph_format").finish(
+            builder, outputs, max_precision=20 if op == "format_f64" else 18)
     else:
         metadata = builder.finish(outputs, emit=op.startswith("emit"), prefix=prefix, suffix=suffix,
                                   preserve_sign=op in ("round_div", "decimal_mul", "scale10", "float_exact"))

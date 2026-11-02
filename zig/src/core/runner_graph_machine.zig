@@ -106,6 +106,8 @@ pub const Machine = struct {
             count += op.outputs;
         }
         if (m.prints.len != 0) {
+            const validated = try printing.validateBytes(m, m.prints, budget, out, cancel);
+            if (validated != .halted) return .{ .end = validated, .steps = m.steps };
             for (m.prints) |p| {
                 const end = try printing.emit(m, p, budget, out, cancel);
                 if (end != .halted) return .{ .end = end, .steps = m.steps };
@@ -126,6 +128,8 @@ pub const Machine = struct {
         if (m.steps >= budget) return .budget;
         if (cancelled(cancel)) return .cancelled;
         for (refs) |ref| try fits(&m.values[ref], t.width);
+        try t.prepare();
+        if (cancelled(cancel)) return .cancelled;
         var fresh: State = undefined;
         const state = if (m.reuse_states) try m.states.get(m.gpa, t) else blk: {
             fresh = try State.init(m.gpa, &t.circuit);

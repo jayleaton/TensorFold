@@ -22,7 +22,9 @@ BYTE = sum(size for _, size in LAYOUT[:6])
 HALT = sum(size for _, size in LAYOUT[:17])
 RUNTIME_FILES = ("runner_graph.zig", "runner_graph_bank.zig", "runner_graph_machine.zig",
                  "runner_graph_binary.zig", "runner_graph_packet.zig", "runner_graph_algorithms.zig",
-                 "runner_graph_state_cache.zig", "runner_graph_print.zig")
+                 "runner_graph_state_cache.zig", "runner_graph_print.zig",
+                 "runner_graph_factor.zig", "runner_graph_lazy.zig", "runner_graph_f64.zig",
+                 "runner_graph_f64_context.zig", "runner_graph_f64_math.zig", "runner_graph_f64_print.zig")
 
 
 def require(condition, message):
@@ -67,10 +69,10 @@ def structural_audit(source_root, probe_source, manifest, cwd):
         code = "\n".join(line.split("//", 1)[0] for line in source.splitlines())
         require(not any(word in code for word in forbidden), f"runtime compilation path in {name}")
     probe = sources[probe_source.name]
-    require(probe.count("graph.Bank.load(") == 1, "probe must load its bank exactly once")
+    require(probe.count("graph.Bank.loadWithMode(") == 1, "probe must load its bank exactly once")
     require("m.trace = &trace" in probe and "graph.Machine.boot(" in probe, "missing actual machine trace hook")
     bank = sources["runner_graph_bank.zig"]
-    require("binary.load(" in bank, "bank must load offline prepared packs")
+    require("binary.loadPinned(" in bank, "bank must load offline prepared packs")
     templates = manifest.get("templates", [])
     require(manifest.get("version") == 1 and templates, "manifest needs prepared templates")
     packs = []
@@ -229,7 +231,7 @@ def pack_controls(binary, manifest_path, cases, cwd):
                 victim["path"] = str(path)
             path = root / "bank.json"
             path.write_text(json.dumps(altered))
-            child = subprocess.run([str(binary), str(path), str(cases)], cwd=cwd,
+            child = subprocess.run([str(binary), str(path), str(cases), "--eager-bank"], cwd=cwd,
                                    capture_output=True, text=True, timeout=60, check=False)
             failure = json.loads(child.stdout)
             require(child.returncode != 0 and failure.get("fatal_error") == expected,
