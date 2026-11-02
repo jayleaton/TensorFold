@@ -11,7 +11,11 @@ const halt: u32 = byte_base + 512 + 8 + 16 + 16 + 128 + 256 + 5;
 
 const Case = struct {
     id: []const u8,
-    packet: std.json.Value,
+    packet: std.json.Value = .null,
+    expression: ?[]const u8 = null,
+    script: ?[]const u8 = null,
+    cell: ?api.Cell = null,
+    syntax: @import("runner_graph_bind.zig").Syntax = .math,
     expected_output: []const u8,
     expected_status: []const u8 = "halted",
     expect_mismatch: bool = false,
@@ -29,6 +33,8 @@ const Row = struct {
     output_equal: bool = false,
     detected_mismatch: bool = false,
     machine_boot_ns: u64 = 0,
+    binding_ns: u64 = 0,
+    bound_packet: []const u8 = "",
     run_ns: u64 = 0,
     cpu_ns: u64 = 0,
     actual_output: []const u8 = "",
@@ -198,8 +204,22 @@ fn audit(a: Allocator, row: *Row, trace: []const u32, out: []const u8, halted: b
 fn runCase(a: Allocator, keep: Allocator, bank: *const graph.Bank, c: Case, budget: u64, fresh_states: bool, fixed_widths: bool, all_raw: *Hash, all_visible: *Hash, seeds: *std.ArrayList(Seed)) !Row {
     var row: Row = .{ .id = try keep.dupe(u8, c.id) };
     row.expected_canonical_sha256 = try expectedHash(keep, c.expected_output, std.mem.eql(u8, c.expected_status, "halted"));
-    const bytes = try std.json.Stringify.valueAlloc(a, c.packet, .{});
+    const bind_start = now();
+    const bound = if (c.expression) |source| try graph.bindExpression(a, bank, source, c.syntax) else if (c.script) |source| try graph.bindScript(a, bank, source) else if (c.cell) |request| blk: {
+        const front = graph.directFrontend(bank);
+        const translation = try front.translate(front.ctx, a, request);
+        break :blk if (translation == .program) translation.program.bytes else null;
+    } else null;
+    const bytes = if (c.expression != null or c.script != null or c.cell != null) bound orelse {
+        row.binding_ns = now() - bind_start;
+        row.status = "unsupported";
+        row.pass = !c.expect_mismatch and std.mem.eql(u8, c.expected_status, row.status) and c.expected_output.len == 0;
+        if (!row.pass) row.reason = "source binding refused";
+        return row;
+    } else try std.json.Stringify.valueAlloc(a, c.packet, .{});
     defer a.free(bytes);
+    row.binding_ns = now() - bind_start;
+    if (c.expression != null or c.script != null or c.cell != null) row.bound_packet = try keep.dupe(u8, bytes);
     const boot_start = now();
     var m = graph.Machine.boot(a, bank, bytes) catch |err| {
         row.machine_boot_ns = now() - boot_start;
