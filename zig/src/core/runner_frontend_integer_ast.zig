@@ -1,10 +1,7 @@
 const std = @import("std");
-const list = @import("runner_frontend_integer_list.zig");
 
 pub const Invalid = error{Unsupported};
 pub const limit: i512 = std.math.pow(i512, 10, 62);
-/// Elements all of a script's lists may hold together (each one a node, so the node budget binds first).
-pub const max_items = 64;
 pub const Op = enum(u8) { literal, neg, add, sub, mul, floor, mod, pow, powmod, digits, divmod, gcd, isqrt, factorial, range_product, digit_sum, eq, ne, lt, le, gt, ge };
 pub const Node = struct {
     op: Op,
@@ -33,68 +30,25 @@ pub const Parser = struct {
     frame: ?Frame = null,
     active: u8 = 0, // functions being inlined, one bit each: a call to one of them is recursion
     check_only: bool = false, // a def's body at its definition: syntax only, names are not looked up
-    // static int lists: parse-time values over element nodes; a name of kind list holds its index in lists
-    items: [max_items]usize = undefined,
-    item_count: usize = 0,
-    lists: [16]list.List = undefined,
-    list_count: usize = 0,
-    kinds: [32]bool = undefined,
-    module_count: usize = 0, // the module's names: bindings[0..module_count] outside any frame or comprehension
-    allow_lists: bool = false, // the whole-script lowering's lists and min/max; every other parser keeps its grammar
-    listed: bool = false, // a list or min/max parsed: the graph route's script only (calc and ELF keep their own)
-    asserted: bool = false, // an `assert` proved: like a def or a list, the graph route's script only
+    asserted: bool = false, // an `assert` proved: like a def, the graph route's script only
 
     /// `def name(params): return <expr>`, inlined at each call; `body` borrows the script.
     pub const Function = struct { name: []const u8, params: [4][]const u8 = undefined, arity: usize = 0, body: []const u8 };
     const Frame = struct { start: usize, globals: usize };
-    /// An int node, or a list's index in `lists`.
-    pub const Operand = struct { index: usize, list: bool };
-    pub const Mark = struct { pos: usize, count: usize, items: usize, lists: usize };
 
     // Names and literal slices borrow source storage; bind after parsing the RHS to preserve prior roots.
     pub fn bind(self: *Parser, name: []const u8, root: usize) Invalid!void {
-        return self.bindAs(name, .{ .index = root, .list = false });
-    }
-
-    pub fn bindAs(self: *Parser, name: []const u8, v: Operand) Invalid!void {
-        if (name.len == 0 or v.index >= (if (v.list) self.list_count else self.count) or self.function(name) != null)
-            return error.Unsupported;
-        for (self.names[0..self.binding_count], self.roots[0..self.binding_count], 0..) |bound_name, *bound_root, i| {
+        if (name.len == 0 or root >= self.count or self.function(name) != null) return error.Unsupported;
+        for (self.names[0..self.binding_count], self.roots[0..self.binding_count]) |bound_name, *bound_root| {
             if (std.mem.eql(u8, name, bound_name)) {
-                bound_root.* = v.index;
-                self.kinds[i] = v.list;
+                bound_root.* = root;
                 return;
             }
         }
         if (self.binding_count == self.names.len) return error.Unsupported;
         self.names[self.binding_count] = name;
-        self.roots[self.binding_count] = v.index;
-        self.kinds[self.binding_count] = v.list;
+        self.roots[self.binding_count] = root;
         self.binding_count += 1;
-        self.module_count = self.binding_count;
-    }
-
-    /// Where to drop what a parse added (a failed attempt, or nodes only a proof reads).
-    pub fn mark(self: *const Parser) Mark {
-        return .{ .pos = self.pos, .count = self.count, .items = self.item_count, .lists = self.list_count };
-    }
-
-    pub fn reset(self: *Parser, m: Mark) void {
-        self.pos, self.count, self.item_count, self.list_count = .{ m.pos, m.count, m.items, m.lists };
-    }
-
-    /// A call argument or a whole right side: a list when one parses up to `,`, `)` or the end, else an int.
-    pub fn operand(self: *Parser, depth: usize) Invalid!Operand {
-        if (list.ahead(self)) {
-            const m = self.mark();
-            if (list.parse(self, depth)) |li| {
-                self.space();
-                if (self.pos == self.source.len or self.source[self.pos] == ',' or self.source[self.pos] == ')')
-                    return .{ .index = li, .list = true };
-            } else |_| {}
-            self.reset(m);
-        }
-        return .{ .index = try self.expr(depth), .list = false };
     }
 
     /// A def as Python compiles it: the body must parse now (names resolve at each call), the name must be new.
@@ -105,9 +59,9 @@ pub const Parser = struct {
             if (std.mem.eql(u8, p, f.name)) return error.Unsupported;
             for (f.params[0..i]) |q| if (std.mem.eql(u8, p, q)) return error.Unsupported;
         }
-        const saved = .{ self.source, self.pos, self.count, self.item_count, self.list_count };
+        const saved = .{ self.source, self.pos, self.count };
         defer {
-            self.source, self.pos, self.count, self.item_count, self.list_count = saved;
+            self.source, self.pos, self.count = saved;
             self.check_only = false;
         }
         self.check_only = true;
@@ -125,27 +79,15 @@ pub const Parser = struct {
         return null;
     }
 
-    /// A name's binding: a body's params, then module names (never a caller's); newest first, so targets shadow.
-    fn slot(self: *const Parser, name: []const u8) ?usize {
+    /// The node a name holds where it is read: in a body its parameters, then the module's names (never a caller's).
+    fn lookup(self: *const Parser, name: []const u8) ?usize {
         const visible: [2][2]usize = if (self.frame) |f| .{ .{ f.start, self.binding_count }, .{ 0, f.globals } } else .{ .{ 0, self.binding_count }, .{ 0, 0 } };
         for (visible) |range| {
-            var i = range[1];
-            while (i > range[0]) {
-                i -= 1;
-                if (std.mem.eql(u8, name, self.names[i])) return i;
+            for (self.names[range[0]..range[1]], self.roots[range[0]..range[1]]) |bound_name, root| {
+                if (std.mem.eql(u8, name, bound_name)) return root;
             }
         }
         return null;
-    }
-
-    fn lookup(self: *const Parser, name: []const u8) ?usize {
-        const s = self.slot(name) orelse return null;
-        return if (self.kinds[s]) null else self.roots[s];
-    }
-
-    pub fn lookupList(self: *const Parser, name: []const u8) ?usize {
-        const s = self.slot(name) orelse return null;
-        return if (self.kinds[s]) self.roots[s] else null;
     }
 
     /// `f(args)` with f's body parsed over the argument nodes: pure, so inlining is exact; recursion refuses.
@@ -153,12 +95,12 @@ pub const Parser = struct {
         const f = self.functions[index];
         const bit = @as(u8, 1) << @intCast(index);
         if (self.active & bit != 0) return error.Unsupported;
-        var args: [4]Operand = undefined;
+        var args: [4]usize = undefined;
         var n: usize = 0;
         try self.need("(");
         if (!self.take(")")) while (true) {
             if (n == args.len) return error.Unsupported;
-            args[n] = try self.operand(depth + 1);
+            args[n] = try self.expr(depth + 1);
             n += 1;
             if (self.take(")")) break;
             try self.need(",");
@@ -169,12 +111,11 @@ pub const Parser = struct {
             self.source, self.pos, self.binding_count, self.frame, self.active = saved;
         }
         // read the outer frame before writing: a struct literal assigned in place may alias self.frame
-        const globals = if (self.frame) |outer| outer.globals else self.module_count;
+        const globals = if (self.frame) |outer| outer.globals else self.binding_count;
         self.frame = .{ .start = self.binding_count, .globals = globals };
         for (f.params[0..n], args[0..n]) |p, arg| {
             self.names[self.binding_count] = p;
-            self.roots[self.binding_count] = arg.index;
-            self.kinds[self.binding_count] = arg.list;
+            self.roots[self.binding_count] = arg;
             self.binding_count += 1;
         }
         self.active |= bit;
@@ -209,26 +150,25 @@ pub const Parser = struct {
         return .{ q, r };
     }
 
-    pub fn space(self: *Parser) void {
+    fn space(self: *Parser) void {
         while (self.pos < self.source.len and (self.source[self.pos] == ' ' or self.source[self.pos] == '\t'))
             self.pos += 1;
     }
 
-    pub fn take(self: *Parser, s: []const u8) bool {
+    fn take(self: *Parser, s: []const u8) bool {
         self.space();
         if (!std.mem.startsWith(u8, self.source[self.pos..], s)) return false;
         self.pos += s.len;
         return true;
     }
 
-    pub fn need(self: *Parser, s: []const u8) Invalid!void {
+    fn need(self: *Parser, s: []const u8) Invalid!void {
         if (!self.take(s)) return error.Unsupported;
     }
 
-    pub fn add(self: *Parser, node: Node) Invalid!usize {
+    fn add(self: *Parser, node: Node) Invalid!usize {
         if (self.count == self.nodes.len) return error.Unsupported;
         self.nodes[self.count] = node;
-        self.proved[self.count] = false; // a reset may reuse the slot
         self.count += 1;
         return self.count - 1;
     }
@@ -242,7 +182,7 @@ pub const Parser = struct {
         return null;
     }
 
-    pub fn expr(self: *Parser, depth: usize) Invalid!usize {
+    fn expr(self: *Parser, depth: usize) Invalid!usize {
         const left = try self.sum(depth);
         const op = self.comparison() orelse return left;
         const right = try self.sum(depth);
@@ -306,16 +246,8 @@ pub const Parser = struct {
             try self.need(")");
             return n;
         }
-        if (list.ahead(self)) return list.index(self, try list.parse(self, depth), depth);
         if (try self.algorithm(depth)) |n| return n;
-        if (self.word("sum")) {
-            if (!self.allow_lists) return self.digitSum(depth);
-            const m = self.mark();
-            if (self.digitSum(depth)) |n| return n else |_| self.reset(m);
-            return list.sum(self, depth);
-        }
-        if (self.allow_lists and self.word("min")) return list.extreme(self, depth, false);
-        if (self.allow_lists and self.word("max")) return list.extreme(self, depth, true);
+        if (self.word("sum")) return self.digitSum(depth);
         if (self.word("divmod")) {
             try self.need("(");
             const a = try self.expr(depth + 1);
@@ -335,10 +267,13 @@ pub const Parser = struct {
             return self.add(.{ .op = .powmod, .l = a, .r = b, .k = m });
         }
         if (self.word("len")) {
-            if (!self.allow_lists) return self.textLength(depth);
-            const m = self.mark();
-            if (self.textLength(depth)) |n| return n else |_| self.reset(m);
-            return list.length(self, depth);
+            try self.need("(");
+            try self.need("str");
+            try self.need("(");
+            const n = try self.expr(depth + 1);
+            try self.need(")");
+            try self.need(")");
+            return self.add(.{ .op = .digits, .l = n });
         }
         if (self.word("int")) return self.convert();
         self.space();
@@ -353,13 +288,10 @@ pub const Parser = struct {
                 if (called) {
                     try self.need("(");
                     if (!self.take(")")) while (true) {
-                        _ = try self.operand(depth + 1);
+                        _ = try self.expr(depth + 1);
                         if (self.take(")")) break;
                         try self.need(",");
                     };
-                } else if (self.take("[")) {
-                    _ = try self.expr(depth + 1);
-                    try self.need("]");
                 }
                 return self.add(.{ .op = .literal, .value = 1, .text = "1" });
             }
@@ -416,7 +348,7 @@ pub const Parser = struct {
         return try self.add(.{ .op = op, .l = a, .r = b, .k = k });
     }
 
-    pub fn word(self: *Parser, token: []const u8) bool {
+    fn word(self: *Parser, token: []const u8) bool {
         self.space();
         const rest = self.source[self.pos..];
         if (!std.mem.startsWith(u8, rest, token)) return false;
@@ -426,7 +358,7 @@ pub const Parser = struct {
         return true;
     }
 
-    pub fn identifier(self: *Parser) Invalid![]const u8 {
+    fn identifier(self: *Parser) Invalid![]const u8 {
         self.space();
         const start = self.pos;
         while (self.pos < self.source.len and
@@ -437,17 +369,6 @@ pub const Parser = struct {
         const reserved = [_][]const u8{ "False", "None", "True", "and", "as", "assert", "async", "await", "break", "class", "continue", "def", "del", "elif", "else", "except", "finally", "for", "from", "global", "if", "import", "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise", "return", "try", "while", "with", "yield" };
         for (reserved) |token| if (std.mem.eql(u8, name, token)) return error.Unsupported;
         return name;
-    }
-
-    /// len(str(n)): n's digit count, its sign included.
-    fn textLength(self: *Parser, depth: usize) Invalid!usize {
-        try self.need("(");
-        try self.need("str");
-        try self.need("(");
-        const n = try self.expr(depth + 1);
-        try self.need(")");
-        try self.need(")");
-        return self.add(.{ .op = .digits, .l = n });
     }
 
     fn digitSum(self: *Parser, depth: usize) Invalid!usize {
