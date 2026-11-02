@@ -25,6 +25,7 @@ test "split: a body compiles alone only when it names none of the runtime's stat
     try t.expect(!split.eligible("int main(void) { char b[8]; memset(b, 0, 8); return b[1]; }"));
     try t.expect(!split.eligible("int main(void) { puts(\"y\"); }"));
     try t.expect(!split.eligible("int main(void) { tf_print_int(3); }"));
+    try t.expect(split.eligible("int main(void) { char d[10]; tf_py_print(-3, 0, d); }"));
     try t.expect(!split.eligible("int main(void) { putchar(10); }"));
     try t.expect(std.mem.indexOf(u8, split.declarations, "printf") == null);
 }
