@@ -350,6 +350,8 @@ pub const Routed = struct {
 
     fn translate(ctx: ?*anyopaque, a: Allocator, cell: api.Cell) Allocator.Error!api.Translation {
         const r: *Routed = @ptrCast(@alignCast(ctx.?));
+        if (try graph.bindCell(a, r.bank, cell)) |bytes|
+            return .{ .program = .{ .kind = .graph, .bytes = bytes } };
         if (cell.form != .inline_expr and std.mem.eql(u8, cell.lang, "python") and !prog.shadowed(cell.prior))
             if (try prog.program(a, r.bank, cell.code)) |bytes| return .{ .program = .{ .kind = .graph, .bytes = bytes } };
         // a whole script the frontend checks runs on the bank before any compile; earlier cells' names stay on its path
