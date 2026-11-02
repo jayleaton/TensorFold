@@ -29,12 +29,10 @@ const refused = [_][]const u8{
     // recursion, direct and mutual
     "def f(n):\n    return f(n - 1)\nprint(f(3))\n",
     "def f(n):\n    return g(n)\ndef g(n):\n    return f(n)\nprint(f(3))\n",
-    // side effects or more than one statement in the body
+    // side effects in the body (multi-statement suites: runner_frontend_integer_loop_test.zig)
     "def f(n):\n    print(n)\n    return n\nprint(f(3))\n",
     "def f(n):\n    global k\n    return n\nprint(f(3))\n",
-    "def f(n):\n    m = n * 2\n    return m\nprint(f(3))\n",
     "def f(n): return n; k = 1\nprint(f(3))\n",
-    "def f(n):\n    for i in range(n):\n        n += i\n    return n\nprint(f(3))\n",
     "def f(n=2):\n    return n\nprint(f())\n",
     "def f(*n):\n    return 1\nprint(f(3))\n",
     "def f(n): return n\n    return 2\nprint(f(3))\n",

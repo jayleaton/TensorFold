@@ -6,7 +6,7 @@ const Invalid = ast.Invalid;
 const node_cap = @typeInfo(@FieldType(Parser, "nodes")).array.len;
 
 /// items[start..][0..len]; a range never prints here; a filtered list's 0/1 masks follow (its len is a circuit value).
-pub const List = struct { start: usize = 0, len: usize = 0, range: bool = false, masked: bool = false };
+pub const List = struct { start: usize = 0, len: usize = 0, range: bool = false, masked: bool = false, literal: bool = false };
 
 /// A list whose elements all exist: a filtered one only reaches sum() and len(), on the circuit.
 pub fn plain(p: *const Parser, li: usize) Invalid!List {
@@ -57,6 +57,7 @@ fn network(p: *Parser, elems: []usize, reverse: bool) Invalid!void {
             const lo, const hi = try exchange(p, elems[c[0]], elems[c[1]]);
             elems[c[0]], elems[c[1]] = if (reverse) .{ hi, lo } else .{ lo, hi };
         }
+        if (p.count > network_nodes) return error.Unsupported;
         return;
     }
     // odd-even transposition: n rounds
@@ -67,7 +68,11 @@ fn network(p: *Parser, elems: []usize, reverse: bool) Invalid!void {
             elems[i], elems[i + 1] = if (reverse) .{ hi, lo } else .{ lo, hi };
         }
     }
+    // the 64-node budget the networks were sized for (a packet's depth), though a whole script may make 512 nodes
+    if (p.count > network_nodes) return error.Unsupported;
 }
+
+const network_nodes = 64;
 
 /// Small literals the lowering itself makes (an index, a length): their text, as a literal node must carry one.
 const digits = blk: {
@@ -228,7 +233,9 @@ fn literal(p: *Parser, content: []const u8, depth: usize) Invalid!usize {
         try p.need(",");
         p.space();
     }
-    return make(p, elems[0..n], false);
+    const li = try make(p, elems[0..n], false);
+    p.lists[li].literal = true; // its length is the script's text, never a value's decision
+    return li;
 }
 
 /// range(n) is the literals 0..n-1; range(start, stop[, step]) is start, then each element before plus the step.
@@ -531,7 +538,7 @@ fn separator(text: []const u8) ?usize {
 }
 
 /// The first whole word `w` at depth 0 from `from`.
-fn top(text: []const u8, w: []const u8, from: usize) ?usize {
+pub fn top(text: []const u8, w: []const u8, from: usize) ?usize {
     var depth: usize = 0;
     var quote: u8 = 0;
     var i = from;
