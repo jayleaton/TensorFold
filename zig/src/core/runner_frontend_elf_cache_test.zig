@@ -8,6 +8,8 @@ const t = std.testing;
 test {
     _ = @import("runner_frontend_spawn.zig");
     _ = @import("runner_frontend_compile_time_test.zig");
+    _ = @import("runner_frontend_split_test.zig");
+    _ = @import("runner_frontend_rvlink.zig");
     _ = elf_cache;
 }
 
