@@ -59,8 +59,10 @@ const Count = struct {
     }
     fn start(ctx: *anyopaque, stream: u64, p: rapi.Program, budget: u64) error{ OutOfMemory, Busy }!rapi.JobId {
         const c: *Count = @ptrCast(@alignCast(ctx));
+        // jobs the inner backend took (a Busy refusal starts nothing)
+        const id = try c.inner.start(stream, p, budget);
         c.started += 1;
-        return c.inner.start(stream, p, budget);
+        return id;
     }
     fn poll(ctx: *anyopaque, job: rapi.JobId) rapi.Poll {
         const c: *Count = @ptrCast(@alignCast(ctx));
@@ -226,6 +228,8 @@ test "runner proof: straight-line integer cells print Python's lines on the grap
         .{ "x = -7\nprint(x // 2); print(x % 3)  # floor", "-4\n2\n" },
         .{ "print(2**64 == 18446744073709551616)", "True\n" },
         .{ "a=10\nprint(a == 11)", "False\n" },
+        .{ divmod_cell[10..112] ++ "print(q*b + r == a + 1, q*b + r != a - 1, q*b + r - a == 0, a != a)", "False True True False\n" },
+        .{ "a = -10**40\nb = 10**40\nprint(a == b, a != b, a == -b, b - a == 2*b)", "False True True True\n" },
         .{ "n = 37\nprint(2**n - 1, n)", "137438953471 37\n" },
         .{ "a = 2**10\nprint(a)", "1024\n" },
         .{ "s = 2 + 3\nprint(s * 4)", "20\n" },

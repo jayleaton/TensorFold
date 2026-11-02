@@ -149,7 +149,7 @@ fn piece(arena: Allocator, bank: *const graph.Bank, defs: anytype, arg: []const 
     const l = try expand(arena, defs, arg[0..at]) orelse return null;
     const r = try expand(arena, defs, arg[at + 2 ..]) orelse return null;
     if (std.mem.indexOfAny(u8, l, "=!<>") != null or std.mem.indexOfAny(u8, r, "=!<>") != null) return null;
-    // d = l - r; with M = 10^D above |d|: (d+M-1)//M is 1 for d > 0, (-d+M-1)//M is 1 for d < 0, both 0 at d = 0
+    // d = l - r; with M = 10^D above |d|, (d+M)%M is 0 only at d = 0, so ((d+M)%M+M-1)//M is d != 0 (d read once)
     const d = try std.mem.concat(arena, u8, &.{ "(", l, ")-(", r, ")" });
     const sh = try route.shape(arena, d) orelse return null;
     const digits = sh.nodes[sh.root].digits;
@@ -157,7 +157,7 @@ fn piece(arena: Allocator, bank: *const graph.Bank, defs: anytype, arg: []const 
     const m = try arena.alloc(u8, digits + 1);
     m[0] = '1';
     @memset(m[1..], '0');
-    const nz = try std.mem.concat(arena, u8, &.{ "(", d, "+", m, "-1)//", m, "+((", r, ")-(", l, ")+", m, "-1)//", m });
+    const nz = try std.mem.concat(arena, u8, &.{ "((", d, "+", m, ")%", m, "+", m, "-1)//", m });
     const e = if (arg[at] == '=') try std.mem.concat(arena, u8, &.{ "1-(", nz, ")" }) else nz;
     return .{ .kind = 'B', .packet = try route.lower(arena, bank, e) orelse return null };
 }

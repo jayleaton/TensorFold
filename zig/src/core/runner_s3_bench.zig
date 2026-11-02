@@ -5,6 +5,8 @@ const runner = @import("runner.zig");
 const ropen = @import("runner_open.zig");
 const prog = @import("runner_graph_program.zig");
 const lane = @import("compute_lane.zig");
+const rc = @import("runner_circuit.zig");
+const elf_cache = @import("runner_frontend_elf_cache.zig");
 const linux = std.os.linux;
 
 fn now() u64 {
@@ -46,9 +48,24 @@ fn pieces(p: api.Program) usize {
 }
 
 /// One cell's staged run: translate, then start and spin-poll to the end (the backend's own time, no S3 naps).
-const Staged = struct { route: []const u8 = "abstain", pieces: usize = 0, bytes: usize = 0, translate: u64 = 0, run: u64 = 0, steps: u64 = 0, exec: u64 = 0, ok: bool = false };
+const Staged = struct { route: []const u8 = "abstain", pieces: usize = 0, bytes: usize = 0, translate: u64 = 0, run: u64 = 0, steps: u64 = 0, exec: u64 = 0, boot: u64 = 0, eval: u64 = 0, ok: bool = false };
 
-fn staged(a: std.mem.Allocator, r: *runner.Runner, c: Cell, stream: u64) !Staged {
+/// A circuit program's boot (the snapshot and the program loaded) and its steps, timed apart on this thread.
+fn split(c: *const rc.Circuit, p: api.Program, budget: u64, s: *Staged) !void {
+    const gpa = std.heap.c_allocator;
+    const t0 = now();
+    var m = try rc.Machine.boot(gpa, c, p);
+    defer m.deinit(gpa);
+    const t1 = now();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    const never: std.atomic.Value(bool) = .init(false);
+    _ = try m.run(budget, &out, null, &never);
+    s.boot = t1 - t0;
+    s.eval = now() - t1;
+}
+
+fn staged(a: std.mem.Allocator, r: *runner.Runner, c: Cell, stream: u64, circuit: ?*const rc.Circuit) !Staged {
     var s: Staged = .{};
     const t0 = now();
     const t = try r.frontend.translate(r.frontend.ctx, a, .{ .form = .fence, .lang = "python", .code = c.code });
@@ -71,6 +88,7 @@ fn staged(a: std.mem.Allocator, r: *runner.Runner, c: Cell, stream: u64) !Staged
     s.steps = res.steps;
     s.exec = res.exec_ns;
     s.ok = res.status == .ok and std.mem.eql(u8, res.out, c.want);
+    if (circuit) |k| if (p.kind != .graph) try split(k, p, r.cfg.max_steps, &s);
     return s;
 }
 
@@ -135,12 +153,17 @@ pub fn main(init: std.process.Init) !u8 {
         return 2;
     };
     const r = try ropen.open(gpa, cfg);
+    // a second copy of the circuit: ELF and calc programs' boot and steps timed apart from the backend
+    var circuit = try rc.Circuit.load(gpa, cfg.circuit);
+    defer circuit.deinit(gpa);
     const rows = try gpa.alloc(Row, cells.items.len);
     const e2es = try gpa.alloc(u64, reps);
     const tr = try gpa.alloc(u64, reps);
     const run = try gpa.alloc(u64, reps);
     var stream: u64 = 1 << 40;
-    std.debug.print("| cell | route | pieces | bytes | steps | translate ms | backend ms | exec ms | S3 first ms | S3 p50 ms | body |\n|---|---|---|---|---|---|---|---|---|---|---|\n", .{});
+    // TF_S3_BENCH_COLD=1 empties the compiled-image cache before every call: each ELF cell pays its compile
+    const cold = env("TF_S3_BENCH_COLD") != null;
+    std.debug.print("| cell | route | pieces | bytes | steps | translate ms | backend ms | exec ms | boot ms | steps ms | S3 first ms | S3 p50 ms | body |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|\n", .{});
     for (cells.items, rows) |c, *row| {
         row.* = .{ .st = .{}, .e2e = .{ 0, 0 }, .served_ok = true };
         for (0..reps) |i| {
@@ -148,13 +171,15 @@ pub fn main(init: std.process.Init) !u8 {
             defer arena.deinit();
             // the served call first (cold on rep 0: no translation or run of this cell before it)
             stream += 1;
+            if (cold) elf_cache.reset(init.io);
             const t0 = now();
             const got = try call(arena.allocator(), r, c.code, stream);
             e2es[i] = now() - t0;
             const want = try lane.runner.body(arena.allocator(), .{ .status = .ok, .stdout = c.want }, 0, 0);
             if (got == null or !std.mem.eql(u8, got.?, want)) row.served_ok = false;
             stream += 1;
-            const st = try staged(arena.allocator(), r, c, stream);
+            if (cold) elf_cache.reset(init.io);
+            const st = try staged(arena.allocator(), r, c, stream, &circuit);
             row.st = st;
             row.st.route = st.route;
             tr[i] = st.translate;
@@ -164,18 +189,23 @@ pub fn main(init: std.process.Init) !u8 {
         row.e2e = .{ e2es[0], median(e2es) };
         row.st.translate = median(tr);
         row.st.run = median(run);
-        std.debug.print("| {s} | {s} | {d} | {d} | {d} | {d:.2} | {d:.2} | {d:.2} | {d:.2} | {d:.2} | {s} |\n", .{ c.id, row.st.route, row.st.pieces, row.st.bytes, row.st.steps, ms(row.st.translate), ms(row.st.run), ms(row.st.exec), ms(row.e2e[0]), ms(row.e2e[1]), if (row.served_ok) "= CPython" else "DIFFERS" });
+        std.debug.print("| {s} | {s} | {d} | {d} | {d} | {d:.2} | {d:.2} | {d:.2} | {d:.2} | {d:.2} | {d:.2} | {d:.2} | {s} |\n", .{ c.id, row.st.route, row.st.pieces, row.st.bytes, row.st.steps, ms(row.st.translate), ms(row.st.run), ms(row.st.exec), ms(row.st.boot), ms(row.st.eval), ms(row.e2e[0]), ms(row.e2e[1]), if (row.served_ok) "= CPython" else "DIFFERS" });
     }
     var all: std.ArrayList(u64) = .empty;
+    var first: std.ArrayList(u64) = .empty;
     var under: u32 = 0;
     var same: u32 = 0;
     for (rows) |row| {
         try all.append(gpa, row.e2e[1]);
+        try first.append(gpa, row.e2e[0]);
         under += @intFromBool(row.e2e[1] < 40 * std.time.ns_per_ms);
         same += @intFromBool(row.served_ok);
     }
     const v = all.items;
     std.mem.sort(u64, v, {}, std.sort.asc(u64));
     std.debug.print("\nS3 call p50 over cells: median {d:.2} ms, p90 {d:.2} ms, max {d:.2} ms; {d}/{d} under 40 ms; {d}/{d} bodies = CPython\n", .{ ms(v[v.len / 2]), ms(v[(v.len * 9) / 10]), ms(v[v.len - 1]), under, v.len, same, v.len });
+    const w = first.items;
+    std.mem.sort(u64, w, {}, std.sort.asc(u64));
+    std.debug.print("S3 first call over cells: median {d:.2} ms, max {d:.2} ms; image cache {s}, {d} hits\n", .{ ms(w[w.len / 2]), ms(w[w.len - 1]), if (cold) "emptied per call" else "kept", elf_cache.hitCount(init.io) });
     return if (same == v.len) 0 else 1;
 }

@@ -100,6 +100,7 @@ const cases = [_][2][]const u8{
     .{ "from decimal import Decimal\nprint(Decimal('0.002')*Decimal('3'))\nprint(Decimal('-0.5')*Decimal('0.25'))\nprint(Decimal('1.50')*Decimal('2'))\n", "0.006\n-0.125\n3.00\n" },
     .{ "print(divmod(-7, 2))\n", "(-4, 1)\n" },
     .{ "x=10**20\ny=10**20+1\nprint(x<y, x<=y, x>y, x>=y, x==y, x!=y)\n", "True True False False False True\n" },
+    .{ "x=10**20\ny=10**20+1\nprint(y==x, y!=x, x==x, x!=x, -y==-y, -y!=y)\n", "False True True False True True\n" },
     .{ "from fractions import Fraction\nprint(float(Fraction(-84, 4)))\n", "-21.0\n" },
     .{ "a=-17\nb=5\nprint(a//b, a%b, (a<b)+1)\n", "-4 3 2\n" },
     .{ "import math\nprint(math.gcd(-12, 18), math.gcd(12, -18))\n", "6 6\n" },

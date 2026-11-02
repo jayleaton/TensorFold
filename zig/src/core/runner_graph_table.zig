@@ -180,6 +180,11 @@ const Emit = struct {
         const m = try e.arena.alloc(u8, digits + 1);
         m[0] = '1';
         @memset(m[1..], '0');
+        if (how == .eq or how == .ne) {
+            // (d+M)%M is 0 only at d = 0 (operands non-negative): d read once, not twice as in pos + neg
+            const nz = try e.join(&.{ "(((", d, "+", m, ")%", m, "+", m, "-1)//", m, ")" }) orelse return null;
+            return if (how == .ne) nz else try e.join(&.{ "(1-", nz, ")" });
+        }
         const pos = try e.join(&.{ "((", d, "+", m, "-1)//", m, ")" }) orelse return null;
         const neg = try e.join(&.{ "((-", d, "+", m, "-1)//", m, ")" }) orelse return null;
         return switch (how) {
@@ -187,8 +192,7 @@ const Emit = struct {
             .lt => neg,
             .ge => try e.join(&.{ "(1-", neg, ")" }),
             .le => try e.join(&.{ "(1-", pos, ")" }),
-            .ne => try e.join(&.{ "(", pos, "+", neg, ")" }),
-            .eq => try e.join(&.{ "(1-", pos, "-", neg, ")" }),
+            .eq, .ne => unreachable,
             .abs => try e.join(&.{ "(", d, "*(", pos, "-", neg, "))" }),
         };
     }

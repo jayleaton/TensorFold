@@ -34,5 +34,6 @@ test {
     _ = @import("runner_proof_test.zig");
     _ = @import("runner_place_test.zig");
     _ = @import("runner_graph_route.zig");
+    _ = @import("runner_graph_dispatch.zig");
     _ = @import("runner_graph_program.zig");
 }
