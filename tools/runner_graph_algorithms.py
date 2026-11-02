@@ -5,7 +5,8 @@ from runner_graph_ir import Value
 
 OPERATIONS = ("meta", "half", "digit_sum", "mulmodstep")
 ALGORITHMS = {"powmod": 3, "gcd": 2, "isqrt": 1, "range_product": 2,
-              "factorial": 1, "digit_sum": 1, "divmod": 2, "square_offset": 2}
+              "factorial": 1, "digit_sum": 1, "divmod": 2, "square_offset": 2,
+              "fraction": 2, "divexact": 2}
 
 
 def build(b, op):
@@ -68,6 +69,10 @@ def build(b, op):
 
 
 def catalog(widths):
-    return [{"name": f"{name}-{width}", "inputs": arity, "literals": [], "ops": [],
+    plans = [{"name": f"{name}-{width}", "inputs": arity, "literals": [], "ops": [],
              "result": 0, "algorithm": name, "width": width}
             for name, arity in ALGORITHMS.items() for width in widths]
+    plans += [{"name": f"fixed_div-{places}-{width}", "inputs": 2, "literals": [], "ops": [],
+               "result": 0, "algorithm": "fixed_div", "width": width, "precision": places}
+              for width in widths for places in range(19)]
+    return plans

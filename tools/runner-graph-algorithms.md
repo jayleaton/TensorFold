@@ -95,3 +95,80 @@ ceiling. This classifies storage shape without assembling a native integer or
 calculating an answer. Missing smaller templates fall back to the plan bucket.
 `--fixed-widths` in the probe is the token-exact comparison control. Digit sum
 uses one parallel compiled reduction tree rather than one ALU call per digit.
+
+## Whole-cell packets and exact formatting
+
+`Builder.program(allocator, values, ops, prints)` binds a complete arithmetic
+SSA program to the boot-loaded bank. It compiles no graph at request time.
+The packet retains version1 and adds `prints`; a named plan may not override
+its schedule or output. Generic operations may invoke the existing integer
+algorithms, including multiple output slots. All operations run before output.
+Set `checked=true` on a frontend's operations to turn an FFN error flag into
+`GraphArithmetic` before any printing; the backend abstains and clears output.
+Unchecked arithmetic retains its existing `error\n` convention.
+
+`Print` selects a value reference, optional second reference, style, precision,
+ending and optional opening parenthesis. Styles are `integer`, `fixed`, `comma`,
+`integral_float`, `boolean`, `fraction` and `tuple`. Precision0..18 applies only
+to `fixed`. Multi-field prints use `space` between arguments and `newline` at
+line end. Other endings are `empty`, `comma_space`, `close`, `slash`,
+`close_space`, `close_empty`, `close_comma_space`. Tuple fields accept newline,
+space, empty or comma-space; they supply their own parentheses. Fraction fields
+consume reduced numerator/positive-denominator outputs of the fraction algorithm.
+The formatter elides `/1`; zero/negative denominators are refused. Output is
+bounded to4096bytes and128Print descriptors per packet.
+
+All ASCII, signs, decimal points, grouping commas, parentheses and separators
+come from the two-input prepared `format-62`/`format-128` circuits. Native code
+binds the formatting controls and follows compiled predicates; it never decodes
+an operand into a host integer or renders an answer. Raw control BCD digits are:
+precision at0/1, mode at2 (integer0/fixed1/comma2/integral-float3/bool4), ending
+at3 (newline0,space1,empty2,comma-space3,close4,slash5,close-space6,
+close-empty7,close-comma-space8), and prefix0/1 at4. Other digits must be zero. Boolean
+values must be0/1. Integer/comma zero is unsigned; fixed/integral-float preserve
+an explicitly encoded negative zero. Cursor segments stay within the existing
+FP32-exact64/65 boundary, including128digit grouped outputs.
+
+New integer algorithm families:
+
+| Name | Inputs | Outputs | Contract |
+|---|---:|---:|---|
+| `fraction` |2|2|Reduced signed numerator and positive denominator; named result prints like Fraction.|
+| `divexact` |2|1|Exact integral quotient, preserving numerator-XOR-denominator sign at zero; error if remainder is nonzero.|
+| `fixed_div` |2|1|Coefficient for a rational rounded half-even at precision0..18; signed zero retained.|
+
+`Builder.integer(.fraction, operands)` selects a named fraction plan.
+`Builder.fixedDivision(allocator, lhs, rhs, places)` selects
+`fixed_div-PLACES-WIDTH`. Generic operations carry the same `precision` metadata
+for `fixed_div`; other operations require zero precision. New kernels are
+`decimal_mul`, `round_div`, `scale10`, `float_exact`, `compare`, `min`, `max`.
+`decimal_mul` preserves zero's XOR sign. `round_div` consumes unsigned quotient
+and remainder plus original signed numerator/denominator. `float_exact` rejects
+coefficients with more than15digits; it performs no binary floating arithmetic.
+
+For a Python true-division bridge, use checked `divexact` then checked
+`float_exact`, and style `integral_float`. Only exact integral quotients within
+15digits are accepted; this bounded domain is exactly representable and uses
+ordinary decimal `.0` spelling in CPython, including `0/-1 -> -0.0`. Fractional
+or wider true division must abstain. This is not general IEEE float emulation.
+Likewise Decimal multiplication is exact only when the frontend proves a finite
+coefficient/scale domain within the selected Decimal context. The development
+binder conservatively requires product coefficient bounds≤28digits and total
+scale≤6, matching fixed-notation output in the unchanged default context. It
+abstains on larger scales, general Decimal contexts, exponents or rounding. Literal integer `-0` is bound as0;
+Decimal's signed zero is retained.
+
+`Builder.sortedDistance(allocator, values)` selects an offline compare-exchange
+plan `loop-sorted_distance-N-WIDTH` for0..16inputs. It computes
+`sum(abs(a[i]-a[j]) for i<j)` using prepared signed min/max followed by a sorted
+prefix reduction. The width selector uses only operand storage widths and the
+bounded pair count. Every operation checks overflow. The existing sum, square,
+factorial, Fibonacci and list-sum plans remain available. Width128 is the hard
+coefficient limit; unsupported or overflowing intermediate values abstain when
+checked, rather than invoking native bignum arithmetic.
+
+`runner_graph_program.compile_program` is an offline development binder for
+whole-cell qualification. It parses a bounded numeric AST into operand bindings,
+checked operations and print descriptors without evaluating answers. Production
+source admission remains owned by the native frontend. Bank capability, offline
+source binding, frontend admission and live ownership are separate measurements.

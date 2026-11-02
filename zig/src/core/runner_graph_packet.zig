@@ -5,6 +5,8 @@ pub const max_packet = 1 << 20;
 pub const max_ops = 4096;
 pub const max_values = 8192;
 pub const max_arity = 16;
+pub const max_prints = 128;
+pub const max_output = 4096;
 pub const max_digits: usize = 128;
 pub const max_groups = (max_digits + 30) / 31;
 pub const Value = [max_groups][128]f32;
@@ -27,6 +29,19 @@ pub const Op = struct {
     outputs: u8 = 1,
     copies: []const Copy = &.{},
     flags: ?u32 = null,
+    precision: u8 = 0,
+    checked: bool = false,
+};
+
+pub const Style = enum { integer, fixed, comma, integral_float, boolean, fraction, tuple };
+pub const Ending = enum { newline, space, empty, comma_space, close, slash, close_space, close_empty, close_comma_space };
+pub const Print = struct {
+    ref: u32,
+    second: ?u32 = null,
+    style: Style = .integer,
+    precision: u8 = 0,
+    ending: Ending = .newline,
+    prefix: bool = false,
 };
 
 pub const Packet = struct {
@@ -35,6 +50,7 @@ pub const Packet = struct {
     plan: ?[]const u8 = null,
     ops: []const Op = &.{},
     result: u32 = 0,
+    prints: []const Print = &.{},
 };
 
 pub const Plan = struct {
@@ -45,20 +61,28 @@ pub const Plan = struct {
     result: u32,
     algorithm: ?[]const u8 = null,
     width: u8 = 62,
+    precision: u8 = 0,
 };
 
 pub const Family = enum { add, sub, mul, div, mod, pow };
-pub const Algorithm = enum { powmod, gcd, isqrt, range_product, factorial, digit_sum, divmod, square_offset };
-pub const Shape = enum { sum, squares, factorial, fib, list_sum };
+pub const Algorithm = enum { powmod, gcd, isqrt, range_product, factorial, digit_sum, divmod, square_offset, fraction, fixed_div, divexact };
+pub const Shape = enum { sum, squares, factorial, fib, list_sum, sorted_distance };
 
 pub const Builder = struct {
     pub fn encode(a: Allocator, packet: Packet) ![]u8 {
-        if (packet.version != 1 or packet.values.len > max_values or packet.ops.len > max_ops)
+        if (packet.version != 1 or packet.values.len > max_values or packet.ops.len > max_ops or packet.prints.len > max_prints)
             return error.GraphPacketSize;
         const bytes = try std.json.Stringify.valueAlloc(a, packet, .{});
         errdefer a.free(bytes);
         if (bytes.len > max_packet) return error.GraphPacketSize;
         return bytes;
+    }
+
+    /// Binds a complete SSA program to preloaded kernels and compiled output formatters.
+    pub fn program(a: Allocator, values: []const []const u8, ops: []const Op, prints: []const Print) ![]u8 {
+        if (prints.len == 0) return error.GraphPrint;
+        for (values) |value| _ = try literal(value);
+        return encode(a, .{ .values = values, .ops = ops, .prints = prints });
     }
 
     pub fn named(a: Allocator, name: []const u8, values: []const []const u8) ![]u8 {
@@ -96,11 +120,8 @@ pub const Builder = struct {
 
     /// Selects an offline integer algorithm using operand widths without evaluating the result.
     pub fn integer(a: Allocator, family: Algorithm, operands: []const []const u8) ![]u8 {
-        const arity: usize = switch (family) {
-            .powmod => 3,
-            .gcd, .range_product, .divmod, .square_offset => 2,
-            .isqrt, .factorial, .digit_sum => 1,
-        };
+        if (family == .fixed_div) return error.GraphPrecision;
+        const arity = algorithmArity(family);
         if (operands.len != arity) return error.GraphSlotArity;
         var needed: usize = 1;
         for (operands) |operand| {
@@ -117,21 +138,66 @@ pub const Builder = struct {
         return named(a, name, operands);
     }
 
+    /// Precision is bounded schedule metadata; all quotient and rounding work stays in prepared FFNs.
+    pub fn fixedDivision(a: Allocator, lhs: []const u8, rhs: []const u8, places: u8) ![]u8 {
+        if (places > 18) return error.GraphPrecision;
+        _ = try literal(lhs);
+        _ = try literal(rhs);
+        const needed = @max(lhs.len - @intFromBool(lhs[0] == '-' or lhs[0] == '+') + places + 1, rhs.len - @intFromBool(rhs[0] == '-' or rhs[0] == '+'));
+        const width = for ([_]u8{ 1, 2, 4, 8, 16, 32, 62, 128 }) |n| {
+            if (n >= @min(max_digits, needed)) break n;
+        } else unreachable;
+        const name = try std.fmt.allocPrint(a, "fixed_div-{d}-{d}", .{ places, width });
+        defer a.free(name);
+        return named(a, name, &.{ lhs, rhs });
+    }
+
     /// Binds a recognized bounded-loop shape to its offline control schedule.
     pub fn loop(a: Allocator, shape: Shape, bound: u16, values: []const []const u8) ![]u8 {
         return loopWidth(a, shape, bound, values, 62);
     }
 
     pub fn loopWidth(a: Allocator, shape: Shape, bound: u16, values: []const []const u8, width: u8) ![]u8 {
-        if (width != 62 and width != 128) return error.GraphLoop;
-        if (bound > 128 or values.len != (if (shape == .list_sum) @as(usize, bound) else 0))
+        if (shape == .sorted_distance) {
+            if (!widthValid(width) or bound > 16) return error.GraphLoop;
+        } else if (width != 62 and width != 128) return error.GraphLoop;
+        if (bound > 128 or values.len != (if (shape == .list_sum or shape == .sorted_distance) @as(usize, bound) else 0))
             return error.GraphLoop;
         for (values) |value| _ = try literal(value);
         const name = try std.fmt.allocPrint(a, "loop-{s}-{d}-{d}", .{ @tagName(shape), bound, width });
         defer a.free(name);
         return named(a, name, values);
     }
+
+    /// Selects a bounded compare-exchange schedule; pair count is control metadata, never operand arithmetic.
+    pub fn sortedDistance(a: Allocator, values: []const []const u8) ![]u8 {
+        if (values.len > 16) return error.GraphLoop;
+        var digits: usize = 1;
+        for (values) |value| {
+            _ = try literal(value);
+            digits = @max(digits, value.len - @intFromBool(value[0] == '-' or value[0] == '+'));
+        }
+        var text: [8]u8 = undefined;
+        const pairs = values.len * (values.len -| 1);
+        const overhead = (try std.fmt.bufPrint(&text, "{d}", .{pairs})).len;
+        const width = for ([_]u8{ 1, 2, 4, 8, 16, 32, 62, 128 }) |n| {
+            if (n >= @min(max_digits, digits + overhead)) break n;
+        } else unreachable;
+        return loopWidth(a, .sorted_distance, @intCast(values.len), values, width);
+    }
 };
+
+pub fn algorithmArity(family: Algorithm) u8 {
+    return switch (family) {
+        .powmod => 3,
+        .gcd, .range_product, .divmod, .square_offset, .fraction, .fixed_div, .divexact => 2,
+        .isqrt, .factorial, .digit_sum => 1,
+    };
+}
+
+pub fn algorithmOutputs(family: Algorithm) u8 {
+    return if (family == .divmod or family == .fraction) 2 else 1;
+}
 
 pub fn widthValid(n: u8) bool {
     return switch (n) {
@@ -226,4 +292,28 @@ test "integer algorithms bind arity and maximum operand width" {
     try t.expectError(error.GraphSlotArity, Builder.integer(t.allocator, .powmod, &.{ "2", "3" }));
     try t.expectError(error.GraphLiteral, Builder.integer(t.allocator, .isqrt, &.{"x"}));
     try t.expectError(error.GraphLiteral, Builder.integer(t.allocator, .factorial, &.{&too_wide}));
+}
+
+test "whole-cell bindings retain operands and bound formatting and schedule controls" {
+    const t = std.testing;
+    const whole = try Builder.program(t.allocator, &.{ "-7", "3" }, &.{.{ .op = "divmod", .width = 1, .a = 0, .b = 1, .outputs = 2, .checked = true }}, &.{.{ .ref = 2, .second = 3, .style = .tuple }});
+    defer t.allocator.free(whole);
+    var parsed = try std.json.parseFromSlice(Packet, t.allocator, whole, .{});
+    defer parsed.deinit();
+    try t.expectEqualStrings("-7", parsed.value.values[0]);
+    try t.expectEqualStrings("3", parsed.value.values[1]);
+    try t.expect(parsed.value.ops[0].checked);
+    try t.expectEqual(Style.tuple, parsed.value.prints[0].style);
+    try t.expectEqual(@as(?u32, 3), parsed.value.prints[0].second);
+    const fixed = try Builder.fixedDivision(t.allocator, "1", "8", 3);
+    defer t.allocator.free(fixed);
+    try t.expect(std.mem.indexOf(u8, fixed, "fixed_div-3-") != null);
+    try t.expectError(error.GraphPrecision, Builder.fixedDivision(t.allocator, "1", "8", 19));
+    const sorted = try Builder.sortedDistance(t.allocator, &.{ "-2", "1", "5" });
+    defer t.allocator.free(sorted);
+    try t.expect(std.mem.indexOf(u8, sorted, "loop-sorted_distance-3-") != null);
+    const too_many: [17][]const u8 = @splat("0");
+    try t.expectError(error.GraphLoop, Builder.sortedDistance(t.allocator, &too_many));
+    const too_many_prints: [max_prints + 1]Print = @splat(.{ .ref = 0 });
+    try t.expectError(error.GraphPacketSize, Builder.program(t.allocator, &.{"1"}, &.{}, &too_many_prints));
 }

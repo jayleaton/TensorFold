@@ -5,30 +5,66 @@ const packet = @import("runner_graph_packet.zig");
 const End = @FieldType(api.RunEnd, "end");
 const Cancel = ?*const std.atomic.Value(bool);
 
-/// Emits one result line; divmod emits the Python tuple (quotient, remainder) through prepared emitters.
-pub fn run(m: anytype, kind: []const u8, width: u8, budget: u64, out: *std.ArrayList(u8), cancel: Cancel) !api.RunEnd {
-    if (!packet.widthValid(width) or m.values.len < 32) return error.GraphAlgorithmScratch;
-    const arity: usize = if (std.mem.eql(u8, kind, "powmod")) 3 else if (std.mem.eql(u8, kind, "gcd") or std.mem.eql(u8, kind, "range_product") or
-        std.mem.eql(u8, kind, "divmod") or std.mem.eql(u8, kind, "square_offset")) 2 else if (std.mem.eql(u8, kind, "isqrt") or std.mem.eql(u8, kind, "factorial") or
-        std.mem.eql(u8, kind, "digit_sum")) 1 else return error.GraphAlgorithm;
-    var inputs: [3]packet.Value = undefined;
-    @memcpy(inputs[0..arity], m.values[0..arity]);
+/// Executes an algorithm in request-local scratch and copies only its typed outputs back to the caller.
+pub fn compute(m: anytype, kind: []const u8, width: u8, precision: u8, refs: []const u32, dest: usize, budget: u64, out: *std.ArrayList(u8), cancel: Cancel) !End {
+    const family = std.meta.stringToEnum(packet.Algorithm, kind) orelse return error.GraphAlgorithm;
+    const outputs = packet.algorithmOutputs(family);
+    if (!packet.widthValid(width) or refs.len != packet.algorithmArity(family) or dest + outputs > m.values.len)
+        return error.GraphAlgorithmScratch;
+    if (precision > 18 or (family != .fixed_div and precision != 0)) return error.GraphPrecision;
+    const original = m.values;
     const zero = try packet.literal("0");
-    for (m.values[0..32]) |*value| value.* = zero;
-    m.values[1] = try packet.literal("1");
-    @memcpy(m.values[2 .. 2 + arity], inputs[0..arity]);
-    const input_digits = @max(1, std.mem.trimStart(u8, m.parsed.value.values[0], "+-0").len);
-    var c: Context(@TypeOf(m)) = .{ .m = m, .width = width, .budget = budget, .out = out, .cancel = cancel, .input_digits = input_digits };
-    c.execute(kind) catch |err| switch (err) {
-        error.GraphAlgorithmStopped => return .{ .end = c.end, .steps = m.steps },
-        error.GraphAlgorithmLimit => return .{ .end = .budget, .steps = m.steps },
-        error.GraphAlgorithmArithmetic => {
-            m.values[0][0][127] = packet.bit_scale;
-            c.emit(0) catch |emit_err| switch (emit_err) {
-                error.GraphAlgorithmStopped => return .{ .end = c.end, .steps = m.steps },
-                else => return emit_err,
-            };
+    var scratch: [32]packet.Value = @splat(zero);
+    scratch[1] = try packet.literal("1");
+    for (refs, 0..) |ref, i| {
+        if (ref >= original.len) return error.GraphReference;
+        for (width..packet.max_digits) |digit| {
+            const bits = original[ref][digit / 31][2 + digit % 31 * 4 ..][0..4];
+            for (bits) |bit| if (bit != 0) return error.GraphNarrowBinding;
+        }
+        scratch[2 + i] = original[ref];
+    }
+    m.values = &scratch;
+    defer m.values = original;
+    var c: Context(@TypeOf(m)) = .{ .m = m, .width = width, .precision = precision, .budget = budget, .out = out, .cancel = cancel, .input_digits = occupiedDigits(&scratch[2]) };
+    const result = c.calculate(kind) catch |err| switch (err) {
+        error.GraphAlgorithmStopped => return c.end,
+        error.GraphAlgorithmLimit => return .budget,
+        error.GraphAlgorithmArithmetic => blk: {
+            scratch[0][0][127] = packet.bit_scale;
+            break :blk [2]u32{ 0, 0 };
         },
+        else => return err,
+    };
+    const values = [2]packet.Value{ scratch[result[0]], scratch[result[1]] };
+    @memcpy(original[dest .. dest + outputs], values[0..outputs]);
+    return .halted;
+}
+
+/// Named legacy algorithms retain their token schedules; new fractional formats use the compiled formatter.
+pub fn run(m: anytype, kind: []const u8, width: u8, budget: u64, out: *std.ArrayList(u8), cancel: Cancel) !api.RunEnd {
+    const family = std.meta.stringToEnum(packet.Algorithm, kind) orelse return error.GraphAlgorithm;
+    const refs = [_]u32{ 0, 1, 2 };
+    var end = try compute(m, kind, width, m.precision, refs[0..packet.algorithmArity(family)], 0, budget, out, cancel);
+    if (end != .halted) return .{ .end = end, .steps = m.steps };
+    if (family == .fraction or family == .fixed_div) {
+        end = try @import("runner_graph_print.zig").emit(m, .{ .ref = 0, .second = if (family == .fraction) 1 else null, .style = if (family == .fraction) .fraction else .fixed, .precision = m.precision }, budget, out, cancel);
+        return .{ .end = end, .steps = m.steps };
+    }
+    var c: Context(@TypeOf(m)) = .{ .m = m, .width = width, .budget = budget, .out = out, .cancel = cancel, .input_digits = 1 };
+    const failed = m.values[0][0][127];
+    if (failed != 0 and failed != packet.bit_scale) return error.GraphPredicate;
+    if (family == .divmod and failed == 0) {
+        c.emitNamed("emit_first", 0) catch |err| switch (err) {
+            error.GraphAlgorithmStopped => return .{ .end = c.end, .steps = m.steps },
+            else => return err,
+        };
+        c.emitNamed("emit_last", 1) catch |err| switch (err) {
+            error.GraphAlgorithmStopped => return .{ .end = c.end, .steps = m.steps },
+            else => return err,
+        };
+    } else c.emit(0) catch |err| switch (err) {
+        error.GraphAlgorithmStopped => return .{ .end = c.end, .steps = m.steps },
         else => return err,
     };
     return .{ .end = .halted, .steps = m.steps };
@@ -42,6 +78,7 @@ fn Context(comptime M: type) type {
         out: *std.ArrayList(u8),
         cancel: Cancel,
         input_digits: usize,
+        precision: u8 = 0,
         end: End = .halted,
 
         const Self = @This();
@@ -52,7 +89,7 @@ fn Context(comptime M: type) type {
             for (refs) |ref| needed = @max(needed, occupiedDigits(&c.m.values[ref]));
             if (std.mem.eql(u8, name, "mul")) {
                 needed = occupiedDigits(&c.m.values[refs[0]]) + occupiedDigits(&c.m.values[refs[1]]);
-            } else if (std.mem.eql(u8, name, "add") or std.mem.eql(u8, name, "sub")) {
+            } else if (std.mem.eql(u8, name, "add") or std.mem.eql(u8, name, "sub") or std.mem.eql(u8, name, "scale10")) {
                 needed += 1;
             } else if (std.mem.eql(u8, name, "meta")) needed = @max(needed, 8);
             const selected = bucket(@min(needed, width));
@@ -119,16 +156,53 @@ fn Context(comptime M: type) type {
             c.move(r, 27);
         }
 
-        fn execute(c: *Self, kind: []const u8) !void {
-            if (std.mem.eql(u8, kind, "divmod")) {
+        fn calculate(c: *Self, kind: []const u8) ![2]u32 {
+            if (std.mem.eql(u8, kind, "divmod") or std.mem.eql(u8, kind, "divexact")) {
                 try c.meta(2, 3);
-                try c.unsigned(20, 21, 5, 6);
-                try c.call("divfinal", &.{ 5, 6, 2, 3 }, 10);
-                try c.emitNamed("emit_first", 10);
-                return c.emitNamed("emit_last", 11);
+                c.move(5, 20);
+                c.move(6, 21);
+                try c.unsigned(5, 6, 7, 8);
+                if (std.mem.eql(u8, kind, "divexact")) {
+                    if (try c.nonzero(8)) return error.GraphAlgorithmArithmetic;
+                    try c.call("round_div", &.{ 7, 8, 2, 3 }, 10);
+                    return .{ 10, 0 };
+                }
+                try c.call("divfinal", &.{ 7, 8, 2, 3 }, 10);
+                return .{ 10, 11 };
             }
+            if (std.mem.eql(u8, kind, "fraction")) return c.fraction();
+            if (std.mem.eql(u8, kind, "fixed_div")) return .{ try c.fixedDivision(), 0 };
             const result: u32 = if (std.mem.eql(u8, kind, "gcd")) try c.gcd() else if (std.mem.eql(u8, kind, "isqrt")) try c.isqrt() else if (std.mem.eql(u8, kind, "digit_sum")) try c.digitSum() else if (std.mem.eql(u8, kind, "powmod")) try c.powmod() else if (std.mem.eql(u8, kind, "square_offset")) try c.squareOffset() else try c.product(std.mem.eql(u8, kind, "factorial"));
-            try c.emit(result);
+            return .{ result, 0 };
+        }
+
+        fn fraction(c: *Self) ![2]u32 {
+            const divisor = try c.gcd();
+            c.move(15, divisor);
+            try c.meta(2, 3);
+            if (!try c.flag(1)) return error.GraphAlgorithmArithmetic;
+            c.move(5, 20);
+            c.move(6, 21);
+            try c.unsigned(5, 15, 7, 8);
+            try c.unsigned(6, 15, 9, 10);
+            try c.call("divfinal", &.{ 7, 0, 2, 3 }, 10);
+            return .{ 10, 9 };
+        }
+
+        fn fixedDivision(c: *Self) !u32 {
+            try c.meta(2, 3);
+            if (!try c.flag(1)) return error.GraphAlgorithmArithmetic;
+            c.move(5, 20);
+            c.move(6, 21);
+            try c.unsigned(5, 6, 7, 8);
+            for (0..c.precision) |_| {
+                try c.call("scale10", &.{7}, 7);
+                try c.call("divstep", &.{ 8, 6, 0 }, 10);
+                c.move(8, 10);
+                try c.call("add", &.{ 7, 11 }, 7);
+            }
+            try c.call("round_div", &.{ 7, 8, 2, 3 }, 10);
+            return 10;
         }
 
         fn gcd(c: *Self) !u32 {
