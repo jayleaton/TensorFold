@@ -422,4 +422,5 @@ test "runner proof: S1's and S2's six saved cells take the graph route and print
 comptime {
     _ = @import("runner_frontend_inline_regression_test.zig");
     _ = @import("runner_inline_mod_test.zig");
+    _ = @import("runner_inline_arith_test.zig");
 }
