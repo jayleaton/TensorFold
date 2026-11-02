@@ -262,7 +262,7 @@ pub const Stream = struct {
             .think_budget = spec.think_budget,
             .think_close = spec.think_close,
             .think_end = spec.think_end,
-            .think_open = spec.think_open orelse (spec.think_budget > 0 or (spec.loop_guard and spec.think_end >= 0)),
+            .think_open = spec.think_open orelse (spec.think_budget > 0 or ((spec.loop_guard or spec.runner != null) and spec.think_end >= 0)),
             .answer_max = spec.answer_max,
             .loop_guard = spec.loop_guard,
             .loop_stop = spec.loop_stop,

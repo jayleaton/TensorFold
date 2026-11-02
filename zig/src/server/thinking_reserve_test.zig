@@ -59,6 +59,9 @@ const Engine = struct {
     max_tokens: u32 = 0,
     answer_max: u32 = 0,
     think_end: ?u32 = null,
+    runner_: ?*api.runner.Runner = null,
+    think_budget: u32 = 0,
+    loop_guard: bool = false,
 
     fn engine(e: *@This()) api.Engine {
         return .{ .ctx = e, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory } };
@@ -66,7 +69,7 @@ const Engine = struct {
 
     fn info(ctx: *anyopaque) api.Info {
         const e: *@This() = @ptrCast(@alignCast(ctx));
-        return .{ .context_window = e.window, .answer_limit = e.answer_limit };
+        return .{ .context_window = e.window, .answer_limit = e.answer_limit, .runner = e.runner_ };
     }
 
     fn submit(ctx: *anyopaque, id: api.Id, r: *const api.Request, sink: api.Sink) api.SubmitError!void {
@@ -74,6 +77,8 @@ const Engine = struct {
         e.max_tokens = r.max_tokens;
         e.answer_max = r.answer_max;
         e.think_end = r.think_end;
+        e.think_budget = r.think_budget;
+        e.loop_guard = r.loop_guard;
         sink.event(sink.ctx, id, &.{ .prefilled = 0 });
         sink.event(sink.ctx, id, &.{ .tokens = &.{ 'a', think_end, 'h', 'i' } });
         sink.event(sink.ctx, id, &.{ .finished = .{ .reason = .stop } });
@@ -143,6 +148,16 @@ test "the thinking reserve stops at the context window" {
 }
 
 test "without thinking, an answer limit, or a reserve, max_tokens limits the whole reply" {
+    var runner_: api.runner.Runner = .{ .gpa = std.testing.allocator, .cfg = .{}, .frontend = undefined, .backend = undefined };
+    for ([_]bool{ false, true }) |thinking| {
+        var e: Engine = .{ .answer_limit = false, .runner_ = &runner_ };
+        try send(&e, 0, thinking);
+        try std.testing.expectEqual(if (thinking) @as(?u32, think_end) else null, e.think_end);
+        try std.testing.expectEqual(@as(u32, 0), e.think_budget);
+        try std.testing.expect(!e.loop_guard);
+        try std.testing.expectEqual(@as(u32, 5), e.max_tokens);
+        try std.testing.expectEqual(@as(u32, 0), e.answer_max);
+    }
     for ([_]struct { bool, i64, bool }{ .{ true, 100, false }, .{ false, 100, true }, .{ true, 0, true } }) |case| {
         var e: Engine = .{ .answer_limit = case[0] };
         try send(&e, case[1], case[2]);

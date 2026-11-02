@@ -482,3 +482,7 @@ test "runner: terminal refusal off and exhausted budget preserve the original re
         try std.testing.expectEqualStrings(lead, got[0]);
     }
 }
+
+test {
+    _ = @import("runner_handoff_native_test.zig");
+}
