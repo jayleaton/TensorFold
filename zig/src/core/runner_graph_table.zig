@@ -30,10 +30,20 @@ pub fn lower(a: Allocator, bank: *const graph.Bank, t: *const integer.Table) All
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var e: Emit = .{ .arena = arena, .bank = bank, .t = t };
-    for (t.roots[0..t.outputs], t.endings[0..t.outputs], t.styles[0..t.outputs], t.scales[0..t.outputs]) |root, end, style, scale| {
-        const sep: u8 = if (end == ' ') 'S' else if (end == '\n') 'N' else return null;
-        if (root >= t.count) return null;
+    for (t.roots[0..t.outputs], t.endings[0..t.outputs], t.styles[0..t.outputs], t.scales[0..t.outputs], t.brackets[0..t.outputs]) |root, end, style, scale, bracket| {
+        const closes = bracket & 2 != 0;
+        // a printed list: `[` J, each value J with `, ` J between, `]` with the print's own separator
+        const outer: u8 = if (end == ' ') 'S' else if (end == '\n') 'N' else if (end == ',' and !closes) 'J' else return null;
+        const sep: u8 = if (bracket != 0 or end == ',') 'J' else outer;
+        if (root >= t.count or bracket > 3) return null;
         const n = t.nodes[root];
+        if (bracket != 0 or end == ',') {
+            if (n.op == .divmod or style != 0) return null;
+            if (bracket & 1 != 0) try e.text('J', "[");
+            if (!try e.value(if (boolean(n.op)) 'B' else 'I', 'J', try e.render(root))) return null;
+            if (closes) try e.text(outer, "]") else try e.text('J', ", ");
+            continue;
+        }
         if (style != 0 and (n.op == .divmod or boolean(n.op))) return null;
         if (style > 2 or scale > 6) return null;
         if (n.op == .divmod) {
