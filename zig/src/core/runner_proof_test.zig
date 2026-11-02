@@ -24,6 +24,7 @@ fn prove(leads: []const []const u8, wants: []const []const u8) !void {
     for (models, leads) |*m, l| m.* = .{ .lead = l };
     // TF_RUNNER_LLD: an absolute ld.lld for hosts without lld beside clang (the image installs lld-18 there)
     var ctx: frontend.Context = .{ .io = std.testing.io };
+    if (std.c.getenv("TF_RUNNER_CLANG")) |clang| ctx.compiler.clang = std.mem.span(clang);
     if (std.c.getenv("TF_RUNNER_LLD")) |l| ctx.compiler.linker = std.mem.span(l);
     const texts = try rt.replies(models, .{ .frontend = ctx.frontend(), .backend = b, .wait_s = 600 }, &fake);
     defer rt.freeAll(texts);
@@ -289,4 +290,8 @@ test "runner proof: big-number-020 past the frontend's 62 digits, inline and REP
         try std.testing.expectEqualStrings("24691357800000000000000000000000000000000000000000000000000000000000000015241578750190521\n", r.out);
     }
     both.graph.release(1);
+}
+
+comptime {
+    _ = @import("runner_frontend_inline_regression_test.zig");
 }
