@@ -201,8 +201,8 @@ pub const Tracer = struct {
     }
 };
 
-/// The owned line's default wording: `{}` stands for `<display> = <value>`.
-pub const default_format = "[exact: {}]";
+/// The owned line's default wording (`{}` is `<display> = <value>`); seeded S2 round 3: 42% fewer tokens than off.
+pub const default_format = "[exact, computed by the engine: {}]";
 
 /// The most a request may ask a restated line to be owned again (runner_trace_repeat).
 pub const max_repeat = 3;

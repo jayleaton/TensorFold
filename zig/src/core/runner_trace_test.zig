@@ -81,7 +81,7 @@ test "runner trace: the display line and the owned text" {
     try std.testing.expectEqualStrings("314159265358979323846264338327950288419716939937510 ÷ 271828182845904523536", f.display);
     const line = (try trace.owned(gpa, "", f.display, true, "(1155727349790921717910215407028, 23663814570294126502)\n")).?;
     defer gpa.free(line);
-    try std.testing.expectEqualStrings("[exact: 314159265358979323846264338327950288419716939937510 ÷ 271828182845904523536 = 1155727349790921717910215407028 remainder 23663814570294126502]\n", line);
+    try std.testing.expectEqualStrings("[exact, computed by the engine: 314159265358979323846264338327950288419716939937510 ÷ 271828182845904523536 = 1155727349790921717910215407028 remainder 23663814570294126502]\n", line);
     const g = (try t.line(bn008)).?;
     try std.testing.expectEqualStrings("7^123 mod 1000000007", g.display);
     var fresh = trace.Tracer.init(gpa); // bn019 above defined A and B; bn015's other A poisons it
@@ -321,11 +321,11 @@ const mul_lead = "Need multiply A=987654 B=137. Need exact product.\nLet's do lo
 test "runner trace: the reply owns one [exact: …] line after the cue, then the model goes on" {
     const got = try traced(mul_lead, "ok", true, 0, false);
     defer gpa.free(got);
-    try std.testing.expectEqualStrings(mul_lead ++ "[exact: 987654 * 137 = 135308598]\nDone.", got);
+    try std.testing.expectEqualStrings(mul_lead ++ "[exact, computed by the engine: 987654 * 137 = 135308598]\nDone.", got);
     const pow = "We need answer compute 7^123 mod 1000000007. Let's compute carefully.\nWe can do it by hand.\n";
     const same = try traced(pow, "ok", true, 0, false);
     defer gpa.free(same);
-    try std.testing.expectEqualStrings(pow ++ "[exact: 7^123 mod 1000000007 = 937329259]\nDone.", same);
+    try std.testing.expectEqualStrings(pow ++ "[exact, computed by the engine: 7^123 mod 1000000007 = 937329259]\nDone.", same);
 }
 
 test "runner trace: late runs give the same reply; faults, the form off and no cue keep the model's text" {
@@ -346,7 +346,7 @@ test "runner trace: late runs give the same reply; faults, the form off and no c
     try std.testing.expectEqualStrings(quiet ++ "ok\nDone.", nocue);
     const digits = try traced(quiet, "135308598", true, 0, false); // the model's own digit line is a hand-work cue
     defer gpa.free(digits);
-    try std.testing.expectEqualStrings(quiet ++ "135308598\n[exact: 987654 * 137 = 135308598]\n", digits);
+    try std.testing.expectEqualStrings(quiet ++ "135308598\n[exact, computed by the engine: 987654 * 137 = 135308598]\n", digits);
 }
 
 test "runner trace: a request's repeat reaches the reply's tracer" {
@@ -365,6 +365,9 @@ test "runner trace: a request's wording frames the owned line; runner_trace fals
     const noted = try tracedAsk(mul_lead, "ok", true, 0, false, .{ .format = "[exact: {}] (computed exactly by the engine)" });
     defer gpa.free(noted);
     try std.testing.expectEqualStrings(mul_lead ++ "[exact: 987654 * 137 = 135308598] (computed exactly by the engine)\nDone.", noted);
+    const old = try tracedAsk(mul_lead, "ok", true, 0, false, .{ .format = "[exact: {}]" }); // the pre-round-3 default
+    defer gpa.free(old);
+    try std.testing.expectEqualStrings(mul_lead ++ "[exact: 987654 * 137 = 135308598]\nDone.", old);
     const default = try tracedAsk(mul_lead, "ok", true, 0, false, .{ .format = trace.default_format });
     defer gpa.free(default);
     const plain = try traced(mul_lead, "ok", true, 0, false);
