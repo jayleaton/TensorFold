@@ -171,7 +171,7 @@ test "runner trace: census pow and hex statements run exactly on the real fronte
     defer bank.deinit();
     const g = try graph.backend(gpa, &bank, 2);
     defer graph.destroy(g);
-    var dispatch: route.Dispatch = .{ .gpa = gpa, .circuit = g, .graph = g };
+    var dispatch: route.Dispatch = .{ .gpa = gpa, .circuit = g, .graph = g, .bank = &bank };
     defer dispatch.deinit();
     var routed: route.Routed = .{ .inner = @import("runner_frontend.zig").frontend(), .bank = &bank };
     const front = routed.frontend();
