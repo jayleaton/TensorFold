@@ -32,8 +32,8 @@ fn checked(a: Allocator, code: []const u8, budget: usize) Failure!integer.Lowere
     const endings = script.endings[0..script.count];
     var t = integer.table(parser, roots, endings, null, null);
     @memcpy(t.brackets[0..script.count], script.brackets[0..script.count]);
-    // lists, defs, asserts or over eight outputs: only the graph route's table (calc and ELF keep their routes)
-    if (parser.listed or parser.function_count != 0 or parser.asserted or script.count > 8) {
+    // lists, defs, asserts, loops, over 64 nodes or 8 outputs: only the graph route's table (calc, ELF keep theirs)
+    if (parser.listed or parser.function_count != 0 or parser.asserted or parser.looped or parser.count > 64 or script.count > 8) {
         if (budget != 0) return error.Unsupported;
         return .{ .source = try a.alloc(u8, 0), .estimated_steps = null, .table = t, .graph_only = true };
     }
@@ -44,7 +44,8 @@ fn checked(a: Allocator, code: []const u8, budget: usize) Failure!integer.Lowere
 // Shares whole-script validation with the RV32 path, including unused assignments and import gates.
 pub fn lowerCalc(a: Allocator, code: []const u8) Allocator.Error!?[]u8 {
     var script = parseScript(code) catch return null;
-    if (script.parser.listed or script.parser.function_count != 0 or script.parser.asserted) return null;
+    const p = &script.parser;
+    if (p.listed or p.function_count != 0 or p.asserted or p.looped or p.count > 64) return null;
     return @import("runner_frontend_integer_calc.zig").lower(a, &script.parser, script.root);
 }
 
@@ -63,11 +64,12 @@ const Outputs = struct {
     count: usize = 0,
 };
 const statements = @import("runner_frontend_integer_statements.zig");
+const suite = @import("runner_frontend_integer_suite.zig");
 
 fn parseOutputs(code: []const u8, multiple: bool) ast.Invalid!Outputs {
     if (code.len == 0 or code.len > 4096 or std.mem.indexOfScalar(u8, code, '\r') != null)
         return error.Unsupported;
-    var parser: ast.Parser = .{ .source = "", .require_math_import = true, .allow_lists = true };
+    var parser: ast.Parser = .{ .source = "", .require_math_import = true, .allow_lists = true, .capacity = ast.max_nodes };
     var lines = statements.Iterator{ .code = code };
     var outputs = Outputs{ .parser = undefined };
     var expression_only = false;
@@ -105,6 +107,14 @@ fn parseOutputs(code: []const u8, multiple: bool) ast.Invalid!Outputs {
             (line[5] == '(' or line[5] == ' ' or line[5] == '\t');
         if (keyword(line, "def")) {
             try define(&parser, &lines, line);
+        } else if (keyword(line, "for") or keyword(line, "while")) {
+            if (!multiple) return error.Unsupported;
+            const Print = struct {
+                fn print(ctx: *anyopaque, p: *ast.Parser, text: []const u8) ast.Invalid!void {
+                    return printRoots(p, @ptrCast(@alignCast(ctx)), text, true);
+                }
+            };
+            try suite.module(&parser, try block(&lines, line), .{ .ctx = &outputs, .print = Print.print });
         } else if (keyword(line, "assert")) {
             try check(&parser, line["assert".len..]);
         } else if (printed) {
@@ -123,6 +133,27 @@ fn parseOutputs(code: []const u8, multiple: bool) ast.Invalid!Outputs {
     if (outputs.count == 0) return error.Unsupported;
     outputs.parser = parser;
     return outputs;
+}
+
+/// A compound statement from its header line through its indented suite, as one slice of the script.
+fn block(lines: *statements.Iterator, header: []const u8) ast.Invalid![]const u8 {
+    const start = @intFromPtr(header.ptr) - @intFromPtr(lines.code.ptr);
+    var end = start + header.len;
+    var indented = false;
+    while (true) {
+        var ahead = lines.*;
+        const raw = try ahead.next() orelse break;
+        const text = std.mem.trimEnd(u8, raw.text, " \t");
+        const stmt = std.mem.trim(u8, text, " \t");
+        // a semicolon's next statement shares its line: inside the suite after an indented one, else the header's body
+        if (stmt.len != 0 and !raw.after_semicolon and text[0] != ' ' and text[0] != '\t') break;
+        if (raw.after_semicolon and !indented and stmt.len != 0 and header[header.len - 1] == ':') break;
+        lines.* = ahead;
+        if (stmt.len == 0) continue;
+        if (!raw.after_semicolon) indented = true;
+        end = @intFromPtr(raw.text.ptr) - @intFromPtr(lines.code.ptr) + text.len;
+    }
+    return lines.code[start..end];
 }
 
 fn expression(parser: *ast.Parser, text: []const u8) ast.Invalid!usize {
@@ -163,12 +194,12 @@ fn keyword(line: []const u8, word: []const u8) bool {
         (line[word.len] == ' ' or line[word.len] == '\t' or line[word.len] == '(');
 }
 
-/// `def name(a, b):` (`int` annotations) whose body is one `return <int expr>`, a docstring first; else refuse.
+/// `def name(a, b):` (`int` annotations): one `return <int expr>` (a docstring first), or a suite of int statements.
 fn define(parser: *ast.Parser, lines: *statements.Iterator, header: []const u8) ast.Invalid!void {
     const open = std.mem.indexOfScalar(u8, header, '(') orelse return error.Unsupported;
     const close = std.mem.indexOfScalarPos(u8, header, open, ')') orelse return error.Unsupported;
     var f: ast.Parser.Function = .{ .name = std.mem.trim(u8, header["def".len..open], " \t"), .body = "" };
-    if (!validBinding(f.name)) return error.Unsupported;
+    if (!validBinding(f.name) and !unimported(parser, f.name)) return error.Unsupported;
     const params = std.mem.trim(u8, header[open + 1 .. close], " \t");
     if (params.len != 0) {
         var names = std.mem.splitScalar(u8, params, ',');
@@ -191,9 +222,15 @@ fn define(parser: *ast.Parser, lines: *statements.Iterator, header: []const u8) 
     }
     if (rest.len == 0 or rest[0] != ':') return error.Unsupported;
     rest = std.mem.trim(u8, rest[1..], " \t");
-    var body: ?[]const u8 = if (rest.len != 0) try returned(rest) else null;
-    var docstring = body == null;
-    // the indented suite: blank and comment-only lines pass; the first unindented statement is the module's again
+    if (rest.len == 0) {
+        // an indented suite: one `return <expr>` (a docstring first) stays an expression body, else statements run
+        const code = try block(lines, header);
+        const text = code[header.len..];
+        if (single(text)) |value| f.body = value else f.suite = text;
+        return parser.define(f);
+    }
+    f.body = try returned(rest);
+    // nothing else may follow on the def's own line or under it
     while (true) {
         var ahead = lines.*;
         const raw = try ahead.next() orelse break;
@@ -202,16 +239,30 @@ fn define(parser: *ast.Parser, lines: *statements.Iterator, header: []const u8) 
         const stmt = std.mem.trim(u8, text, " \t");
         if (stmt.len != 0 and text[0] != ' ' and text[0] != '\t') break;
         lines.* = ahead;
+        if (stmt.len != 0) return error.Unsupported;
+    }
+    try parser.define(f);
+}
+
+/// A suite that is one `return <expr>` without a conditional expression (a docstring may come first), else null.
+fn single(text: []const u8) ?[]const u8 {
+    var it = statements.Iterator{ .code = text };
+    var value: ?[]const u8 = null;
+    var docstring = true;
+    while (it.next() catch return null) |raw| {
+        const stmt = std.mem.trim(u8, raw.text, " \t");
         if (stmt.len == 0) continue;
-        if (body != null) return error.Unsupported;
+        if (value != null) return null;
         if (docstring and stmt.len >= 2 and (stmt[0] == '"' or stmt[0] == '\'') and stmt[stmt.len - 1] == stmt[0]) {
             docstring = false;
             continue;
         }
-        body = try returned(stmt);
+        docstring = false;
+        const v = returned(stmt) catch return null;
+        if (list.top(v, "if", 0) != null) return null;
+        value = v;
     }
-    f.body = body orelse return error.Unsupported;
-    try parser.define(f);
+    return value;
 }
 
 /// The expression of `return <expr>`: one value (a tuple, or a bare `return`, is not an int).
@@ -270,7 +321,15 @@ pub fn compile(a: Allocator, io: std.Io, code: []const u8, config: compiler.Conf
     return compiler.compile(a, io, result.source, trusted);
 }
 
-fn validBinding(name: []const u8) bool {
+/// math's gcd/isqrt/factorial/prod as a def's own name, where the script never imports it bare.
+fn unimported(parser: *const ast.Parser, name: []const u8) bool {
+    for ([_][]const u8{ "gcd", "isqrt", "factorial", "prod" }, 0..) |w, i| {
+        if (std.mem.eql(u8, name, w)) return parser.math_imports & (@as(u8, 1) << @intCast(i)) == 0;
+    }
+    return false;
+}
+
+pub fn validBinding(name: []const u8) bool {
     if (name.len == 0 or !(std.ascii.isAlphabetic(name[0]) or name[0] == '_')) return false;
     for (name) |c| if (!(std.ascii.isAlphanumeric(c) or c == '_')) return false;
     for ([_][]const u8{

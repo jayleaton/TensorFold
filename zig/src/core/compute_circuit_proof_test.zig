@@ -18,10 +18,8 @@ const calc_owned = [_][]const u8{ "add30-06", "add30-11", "add30-22", "add30-23"
 const bank_owned = [_][]const u8{"bignum-10"};
 /// Floor division with divmod and Fraction, Decimal: the graph bank's, or an ELF's when compiling.
 const graph_owned = [_][]const u8{ "div_big-04", "div_big-08", "div_big-20", "div_big-23", "div_big-32", "div_big-36", "mul_big-08", "mul_big-17", "mul_big-18" };
-/// One-expression integer defs with asserts (mbpp-66 over a static int list): the bank's, an ELF's otherwise.
-const def_owned = [_][]const u8{ "mbpp-80", "mbpp-86", "mbpp-66" };
-/// MBPP functions only an ELF runs.
-const elf_owned = [_][]const u8{"mbpp-56"};
+/// Integer defs with asserts (mbpp-66 over a static int list, mbpp-56 reversing digits): the bank's, else an ELF's.
+const def_owned = [_][]const u8{ "mbpp-80", "mbpp-86", "mbpp-66", "mbpp-56" };
 
 test "compute runner proof: served S3 (no ELF): owned calls print the sandbox's bytes, never as an ELF" {
     try proof(false);
@@ -93,7 +91,7 @@ fn proof(elf: bool) !void {
             .declined => |why| std.debug.print("{s}#{d}: code tool ({t})\n", .{ r.task, r.call, why }),
         }
         const must = listed(&calc_owned, r.task) or (listed(&bank_owned, r.task) and (with_bank != null or elf)) or
-            (listed(&graph_owned, r.task) and (with_bank != null or elf)) or (listed(&elf_owned, r.task) and elf) or
+            (listed(&graph_owned, r.task) and (with_bank != null or elf)) or
             (listed(&def_owned, r.task) and (with_bank != null or elf));
         if (must and got != .owned) {
             std.debug.print("  MUST OWN: {s} went to the code tool\n", .{r.task});

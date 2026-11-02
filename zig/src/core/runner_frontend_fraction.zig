@@ -205,7 +205,7 @@ const Script = struct {
     }
 
     fn append(self: *Script, node: ast.Node) Invalid!usize {
-        if (self.parser.count == self.parser.nodes.len) return error.Unsupported;
+        if (self.parser.count == self.parser.capacity) return error.Unsupported;
         const root = self.parser.count;
         self.parser.nodes[root] = node;
         self.parser.proved[root] = true;

@@ -8,7 +8,7 @@ pub const Lowered = struct { source: []u8, estimated_steps: ?usize, table: ?Tabl
 
 /// A lowered script's DAG and ordered outputs, the data the runtime evaluates; literal text is dropped (use value).
 pub const Table = struct {
-    nodes: [64]ast.Node = undefined,
+    nodes: [ast.max_nodes]ast.Node = undefined,
     count: usize = 0,
     roots: [32]usize = undefined,
     endings: [32]u8 = undefined, // ' ', '\n', or ',' between a printed list's elements

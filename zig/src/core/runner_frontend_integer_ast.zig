@@ -5,6 +5,10 @@ pub const Invalid = error{Unsupported};
 pub const limit: i512 = std.math.pow(i512, 10, 62);
 /// Elements all of a script's lists may hold together (each one a node, so the node budget binds first).
 pub const max_items = 64;
+/// Nodes a whole script may make (loops unroll into them); other lowerings keep `capacity`'s 64, the C runtime's.
+pub const max_nodes = 512;
+/// A name bound but not yet assigned: a function's local before its first assignment (UnboundLocalError).
+pub const unbound = std.math.maxInt(usize);
 pub const Op = enum(u8) { literal, neg, add, sub, mul, floor, mod, pow, powmod, digits, divmod, gcd, isqrt, factorial, range_product, digit_sum, eq, ne, lt, le, gt, ge };
 pub const Node = struct {
     op: Op,
@@ -18,11 +22,12 @@ pub const Node = struct {
 pub const Parser = struct {
     source: []const u8,
     pos: usize = 0,
-    nodes: [64]Node = undefined,
+    nodes: [max_nodes]Node = undefined,
     count: usize = 0,
-    proved: [64]bool = @splat(false),
-    names: [32][]const u8 = undefined,
-    roots: [32]usize = undefined,
+    capacity: usize = 64,
+    proved: [max_nodes]bool = @splat(false),
+    names: [64][]const u8 = undefined,
+    roots: [64]usize = undefined,
     binding_count: usize = 0,
     require_math_import: bool = false,
     math_module: bool = false,
@@ -38,14 +43,19 @@ pub const Parser = struct {
     item_count: usize = 0,
     lists: [16]list.List = undefined,
     list_count: usize = 0,
-    kinds: [32]bool = undefined,
+    kinds: [64]bool = undefined,
     module_count: usize = 0, // the module's names: bindings[0..module_count] outside any frame or comprehension
     allow_lists: bool = false, // the whole-script lowering's lists and min/max; every other parser keeps its grammar
     listed: bool = false, // a list or min/max parsed: the graph route's script only (calc and ELF keep their own)
     asserted: bool = false, // an `assert` proved: like a def or a list, the graph route's script only
+    looped: bool = false, // a loop, a suite body or a digit reversal: the graph route's script only
+    calls: u8 = 0, // nested calls being inlined: a suite's recursion stops at 24
+    no_recurse: bool = false, // a branch tried only if it needs no recursion (a schedule's last level)
+    recursions: u32 = 0, // recursive calls inlined so far: a branch that recursed is not a schedule's last level
+    cut: bool = false, // a recursion no_recurse refused: the untaken branch is past the schedule, not unsupported
 
     /// `def name(params): return <expr>`, inlined at each call; `body` borrows the script.
-    pub const Function = struct { name: []const u8, params: [4][]const u8 = undefined, arity: usize = 0, body: []const u8 };
+    pub const Function = struct { name: []const u8, params: [4][]const u8 = undefined, arity: usize = 0, body: []const u8, suite: []const u8 = "" };
     const Frame = struct { start: usize, globals: usize };
     /// An int node, or a list's index in `lists`.
     pub const Operand = struct { index: usize, list: bool };
@@ -111,11 +121,13 @@ pub const Parser = struct {
             self.check_only = false;
         }
         self.check_only = true;
-        self.source = f.body;
-        self.pos = 0;
-        _ = try self.expr(0);
-        self.space();
-        if (self.pos != self.source.len) return error.Unsupported;
+        if (f.suite.len != 0) try @import("runner_frontend_integer_suite.zig").check(self, f.suite) else {
+            self.source = f.body;
+            self.pos = 0;
+            _ = try self.expr(0);
+            self.space();
+            if (self.pos != self.source.len) return error.Unsupported;
+        }
         self.functions[self.function_count] = f;
         self.function_count += 1;
     }
@@ -126,7 +138,7 @@ pub const Parser = struct {
     }
 
     /// A name's binding: a body's params, then module names (never a caller's); newest first, so targets shadow.
-    fn slot(self: *const Parser, name: []const u8) ?usize {
+    pub fn slot(self: *const Parser, name: []const u8) ?usize {
         const visible: [2][2]usize = if (self.frame) |f| .{ .{ f.start, self.binding_count }, .{ 0, f.globals } } else .{ .{ 0, self.binding_count }, .{ 0, 0 } };
         for (visible) |range| {
             var i = range[1];
@@ -140,7 +152,7 @@ pub const Parser = struct {
 
     fn lookup(self: *const Parser, name: []const u8) ?usize {
         const s = self.slot(name) orelse return null;
-        return if (self.kinds[s]) null else self.roots[s];
+        return if (self.kinds[s] or self.roots[s] == unbound) null else self.roots[s];
     }
 
     pub fn lookupList(self: *const Parser, name: []const u8) ?usize {
@@ -152,7 +164,15 @@ pub const Parser = struct {
     fn call(self: *Parser, index: usize, depth: usize) Invalid!usize {
         const f = self.functions[index];
         const bit = @as(u8, 1) << @intCast(index);
-        if (self.active & bit != 0) return error.Unsupported;
+        // only a suite recurses, within its schedule (runner_frontend_integer_suite.zig)
+        if (self.active & bit != 0) {
+            if (f.suite.len == 0 or self.calls >= 24) return error.Unsupported;
+            if (self.no_recurse) {
+                self.cut = true;
+                return error.Unsupported;
+            }
+            self.recursions += 1;
+        }
         var args: [4]Operand = undefined;
         var n: usize = 0;
         try self.need("(");
@@ -164,9 +184,9 @@ pub const Parser = struct {
             try self.need(",");
         };
         if (n != f.arity or self.binding_count + n > self.names.len) return error.Unsupported;
-        const saved = .{ self.source, self.pos, self.binding_count, self.frame, self.active };
+        const saved = .{ self.source, self.pos, self.binding_count, self.frame, self.active, self.calls };
         defer {
-            self.source, self.pos, self.binding_count, self.frame, self.active = saved;
+            self.source, self.pos, self.binding_count, self.frame, self.active, self.calls = saved;
         }
         // read the outer frame before writing: a struct literal assigned in place may alias self.frame
         const globals = if (self.frame) |outer| outer.globals else self.module_count;
@@ -178,6 +198,8 @@ pub const Parser = struct {
             self.binding_count += 1;
         }
         self.active |= bit;
+        self.calls += 1;
+        if (f.suite.len != 0) return @import("runner_frontend_integer_suite.zig").call(self, f.suite);
         self.source = f.body;
         self.pos = 0;
         const root = try self.expr(depth + 1);
@@ -198,7 +220,7 @@ pub const Parser = struct {
 
     // Project both results from the original operands; proof values never become literal nodes.
     pub fn divisionPair(self: *Parser, root: usize) Invalid![2]usize {
-        if (root >= self.count or self.nodes[root].op != .divmod or self.count > self.nodes.len - 2)
+        if (root >= self.count or self.nodes[root].op != .divmod or self.count > self.capacity - 2)
             return error.Unsupported;
         _ = try self.prove(root, root);
         const n = self.nodes[root];
@@ -226,7 +248,7 @@ pub const Parser = struct {
     }
 
     pub fn add(self: *Parser, node: Node) Invalid!usize {
-        if (self.count == self.nodes.len) return error.Unsupported;
+        if (self.count == self.capacity) return error.Unsupported;
         self.nodes[self.count] = node;
         self.proved[self.count] = false; // a reset may reuse the slot
         self.count += 1;
@@ -340,7 +362,7 @@ pub const Parser = struct {
             if (self.textLength(depth)) |n| return n else |_| self.reset(m);
             return list.length(self, depth);
         }
-        if (self.word("int")) return self.convert();
+        if (self.word("int")) return if (self.take("(str(")) @import("runner_frontend_integer_digits.zig").reversed(self, depth) else self.convert();
         self.space();
         if (self.pos < self.source.len and
             (std.ascii.isAlphabetic(self.source[self.pos]) or self.source[self.pos] == '_'))
@@ -370,6 +392,7 @@ pub const Parser = struct {
     }
 
     fn algorithm(self: *Parser, depth: usize) Invalid!?usize {
+        const start = self.pos;
         const qualified = self.word("math");
         if (qualified) try self.need(".");
         const op: Op = if (self.word("gcd")) .gcd else if (self.word("isqrt")) .isqrt else if (self.word("factorial")) .factorial else if (self.word("prod")) .range_product else {
@@ -384,7 +407,11 @@ pub const Parser = struct {
                 .range_product => 8,
                 else => unreachable,
             };
-            if (if (qualified) !self.math_module else self.math_imports & mask == 0) return error.Unsupported;
+            if (!qualified and self.math_imports & mask == 0) {
+                self.pos = start; // not imported: a def of that name, or nothing (the call refuses)
+                return null;
+            }
+            if (qualified and !self.math_module) return error.Unsupported;
         }
         try self.need("(");
         if (op == .range_product) {
