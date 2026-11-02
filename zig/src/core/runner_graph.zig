@@ -12,6 +12,10 @@ pub const PrintStyle = @import("runner_graph_packet.zig").Style;
 pub const PrintEnding = @import("runner_graph_packet.zig").Ending;
 pub const Builder = @import("runner_graph_packet.zig").Builder;
 pub const id = "graph";
+pub const bindCell = @import("runner_graph_bind.zig").cell;
+pub const bindExpression = @import("runner_graph_bind.zig").expression;
+pub const bindScript = @import("runner_graph_bind.zig").script;
+pub const directFrontend = @import("runner_graph_frontend.zig").frontend;
 
 const Allocator = std.mem.Allocator;
 

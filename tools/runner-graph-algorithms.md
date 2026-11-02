@@ -172,3 +172,63 @@ whole-cell qualification. It parses a bounded numeric AST into operand bindings,
 checked operations and print descriptors without evaluating answers. Production
 source admission remains owned by the native frontend. Bank capability, offline
 source binding, frontend admission and live ownership are separate measurements.
+
+Bounded trial division adds `smallest_factor(n,bound)` and named-only
+`factorize(n,bound)` plans in every bucket. Both require n≥1 and an inclusive
+bound1..10000. Smallest-factor returns the least divisor, n if primality is
+proved, or0 if the bound prevents a conclusion; n1 returns1. Factorize emits
+`(remaining, count, f1, ..., fk)\n`; factors repeat in sorted order, and remaining1
+means complete. A residual proved prime can be retained above the trial bound.
+All arithmetic and branch predicates run through prepared FFNs.
+
+`reverse_decimal` matches `int(str(n)[::-1])` for nonnegative integers, using
+occupied decimal length rather than padded bucket width. Negative nonzero
+inputs set the checked error flag. `select(a,b,condition)` selects a for a
+nonzero condition and b otherwise. `assert_true` sets the checked error flag
+when its input is zero. These kernels do not recognize problem-specific names.
+
+`Print.style=byte` emits one numeric byte0..255, with ending`empty`, prefixfalse
+and precision0. Before any program output, `byte_check-128` validates every
+such descriptor through FFNs. `emit_byte-4` produces the BYTE and HALT tokens.
+Sequences can encode ASCII or valid UTF-8; source admission must enforce its
+chosen text domain, bounds, quoting, container and assertion semantics.
+
+`Bank.load` reads v2 prepared-pack headers and plans, deferring payload decoding
+until first use of each template. `Bank.loadEager` or `loadWithMode(...,.eager)`
+provides explicit preloading. First use verifies the pinned header and payload
+checksum, decoded identity and bindings under a per-template mutex. Loaded
+weights stay immutable and shared; each stream retains its own State. Failures
+are cached; `retryFailed(name,width)` permits retry against the same pinned
+artifact only. Destroy all machines/backends before bank deinit. The allocator
+must support concurrent allocations. Lazy loading performs no graph compilation.
+Old v1 packs remain eagerly validated; rebake them offline for lazy loading.
+
+Unrestricted binary64 arithmetic and Python float rendering remain unsupported.
+Exact Fraction/Decimal and integral-float bridges do not establish IEEE coverage.
+
+The bounded finite-normal binary64 family uses a canonical pair `(M,E)` for
+`M*2**E`: nonzero absolute M is in `[2**52,2**53)`, E is in `[-100,100]`,
+and signed zero uses M0/E0. `f64_ratio(N,D)` takes exact signed integers with
+at most62digits per operand; `f64_mul` and `f64_sub` take two canonical pairs.
+They return two Values and round nearest-even after each operation. Invalid
+pairs, division by zero, unsupported intermediate results or widths abstain.
+This domain excludes subnormals, infinities and NaNs.
+
+`f64_isclose` takes four pairs: a, b, relative tolerance and absolute tolerance.
+It validates external pairs and nonnegative tolerances, compares equality, then
+uses rounded subtraction and relative products with internal exponents up to±256. `f64_format(M,E)` returns coefficient/control
+Values for `Print.style=prepared`, with the control in `Print.second`. It finds
+the shortest round-trip fixed spelling, including signed zero and integral .0,
+and requires final adjusted decimal exponent in `[-4,15]`. The distinct
+`format_f64-62` prepared formatter allows precision up to20; legacy `format`
+retains its18-place domain. Prepared Print requires descriptor precision0,
+endingnewline and prefixfalse; its typed control supplies the actual layout.
+Named-only `f64_repr` emits that spelling directly. All binary64 plans use
+width128; native dispatch decodes no mantissas or exponents.
+
+Python source lowering must preserve evaluation order and conversion points:
+`(4/3)*pi*radius**3` rounds the ratio and first product, computes integer power,
+rounds that integer's float conversion, then rounds the final product. Pi binds
+its specified binary64 encoding. Source admission and lexical literal conversion
+remain frontend responsibilities; these bounded operators are not a claim of
+unrestricted Python floating-point support.

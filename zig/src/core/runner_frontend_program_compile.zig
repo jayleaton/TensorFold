@@ -3,6 +3,12 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const inputs = @import("runner_frontend_c_inputs.zig");
 const cost = @import("runner_frontend_c_cost.zig");
+const spawn = @import("runner_frontend_spawn.zig");
+const elf_cache = @import("runner_frontend_elf_cache.zig");
+const log = std.log.scoped(.runner_frontend);
+
+/// The build's own cap, a hang guard: under a translate deadline the build may use all that is left of it.
+pub const build_cap_ms = 1900;
 
 pub const Config = struct {
     clang: []const u8 = "/usr/bin/clang",
@@ -133,6 +139,8 @@ pub fn compile(a: Allocator, io: std.Io, source: []const u8, config: Config) All
     if (config.deadline) |end| if (std.Io.Clock.awake.now(io).toNanoseconds() >= end.toNanoseconds()) return null;
     const normalized = try normalizeWithTrust(a, source, config.opaque_inputs) orelse return null;
     defer a.free(normalized);
+    const cached = imageKey(normalized, config);
+    if (cached) |k| if (try elf_cache.get(a, io, k)) |bytes| return bytes;
     if (!std.fs.path.isAbsolute(config.scratch_root)) return null;
     const parent = std.Io.Dir.cwd().openDir(io, config.scratch_root, .{}) catch return null;
     defer parent.close(io);
@@ -174,18 +182,13 @@ pub fn compile(a: Allocator, io: std.Io, source: []const u8, config: Config) All
         if (config.estimated_steps) |steps| if (steps > config.step_budget) return null;
     }
     if (!config.opaque_inputs or (config.step_budget != 0 and config.estimated_steps == null)) {
-        const ast = std.process.run(a, io, .{
-            .argv = &.{ config.clang, "--target=riscv32-unknown-elf", "-march=rv32im_zba", "-mabi=ilp32", "-ffreestanding", "-fno-builtin", "-nostdinc", "-Werror=format", "-fsyntax-only", "-Xclang", "-ast-dump=json", "-x", "c", src },
-            .stdout_limit = .limited(4 * 1024 * 1024),
-            .stderr_limit = .limited(16384),
-            .timeout = .{ .duration = .{ .raw = remaining(io, config, 500) orelse return null, .clock = .awake } },
-        }) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return null,
-        };
-        defer a.free(ast.stdout);
-        defer a.free(ast.stderr);
-        if (!ast.term.success()) return null;
+        const ast = try spawn.run(a, io, &.{ config.clang, "--target=riscv32-unknown-elf", "-march=rv32im_zba", "-mabi=ilp32", "-ffreestanding", "-fno-builtin", "-nostdinc", "-Werror=format", "-fsyntax-only", "-Xclang", "-ast-dump=json", "-x", "c", src }, .{
+            .stdout = 4 * 1024 * 1024,
+            .stderr = 16384,
+            .timeout = remaining(io, config, 500) orelse return null,
+        }) orelse return null;
+        defer ast.deinit(a);
+        if (!ast.ok) return null;
         var instrumented: ?[]u8 = null;
         var restoration_steps: usize = 0;
         defer if (instrumented) |text| a.free(text);
@@ -207,31 +210,29 @@ pub fn compile(a: Allocator, io: std.Io, source: []const u8, config: Config) All
             file.writeStreamingAll(io, rewritten) catch return null;
         }
     }
-    const result = std.process.run(a, io, .{
-        .argv = &.{
-            config.clang,           "--target=riscv32-unknown-elf", "-march=rv32im_zba",   "-mabi=ilp32",
-            switch (config.optimize) {
-                .O0 => "-O0",
-                .O1 => "-O1",
-                .O2 => "-O2",
-            },
-            "-ffreestanding",       "-fno-builtin",                 "-nostdinc",           "-nostdlib",
-            "-fno-stack-protector", "-fno-pic",                     "-mno-relax",          "-Werror=format",
-            "-Wno-format-security", "-fstack-usage",                "-fno-unwind-tables",  "-fno-asynchronous-unwind-tables",
-            linker_arg,             "-Wl,--no-relax",               "-Wl,--build-id=none", "-Wl,-T",
-            link_path,              "-x",                           "c",                   src,
-            "-o",                   elf,
+    const build_timeout = remaining(io, config, build_cap_ms) orelse return null;
+    const build_start = std.Io.Clock.awake.now(io);
+    const result = try spawn.run(a, io, &.{
+        config.clang,           "--target=riscv32-unknown-elf", "-march=rv32im_zba",   "-mabi=ilp32",
+        switch (config.optimize) {
+            .O0 => "-O0",
+            .O1 => "-O1",
+            .O2 => "-O2",
         },
-        .stdout_limit = .limited(4096),
-        .stderr_limit = .limited(16384),
-        .timeout = .{ .duration = .{ .raw = remaining(io, config, 1000) orelse return null, .clock = .awake } },
-    }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return null,
+        "-ffreestanding",       "-fno-builtin",                 "-nostdinc",           "-nostdlib",
+        "-fno-stack-protector", "-fno-pic",                     "-mno-relax",          "-Werror=format",
+        "-Wno-format-security", "-fstack-usage",                "-fno-unwind-tables",  "-fno-asynchronous-unwind-tables",
+        linker_arg,             "-Wl,--no-relax",               "-Wl,--build-id=none", "-Wl,-T",
+        link_path,              "-x",                           "c",                   src,
+        "-o",                   elf,
+    }, .{ .stdout = 4096, .stderr = 16384, .timeout = build_timeout }) orelse {
+        const spent = build_start.durationTo(std.Io.Clock.awake.now(io));
+        if (spent.toNanoseconds() >= build_timeout.toNanoseconds())
+            log.warn("clang stopped after {d} ms by the compile time limit; the call declines", .{@divTrunc(spent.toNanoseconds(), std.time.ns_per_ms)});
+        return null;
     };
-    defer a.free(result.stdout);
-    defer a.free(result.stderr);
-    if (!result.term.success()) return null;
+    defer result.deinit(a);
+    if (!result.ok) return null;
     if (config.stack_limit != 0) {
         const usage = dir.readFileAlloc(io, "program.su", a, .limited(65536)) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -248,7 +249,20 @@ pub fn compile(a: Allocator, io: std.Io, source: []const u8, config: Config) All
         a.free(bytes);
         return null;
     }
+    if (cached) |k| elf_cache.put(io, k, bytes);
     return bytes;
+}
+
+fn imageKey(normalized: []const u8, config: Config) ?elf_cache.Key {
+    if (!elf_cache.wanted(config.opaque_inputs, config.step_budget, config.estimated_steps)) return null;
+    return elf_cache.key(normalized, config.clang, config.linker, @backingInt(config.optimize), config.stack_limit);
+}
+
+/// The image-cache key compile() uses for `source` under `config`, or null when it would not cache (tests).
+pub fn cacheKey(a: Allocator, source: []const u8, config: Config) Allocator.Error!?elf_cache.Key {
+    const normalized = try normalizeWithTrust(a, source, config.opaque_inputs) orelse return null;
+    defer a.free(normalized);
+    return imageKey(normalized, config);
 }
 
 fn remaining(io: std.Io, config: Config, milliseconds: i64) ?std.Io.Duration {

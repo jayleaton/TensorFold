@@ -33,7 +33,7 @@ pub const Op = struct {
     checked: bool = false,
 };
 
-pub const Style = enum { integer, fixed, comma, integral_float, boolean, fraction, tuple };
+pub const Style = enum { integer, fixed, comma, integral_float, boolean, fraction, tuple, byte, prepared };
 pub const Ending = enum { newline, space, empty, comma_space, close, slash, close_space, close_empty, close_comma_space };
 pub const Print = struct {
     ref: u32,
@@ -65,7 +65,7 @@ pub const Plan = struct {
 };
 
 pub const Family = enum { add, sub, mul, div, mod, pow };
-pub const Algorithm = enum { powmod, gcd, isqrt, range_product, factorial, digit_sum, divmod, square_offset, fraction, fixed_div, divexact };
+pub const Algorithm = enum { powmod, gcd, isqrt, range_product, factorial, digit_sum, divmod, square_offset, fraction, fixed_div, divexact, smallest_factor, factorize, f64_ratio, f64_mul, f64_sub, f64_isclose, f64_repr, f64_format };
 pub const Shape = enum { sum, squares, factorial, fib, list_sum, sorted_distance };
 
 pub const Builder = struct {
@@ -129,7 +129,8 @@ pub const Builder = struct {
             const digits = operand.len - @intFromBool(operand[0] == '-' or operand[0] == '+');
             needed = @max(needed, digits);
         }
-        const width: u8 = if (family == .factorial or family == .range_product) 128 else blk: {
+        const width: u8 = if (family == .factorial or family == .range_product or
+            std.mem.startsWith(u8, @tagName(family), "f64_")) 128 else blk: {
             for ([_]u8{ 1, 2, 4, 8, 16, 32, 62, 128 }) |n| if (needed <= n) break :blk n;
             unreachable;
         };
@@ -189,14 +190,17 @@ pub const Builder = struct {
 
 pub fn algorithmArity(family: Algorithm) u8 {
     return switch (family) {
+        .f64_mul, .f64_sub => 4,
+        .f64_isclose => 8,
+        .f64_ratio, .f64_repr, .f64_format => 2,
         .powmod => 3,
-        .gcd, .range_product, .divmod, .square_offset, .fraction, .fixed_div, .divexact => 2,
+        .gcd, .range_product, .divmod, .square_offset, .fraction, .fixed_div, .divexact, .smallest_factor, .factorize => 2,
         .isqrt, .factorial, .digit_sum => 1,
     };
 }
 
 pub fn algorithmOutputs(family: Algorithm) u8 {
-    return if (family == .divmod or family == .fraction) 2 else 1;
+    return if (family == .divmod or family == .fraction or family == .f64_ratio or family == .f64_mul or family == .f64_sub or family == .f64_format) 2 else 1;
 }
 
 pub fn widthValid(n: u8) bool {

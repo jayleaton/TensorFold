@@ -76,7 +76,8 @@ const Parser = struct {
             steps = (@import("runner_frontend_integer_cost.zig").estimateMany(&p.nodes, roots[0..count], budget - extra) orelse return error.Unsupported) + extra;
         }
         const endings: [8]u8 = @splat('\n');
-        return .{ .source = try integer.lowerFormatted(a, &p.nodes, roots[0..count], endings[0..count], styles[0..count], scales[0..count]), .estimated_steps = steps };
+        const source = try integer.lowerFormatted(a, &p.nodes, roots[0..count], endings[0..count], styles[0..count], scales[0..count]);
+        return .{ .source = source, .estimated_steps = steps, .table = integer.table(&p.nodes, roots[0..count], endings[0..count], styles[0..count], scales[0..count]) };
     }
 
     fn parse(p: *Parser, text: []const u8) !Value {

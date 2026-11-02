@@ -2,11 +2,14 @@
 const std = @import("std");
 const api = @import("runner_api.zig");
 const packet = @import("runner_graph_packet.zig");
+const factor = @import("runner_graph_factor.zig");
 const End = @FieldType(api.RunEnd, "end");
 const Cancel = ?*const std.atomic.Value(bool);
 
 /// Executes an algorithm in request-local scratch and copies only its typed outputs back to the caller.
 pub fn compute(m: anytype, kind: []const u8, width: u8, precision: u8, refs: []const u32, dest: usize, budget: u64, out: *std.ArrayList(u8), cancel: Cancel) !End {
+    if (std.mem.startsWith(u8, kind, "f64_")) return @import("runner_graph_f64.zig").compute(m, kind, width, refs, dest, budget, out, cancel);
+    if (std.mem.eql(u8, kind, "factorize")) return error.GraphAlgorithm;
     const family = std.meta.stringToEnum(packet.Algorithm, kind) orelse return error.GraphAlgorithm;
     const outputs = packet.algorithmOutputs(family);
     if (!packet.widthValid(width) or refs.len != packet.algorithmArity(family) or dest + outputs > m.values.len)
@@ -26,7 +29,8 @@ pub fn compute(m: anytype, kind: []const u8, width: u8, precision: u8, refs: []c
     }
     m.values = &scratch;
     defer m.values = original;
-    var c: Context(@TypeOf(m)) = .{ .m = m, .width = width, .precision = precision, .budget = budget, .out = out, .cancel = cancel, .input_digits = occupiedDigits(&scratch[2]) };
+    const work_width = if (std.mem.eql(u8, kind, "smallest_factor")) @max(width, 8) else width;
+    var c: Context(@TypeOf(m)) = .{ .m = m, .width = work_width, .precision = precision, .budget = budget, .out = out, .cancel = cancel, .input_digits = occupiedDigits(&scratch[2]) };
     const result = c.calculate(kind) catch |err| switch (err) {
         error.GraphAlgorithmStopped => return c.end,
         error.GraphAlgorithmLimit => return .budget,
@@ -43,10 +47,16 @@ pub fn compute(m: anytype, kind: []const u8, width: u8, precision: u8, refs: []c
 
 /// Named legacy algorithms retain their token schedules; new fractional formats use the compiled formatter.
 pub fn run(m: anytype, kind: []const u8, width: u8, budget: u64, out: *std.ArrayList(u8), cancel: Cancel) !api.RunEnd {
+    if (std.mem.startsWith(u8, kind, "f64_")) return @import("runner_graph_f64.zig").run(m, kind, budget, out, cancel);
+    if (std.mem.eql(u8, kind, "factorize")) return runFactorize(m, width, budget, out, cancel);
     const family = std.meta.stringToEnum(packet.Algorithm, kind) orelse return error.GraphAlgorithm;
     const refs = [_]u32{ 0, 1, 2 };
     var end = try compute(m, kind, width, m.precision, refs[0..packet.algorithmArity(family)], 0, budget, out, cancel);
     if (end != .halted) return .{ .end = end, .steps = m.steps };
+    if (std.mem.eql(u8, kind, "smallest_factor")) {
+        end = try @import("runner_graph_print.zig").emit(m, .{ .ref = 0 }, budget, out, cancel);
+        return .{ .end = end, .steps = m.steps };
+    }
     if (family == .fraction or family == .fixed_div) {
         end = try @import("runner_graph_print.zig").emit(m, .{ .ref = 0, .second = if (family == .fraction) 1 else null, .style = if (family == .fraction) .fraction else .fixed, .precision = m.precision }, budget, out, cancel);
         return .{ .end = end, .steps = m.steps };
@@ -70,6 +80,36 @@ pub fn run(m: anytype, kind: []const u8, width: u8, budget: u64, out: *std.Array
     return .{ .end = .halted, .steps = m.steps };
 }
 
+fn runFactorize(m: anytype, width: u8, budget: u64, out: *std.ArrayList(u8), cancel: Cancel) !api.RunEnd {
+    if (!packet.widthValid(width) or m.values.len < 2) return error.GraphAlgorithmScratch;
+    if (m.precision != 0) return error.GraphPrecision;
+    const original = m.values;
+    const zero = try packet.literal("0");
+    var scratch: [32]packet.Value = @splat(zero);
+    scratch[1] = try packet.literal("1");
+    for (original[0..2], 0..) |value, i| {
+        for (width..packet.max_digits) |digit| {
+            for (value[digit / 31][2 + digit % 31 * 4 ..][0..4]) |bit|
+                if (bit != 0) return error.GraphNarrowBinding;
+        }
+        scratch[2 + i] = value;
+    }
+    m.values = &scratch;
+    defer m.values = original;
+    var c: Context(@TypeOf(m)) = .{ .m = m, .width = @max(width, 8), .budget = budget, .out = out, .cancel = cancel, .input_digits = occupiedDigits(&scratch[2]) };
+    factor.factorize(&c) catch |err| switch (err) {
+        error.GraphAlgorithmStopped => return .{ .end = c.end, .steps = m.steps },
+        error.GraphAlgorithmLimit => return .{ .end = .budget, .steps = m.steps },
+        error.GraphAlgorithmArithmetic => {
+            scratch[0][0][127] = packet.bit_scale;
+            const end = try @import("runner_graph_print.zig").emit(m, .{ .ref = 0 }, budget, out, cancel);
+            return .{ .end = end, .steps = m.steps };
+        },
+        else => return err,
+    };
+    return .{ .end = .halted, .steps = m.steps };
+}
+
 fn Context(comptime M: type) type {
     return struct {
         m: M,
@@ -83,7 +123,7 @@ fn Context(comptime M: type) type {
 
         const Self = @This();
 
-        fn call(c: *Self, name: []const u8, refs: []const u32, dest: usize) !void {
+        pub fn call(c: *Self, name: []const u8, refs: []const u32, dest: usize) !void {
             const width = if (std.mem.eql(u8, name, "meta")) @max(c.width, 8) else c.width;
             var needed: usize = 1;
             for (refs) |ref| needed = @max(needed, occupiedDigits(&c.m.values[ref]));
@@ -112,19 +152,19 @@ fn Context(comptime M: type) type {
             if (c.end != .halted) return error.GraphAlgorithmStopped;
         }
 
-        fn move(c: *Self, dest: usize, source: usize) void {
+        pub fn move(c: *Self, dest: usize, source: usize) void {
             c.m.values[dest] = c.m.values[source];
         }
 
-        fn meta(c: *Self, a: u32, b: u32) !void {
+        pub fn meta(c: *Self, a: u32, b: u32) !void {
             try c.call("meta", &.{ a, b }, 20);
         }
 
-        fn flag(c: *Self, digit: usize) !bool {
+        pub fn flag(c: *Self, digit: usize) !bool {
             return predicate(&c.m.values[22], digit);
         }
 
-        fn nonzero(c: *Self, ref: u32) !bool {
+        pub fn nonzero(c: *Self, ref: u32) !bool {
             try c.meta(ref, 0);
             return c.flag(0);
         }
@@ -157,6 +197,7 @@ fn Context(comptime M: type) type {
         }
 
         fn calculate(c: *Self, kind: []const u8) ![2]u32 {
+            if (std.mem.eql(u8, kind, "smallest_factor")) return .{ try factor.smallest(c), 0 };
             if (std.mem.eql(u8, kind, "divmod") or std.mem.eql(u8, kind, "divexact")) {
                 try c.meta(2, 3);
                 c.move(5, 20);

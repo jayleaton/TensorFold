@@ -4,58 +4,113 @@ const runner = @import("runner.zig");
 const circuit = @import("runner_circuit.zig");
 const graph = @import("runner_graph.zig");
 const route = @import("runner_graph_route.zig");
+const frontend_mod = @import("runner_frontend.zig");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.runner);
 
 pub const Config = runner.Config;
 pub const Runner = runner.Runner;
 pub const Text = runner.Text;
+pub const TraceAsk = runner.TraceAsk;
+pub const validTraceFormat = @import("runner_trace.zig").validFormat;
+pub const maxTraceRepeat = @import("runner_trace.zig").max_repeat;
 pub const place = runner.place;
 
 const Opened = struct {
     runner: Runner,
-    circuit: circuit.Circuit,
+    circuit: *const circuit.Circuit, // own_circuit, or the circuit of the runner this one shares with
+    own_circuit: circuit.Circuit = undefined,
     placer: runner.place.Placer,
-    bank: graph.Bank = undefined,
+    bank: *const graph.Bank = undefined, // likewise own_bank or a shared bank
+    own_bank: graph.Bank = undefined,
+    has_bank: bool = false,
     routed: route.Routed = undefined,
+    quick: route.Quick = undefined, // cfg.sync_graph: routed's engine-thread part
     dispatch: route.Dispatch = undefined,
+    threaded: std.Io.Threaded = undefined, // the no-compile frontend's io (cfg.compile false)
+    no_compile: frontend_mod.Context = undefined,
+    compiles: bool = true, // the frontend may build an ELF (clang); false under cfg.compile false
 };
+
+var loads: std.atomic.Value(u32) = .init(0);
+
+/// Whether `r`'s frontend may build an ELF (clang), as its Config's compile asked.
+pub fn compiles(r: *Runner) bool {
+    const o: *Opened = @alignCast(@fieldParentPtr("runner", r));
+    return o.compiles;
+}
+
+/// Circuit and graph-bank files this process has loaded (each open that shares nothing adds one or two).
+pub fn loaded() u32 {
+    return loads.load(.monotonic);
+}
 
 /// The runner for `cfg` (from Config.parse); lives as long as the engine. CUDA waits for its backend (DESIGN T4).
 pub fn open(gpa: Allocator, cfg: Config) !*Runner {
+    return openSharing(gpa, cfg, null);
+}
+
+/// open, reusing `with`'s loaded circuit (and bank) when `cfg` names the same files; backend and workers stay its own.
+pub fn openSharing(gpa: Allocator, cfg: Config, with: ?*Runner) !*Runner {
     if (cfg.device != .cpu) {
         log.err("TF_DSV41_RUNNER_DEVICE=cuda: the CUDA circuit backend is not in this build", .{});
         return error.BadKnob;
     }
+    const w: ?*Opened = if (with) |r| @as(*Opened, @alignCast(@fieldParentPtr("runner", r))) else null;
     const o = try gpa.create(Opened);
     errdefer gpa.destroy(o);
     o.* = .{ .runner = undefined, .circuit = undefined, .placer = .{ .cfg = cfg.place } };
-    o.circuit = circuit.Circuit.load(gpa, cfg.circuit) catch |e| {
-        log.err("TF_DSV41_RUNNER_CIRCUIT={s}: {t}", .{ cfg.circuit, e });
-        return e;
-    };
-    errdefer o.circuit.deinit(gpa);
-    try probe(gpa, &o.circuit);
-    const back = try @import("runner_circuit_backend.zig").placed(gpa, &o.circuit, cfg.workers, &o.placer);
-    var frontend = @import("runner_frontend.zig").frontend();
+    if (w != null and std.mem.eql(u8, w.?.runner.cfg.circuit, cfg.circuit)) {
+        o.circuit = w.?.circuit; // loaded and probed once, by the runner it shares with
+    } else {
+        o.own_circuit = circuit.Circuit.load(gpa, cfg.circuit) catch |e| {
+            log.err("TF_DSV41_RUNNER_CIRCUIT={s}: {t}", .{ cfg.circuit, e });
+            return e;
+        };
+        errdefer o.own_circuit.deinit(gpa);
+        _ = loads.fetchAdd(1, .monotonic);
+        o.circuit = &o.own_circuit;
+        try probe(gpa, o.circuit);
+    }
+    errdefer if (o.circuit == &o.own_circuit) o.own_circuit.deinit(gpa);
+    const back = try @import("runner_circuit_backend.zig").placed(gpa, o.circuit, cfg.workers, &o.placer);
+    var frontend = frontend_mod.frontend();
+    if (!cfg.compile) {
+        // no scratch root: compile returns before clang, so a program the frontend would build as an ELF abstains
+        o.threaded = .init(gpa, .{});
+        o.no_compile = .{ .io = o.threaded.io(), .compiler = .{ .scratch_root = "" } };
+        frontend = o.no_compile.frontend();
+        o.compiles = false;
+    }
     var backend = back;
     // backend graph: T1's bank loads once here; pure-integer calc programs run on it, the rest on the circuit
     if (cfg.backend == .graph) {
         const t0 = nowNs();
-        o.bank = graph.Bank.load(gpa, cfg.graph_bank) catch |e| {
-            log.err("TF_DSV41_RUNNER_GRAPH_BANK={s}: {t}", .{ cfg.graph_bank, e });
-            return e;
-        };
-        o.routed = .{ .inner = frontend, .bank = &o.bank };
+        if (w != null and w.?.has_bank and std.mem.eql(u8, w.?.runner.cfg.graph_bank, cfg.graph_bank)) {
+            o.bank = w.?.bank;
+        } else {
+            o.own_bank = graph.Bank.load(gpa, cfg.graph_bank) catch |e| {
+                log.err("TF_DSV41_RUNNER_GRAPH_BANK={s}: {t}", .{ cfg.graph_bank, e });
+                return e;
+            };
+            _ = loads.fetchAdd(1, .monotonic);
+            o.bank = &o.own_bank;
+        }
+        o.has_bank = true;
+        o.routed = .{ .inner = frontend, .bank = o.bank };
         // settling holds: graph jobs leave the engine thread's CPU as the circuit's do (unplaced, they share its pin)
         const placer: ?*runner.place.Placer = if (cfg.settle_us > 0) &o.placer else null;
-        o.dispatch = .{ .gpa = gpa, .circuit = back, .graph = try graph.placed(gpa, &o.bank, cfg.workers, placer) };
+        o.dispatch = .{ .gpa = gpa, .circuit = back, .graph = try graph.placed(gpa, o.bank, cfg.workers, placer), .bank = o.bank };
         frontend = o.routed.frontend();
         backend = o.dispatch.backend();
-        log.info("in-model runner: graph bank {s} loaded in {d} ms", .{ cfg.graph_bank, (nowNs() - t0) / std.time.ns_per_ms });
+        log.info("in-model runner: graph bank {s} {s} in {d} ms", .{ cfg.graph_bank, if (o.bank == &o.own_bank) "loaded" else "shared", (nowNs() - t0) / std.time.ns_per_ms });
     }
     o.runner = .{ .gpa = gpa, .cfg = cfg, .frontend = frontend, .backend = backend, .placer = &o.placer };
-    log.info("in-model runner: circuit {s}, cpu, {d} workers, {d} steps a run, backend {t}, settle {d} us", .{ cfg.circuit, cfg.workers, cfg.max_steps, cfg.backend, cfg.settle_us });
+    if (cfg.sync_graph) {
+        o.quick = .{ .routed = &o.routed };
+        o.runner.quick = o.quick.frontend();
+    }
+    log.info("in-model runner: circuit {s}{s}, cpu, {d} workers, {d} steps a run, backend {t}, settle {d} us{s}{s}", .{ cfg.circuit, if (o.circuit == &o.own_circuit) "" else " (shared)", cfg.workers, cfg.max_steps, cfg.backend, cfg.settle_us, if (cfg.compile) "" else ", no ELF", if (cfg.sync_graph) ", graph results settle at their trigger" else "" });
     return &o.runner;
 }
 

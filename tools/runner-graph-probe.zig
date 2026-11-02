@@ -11,7 +11,11 @@ const halt: u32 = byte_base + 512 + 8 + 16 + 16 + 128 + 256 + 5;
 
 const Case = struct {
     id: []const u8,
-    packet: std.json.Value,
+    packet: std.json.Value = .null,
+    expression: ?[]const u8 = null,
+    script: ?[]const u8 = null,
+    cell: ?api.Cell = null,
+    syntax: @import("runner_graph_bind.zig").Syntax = .math,
     expected_output: []const u8,
     expected_status: []const u8 = "halted",
     expect_mismatch: bool = false,
@@ -29,6 +33,8 @@ const Row = struct {
     output_equal: bool = false,
     detected_mismatch: bool = false,
     machine_boot_ns: u64 = 0,
+    binding_ns: u64 = 0,
+    bound_packet: []const u8 = "",
     run_ns: u64 = 0,
     cpu_ns: u64 = 0,
     actual_output: []const u8 = "",
@@ -51,11 +57,15 @@ const Options = struct {
     algorithm_lifecycle: bool = false,
     fresh_states: bool = false,
     fixed_widths: bool = false,
+    eager_bank: bool = false,
 };
 const Report = struct {
     pass: bool,
     reuse_states: bool,
     adaptive_widths: bool,
+    boot_prepared: usize,
+    prepared_templates: usize,
+    template_load_attempts: u64,
     boot_wall_ns: u64,
     boot_process_cpu_ns: u64,
     run_wall_ns: u64,
@@ -110,6 +120,10 @@ fn options(args: []const []const u8) !Options {
     var o: Options = .{ .manifest = args[1], .cases = args[2] };
     var i: usize = 3;
     while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--eager-bank")) {
+            o.eager_bank = true;
+            continue;
+        }
         if (std.mem.eql(u8, args[i], "--lifecycle")) {
             o.lifecycle = true;
             continue;
@@ -142,7 +156,8 @@ fn options(args: []const []const u8) !Options {
 }
 
 fn canonicalBank(bank: *const graph.Bank) !void {
-    for (bank.templates) |t| {
+    for (bank.templates) |*t| {
+        if (!t.isPrepared()) continue;
         if (t.circuit.halt != halt or t.circuit.byte_family != 6) return error.NoncanonicalBank;
         const family, const payload = t.circuit.split(byte_base + 255) orelse return error.NoncanonicalBank;
         if (family != 6 or payload != 255) return error.NoncanonicalBank;
@@ -189,8 +204,22 @@ fn audit(a: Allocator, row: *Row, trace: []const u32, out: []const u8, halted: b
 fn runCase(a: Allocator, keep: Allocator, bank: *const graph.Bank, c: Case, budget: u64, fresh_states: bool, fixed_widths: bool, all_raw: *Hash, all_visible: *Hash, seeds: *std.ArrayList(Seed)) !Row {
     var row: Row = .{ .id = try keep.dupe(u8, c.id) };
     row.expected_canonical_sha256 = try expectedHash(keep, c.expected_output, std.mem.eql(u8, c.expected_status, "halted"));
-    const bytes = try std.json.Stringify.valueAlloc(a, c.packet, .{});
+    const bind_start = now();
+    const bound = if (c.expression) |source| try graph.bindExpression(a, bank, source, c.syntax) else if (c.script) |source| try graph.bindScript(a, bank, source) else if (c.cell) |request| blk: {
+        const front = graph.directFrontend(bank);
+        const translation = try front.translate(front.ctx, a, request);
+        break :blk if (translation == .program) translation.program.bytes else null;
+    } else null;
+    const bytes = if (c.expression != null or c.script != null or c.cell != null) bound orelse {
+        row.binding_ns = now() - bind_start;
+        row.status = "unsupported";
+        row.pass = !c.expect_mismatch and std.mem.eql(u8, c.expected_status, row.status) and c.expected_output.len == 0;
+        if (!row.pass) row.reason = "source binding refused";
+        return row;
+    } else try std.json.Stringify.valueAlloc(a, c.packet, .{});
     defer a.free(bytes);
+    row.binding_ns = now() - bind_start;
+    if (c.expression != null or c.script != null or c.cell != null) row.bound_packet = try keep.dupe(u8, bytes);
     const boot_start = now();
     var m = graph.Machine.boot(a, bank, bytes) catch |err| {
         row.machine_boot_ns = now() - boot_start;
@@ -287,6 +316,7 @@ fn cacheClean(cache: *const state_cache.Cache) bool {
 
 fn resetProof(a: Allocator, bank: *const graph.Bank) !void {
     const t = &bank.templates[0];
+    try t.prepare();
     var first: state_cache.Cache = .{};
     defer first.deinit(a);
     var second: state_cache.Cache = .{};
@@ -441,9 +471,10 @@ fn run(init: std.process.Init) !u8 {
     const o = try options(args);
     const boot_start = now();
     const boot_cpu_start = cpuNow();
-    var bank = try graph.Bank.load(a, o.manifest);
+    var bank = try graph.Bank.loadWithMode(a, o.manifest, if (o.eager_bank) .eager else .lazy);
     const boot_cpu_ns = cpuNow() - boot_cpu_start;
     const boot_ns = now() - boot_start;
+    const boot_prepared = bank.preparedCount();
     defer bank.deinit();
     try canonicalBank(&bank);
     const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, o.cases, a, .limited(128 << 20));
@@ -494,7 +525,11 @@ fn run(init: std.process.Init) !u8 {
         life.pass = life.error_name.len == 0 and life.checks == (if (seeds.items.len == 4) @as(usize, 10) else 9) and
             (!o.algorithm_lifecycle or seeds.items.len == 4);
     }
+    try canonicalBank(&bank);
     const report: Report = .{
+        .boot_prepared = boot_prepared,
+        .prepared_templates = bank.preparedCount(),
+        .template_load_attempts = bank.loadAttempts(),
         .pass = rows.items.len > 0 and failed == 0 and (!o.lifecycle or life.pass),
         .reuse_states = !o.fresh_states,
         .adaptive_widths = !o.fixed_widths,

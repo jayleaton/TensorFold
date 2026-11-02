@@ -5,6 +5,7 @@ const t = std.testing;
 test {
     _ = @import("runner_frontend_integer_test.zig");
     _ = @import("runner_frontend_integer_python.zig");
+    _ = @import("runner_frontend_integer_def_test.zig");
     _ = @import("runner_frontend_algorithm_test.zig");
     _ = @import("runner_frontend_cwide_test.zig");
     _ = @import("runner_frontend_blocks_test.zig");
@@ -20,6 +21,7 @@ test {
     _ = @import("runner_frontend_decimal_test.zig");
     _ = @import("runner_frontend_fraction_test.zig");
     _ = @import("runner_frontend_digit_reverse_test.zig");
+    _ = @import("runner_frontend_elf_cache_test.zig");
 }
 
 test "complete integer assignment requests use firmware with original inputs and no compiler" {

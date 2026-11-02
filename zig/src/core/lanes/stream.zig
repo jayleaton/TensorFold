@@ -25,7 +25,6 @@ pub const Reason = enum {
 };
 
 pub const Mode = enum { pipe, drain, verify, exit };
-
 pub const loop_max_period: usize = 8;
 pub const loop_min_run: usize = 256;
 pub const loop_warm_in: usize = 64;
@@ -69,11 +68,7 @@ pub fn detectLoop(emitted: []const u32) ?u32 {
 }
 
 /// The in-model runner's view of each committed token (core/runner.zig): true holds the stream for a result here.
-pub const RunnerHook = struct {
-    ptr: *anyopaque,
-    token: *const fn (ptr: *anyopaque, token: u32, think_open: bool, can_hold: bool, think_end: bool) bool,
-    eos: ?*const fn (ptr: *anyopaque, think_open: bool, can_hold: bool) bool = null,
-};
+pub const RunnerHook = @import("runner_hook.zig").RunnerHook;
 
 /// A stop-string check over the emitted tokens (the server's StopPolicy decodes their tail).
 pub const StopCheck = struct {
@@ -240,6 +235,7 @@ pub const Stream = struct {
     runner: ?RunnerHook = null,
     awaiting: bool = false, // held at a runner trigger: hold.resumeAwaiting continues it
     runner_eos_pending: bool = false,
+    settle: enum { none, matching, cut } = .none, // this commit: a result settled at a trigger (hold.settle), its end
     depth: ?State = null,
     mode: ?Mode = null,
     next: ?Held = null,
@@ -457,8 +453,10 @@ pub const Stream = struct {
             try s.long_loop.reserve(gpa, s.emitted().len + end);
         }
         var landed: usize = 0;
+        s.settle = .none;
         for (tokens, 0..) |t, i| {
             if (s.finished) break;
+            if (s.settle == .matching and !@import("hold.zig").settledNext(s, t)) break;
             if (s.grammar) |g| {
                 if (!try g.follow(t)) {
                     s.finished = true;
@@ -487,6 +485,7 @@ pub const Stream = struct {
             if (@import("runner_eos.zig").hold(s, t, stopped)) break;
             const can_hold = !s.isEos(t) and s.force.items.len == 0 and s.budgetLeft() > 1;
             if (s.runner) |r| if (r.token(r.ptr, t, s.think_open, can_hold, ended_think) and can_hold) {
+                if (try @import("hold.zig").settle(s, gpa, r)) continue;
                 s.held = true;
                 s.awaiting = true;
                 s.paused = true;

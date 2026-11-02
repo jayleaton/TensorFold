@@ -3,7 +3,29 @@ const ast = @import("runner_frontend_integer_ast.zig");
 const compiler = @import("runner_frontend_program_compile.zig");
 const cost = @import("runner_frontend_integer_cost.zig");
 
-pub const Lowered = struct { source: []u8, estimated_steps: ?usize };
+pub const Lowered = struct { source: []u8, estimated_steps: ?usize, table: ?Table = null };
+
+/// A lowered script's DAG and ordered outputs, the data the runtime evaluates; literal text is dropped (use value).
+pub const Table = struct {
+    nodes: [64]ast.Node = undefined,
+    count: usize = 0,
+    roots: [8]usize = undefined,
+    endings: [8]u8 = undefined,
+    styles: [8]u8 = @splat(0), // 0 integer/bool/tuple, 1 exact integral float, 2 fixed Decimal
+    scales: [8]u8 = @splat(0),
+    outputs: usize = 0,
+};
+
+/// The table lowerFormatted renders as C; a non-literal node's value is a proof, never a result to print.
+pub fn table(parser: *const ast.Parser, roots: []const usize, endings: []const u8, styles: ?[]const u8, scales: ?[]const u8) Table {
+    var t: Table = .{ .count = parser.count, .outputs = roots.len };
+    for (parser.nodes[0..parser.count], t.nodes[0..parser.count]) |n, *m| m.* = .{ .op = n.op, .l = n.l, .r = n.r, .k = n.k, .value = n.value };
+    @memcpy(t.roots[0..roots.len], roots);
+    @memcpy(t.endings[0..roots.len], endings);
+    if (styles) |s| @memcpy(t.styles[0..roots.len], s);
+    if (scales) |s| @memcpy(t.scales[0..roots.len], s);
+    return t;
+}
 
 pub fn ambiguousPercent(a: std.mem.Allocator, source: []const u8) std.mem.Allocator.Error!bool {
     if (std.mem.indexOfScalar(u8, source, '%') == null) return false;

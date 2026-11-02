@@ -16,13 +16,10 @@ pub const embedding_vector = @import("embedding_vector.zig");
 
 /// One image of a request (``Request.images``): the tower's input and the placeholder rows its output replaces.
 pub const Image = lanes.stream.Image;
-
 /// A prompt's reproducible seed (``seed_for``), for requests that name none.
 pub const seedFor = lanes.sampling.seedFor;
-
 /// A committed token's log probability under the target's raw distribution, with the best tokens at its position.
 pub const LogprobRow = lanes.LogprobRow;
-
 /// The request's stop strings, checked on the engine's thread after each committed token (the server decodes the tail).
 pub const Stop = struct {
     ctx: *anyopaque,
@@ -74,8 +71,7 @@ pub const Request = struct {
     stop: ?Stop = null,
     /// false: one token a round and no drafts, the serial reference drafted replies must equal.
     drafts: bool = true,
-    /// Background work yields to foreground arrivals.
-    background: bool = false,
+    background: bool = false, // background work yields to foreground arrivals
     /// The prompt length its kept states count as (0: its own); a pass prefilling a reply carries that request's.
     born: u32 = 0,
     /// Prompt prefix lengths worth keeping for a later turn: the rendered history, then shared system blocks.
@@ -119,6 +115,7 @@ pub const Request = struct {
     /// At an EOS the stream holds for ``Engine.resumeHeld`` (a built-in tool's result) instead of finishing.
     hold_eos: bool = false,
     run_cells: bool = false, // code cells the reply writes run on the host's in-model runner (core/runner.zig)
+    run_trace: @import("runner.zig").TraceAsk = .{}, // with run_cells: the request's own say over form trace
 
     /// The prompt as the prompt cache matches it: an image request's placeholders stand for their images.
     pub fn cacheKey(r: *const Request) []const u32 {
@@ -244,6 +241,7 @@ pub const Info = struct {
     admit: ?Admit = null,
     compute: ?compute_lane.Config = null, // the family's built-in code execution: replies hold at EOS for its results
     runner: ?*runner.Runner = null, // the in-model runner: the server gives it the tokenizer and chats set run_cells
+    compute_runner: ?compute_circuit.Setup = null, // S3: lane calls the circuit can run go there (compute_circuit.zig)
 
     /// What a lane engine's streams enforce themselves (core/lanes/stream.zig): loop guards and answer limits.
     pub fn ofLanes(i: Info) Info {
@@ -255,6 +253,8 @@ pub const Info = struct {
 };
 pub const runner = @import("runner_open.zig");
 pub const compute_lane = @import("compute_lane.zig");
+pub const compute_circuit = @import("compute_circuit.zig");
+pub const runner_api = @import("runner_api.zig");
 /// A held reply's result tokens (empty: it ends at its EOS), forced after the EOS between rounds.
 pub const Resume = lanes.hold.Resume;
 pub const Admit = struct {

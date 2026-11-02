@@ -4,6 +4,24 @@ const packet = @import("runner_graph_packet.zig");
 const api = @import("runner_api.zig");
 const End = @FieldType(api.RunEnd, "end");
 
+/// Validate every byte before any output so invalid later bytes cannot leave a partial successful prefix.
+pub fn validateBytes(m: anytype, prints: []const packet.Print, budget: u64, out: *std.ArrayList(u8), cancel: ?*const std.atomic.Value(bool)) !End {
+    const original = m.values;
+    var scratch: [2]packet.Value = undefined;
+    m.values = &scratch;
+    defer m.values = original;
+    for (prints) |p| {
+        if (p.style != .byte) continue;
+        scratch[0] = original[p.ref];
+        const t = m.bank.find("byte_check", 128) orelse return error.GraphTemplate;
+        const end = try m.invoke(t, &.{0}, 1, budget, out, cancel, false);
+        if (end != .halted) return end;
+        if (scratch[1][0][127] == packet.bit_scale) return error.GraphArithmetic;
+        if (scratch[1][0][127] != 0) return error.GraphPredicate;
+    }
+    return .halted;
+}
+
 pub fn emit(m: anytype, p: packet.Print, budget: u64, out: *std.ArrayList(u8), cancel: ?*const std.atomic.Value(bool)) !End {
     const original = m.values;
     if (p.ref >= original.len) return error.GraphReference;
@@ -22,6 +40,14 @@ pub fn emit(m: anytype, p: packet.Print, budget: u64, out: *std.ArrayList(u8), c
         if (scratch[i][0][127] != packet.bit_scale) return error.GraphPredicate;
         scratch[2][0][127] = packet.bit_scale;
         return part(m, 2, .integer, 0, .newline, false, budget, out, cancel);
+    }
+    if (p.style == .prepared) {
+        const t = m.bank.find("format_f64", 62) orelse return error.GraphTemplate;
+        return m.invoke(t, &.{ 2, 3 }, 0, budget, out, cancel, true);
+    }
+    if (p.style == .byte) {
+        const t = m.bank.find("emit_byte", 4) orelse return error.GraphTemplate;
+        return m.invoke(t, &.{2}, 0, budget, out, cancel, true);
     }
     if (p.style == .fraction) {
         const t = m.bank.find("meta", 128) orelse return error.GraphTemplate;
@@ -54,7 +80,7 @@ pub fn emit(m: anytype, p: packet.Print, budget: u64, out: *std.ArrayList(u8), c
 }
 
 fn part(m: anytype, ref: u32, style: packet.Style, precision: u8, ending: packet.Ending, prefix: bool, budget: u64, out: *std.ArrayList(u8), cancel: ?*const std.atomic.Value(bool)) !End {
-    if (style == .fraction or style == .tuple or precision > 18 or (style != .fixed and precision != 0))
+    if (style == .fraction or style == .tuple or style == .prepared or style == .byte or precision > 18 or (style != .fixed and precision != 0))
         return error.GraphPrint;
     const mode: u32 = switch (style) {
         .integer => 0,

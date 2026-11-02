@@ -65,7 +65,7 @@ fn pass(gpa: std.mem.Allocator, r: *runner.Runner, replies: []const Reply, mode:
             t.tokens += rep.tokens.len;
             continue;
         }
-        const s = (try r.session()).?;
+        const s = (try r.session(.{})).?;
         defer s.destroy();
         const hook = s.hook();
         for (rep.tokens, 0..) |tok, i| {

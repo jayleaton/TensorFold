@@ -16,6 +16,7 @@ pub const Cache = struct {
 
     /// The returned pointer stays valid until the next get; callers release it with reset on every exit.
     pub fn get(c: *Cache, a: std.mem.Allocator, t: *const Template) !*State {
+        try t.prepare();
         for (c.entries.items) |*e| if (e.template == t) return &e.state;
         try c.entries.ensureUnusedCapacity(a, 1);
         const state = try State.init(a, &t.circuit);

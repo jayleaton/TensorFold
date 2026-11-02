@@ -143,6 +143,14 @@ pub const Served = struct {
             s.host.runner = try api.runner.open(gpa, rc);
             s.host.info_.runner = s.host.runner;
         }
+        // TF_DSV41_COMPUTE_LANE_RUNNER=1 (S3): lane calls the frontend takes run on the circuit, shared if loaded above
+        if (s.host.info_.compute != null) if (try api.runner.Config.parse(&@import("serve_knobs.zig").env, "TF_DSV41_COMPUTE_LANE_RUNNER")) |parsed| {
+            const cfg = try api.compute_circuit.Config.parse(&@import("serve_knobs.zig").env, "TF_DSV41_COMPUTE_LANE_RUNNER");
+            var rc = parsed;
+            rc.place.engine = engineCpus;
+            rc.compile = cfg.elf;
+            s.host.info_.compute_runner = .{ .runner = try api.runner.openSharing(gpa, rc, s.host.runner), .cfg = cfg };
+        };
         // the lanes run on LaneHost's thread: the model's CUDA context must be current there
         s.host.on_thread = .{ .ctx = m, .run = bindContext };
         // /metrics' device memory: bytes this rank holds in cuda.DeviceBuffers (weights, KV pool, staging), peak

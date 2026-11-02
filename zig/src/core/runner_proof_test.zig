@@ -49,6 +49,7 @@ test "runner proof: loop cells (a generator sum and an accumulator) print 285 th
 const rapi = @import("runner_api.zig");
 const graph = @import("runner_graph.zig");
 const route = @import("runner_graph_route.zig");
+const program = @import("runner_graph_program.zig");
 
 /// A backend that counts the jobs it starts.
 const Count = struct {
@@ -60,8 +61,10 @@ const Count = struct {
     }
     fn start(ctx: *anyopaque, stream: u64, p: rapi.Program, budget: u64) error{ OutOfMemory, Busy }!rapi.JobId {
         const c: *Count = @ptrCast(@alignCast(ctx));
+        // jobs the inner backend took (a Busy refusal starts nothing)
+        const id = try c.inner.start(stream, p, budget);
         c.started += 1;
-        return c.inner.start(stream, p, budget);
+        return id;
     }
     fn poll(ctx: *anyopaque, job: rapi.JobId) rapi.Poll {
         const c: *Count = @ptrCast(@alignCast(ctx));
@@ -126,7 +129,7 @@ test "runner proof: a REPL bignum cell takes the graph route and gives the calc 
     var calc_fallback: Count = .{ .inner = both.calc };
     var on_graph: Count = .{ .inner = both.graph };
     var routed: route.Routed = .{ .inner = ctx.frontend(), .bank = &both.bank };
-    var dispatch: route.Dispatch = .{ .gpa = gpa, .circuit = calc_fallback.backend(), .graph = on_graph.backend() };
+    var dispatch: route.Dispatch = .{ .gpa = gpa, .circuit = calc_fallback.backend(), .graph = on_graph.backend(), .bank = &both.bank };
     defer dispatch.deinit();
     const graph_texts = try rt.replies(&models, .{ .frontend = routed.frontend(), .backend = dispatch.backend(), .wait_s = 600 }, &fake);
     defer rt.freeAll(graph_texts);
@@ -205,7 +208,7 @@ test "runner proof: a whole-problem divmod cell with a bool print is owned on th
     var calc_fallback: Count = .{ .inner = both.calc };
     var on_graph: Count = .{ .inner = both.graph };
     var routed: route.Routed = .{ .inner = ctx.frontend(), .bank = &both.bank };
-    var dispatch: route.Dispatch = .{ .gpa = gpa, .circuit = calc_fallback.backend(), .graph = on_graph.backend() };
+    var dispatch: route.Dispatch = .{ .gpa = gpa, .circuit = calc_fallback.backend(), .graph = on_graph.backend(), .bank = &both.bank };
     defer dispatch.deinit();
     const texts = try rt.replies(&models, .{ .frontend = routed.frontend(), .backend = dispatch.backend(), .wait_s = 600 }, &fake);
     defer rt.freeAll(texts);
@@ -218,7 +221,7 @@ test "runner proof: straight-line integer cells print Python's lines on the grap
     var both: Both = undefined;
     try both.open();
     defer both.close();
-    var dispatch: route.Dispatch = .{ .gpa = gpa, .circuit = both.calc, .graph = both.graph };
+    var dispatch: route.Dispatch = .{ .gpa = gpa, .circuit = both.calc, .graph = both.graph, .bank = &both.bank };
     defer dispatch.deinit();
     const b = dispatch.backend();
     for ([_][2][]const u8{
@@ -227,6 +230,8 @@ test "runner proof: straight-line integer cells print Python's lines on the grap
         .{ "x = -7\nprint(x // 2); print(x % 3)  # floor", "-4\n2\n" },
         .{ "print(2**64 == 18446744073709551616)", "True\n" },
         .{ "a=10\nprint(a == 11)", "False\n" },
+        .{ divmod_cell[10..112] ++ "print(q*b + r == a + 1, q*b + r != a - 1, q*b + r - a == 0, a != a)", "False True True False\n" },
+        .{ "a = -10**40\nb = 10**40\nprint(a == b, a != b, a == -b, b - a == 2*b)", "False True True True\n" },
         .{ "n = 37\nprint(2**n - 1, n)", "137438953471 37\n" },
         .{ "a = 2**10\nprint(a)", "1024\n" },
         .{ "s = 2 + 3\nprint(s * 4)", "20\n" },
@@ -290,6 +295,90 @@ test "runner proof: big-number-020 past the frontend's 62 digits, inline and REP
         try std.testing.expectEqualStrings("24691357800000000000000000000000000000000000000000000000000000000000000015241578750190521\n", r.out);
     }
     both.graph.release(1);
+}
+
+test "runner proof: a print reads an earlier piece's value (TFGS2), so d_mirror's check reuses q and r; cheap names do not" {
+    var both: Both = undefined;
+    try both.open();
+    defer both.close();
+    const cell = divmod_cell[10 .. divmod_cell.len - 14];
+    const bytes = (try route.program(gpa, &both.bank, cell)).?;
+    defer gpa.free(bytes);
+    try std.testing.expectStringStartsWith(bytes, "TFGS2\n");
+    const want = "BN @=$0*271828182845904523536+$1;314159265358979323846264338327950288419716939937510\n";
+    try std.testing.expect(std.mem.endsWith(u8, bytes, want));
+    // a value with no division or power is recomputed beside the rest, as before
+    const cheap = (try route.program(gpa, &both.bank, "a = 7 + 3\nprint(a)\nprint(a * 2)")).?;
+    defer gpa.free(cheap);
+    try std.testing.expectStringStartsWith(cheap, "TFGS1\n");
+    // a template bound to the bank's values: the comparison reads them, so a wrong value moves the answer
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var dispatch: route.Dispatch = .{ .gpa = gpa, .circuit = both.calc, .graph = both.graph, .bank = &both.bank };
+    defer dispatch.deinit();
+    const b = dispatch.backend();
+    for ([_]struct { []const u8, [2]?[]const u8, []const u8 }{
+        .{ "@=$0*3+$1;14", .{ "4", "2" }, "1" },
+        .{ "@=$0*3+$1;14", .{ "4", "3" }, "0" },
+        .{ "@!$0;-5", .{ "-5", null }, "0" },
+        .{ "@I$0*$1-1", .{ "-12", "12" }, "-145" },
+    }) |c| {
+        const p = (try program.bind(arena, &both.bank, c[0], &c[1])).?;
+        const r = finish(b, try b.start(1, .{ .kind = .graph, .bytes = p }, 4_000_000));
+        try std.testing.expectEqualStrings(c[2], std.mem.trimEnd(u8, r.out, "\n"));
+    }
+    b.release(1);
+    // a reference past the values or to a missing one, and an unknown template op, bind nothing
+    try std.testing.expectEqual(null, try program.bind(arena, &both.bank, "@I$2+1", &.{ "1", "2" }));
+    try std.testing.expectEqual(null, try program.bind(arena, &both.bank, "@I$1+1", &.{ "1", null }));
+    try std.testing.expectEqual(null, try program.bind(arena, &both.bank, "@<$0;1", &.{"1"}));
+}
+
+test "runner proof: S1's and S2's six saved cells take the graph route and print CPython's stdout (T1 direct binding)" {
+    var both: Both = undefined;
+    try both.open();
+    defer both.close();
+    var ctx: frontend.Context = .{ .io = std.testing.io };
+    if (std.c.getenv("TF_RUNNER_LLD")) |l| ctx.compiler.linker = std.mem.span(l);
+    var routed: route.Routed = .{ .inner = ctx.frontend(), .bank = &both.bank };
+    const front = routed.frontend();
+    var dispatch: route.Dispatch = .{ .gpa = gpa, .circuit = both.calc, .graph = both.graph, .bank = &both.bank };
+    defer dispatch.deinit();
+    const b = dispatch.backend();
+    // S1 d_mirror-c1-g2 cells (S1-UNOWNED-CELLS.md) verbatim; S2's saved 008/011/015 as printed cells
+    for ([_][2][]const u8{
+        .{ "import math\na=12345678901234567890\nb=98765432109876543210\nprint(math.gcd(a,b))", "900000000090\n" },
+        .{ "import math\nn = 123456789012345678901234\nr = math.isqrt(n)\nprint(r)\nprint(r*r)\nprint((r+1)*(r+1))\nprint(n - r*r)", "351364182882\n123456789012335541825924\n123456789013038270191689\n10137075310\n" },
+        .{ "print(pow(7, 83, 1000000007))", "269823221\n" },
+        .{ "print(7**123%1000000007)", "937329259\n" },
+        .{ "print(3**400%10**18)", "192443283334088001\n" },
+        .{ "print(0xFEDCBA9876543210*2**64+0x0123456789ABCDEF)", "338770000845734292516042252062085074415\n" },
+        .{ "a=3\nprint(100//(a+1))\n", "25\n" }, // a computed divisor (T2's table refused it before graph-v4)
+    }) |c| {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const t = try front.translate(front.ctx, arena.allocator(), .{ .form = .fence, .lang = "python", .code = c[0] });
+        if (t != .program or t.program.kind != .graph) {
+            std.debug.print("not on the graph route: {s}: {any}\n", .{ c[0], t });
+            return error.TestExpectedRoute;
+        }
+        const r = finish(b, try b.start(1, t.program, 4_000_000));
+        if (r.status != .ok or !std.mem.eql(u8, c[1], r.out)) {
+            std.debug.print("{s}: {t} '{s}'\n", .{ c[0], r.status, r.out });
+            return error.TestExpectedEqual;
+        }
+    }
+    // a zero divisor is Python's ZeroDivisionError: no printed value is owned
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const z = try front.translate(front.ctx, arena.allocator(), .{ .form = .fence, .lang = "python", .code = "a=-1\nprint(100//(a+1))\n" });
+    if (z == .program) {
+        const r = finish(b, try b.start(1, z.program, 4_000_000));
+        std.debug.print("zero divisor: {t} '{s}'\n", .{ r.status, r.out });
+        try std.testing.expect(r.status != .ok);
+    }
+    b.release(1);
 }
 
 comptime {

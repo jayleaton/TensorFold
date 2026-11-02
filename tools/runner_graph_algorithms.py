@@ -6,14 +6,14 @@ from runner_graph_ir import Value
 OPERATIONS = ("meta", "half", "digit_sum", "mulmodstep")
 ALGORITHMS = {"powmod": 3, "gcd": 2, "isqrt": 1, "range_product": 2,
               "factorial": 1, "digit_sum": 1, "divmod": 2, "square_offset": 2,
-              "fraction": 2, "divexact": 2}
+              "fraction": 2, "divexact": 2, "smallest_factor": 2, "factorize": 2}
 
 
 def build(b, op):
     zero = b.zero
     width = b.width
-    arity = {"meta": 2, "half": 1, "digit_sum": 1, "mulmodstep": 4}[op]
-    inputs = [b.input(i) for i in range(arity)]
+    arity = {"meta": 2, "half": 1, "digit_sum": 1, "mulmodstep": 4, "raw_meta": 2}[op]
+    inputs = [b.input(i, preserve_sign=op == "raw_meta") for i in range(arity)]
     error = b.any(value.error for value in inputs)
     if op == "mulmodstep":
         remainder, a, digit, modulus = inputs
@@ -46,7 +46,7 @@ def build(b, op):
                     merged.append(digits + [carry])
             rows = merged
         return Value(rows[0], zero, error)
-    if op == "meta":
+    if op in ("meta", "raw_meta"):
         a, c = inputs
         _, less = b.sub(a.digits, c.digits)
         equal = b.one - b.any(b.one - b.eq(x - y, 0, -9, 9)
@@ -75,4 +75,11 @@ def catalog(widths):
     plans += [{"name": f"fixed_div-{places}-{width}", "inputs": 2, "literals": [], "ops": [],
                "result": 0, "algorithm": "fixed_div", "width": width, "precision": places}
               for width in widths for places in range(19)]
+    plans += [{"name": f"reverse_decimal-{width}", "inputs": 1, "literals": [],
+               "ops": [{"op": "reverse_decimal", "a": 0, "width": width, "checked": True}],
+               "result": 1} for width in widths]
+    plans += [{"name": f"{name}-128", "inputs": arity, "literals": [], "ops": [],
+               "result": 0, "algorithm": name, "width": 128}
+              for name, arity in (("f64_ratio", 2), ("f64_mul", 4), ("f64_sub", 4),
+                                  ("f64_isclose", 8), ("f64_repr", 2), ("f64_format", 2)) if 128 in widths]
     return plans
