@@ -404,6 +404,17 @@ fn runningOperand(word: []const u8) bool {
     return false;
 }
 
+/// `1119 + 392`: two plain non-negative integers added, nothing else (after a join cue it may be a concatenation).
+pub fn twoInts(e: []const u8) bool {
+    const plus = std.mem.indexOfScalar(u8, e, '+') orelse return false;
+    for ([_][]const u8{ e[0..plus], e[plus + 1 ..] }) |side| {
+        const t = std.mem.trim(u8, side, " \t");
+        if (t.len == 0) return false;
+        for (t) |c| if (!std.ascii.isDigit(c) and c != ',') return false;
+    }
+    return true;
+}
+
 /// `gcd(a, b)` on plain non-negative literals ending the text, as its own phrase (not `2 * gcd(…)`, `math.gcd`).
 fn gcdCall(before: []const u8) ?[]const u8 {
     const s = std.mem.trimEnd(u8, before, " \t");

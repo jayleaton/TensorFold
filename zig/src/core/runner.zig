@@ -264,7 +264,7 @@ pub const Session = struct {
             return;
         }
         // exact inline math would contradict a reply reasoning in Python floats
-        if (c.float_context) {
+        if (c.own_context) {
             cell.translation = .{ .abstain = .context };
             cell.translated.store(true, .release);
             return;
@@ -585,4 +585,5 @@ test {
     _ = @import("runner_inline_mod_test.zig");
     _ = @import("runner_inline_arith_test.zig");
     _ = @import("runner_inline_chain_test.zig");
+    _ = @import("runner_inline_context_test.zig");
 }
