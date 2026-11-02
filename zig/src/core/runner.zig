@@ -586,4 +586,5 @@ test {
     _ = @import("runner_inline_arith_test.zig");
     _ = @import("runner_inline_chain_test.zig");
     _ = @import("runner_inline_context_test.zig");
+    _ = @import("runner_inline_hex_test.zig");
 }

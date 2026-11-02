@@ -20,6 +20,8 @@ pub fn inlineExpr(line: []const u8, arith: bool, chain: bool) ?struct { expr: []
     }
     if (std.mem.indexOfAny(u8, before, "<>!") != null) return null;
     if (arith and seg_from == 0) if (gcdCall(before)) |g| return .{ .expr = g, .space = space, .call = true };
+    // live R4 d_mirror hex-a and hex: `0xABCDEF0123456789 =`, the whole conversion as one Python literal
+    if (arith and seg_from == 0) if (hexLiteral(before)) |h| return .{ .expr = h, .space = space, .call = true };
     var start = before.len;
     var period_stop = false;
     while (start > seg_from) {
@@ -439,6 +441,27 @@ fn gcdCall(before: []const u8) ?[]const u8 {
         if (n.len > 60 or !allDigits(n) or (n[0] == '0' and n.len > 1)) return null;
     }
     return s[at..];
+}
+
+/// A bare `0x…` literal of 2 to 100 hex digits ending the text, as its own word (not `#0xFF`, `-0xFF`, `mod 0xFF`).
+fn hexLiteral(before: []const u8) ?[]const u8 {
+    const s = std.mem.trimEnd(u8, before, " \t");
+    var at = s.len;
+    while (at > 0 and std.ascii.isHex(s[at - 1])) at -= 1;
+    if (s.len - at < 2 or s.len - at > 100 or at < 2 or s[at - 2] != '0' or (s[at - 1] != 'x' and s[at - 1] != 'X'))
+        return null;
+    const from = at - 2;
+    if (from > 0 and s[from - 1] != ' ' and s[from - 1] != '\t') return null;
+    const word = std.mem.trimEnd(u8, s[0..from], " \t");
+    if (word.len > 0) {
+        const w = word[word.len - 1];
+        // an operand of a bigger expression (live 0633: `0xFFFFFFFFFFFFFFFF - 0xFEDC… =`), of mod or of a total
+        if (std.ascii.isDigit(w) or w >= 0x80 or std.mem.indexOfScalar(u8, "+-*/^%(,&|<>~", w) != null) return null;
+        if (std.mem.endsWith(u8, word, "mod") and (word.len == 3 or !std.ascii.isAlphanumeric(word[word.len - 4])))
+            return null;
+        if (runningOperand(std.mem.trimEnd(u8, word, ":"))) return null;
+    }
+    return s[from..];
 }
 
 /// A nonzero literal modulus: digits, `b^k`, `b**k`, `dek` (1e9), or thousands groups.

@@ -13,7 +13,7 @@ pub const Config = struct {
     reasoning_only: bool = false, // triggers only while the think block is open
     inline_math: bool = false, // `A op B =` at a line's end: the value after `=` (exact math semantics)
     inline_mod: bool = true, // with inline_math: `A mod M =` and `A % M =` on literals, after any earlier `=`
-    inline_arith: bool = true, // with inline_math: thousands commas (`147,000+73`) and a whole `gcd(a, b)` on literals
+    inline_arith: bool = true, // with inline_math: thousands commas (`147,000+73`), a whole `gcd(a, b)` or `0xFF`
     inline_chain: bool = false, // opt-in, T5 decides: the last `<expr> =` after an earlier `=` statement
     float_window: u32 = 512, // tokens after a Python-float cue in which an inline span with `.` or `/` abstains
     trace: bool = false, // a computation the reasoning states, owned as `[exact: …]` where its hand trace starts

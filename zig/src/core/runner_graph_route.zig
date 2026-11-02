@@ -339,6 +339,40 @@ const Map = struct {
     }
 };
 
+/// The most hex digits a bare literal cell converts: 16^100 has 121 decimal digits, under the bank's 128.
+pub const max_hex = 100;
+
+/// A bare hex literal cell (`0xFEDC… =`): Horner's rule on the bank over its digits, so the circuit does the radix.
+pub fn hexLiteral(a: Allocator, bank: *const graph.Bank, cell: api.Cell) Allocator.Error!?[]u8 {
+    if ((cell.form != .inline_expr and cell.form != .repl) or !std.mem.eql(u8, cell.lang, "python")) return null;
+    const src = std.mem.trim(u8, cell.code, " \t");
+    if (src.len < 4 or src.len > 2 + max_hex or src[0] != '0' or (src[1] != 'x' and src[1] != 'X')) return null;
+    const hex = src[2..];
+    for (hex) |c| if (!std.ascii.isHex(c)) return null;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const values = try arena.alloc([]const u8, hex.len + 1);
+    values[0] = "16";
+    for (hex, 1..) |c, i| values[i] = try std.fmt.allocPrint(arena, "{d}", .{std.fmt.charToDigit(c, 16) catch unreachable});
+    var ops: std.ArrayList(packet.Op) = .empty;
+    var acc: u32 = 1;
+    for (2..values.len) |k| {
+        // after k digits the value is below 16^k: at most k*1.21 + 1 decimal digits (log10 16 < 1.21)
+        const w = for ([_]u8{ 1, 2, 4, 8, 16, 32, 62, 128 }) |x| {
+            if (k * 121 / 100 + 1 <= x) break x;
+        } else return null;
+        if (bank.find("mul", w) == null or bank.find("add", w) == null) return null;
+        const digit: u32 = @intCast(k);
+        const product: u32 = @intCast(values.len + ops.items.len);
+        try ops.append(arena, .{ .op = "mul", .width = w, .args = try arena.dupe(u32, &.{ acc, 0 }), .checked = true });
+        try ops.append(arena, .{ .op = "add", .width = w, .args = try arena.dupe(u32, &.{ product, digit }), .checked = true });
+        acc = product + 1;
+    }
+    _ = bank.validate(values.len, ops.items, acc) catch return null;
+    return packet.Builder.program(a, values, ops.items, &.{.{ .ref = acc }}) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else null;
+}
+
 /// A frontend that runs `inner`, then moves a pure-integer calc program onto the graph bank; calc and ELF otherwise.
 pub const Routed = struct {
     inner: api.Frontend,
@@ -350,6 +384,7 @@ pub const Routed = struct {
 
     /// The graph steps before the inner frontend (no compile): T1's binding, a straight-line program, a whole script.
     fn graphFirst(r: *const Routed, a: Allocator, cell: api.Cell) Allocator.Error!?[]u8 {
+        if (try hexLiteral(a, r.bank, cell)) |bytes| return bytes;
         if (try graph.bindCell(a, r.bank, cell)) |bytes| return bytes;
         if (cell.form != .inline_expr and std.mem.eql(u8, cell.lang, "python") and !prog.shadowed(cell.prior))
             if (try prog.program(a, r.bank, cell.code)) |bytes| return bytes;
