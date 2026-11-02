@@ -1,0 +1,10 @@
+--- a/zig/src/core/runner_graph_route.zig
++++ b/zig/src/core/runner_graph_route.zig
+@@ -351,5 +351,7 @@
+     fn translate(ctx: ?*anyopaque, a: Allocator, cell: api.Cell) Allocator.Error!api.Translation {
+         const r: *Routed = @ptrCast(@alignCast(ctx.?));
++        if (try graph.bindCell(a, r.bank, cell)) |bytes|
++            return .{ .program = .{ .kind = .graph, .bytes = bytes } };
+         if (cell.form != .inline_expr and std.mem.eql(u8, cell.lang, "python") and !prog.shadowed(cell.prior))
+             if (try prog.program(a, r.bank, cell.code)) |bytes| return .{ .program = .{ .kind = .graph, .bytes = bytes } };
+         const t = try r.inner.translate(r.inner.ctx, a, cell);
