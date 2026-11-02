@@ -176,7 +176,6 @@ const Parser = struct {
     fn term(p: *Parser) Error!Expr {
         var e = try p.factor();
         var moded = false;
-        var times = false;
         while (p.peek("*") or p.peek("%")) {
             const op = p.toks[p.i].text;
             if (moded or (op[0] == '%' and p.depth > 0)) return error.Refused; // mod last, never in brackets
@@ -187,11 +186,10 @@ const Parser = struct {
                 // the modulus is a plain number, name or power chain (10^18), never a sum or a bracket
                 for (p.toks[start..p.i]) |t| if (t.kind == .op and !std.mem.eql(u8, t.text, "^")) return error.Refused;
                 moded = true;
-                // a lone power mod m runs as Python's three-argument pow: the same value, an exact modular route
-                const run = if (e.pw != null and !times) try cat(p.a, &.{ "pow(", e.pw.?.base, ", ", e.pw.?.k, ", ", try tens(p.a, r.run), ")" }) else try cat(p.a, &.{ e.run, "%", r.run });
+                // a lone power mod m (a product carries no `pw`) runs as Python's pow(a, b, m): the same value
+                const run = if (e.pw != null) try cat(p.a, &.{ "pow(", e.pw.?.base, ", ", e.pw.?.k, ", ", try tens(p.a, r.run), ")" }) else try cat(p.a, &.{ e.run, "%", r.run });
                 e = .{ .source = try cat(p.a, &.{ e.source, "%", r.source }), .display = try cat(p.a, &.{ e.display, " mod ", r.display }), .bound = r.bound, .ops = e.ops + r.ops + 1, .constant = false, .run = run };
             } else {
-                times = true;
                 e = .{ .source = try cat(p.a, &.{ e.source, "*", r.source }), .display = try cat(p.a, &.{ e.display, "*", r.display }), .bound = sat(e.bound + r.bound), .ops = e.ops + r.ops + 1, .constant = false, .run = try cat(p.a, &.{ e.run, "*", r.run }) };
             }
         }
