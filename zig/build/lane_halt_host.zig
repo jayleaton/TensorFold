@@ -19,6 +19,7 @@ pub fn steps(b: *std.Build) void {
     const lanes_fast = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = b.graph.host, .optimize = .ReleaseSafe, .link_libc = true });
     const api_fast = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = b.graph.host, .optimize = .ReleaseSafe, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes_fast }} });
     b.step("test-runner-proof-host", "Multiply and loop replies on the real frontend and CPU circuit (TF_RUNNER_CIRCUIT)").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = api_fast, .filters = &.{"runner proof:"} })).step);
+    b.step("test-settle-fire-host", "TF_DSV41_RUNNER_SYNC_GRAPH on the fake target: fires settled at their trigger never hold").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = lanes, .filters = &.{"settled fires:"} })).step);
     b.step("test-compute-runner-host", "S3: lane calls on the circuit, their fallbacks and knobs, with a scripted backend").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = api, .filters = &.{"compute runner:"} })).step);
     b.step("test-compute-runner-proof-host", "S3 on recorded arm-d calls: the real frontend and CPU circuit (TF_RUNNER_CIRCUIT)").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = api_fast, .filters = &.{"compute runner proof:"} })).step);
     const copies = b.step("test-root-copy-host", "Root copy precedence, drafter absorption and real worker checks without GPU");

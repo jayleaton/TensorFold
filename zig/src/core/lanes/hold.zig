@@ -47,3 +47,23 @@ pub fn resumeAwaiting(s: *Stream, gpa: Allocator, tokens: []const u32) Allocator
     s.awaiting = false;
     return true;
 }
+
+/// At a runner trigger in `commit`: forces the hook's settled result (cut to the room left) instead of a hold.
+pub fn settle(s: *Stream, gpa: Allocator, r: @import("stream.zig").RunnerHook) Allocator.Error!bool {
+    const ids = (r.settled orelse return false)(r.ptr) orelse return false;
+    const room: usize = @intCast(@max(0, s.budgetLeft() - 1));
+    try s.force.appendSlice(gpa, ids[0..@min(ids.len, room)]);
+    if (ids.len > 0 and room > 0) s.settle = .matching;
+    return s.settle == .matching;
+}
+
+/// A later token of the settling commit: false cuts the commit there (not the result's next token), else it lands.
+pub fn settledNext(s: *Stream, t: u32) bool {
+    if (s.force.items.len == 0 or s.force.items[0] != t) {
+        s.settle = .cut;
+        return false;
+    }
+    _ = s.force.orderedRemove(0);
+    if (s.force.items.len == 0) s.settle = .none;
+    return true;
+}

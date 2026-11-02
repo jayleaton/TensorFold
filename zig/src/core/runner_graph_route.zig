@@ -348,19 +348,40 @@ pub const Routed = struct {
         return .{ .ctx = r, .translate = translate };
     }
 
-    fn translate(ctx: ?*anyopaque, a: Allocator, cell: api.Cell) Allocator.Error!api.Translation {
-        const r: *Routed = @ptrCast(@alignCast(ctx.?));
-        if (try graph.bindCell(a, r.bank, cell)) |bytes|
-            return .{ .program = .{ .kind = .graph, .bytes = bytes } };
+    /// The graph steps before the inner frontend (no compile): T1's binding, a straight-line program, a whole script.
+    fn graphFirst(r: *const Routed, a: Allocator, cell: api.Cell) Allocator.Error!?[]u8 {
+        if (try graph.bindCell(a, r.bank, cell)) |bytes| return bytes;
         if (cell.form != .inline_expr and std.mem.eql(u8, cell.lang, "python") and !prog.shadowed(cell.prior))
-            if (try prog.program(a, r.bank, cell.code)) |bytes| return .{ .program = .{ .kind = .graph, .bytes = bytes } };
+            if (try prog.program(a, r.bank, cell.code)) |bytes| return bytes;
         // a whole script the frontend checks runs on the bank before any compile; earlier cells' names stay on its path
         if (cell.form != .inline_expr and std.mem.eql(u8, cell.lang, "python") and cell.prior.len == 0)
-            if (try @import("runner_graph_table.zig").translate(a, r.bank, cell.code)) |bytes| return .{ .program = .{ .kind = .graph, .bytes = bytes } };
+            if (try @import("runner_graph_table.zig").translate(a, r.bank, cell.code)) |bytes| return bytes;
+        return null;
+    }
+
+    fn translate(ctx: ?*anyopaque, a: Allocator, cell: api.Cell) Allocator.Error!api.Translation {
+        const r: *Routed = @ptrCast(@alignCast(ctx.?));
+        if (try r.graphFirst(a, cell)) |bytes| return .{ .program = .{ .kind = .graph, .bytes = bytes } };
         const t = try r.inner.translate(r.inner.ctx, a, cell);
         if (t == .abstain) if (try prog.direct(a, r.bank, cell, t.abstain)) |bytes| return .{ .program = .{ .kind = .graph, .bytes = bytes } };
         if (t != .program or t.program.kind != .calc) return t;
         const bytes = try lower(a, r.bank, t.program.bytes) orelse return t;
+        return .{ .program = .{ .kind = .graph, .bytes = bytes } };
+    }
+};
+
+/// TF_DSV41_RUNNER_SYNC_GRAPH on the engine thread: the whole route for an inline value, else its graph steps only.
+pub const Quick = struct {
+    routed: *Routed,
+
+    pub fn frontend(q: *Quick) api.Frontend {
+        return .{ .ctx = q, .translate = translate };
+    }
+
+    fn translate(ctx: ?*anyopaque, a: Allocator, cell: api.Cell) Allocator.Error!api.Translation {
+        const q: *Quick = @ptrCast(@alignCast(ctx.?));
+        if (cell.form == .inline_expr) return Routed.translate(q.routed, a, cell);
+        const bytes = try q.routed.graphFirst(a, cell) orelse return .{ .abstain = .unsupported };
         return .{ .program = .{ .kind = .graph, .bytes = bytes } };
     }
 };
