@@ -352,6 +352,9 @@ pub const Routed = struct {
         const r: *Routed = @ptrCast(@alignCast(ctx.?));
         if (cell.form != .inline_expr and std.mem.eql(u8, cell.lang, "python") and !prog.shadowed(cell.prior))
             if (try prog.program(a, r.bank, cell.code)) |bytes| return .{ .program = .{ .kind = .graph, .bytes = bytes } };
+        // a whole script the frontend checks runs on the bank before any compile; earlier cells' names stay on its path
+        if (cell.form != .inline_expr and std.mem.eql(u8, cell.lang, "python") and cell.prior.len == 0)
+            if (try @import("runner_graph_table.zig").translate(a, r.bank, cell.code)) |bytes| return .{ .program = .{ .kind = .graph, .bytes = bytes } };
         const t = try r.inner.translate(r.inner.ctx, a, cell);
         if (t == .abstain) if (try prog.direct(a, r.bank, cell, t.abstain)) |bytes| return .{ .program = .{ .kind = .graph, .bytes = bytes } };
         if (t != .program or t.program.kind != .calc) return t;
@@ -383,6 +386,25 @@ pub const Dispatch = struct {
         end: ?api.Result = null,
         delivered: bool = false,
         bytes: []u8,
+
+        /// Appends a piece's text and its separator (S a space, N a newline, J none); false when the run ended here.
+        fn say(q: *Seq, gpa: Allocator, text: []const u8, sep: u8) bool {
+            const end: []const u8 = switch (sep) {
+                'S' => " ",
+                'N' => "\n",
+                'J' => "",
+                else => {
+                    q.end = .{ .status = .fault, .steps = q.steps };
+                    return false;
+                },
+            };
+            q.out.appendSlice(gpa, text) catch {
+                q.end = .{ .status = .abstain, .abstain = .too_big };
+                return false;
+            };
+            q.out.appendSlice(gpa, end) catch {};
+            return true;
+        }
     };
 
     pub fn backend(d: *Dispatch) api.Backend {
@@ -434,6 +456,12 @@ pub const Dispatch = struct {
                     q.end = .{ .status = .fault };
                     return;
                 }
+                // a text piece (a tuple's parentheses and comma) prints as written, with no run
+                if (line[0] == 'L') {
+                    q.lines = q.lines[nl + 1 ..];
+                    if (!q.say(d.gpa, line[3..], line[1])) return;
+                    continue;
+                }
                 q.job = d.graph.start(q.stream, .{ .kind = .graph, .bytes = line[3..] }, q.budget -| q.steps) catch return;
             }
             const r = switch (d.graph.poll(q.job.?)) {
@@ -445,24 +473,50 @@ pub const Dispatch = struct {
             q.exec_ns += r.exec_ns;
             const nl = std.mem.indexOfScalar(u8, q.lines, '\n').?;
             const kind = q.lines[0];
-            const sep: u8 = if (q.lines[1] == 'S') ' ' else '\n';
+            const sep = q.lines[1];
             q.lines = q.lines[nl + 1 ..];
             if (r.status != .ok) {
                 q.end = .{ .status = r.status, .abstain = r.abstain, .steps = q.steps, .exec_ns = q.exec_ns };
                 return;
             }
-            const v = std.mem.trimEnd(u8, r.out, "\n");
-            // a comparison's graph prints 1 or 0; Python prints the bool
-            const text = if (kind == 'I') v else if (std.mem.eql(u8, v, "1")) "True" else if (std.mem.eql(u8, v, "0")) "False" else {
+            var buf: [160]u8 = undefined;
+            const text = format(kind, std.mem.trimEnd(u8, r.out, "\n"), &buf) orelse {
                 q.end = .{ .status = .fault, .steps = q.steps };
                 return;
             };
-            q.out.appendSlice(d.gpa, text) catch {
-                q.end = .{ .status = .abstain, .abstain = .too_big };
-                return;
-            };
-            q.out.append(d.gpa, sep) catch {};
+            if (!q.say(d.gpa, text, sep)) return;
         }
+    }
+    /// A piece's printed value: I as is, B as Python's bool, F with `.0`, `1`..`6` at that fixed Decimal scale.
+    fn format(kind: u8, v: []const u8, buf: []u8) ?[]const u8 {
+        const digits = v[@intFromBool(v.len > 0 and v[0] == '-')..];
+        if (digits.len == 0 or digits.len + 3 > buf.len) return null;
+        for (digits) |c| if (!std.ascii.isDigit(c)) return null;
+        return switch (kind) {
+            'I' => v,
+            // a comparison's graph prints 1 or 0
+            'B' => if (std.mem.eql(u8, v, "1")) "True" else if (std.mem.eql(u8, v, "0")) "False" else null,
+            'F' => std.fmt.bufPrint(buf, "{s}.0", .{v}) catch null,
+            '1'...'6' => fixed(v, kind - '0', buf),
+            else => null,
+        };
+    }
+    /// Decimal's str of coefficient v at `scale` places (the runtime's tf_wfixed): 0.0042, -12.50.
+    fn fixed(v: []const u8, scale: usize, buf: []u8) ?[]const u8 {
+        const neg = v[0] == '-';
+        const digits = v[@intFromBool(neg)..];
+        var w: std.Io.Writer = .fixed(buf);
+        if (neg) w.writeByte('-') catch return null;
+        if (digits.len <= scale) {
+            w.writeAll("0.") catch return null;
+            w.splatByteAll('0', scale - digits.len) catch return null;
+            w.writeAll(digits) catch return null;
+        } else {
+            w.writeAll(digits[0 .. digits.len - scale]) catch return null;
+            w.writeByte('.') catch return null;
+            w.writeAll(digits[digits.len - scale ..]) catch return null;
+        }
+        return w.buffered();
     }
     fn find(d: *Dispatch, id: api.JobId) ?*Seq {
         for (d.seqs.items) |q| if (q.id == id) return q;

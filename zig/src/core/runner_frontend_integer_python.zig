@@ -25,7 +25,8 @@ fn checked(a: Allocator, code: []const u8, budget: usize) Failure!integer.Lowere
     var steps: ?usize = null;
     const roots = script.roots[0..script.count];
     if (budget != 0) steps = cost.estimateMany(parser, roots, budget) orelse return error.Unsupported;
-    return .{ .source = try integer.lowerPrints(a, parser, roots, script.endings[0..script.count]), .estimated_steps = steps };
+    const endings = script.endings[0..script.count];
+    return .{ .source = try integer.lowerPrints(a, parser, roots, endings), .estimated_steps = steps, .table = integer.table(parser, roots, endings, null, null) };
 }
 
 // Shares whole-script validation with the RV32 path, including unused assignments and import gates.
