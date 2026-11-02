@@ -230,7 +230,6 @@ fn check(parser: *ast.Parser, text: []const u8) ast.Invalid!void {
     if (!parser.boolean(root) or parser.nodes[root].value == 0) return error.Unsupported;
     parser.reset(m); // its nodes only proved it: they never print
     parser.asserted = true;
-
 }
 
 fn printRoots(parser: *ast.Parser, outputs: *Outputs, text: []const u8, multiple: bool) ast.Invalid!void {
