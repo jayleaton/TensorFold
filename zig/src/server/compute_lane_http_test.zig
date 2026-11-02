@@ -152,7 +152,7 @@ test "compute lane: a held python call's result is forced in as the template's t
     try t.expectEqualStrings("ok", report.strField("status").?);
     try t.expect(report.get("inserted").?.bool);
     // S3 off: the reply names no executor and counts none (the lane's reply as before)
-    try t.expect(report.get("executor") == null and compute.get("runner_calls") == null);
+    try t.expect(report.get("executor") == null and report.get("call_ms") == null and compute.get("runner_calls") == null);
 }
 
 test "compute lane: code_interpreter on a server without the lane is refused before the engine sees it" {
@@ -202,6 +202,15 @@ const Circuit = struct {
     }
     fn noop(_: *anyopaque, _: u64) void {}
 };
+
+/// A report's millisecond field: a float, or an int when it printed without a fraction.
+fn ms(v: json.Value) f64 {
+    return switch (v) {
+        .float => |x| x,
+        .int => |text| std.fmt.parseFloat(f64, text) catch -1,
+        else => -1,
+    };
+}
 
 /// One held call of `code` through the chat route with S3 on: the forced tokens and the result turn they must equal.
 const S3Run = struct { reply: Reply, inserted: []const u32, want: []const u32, report: json.Value, compute: json.Value };
@@ -263,6 +272,8 @@ test "compute runner: a held call the circuit runs inserts the lane's own result
     try t.expectEqualSlices(u32, r.want, r.inserted);
     try t.expectEqualStrings("in-model runner", r.report.strField("executor").?);
     try t.expectEqualStrings("calc", r.report.strField("program").?);
+    // the server's time on the call covers the run's own
+    try t.expect(ms(r.report.get("call_ms").?) >= ms(r.report.get("exec_ms").?));
     try t.expectEqual(@as(i64, 1), r.compute.get("runner_calls").?.int64().?);
     try t.expectEqual(@as(i64, 0), r.compute.get("tool_calls").?.int64().?);
 }

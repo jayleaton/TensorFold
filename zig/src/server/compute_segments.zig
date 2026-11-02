@@ -140,6 +140,7 @@ fn runAll(a: Allocator, srv: *Server, cfg: lane.Config, calls: []const Value, ra
         var body: []const u8 = undefined;
         var s3: ?s3_api.Outcome = null;
         var verify: ?bool = null;
+        const t0 = s3_api.nowNs();
         if (ran.* >= cfg.max_calls) {
             body = "[call limit reached: answer without running more code]";
         } else {
@@ -166,7 +167,7 @@ fn runAll(a: Allocator, srv: *Server, cfg: lane.Config, calls: []const Value, ra
             ran.* += 1;
         }
         slot.* = try report(a, c, code orelse "", o, try capTokens(a, srv, body, cfg.max_result_tokens));
-        if (srv.compute_exec != null) try executor(a, slot.object, s3, verify);
+        if (srv.compute_exec != null) try executor(a, slot.object, s3, verify, s3_api.nowNs() - t0);
     }
     return out;
 }
@@ -183,8 +184,10 @@ fn ownedOf(s3: ?s3_api.Outcome) ?s3_api.Owned {
 }
 
 /// S3's report fields: who produced the inserted body (never both), what ran it or why the circuit declined.
-fn executor(a: Allocator, r: *json.Object, s3: ?s3_api.Outcome, verify: ?bool) Allocator.Error!void {
+fn executor(a: Allocator, r: *json.Object, s3: ?s3_api.Outcome, verify: ?bool, call_ns: u64) Allocator.Error!void {
     const w = ownedOf(s3);
+    // the server's whole time on the call (translate, queue, run; both executors under verify), beside exec_ms's run
+    try r.put(a, "call_ms", .{ .float = @as(f64, @floatFromInt(call_ns)) / 1e6 });
     const by_circuit = w != null and verify == null;
     try r.put(a, "executor", .{ .string = if (by_circuit) s3_api.in_model else s3_api.code_tool });
     if (by_circuit) {

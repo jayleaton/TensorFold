@@ -123,53 +123,6 @@ test "compute runner: a lane call is a fresh python fence cell: no earlier call'
     try std.testing.expectEqual(@as(usize, 0), f.front.last.prior.len);
 }
 
-test "compute runner: a straight-line integer script folds into its last line; the frontend gets the folded cell" {
-    var f: Fixture = .{};
-    defer f.arena.deinit();
-    const a = f.arena.allocator();
-    const cases = [_][2][]const u8{
-        .{ "a=140857552301908510213574088100\nb=690019271788334891377792747413\nprint(a+b)\n", "print((140857552301908510213574088100)+(690019271788334891377792747413))" },
-        .{ "x = 7  # seven\n\nx *= x + 1\nx", "((7) * ((7) + 1))" },
-        .{ "n = 2**64\nm = n - 1\nprint(pow(m, 3, n))", "print(pow(((2**64) - 1), 3, (2**64)))" },
-        .{ "a = 5\na = a + 1\nprint(-a**2)", "print(-((5) + 1)**2)" },
-    };
-    for (cases) |c| try std.testing.expectEqualStrings(c[1], (try s3.fold(a, c[0])).?);
-    _ = try f.run(.{}, cases[0][0], null);
-    try std.testing.expectEqualStrings(cases[0][1], f.front.last.code);
-}
-
-test "compute runner: any other shape is not folded: unread or unbound names, strings, blocks, several outputs" {
-    var arena: std.heap.ArenaAllocator = .init(gpa);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const left = [_][]const u8{
-        "print(2**100 - 3**50)", // nothing to fold: the frontend takes it as written
-        "x = 1//0\nprint(5)", // unread binding: Python raises, a fold would print 5
-        "x = 1\nx = 2\nprint(x)", // overwritten before it is read
-        "print(y + 1)\n",
-        "y += 1\nprint(y)", // NameError
-        "a = 1\nprint(a, a)", // print joins two values
-        "a = 1\na, a",
-        "a = 1\nprint(a)\nprint(a)",
-        "a = 1\nprint(a)\nb = 2",
-        "s = 'x'\nprint(s)",
-        "import math\na = 2\nprint(a)",
-        "a = 1.5\nprint(a)",
-        "a = 1\nif a:\n    print(a)",
-        "a = 1\nprint(a == 1)",
-        "print = 3\nprint(print)",
-        "a, b = 1, 2\nprint(a + b)",
-        "a = 1\nprint(len(a))",
-        "a = 1\nprint(a)+print(a)",
-    };
-    for (left) |code| {
-        if (try s3.fold(a, code)) |got| {
-            std.debug.print("folded \"{s}\" to \"{s}\"\n", .{ code, got });
-            return error.TestUnexpectedResult;
-        }
-    }
-}
-
 test "compute runner: every frontend abstain declines with its reason and starts nothing" {
     var f: Fixture = .{};
     defer f.arena.deinit();
@@ -225,8 +178,8 @@ test "compute runner: S3 knobs: defaults, values and bad values" {
     };
     Env.pairs = &.{};
     try std.testing.expectEqual(s3.Config{}, try s3.Config.parse(Env.get, "X"));
-    Env.pairs = &.{ .{ "X_WALL_MS", "50" }, .{ "X_BUSY_MS", "0" }, .{ "X_VERIFY", "1" } };
-    try std.testing.expectEqual(s3.Config{ .wall_ms = 50, .busy_ms = 0, .verify = true }, try s3.Config.parse(Env.get, "X"));
+    Env.pairs = &.{ .{ "X_WALL_MS", "50" }, .{ "X_BUSY_MS", "0" }, .{ "X_VERIFY", "1" }, .{ "X_ELF", "1" } };
+    try std.testing.expectEqual(s3.Config{ .wall_ms = 50, .busy_ms = 0, .verify = true, .elf = true }, try s3.Config.parse(Env.get, "X"));
     Env.pairs = &.{.{ "X_VERIFY", "2" }};
     try std.testing.expectError(error.BadKnob, s3.Config.parse(Env.get, "X"));
     Env.pairs = &.{.{ "X_WALL_MS", "0" }};

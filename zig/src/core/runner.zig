@@ -21,6 +21,7 @@ pub const Config = struct {
     place: place.Config = .{}, // PREFIX_CPUS / PREFIX_NICE: where the runner's threads run (core/runner_place.zig)
     settle_us: u32 = 0, // PREFIX_SETTLE_US: a held tick waits this long for its cell; 0: one stage per tick (as before)
     guide: []const u8 = "", // PREFIX_GUIDE: "1" RUNNER-GUIDE.md, else a file, as chats' default guide (server/runner_guide.zig)
+    compile: bool = true, // false: the frontend never builds an ELF (no clang); calc and graph programs only (S3)
 
     /// PREFIX "1" enables (unset, "" or "0": null); PREFIX_* knobs override defaults; a bad value is error.BadKnob.
     pub fn parse(get: *const fn ([]const u8) ?[]const u8, comptime prefix: []const u8) error{BadKnob}!?Config {

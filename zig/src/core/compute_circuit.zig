@@ -9,17 +9,19 @@ const Allocator = std.mem.Allocator;
 pub const in_model = "in-model runner";
 pub const code_tool = "code tool";
 
-/// S3's knobs beside the runner's under the same prefix (PREFIX_WALL_MS, PREFIX_BUSY_MS, PREFIX_VERIFY).
+/// S3's knobs beside the runner's under the same prefix (PREFIX_WALL_MS, PREFIX_BUSY_MS, PREFIX_VERIFY, PREFIX_ELF).
 pub const Config = struct {
     wall_ms: u32 = 2000, // the safety net: a run still going is cancelled and the call goes to the sandbox
     busy_ms: u32 = 2000, // how long a call waits for a free backend slot before it goes to the sandbox
     verify: bool = false, // shadow: the sandbox runs too, its result is inserted and the bodies compared
+    elf: bool = false, // compile ELF programs too: off, as clang alone (80-410 ms) loses to the sandbox (~15 ms)
 
     pub fn parse(get: *const fn ([]const u8) ?[]const u8, comptime prefix: []const u8) error{BadKnob}!Config {
         var c: Config = .{};
         c.wall_ms = try knob(u32, get, prefix ++ "_WALL_MS", c.wall_ms, 1, 3_600_000);
         c.busy_ms = try knob(u32, get, prefix ++ "_BUSY_MS", c.busy_ms, 0, 3_600_000);
         c.verify = try knob(u1, get, prefix ++ "_VERIFY", 0, 0, 1) == 1;
+        c.elf = try knob(u1, get, prefix ++ "_ELF", 0, 0, 1) == 1;
         return c;
     }
 
@@ -61,8 +63,7 @@ pub const Exec = struct {
 
     /// The call's code as a fresh fence cell (a lane call sees no earlier call's names), run to its halt or declined.
     pub fn run(e: *Exec, a: Allocator, code: []const u8, hook: ?lane.Cancel) Allocator.Error!Outcome {
-        const cell = try fold(a, code) orelse code;
-        const t = try e.frontend.translate(e.frontend.ctx, a, .{ .form = .fence, .lang = "python", .code = cell });
+        const t = try e.frontend.translate(e.frontend.ctx, a, .{ .form = .fence, .lang = "python", .code = code });
         const program = switch (t) {
             .program => |p| p,
             .abstain => |why| return .{ .declined = from(why) },
@@ -133,144 +134,6 @@ pub fn body(a: Allocator, out: []const u8) Allocator.Error![]u8 {
     return lane.runner.body(a, .{ .status = .ok, .stdout = out }, 0, 0);
 }
 
-/// `a = ...` / `a op= ...` lines, then print(expr) or an expr: that last line with names bound in parentheses, or null.
-pub fn fold(a: Allocator, code: []const u8) Allocator.Error!?[]u8 {
-    for (code) |c| switch (c) {
-        '0'...'9', 'a'...'z', 'A'...'Z', '_', ' ', '\t', '\r', '\n', '+', '-', '*', '/', '%', '(', ')', ',', '=', '#' => {},
-        else => return null,
-    };
-    var arena: std.heap.ArenaAllocator = .init(a);
-    defer arena.deinit();
-    const s = arena.allocator();
-    var names: [32]Binding = undefined;
-    var n: usize = 0;
-    var last: ?[]const u8 = null;
-    var lines = std.mem.splitScalar(u8, code, '\n');
-    while (lines.next()) |raw| {
-        const line = std.mem.trimEnd(u8, raw[0 .. std.mem.indexOfScalar(u8, raw, '#') orelse raw.len], " \t\r");
-        if (line.len == 0) continue;
-        if (last != null or line[0] == ' ' or line[0] == '\t') return null;
-        const eq = std.mem.indexOfScalar(u8, line, '=') orelse {
-            last = line;
-            continue;
-        };
-        if (std.mem.indexOfScalarPos(u8, line, eq + 1, '=') != null) return null;
-        var lhs = std.mem.trimEnd(u8, line[0..eq], " \t");
-        const op = augmented(lhs);
-        lhs = std.mem.trimEnd(u8, lhs[0 .. lhs.len - op.len], " \t");
-        if (!identifier(lhs) or reserved(lhs)) return null;
-        var value = try substitute(s, names[0..n], line[eq + 1 ..]) orelse return null;
-        const slot = for (names[0..n], 0..) |x, i| {
-            if (std.mem.eql(u8, x.name, lhs)) break i;
-        } else null;
-        if (op.len > 0) {
-            const old = &names[slot orelse return null]; // NameError in Python
-            old.used = true;
-            value = try std.fmt.allocPrint(s, "{s} {s} ({s})", .{ old.value, op, value });
-        }
-        if (value.len > max_cell) return null;
-        const b: Binding = .{ .name = lhs, .value = try std.fmt.allocPrint(s, "({s})", .{value}) };
-        if (slot) |i| {
-            if (!names[i].used) return null; // an unread `x = 1//0` raises in Python: a fold would drop it
-            names[i] = b;
-        } else {
-            if (n == names.len) return null;
-            names[n] = b;
-            n += 1;
-        }
-    }
-    const tail = last orelse return null;
-    if (n == 0) return null;
-    const call = std.mem.startsWith(u8, tail, "print(") and (closes(tail, "print(".len - 1) orelse 0) == tail.len - 1;
-    const expr = if (call) tail["print(".len .. tail.len - 1] else tail;
-    if (topComma(expr)) return null;
-    const folded = try substitute(s, names[0..n], expr) orelse return null;
-    for (names[0..n]) |b| if (!b.used) return null; // the same: every binding is read
-    if (folded.len > max_cell) return null;
-    return if (call) try std.fmt.allocPrint(a, "print({s})", .{folded}) else try a.dupe(u8, folded);
-}
-
-const Binding = struct { name: []const u8, value: []const u8, used: bool = false };
-const max_cell = 4096; // the frontend's own length limit
-
-/// `expr` with bound names replaced by their parenthesised values; null on other names (pow and abs pass through).
-fn substitute(s: Allocator, names: []Binding, expr: []const u8) Allocator.Error!?[]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    var i: usize = 0;
-    while (i < expr.len) {
-        const c = expr[i];
-        const start = i;
-        if (std.ascii.isAlphanumeric(c) or c == '_') {
-            while (i < expr.len and (std.ascii.isAlphanumeric(expr[i]) or expr[i] == '_')) i += 1;
-            const word = expr[start..i];
-            if (std.ascii.isDigit(c)) {
-                try out.appendSlice(s, word); // a literal, kept as written
-                continue;
-            }
-            const b = for (names) |*x| {
-                if (std.mem.eql(u8, x.name, word)) break x;
-            } else {
-                if (!std.mem.eql(u8, word, "pow") and !std.mem.eql(u8, word, "abs")) return null;
-                try out.appendSlice(s, word);
-                continue;
-            };
-            b.used = true;
-            try out.appendSlice(s, b.value);
-            if (out.items.len > max_cell) return null;
-            continue;
-        }
-        try out.append(s, c);
-        i += 1;
-    }
-    const text = std.mem.trim(u8, out.items, " \t");
-    return if (text.len == 0) null else text;
-}
-
-/// The operator of an augmented assignment's left side (`a +=` gives "+"), "" for plain `=`.
-fn augmented(lhs: []const u8) []const u8 {
-    for ([_][]const u8{ "**", "//", "+", "-", "*", "/", "%" }) |op| if (std.mem.endsWith(u8, lhs, op)) return op;
-    return "";
-}
-
-fn identifier(word: []const u8) bool {
-    if (word.len == 0 or std.ascii.isDigit(word[0])) return false;
-    for (word) |c| if (!std.ascii.isAlphanumeric(c) and c != '_') return false;
-    return true;
-}
-
-/// Names a binding may not take: keywords and the calls the fold treats as builtins.
-fn reserved(word: []const u8) bool {
-    const words = [_][]const u8{ "print", "pow", "abs", "and", "or", "not", "in", "is", "if", "else", "for", "while", "def", "del", "lambda", "return", "import", "from", "as", "pass", "class", "global", "nonlocal", "assert", "with", "yield", "try", "except", "finally", "raise", "break", "continue", "elif", "await", "async", "True", "False", "None" };
-    for (words) |w| if (std.mem.eql(u8, w, word)) return true;
-    return false;
-}
-
-/// The index of the parenthesis closing the one at `open`, or null.
-fn closes(text: []const u8, open: usize) ?usize {
-    var depth: usize = 0;
-    for (text[open..], open..) |c, i| switch (c) {
-        '(' => depth += 1,
-        ')' => {
-            depth -= 1;
-            if (depth == 0) return i;
-        },
-        else => {},
-    };
-    return null;
-}
-
-/// A comma outside parentheses: print would join several values, a bare expression would be a tuple.
-fn topComma(expr: []const u8) bool {
-    var depth: usize = 0;
-    for (expr) |c| switch (c) {
-        '(' => depth += 1,
-        ')' => depth -|= 1,
-        ',' => if (depth == 0) return true,
-        else => {},
-    };
-    return false;
-}
-
 fn from(why: api.Abstain) Decline {
     return switch (why) {
         inline else => |w| @field(Decline, @tagName(w)),
@@ -287,7 +150,7 @@ fn sleepMs(ms: u64) void {
     _ = std.c.nanosleep(&ts, null);
 }
 
-fn nowNs() u64 {
+pub fn nowNs() u64 {
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &ts);
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
