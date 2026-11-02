@@ -94,6 +94,7 @@ const inline_cases = [_]Case{
     .{ .code = "0.125*2", .expected = "0.25\n", .form = .inline_expr },
     .{ .code = "1/3+2/3", .expected = "1\n", .form = .inline_expr },
     .{ .code = "11/18", .expected = "11/18\n", .form = .inline_expr },
+    .{ .code = "gcd(48,18)", .expected = "6\n", .form = .inline_expr },
 };
 
 fn configured(clang: []const u8, linker: ?[]const u8) f.Context {

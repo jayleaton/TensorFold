@@ -24,6 +24,7 @@ fn prove(leads: []const []const u8, wants: []const []const u8) !void {
     for (models, leads) |*m, l| m.* = .{ .lead = l };
     // TF_RUNNER_LLD: an absolute ld.lld for hosts without lld beside clang (the image installs lld-18 there)
     var ctx: frontend.Context = .{ .io = std.testing.io };
+    if (std.c.getenv("TF_RUNNER_CLANG")) |clang| ctx.compiler.clang = std.mem.span(clang);
     if (std.c.getenv("TF_RUNNER_LLD")) |l| ctx.compiler.linker = std.mem.span(l);
     const texts = try rt.replies(models, .{ .frontend = ctx.frontend(), .backend = b, .wait_s = 600 }, &fake);
     defer rt.freeAll(texts);
@@ -378,4 +379,8 @@ test "runner proof: S1's and S2's six saved cells take the graph route and print
         try std.testing.expect(r.status != .ok);
     }
     b.release(1);
+}
+
+comptime {
+    _ = @import("runner_frontend_inline_regression_test.zig");
 }

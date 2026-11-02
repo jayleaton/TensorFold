@@ -306,8 +306,11 @@ pub fn shadowed(prior: []const []const u8) bool {
 pub fn direct(a: Allocator, bank: *const graph.Bank, cell: api.Cell, why: api.Abstain) Allocator.Error!?[]u8 {
     if ((why != .unsupported and why != .too_big) or cell.form == .fence or !std.mem.eql(u8, cell.lang, "python")) return null;
     var src = std.mem.trim(u8, cell.code, " \t\n");
-    if (std.mem.startsWith(u8, src, ">>>")) src = std.mem.trim(u8, src[3..], " \t");
-    if (src.len == 0 or src.len > 4096) return null;
+    if (cell.form != .inline_expr and std.mem.startsWith(u8, src, ">>>")) src = std.mem.trim(u8, src[3..], " \t");
+    if (src.len == 0 or src.len > 4096 or shadowed(cell.prior)) return null;
+    if (cell.prior.len == 0)
+        if (try @import("runner_frontend_inline_integer.zig").lower(a, bank, src, cell.form == .inline_expr)) |bytes|
+            return bytes;
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(a);
     var i: usize = 0;

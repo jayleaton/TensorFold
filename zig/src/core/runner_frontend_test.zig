@@ -66,15 +66,23 @@ test "frontend accepts model multiply and REPL power without computing the answe
 }
 
 test "frontend declines unsupported code and Python output mismatches" {
-    const front = f.frontend();
+    var env = try t.environ.createMap(t.allocator);
+    defer env.deinit();
+    var context: f.Context = .{ .io = t.io, .compiler = .{
+        .clang = env.get("TF_RUNNER_CLANG") orelse "/usr/bin/clang",
+        .linker = env.get("TF_RUNNER_LLD"),
+    } };
+    const front = context.frontend();
     const cases = [_][2][]const u8{
-        .{ "javascript", "2*3" },            .{ "python", "print(missing)" },  .{ "python", "import os" },
-        .{ "python", "print(1/3)" },         .{ "python", "print(1.25*2.4)" }, .{ "python", "gcd(2,4)" },
-        .{ "python", "print(2); print(3)" }, .{ "python", "10**100" },         .{ "python", "1//0" },
-        .{ "exact", "1/3" },                 .{ "calc", "1.25*2.4" },
+        .{ "javascript", "2*3" },                  .{ "python", "print(missing)" },  .{ "python", "import os" },
+        .{ "python", "print(1/3)" },               .{ "python", "print(1.25*2.4)" }, .{ "python", "gcd(2,4)" },
+        .{ "python", "print(2); print(missing)" }, .{ "python", "10**100" },         .{ "python", "1//0" },
+        .{ "exact", "1/3" },                       .{ "calc", "1.25*2.4" },
     };
     for (cases) |case| {
         const result = try front.translate(front.ctx, t.allocator, .{ .form = .fence, .lang = case[0], .code = case[1] });
+        defer if (result == .program) t.allocator.free(result.program.bytes);
+        if (result == .program) std.debug.print("unexpectedly accepted {s}: {s}\n", .{ case[0], case[1] });
         try t.expect(result == .abstain);
     }
 }
@@ -111,6 +119,7 @@ test "real compiler emits circuit ELF for loops and C with negative controls" {
     };
     const front = context.frontend();
     const cases = [_][4][]const u8{
+        .{ "python", "print(2); print(3)", "prints.elf", "2\n3\n" },
         .{ "python", "print(sum(i*i for i in range(10)))", "squares.elf", "285\n" },
         .{ "python", "print(sum(i+i for i in range(10)))", "addition.elf", "90\n" },
         .{ "python", "s = 0\nfor i in range(10):\n    s += i*i\nprint(s)", "loop.elf", "285\n" },

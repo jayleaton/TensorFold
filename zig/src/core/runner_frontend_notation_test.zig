@@ -58,16 +58,22 @@ test "inline exact notation prints finite decimals or natural fractions through 
 }
 
 test "inline math declines incomplete ambiguous repeating and unsafe notation" {
-    const front = f.frontend();
+    var env = try t.environ.createMap(t.allocator);
+    defer env.deinit();
+    var context: f.Context = .{ .io = t.io, .compiler = .{
+        .clang = env.get("TF_RUNNER_CLANG") orelse "/usr/bin/clang",
+        .linker = env.get("TF_RUNNER_LLD"),
+    } };
+    const front = context.frontend();
     const bad = [_][]const u8{
-        "1,000+2",    "2*3,18",  "1+2=3",      "1=1=1",   "1/",      "(2+3",    "1+",    "...",       "2.",
-        "print(1/2)", ">>> 1/2", "gcd(48,18)", "20%%",    "+1/3",
+        "1,000+2",    "2*3,18",  "1+2=3",           "1=1=1",   "1/",      "(2+3",    "1+",    "...",       "2.",
+        "print(1/2)", ">>> 1/2", "gcd(48,missing)", "20%%",    "+1/3",
         "×2",
-        "2\n3",       "3/0",     "1.0/3",      "0.1+1/3", "0.01//2", "10**100", "2**-1", "0.1/(2-2)", "10^100",
+        "2\n3",       "3/0",     "1.0/3",           "0.1+1/3", "0.01//2", "10**100", "2**-1", "0.1/(2-2)", "10^100",
         "2^-1",       "2^",      "^2",
     };
     for (bad) |source| {
-        const result = try front.translate(null, t.allocator, .{ .form = .inline_expr, .lang = "python", .code = source });
+        const result = try front.translate(front.ctx, t.allocator, .{ .form = .inline_expr, .lang = "python", .code = source });
         if (result == .program) {
             defer t.allocator.free(result.program.bytes);
             std.debug.print("inline unexpectedly accepted: {s}\n", .{source});
