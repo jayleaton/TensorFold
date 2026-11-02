@@ -196,7 +196,7 @@ fn range(p: *Parser, depth: usize) Invalid!usize {
     if (start) |first| {
         if (count != 0) elems[0] = first;
         const inc = if (count > 1) step orelse try number(p, 1) else 0;
-        for (1..count) |k| elems[k] = try p.add(.{ .op = .add, .l = elems[k - 1], .r = inc });
+        for (1..@max(count, 1)) |k| elems[k] = try p.add(.{ .op = .add, .l = elems[k - 1], .r = inc });
     } else for (0..count) |k| {
         elems[k] = try number(p, k);
     }

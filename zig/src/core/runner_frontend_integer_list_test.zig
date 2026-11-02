@@ -36,6 +36,8 @@ const cases = [_][2][]const u8{
     .{ "xs = [1, 2]\nprint(xs)\nprint(len(xs))\n", "[1, 2]\n2\n" },
     .{ "print([x for x in range(20) if x % 2 == 0 if x % 3 == 0])\n", "[0, 6, 12, 18]\n" },
     .{ "print(list(range(12)))\n", "[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]\n" },
+    // an empty range with a start (T5: `sum(range(3,1))` panicked in ReleaseSafe)
+    .{ "print(sum(range(3, 1)), len(range(4, 2)), sum(range(2, 2, 3)))\n", "0 0 0\n" },
     .{ "k = 3\nxs = [k, k * 2]\nk = 10\nprint(xs, k)\n", "[3, 6] 10\n" },
     .{ "print([1, 2, 3,][1], len(range(7, 1, -2)), range(10)[3])\n", "2 3 3\n" },
     .{ "xs = sorted([5, 3, 8])\nprint(xs[0] + xs[-1])\n", "11\n" },
