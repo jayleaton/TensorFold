@@ -22,6 +22,7 @@ pub const Config = struct {
     settle_us: u32 = 0, // PREFIX_SETTLE_US: a held tick waits this long for its cell; 0: one stage per tick (as before)
     guide: []const u8 = "", // PREFIX_GUIDE: "1" RUNNER-GUIDE.md, else a file, as chats' default guide (server/runner_guide.zig)
     compile: bool = true, // false: the frontend never builds an ELF (no clang); calc and graph programs only (S3)
+    sync_graph: bool = false, // PREFIX_SYNC_GRAPH: a graph result settles at its trigger token, in that round (no hold)
 
     /// PREFIX "1" enables (unset, "" or "0": null); PREFIX_* knobs override defaults; a bad value is error.BadKnob.
     pub fn parse(get: *const fn ([]const u8) ?[]const u8, comptime prefix: []const u8) error{BadKnob}!?Config {
@@ -44,6 +45,8 @@ pub const Config = struct {
         c.max_tokens = try knob(u32, get, prefix ++ "_MAX_TOKENS", c.max_tokens, 1, 1 << 20);
         c.exact = try knob(u1, get, prefix ++ "_EXACT", 0, 0, 1) == 1;
         c.settle_us = try knob(u32, get, prefix ++ "_SETTLE_US", c.settle_us, 0, 100_000);
+        c.sync_graph = try knob(u1, get, prefix ++ "_SYNC_GRAPH", 0, 0, 1) == 1;
+        if (c.sync_graph and c.backend != .graph) return bad(prefix ++ "_SYNC_GRAPH", "1 (backend is not graph)");
         c.guide = get(prefix ++ "_GUIDE") orelse "";
         if (std.mem.eql(u8, c.guide, "0")) c.guide = "";
         c.place = try place.Config.parse(get, prefix);
@@ -103,6 +106,7 @@ pub const Runner = struct {
     text: ?Text = null,
     next_id: u64 = 1,
     placer: ?*place.Placer = null, // the backend's job threads and the translations run placed
+    quick: ?api.Frontend = null, // cfg.sync_graph: translates on the engine thread, graph programs or abstain only
 
     /// A reply's session; null until the server has given the runner its tokenizer.
     pub fn session(r: *Runner, ask: TraceAsk) Allocator.Error!?*Session {
@@ -150,10 +154,17 @@ pub const Session = struct {
     forcing: ?struct { at: u64, left: usize, cell: u32 } = null, // an owned result's forced tokens still to commit
     resume_ms: u64 = 0, // summed: an owned result's settling to the model's first token after it
     broken: bool = false, // out of memory once: no more cells, no more holds
+    sync_ids: []u32 = &.{}, // cfg.sync_graph: the result a trigger settled with, forced by the stream (hook.settled)
     format: []u8, // TraceAsk.format, owned
 
     pub fn hook(s: *Session) lanes.stream.RunnerHook {
-        return .{ .ptr = s, .token = onToken };
+        return .{ .ptr = s, .token = onToken, .settled = if (s.r.cfg.sync_graph) settled else null };
+    }
+
+    /// The tokens a trigger's run settled with at the token itself (once; null: hold for them as before).
+    fn settled(ptr: *anyopaque) ?[]const u32 {
+        const s: *Session = @ptrCast(@alignCast(ptr));
+        return if (s.sync_ids.len > 0) s.sync_ids else null;
     }
 
     fn onToken(ptr: *anyopaque, token: u32, think_open: bool, can_hold: bool) bool {
@@ -176,10 +187,23 @@ pub const Session = struct {
                 s.forcing = null;
             }
         }
+        if (s.sync_ids.len > 0) {
+            s.r.gpa.free(s.sync_ids);
+            s.sync_ids = &.{};
+        }
         const ev = try s.scan.feed(s.r.gpa, tx.bytes(tx.ctx, token), think_open);
         if (ev.closed) |c| try s.open(c);
         const t = ev.trigger orelse return false;
         if (!can_hold or t.index >= s.cells.items.len) return false;
+        if (s.r.cfg.sync_graph and !t.trace) if (try s.now(t)) |ids| {
+            // settled here: owned tokens go to the stream as forced ones (empty: abstained, the model's own text stays)
+            if (ids.len == 0) {
+                s.r.gpa.free(ids);
+                return false;
+            }
+            s.sync_ids = ids;
+            return true;
+        };
         s.waiting = t;
         s.held_at = nowNs();
         s.held_ticks = 0;
@@ -226,6 +250,17 @@ pub const Session = struct {
             return;
         }
         const task: Translate = .{ .cell = cell, .fe = s.r.frontend, .prior = prior, .placer = s.r.placer };
+        // sync_graph: what the quick frontend finds on the engine thread (graph steps; inline: all) needs no thread
+        if (s.r.cfg.sync_graph) if (s.r.quick) |q| {
+            const quick: api.Cell = .{ .form = cell.form, .lang = cell.lang, .code = cell.code, .prior = prior };
+            const t = q.translate(q.ctx, cell.arena.allocator(), quick) catch @as(api.Translation, .{ .abstain = .too_big });
+            // an inline value's quick translation is its whole one (no compile); other cells keep a graph program only
+            if (cell.form == .inline_expr or (t == .program and t.program.kind == .graph)) {
+                cell.translation = t;
+                cell.translated.store(true, .release);
+                return;
+            }
+        };
         // settling: an inline value (microseconds to translate) waits on no thread's start
         if (s.r.cfg.settle_us > 0 and c.form == .inline_expr) return task.run();
         cell.thread = std.Thread.spawn(.{}, Translate.spawned, .{task}) catch blk: {
@@ -245,6 +280,31 @@ pub const Session = struct {
         s.waiting = null;
         const held_ms = (nowNs() -| s.held_at) / std.time.ns_per_ms;
         s.held_ms += held_ms;
+        return try s.conclude(w, c, held_ms);
+    }
+
+    /// cfg.sync_graph at a trigger: a graph program run here, its tokens forced this round (empty: abstain, null: hold)
+    fn now(s: *Session, w: scan.Trigger) Allocator.Error!?[]u32 {
+        const c = s.cells.items[w.index];
+        if (!c.translated.load(.acquire) or c.job != null) return null;
+        if (c.thread) |th| {
+            th.join();
+            c.thread = null;
+        }
+        if (c.result == null and !c.abstained) switch (c.translation) {
+            .abstain => c.abstained = true,
+            .program => |p| {
+                if (p.kind != .graph) return null;
+                const res = s.r.backend.now(p, s.r.cfg.max_steps, sync_steps) orelse return null;
+                s.take(c, res);
+            },
+        };
+        s.held_ticks = 0;
+        return try s.conclude(w, c, 0);
+    }
+
+    /// A settled cell's tokens to force after its trigger (empty: abstained), counted and logged with the hold's ticks.
+    fn conclude(s: *Session, w: scan.Trigger, c: *Cell, held_ms: u64) Allocator.Error![]u32 {
         if (w.trace) return try s.ownTrace(c, w.index, held_ms);
         // an inline value is owned only when the run halted with a one-line value
         if (!c.abstained and w.inline_space != null and (c.result.?.status != .ok or std.mem.indexOfScalar(u8, std.mem.trimEnd(u8, c.result.?.out, "\n"), '\n') != null)) c.abstained = true;
@@ -436,6 +496,7 @@ pub const Session = struct {
     /// Cancels runs, joins translations and frees the session; the backend drops the stream's machines.
     pub fn destroy(s: *Session) void {
         const gpa = s.r.gpa;
+        gpa.free(s.sync_ids);
         if (s.cells.items.len > 0) log.info("reply {d}: {d} cells closed, {d} owned, {d} abstained at a header, {d} never claimed", .{ s.id, s.cells.items.len, s.owned_n, s.abstained_n, s.cells.items.len - s.owned_n - s.abstained_n });
         for (s.cells.items) |c| {
             if (c.thread) |th| th.join();
@@ -455,6 +516,9 @@ pub const Session = struct {
 
 /// Settling's cap on a run on the engine thread: steps per microsecond of settle_us (a graph step is about 20 ns).
 const quick_steps_per_us = 20;
+
+/// sync_graph's cap on a run at its trigger, on the engine thread: about 2 ms of graph steps; longer runs hold.
+const sync_steps = 100_000;
 
 /// Monotonic nanoseconds for the serving log only.
 fn nowNs() u64 {
@@ -488,6 +552,7 @@ test {
     _ = @import("runner_api.zig");
     _ = @import("runner_trace_test.zig");
     _ = @import("runner_settle_test.zig");
+    _ = @import("runner_sync_test.zig");
     _ = @import("runner_probe.zig");
     _ = @import("runner_graph_table_test.zig");
 }

@@ -25,6 +25,7 @@ const Opened = struct {
     own_bank: graph.Bank = undefined,
     has_bank: bool = false,
     routed: route.Routed = undefined,
+    quick: route.Quick = undefined, // cfg.sync_graph: routed's engine-thread part
     dispatch: route.Dispatch = undefined,
     threaded: std.Io.Threaded = undefined, // the no-compile frontend's io (cfg.compile false)
     no_compile: frontend_mod.Context = undefined,
@@ -105,7 +106,11 @@ pub fn openSharing(gpa: Allocator, cfg: Config, with: ?*Runner) !*Runner {
         log.info("in-model runner: graph bank {s} {s} in {d} ms", .{ cfg.graph_bank, if (o.bank == &o.own_bank) "loaded" else "shared", (nowNs() - t0) / std.time.ns_per_ms });
     }
     o.runner = .{ .gpa = gpa, .cfg = cfg, .frontend = frontend, .backend = backend, .placer = &o.placer };
-    log.info("in-model runner: circuit {s}{s}, cpu, {d} workers, {d} steps a run, backend {t}, settle {d} us{s}", .{ cfg.circuit, if (o.circuit == &o.own_circuit) "" else " (shared)", cfg.workers, cfg.max_steps, cfg.backend, cfg.settle_us, if (cfg.compile) "" else ", no ELF" });
+    if (cfg.sync_graph) {
+        o.quick = .{ .routed = &o.routed };
+        o.runner.quick = o.quick.frontend();
+    }
+    log.info("in-model runner: circuit {s}{s}, cpu, {d} workers, {d} steps a run, backend {t}, settle {d} us{s}{s}", .{ cfg.circuit, if (o.circuit == &o.own_circuit) "" else " (shared)", cfg.workers, cfg.max_steps, cfg.backend, cfg.settle_us, if (cfg.compile) "" else ", no ELF", if (cfg.sync_graph) ", graph results settle at their trigger" else "" });
     return &o.runner;
 }
 

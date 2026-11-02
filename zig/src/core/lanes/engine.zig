@@ -423,7 +423,8 @@ pub const Engine = struct {
         const landed = try s.commit(e.gpa, committed.items, committed_rows);
         const got = committed.items[0..landed];
         if (s.finished and got.len < path.len) path = path[0 .. got.len + 1];
-        if (s.held and got.len < path.len) path = path[0..got.len]; // a held EOS stays pending: its row runs again
+        // a held EOS stays pending: its row runs again; so does a settled trigger's last kept token (forced next)
+        if ((s.held or s.settle == .cut) and got.len < path.len) path = path[0..got.len];
         const keep = path.len;
         s.cache_len += keep;
         s.pending = committed.items[keep - 1];
