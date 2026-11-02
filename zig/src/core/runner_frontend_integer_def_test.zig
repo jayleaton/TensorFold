@@ -154,3 +154,33 @@ test "runner frontend integer def: the scripts run on the real bank and print CP
     }
     for (refused) |code| try std.testing.expectEqual(null, try table.translate(gpa, &bank, code));
 }
+
+/// T5's merge gate on the list tip (T5-S3-MERGE.md): the served graph route refuses each, or prints CPython's stdout.
+const lists = [_][2][]const u8{
+    .{ "print(min([2, 3]))\n", "2\n" },
+    .{ "print(min([4, 3]))\n", "3\n" },
+    .{ "print(sorted([4, 3]))\n", "[3, 4]\n" },
+    .{ "print(len([x for x in [7] if x > 0]))\n", "1\n" },
+    .{ "print(sum(range(3, 1)))\n", "0\n" },
+};
+
+test "runner frontend integer def: lists refuse in the integer lowering and the served graph route never misprints them" {
+    for (lists) |c| try std.testing.expectEqual(null, try integer_python.lowerWithCost(gpa, c[0], 0));
+    const g = std.c.getenv("TF_RUNNER_GRAPH_BANK") orelse return error.SkipZigTest;
+    var bank = try graph.Bank.load(gpa, std.mem.span(g));
+    defer bank.deinit();
+    var context: @import("runner_frontend.zig").Context = .{ .io = std.testing.io, .compiler = .{ .clang = "/nonexistent-list-clang" } };
+    var routed: route.Routed = .{ .inner = context.frontend(), .bank = &bank };
+    const f = routed.frontend();
+    for (lists) |c| {
+        const result = try f.translate(f.ctx, gpa, .{ .form = .fence, .lang = "python", .code = c[0] });
+        defer if (result == .program) gpa.free(result.program.bytes);
+        if (result != .program or result.program.kind != .graph) continue;
+        var machine = try @import("runner_graph_machine.zig").Machine.boot(gpa, &bank, result.program.bytes);
+        defer machine.deinit();
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(gpa);
+        const end = try machine.run(4_000_000, &out, null);
+        if (end.end == .halted) try std.testing.expectEqualStrings(c[1], out.items);
+    }
+}
