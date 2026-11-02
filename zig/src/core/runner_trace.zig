@@ -9,7 +9,7 @@ const Expr = expr.Expr;
 pub const max_digits = 62;
 
 /// A stated computation: Python source for the frontend, the expression shown to the model, divmod's re-shaping.
-pub const Found = struct { source: []const u8, display: []const u8, divmod: bool = false, same_line: bool = false };
+pub const Found = struct { source: []const u8, display: []const u8, divmod: bool = false, same_line: bool = false, run: []const u8 };
 
 /// Per reply: the names the reasoning defined and the sources already owned (`keep`); one line's work (`scratch`).
 pub const Tracer = struct {
@@ -17,6 +17,7 @@ pub const Tracer = struct {
     scratch: std.heap.ArenaAllocator,
     names: std.ArrayList(expr.Name) = .empty,
     fired: std.ArrayList([]const u8) = .empty,
+    repeat: u8 = 0, // times a displayed line may be owned again when the reasoning restates it (TraceAsk.repeat)
 
     pub fn init(gpa: Allocator) Tracer {
         return .{ .keep = .init(gpa), .scratch = .init(gpa) };
@@ -27,15 +28,16 @@ pub const Tracer = struct {
         t.scratch.deinit();
     }
 
-    /// The displayed line owned once: a restatement through names (other source, same display) never fires again.
+    /// A displayed line owned: a restatement (also through names) fires again only `repeat` more times.
     pub fn fire(t: *Tracer, display: []const u8) Allocator.Error!void {
         const a = t.keep.allocator();
         try t.fired.append(a, try a.dupe(u8, display));
     }
 
     fn firedHas(t: *const Tracer, display: []const u8) bool {
-        for (t.fired.items) |f| if (std.mem.eql(u8, f, display)) return true;
-        return false;
+        var n: usize = 0;
+        for (t.fired.items) |f| n += @intFromBool(std.mem.eql(u8, f, display));
+        return n > t.repeat;
     }
 
     fn poison(t: *Tracer, n: []const u8) void {
@@ -69,8 +71,10 @@ pub const Tracer = struct {
         }
         if (first) |*f| {
             f.same_line = text.cueIn(clean[last_head..]);
+            f.run = try printed(a, f.run);
             return f.*;
         }
+        if (define) |*d| d.run = try printed(a, d.run);
         return define;
     }
 
@@ -96,11 +100,11 @@ pub const Tracer = struct {
                 if (old.expr != null and !std.mem.eql(u8, old.expr.?.source, e.source)) t.poison(n);
                 continue;
             }
-            const kept: Expr = .{ .source = try a.dupe(u8, e.source), .display = try a.dupe(u8, e.display), .bound = e.bound, .ops = e.ops, .constant = e.constant };
+            const kept: Expr = .{ .source = try a.dupe(u8, e.source), .display = try a.dupe(u8, e.display), .bound = e.bound, .ops = e.ops, .constant = e.constant, .run = try a.dupe(u8, e.run) };
             try t.names.append(a, .{ .name = try a.dupe(u8, n), .expr = kept });
             // a first wide definition with nothing after it states that computation ("N = A*2^64 + B.")
             if (hasArith(e.source) and e.bound >= 12 and e.bound <= max_digits and text.sentenceEndsAt(clean, txt_end) and
-                !t.firedHas(e.display)) define.* = .{ .source = e.source, .display = e.display };
+                !t.firedHas(e.display)) define.* = .{ .source = e.source, .display = e.display, .run = e.run };
         }
     }
 
@@ -118,19 +122,19 @@ pub const Tracer = struct {
         switch (ph.kind) {
             .expr => {
                 if (parts[0].ops == 0) return null;
-                f = .{ .source = parts[0].source, .display = parts[0].display };
+                f = .{ .source = parts[0].source, .display = parts[0].display, .run = parts[0].run };
                 bound = parts[0].bound;
             },
             .divmod => {
-                f = .{ .source = try std.fmt.allocPrint(a, "divmod({s}, {s})", .{ parts[0].source, parts[1].source }), .display = try std.fmt.allocPrint(a, "{s} ÷ {s}", .{ try wrapped(a, parts[0]), try wrapped(a, parts[1]) }), .divmod = true };
+                f = .{ .source = try std.fmt.allocPrint(a, "divmod({s}, {s})", .{ parts[0].source, parts[1].source }), .display = try std.fmt.allocPrint(a, "{s} ÷ {s}", .{ try wrapped(a, parts[0]), try wrapped(a, parts[1]) }), .divmod = true, .run = try std.fmt.allocPrint(a, "divmod({s}, {s})", .{ parts[0].run, parts[1].run }) };
                 bound = parts[0].bound;
             },
             .mul => {
-                f = .{ .source = try std.fmt.allocPrint(a, "({s}) * ({s})", .{ parts[0].source, parts[1].source }), .display = try std.fmt.allocPrint(a, "{s} * {s}", .{ try wrapped(a, parts[0]), try wrapped(a, parts[1]) }) };
+                f = .{ .source = try std.fmt.allocPrint(a, "({s}) * ({s})", .{ parts[0].source, parts[1].source }), .display = try std.fmt.allocPrint(a, "{s} * {s}", .{ try wrapped(a, parts[0]), try wrapped(a, parts[1]) }), .run = try std.fmt.allocPrint(a, "({s}) * ({s})", .{ parts[0].run, parts[1].run }) };
                 bound = expr.sat(parts[0].bound + parts[1].bound);
             },
             .subfrom => {
-                f = .{ .source = try std.fmt.allocPrint(a, "({s}) - ({s})", .{ parts[1].source, parts[0].source }), .display = try std.fmt.allocPrint(a, "{s} - {s}", .{ try wrapped(a, parts[1]), try wrapped(a, parts[0]) }) };
+                f = .{ .source = try std.fmt.allocPrint(a, "({s}) - ({s})", .{ parts[1].source, parts[0].source }), .display = try std.fmt.allocPrint(a, "{s} - {s}", .{ try wrapped(a, parts[1]), try wrapped(a, parts[0]) }), .run = try std.fmt.allocPrint(a, "({s}) - ({s})", .{ parts[1].run, parts[0].run }) };
                 bound = expr.sat(@max(parts[0].bound, parts[1].bound) + 1);
             },
         }
@@ -147,6 +151,9 @@ pub const Tracer = struct {
 
 /// The owned line's default wording: `{}` stands for `<display> = <value>`.
 pub const default_format = "[exact: {}]";
+
+/// The most a request may ask a restated line to be owned again (runner_trace_repeat).
+pub const max_repeat = 3;
 
 /// The longest wording a request may give (runner_trace_format).
 pub const max_format = 128;
@@ -184,6 +191,18 @@ fn isInt(s: []const u8) bool {
 
 fn wrapped(a: Allocator, e: Expr) Allocator.Error![]const u8 {
     return if (e.ops > 0) std.fmt.allocPrint(a, "({s})", .{e.display}) else e.display;
+}
+
+/// A whole-statement pow(a, b, m) as `print(...)`: the form the graph bank's modular-power plan takes; else `run`.
+fn printed(a: Allocator, run: []const u8) Allocator.Error![]const u8 {
+    if (!std.mem.startsWith(u8, run, "pow(") or run[run.len - 1] != ')') return run;
+    var depth: usize = 0;
+    for (run[3 .. run.len - 1]) |c| {
+        if (c == '(') depth += 1;
+        if (c == ')') depth -= 1;
+        if (depth == 0) return run; // pow(...) is only part of the statement
+    }
+    return std.mem.concat(a, u8, &.{ "print(", run, ")" });
 }
 
 fn hasArith(source: []const u8) bool {

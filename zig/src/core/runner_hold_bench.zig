@@ -63,7 +63,7 @@ const Arm = struct {
 
 fn pass(gpa: std.mem.Allocator, r: *runner.Runner, replies: []const cost.Reply, arm: Arm, fires: *std.ArrayList(Fire), digest: *std.hash.Wyhash) !void {
     for (replies) |rep| {
-        const s = (try r.session()).?;
+        const s = (try r.session(.{})).?;
         defer s.destroy();
         const hook = s.hook();
         for (rep.tokens, 0..) |tok, i| {

@@ -8,8 +8,10 @@ pub const inf: u32 = 1 << 20;
 pub const Kind = enum { num, name, op };
 pub const Tok = struct { kind: Kind, text: []const u8 };
 
-/// A parsed operand: Python source, display text, syntax bound in decimal digits, binary operators, literal-only.
-pub const Expr = struct { source: []u8, display: []u8, bound: u32, ops: u32, constant: bool };
+/// A parsed operand: source, display, digit bound, operators, literal-only; `run` the frontend's source, `pw` a power.
+pub const Expr = struct { source: []u8, display: []u8, bound: u32, ops: u32, constant: bool, run: []u8, pw: ?Pow = null };
+
+pub const Pow = struct { base: []u8, k: []const u8 };
 
 pub const Name = struct { name: []u8, expr: ?Expr };
 
@@ -164,7 +166,7 @@ const Parser = struct {
             const r = try p.term();
             has_mod = has_mod or p.last_mod;
             terms += 1;
-            e = .{ .source = try cat(p.a, &.{ e.source, op, r.source }), .display = try cat(p.a, &.{ e.display, " ", op, " ", r.display }), .bound = sat(@max(e.bound, r.bound) + 1), .ops = e.ops + r.ops + 1, .constant = false };
+            e = .{ .source = try cat(p.a, &.{ e.source, op, r.source }), .display = try cat(p.a, &.{ e.display, " ", op, " ", r.display }), .bound = sat(@max(e.bound, r.bound) + 1), .ops = e.ops + r.ops + 1, .constant = false, .run = try cat(p.a, &.{ e.run, op, r.run }) };
         }
         // `A + B mod M` reads two ways: mod only in an expression that is one term
         if (has_mod and terms > 1) return error.Refused;
@@ -184,9 +186,11 @@ const Parser = struct {
                 // the modulus is a plain number, name or power chain (10^18), never a sum or a bracket
                 for (p.toks[start..p.i]) |t| if (t.kind == .op and !std.mem.eql(u8, t.text, "^")) return error.Refused;
                 moded = true;
-                e = .{ .source = try cat(p.a, &.{ e.source, "%", r.source }), .display = try cat(p.a, &.{ e.display, " mod ", r.display }), .bound = r.bound, .ops = e.ops + r.ops + 1, .constant = false };
+                // a lone power mod m (a product carries no `pw`) runs as Python's pow(a, b, m): the same value
+                const run = if (e.pw != null) try cat(p.a, &.{ "pow(", e.pw.?.base, ", ", e.pw.?.k, ", ", try tens(p.a, r.run), ")" }) else try cat(p.a, &.{ e.run, "%", r.run });
+                e = .{ .source = try cat(p.a, &.{ e.source, "%", r.source }), .display = try cat(p.a, &.{ e.display, " mod ", r.display }), .bound = r.bound, .ops = e.ops + r.ops + 1, .constant = false, .run = run };
             } else {
-                e = .{ .source = try cat(p.a, &.{ e.source, "*", r.source }), .display = try cat(p.a, &.{ e.display, "*", r.display }), .bound = sat(e.bound + r.bound), .ops = e.ops + r.ops + 1, .constant = false };
+                e = .{ .source = try cat(p.a, &.{ e.source, "*", r.source }), .display = try cat(p.a, &.{ e.display, "*", r.display }), .bound = sat(e.bound + r.bound), .ops = e.ops + r.ops + 1, .constant = false, .run = try cat(p.a, &.{ e.run, "*", r.run }) };
             }
         }
         p.last_mod = moded;
@@ -197,7 +201,7 @@ const Parser = struct {
         if (p.peek("-")) {
             p.i += 1;
             const e = try p.factor();
-            return .{ .source = try cat(p.a, &.{ "-", e.source }), .display = try cat(p.a, &.{ "-", e.display }), .bound = e.bound, .ops = e.ops, .constant = false };
+            return .{ .source = try cat(p.a, &.{ "-", e.source }), .display = try cat(p.a, &.{ "-", e.display }), .bound = e.bound, .ops = e.ops, .constant = false, .run = try cat(p.a, &.{ "-", e.run }) };
         }
         const base = try p.atom();
         if (!p.peek("^")) return base;
@@ -208,7 +212,7 @@ const Parser = struct {
         if (p.peek("^")) return error.Refused; // a^b^c
         const k = std.fmt.parseInt(u32, k_text, 10) catch return error.Refused;
         const bound: u32 = if (base.constant and k <= 4096) constPowDigits(base.source, k) else sat(@as(u32, @intCast(@min(@as(u64, base.bound) * k, inf))));
-        return .{ .source = try cat(p.a, &.{ base.source, "**", k_text }), .display = try cat(p.a, &.{ base.display, "^", k_text }), .bound = bound, .ops = base.ops + 1, .constant = false };
+        return .{ .source = try cat(p.a, &.{ base.source, "**", k_text }), .display = try cat(p.a, &.{ base.display, "^", k_text }), .bound = bound, .ops = base.ops + 1, .constant = false, .run = try cat(p.a, &.{ base.run, "**", k_text }), .pw = .{ .base = base.run, .k = k_text } };
     }
 
     fn atom(p: *Parser) Error!Expr {
@@ -216,10 +220,10 @@ const Parser = struct {
         const t = p.toks[p.i];
         p.i += 1;
         switch (t.kind) {
-            .num => return .{ .source = try p.a.dupe(u8, t.text), .display = try p.a.dupe(u8, t.text), .bound = litDigits(t.text), .ops = 0, .constant = true },
+            .num => return .{ .source = try p.a.dupe(u8, t.text), .display = try p.a.dupe(u8, t.text), .bound = litDigits(t.text), .ops = 0, .constant = true, .run = try decimal(p.a, t.text) },
             .name => {
                 const e = lookup(p.names, t.text) orelse return error.Refused;
-                return .{ .source = try cat(p.a, &.{ "(", e.source, ")" }), .display = if (e.ops > 0) try cat(p.a, &.{ "(", e.display, ")" }) else e.display, .bound = e.bound, .ops = e.ops, .constant = e.constant };
+                return .{ .source = try cat(p.a, &.{ "(", e.source, ")" }), .display = if (e.ops > 0) try cat(p.a, &.{ "(", e.display, ")" }) else e.display, .bound = e.bound, .ops = e.ops, .constant = e.constant, .run = try cat(p.a, &.{ "(", e.run, ")" }) };
             },
             .op => {
                 if (!std.mem.eql(u8, t.text, "(")) return error.Refused;
@@ -228,7 +232,7 @@ const Parser = struct {
                 if (!p.peek(")")) return error.Refused;
                 p.depth -= 1;
                 p.i += 1;
-                return .{ .source = try cat(p.a, &.{ "(", e.source, ")" }), .display = try cat(p.a, &.{ "(", e.display, ")" }), .bound = e.bound, .ops = e.ops, .constant = e.constant };
+                return .{ .source = try cat(p.a, &.{ "(", e.source, ")" }), .display = try cat(p.a, &.{ "(", e.display, ")" }), .bound = e.bound, .ops = e.ops, .constant = e.constant, .run = try cat(p.a, &.{ "(", e.run, ")" }) };
             },
         }
     }
@@ -236,6 +240,31 @@ const Parser = struct {
 
 fn cat(a: Allocator, parts: []const []const u8) Allocator.Error![]u8 {
     return std.mem.concat(a, u8, parts);
+}
+
+/// A modulus `10**k` written out in digits (notation, like hex in decimal); any other modulus as it is.
+fn tens(a: Allocator, run: []const u8) Allocator.Error![]const u8 {
+    if (!std.mem.startsWith(u8, run, "10**") or run.len == 4 or !allDigits(run[4..])) return run;
+    const k = std.fmt.parseInt(u8, run[4..], 10) catch return run;
+    if (k > 128) return run;
+    const out = try a.alloc(u8, @as(usize, k) + 1);
+    out[0] = '1';
+    @memset(out[1..], '0');
+    return out;
+}
+
+/// A literal as the frontend gets it: hex in decimal (text plumbing, the value unchanged), else as written.
+fn decimal(a: Allocator, lit: []const u8) Allocator.Error![]u8 {
+    if (!std.mem.startsWith(u8, lit, "0x")) return a.dupe(u8, lit);
+    var v = try std.math.big.int.Managed.init(a);
+    v.setString(16, lit[2..]) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => unreachable, // number() admits hex digits only
+    };
+    return v.toString(a, 10, .lower) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => unreachable, // base 10 is valid
+    };
 }
 
 /// Decimal digits of a literal (hex: of its value).
