@@ -14,7 +14,7 @@ const Kind = enum { forced, drafted, plain };
 
 /// What the trace last saw of a stream: its counters before the step, and where it stands around its fires.
 const Seen = struct {
-    s: ?*const Stream = null,
+    s: ?*const Stream = null, // compared, never read: the engine frees a stream once it leaves `live`
     rounds: u64 = 0,
     drafted: u64 = 0,
     accepted: u64 = 0,
@@ -92,12 +92,24 @@ fn readExtras(out: []u64) void {
     if (extras) |v| v.read(v.ctx, out[0..v.names.len]);
 }
 
-/// The stream's entry (a new one takes a free or finished entry; null when all are taken by live streams).
-fn entry(s: *const Stream) ?*Seen {
+fn live(e: *const Engine, p: *const Stream) bool {
+    for (e.live.items) |s| if (s == p) return true;
+    return false;
+}
+
+/// Frees entries of streams no longer live (pointers compared only): a new stream at a freed address starts fresh.
+fn forget(e: *const Engine) void {
+    for (&seen) |*x| if (x.s) |p| if (!live(e, p)) {
+        x.* = .{};
+    };
+}
+
+/// The live stream's entry (a new one takes an entry no live stream holds; null when all are taken).
+fn entry(e: *const Engine, s: *const Stream) ?*Seen {
     var free: ?*Seen = null;
     for (&seen) |*x| {
         if (x.s == s) return x;
-        if (free == null and (x.s == null or x.s.?.finished)) free = x;
+        if (free == null and (x.s == null or !live(e, x.s.?))) free = x;
     }
     const x = free orelse return null;
     x.* = .{ .s = s, .rounds = s.rounds, .drafted = s.drafted, .accepted = s.accepted, .emitted = s.emitted().len };
@@ -108,8 +120,9 @@ fn entry(s: *const Stream) ?*Seen {
 pub fn before(e: *const Engine) void {
     step_start = now();
     readExtras(&x_before);
+    forget(e);
     for (e.live.items) |s| {
-        const x = entry(s) orelse continue;
+        const x = entry(e, s) orelse continue;
         if (x.awaiting and !s.awaiting) {
             var w = std.Io.Writer.fixed(&buf);
             w.print("{{\"rt\":\"resume\",\"stream\":{d},\"t_us\":{d},\"held_us\":{d},\"forced\":{d}}}\n", .{ index(x), us(step_start - t_open), us(step_start - x.hold_ns), s.force.items.len }) catch {};
@@ -131,8 +144,14 @@ pub fn after(e: *const Engine) void {
     const t = now();
     var x_after: [max_extras]u64 = @splat(0);
     readExtras(&x_after);
+    defer for (e.live.items) |s| {
+        // a finished stream leaves `live` in this step's sweep, then is freed: its entry goes now, while it is live
+        if (s.finished) if (find(s)) |x| {
+            x.* = .{};
+        };
+    };
     for (e.live.items) |s| {
-        const x = entry(s) orelse continue;
+        const x = entry(e, s) orelse continue;
         if (s.rounds == x.rounds) continue;
         if (x.since >= 0) x.since += 1;
         var r: Rec = .{ .step = e.steps, .t_ns = t - t_open, .stream = index(x), .since = x.since, .kind = if (x.forced) .forced else if (s.drafted > x.drafted) .drafted else .plain, .drafted = s.drafted - x.drafted, .kept = s.accepted - x.accepted, .got = s.emitted().len - x.emitted, .held_next = if (s.next) |n| n.count else 0, .wall_ns = t - step_start, .gap_ns = step_start - last_end, .streams = e.live.items.len, .x = undefined };
@@ -153,6 +172,18 @@ pub fn after(e: *const Engine) void {
         } else push(r);
     }
     last_end = now();
+}
+
+fn find(s: *const Stream) ?*Seen {
+    for (&seen) |*x| if (x.s == s) return x;
+    return null;
+}
+
+/// Entries held (tests).
+pub fn held() usize {
+    var n: usize = 0;
+    for (seen) |x| n += @intFromBool(x.s != null);
+    return n;
 }
 
 fn index(x: *const Seen) u32 {
