@@ -2,7 +2,7 @@ const std = @import("std");
 
 pub const Invalid = error{Unsupported};
 pub const limit: i512 = std.math.pow(i512, 10, 62);
-pub const Op = enum(u8) { literal, neg, add, sub, mul, floor, mod, pow, powmod, digits, divmod };
+pub const Op = enum(u8) { literal, neg, add, sub, mul, floor, mod, pow, powmod, digits, divmod, gcd, isqrt, factorial, range_product, digit_sum, eq, ne, lt, le, gt, ge };
 pub const Node = struct {
     op: Op,
     l: usize = 0,
@@ -18,6 +18,27 @@ pub const Parser = struct {
     nodes: [64]Node = undefined,
     count: usize = 0,
     proved: [64]bool = @splat(false),
+    names: [32][]const u8 = undefined,
+    roots: [32]usize = undefined,
+    binding_count: usize = 0,
+    require_math_import: bool = false,
+    math_module: bool = false,
+    math_imports: u8 = 0,
+
+    // Names and literal slices borrow source storage; bind after parsing the RHS to preserve prior roots.
+    pub fn bind(self: *Parser, name: []const u8, root: usize) Invalid!void {
+        if (name.len == 0 or root >= self.count) return error.Unsupported;
+        for (self.names[0..self.binding_count], self.roots[0..self.binding_count]) |bound_name, *bound_root| {
+            if (std.mem.eql(u8, name, bound_name)) {
+                bound_root.* = root;
+                return;
+            }
+        }
+        if (self.binding_count == self.names.len) return error.Unsupported;
+        self.names[self.binding_count] = name;
+        self.roots[self.binding_count] = root;
+        self.binding_count += 1;
+    }
 
     pub fn parse(self: *Parser) Invalid!usize {
         self.space();
@@ -27,6 +48,19 @@ pub const Parser = struct {
         if (self.pos != self.source.len) return error.Unsupported;
         _ = try self.prove(root, root);
         return root;
+    }
+
+    // Project both results from the original operands; proof values never become literal nodes.
+    pub fn divisionPair(self: *Parser, root: usize) Invalid![2]usize {
+        if (root >= self.count or self.nodes[root].op != .divmod or self.count > self.nodes.len - 2)
+            return error.Unsupported;
+        _ = try self.prove(root, root);
+        const n = self.nodes[root];
+        const q = try self.add(.{ .op = .floor, .l = n.l, .r = n.r });
+        const r = try self.add(.{ .op = .mod, .l = n.l, .r = n.r });
+        _ = try self.prove(q, q);
+        _ = try self.prove(r, r);
+        return .{ q, r };
     }
 
     fn space(self: *Parser) void {
@@ -52,7 +86,24 @@ pub const Parser = struct {
         return self.count - 1;
     }
 
+    fn comparison(self: *Parser) ?Op {
+        const tokens = [_][]const u8{ "==", "!=", "<", "<=", ">", ">=" };
+        const ops = [_]Op{ .eq, .ne, .lt, .le, .gt, .ge };
+        for ([_]usize{ 0, 1, 3, 5, 2, 4 }) |i| {
+            if (self.take(tokens[i])) return ops[i];
+        }
+        return null;
+    }
+
     fn expr(self: *Parser, depth: usize) Invalid!usize {
+        const left = try self.sum(depth);
+        const op = self.comparison() orelse return left;
+        const right = try self.sum(depth);
+        if (self.comparison() != null) return error.Unsupported;
+        return self.add(.{ .op = op, .l = left, .r = right });
+    }
+
+    fn sum(self: *Parser, depth: usize) Invalid!usize {
         if (depth > 12) return error.Unsupported;
         var left = try self.term(depth);
         while (true) {
@@ -82,9 +133,20 @@ pub const Parser = struct {
         return left;
     }
 
+    fn boolean(self: *const Parser, index: usize) bool {
+        return switch (self.nodes[index].op) {
+            .eq, .ne, .lt, .le, .gt, .ge => true,
+            else => false,
+        };
+    }
+
     fn factor(self: *Parser, depth: usize) Invalid!usize {
         if (depth > 12) return error.Unsupported;
-        if (self.take("+")) return self.factor(depth + 1);
+        if (self.take("+")) {
+            const child = try self.factor(depth + 1);
+            if (self.boolean(child)) return error.Unsupported;
+            return child;
+        }
         if (self.take("-")) return self.add(.{ .op = .neg, .l = try self.factor(depth + 1) });
         const left = try self.atom(depth);
         if (self.take("**")) return self.add(.{ .op = .pow, .l = left, .r = try self.factor(depth + 1) });
@@ -97,7 +159,9 @@ pub const Parser = struct {
             try self.need(")");
             return n;
         }
-        if (self.take("divmod")) {
+        if (try self.algorithm(depth)) |n| return n;
+        if (self.word("sum")) return self.digitSum(depth);
+        if (self.word("divmod")) {
             try self.need("(");
             const a = try self.expr(depth + 1);
             try self.need(",");
@@ -105,7 +169,7 @@ pub const Parser = struct {
             try self.need(")");
             return self.add(.{ .op = .divmod, .l = a, .r = b });
         }
-        if (self.take("pow")) {
+        if (self.word("pow")) {
             try self.need("(");
             const a = try self.expr(depth + 1);
             try self.need(",");
@@ -115,7 +179,7 @@ pub const Parser = struct {
             try self.need(")");
             return self.add(.{ .op = .powmod, .l = a, .r = b, .k = m });
         }
-        if (self.take("len")) {
+        if (self.word("len")) {
             try self.need("(");
             try self.need("str");
             try self.need("(");
@@ -124,8 +188,113 @@ pub const Parser = struct {
             try self.need(")");
             return self.add(.{ .op = .digits, .l = n });
         }
-        if (self.take("int")) return self.convert();
+        if (self.word("int")) return self.convert();
+        self.space();
+        if (self.pos < self.source.len and
+            (std.ascii.isAlphabetic(self.source[self.pos]) or self.source[self.pos] == '_'))
+        {
+            const name = try self.identifier();
+            for (self.names[0..self.binding_count], self.roots[0..self.binding_count]) |bound_name, root| {
+                if (std.mem.eql(u8, name, bound_name)) return root;
+            }
+            return error.Unsupported;
+        }
         return self.literal();
+    }
+
+    fn algorithm(self: *Parser, depth: usize) Invalid!?usize {
+        const qualified = self.word("math");
+        if (qualified) try self.need(".");
+        const op: Op = if (self.word("gcd")) .gcd else if (self.word("isqrt")) .isqrt else if (self.word("factorial")) .factorial else if (self.word("prod")) .range_product else {
+            if (qualified) return error.Unsupported;
+            return null;
+        };
+        if (self.require_math_import) {
+            const mask: u8 = switch (op) {
+                .gcd => 1,
+                .isqrt => 2,
+                .factorial => 4,
+                .range_product => 8,
+                else => unreachable,
+            };
+            if (if (qualified) !self.math_module else self.math_imports & mask == 0) return error.Unsupported;
+        }
+        try self.need("(");
+        if (op == .range_product) {
+            try self.need("range");
+            try self.need("(");
+        }
+        var a = try self.expr(depth + 1);
+        var b: usize = 0;
+        var k: usize = 0;
+        if (op == .gcd) {
+            try self.need(",");
+            b = try self.expr(depth + 1);
+        }
+        if (op == .range_product) {
+            if (self.take(",")) {
+                b = try self.expr(depth + 1);
+            } else {
+                b = a;
+                a = try self.add(.{ .op = .literal, .value = 0, .text = "0" });
+            }
+            k = if (self.take(",")) try self.expr(depth + 1) else try self.add(.{
+                .op = .literal,
+                .value = 1,
+                .text = "1",
+            });
+            try self.need(")");
+        }
+        try self.need(")");
+        return try self.add(.{ .op = op, .l = a, .r = b, .k = k });
+    }
+
+    fn word(self: *Parser, token: []const u8) bool {
+        self.space();
+        const rest = self.source[self.pos..];
+        if (!std.mem.startsWith(u8, rest, token)) return false;
+        if (rest.len > token.len and (std.ascii.isAlphanumeric(rest[token.len]) or rest[token.len] == '_'))
+            return false;
+        self.pos += token.len;
+        return true;
+    }
+
+    fn identifier(self: *Parser) Invalid![]const u8 {
+        self.space();
+        const start = self.pos;
+        while (self.pos < self.source.len and
+            (std.ascii.isAlphanumeric(self.source[self.pos]) or self.source[self.pos] == '_')) self.pos += 1;
+        if (start == self.pos or std.ascii.isDigit(self.source[start])) return error.Unsupported;
+        const name = self.source[start..self.pos];
+        if (std.mem.eql(u8, name, "int") or std.mem.eql(u8, name, "__debug__")) return error.Unsupported;
+        const reserved = [_][]const u8{ "False", "None", "True", "and", "as", "assert", "async", "await", "break", "class", "continue", "def", "del", "elif", "else", "except", "finally", "for", "from", "global", "if", "import", "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise", "return", "try", "while", "with", "yield" };
+        for (reserved) |token| if (std.mem.eql(u8, name, token)) return error.Unsupported;
+        return name;
+    }
+
+    fn digitSum(self: *Parser, depth: usize) Invalid!usize {
+        try self.need("(");
+        const mapped = self.word("map");
+        if (mapped) {
+            try self.need("(");
+            try self.need("int");
+            try self.need(",");
+        } else {
+            try self.need("int");
+            try self.need("(");
+            const name = try self.identifier();
+            try self.need(")");
+            if (!self.word("for")) return error.Unsupported;
+            const binding = try self.identifier();
+            if (!std.mem.eql(u8, name, binding) or !self.word("in")) return error.Unsupported;
+        }
+        try self.need("str");
+        try self.need("(");
+        const value = try self.expr(depth + 1);
+        try self.need(")");
+        if (mapped) try self.need(")");
+        try self.need(")");
+        return self.add(.{ .op = .digit_sum, .l = value });
     }
 
     fn convert(self: *Parser) Invalid!usize {
@@ -175,11 +344,12 @@ pub const Parser = struct {
 
     fn prove(self: *Parser, index: usize, root: usize) Invalid!i512 {
         const n = self.nodes[index];
+        if (n.op == .divmod and index != root) return error.Unsupported;
         if (self.proved[index]) return n.value;
         if (n.op == .literal) return n.value;
         const a = try self.prove(n.l, root);
         const b = switch (n.op) {
-            .neg, .digits => 0,
+            .neg, .digits, .isqrt, .factorial, .digit_sum => 0,
             else => try self.prove(n.r, root),
         };
         const result = switch (n.op) {
@@ -188,6 +358,12 @@ pub const Parser = struct {
             .add => a + b,
             .sub => a - b,
             .mul => a * b,
+            .eq => @intFromBool(a == b),
+            .ne => @intFromBool(a != b),
+            .lt => @intFromBool(a < b),
+            .le => @intFromBool(a <= b),
+            .gt => @intFromBool(a > b),
+            .ge => @intFromBool(a >= b),
             .floor, .mod, .divmod => blk: {
                 if (b == 0 or (n.op == .divmod and index != root)) return error.Unsupported;
                 if (n.op == .mod) break :blk @mod(a, b);
@@ -209,7 +385,55 @@ pub const Parser = struct {
                 }
                 break :blk result;
             },
+            .gcd => blk: {
+                var x = if (a < 0) -a else a;
+                var y = if (b < 0) -b else b;
+                while (y != 0) {
+                    const r = @mod(x, y);
+                    x = y;
+                    y = r;
+                }
+                break :blk x;
+            },
+            .isqrt => blk: {
+                if (a < 0) return error.Unsupported;
+                var x = a;
+                var y = @divTrunc(x + 1, 2);
+                while (y < x) {
+                    x = y;
+                    y = @divTrunc(x + @divTrunc(a, x), 2);
+                }
+                break :blk x;
+            },
+            .factorial => blk: {
+                if (a < 0 or a > 48) return error.Unsupported;
+                var result: i512 = 1;
+                var x: i512 = 2;
+                while (x <= a) : (x += 1) result = try bound(result * x);
+                break :blk result;
+            },
+            .range_product => blk: {
+                const step = try self.prove(n.k, root);
+                if (step == 0) return error.Unsupported;
+                var x = a;
+                var count: usize = 0;
+                var result: i512 = 1;
+                while (if (step > 0) x < b else x > b) : (x += step) {
+                    if (count == 10000) return error.Unsupported;
+                    count += 1;
+                    result = try bound(result * try bound(x));
+                }
+                break :blk result;
+            },
+            .digit_sum => blk: {
+                if (self.boolean(n.l) or a < 0) return error.Unsupported;
+                var x = a;
+                var result: i512 = 0;
+                while (x != 0) : (x = @divTrunc(x, 10)) result += @mod(x, 10);
+                break :blk result;
+            },
             .digits => blk: {
+                if (self.boolean(n.l)) return error.Unsupported;
                 var magnitude = if (a < 0) -a else a;
                 var count: i512 = if (a < 0) 2 else 1;
                 while (magnitude >= 10) : (magnitude = @divTrunc(magnitude, 10)) count += 1;

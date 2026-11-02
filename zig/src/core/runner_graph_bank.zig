@@ -33,6 +33,7 @@ pub const PreparedPlan = struct {
     total_values: usize,
     algorithm: ?[]const u8,
     width: u8,
+    precision: u8,
 };
 
 const Manifest = struct {
@@ -81,29 +82,13 @@ pub const Bank = struct {
             for (p.literals, constants) |text, *v| v.* = try packet.literal(text);
             if (p.algorithm) |kind| {
                 const family = std.meta.stringToEnum(packet.Algorithm, kind) orelse return error.GraphAlgorithm;
-                const arity: u32 = switch (family) {
-                    .powmod => 3,
-                    .gcd, .range_product, .divmod, .square_offset => 2,
-                    .isqrt, .factorial, .digit_sum => 1,
-                };
-                if (p.inputs != arity or p.ops.len != 0 or constants.len != 0 or p.result != 0 or
-                    !packet.widthValid(p.width)) return error.GraphAlgorithm;
-                const kernels = [_]struct { []const u8, u8, u8 }{
-                    .{ "add", 2, 1 },        .{ "sub", 2, 1 },      .{ "mul", 2, 1 },  .{ "half", 1, 2 },
-                    .{ "divstep", 3, 2 },    .{ "divfinal", 4, 2 }, .{ "meta", 2, 3 }, .{ "digit_sum", 1, 1 },
-                    .{ "mulmodstep", 4, 1 },
-                };
-                for (kernels) |k| {
-                    const t = bank.find(k[0], if (std.mem.eql(u8, k[0], "meta")) @max(p.width, 8) else p.width) orelse
-                        return error.GraphTemplate;
-                    if (t.inputs != k[1] or t.outputs != k[2]) return error.GraphSlotArity;
-                }
-                if (family == .divmod) for ([_][]const u8{ "emit_first", "emit_last" }) |op| {
-                    const t = bank.find(op, @max(p.width, 62)) orelse return error.GraphEmitMissing;
-                    if (t.inputs != 1 or t.outputs != 1) return error.GraphSlotArity;
-                };
+                if (p.inputs != packet.algorithmArity(family) or p.ops.len != 0 or constants.len != 0 or p.result != 0)
+                    return error.GraphAlgorithm;
+                try bank.validateAlgorithm(family, p.width, p.precision);
+            } else if (p.precision != 0) {
+                return error.GraphPrecision;
             }
-            plans[i] = .{ .name = p.name, .inputs = p.inputs, .ops = p.ops, .result = p.result, .constants = constants, .total_values = if (p.algorithm != null) 32 else try bank.validate(p.inputs + p.literals.len, p.ops, p.result), .algorithm = p.algorithm, .width = p.width };
+            plans[i] = .{ .name = p.name, .inputs = p.inputs, .ops = p.ops, .result = p.result, .constants = constants, .total_values = if (p.algorithm != null) 32 else try bank.validate(p.inputs + p.literals.len, p.ops, p.result), .algorithm = p.algorithm, .width = p.width, .precision = p.precision };
         }
         const emitter = bank.find("emit", 62) orelse return error.GraphEmitMissing;
         if (emitter.inputs != 1 or emitter.outputs != 1) return error.GraphSlotArity;
@@ -139,22 +124,30 @@ pub const Bank = struct {
             if (op.outputs == 0 or op.outputs > packet.max_arity or count + op.outputs > packet.max_values)
                 return error.GraphPlanSize;
             if (std.mem.eql(u8, op.op, "bind")) {
-                if (op.outputs != 1 or op.copies.len > 128 or op.args != null or op.b != null)
+                if (op.outputs != 1 or op.copies.len > 128 or op.args != null or op.b != null or op.precision != 0)
                     return error.GraphBinding;
                 for (op.copies) |c| if (c.ref >= count or c.from > packet.max_digits or c.to > packet.max_digits or
                     c.digits > packet.max_digits - c.from or c.digits > packet.max_digits - c.to)
                     return error.GraphBinding;
                 if (op.flags) |r| if (r >= count) return error.GraphReference;
             } else {
-                if (std.mem.startsWith(u8, op.op, "emit") or op.copies.len != 0 or op.flags != null)
+                if (std.mem.startsWith(u8, op.op, "emit") or std.mem.eql(u8, op.op, "format") or op.copies.len != 0 or op.flags != null)
                     return error.GraphTemplate;
-                const t = b.find(op.op, op.width) orelse return error.GraphTemplate;
-                if (t.outputs != op.outputs) return error.GraphSlotArity;
+                const arity: u8 = if (std.meta.stringToEnum(packet.Algorithm, op.op)) |family| blk: {
+                    try b.validateAlgorithm(family, op.width, op.precision);
+                    if (op.outputs != packet.algorithmOutputs(family)) return error.GraphSlotArity;
+                    break :blk packet.algorithmArity(family);
+                } else blk: {
+                    if (op.precision != 0) return error.GraphPrecision;
+                    const t = b.find(op.op, op.width) orelse return error.GraphTemplate;
+                    if (t.outputs != op.outputs) return error.GraphSlotArity;
+                    break :blk t.inputs;
+                };
                 if (op.args) |args| {
-                    if (args.len != t.inputs) return error.GraphSlotArity;
+                    if (args.len != arity) return error.GraphSlotArity;
                     for (args) |r| if (r >= count) return error.GraphReference;
                 } else {
-                    if (t.inputs != 1 + @as(usize, @intFromBool(op.b != null)) or op.a >= count)
+                    if (arity != 1 + @as(usize, @intFromBool(op.b != null)) or op.a >= count)
                         return error.GraphSlotArity;
                     if (op.b) |r| if (r >= count) return error.GraphReference;
                 }
@@ -163,6 +156,48 @@ pub const Bank = struct {
         }
         if (result >= count) return error.GraphReference;
         return count;
+    }
+
+    pub fn validatePrints(b: *const Bank, prints: []const packet.Print, count: usize) !void {
+        if (prints.len > packet.max_prints) return error.GraphPrint;
+        if (prints.len == 0) return;
+        try b.require("format", 62, 2, 2);
+        try b.require("format", 128, 2, 2);
+        for (prints) |p| {
+            if (p.ref >= count or p.precision > 18 or (p.style != .fixed and p.precision != 0)) return error.GraphPrint;
+            if ((p.style == .fraction or p.style == .tuple) != (p.second != null)) return error.GraphPrint;
+            if (p.second) |ref| if (ref >= count) return error.GraphReference;
+            if (p.style == .fraction) try b.require("meta", 128, 2, 3);
+            if (p.style == .tuple and (p.prefix or (p.ending != .newline and p.ending != .space and p.ending != .empty and p.ending != .comma_space)))
+                return error.GraphPrint;
+        }
+    }
+
+    fn require(b: *const Bank, name: []const u8, width: u8, inputs: u8, outputs: u8) !void {
+        const t = b.find(name, width) orelse return error.GraphTemplate;
+        if (t.inputs != inputs or t.outputs != outputs) return error.GraphSlotArity;
+    }
+
+    fn validateAlgorithm(b: *const Bank, family: packet.Algorithm, width: u8, precision: u8) !void {
+        if (!packet.widthValid(width) or precision > 18 or (family != .fixed_div and precision != 0))
+            return error.GraphAlgorithm;
+        const kernels = [_]struct { []const u8, u8, u8 }{
+            .{ "add", 2, 1 },        .{ "sub", 2, 1 },      .{ "mul", 2, 1 },  .{ "half", 1, 2 },
+            .{ "divstep", 3, 2 },    .{ "divfinal", 4, 2 }, .{ "meta", 2, 3 }, .{ "digit_sum", 1, 1 },
+            .{ "mulmodstep", 4, 1 },
+        };
+        for (kernels) |k| try b.require(k[0], if (std.mem.eql(u8, k[0], "meta")) @max(width, 8) else width, k[1], k[2]);
+        if (family == .fixed_div) {
+            try b.require("scale10", width, 1, 1);
+        }
+        if (family == .fixed_div or family == .divexact) try b.require("round_div", width, 4, 1);
+        if (family == .fraction or family == .fixed_div) {
+            try b.require("format", 62, 2, 2);
+            try b.require("format", 128, 2, 2);
+        }
+        if (family == .fraction) try b.require("meta", 128, 2, 3);
+        if (family == .divmod) for ([_][]const u8{ "emit_first", "emit_last" }) |name|
+            try b.require(name, @max(width, 62), 1, 1);
     }
 };
 

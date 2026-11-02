@@ -8,6 +8,7 @@ pub const State = struct {
     defined: [32]bool = @splat(false),
     values: [32][32]i64 = @splat(@splat(0)),
     fuel: usize = 2_000_000,
+    estimated_steps: usize = 200,
 };
 
 pub fn fits(n: i64) bool {
@@ -49,6 +50,7 @@ pub const Graph = struct {
     pub fn eval(g: *const Graph, id: usize, s: *State) Invalid!i64 {
         if (s.fuel == 0) return error.Unsupported;
         s.fuel -= 1;
+        s.estimated_steps +|= 10;
         const n = g.nodes[id];
         const result: i64 = switch (n.op) {
             .literal => n.value,
@@ -70,6 +72,7 @@ pub const Graph = struct {
                     },
                     .power => pow: {
                         if (y < 0 or y > 31) return error.Unsupported;
+                        s.estimated_steps +|= @as(usize, @intCast(y)) * 6;
                         var r: i64 = 1;
                         var i: i64 = 0;
                         while (i < y) : (i += 1) {
@@ -87,10 +90,24 @@ pub const Graph = struct {
     }
 
     pub fn emit(g: *const Graph, a: std.mem.Allocator, out: *std.ArrayList(u8), start: usize, end: usize) !void {
+        try out.print(a, "static volatile int tf_inputs{d}[]={{", .{start});
+        var inputs: usize = 0;
+        for (g.nodes[start..end]) |n| {
+            if (n.op == .literal) {
+                try out.print(a, "{d},", .{n.value});
+                inputs += 1;
+            }
+        }
+        if (inputs == 0) try out.appendSlice(a, "0");
+        try out.appendSlice(a, "};\n");
+        inputs = 0;
         for (g.nodes[start..end], start..) |n, id| {
             try out.print(a, "int tf_e{d} = ", .{id});
             switch (n.op) {
-                .literal => try out.print(a, "{d}", .{n.value}),
+                .literal => {
+                    try out.print(a, "tf_inputs{d}[{d}]", .{ start, inputs });
+                    inputs += 1;
+                },
                 .variable => try out.print(a, "tf_v{d}", .{n.lhs}),
                 .element => try out.print(a, "tf_v{d}[{d}]", .{ n.lhs, n.rhs }),
                 .list_zero => try out.appendSlice(a, "0"),
@@ -122,7 +139,7 @@ pub const Graph = struct {
                     });
                 },
             }
-            try out.appendSlice(a, ";\n");
+            try out.print(a, ";\n__asm__ volatile(\"\" : \"+r\"(tf_e{d}));\n", .{id});
         }
     }
 };
@@ -252,9 +269,11 @@ fn nameChar(c: u8) bool {
 
 fn validName(s: []const u8) bool {
     const reserved = [_][]const u8{
-        "print", "sum",    "range",   "for",  "in",     "True",   "False", "None",     "and",  "or",    "not",    "if",     "else",
-        "def",   "class",  "import",  "from", "return", "while",  "break", "continue", "pass", "yield", "lambda", "global", "nonlocal",
-        "try",   "except", "finally", "with", "as",     "assert", "del",   "raise",    "is",   "async", "await",  "elif",   "__debug__",
+        "print",        "sum",    "range",   "for",  "in",     "True",   "False", "None",     "and",  "or",    "not",    "if",        "else",
+        "def",          "class",  "import",  "from", "return", "while",  "break", "continue", "pass", "yield", "lambda", "global",    "nonlocal",
+        "try",          "except", "finally", "with", "as",     "assert", "del",   "raise",    "is",   "async", "await",  "elif",      "__debug__",
+        "pow",          "divmod", "int",     "str",  "len",    "map",    "all",   "abs",      "math", "gcd",   "isqrt",  "factorial", "prod",
+        "__builtins__",
     };
     for (reserved) |name| if (std.mem.eql(u8, name, s)) return false;
     return true;

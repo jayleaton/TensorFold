@@ -161,6 +161,8 @@ test "runner proof: pure-integer calc programs print Python's value on the graph
         .{ "7//-2", "-4" },
         .{ "12345678901234567890*98765432109876543210", "1219326311370217952237463801111263526900" },
         .{ "-(2**40)//3", "-366503875926" },
+        .{ "10**62", "100000000000000000000000000000000000000000000000000000000000000" },
+        .{ "(10**80+123456789)**2-10**160", "24691357800000000000000000000000000000000000000000000000000000000000000015241578750190521" },
     }) |c| {
         const bytes = (try route.lower(gpa, &both.bank, c[0])) orelse {
             std.debug.print("not routed: {s}\n", .{c[0]});
@@ -170,6 +172,11 @@ test "runner proof: pure-integer calc programs print Python's value on the graph
         const g = finish(both.graph, try both.graph.start(1, .{ .kind = .graph, .bytes = bytes }, 1_000_000));
         const got = try gpa.dupe(u8, g.out);
         defer gpa.free(got);
+        // TF_DSV41_RUNNER_SETTLE_US: a run here within its steps is the job's result; one step short, a job's again
+        const prog: rapi.Program = .{ .kind = .graph, .bytes = bytes };
+        const here = both.graph.now(prog, 1_000_000, g.steps).?;
+        try std.testing.expect(here.status == g.status and here.steps == g.steps and std.mem.eql(u8, here.out, got));
+        try std.testing.expectEqual(null, both.graph.now(prog, 1_000_000, g.steps - 1));
         const want = try std.mem.concat(gpa, u8, &.{ c[1], "\n" });
         defer gpa.free(want);
         // calc firmware prints `error` past its own width (10**61); there the graph's value is checked alone
@@ -222,6 +229,9 @@ test "runner proof: straight-line integer cells print Python's lines on the grap
         .{ "n = 37\nprint(2**n - 1, n)", "137438953471 37\n" },
         .{ "a = 2**10\nprint(a)", "1024\n" },
         .{ "s = 2 + 3\nprint(s * 4)", "20\n" },
+        .{ "print(pow(3, 200, 10000000000000000000000000000000000000007))", "6037814813667445162521849728381872075460\n" },
+        .{ "import math\nprint(math.gcd(1267650600228229401496703205375, 42391158275216203514294433200))", "8525\n" },
+        .{ "from math import isqrt, factorial\nprint(isqrt(100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000))\nprint(factorial(50))", "316227766016837933199889354443271853371955513932521\n30414093201713378043612608166064768844377641568960512000000000000\n" },
     }) |c| {
         const bytes = (try route.program(gpa, &both.bank, c[0])) orelse {
             std.debug.print("not lowered: {s}\n", .{c[0]});
@@ -240,9 +250,43 @@ test "runner proof: straight-line integer cells print Python's lines on the grap
         "for i in range(3):\n    print(i)", "a = 7\nprint(a / 2)",           "print('x')",
         "a = 1\nprint(a < 2)",              "q, r = divmod(7, 0)\nprint(q)", "a = 1\nb = a == 1\nprint(b)",
         "print(1 == 1 == 1)",               "x = 5",                         "print = 3\nprint(print)",
+        "print(math.gcd(4, 6))",            "print(gcd(4, 6))",              "import math\nprint(math.lcm(4, 6))",
+        "print(pow(3, 2, 0) + 1)",          "from math import sqrt",         "import math\nprint(math.pi)",
     }) |src| if (try route.program(gpa, &both.bank, src)) |got| {
         gpa.free(got);
         std.debug.print("lowered: {s}\n", .{src});
         return error.TestUnexpectedRoute;
     };
+}
+
+test "runner proof: big-number-020 past the frontend's 62 digits, inline and REPL, runs on the 128-digit bank" {
+    var both: Both = undefined;
+    try both.open();
+    defer both.close();
+    var ctx: frontend.Context = .{ .io = std.testing.io };
+    if (std.c.getenv("TF_RUNNER_LLD")) |l| ctx.compiler.linker = std.mem.span(l);
+    var routed: route.Routed = .{ .inner = ctx.frontend(), .bank = &both.bank };
+    const front = routed.frontend();
+    const Case = struct { form: rapi.Form, code: []const u8, graph: bool };
+    for ([_]Case{
+        .{ .form = .inline_expr, .code = "(10^80 + 123456789)^2 − 10^160", .graph = true },
+        .{ .form = .inline_expr, .code = "(10^80+123456789)^2-10^160", .graph = true },
+        .{ .form = .repl, .code = "(10**80 + 123456789)**2 - 10**160", .graph = true },
+        .{ .form = .repl, .code = "(10^80+123456789)^2-10^160", .graph = false }, // XOR in Python
+        .{ .form = .inline_expr, .code = "(10^80+123456789)^2 % 7", .graph = false },
+        .{ .form = .inline_expr, .code = "10^200 + 1", .graph = false },
+    }) |c| {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const t = try front.translate(front.ctx, arena.allocator(), .{ .form = c.form, .lang = "python", .code = c.code });
+        const on_graph = t == .program and t.program.kind == .graph;
+        if (on_graph != c.graph) {
+            std.debug.print("{s}: {any}\n", .{ c.code, t });
+            return error.TestExpectedEqual;
+        }
+        if (!on_graph) continue;
+        const r = finish(both.graph, try both.graph.start(1, t.program, 4_000_000));
+        try std.testing.expectEqualStrings("24691357800000000000000000000000000000000000000000000000000000000000000015241578750190521\n", r.out);
+    }
+    both.graph.release(1);
 }
