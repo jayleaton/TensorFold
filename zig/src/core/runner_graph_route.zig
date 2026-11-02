@@ -161,9 +161,10 @@ fn plan(a: Allocator, f: Family, dl: u32, dr: u32) error{ Unsupported, OutOfMemo
         .pow => unreachable,
     };
     if (needed > max_digits) return error.Unsupported;
-    const width = for ([_]u8{ 1, 2, 4, 8, 16, 32, 62, 128 }) |n| {
+    // 256: T1's b047d48c8 widths; a bank without that plan (v4, or div/mod) refuses at lowering, never here
+    const width = for ([_]u16{ 1, 2, 4, 8, 16, 32, 62, 128, 256 }) |n| {
         if (n >= needed) break n;
-    } else unreachable;
+    } else return error.Unsupported;
     return std.fmt.allocPrint(a, "{t}-{d}", .{ f, width });
 }
 
@@ -244,7 +245,7 @@ pub fn shape(arena: Allocator, src: []const u8) Allocator.Error!?Shape {
             .literal => continue,
             .neg => plan(arena, .sub, 1, n.digits),
             .binary => plan(arena, n.family, nodes[n.l].digits, nodes[n.r].digits),
-            .pow => std.fmt.allocPrint(arena, "pow-{d}-{d}", .{ n.k, @as(u32, if (n.digits > 62) 128 else 62) }),
+            .pow => std.fmt.allocPrint(arena, "pow-{d}-{d}", .{ n.k, @as(u32, if (n.digits > 128) 256 else if (n.digits > 62) 128 else 62) }),
         } catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else null;
     }
     return .{ .nodes = nodes, .root = root, .live = live, .plans = plans };
