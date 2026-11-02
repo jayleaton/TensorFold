@@ -7,6 +7,7 @@ const prog = @import("runner_graph_program.zig");
 const lane = @import("compute_lane.zig");
 const rc = @import("runner_circuit.zig");
 const elf_cache = @import("runner_frontend_elf_cache.zig");
+const s3 = @import("compute_circuit.zig");
 const linux = std.os.linux;
 
 fn now() u64 {
@@ -131,10 +132,111 @@ fn ms(ns: u64) f64 {
     return @as(f64, @floatFromInt(ns)) / 1e6;
 }
 
+/// The code tool S3 falls back to (TF_S3_BENCH_SANDBOX=1): each call in the lane's sandbox, first and p50 as S3's.
+fn sandboxed(gpa: std.mem.Allocator, cells: []const Cell, reps: u32) !u8 {
+    const cfg = (try lane.Config.parse(&env, "TF_DSV41_COMPUTE_LANE")) orelse {
+        std.debug.print("TF_DSV41_COMPUTE_LANE is off\n", .{});
+        return 2;
+    };
+    var pool = lane.Pool.init(cfg, &.{ "/proc/self/exe", "__compute_sandbox" });
+    const e2es = try gpa.alloc(u64, reps);
+    var first: std.ArrayList(u64) = .empty;
+    var all: std.ArrayList(u64) = .empty;
+    var same: u32 = 0;
+    std.debug.print("| cell | route | exec ms | sandbox first ms | sandbox p50 ms | body |\n|---|---|---|---|---|---|\n", .{});
+    for (cells) |c| {
+        var ok = true;
+        var exec: u64 = 0;
+        for (0..reps) |i| {
+            var arena = std.heap.ArenaAllocator.init(gpa);
+            defer arena.deinit();
+            const t0 = now();
+            const o = try pool.run(arena.allocator(), c.code, null);
+            e2es[i] = now() - t0;
+            exec = o.exec_ns;
+            if (o.status != .ok or !std.mem.eql(u8, o.stdout, c.want)) ok = false;
+        }
+        try first.append(gpa, e2es[0]);
+        try all.append(gpa, median(e2es));
+        same += @intFromBool(ok);
+        std.debug.print("| {s} | sandbox | {d:.2} | {d:.2} | {d:.2} | {s} |\n", .{ c.id, ms(exec), ms(e2es[0]), ms(median(e2es)), if (ok) "= CPython" else "DIFFERS" });
+    }
+    std.mem.sort(u64, all.items, {}, std.sort.asc(u64));
+    std.mem.sort(u64, first.items, {}, std.sort.asc(u64));
+    const v = all.items;
+    std.debug.print("\nS3 call p50 over cells: median {d:.2} ms, p90 {d:.2} ms, max {d:.2} ms; {d}/{d} bodies = CPython\n", .{ ms(v[v.len / 2]), ms(v[(v.len * 9) / 10]), ms(v[v.len - 1]), same, v.len });
+    std.debug.print("S3 first call over cells: median {d:.2} ms, max {d:.2} ms; sandbox\n", .{ ms(first.items[first.items.len / 2]), ms(first.items[first.items.len - 1]) });
+    return if (same == v.len) 0 else 1;
+}
+
+/// n request threads at once (TF_S3_BENCH_THREADS=n), as the server's at c=n: S3's own executor or the lane's pool.
+const Load = struct { cells: []const Cell, reps: u32, threads: usize, exec: ?*s3.Exec, pool: ?*lane.Pool, io: std.Io, ns: []u64, ok: []bool };
+
+fn worker(l: *Load, t: usize) void {
+    const n = l.cells.len;
+    for (0..l.reps) |rep| for (0..n) |k| {
+        // threads start three cells apart, so calls at one time are mostly different cells
+        const i = (k + t * 3) % n;
+        const c = l.cells[i];
+        var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+        defer arena.deinit();
+        const want = lane.runner.body(arena.allocator(), .{ .status = .ok, .stdout = c.want }, 0, 0) catch return;
+        const t0 = now();
+        const good = if (l.exec) |e| blk: {
+            elf_cache.reset(l.io);
+            const o = e.run(arena.allocator(), c.code, null) catch break :blk false;
+            break :blk o == .owned and std.mem.eql(u8, o.owned.body, want);
+        } else blk: {
+            const o = l.pool.?.run(arena.allocator(), c.code, null) catch break :blk false;
+            break :blk o.status == .ok and std.mem.eql(u8, o.stdout, c.want);
+        };
+        l.ns[(t * l.reps + rep) * n + i] = now() - t0;
+        if (!good) l.ok[i] = false;
+    };
+}
+
+/// Per cell: first = median of the threads' first calls, p50 over all; the ELF arm empties the image cache per call.
+fn concurrent(gpa: std.mem.Allocator, io: std.Io, cells: []const Cell, reps: u32, threads: usize, r: ?*runner.Runner) !u8 {
+    var exec: s3.Exec = undefined;
+    var pool: lane.Pool = undefined;
+    var l: Load = .{ .cells = cells, .reps = reps, .threads = threads, .exec = null, .pool = null, .io = io, .ns = try gpa.alloc(u64, threads * reps * cells.len), .ok = try gpa.alloc(bool, cells.len) };
+    @memset(l.ok, true);
+    if (r) |served| {
+        var cfg = try s3.Config.parse(&env, "TF_DSV41_COMPUTE_LANE_RUNNER");
+        cfg.elf = true;
+        exec = s3.Exec.init(.{ .runner = served, .cfg = cfg });
+        l.exec = &exec;
+    } else {
+        const cfg = (try lane.Config.parse(&env, "TF_DSV41_COMPUTE_LANE")) orelse return 2;
+        pool = lane.Pool.init(cfg, &.{ "/proc/self/exe", "__compute_sandbox" });
+        l.pool = &pool;
+    }
+    const hits = elf_cache.hitCount(io);
+    const handles = try gpa.alloc(std.Thread, threads);
+    for (handles, 0..) |*h, t| h.* = try std.Thread.spawn(.{}, worker, .{ &l, t });
+    for (handles) |h| h.join();
+    const arm = if (r != null) "elf" else "sandbox";
+    std.debug.print("| cell | route | first ms | p50 ms | body |\n|---|---|---|---|---|\n", .{});
+    const firsts = try gpa.alloc(u64, threads);
+    const calls = try gpa.alloc(u64, threads * reps);
+    var same: u32 = 0;
+    for (cells, 0..) |c, i| {
+        for (0..threads) |t| {
+            firsts[t] = l.ns[(t * reps) * cells.len + i];
+            for (0..reps) |rep| calls[t * reps + rep] = l.ns[(t * reps + rep) * cells.len + i];
+        }
+        same += @intFromBool(l.ok[i]);
+        std.debug.print("| {s} | {s} | {d:.2} | {d:.2} | {s} |\n", .{ c.id, arm, ms(median(firsts)), ms(median(calls)), if (l.ok[i]) "= CPython" else "DIFFERS" });
+    }
+    std.debug.print("\n{s} at c={d}: {d}/{d} bodies = CPython; image cache hits {d}\n", .{ arm, threads, same, cells.len, elf_cache.hitCount(io) - hits });
+    return if (same == cells.len) 0 else 1;
+}
+
 /// runner-s3-bench <cells.jsonl> [reps] [engine-cpu]; a line is {"id", "code", "want"} (want: CPython's stdout).
 pub fn main(init: std.process.Init) !u8 {
     const gpa = std.heap.c_allocator;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
+    if (argv.len >= 2 and std.mem.eql(u8, argv[1], "__compute_sandbox")) lane.sandbox.main(argv[2..]);
     if (argv.len < 2) {
         std.debug.print("usage: runner-s3-bench <cells.jsonl> [reps] [engine-cpu] (TF_DSV41_COMPUTE_LANE_RUNNER* knobs)\n", .{});
         return 2;
@@ -148,11 +250,14 @@ pub fn main(init: std.process.Init) !u8 {
         const p = try std.json.parseFromSlice(Cell, gpa, line, .{ .ignore_unknown_fields = true });
         try cells.append(gpa, p.value);
     };
+    const threads = if (env("TF_S3_BENCH_THREADS")) |v| try std.fmt.parseInt(usize, v, 10) else 0;
+    if (env("TF_S3_BENCH_SANDBOX") != null) return if (threads > 0) concurrent(gpa, init.io, cells.items, reps, threads, null) else sandboxed(gpa, cells.items, reps);
     const cfg = (try runner.Config.parse(&env, "TF_DSV41_COMPUTE_LANE_RUNNER")) orelse {
         std.debug.print("TF_DSV41_COMPUTE_LANE_RUNNER is off\n", .{});
         return 2;
     };
     const r = try ropen.open(gpa, cfg);
+    if (threads > 0) return concurrent(gpa, init.io, cells.items, reps, threads, r);
     // a second copy of the circuit: ELF and calc programs' boot and steps timed apart from the backend
     var circuit = try rc.Circuit.load(gpa, cfg.circuit);
     defer circuit.deinit(gpa);
@@ -189,7 +294,7 @@ pub fn main(init: std.process.Init) !u8 {
         row.e2e = .{ e2es[0], median(e2es) };
         row.st.translate = median(tr);
         row.st.run = median(run);
-        std.debug.print("| {s} | {s} | {d} | {d} | {d} | {d:.2} | {d:.2} | {d:.2} | {d:.2} | {d:.2} | {d:.2} | {d:.2} | {s} |\n", .{ c.id, row.st.route, row.st.pieces, row.st.bytes, row.st.steps, ms(row.st.translate), ms(row.st.run), ms(row.st.exec), ms(row.st.boot), ms(row.st.eval), ms(row.e2e[0]), ms(row.e2e[1]), if (row.served_ok) "= CPython" else "DIFFERS" });
+        std.debug.print("| {s} | {s} | {d} | {d} | {d} | {d:.2} | {d:.2} | {d:.2} | {d:.2} | {d:.2} | {d:.2} | {d:.2} | {s} |\n", .{ c.id, row.st.route, row.st.pieces, row.st.bytes, row.st.steps, ms(row.st.translate), ms(row.st.run), ms(row.st.exec), ms(row.st.boot), ms(row.st.eval), ms(row.e2e[0]), ms(row.e2e[1]), if (row.served_ok) "= CPython" else if (std.mem.eql(u8, row.st.route, "abstain")) "declined" else "DIFFERS" });
     }
     var all: std.ArrayList(u64) = .empty;
     var first: std.ArrayList(u64) = .empty;

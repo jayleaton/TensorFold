@@ -34,6 +34,7 @@ pub const shim_source =
     \\extern void *mmap(void *, size_t, int, int, int, long);
     \\extern void *dlsym(void *, const char *);
     \\extern int *__errno_location(void);
+    \\extern long syscall(long, ...);
     \\typedef int (*main_fn)(int, char **, char **);
     \\typedef int (*start_fn)(main_fn, int, char **, void (*)(void), void (*)(void), void (*)(void), void *);
     \\static main_fn tool_main;
@@ -92,6 +93,8 @@ pub const shim_source =
     \\}
     \\static int serve(int argc, char **argv, char **envp) {
     \\    (void)argc; (void)argv; (void)envp;
+    \\    // the server outlives calls: drop the runner's other pipes and sockets (close_range, else one by one)
+    \\    if (syscall(436, 4u, ~0u, 0u) != 0) for (int fd = 4; fd < 1024; ++fd) close(fd);
     \\    flags = mmap(0, 4096, 3, 0x21, -1, 0);
     \\    if (flags == (void *)-1l) _exit(0);
     \\    unsigned int ready = 0x52454459;
@@ -204,6 +207,12 @@ pub fn run(a: Allocator, io: std.Io, dir: []const u8, argv: []const []const u8, 
         }
     }
     return spawn.run(a, io, argv, limits);
+}
+
+/// The ready server's process for `tool` (tests: what it holds open).
+pub fn serverPid(tool: []const u8) ?linux.pid_t {
+    for (&servers) |*s| if (@atomicLoad(bool, &s.alive, .acquire) and std.mem.eql(u8, s.tool[0..s.tool_len], tool)) return s.pid;
+    return null;
 }
 
 /// Whether a server for `tool` is ready (tests and reports).
@@ -329,7 +338,6 @@ const libc = struct {
     extern "c" fn posix_spawn_file_actions_destroy(actions: *Opaque) c_int;
     extern "c" fn posix_spawn_file_actions_adddup2(actions: *Opaque, fd: c_int, to: c_int) c_int;
     extern "c" fn posix_spawn_file_actions_addopen(actions: *Opaque, fd: c_int, path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
-    extern "c" fn posix_spawn_file_actions_addclose(actions: *Opaque, fd: c_int) c_int;
     extern "c" var environ: [*:null]?[*:0]u8;
 };
 
@@ -358,36 +366,11 @@ fn launch(a: Allocator, tool: []const u8, so: []const u8, control: linux.fd_t) A
     var rc = libc.posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", 0, 0);
     if (rc == 0) rc = libc.posix_spawn_file_actions_addopen(&actions, 1, "/dev/null", 1, 0);
     if (rc == 0) rc = libc.posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", 1, 0);
+    // fds above 3 close in the shim's serve(): posix_spawn_file_actions_addclosefrom_np needs glibc 2.34
     if (rc == 0) rc = libc.posix_spawn_file_actions_adddup2(&actions, control, 3);
-    // the server outlives calls: it must not hold the runner's other pipes and sockets open
-    if (rc == 0) rc = closeFrom(&actions, 4);
     var pid: linux.pid_t = 0;
     if (rc == 0) rc = libc.posix_spawn(&pid, path, &actions, null, &argv, @ptrCast(env.items.ptr));
     return if (rc == 0) pid else 0;
-}
-
-/// addclosefrom_np is glibc 2.34, past the serve targets' glibc: one addclose per fd open from `from` instead.
-fn closeFrom(actions: *Opaque, from: c_int) c_int {
-    const opened = linux.open("/proc/self/fd", .{ .DIRECTORY = true, .CLOEXEC = true }, 0);
-    if (linux.errno(opened) != .SUCCESS) return @backingInt(linux.errno(opened));
-    const dir: linux.fd_t = @intCast(opened);
-    defer _ = linux.close(dir);
-    var buf: [4096]u8 align(8) = undefined;
-    while (true) {
-        const n = linux.getdents64(dir, &buf, buf.len);
-        if (linux.errno(n) != .SUCCESS) return @backingInt(linux.errno(n));
-        if (n == 0) return 0;
-        var at: usize = 0;
-        while (at < n) {
-            const d: *align(1) const linux.dirent64 = @ptrCast(&buf[at]);
-            at += d.reclen;
-            const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&d.name)), 0);
-            const fd = std.fmt.parseInt(c_int, name, 10) catch continue; // "." and ".."
-            if (fd < from or fd == dir) continue;
-            const rc = libc.posix_spawn_file_actions_addclose(actions, fd);
-            if (rc != 0) return rc;
-        }
-    }
 }
 
 fn reap(pid: linux.pid_t) void {

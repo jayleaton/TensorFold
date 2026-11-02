@@ -21,3 +21,15 @@ pub fn tests(b: *std.Build, all: *std.Build.Step) void {
     b.step("runner-frontend-check", "Build the compiler/ELF boot self-test for derived serving images")
         .dependOn(&b.addInstallArtifact(check, .{}).step);
 }
+
+/// The runner's libc calls linked against -Dtarget's glibc: host gates link the hosts' newer one and cannot see this.
+pub fn linkCheck(b: *std.Build, target: std.Build.ResolvedTarget) void {
+    const exe = b.addExecutable(.{ .name = "tf-runner-link-check", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/src/core/runner_link_check.zig"),
+        .target = target,
+        .optimize = .ReleaseSmall,
+        .link_libc = true,
+    }) });
+    b.step("runner-link-check", "Link the runner's libc calls for -Dtarget (e.g. aarch64-linux-gnu, the serve build's glibc)")
+        .dependOn(&b.addInstallArtifact(exe, .{}).step);
+}
