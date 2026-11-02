@@ -3,17 +3,18 @@ const ast = @import("runner_frontend_integer_ast.zig");
 const compiler = @import("runner_frontend_program_compile.zig");
 const cost = @import("runner_frontend_integer_cost.zig");
 
-/// graph_only: only the graph route takes the table (defs, asserts); `source` is empty.
+/// graph_only: only the graph route takes the table (lists, more than eight values); `source` is empty.
 pub const Lowered = struct { source: []u8, estimated_steps: ?usize, table: ?Table = null, graph_only: bool = false };
 
 /// A lowered script's DAG and ordered outputs, the data the runtime evaluates; literal text is dropped (use value).
 pub const Table = struct {
     nodes: [64]ast.Node = undefined,
     count: usize = 0,
-    roots: [8]usize = undefined,
-    endings: [8]u8 = undefined,
-    styles: [8]u8 = @splat(0), // 0 integer/bool/tuple, 1 exact integral float, 2 fixed Decimal
-    scales: [8]u8 = @splat(0),
+    roots: [32]usize = undefined,
+    endings: [32]u8 = undefined, // ' ', '\n', or ',' between a printed list's elements
+    styles: [32]u8 = @splat(0), // 0 integer/bool/tuple, 1 exact integral float, 2 fixed Decimal
+    scales: [32]u8 = @splat(0),
+    brackets: [32]u8 = @splat(0), // 1: a list's `[` before the value, 2: its `]` after
     outputs: usize = 0,
 };
 
