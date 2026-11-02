@@ -312,8 +312,19 @@ test "configured fork server: answers as a spawned clang, streams included; a ti
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(t.io, ".", a);
     const linker = if (std.c.getenv("TF_RUNNER_LLD")) |l| std.mem.span(l) else null;
+    // an inheritable pipe the runner holds: the server must not keep it (it outlives every call)
+    var leak: [2]i32 = undefined;
+    try t.expectEqual(@as(usize, 0), std.os.linux.pipe2(&leak, .{}));
+    defer for (leak) |fd| {
+        _ = std.os.linux.close(fd);
+    };
     try t.expect(try forkserver.start(a, t.io, clang, linker, dir));
     try t.expect(forkserver.ready(clang));
+    const fds = try std.fmt.allocPrint(a, "/proc/{d}/fd", .{forkserver.serverPid(clang).?});
+    var held = try std.Io.Dir.cwd().openDir(t.io, fds, .{ .iterate = true });
+    defer held.close(t.io);
+    var it = held.iterate();
+    while (try it.next(t.io)) |e| try t.expect(try std.fmt.parseInt(u32, e.name, 10) <= 3);
     const src = try std.fmt.allocPrint(a, "{s}/x.c", .{dir});
     try std.Io.Dir.cwd().writeFile(t.io, .{ .sub_path = src, .data = split.declarations ++ "int main(void) { char b[4]; memset(b, 7, sizeof b); return b[1]; }\n" });
     const limits: spawn.Limits = .{ .stdout = 4 << 20, .stderr = 1 << 16, .timeout = .fromMilliseconds(20_000) };
