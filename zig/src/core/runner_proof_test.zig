@@ -296,4 +296,5 @@ comptime {
     _ = @import("runner_frontend_inline_regression_test.zig");
     _ = @import("runner_inline_mod_test.zig");
     _ = @import("runner_inline_arith_test.zig");
+    _ = @import("runner_inline_chain_test.zig");
 }
