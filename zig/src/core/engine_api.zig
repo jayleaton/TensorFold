@@ -16,13 +16,10 @@ pub const embedding_vector = @import("embedding_vector.zig");
 
 /// One image of a request (``Request.images``): the tower's input and the placeholder rows its output replaces.
 pub const Image = lanes.stream.Image;
-
 /// A prompt's reproducible seed (``seed_for``), for requests that name none.
 pub const seedFor = lanes.sampling.seedFor;
-
 /// A committed token's log probability under the target's raw distribution, with the best tokens at its position.
 pub const LogprobRow = lanes.LogprobRow;
-
 /// The request's stop strings, checked on the engine's thread after each committed token (the server decodes the tail).
 pub const Stop = struct {
     ctx: *anyopaque,
