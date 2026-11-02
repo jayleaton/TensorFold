@@ -19,6 +19,7 @@ pub const Ran = struct {
 pub const Limits = struct { stdout: usize, stderr: usize, timeout: std.Io.Duration };
 
 const spawned = builtin.link_libc and builtin.os.tag == .linux;
+const spawn_setpgroup: c_short = 0x02;
 
 /// argv run with stdin on /dev/null (PATH for a bare name); null if it cannot start, overflows a limit or times out.
 pub fn run(a: Allocator, io: std.Io, argv: []const []const u8, limits: Limits) Allocator.Error!?Ran {
@@ -55,7 +56,14 @@ pub fn run(a: Allocator, io: std.Io, argv: []const []const u8, limits: Limits) A
         kill(pid);
         return null;
     }
-    const status = reap(pid) orelse return null;
+    const status = switch (waitUntil(pid, deadline)) {
+        .done => |status| status,
+        .timed_out => {
+            kill(pid);
+            return null;
+        },
+        .lost => return null,
+    };
     const stdout = try out.toOwnedSlice(a);
     errdefer a.free(stdout);
     return .{ .stdout = stdout, .stderr = try err.toOwnedSlice(a), .ok = status == 0 };
@@ -97,25 +105,50 @@ const libc = struct {
     extern "c" fn posix_spawn_file_actions_destroy(actions: *Opaque) c_int;
     extern "c" fn posix_spawn_file_actions_adddup2(actions: *Opaque, fd: c_int, to: c_int) c_int;
     extern "c" fn posix_spawn_file_actions_addopen(actions: *Opaque, fd: c_int, path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
+    extern "c" fn posix_spawnattr_init(attr: *Opaque) c_int;
+    extern "c" fn posix_spawnattr_destroy(attr: *Opaque) c_int;
+    extern "c" fn posix_spawnattr_setpgroup(attr: *Opaque, group: linux.pid_t) c_int;
+    extern "c" fn posix_spawnattr_setflags(attr: *Opaque, flags: c_short) c_int;
+    extern "c" fn getsid(pid: linux.pid_t) linux.pid_t;
     extern "c" var environ: [*:null]?[*:0]u8;
 };
 
 const Opaque = extern struct { bytes: [512]u8 align(16) = undefined };
 
 fn start(pid: *linux.pid_t, argv: [:null]?[*:0]const u8, stdout: linux.fd_t, stderr: linux.fd_t) bool {
+    var attr: Opaque = .{};
+    if (libc.posix_spawnattr_init(&attr) != 0) return false;
+    defer _ = libc.posix_spawnattr_destroy(&attr);
+    if (libc.posix_spawnattr_setpgroup(&attr, 0) != 0 or libc.posix_spawnattr_setflags(&attr, spawn_setpgroup) != 0) return false;
     var actions: Opaque = .{};
     if (libc.posix_spawn_file_actions_init(&actions) != 0) return false;
     defer _ = libc.posix_spawn_file_actions_destroy(&actions);
     var rc = libc.posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", 0, 0);
     if (rc == 0) rc = libc.posix_spawn_file_actions_adddup2(&actions, stdout, 1);
     if (rc == 0) rc = libc.posix_spawn_file_actions_adddup2(&actions, stderr, 2);
-    if (rc == 0) rc = libc.posix_spawnp(pid, argv[0].?, &actions, null, argv.ptr, @ptrCast(libc.environ));
+    if (rc == 0) rc = libc.posix_spawnp(pid, argv[0].?, &actions, &attr, argv.ptr, @ptrCast(libc.environ));
     return rc == 0;
 }
 
 fn kill(pid: linux.pid_t) void {
-    _ = linux.kill(pid, .KILL);
+    _ = linux.kill(-pid, .KILL);
     _ = reap(pid);
+}
+
+/// Pipe EOF does not prove exit: a child that closes its streams still has the original deadline.
+fn waitUntil(pid: linux.pid_t, deadline: u64) union(enum) { done: u32, timed_out, lost } {
+    while (true) {
+        var st: i32 = 0;
+        const rc = linux.wait4(pid, &st, 1, null);
+        switch (linux.errno(rc)) {
+            .SUCCESS => if (rc != 0) return .{ .done = @bitCast(st) },
+            .INTR => continue,
+            else => return .lost,
+        }
+        if (now() >= deadline) return .timed_out;
+        const pause: linux.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = linux.nanosleep(&pause, null);
+    }
 }
 
 /// The child's wait status, or null when it cannot be reaped.
@@ -168,5 +201,56 @@ test "spawned compiler process: exit status, captured streams, limits, timeout a
     const t0 = now();
     try t.expectEqual(@as(?Ran, null), try run(t.allocator, t.io, &.{ "/bin/sh", "-c", "sleep 5" }, .{ .stdout = 64, .stderr = 64, .timeout = .fromMilliseconds(100) }));
     try t.expect(now() - t0 < 3 * std.time.ns_per_s);
+    if (comptime spawned) {
+        const closed = now();
+        try t.expectEqual(@as(?Ran, null), try run(t.allocator, t.io, &.{ "/bin/sh", "-c", "exec 1>/dev/null 2>&1; sleep 5" }, .{ .stdout = 64, .stderr = 64, .timeout = .fromMilliseconds(100) }));
+        try t.expect(now() - closed < 3 * std.time.ns_per_s);
+        try descendantsStop();
+    }
     try t.expectEqual(@as(?Ran, null), try run(t.allocator, t.io, &.{"/nonexistent/tf-clang"}, .{ .stdout = 64, .stderr = 64, .timeout = .fromMilliseconds(5000) }));
+}
+
+/// A timed-out compiler driver must leave no live worker in the scope, even when the worker outlives the driver.
+fn descendantsStop() !void {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(dir);
+    const path = try std.fs.path.join(t.allocator, &.{ dir, "child" });
+    defer t.allocator.free(path);
+    try t.expectEqual(@as(?Ran, null), try run(t.allocator, t.io, &.{ "/bin/sh", "-c", "sleep 30 & echo $! > \"$1\"; wait", "compiler", path }, .{ .stdout = 64, .stderr = 64, .timeout = .fromMilliseconds(200) }));
+    const bytes = try tmp.dir.readFileAlloc(t.io, "child", t.allocator, .limited(64));
+    defer t.allocator.free(bytes);
+    const pid = try std.fmt.parseInt(linux.pid_t, std.mem.trim(u8, bytes, " \r\n\t"), 10);
+    const proc = try std.fmt.allocPrint(t.allocator, "/proc/{d}/stat", .{pid});
+    defer t.allocator.free(proc);
+    const settled_by = now() + std.time.ns_per_s;
+    var alive = true;
+    var owned = false;
+    while (true) {
+        const file = std.Io.Dir.cwd().openFile(t.io, proc, .{}) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer file.close(t.io);
+        var buffer: [4096]u8 = undefined;
+        var reader = file.readerStreaming(t.io, &buffer);
+        const stat = try reader.interface.allocRemaining(t.allocator, .limited(4096));
+        defer t.allocator.free(stat);
+        if (stat.len == 0) return;
+        const end = std.mem.lastIndexOfScalar(u8, stat, ')') orelse return error.InvalidProcStat;
+        var fields = std.mem.tokenizeScalar(u8, stat[end + 1 ..], ' ');
+        const state = fields.next() orelse return error.InvalidProcStat;
+        _ = fields.next() orelse return error.InvalidProcStat;
+        _ = fields.next() orelse return error.InvalidProcStat;
+        const sid = try std.fmt.parseInt(linux.pid_t, fields.next() orelse return error.InvalidProcStat, 10);
+        alive = state[0] != 'Z' and state[0] != 'X';
+        owned = sid == libc.getsid(0) and std.mem.indexOf(u8, stat, "(sleep)") != null;
+        if (!alive or now() >= settled_by) break;
+        const pause: linux.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = linux.nanosleep(&pause, null);
+    }
+    if (alive and owned) _ = linux.kill(pid, .KILL);
+    try t.expect(!alive);
 }

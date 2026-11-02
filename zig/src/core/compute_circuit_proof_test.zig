@@ -46,6 +46,7 @@ fn proof(elf: bool) !void {
     const b = try backend.backend(gpa, &c, 2);
     defer backend.destroy(b);
     var ctx: frontend.Context = .{ .io = std.testing.io };
+    if (std.c.getenv("TF_RUNNER_CLANG")) |cxx| ctx.compiler.clang = std.mem.span(cxx);
     if (std.c.getenv("TF_RUNNER_LLD")) |l| ctx.compiler.linker = std.mem.span(l);
     if (!elf) ctx.compiler.scratch_root = ""; // runner_open's no-compile frontend (TF_DSV41_COMPUTE_LANE_RUNNER_ELF=0)
     var e: s3.Exec = .{ .frontend = ctx.frontend(), .backend = b, .max_steps = 4_000_000, .cfg = .{ .wall_ms = 600_000, .elf = elf } };

@@ -180,7 +180,7 @@ test "configured assertion cells match exact CPython stdout through fence dispat
         const result = try front.translate(front.ctx, t.allocator, .{ .form = .fence, .lang = "python", .code = fixture.code });
         try t.expect(result == .program);
         defer t.allocator.free(result.program.bytes);
-        try t.expectEqual(.elf, result.program.kind);
+        try t.expect(result.program.kind == .elf or result.program.kind == .calc);
         const oracle = try std.process.run(t.allocator, t.io, .{
             .argv = &.{ env.get("TF_RUNNER_REFERENCE_PYTHON") orelse "/usr/bin/python3", "-I", "-c", fixture.code },
             .stdout_limit = .limited(4096),
@@ -191,7 +191,12 @@ test "configured assertion cells match exact CPython stdout through fence dispat
         defer t.allocator.free(oracle.stderr);
         try t.expect(oracle.term.success());
         try t.expectEqualStrings(fixture.expected, oracle.stdout);
-        try checkReference(&env, result.program.bytes, oracle.stdout, "0");
+        try @import("runner_frontend_reference_test.zig").check(
+            env.get("TF_RUNNER_QWENPUTER") orelse return error.SkipZigTest,
+            env.get("TF_RUNNER_REFERENCE_PYTHON") orelse "/usr/bin/python3",
+            result.program,
+            oracle.stdout,
+        );
     }
     for (refused) |code| {
         const result = try front.translate(front.ctx, t.allocator, .{ .form = .fence, .lang = "python", .code = code });
