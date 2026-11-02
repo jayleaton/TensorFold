@@ -121,6 +121,7 @@ pub const Tracer = struct {
         if (text.approx(rest[0..ph.end])) return null;
         if (text.listed(rest, ph)) return null;
         if (std.mem.indexOfScalar(u8, text.sentenceAt(clean, h.end), '?') != null) return null;
+        if (ph.kind == .isqrt or ph.kind == .edit) return t.named(rest, ph);
         var parts: [2]Expr = undefined;
         for (ph.parts[0..ph.n], 0..) |p, k| parts[k] = try t.parse(rest[p[0]..p[1]]) orelse return null;
         var f: Found = undefined;
@@ -147,11 +148,30 @@ pub const Tracer = struct {
                 f = .{ .source = try std.fmt.allocPrint(a, "({s}) - ({s})", .{ parts[1].source, parts[0].source }), .display = try std.fmt.allocPrint(a, "{s} - {s}", .{ try wrapped(a, parts[1]), try wrapped(a, parts[0]) }), .run = try std.fmt.allocPrint(a, "({s}) - ({s})", .{ parts[1].run, parts[0].run }) };
                 bound = expr.sat(@max(parts[0].bound, parts[1].bound) + 1);
             },
+            .isqrt, .edit => unreachable,
         }
         if (t.firedHas(f.display) or bound > max_digits) return null;
         // a bare sentence counts only when it is plainly a computation: a power or a six-digit literal
         if (h.bare and std.mem.indexOf(u8, f.source, "**") == null and !hasDigitRun(f.source, 6)) return null;
         return f;
+    }
+
+    /// A named problem over literals (STATED): isqrt on the bank's plan, edit distance as one RV32 program.
+    fn named(t: *Tracer, rest: []const u8, ph: text.Phrase) Allocator.Error!?Found {
+        const a = t.scratch.allocator();
+        const x = rest[ph.parts[0][0]..ph.parts[0][1]];
+        const f: Found = if (ph.kind == .isqrt) blk: {
+            const n = try std.mem.replaceOwned(u8, a, x, ",", "");
+            // a zero-led literal is no Python integer, and the plan is as wide as the integer frontend
+            if ((n.len > 1 and n[0] == '0') or n.len > max_digits) return null;
+            const call = try std.fmt.allocPrint(a, "isqrt({s})", .{n});
+            break :blk .{ .source = call, .display = call, .run = try std.fmt.allocPrint(a, "from math import isqrt\nprint({s})", .{call}) };
+        } else blk: {
+            const y = rest[ph.parts[1][0]..ph.parts[1][1]];
+            const call = try std.fmt.allocPrint(a, "edit_distance(\"{s}\", \"{s}\")", .{ x, y });
+            break :blk .{ .source = call, .display = call, .run = try std.fmt.allocPrint(a, edit_program, .{ x, y }) };
+        };
+        return if (t.firedHas(f.display)) null else f;
     }
 
     /// TF_DSV41_RUNNER_STATED's line shapes: `L = R.` with L over names and literally R, or a hex literal's value.
@@ -200,6 +220,25 @@ pub const Tracer = struct {
         return expr.parse(t.scratch.allocator(), t.names.items, s);
     }
 };
+
+/// Levenshtein distance: T5's census program; past the default compile budget it needs TF_DSV41_RUNNER_COMPILE_STEPS.
+pub const edit_program =
+    \\def edit_distance(a,b):
+    \\    if len(a) > len(b):
+    \\        a,b = b,a
+    \\    m = len(a)
+    \\    dp = list(range(m+1))
+    \\    for i, ch in enumerate(b, 1):
+    \\        prev = dp[0]
+    \\        dp[0] = i
+    \\        for j in range(1, m+1):
+    \\            old = dp[j]
+    \\            cost = 0 if a[j-1] == ch else 1
+    \\            dp[j] = min(old + 1, dp[j-1] + 1, prev + cost)
+    \\            prev = old
+    \\    return dp[m]
+    \\print(edit_distance("{s}", "{s}"))
+;
 
 /// The owned line's default wording (`{}` is `<display> = <value>`); seeded S2 round 3: 42% fewer tokens than off.
 pub const default_format = "[exact, computed by the engine: {}]";

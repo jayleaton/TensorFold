@@ -276,18 +276,20 @@ pub fn bareHeads(a: Allocator, s: []const u8, commas: bool, out: *std.ArrayList(
     }
 }
 
-pub const Phrase = struct { kind: enum { divmod, mul, subfrom, expr, gcd }, parts: [2][2]usize = undefined, n: usize = 1, end: usize };
+pub const Phrase = struct { kind: enum { divmod, mul, subfrom, expr, gcd, isqrt, edit }, parts: [2][2]usize = undefined, n: usize = 1, end: usize };
 
 const fill_words = [_][]const u8{ "the", "answer", "exact", "exactly", "value", "of", "integer", "decimal", "product", "sum", "difference", "result", "floor", "huge", "number", "big" };
 const trail_words = [_][]const u8{ "exactly", "exact", "accurately", "carefully", "precisely", "manually" };
 
-/// The phrase a head introduces, up to the first sentence end (`.,;:` then a space, or the line's end; `whole`: gcd).
+/// The phrase a head introduces, up to the first sentence end (`.,;:` then a space, or the line's end; `whole`: named).
 pub fn phrase(rest: []const u8, whole: bool) ?Phrase {
     var i: usize = 0;
     var n: usize = 0;
+    var integral = false; // "integer" or "floor" read: a square root is isqrt's
     while (n < 4) : (n += 1) {
         var hit = false;
         for (fill_words) |w| if (seq(rest, i, &.{w})) |j| if (j < rest.len and isSpace(rest[j])) {
+            integral = integral or std.mem.eql(u8, w, "integer") or std.mem.eql(u8, w, "floor");
             i = j;
             while (i < rest.len and isSpace(rest[i])) i += 1;
             hit = true;
@@ -300,6 +302,8 @@ pub fn phrase(rest: []const u8, whole: bool) ?Phrase {
     if (multiplyDefs(rest, i)) |p| return .{ .kind = .mul, .parts = p.parts, .n = 2, .end = p.end };
     if (verbPhrase(rest, i, "subtract", &.{"from"})) |p| return .{ .kind = .subfrom, .parts = p.parts, .n = 2, .end = p.end };
     if (whole) if (gcdCall(rest, i)) |p| return .{ .kind = .gcd, .parts = p.parts, .n = 2, .end = p.end };
+    if (whole) if (isqrtOf(rest, i, integral)) |p| return .{ .kind = .isqrt, .parts = p.parts, .end = p.end };
+    if (whole) if (editDistance(rest, i)) |p| return .{ .kind = .edit, .parts = p.parts, .n = 2, .end = p.end };
     const e = lazyEnd(rest, i) orelse return null;
     return .{ .kind = .expr, .parts = .{ .{ i, e.text }, undefined }, .end = e.end };
 }
@@ -367,6 +371,78 @@ fn gcdCall(s: []const u8, i: usize) ?Two {
     const c = comma orelse return null;
     const e = endAt(s, k + 1) orelse return null;
     return .{ .parts = .{ .{ open, c }, .{ c + 1, k } }, .end = e };
+}
+
+/// `isqrt(N)`, or `sqrt of N` / `square root of N` after "integer" or "floor" (bare, it may mean the real root).
+fn isqrtOf(s: []const u8, i: usize, integral: bool) ?Two {
+    var j: usize = undefined;
+    var call = false;
+    if (seq(s, i, &.{"isqrt("})) |k| {
+        j = k;
+        call = true;
+    } else if (integral) {
+        j = seq(s, i, &.{ "sqrt", "of" }) orelse seq(s, i, &.{ "square", "root", "of" }) orelse return null;
+        j = skipDef(s, spaces(s, j) orelse return null);
+    } else return null;
+    const x0 = j;
+    while (j < s.len and (std.ascii.isDigit(s[j]) or thousandsAt(s, j))) j += 1;
+    if (j == x0 or (j < s.len and isWord(s[j]))) return null;
+    const x1 = j;
+    if (call) {
+        if (j >= s.len or s[j] != ')') return null;
+        j += 1;
+    }
+    const e = trailEnd(s, j) orelse return null;
+    return .{ .parts = .{ .{ x0, x1 }, undefined }, .end = e };
+}
+
+/// The longest string an edit distance takes as written (the frontend refuses long ones on cost anyway).
+pub const max_edit = 32;
+
+/// `Levenshtein [distance]` or `edit distance`, [between|of|from] "A" and|to "B": quoted literals, not prose words.
+fn editDistance(s: []const u8, i: usize) ?Two {
+    var j = seq(s, i, &.{ "levenshtein", "distance" }) orelse seq(s, i, &.{ "edit", "distance" }) orelse
+        seq(s, i, &.{"levenshtein"}) orelse return null;
+    j = spaces(s, j) orelse return null;
+    for ([_][]const u8{ "between", "of", "from" }) |w| if (seq(s, j, &.{w})) |k| {
+        j = spaces(s, k) orelse return null;
+        break;
+    };
+    const x = quoted(s, j) orelse return null;
+    var k = spaces(s, x.end) orelse return null;
+    k = seq(s, k, &.{"and"}) orelse seq(s, k, &.{"to"}) orelse return null;
+    k = spaces(s, k) orelse return null;
+    const y = quoted(s, k) orelse return null;
+    const e = trailEnd(s, y.end) orelse return null;
+    return .{ .parts = .{ x.text, y.text }, .end = e };
+}
+
+/// A quoted literal at `i` ('…', "…", ‘…’ or “…”): its contents, printable ASCII without quotes or a backslash.
+fn quoted(s: []const u8, i: usize) ?struct { text: [2]usize, end: usize } {
+    const marks = [_][2][]const u8{ .{ "\"", "\"" }, .{ "'", "'" }, .{ "“", "”" }, .{ "‘", "’" } };
+    for (marks) |q| if (std.mem.startsWith(u8, s[i..], q[0])) {
+        const from = i + q[0].len;
+        const close = std.mem.indexOfPos(u8, s, from, q[1]) orelse return null;
+        if (close == from or close - from > max_edit) return null;
+        for (s[from..close]) |c| if (c < 0x20 or c > 0x7e or c == '"' or c == '\'' or c == '\\') return null;
+        return .{ .text = .{ from, close }, .end = close + q[1].len };
+    };
+    return null;
+}
+
+/// Past one or more spaces at `i`; null without one.
+fn spaces(s: []const u8, i: usize) ?usize {
+    var j = i;
+    while (j < s.len and isSpace(s[j])) j += 1;
+    return if (j > i) j else null;
+}
+
+/// A sentence end at `k`, or after one trailer word ("exactly").
+fn trailEnd(s: []const u8, k: usize) ?usize {
+    if (endAt(s, k)) |e| return e;
+    const j = spaces(s, k) orelse return null;
+    for (trail_words) |w| if (seq(s, j, &.{w})) |t| if (endAt(s, t)) |e| return e;
+    return null;
 }
 
 /// `multiply A=x B=y`: two definitions side by side.

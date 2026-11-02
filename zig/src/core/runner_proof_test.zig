@@ -428,4 +428,5 @@ comptime {
     _ = @import("runner_inline_hex_test.zig");
     _ = @import("runner_trace_stated_test.zig");
     _ = @import("runner_trace_divmod_test.zig");
+    _ = @import("runner_trace_named_test.zig");
 }
