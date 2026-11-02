@@ -48,6 +48,7 @@ pub const Config = struct {
         c.place = try place.Config.parse(get, prefix);
         c.scan.lookahead = try knob(u32, get, prefix ++ "_LOOKAHEAD", c.scan.lookahead, 1, 4096);
         c.scan.float_window = try knob(u32, get, prefix ++ "_FLOAT_WINDOW", c.scan.float_window, 0, 65536);
+        c.scan.inline_mod = try knob(u1, get, prefix ++ "_INLINE_MOD", 1, 0, 1) == 1;
         c.scan.trace_window = try knob(u32, get, prefix ++ "_TRACE_WINDOW", c.scan.trace_window, 1, 65536);
         if (get(prefix ++ "_FORMS")) |f| if (f.len > 0) {
             c.scan.fence = false;
@@ -498,4 +499,5 @@ test {
     _ = @import("runner_trace_test.zig");
     _ = @import("runner_settle_test.zig");
     _ = @import("runner_probe.zig");
+    _ = @import("runner_inline_mod_test.zig");
 }
