@@ -3,13 +3,26 @@
 from runner_graph_ir import Value
 
 
-OPERATIONS = ("round_div", "decimal_mul", "compare", "min", "max", "scale10", "float_exact")
+OPERATIONS = ("round_div", "decimal_mul", "compare", "min", "max", "scale10", "float_exact", "reverse_decimal", "assert_true")
 
 
 def build(b, op):
-    arity = 4 if op == "round_div" else 1 if op in ("scale10", "float_exact") else 2
+    arity = 4 if op == "round_div" else 1 if op in ("scale10", "float_exact", "reverse_decimal", "assert_true") else 2
     inputs = [b.input(i, preserve_sign=True) for i in range(arity)]
     error = b.any(value.error for value in inputs)
+    if op == "assert_true":
+        value = inputs[0]
+        return Value(value.digits, value.sign, b.any([error, b.one - b.nz(value.digits)]))
+    if op == "reverse_decimal":
+        a = b.normalize(inputs[0])
+        suffix = [b.zero] * (b.width + 1)
+        for i in reversed(range(b.width)):
+            suffix[i] = b.any([b.ge(a.digits[i], 1, 0, 9), suffix[i + 1]])
+        lengths = [b.node([(1, suffix[i], b.one - suffix[i + 1])], "reverse.length")
+                   for i in range(b.width)]
+        digits = [b.node([(1, a.digits[end - i], lengths[end]) for end in range(i, b.width)],
+                         "reverse.digit") for i in range(b.width)]
+        return Value(digits, b.zero, b.any([error, a.sign]))
     if op == "float_exact":
         a = inputs[0]
         return Value(a.digits, a.sign, b.any([error, b.nz(a.digits[15:])]))
