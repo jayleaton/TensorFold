@@ -4,6 +4,7 @@ const lanes = @import("lanes");
 const api = @import("runner_api.zig");
 const scan = @import("runner_scan.zig");
 const trace = @import("runner_trace.zig");
+const records = @import("runner_receipt.zig");
 pub const place = @import("runner_place.zig");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.runner);
@@ -23,6 +24,7 @@ pub const Config = struct {
     guide: []const u8 = "", // PREFIX_GUIDE: "1" RUNNER-GUIDE.md, else a file, as chats' default guide (server/runner_guide.zig)
     compile: bool = true, // false: the frontend never builds an ELF (no clang); calc and graph programs only (S3)
     sync_graph: bool = false, // PREFIX_SYNC_GRAPH: a graph result settles at its trigger token, in that round (no hold)
+    cells: bool = true, // PREFIX_CELLS: the receipt records each owned cell's span, route and landed value (runner_receipt.zig)
 
     /// PREFIX "1" enables (unset, "" or "0": null); PREFIX_* knobs override defaults; a bad value is error.BadKnob.
     pub fn parse(get: *const fn ([]const u8) ?[]const u8, comptime prefix: []const u8) error{BadKnob}!?Config {
@@ -47,6 +49,7 @@ pub const Config = struct {
         c.settle_us = try knob(u32, get, prefix ++ "_SETTLE_US", c.settle_us, 0, 100_000);
         c.sync_graph = try knob(u1, get, prefix ++ "_SYNC_GRAPH", 0, 0, 1) == 1;
         if (c.sync_graph and c.backend != .graph) return bad(prefix ++ "_SYNC_GRAPH", "1 (backend is not graph)");
+        c.cells = try knob(u1, get, prefix ++ "_CELLS", 1, 0, 1) == 1;
         c.guide = get(prefix ++ "_GUIDE") orelse "";
         if (std.mem.eql(u8, c.guide, "0")) c.guide = "";
         c.place = try place.Config.parse(get, prefix);
@@ -120,7 +123,7 @@ pub const Runner = struct {
         var cfg = r.cfg.scan;
         if (ask.off) cfg.trace = false;
         cfg.trace_repeat = ask.repeat;
-        s.* = .{ .r = r, .id = r.next_id, .scan = .{ .cfg = cfg }, .format = format };
+        s.* = .{ .r = r, .id = r.next_id, .scan = .{ .cfg = cfg }, .format = format, .rec = .{ .on = r.cfg.cells } };
         r.next_id += 1;
         return s;
     }
@@ -160,6 +163,7 @@ pub const Session = struct {
     broken: bool = false, // out of memory once: no more cells, no more holds
     sync_ids: []u32 = &.{}, // cfg.sync_graph: the result a trigger settled with, forced by the stream (hook.settled)
     format: []u8, // TraceAsk.format, owned
+    rec: records.Log = .{}, // the receipt's per-cell records
 
     pub fn hook(s: *Session) lanes.stream.RunnerHook {
         return .{ .ptr = s, .token = onToken, .settled = if (s.r.cfg.sync_graph) settled else null, .eos = onEos };
@@ -216,7 +220,9 @@ pub const Session = struct {
             s.r.gpa.free(s.sync_ids);
             s.sync_ids = &.{};
         }
-        const ev = try s.scan.feed(s.r.gpa, if (think_end) "" else tx.bytes(tx.ctx, token), think_open);
+        const bytes = if (think_end) "" else tx.bytes(tx.ctx, token);
+        try s.rec.token(s.r.gpa, token, bytes, think_open);
+        const ev = try s.scan.feed(s.r.gpa, bytes, think_open);
         if (ev.closed) |c| try s.open(c);
         const t = ev.trigger orelse return false;
         if (!can_hold or t.index >= s.cells.items.len) return false;
@@ -227,6 +233,7 @@ pub const Session = struct {
                 return false;
             }
             s.sync_ids = ids;
+            s.rec.synced();
             return true;
         };
         s.waiting = t;
@@ -296,6 +303,7 @@ pub const Session = struct {
 
     /// Advances translations and runs; the tokens to force when the awaited cell is settled (caller frees them).
     pub fn tick(s: *Session) Allocator.Error!?[]u32 {
+        s.rec.rounds += 1;
         if (s.waiting) |w| if (s.r.cfg.settle_us > 0) s.settle(s.cells.items[w.index]);
         for (s.cells.items) |c| s.advance(c);
         const w = s.waiting orelse return null;
@@ -344,6 +352,9 @@ pub const Session = struct {
         s.owned_n += 1;
         c.told = .owned;
         c.owned_tokens = @intCast(ids.len);
+        s.rec.owned(s.r.gpa, w.index, ids) catch {
+            s.rec.on = false; // out of memory: this reply's receipt has no records
+        };
         s.forcing = .{ .at = nowNs(), .left = ids.len, .cell = w.index };
         log.info("reply {d} cell {d} ({s} {t}): owned {d} tokens, {t} after {d} steps, run {d} ms, held {d} ms, ticks {d}", .{ s.id, w.index, c.lang, c.form, ids.len, res.status, res.steps, res.exec_ns / std.time.ns_per_ms, held_ms, s.held_ticks });
         return ids;
@@ -361,6 +372,9 @@ pub const Session = struct {
                 s.owned_n += 1;
                 c.told = .owned;
                 c.owned_tokens = @intCast(ids.len);
+                s.rec.owned(gpa, index, ids) catch {
+                    s.rec.on = false;
+                };
                 s.forcing = .{ .at = nowNs(), .left = ids.len, .cell = index };
                 const res = c.result.?;
                 log.info("reply {d} cell {d} (trace): owned {d} tokens, {d} steps, run {d} ms, held {d} ms, ticks {d}", .{ s.id, index, ids.len, res.steps, res.exec_ns / std.time.ns_per_ms, held_ms, s.held_ticks });
@@ -495,29 +509,9 @@ pub const Session = struct {
         return s.waiting != null;
     }
 
-    /// The reply's cells per form, owned cells by program kind and the summed hold, as JSON in `buf` (runtime.runner).
-    pub fn summary(s: *const Session, buf: []u8) []const u8 {
-        var forms = std.mem.zeroes([4][4]u32);
-        var kinds = std.mem.zeroes([3]u32);
-        for (s.cells.items) |c| {
-            const f = &forms[if (c.stated != null) 3 else @backingInt(c.form)];
-            f[0] += 1;
-            switch (c.told) {
-                .none => {},
-                .owned => {
-                    f[1] += 1;
-                    f[3] += c.owned_tokens;
-                    if (c.translation == .program) kinds[@backingInt(c.translation.program.kind)] += 1;
-                },
-                .abstained => f[2] += 1,
-            }
-        }
-        var w: std.Io.Writer = .fixed(buf);
-        w.writeByte('{') catch return "";
-        for (forms, [_][]const u8{ "fence", "repl", "inline", "trace" }) |f, name|
-            w.print("\"{s}\":{{\"closed\":{d},\"owned\":{d},\"abstained\":{d},\"owned_tokens\":{d}}},", .{ name, f[0], f[1], f[2], f[3] }) catch return "";
-        w.print("\"owned_by\":{{\"calc\":{d},\"elf\":{d},\"graph\":{d}}},\"held_ms\":{d},\"resume_ms\":{d}}}", .{ kinds[0], kinds[1], kinds[2], s.held_ms, s.resume_ms }) catch return "";
-        return w.buffered();
+    /// The reply's runner receipt as JSON (runtime.runner, runner_receipt.zig); valid until the session is destroyed.
+    pub fn receipt(s: *Session) []const u8 {
+        return records.write(s);
     }
 
     /// Cancels runs, joins translations and frees the session; the backend drops the stream's machines.
@@ -537,6 +531,7 @@ pub const Session = struct {
         s.cells.deinit(gpa);
         s.scan.deinit(gpa);
         gpa.free(s.format);
+        s.rec.deinit(gpa);
         gpa.destroy(s);
     }
 };
@@ -585,4 +580,5 @@ test {
     _ = @import("runner_inline_mod_test.zig");
     _ = @import("runner_inline_arith_test.zig");
     _ = @import("runner_inline_chain_test.zig");
+    _ = @import("runner_receipt_test.zig");
 }

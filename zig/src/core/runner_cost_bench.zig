@@ -52,10 +52,10 @@ fn sleepNs(ns: u64) void {
 
 const Mode = enum { off, scan_cr, scan_inline, fire };
 
-const Totals = struct { tokens: u64 = 0, feed_ns: u64 = 0, fires: u64 = 0, tick_ns: u64 = 0, settle_ns: u64 = 0, sink: u64 = 0 };
+const Totals = struct { tokens: u64 = 0, feed_ns: u64 = 0, fires: u64 = 0, tick_ns: u64 = 0, settle_ns: u64 = 0, sink: u64 = 0, receipt_ns: u64 = 0, receipt_bytes: u64 = 0, replies: u64 = 0 };
 
-/// One pass over every reply; `poll_ns` is the idle loop's wait between ticks while a stream is held.
-fn pass(gpa: std.mem.Allocator, r: *runner.Runner, replies: []const Reply, mode: Mode, poll_ns: u64) !Totals {
+/// One pass over every reply; `poll_ns`: the idle wait between ticks while held; `forced`: results fed after holds.
+fn pass(gpa: std.mem.Allocator, r: *runner.Runner, replies: []const Reply, mode: Mode, poll_ns: u64, forced: bool) !Totals {
     var t: Totals = .{};
     for (replies) |rep| {
         if (mode == .off) {
@@ -81,7 +81,13 @@ fn pass(gpa: std.mem.Allocator, r: *runner.Runner, replies: []const Reply, mode:
                 const got = try s.tick();
                 t.tick_ns += now() - k0;
                 if (got) |ids| {
-                    gpa.free(ids);
+                    defer gpa.free(ids);
+                    if (forced) for (ids) |f| {
+                        const f0 = now();
+                        _ = hook.token(hook.ptr, f, i < rep.think_end, false, false);
+                        t.feed_ns += now() - f0;
+                        t.tokens += 1;
+                    };
                     break;
                 }
                 if (poll_ns > 0) sleepNs(poll_ns);
@@ -89,6 +95,10 @@ fn pass(gpa: std.mem.Allocator, r: *runner.Runner, replies: []const Reply, mode:
             t.settle_ns += now() - h0;
             t.fires += 1;
         }
+        const r0 = now();
+        t.receipt_bytes += s.receipt().len;
+        t.receipt_ns += now() - r0;
+        t.replies += 1;
     }
     return t;
 }
@@ -126,7 +136,7 @@ pub fn main(init: std.process.Init) !u8 {
     const replies = try load(gpa, init.io, &table, argv[2]);
     var ctx: frontend.Context = .{ .io = init.io };
     var r: runner.Runner = .{ .gpa = gpa, .cfg = .{ .circuit = "bench" }, .frontend = ctx.frontend(), .backend = Instant.backend(), .text = .{ .ctx = &table, .bytes = Table.bytes, .encode = Table.encode } };
-    const Case = struct { name: []const u8, mode: Mode, inline_math: bool, poll_ns: u64 };
+    const Case = struct { name: []const u8, mode: Mode, inline_math: bool, poll_ns: u64, forced: bool = false, cells: bool = false };
     const cases = [_]Case{
         .{ .name = "runner off (byte lookup only)", .mode = .off, .inline_math = false, .poll_ns = 0 },
         .{ .name = "on, fence/repl scan, no holds", .mode = .scan_cr, .inline_math = false, .poll_ns = 0 },
@@ -134,12 +144,15 @@ pub fn main(init: std.process.Init) !u8 {
         .{ .name = "on, +inline, firing, tick spin", .mode = .fire, .inline_math = true, .poll_ns = 0 },
         .{ .name = "on, +inline, firing, 1 ms idle", .mode = .fire, .inline_math = true, .poll_ns = std.time.ns_per_ms },
         .{ .name = "on, +inline, firing, 20 ms idle", .mode = .fire, .inline_math = true, .poll_ns = 20 * std.time.ns_per_ms },
+        .{ .name = "firing, forced fed, records off", .mode = .fire, .inline_math = true, .poll_ns = 0, .forced = true },
+        .{ .name = "firing, forced fed, records on", .mode = .fire, .inline_math = true, .poll_ns = 0, .forced = true, .cells = true },
     };
     for (cases) |c| {
         r.cfg.scan.inline_math = c.inline_math;
+        r.cfg.cells = c.cells;
         var best: ?Totals = null;
         for (0..repeats) |_| {
-            const t = try pass(gpa, &r, replies, c.mode, c.poll_ns);
+            const t = try pass(gpa, &r, replies, c.mode, c.poll_ns, c.forced);
             if (best == null or t.feed_ns < best.?.feed_ns) best = t;
         }
         const t = best.?;
@@ -149,6 +162,7 @@ pub fn main(init: std.process.Init) !u8 {
             const f: f64 = @floatFromInt(t.fires);
             std.debug.print(", {d} fires: tick {d:.1} us/fire, hold-to-result {d:.2} ms/fire", .{ t.fires, @as(f64, @floatFromInt(t.tick_ns)) / f / 1e3, @as(f64, @floatFromInt(t.settle_ns)) / f / 1e6 });
         }
+        if (t.replies > 0) std.debug.print(", receipt {d:.2} us/reply ({d} bytes/reply)", .{ @as(f64, @floatFromInt(t.receipt_ns)) / @as(f64, @floatFromInt(t.replies)) / 1e3, t.receipt_bytes / t.replies });
         std.debug.print("\n", .{});
     }
     return 0;
