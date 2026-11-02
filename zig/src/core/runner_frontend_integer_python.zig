@@ -89,15 +89,19 @@ fn parseOutputs(code: []const u8, multiple: bool) ast.Invalid!Outputs {
         started = true;
         const printed = std.mem.startsWith(u8, line, "print") and line.len > 5 and
             (line[5] == '(' or line[5] == ' ' or line[5] == '\t');
-        if (printed) {
+        if (keyword(line, "def")) {
+            try define(&parser, &lines, line);
+        } else if (keyword(line, "assert")) {
+            try check(&parser, line["assert".len..]);
+        } else if (printed) {
             line = std.mem.trimStart(u8, line[5..], " \t");
             if (line.len < 3 or line[0] != '(' or line[line.len - 1] != ')') return error.Unsupported;
             try printRoots(&parser, &outputs, line[1 .. line.len - 1], multiple);
         } else if (statements.separator(line, '=')) |equal| {
             try assignment(&parser, std.mem.trim(u8, line[0..equal], " \t"), line[equal + 1 ..]);
         } else {
-            if (outputs.count != 0 or parser.binding_count != 0 or parser.math_module or parser.math_imports != 0)
-                return error.Unsupported;
+            if (outputs.count != 0 or parser.binding_count != 0 or parser.function_count != 0 or parser.math_module or
+                parser.math_imports != 0) return error.Unsupported;
             try printRoots(&parser, &outputs, line, false);
             expression_only = true;
         }
@@ -127,6 +131,77 @@ fn assignment(parser: *ast.Parser, names: []const u8, rhs: []const u8) ast.Inval
         if (parser.nodes[root].op == .divmod) return error.Unsupported;
         try parser.bind(names, root);
     }
+}
+
+fn keyword(line: []const u8, word: []const u8) bool {
+    return std.mem.startsWith(u8, line, word) and line.len > word.len and
+        (line[word.len] == ' ' or line[word.len] == '\t' or line[word.len] == '(');
+}
+
+/// `def name(a, b):` (`int` annotations) whose body is one `return <int expr>`, a docstring first; else refuse.
+fn define(parser: *ast.Parser, lines: *statements.Iterator, header: []const u8) ast.Invalid!void {
+    const open = std.mem.indexOfScalar(u8, header, '(') orelse return error.Unsupported;
+    const close = std.mem.indexOfScalarPos(u8, header, open, ')') orelse return error.Unsupported;
+    var f: ast.Parser.Function = .{ .name = std.mem.trim(u8, header["def".len..open], " \t"), .body = "" };
+    if (!validBinding(f.name)) return error.Unsupported;
+    const params = std.mem.trim(u8, header[open + 1 .. close], " \t");
+    if (params.len != 0) {
+        var names = std.mem.splitScalar(u8, params, ',');
+        while (names.next()) |raw| {
+            var p = std.mem.trim(u8, raw, " \t");
+            if (std.mem.indexOfScalar(u8, p, ':')) |colon| {
+                if (!std.mem.eql(u8, std.mem.trim(u8, p[colon + 1 ..], " \t"), "int")) return error.Unsupported;
+                p = std.mem.trim(u8, p[0..colon], " \t");
+            }
+            if (!validBinding(p) or f.arity == f.params.len) return error.Unsupported;
+            f.params[f.arity] = p;
+            f.arity += 1;
+        }
+    }
+    var rest = std.mem.trim(u8, header[close + 1 ..], " \t");
+    if (std.mem.startsWith(u8, rest, "->")) {
+        rest = std.mem.trimStart(u8, rest[2..], " \t");
+        if (!std.mem.startsWith(u8, rest, "int")) return error.Unsupported;
+        rest = std.mem.trimStart(u8, rest[3..], " \t"); // `-> intx:` leaves `x:`, refused below
+    }
+    if (rest.len == 0 or rest[0] != ':') return error.Unsupported;
+    rest = std.mem.trim(u8, rest[1..], " \t");
+    var body: ?[]const u8 = if (rest.len != 0) try returned(rest) else null;
+    var docstring = body == null;
+    // the indented suite: blank and comment-only lines pass; the first unindented statement is the module's again
+    while (true) {
+        var ahead = lines.*;
+        const raw = try ahead.next() orelse break;
+        if (raw.after_semicolon) return error.Unsupported; // `def f(): return x; y = 1`: a second body statement
+        const text = std.mem.trimEnd(u8, raw.text, " \t");
+        const stmt = std.mem.trim(u8, text, " \t");
+        if (stmt.len != 0 and text[0] != ' ' and text[0] != '\t') break;
+        lines.* = ahead;
+        if (stmt.len == 0) continue;
+        if (body != null) return error.Unsupported;
+        if (docstring and stmt.len >= 2 and (stmt[0] == '"' or stmt[0] == '\'') and stmt[stmt.len - 1] == stmt[0]) {
+            docstring = false;
+            continue;
+        }
+        body = try returned(stmt);
+    }
+    f.body = body orelse return error.Unsupported;
+    try parser.define(f);
+}
+
+/// The expression of `return <expr>`: one value (a tuple, or a bare `return`, is not an int).
+fn returned(stmt: []const u8) ast.Invalid![]const u8 {
+    if (!keyword(stmt, "return")) return error.Unsupported;
+    const value = std.mem.trim(u8, stmt["return".len..], " \t");
+    if (value.len == 0 or statements.separator(value, ',') != null) return error.Unsupported;
+    return value;
+}
+
+/// `assert <int cmp>`, proved on the outputs' exact values: true prints nothing; false refuses (the sandbox raises).
+fn check(parser: *ast.Parser, text: []const u8) ast.Invalid!void {
+    if (statements.separator(text, ',') != null) return error.Unsupported; // a message: refuse rather than evaluate it
+    const root = try expression(parser, text);
+    if (!parser.boolean(root) or parser.nodes[root].value == 0) return error.Unsupported;
 }
 
 fn printRoots(parser: *ast.Parser, outputs: *Outputs, text: []const u8, multiple: bool) ast.Invalid!void {

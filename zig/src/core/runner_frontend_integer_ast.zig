@@ -24,10 +24,20 @@ pub const Parser = struct {
     require_math_import: bool = false,
     math_module: bool = false,
     math_imports: u8 = 0,
+    functions: [8]Function = undefined,
+    function_count: usize = 0,
+    // inside an inlined body: its parameters are bindings[frame..], the module's are bindings[0..globals]
+    frame: ?Frame = null,
+    active: u8 = 0, // functions being inlined, one bit each: a call to one of them is recursion
+    check_only: bool = false, // a def's body at its definition: syntax only, names are not looked up
+
+    /// `def name(params): return <expr>`, inlined at each call; `body` borrows the script.
+    pub const Function = struct { name: []const u8, params: [4][]const u8 = undefined, arity: usize = 0, body: []const u8 };
+    const Frame = struct { start: usize, globals: usize };
 
     // Names and literal slices borrow source storage; bind after parsing the RHS to preserve prior roots.
     pub fn bind(self: *Parser, name: []const u8, root: usize) Invalid!void {
-        if (name.len == 0 or root >= self.count) return error.Unsupported;
+        if (name.len == 0 or root >= self.count or self.function(name) != null) return error.Unsupported;
         for (self.names[0..self.binding_count], self.roots[0..self.binding_count]) |bound_name, *bound_root| {
             if (std.mem.eql(u8, name, bound_name)) {
                 bound_root.* = root;
@@ -38,6 +48,82 @@ pub const Parser = struct {
         self.names[self.binding_count] = name;
         self.roots[self.binding_count] = root;
         self.binding_count += 1;
+    }
+
+    /// A def as Python compiles it: the body must parse now (names resolve at each call), the name must be new.
+    pub fn define(self: *Parser, f: Function) Invalid!void {
+        if (self.function_count == self.functions.len or self.function(f.name) != null) return error.Unsupported;
+        for (self.names[0..self.binding_count]) |held| if (std.mem.eql(u8, held, f.name)) return error.Unsupported;
+        for (f.params[0..f.arity], 0..) |p, i| {
+            if (std.mem.eql(u8, p, f.name)) return error.Unsupported;
+            for (f.params[0..i]) |q| if (std.mem.eql(u8, p, q)) return error.Unsupported;
+        }
+        const saved = .{ self.source, self.pos, self.count };
+        defer {
+            self.source, self.pos, self.count = saved;
+            self.check_only = false;
+        }
+        self.check_only = true;
+        self.source = f.body;
+        self.pos = 0;
+        _ = try self.expr(0);
+        self.space();
+        if (self.pos != self.source.len) return error.Unsupported;
+        self.functions[self.function_count] = f;
+        self.function_count += 1;
+    }
+
+    fn function(self: *const Parser, name: []const u8) ?usize {
+        for (self.functions[0..self.function_count], 0..) |f, i| if (std.mem.eql(u8, f.name, name)) return i;
+        return null;
+    }
+
+    /// The node a name holds where it is read: in a body its parameters, then the module's names (never a caller's).
+    fn lookup(self: *const Parser, name: []const u8) ?usize {
+        const visible: [2][2]usize = if (self.frame) |f| .{ .{ f.start, self.binding_count }, .{ 0, f.globals } } else .{ .{ 0, self.binding_count }, .{ 0, 0 } };
+        for (visible) |range| {
+            for (self.names[range[0]..range[1]], self.roots[range[0]..range[1]]) |bound_name, root| {
+                if (std.mem.eql(u8, name, bound_name)) return root;
+            }
+        }
+        return null;
+    }
+
+    /// `f(args)` with f's body parsed over the argument nodes: pure, so inlining is exact; recursion refuses.
+    fn call(self: *Parser, index: usize, depth: usize) Invalid!usize {
+        const f = self.functions[index];
+        const bit = @as(u8, 1) << @intCast(index);
+        if (self.active & bit != 0) return error.Unsupported;
+        var args: [4]usize = undefined;
+        var n: usize = 0;
+        try self.need("(");
+        if (!self.take(")")) while (true) {
+            if (n == args.len) return error.Unsupported;
+            args[n] = try self.expr(depth + 1);
+            n += 1;
+            if (self.take(")")) break;
+            try self.need(",");
+        };
+        if (n != f.arity or self.binding_count + n > self.names.len) return error.Unsupported;
+        const saved = .{ self.source, self.pos, self.binding_count, self.frame, self.active };
+        defer {
+            self.source, self.pos, self.binding_count, self.frame, self.active = saved;
+        }
+        // read the outer frame before writing: a struct literal assigned in place may alias self.frame
+        const globals = if (self.frame) |outer| outer.globals else self.binding_count;
+        self.frame = .{ .start = self.binding_count, .globals = globals };
+        for (f.params[0..n], args[0..n]) |p, arg| {
+            self.names[self.binding_count] = p;
+            self.roots[self.binding_count] = arg;
+            self.binding_count += 1;
+        }
+        self.active |= bit;
+        self.source = f.body;
+        self.pos = 0;
+        const root = try self.expr(depth + 1);
+        self.space();
+        if (self.pos != self.source.len) return error.Unsupported;
+        return root;
     }
 
     pub fn parse(self: *Parser) Invalid!usize {
@@ -133,7 +219,7 @@ pub const Parser = struct {
         return left;
     }
 
-    fn boolean(self: *const Parser, index: usize) bool {
+    pub fn boolean(self: *const Parser, index: usize) bool {
         return switch (self.nodes[index].op) {
             .eq, .ne, .lt, .le, .gt, .ge => true,
             else => false,
@@ -194,10 +280,22 @@ pub const Parser = struct {
             (std.ascii.isAlphabetic(self.source[self.pos]) or self.source[self.pos] == '_'))
         {
             const name = try self.identifier();
-            for (self.names[0..self.binding_count], self.roots[0..self.binding_count]) |bound_name, root| {
-                if (std.mem.eql(u8, name, bound_name)) return root;
+            self.space();
+            const called = self.pos < self.source.len and self.source[self.pos] == '(';
+            if (self.check_only) {
+                // a def's body at its definition: any name, any call (defined later or not), resolved when it runs
+                if (called) {
+                    try self.need("(");
+                    if (!self.take(")")) while (true) {
+                        _ = try self.expr(depth + 1);
+                        if (self.take(")")) break;
+                        try self.need(",");
+                    };
+                }
+                return self.add(.{ .op = .literal, .value = 1, .text = "1" });
             }
-            return error.Unsupported;
+            if (called) return self.call(self.function(name) orelse return error.Unsupported, depth);
+            return self.lookup(name) orelse error.Unsupported;
         }
         return self.literal();
     }
