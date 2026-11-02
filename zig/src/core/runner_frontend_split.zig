@@ -1,4 +1,4 @@
-//! Runtime compiled once per clang and level; a printf-only body compiles alone, its code equal to the whole file's.
+//! Runtime compiled once per clang and level; a body using none of its statics compiles alone, as in the whole file.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const compile = @import("runner_frontend_program_compile.zig");
@@ -6,38 +6,18 @@ const forkserver = @import("runner_frontend_forkserver.zig");
 const rvlink = @import("runner_frontend_rvlink.zig");
 const log = std.log.scoped(.runner_frontend);
 
-/// compile.runtime, printf external and returning nothing (variadic: never inlined; no whole-file caller reads it).
-pub const runtime = blk: {
-    @setEvalBranchQuota(200_000);
-    var text: []const u8 = compile.runtime;
-    for ([_][2][]const u8{
-        .{ "static int printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));", "void printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));" },
-        .{ "static int printf(const char *fmt, ...) {", "void printf(const char *fmt, ...) {" },
-        .{ " unsigned int before = tf_output_count;\n", "" },
-        .{ "{ __builtin_va_end(args); return -1; }", "{ __builtin_va_end(args); return; }" },
-        .{ " __builtin_va_end(args); return (int)(tf_output_count - before);", " __builtin_va_end(args);" },
-    }) |r| {
-        const n = std.mem.count(u8, text, r[0]);
-        if (n == 0) @compileError("runner runtime changed: " ++ r[0]);
-        var out: [std.mem.replacementSize(u8, text, r[0], r[1])]u8 = undefined;
-        _ = std.mem.replace(u8, text, r[0], r[1], &out);
-        const fixed = out;
-        text = &fixed;
-    }
-    break :blk text;
-};
+/// The whole file's runtime compiled alone: its static printf and helpers drop out, memset and memcpy stay.
+pub const runtime = compile.runtime;
 
-/// What a body sees of the runtime: its types and macros, and the three functions it may call.
+/// What a body sees of the runtime: its types and macros, and the two functions it may call.
 pub const declarations = compile.runtime[0..std.mem.indexOf(u8, compile.runtime, "void *memset").?] ++
     \\void *memset(void *destination, int value, size_t count);
     \\void *memcpy(void *destination, const void *source, size_t count);
-    \\void printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
     \\
 ;
 
-/// A body may compile alone when it calls printf and names no runtime function the whole file could inline.
+/// A body may compile alone when it names none of the runtime's static functions or a call the whole file could inline.
 pub fn eligible(body: []const u8) bool {
-    var printf = false;
     var i: usize = 0;
     while (i < body.len) {
         const c = body[i];
@@ -48,11 +28,10 @@ pub fn eligible(body: []const u8) bool {
         const start = i;
         while (i < body.len and (std.ascii.isAlphanumeric(body[i]) or body[i] == '_')) i += 1;
         const word = body[start..i];
-        for ([_][]const u8{ "putchar", "puts", "memset", "memcpy" }) |helper| if (std.mem.eql(u8, word, helper)) return false;
+        for ([_][]const u8{ "printf", "putchar", "puts", "memset", "memcpy" }) |helper| if (std.mem.eql(u8, word, helper)) return false;
         if (std.mem.startsWith(u8, word, "tf_")) return false;
-        if (std.mem.eql(u8, word, "printf")) printf = true;
     }
-    return printf;
+    return true;
 }
 
 const Prebuilt = struct { clang: [256]u8 = undefined, clang_len: usize = 0, optimize: u8 = 0, object: []u8 = &.{}, su: []u8 = &.{} };
@@ -135,7 +114,7 @@ pub const Built = struct {
 
 /// The body compiled alone in `path`, linked with the runtime; null on any failure (the whole file builds instead).
 pub fn build(a: Allocator, io: std.Io, path: []const u8, body: []const u8, config: compile.Config, timeout: std.Io.Duration) Allocator.Error!?Built {
-    // at O0 the void printf compiles to other instructions than the whole file's
+    // the identity tests cover O1 and O2, the levels calls use
     if (config.optimize == .O0) return null;
     const rt = try runtimeFor(a, io, path, config, timeout, false) orelse return null;
     const src = try std.fs.path.join(a, &.{ path, "body.c" });
@@ -151,8 +130,6 @@ pub fn build(a: Allocator, io: std.Io, path: []const u8, body: []const u8, confi
     if (!ran.ok) return null;
     const object = readFile(io, path, "body.o", 1 << 20) orelse return null;
     defer std.heap.page_allocator.free(object);
-    // a body that never calls printf: the whole file emits no printf, so its stack report would differ
-    if (!rvlink.references(object, "printf")) return null;
     // an aggregate copy or fill the compiler lowered to a call: the whole file may inline that function
     if (rvlink.references(object, "memset") or rvlink.references(object, "memcpy")) return null;
     const body_su = readFile(io, path, "body.su", 65536) orelse return null;

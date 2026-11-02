@@ -19,15 +19,14 @@ const cells = [_][]const u8{
     "def tetrahedral_number(n):\n    return n * (n + 1) * (n + 2) // 6\n\nassert tetrahedral_number(5) == 35\nprint(tetrahedral_number(5))",
 };
 
-test "split: a body compiles alone only when it calls printf and no inlined runtime helper" {
-    try t.expect(split.eligible("int main(void) { printf(\"%d\", 1); return 0; }"));
-    try t.expect(!split.eligible("int main(void) { return 0; }"));
-    try t.expect(!split.eligible("int main(void) { printf(\"x\"); puts(\"y\"); }"));
-    try t.expect(!split.eligible("int main(void) { tf_print_int(3); printf(\"x\"); }"));
-    try t.expect(!split.eligible("int main(void) { printf(\"x\"); putchar(10); }"));
-    try t.expect(std.mem.indexOf(u8, split.runtime, "static int printf") == null);
-    try t.expect(std.mem.indexOf(u8, split.runtime, "before") == null);
-    try t.expectEqual(@as(usize, 2), std.mem.count(u8, split.runtime, "void printf("));
+test "split: a body compiles alone only when it names none of the runtime's statics or inlinable calls" {
+    try t.expect(split.eligible("static void py_out(int c) {} int main(void) { py_out(10); return 0; }"));
+    try t.expect(!split.eligible("int main(void) { printf(\"%d\", 1); return 0; }"));
+    try t.expect(!split.eligible("int main(void) { char b[8]; memset(b, 0, 8); return b[1]; }"));
+    try t.expect(!split.eligible("int main(void) { puts(\"y\"); }"));
+    try t.expect(!split.eligible("int main(void) { tf_print_int(3); }"));
+    try t.expect(!split.eligible("int main(void) { putchar(10); }"));
+    try t.expect(std.mem.indexOf(u8, split.declarations, "printf") == null);
 }
 
 test "in-process link: the relocations the compile step emits patch as ld.lld does; others decline" {
@@ -169,6 +168,57 @@ test "configured split compile: every function of the slow ELF cells equals the 
     }
 }
 
+/// (function, frame size) of each stack report line, sorted: the multiset the admission check sums.
+fn frames(a: std.mem.Allocator, report: []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var lines = std.mem.splitScalar(u8, report, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const tab = std.mem.indexOfScalar(u8, line, '\t').?;
+        const name = line[std.mem.lastIndexOfScalar(u8, line[0..tab], ':').? + 1 .. tab];
+        try out.append(a, try std.fmt.allocPrint(a, "{s} {s}", .{ name, line[tab + 1 ..] }));
+    }
+    std.mem.sort([]const u8, out.items, {}, struct {
+        fn less(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.order(u8, x, y) == .lt;
+        }
+    }.less);
+    return out.items;
+}
+
+test "configured split build: the stack report sums the frames of the whole file's (O1, O2)" {
+    const clang = clangOr() orelse return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    for (cells) |code| {
+        const body = (try compile.normalizeWithTrust(a, try cellSource(a, code), true)).?;
+        for ([_]@TypeOf(@as(compile.Config, .{}).optimize){ .O1, .O2 }) |optimize| {
+            const src = try std.fmt.allocPrint(a, "{s}/whole.c", .{dir});
+            try std.Io.Dir.cwd().writeFile(t.io, .{ .sub_path = src, .data = try std.mem.concat(a, u8, &.{ compile.runtime, "\n", body, "\n" }) });
+            var argv: std.ArrayList([]const u8) = .empty;
+            try argv.appendSlice(a, &.{ clang, if (optimize == .O1) "-O1" else "-O2" });
+            try argv.appendSlice(a, &flags);
+            try argv.appendSlice(a, &.{ "-fstack-usage", "-c", "-x", "c", src, "-o", try std.fmt.allocPrint(a, "{s}/whole.o", .{dir}) });
+            try run(a, argv.items);
+            const whole = try std.Io.Dir.cwd().readFileAlloc(t.io, try std.fmt.allocPrint(a, "{s}/whole.su", .{dir}), a, .limited(1 << 16));
+            var config: compile.Config = .{ .clang = clang, .optimize = optimize };
+            config.scratch_root = dir;
+            const sub = try std.fmt.allocPrint(a, "{s}/split-{t}", .{ dir, optimize });
+            try std.Io.Dir.cwd().createDirPath(t.io, sub);
+            const built = (try split.build(a, t.io, sub, body, config, .fromMilliseconds(20_000))).?;
+            const want = try frames(a, whole);
+            const got = try frames(a, built.su);
+            if (want.len != got.len) std.debug.print("{t}: whole {s} | split {s}\n", .{ optimize, whole, built.su });
+            try t.expectEqual(want.len, got.len);
+            for (want, got) |w, g| try t.expectEqualStrings(w, g);
+        }
+    }
+}
+
 /// vaddr, file bytes and memory size of each loaded segment.
 fn segments(a: std.mem.Allocator, b: []const u8) ![]const [3]u64 {
     var out: std.ArrayList([3]u64) = .empty;
@@ -184,7 +234,7 @@ fn segments(a: std.mem.Allocator, b: []const u8) ![]const [3]u64 {
     return out.items;
 }
 
-test "configured in-process link: loads the same segments as ld.lld for a body without merged strings" {
+test "configured in-process link: loads the same segments as ld.lld for a body calling into the runtime" {
     const clang = clangOr() orelse return error.SkipZigTest;
     const lld = std.c.getenv("TF_RUNNER_LLD") orelse return error.SkipZigTest;
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
@@ -194,11 +244,19 @@ test "configured in-process link: loads the same segments as ld.lld for a body w
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(t.io, ".", a);
     const body =
-        \\static const char fmt[] = {'%', 'd', '\n', 0};
+        \\static const char name[] = {'s', 'u', 'm', 0};
         \\static volatile int seen[4] = {3, 1, 4, 1};
         \\static int total;
+        \\static void out(int c) {
+        \\ register int a0 __asm__("a0") = c; register int a7 __asm__("a7") = 1;
+        \\ __asm__ volatile("ecall" : "+r"(a0) : "r"(a7));
+        \\}
         \\int main(void) {
-        \\ for (int i = 0; i < 4; ++i) { total += seen[i]; printf(fmt, total); }
+        \\ char copy[24];
+        \\ for (int i = 0; i < 4; ++i) { total += seen[i]; out('0' + total % 10); }
+        \\ memset(copy, seen[0], sizeof copy);
+        \\ memcpy(copy + 4, name, sizeof name);
+        \\ for (const char *p = copy + 4; *p; ++p) out(*p);
         \\ return 0;
         \\}
         \\
@@ -256,13 +314,13 @@ test "configured fork server: answers as a spawned clang, streams included; a ti
     try t.expect(try forkserver.start(a, t.io, clang, linker, dir));
     try t.expect(forkserver.ready(clang));
     const src = try std.fmt.allocPrint(a, "{s}/x.c", .{dir});
-    try std.Io.Dir.cwd().writeFile(t.io, .{ .sub_path = src, .data = split.declarations ++ "int main(void) { printf(\"%d\\n\", 7); return 0; }\n" });
+    try std.Io.Dir.cwd().writeFile(t.io, .{ .sub_path = src, .data = split.declarations ++ "int main(void) { char b[4]; memset(b, 7, sizeof b); return b[1]; }\n" });
     const limits: spawn.Limits = .{ .stdout = 4 << 20, .stderr = 1 << 16, .timeout = .fromMilliseconds(20_000) };
     // -ast-print writes through clang's buffered stdout, which a served child flushes before it answers
     const ast = [_][]const u8{ clang, "--target=riscv32-unknown-elf", "-ffreestanding", "-nostdinc", "-fsyntax-only", "-Xclang", "-ast-print", "-x", "c", src };
     const served = (try forkserver.run(a, t.io, dir, &ast, limits)).?;
     const spawned = (try spawn.run(a, t.io, &ast, limits)).?;
-    try t.expect(served.ok and spawned.ok and served.stdout.len > 500);
+    try t.expect(served.ok and spawned.ok and std.mem.indexOf(u8, served.stdout, "int main(void)") != null);
     try t.expectEqualStrings(spawned.stdout, served.stdout);
     const bad = (try forkserver.run(a, t.io, dir, &.{ clang, "-fno-such-flag-tf", "-c", src }, limits)).?;
     try t.expect(!bad.ok and bad.stderr.len > 0);

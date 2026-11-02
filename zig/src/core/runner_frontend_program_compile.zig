@@ -56,13 +56,25 @@ pub const runtime =
     \\#define false 0
     \\#define NULL ((void*)0)
     \\void *memset(void *destination, int value, size_t count) {
-    \\ unsigned char *d = destination;
-    \\ for(size_t i=0;i<count;++i) d[i]=(unsigned char)value;
+    \\ typedef unsigned int __attribute__((may_alias)) word;
+    \\ unsigned char *d = destination; size_t i = 0;
+    \\ if(!((size_t)d & 3)) {
+    \\  word *w = destination, *end = w + count / 4; word v = (unsigned char)value * 0x01010101u;
+    \\  while(w != end) *w++ = v;
+    \\  i = count & ~(size_t)3;
+    \\ }
+    \\ for(; i<count; ++i) d[i]=(unsigned char)value;
     \\ return destination;
     \\}
     \\void *memcpy(void *destination, const void *source, size_t count) {
-    \\ unsigned char *d = destination; const unsigned char *s = source;
-    \\ for(size_t i=0;i<count;++i) d[i]=s[i];
+    \\ typedef unsigned int __attribute__((may_alias)) word;
+    \\ unsigned char *d = destination; const unsigned char *s = source; size_t i = 0;
+    \\ if(!(((size_t)d | (size_t)s) & 3)) {
+    \\  word *w = destination, *end = w + count / 4; const word *v = source;
+    \\  while(w != end) *w++ = *v++;
+    \\  i = count & ~(size_t)3;
+    \\ }
+    \\ for(; i<count; ++i) d[i]=s[i];
     \\ return destination;
     \\}
     \\static unsigned int tf_output_count;
@@ -83,12 +95,11 @@ pub const runtime =
     \\ else tf_unsigned((unsigned int)n);
     \\}
     \\static unsigned long long tf_div10(unsigned long long n, unsigned int *remainder) {
-    \\ unsigned long long q = 0; unsigned int r = 0;
-    \\ for(int bit = 0; bit < 64; ++bit) {
-    \\  r = (r << 1) | (unsigned int)(n >> 63); n <<= 1; q <<= 1;
-    \\  if(r >= 10) { r -= 10; q |= 1; }
-    \\ }
-    \\ *remainder = r; return q;
+    \\ unsigned int high = (unsigned int)(n >> 32), low = (unsigned int)n, r = high % 10;
+    \\ unsigned int t = (r << 16) | (low >> 16), q1 = t / 10;
+    \\ t = ((t % 10) << 16) | (low & 65535u);
+    \\ *remainder = t % 10;
+    \\ return ((unsigned long long)(high / 10) << 32) | (q1 << 16) | (t / 10);
     \\}
     \\static void tf_unsigned_wide(unsigned long long n) {
     \\ if(n <= 0xffffffffULL) { tf_unsigned((unsigned int)n); return; }
