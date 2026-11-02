@@ -70,6 +70,9 @@ pub fn toolHostTests(b: *std.Build, parser: *std.Build.Module, server: *std.Buil
     deepseek.has_side_effects = true;
     all.dependOn(&deepseek.step);
     b.step("test-server-deepseek-chat-host", "Native DeepSeek prompt goldens, provenance and missing-template HTTP refusal").dependOn(&deepseek.step);
+    const lane_http = b.addRunArtifact(b.addTest(.{ .root_module = server, .filters = &.{ "compute lane:", "compute runner:" } }));
+    lane_http.has_side_effects = true;
+    b.step("test-compute-runner-http-host", "The compute lane through the chat route, S3 off and on: inserted tokens and executor reports").dependOn(&lane_http.step);
 }
 
 /// The server tree's module rooted at `root` over no native engines: the fake server's, or a test among its sources.

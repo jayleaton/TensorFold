@@ -244,6 +244,7 @@ pub const Info = struct {
     admit: ?Admit = null,
     compute: ?compute_lane.Config = null, // the family's built-in code execution: replies hold at EOS for its results
     runner: ?*runner.Runner = null, // the in-model runner: the server gives it the tokenizer and chats set run_cells
+    compute_runner: ?compute_circuit.Setup = null, // S3: lane calls the circuit can run go there (compute_circuit.zig)
 
     /// What a lane engine's streams enforce themselves (core/lanes/stream.zig): loop guards and answer limits.
     pub fn ofLanes(i: Info) Info {
@@ -255,6 +256,8 @@ pub const Info = struct {
 };
 pub const runner = @import("runner_open.zig");
 pub const compute_lane = @import("compute_lane.zig");
+pub const compute_circuit = @import("compute_circuit.zig");
+pub const runner_api = @import("runner_api.zig");
 /// A held reply's result tokens (empty: it ends at its EOS), forced after the EOS between rounds.
 pub const Resume = lanes.hold.Resume;
 pub const Admit = struct {
