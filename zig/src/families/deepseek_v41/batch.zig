@@ -83,6 +83,7 @@ pub const Batch = struct {
         keep_ns: u64 = 0,
     } = .{},
     prof: ?*WinProf = null, // TF_DSV41_WIN_PROF=1: host ns per runRows step, logged at deinit; null: no clock reads
+    gpu: ?*@import("batch_gpu_time.zig").GpuPair = null, // TF_DSV41_RUNNER_TRACE: windows' GPU time; null: no events
     /// the session store (model.zig): each slot's kept rows are its committed ids
     sess: ?*sessions_gpu.Sessions = null,
 
@@ -158,6 +159,7 @@ pub const Batch = struct {
             b.gpa.destroy(p);
         }
         if (b.g) |*g| g.deinit();
+        if (b.gpu) |t| t.deinit();
         for (b.stash.items) |*x| x.buf.free();
         b.stash.deinit(b.gpa);
         if (b.taps_stash) |*x| x.free();
@@ -281,6 +283,8 @@ pub const Batch = struct {
             m.armed = false;
         };
         pt.mark(.bookkeep);
+        if (b.gpu) |t| try t.begin(r.stream);
+        defer if (b.gpu) |t| t.finish(r.stream);
         if (b.g) |*g| {
             const fp = b.fingerprint();
             pt.mark(.fingerprint);

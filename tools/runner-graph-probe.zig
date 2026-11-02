@@ -1,6 +1,8 @@
 //! Native graph evidence: evaluator tokens, exact stdout, prepared-bank boot and backend lifecycle.
 const std = @import("std");
 const graph = @import("runner_graph.zig");
+const packet = @import("runner_graph_packet.zig");
+const state_cache = @import("runner_graph_state_cache.zig");
 const api = @import("runner_api.zig");
 const Allocator = std.mem.Allocator;
 const Hash = std.crypto.hash.sha2.Sha256;
@@ -33,6 +35,8 @@ const Row = struct {
     actual_canonical_sha256: []const u8 = "",
     expected_canonical_sha256: []const u8 = "",
     raw_trace_sha256: []const u8 = "",
+    state_instances: usize = 0,
+    state_reset_clean: bool = true,
 };
 
 const Seed = struct { packet: []const u8, output: []const u8, op: []const u8 };
@@ -44,9 +48,14 @@ const Options = struct {
     count: usize = std.math.maxInt(usize),
     budget: u64 = 100000,
     lifecycle: bool = false,
+    algorithm_lifecycle: bool = false,
+    fresh_states: bool = false,
+    fixed_widths: bool = false,
 };
 const Report = struct {
     pass: bool,
+    reuse_states: bool,
+    adaptive_widths: bool,
     boot_wall_ns: u64,
     boot_process_cpu_ns: u64,
     run_wall_ns: u64,
@@ -105,6 +114,19 @@ fn options(args: []const []const u8) !Options {
             o.lifecycle = true;
             continue;
         }
+        if (std.mem.eql(u8, args[i], "--algorithm-lifecycle")) {
+            o.lifecycle = true;
+            o.algorithm_lifecycle = true;
+            continue;
+        }
+        if (std.mem.eql(u8, args[i], "--fresh-states")) {
+            o.fresh_states = true;
+            continue;
+        }
+        if (std.mem.eql(u8, args[i], "--fixed-widths")) {
+            o.fixed_widths = true;
+            continue;
+        }
         if (i + 1 >= args.len) return error.MissingOptionValue;
         const key = args[i];
         i += 1;
@@ -132,12 +154,13 @@ fn audit(a: Allocator, row: *Row, trace: []const u32, out: []const u8, halted: b
     var visible = Hash.init(.{});
     var valid = trace.len == row.steps;
     var cursor: usize = 0;
+    var internal_halts: usize = 0;
     for (trace, 0..) |token, i| {
         tokenHash(&raw, token);
         tokenHash(all_raw, token);
         const is_byte = token >= byte_base and token < byte_base + 256;
         if (is_byte) {
-            if (i < row.alu_halts or cursor >= out.len) {
+            if (cursor >= out.len) {
                 valid = false;
             } else if (token != byte_base + out[cursor]) valid = false;
             cursor += 1;
@@ -148,10 +171,11 @@ fn audit(a: Allocator, row: *Row, trace: []const u32, out: []const u8, halted: b
             if (halted and i + 1 == trace.len) {
                 tokenHash(&visible, token);
                 tokenHash(all_visible, token);
-            } else if (i >= row.alu_halts) valid = false;
+            } else internal_halts += 1;
         }
     }
     if (cursor != out.len) valid = false;
+    if (internal_halts != row.alu_halts) valid = false;
     if (halted) {
         if (trace.len != row.alu_halts + out.len + 1) valid = false;
         if (trace.len == 0 or trace[trace.len - 1] != halt) valid = false;
@@ -162,7 +186,7 @@ fn audit(a: Allocator, row: *Row, trace: []const u32, out: []const u8, halted: b
     row.raw_trace_sha256 = try hex(a, &raw);
 }
 
-fn runCase(a: Allocator, keep: Allocator, bank: *const graph.Bank, c: Case, budget: u64, all_raw: *Hash, all_visible: *Hash, seeds: *std.ArrayList(Seed)) !Row {
+fn runCase(a: Allocator, keep: Allocator, bank: *const graph.Bank, c: Case, budget: u64, fresh_states: bool, fixed_widths: bool, all_raw: *Hash, all_visible: *Hash, seeds: *std.ArrayList(Seed)) !Row {
     var row: Row = .{ .id = try keep.dupe(u8, c.id) };
     row.expected_canonical_sha256 = try expectedHash(keep, c.expected_output, std.mem.eql(u8, c.expected_status, "halted"));
     const bytes = try std.json.Stringify.valueAlloc(a, c.packet, .{});
@@ -177,6 +201,8 @@ fn runCase(a: Allocator, keep: Allocator, bank: *const graph.Bank, c: Case, budg
         return row;
     };
     defer m.deinit();
+    m.reuse_states = !fresh_states;
+    m.adaptive_widths = !fixed_widths;
     row.machine_boot_ns = now() - boot_start;
     if (m.ops.len > 4096) {
         row.reason = "case exceeds 4096 operation limit";
@@ -198,18 +224,28 @@ fn runCase(a: Allocator, keep: Allocator, bank: *const graph.Bank, c: Case, budg
     };
     row.cpu_ns = cpuNow() - cpu_start;
     row.run_ns = now() - start;
+    row.state_instances = m.states.entries.items.len;
+    row.state_reset_clean = cacheClean(&m.states);
     row.steps = m.steps;
     if (end) |e| row.status = @tagName(e.end);
     const halted = std.mem.eql(u8, row.status, "halted");
+    row.alu_halts = std.mem.count(u32, trace.items, &.{halt}) - @as(usize, @intFromBool(halted));
     try audit(keep, &row, trace.items, out.items, halted, all_raw, all_visible);
     row.actual_output = try keep.dupe(u8, out.items);
     row.output_equal = std.mem.eql(u8, out.items, c.expected_output);
     row.detected_mismatch = halted and row.trace_valid and !row.output_equal;
     row.pass = if (c.expect_mismatch) row.detected_mismatch else row.trace_valid and row.output_equal and std.mem.eql(u8, row.status, c.expected_status);
+    row.pass = row.pass and row.state_reset_clean;
     if (!row.pass) row.reason = "status, output or generated token trace differs";
-    if (row.pass and halted and !c.expect_mismatch and seeds.items.len < 2) {
-        const op = if (m.ops.len > 0) m.ops[0].op else "identity";
-        if (seeds.items.len == 0 or !std.mem.eql(u8, op, seeds.items[0].op)) {
+    if (row.pass and halted and !c.expect_mismatch and seeds.items.len < 4) {
+        const op = m.algorithm orelse if (m.ops.len > 0) m.ops[0].op else "identity";
+        const simple_output = m.prints.len == 0 or (m.prints.len == 1 and m.prints[0].style == .integer and
+            m.prints[0].ending == .newline and !m.prints[0].prefix and m.prints[0].precision == 0);
+        const eligible = if (seeds.items.len < 2) m.algorithm == null and simple_output else m.algorithm != null;
+        const distinct = for (seeds.items) |seed| {
+            if (std.mem.eql(u8, op, seed.op)) break false;
+        } else true;
+        if (eligible and distinct) {
             try seeds.append(keep, .{ .packet = try keep.dupe(u8, bytes), .output = row.actual_output, .op = try keep.dupe(u8, op) });
         }
     }
@@ -231,6 +267,53 @@ fn wait(b: api.Backend, id: api.JobId) !api.Result {
 
 fn require(ok: bool) !void {
     if (!ok) return error.BackendContract;
+}
+
+fn cacheClean(cache: *const state_cache.Cache) bool {
+    for (cache.entries.items) |*e| {
+        const s = &e.state;
+        if (s.steps != 0 or s.active.items.len != 0) return false;
+        for (s.history) |v| if (v != 0) return false;
+        for (s.x) |v| if (v != 0) return false;
+        for (s.seen) |v| if (v) return false;
+        for (s.work) |v| if (v != 0) return false;
+        for (s.circuit.tables, s.tables, s.present) |t, rows, present| {
+            if (present != t.present) return false;
+            if (!std.mem.eql(u8, std.mem.sliceAsBytes(rows), std.mem.sliceAsBytes(t.rows))) return false;
+        }
+    }
+    return true;
+}
+
+fn resetProof(a: Allocator, bank: *const graph.Bank) !void {
+    const t = &bank.templates[0];
+    var first: state_cache.Cache = .{};
+    defer first.deinit(a);
+    var second: state_cache.Cache = .{};
+    defer second.deinit(a);
+    const s = try first.get(a, t);
+    const other = try second.get(a, t);
+    for (s.tables, 0..) |_, i| {
+        try s.own(@intCast(i));
+        try require(s.tables[i].ptr != other.tables[i].ptr);
+        @memset(s.tables[i], 7);
+        s.present[i] = ~s.present[i];
+    }
+    @memset(s.history, 7);
+    @memset(s.x, 7);
+    @memset(s.seen, true);
+    s.active.appendAssumeCapacity(0);
+    s.steps = 7;
+    @memset(s.work, 7);
+    try require(!cacheClean(&first));
+    state_cache.reset(s);
+    try require(cacheClean(&first));
+    try require(try first.get(a, t) == s and first.entries.items.len == 1);
+    for (other.circuit.tables, other.tables, other.present) |table, rows, present| {
+        try require(present == table.present);
+        try require(std.mem.eql(u8, std.mem.sliceAsBytes(rows), std.mem.sliceAsBytes(table.rows)));
+    }
+    try require(other.steps == 0 and other.active.items.len == 0);
 }
 
 fn result(b: api.Backend, job: api.JobId, want: []const u8) !void {
@@ -256,7 +339,8 @@ fn lifecycle(a: Allocator, bank: *const graph.Bank, seeds: []const Seed, budget:
     const Kind = @FieldType(api.Program, "kind");
     if (comptime !@hasField(Kind, "graph")) return error.GraphKindUnavailable;
     const kind = std.meta.stringToEnum(Kind, "graph") orelse return error.GraphKindUnavailable;
-    if (seeds.len != 2) return error.NeedTwoDistinctOperations;
+    if (seeds.len < 2) return error.NeedTwoDistinctOperations;
+    try resetProof(a, bank);
     const p: api.Program = .{ .kind = kind, .bytes = seeds[0].packet };
     const q: api.Program = .{ .kind = kind, .bytes = seeds[1].packet };
     const b = try graph.backend(a, bank, 2);
@@ -300,7 +384,54 @@ fn lifecycle(a: Allocator, bank: *const graph.Bank, seeds: []const Seed, budget:
     const flag = std.atomic.Value(bool).init(true);
     const end = try m.run(budget, &out, &flag);
     try require(end.end == .cancelled and m.steps == 0 and out.items.len == 0);
+    var partial = try graph.Machine.boot(a, bank, seeds[0].packet);
+    defer partial.deinit();
+    const limited_end = try partial.run(1, &out, null);
+    try require(limited_end.end == .budget and partial.steps == 1);
+    try require(partial.states.entries.items.len > 0 and cacheClean(&partial.states));
+    var complete = try graph.Machine.boot(a, bank, seeds[0].packet);
+    defer complete.deinit();
+    out.clearRetainingCapacity();
+    try require((try complete.run(budget, &out, null)).end == .halted);
+    const entries = complete.states.entries.items;
+    var template = entries[entries.len - 1].template.*;
+    const formatted = std.mem.eql(u8, template.name, "format");
+    try require((formatted or std.mem.eql(u8, template.name, "emit")) and out.items.len > 0);
+    const result_ref = if (complete.prints.len == 1) complete.prints[0].ref else complete.result;
+    var replay = [2]packet.Value{ complete.values[result_ref], try packet.literal("0") };
+    const original_values = complete.values;
+    complete.values = &replay;
+    defer complete.values = original_values;
+    const emitter_args = [_]u32{ 0, 1 };
+    const emitter_refs = emitter_args[0..(if (formatted) @as(usize, 2) else 1)];
+    template.circuit.fault_family = template.circuit.byte_family;
+    out.clearRetainingCapacity();
+    const fault_end = try complete.invoke(&template, emitter_refs, 0, std.math.maxInt(u64), &out, null, true);
+    try require(fault_end == .fault and cacheClean(&complete.states));
+    template.circuit.fault_family = null;
+    if (complete.invoke(&template, emitter_refs, 0, std.math.maxInt(u64), &out, null, false)) |_|
+        return error.MissingUnexpectedByte
+    else |err|
+        try require(err == error.GraphUnexpectedByte);
+    try require(cacheClean(&complete.states));
+    try require((try complete.invoke(&template, emitter_refs, 0, std.math.maxInt(u64), &out, null, true)) == .halted);
+    try require(std.mem.eql(u8, out.items, seeds[0].output) and cacheClean(&complete.states));
     checks.* += 1;
+    if (seeds.len == 4) {
+        const x: api.Program = .{ .kind = kind, .bytes = seeds[2].packet };
+        const y: api.Program = .{ .kind = kind, .bytes = seeds[3].packet };
+        const jx = try b.start(10, x, budget);
+        const jy = try b.start(11, y, budget);
+        try result(b, jy, seeds[3].output);
+        try result(b, jx, seeds[2].output);
+        b.release(10);
+        b.release(11);
+        const stopped = try b.start(10, x, 0);
+        const limited_algorithm = try wait(b, stopped);
+        try require(limited_algorithm.status == .budget and limited_algorithm.steps == 0);
+        try result(b, try b.start(10, y, budget), seeds[3].output);
+        checks.* += 1;
+    }
 }
 
 fn run(init: std.process.Init) !u8 {
@@ -344,7 +475,7 @@ fn run(init: std.process.Init) !u8 {
         defer parsed.deinit();
         const c = parsed.value;
         if (c.packet == .object and c.packet.object.get("plan") != null) named += 1 else generic += 1;
-        const row = try runCase(a, keep, &bank, c, o.budget, &raw, &visible, &seeds);
+        const row = try runCase(a, keep, &bank, c, o.budget, o.fresh_states, o.fixed_widths, &raw, &visible, &seeds);
         try rows.append(keep, row);
         if (!row.pass) failed += 1;
         steps += row.steps;
@@ -360,10 +491,13 @@ fn run(init: std.process.Init) !u8 {
         lifecycle(a, &bank, seeds.items, o.budget, &life.checks) catch |err| {
             life.error_name = @errorName(err);
         };
-        life.pass = life.error_name.len == 0 and life.checks == 9;
+        life.pass = life.error_name.len == 0 and life.checks == (if (seeds.items.len == 4) @as(usize, 10) else 9) and
+            (!o.algorithm_lifecycle or seeds.items.len == 4);
     }
     const report: Report = .{
         .pass = rows.items.len > 0 and failed == 0 and (!o.lifecycle or life.pass),
+        .reuse_states = !o.fresh_states,
+        .adaptive_widths = !o.fixed_widths,
         .boot_wall_ns = boot_ns,
         .boot_process_cpu_ns = boot_cpu_ns,
         .run_wall_ns = run_ns,

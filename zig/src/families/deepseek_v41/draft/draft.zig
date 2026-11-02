@@ -47,6 +47,7 @@ test {
     _ = @import("golden_test.zig");
     _ = spec;
     _ = @import("spec_test.zig");
+    _ = @import("spec_hold_test.zig");
     _ = lookup;
     _ = @import("lookup_test.zig");
 }

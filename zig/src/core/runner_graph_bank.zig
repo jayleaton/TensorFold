@@ -5,7 +5,7 @@ const binary = @import("runner_graph_binary.zig");
 const packet = @import("runner_graph_packet.zig");
 const Allocator = std.mem.Allocator;
 const missing = std.math.maxInt(u32);
-pub const Slots = [packet.max_arity][2]u32;
+pub const Slots = [packet.max_arity][packet.max_groups]u32;
 
 pub const Template = struct {
     name: []const u8,
@@ -31,6 +31,9 @@ pub const PreparedPlan = struct {
     result: u32,
     constants: []const packet.Value,
     total_values: usize,
+    algorithm: ?[]const u8,
+    width: u8,
+    precision: u8,
 };
 
 const Manifest = struct {
@@ -77,10 +80,23 @@ pub const Bank = struct {
                 return error.GraphPlanSize;
             const constants = try arena.allocator().alloc(packet.Value, p.literals.len);
             for (p.literals, constants) |text, *v| v.* = try packet.literal(text);
-            plans[i] = .{ .name = p.name, .inputs = p.inputs, .ops = p.ops, .result = p.result, .constants = constants, .total_values = try bank.validate(p.inputs + p.literals.len, p.ops, p.result) };
+            if (p.algorithm) |kind| {
+                const family = std.meta.stringToEnum(packet.Algorithm, kind) orelse return error.GraphAlgorithm;
+                if (p.inputs != packet.algorithmArity(family) or p.ops.len != 0 or constants.len != 0 or p.result != 0)
+                    return error.GraphAlgorithm;
+                try bank.validateAlgorithm(family, p.width, p.precision);
+            } else if (p.precision != 0) {
+                return error.GraphPrecision;
+            }
+            plans[i] = .{ .name = p.name, .inputs = p.inputs, .ops = p.ops, .result = p.result, .constants = constants, .total_values = if (p.algorithm != null) 32 else try bank.validate(p.inputs + p.literals.len, p.ops, p.result), .algorithm = p.algorithm, .width = p.width, .precision = p.precision };
         }
         const emitter = bank.find("emit", 62) orelse return error.GraphEmitMissing;
         if (emitter.inputs != 1 or emitter.outputs != 1) return error.GraphSlotArity;
+        for (templates) |t| if (t.width == 128) {
+            const wide = bank.find("emit", 128) orelse return error.GraphEmitMissing;
+            if (wide.inputs != 1 or wide.outputs != 1) return error.GraphSlotArity;
+            break;
+        };
         bank.arena = arena;
         return bank;
     }
@@ -108,21 +124,30 @@ pub const Bank = struct {
             if (op.outputs == 0 or op.outputs > packet.max_arity or count + op.outputs > packet.max_values)
                 return error.GraphPlanSize;
             if (std.mem.eql(u8, op.op, "bind")) {
-                if (op.outputs != 1 or op.copies.len > 128 or op.args != null or op.b != null)
+                if (op.outputs != 1 or op.copies.len > 128 or op.args != null or op.b != null or op.precision != 0)
                     return error.GraphBinding;
-                for (op.copies) |c| if (c.ref >= count or c.from > 62 or c.to > 62 or
-                    c.digits > 62 - c.from or c.digits > 62 - c.to) return error.GraphBinding;
+                for (op.copies) |c| if (c.ref >= count or c.from > packet.max_digits or c.to > packet.max_digits or
+                    c.digits > packet.max_digits - c.from or c.digits > packet.max_digits - c.to)
+                    return error.GraphBinding;
                 if (op.flags) |r| if (r >= count) return error.GraphReference;
             } else {
-                if (std.mem.eql(u8, op.op, "emit") or op.copies.len != 0 or op.flags != null)
+                if (std.mem.startsWith(u8, op.op, "emit") or std.mem.eql(u8, op.op, "format") or op.copies.len != 0 or op.flags != null)
                     return error.GraphTemplate;
-                const t = b.find(op.op, op.width) orelse return error.GraphTemplate;
-                if (t.outputs != op.outputs) return error.GraphSlotArity;
+                const arity: u8 = if (std.meta.stringToEnum(packet.Algorithm, op.op)) |family| blk: {
+                    try b.validateAlgorithm(family, op.width, op.precision);
+                    if (op.outputs != packet.algorithmOutputs(family)) return error.GraphSlotArity;
+                    break :blk packet.algorithmArity(family);
+                } else blk: {
+                    if (op.precision != 0) return error.GraphPrecision;
+                    const t = b.find(op.op, op.width) orelse return error.GraphTemplate;
+                    if (t.outputs != op.outputs) return error.GraphSlotArity;
+                    break :blk t.inputs;
+                };
                 if (op.args) |args| {
-                    if (args.len != t.inputs) return error.GraphSlotArity;
+                    if (args.len != arity) return error.GraphSlotArity;
                     for (args) |r| if (r >= count) return error.GraphReference;
                 } else {
-                    if (t.inputs != 1 + @as(usize, @intFromBool(op.b != null)) or op.a >= count)
+                    if (arity != 1 + @as(usize, @intFromBool(op.b != null)) or op.a >= count)
                         return error.GraphSlotArity;
                     if (op.b) |r| if (r >= count) return error.GraphReference;
                 }
@@ -132,6 +157,48 @@ pub const Bank = struct {
         if (result >= count) return error.GraphReference;
         return count;
     }
+
+    pub fn validatePrints(b: *const Bank, prints: []const packet.Print, count: usize) !void {
+        if (prints.len > packet.max_prints) return error.GraphPrint;
+        if (prints.len == 0) return;
+        try b.require("format", 62, 2, 2);
+        try b.require("format", 128, 2, 2);
+        for (prints) |p| {
+            if (p.ref >= count or p.precision > 18 or (p.style != .fixed and p.precision != 0)) return error.GraphPrint;
+            if ((p.style == .fraction or p.style == .tuple) != (p.second != null)) return error.GraphPrint;
+            if (p.second) |ref| if (ref >= count) return error.GraphReference;
+            if (p.style == .fraction) try b.require("meta", 128, 2, 3);
+            if (p.style == .tuple and (p.prefix or (p.ending != .newline and p.ending != .space and p.ending != .empty and p.ending != .comma_space)))
+                return error.GraphPrint;
+        }
+    }
+
+    fn require(b: *const Bank, name: []const u8, width: u8, inputs: u8, outputs: u8) !void {
+        const t = b.find(name, width) orelse return error.GraphTemplate;
+        if (t.inputs != inputs or t.outputs != outputs) return error.GraphSlotArity;
+    }
+
+    fn validateAlgorithm(b: *const Bank, family: packet.Algorithm, width: u8, precision: u8) !void {
+        if (!packet.widthValid(width) or precision > 18 or (family != .fixed_div and precision != 0))
+            return error.GraphAlgorithm;
+        const kernels = [_]struct { []const u8, u8, u8 }{
+            .{ "add", 2, 1 },        .{ "sub", 2, 1 },      .{ "mul", 2, 1 },  .{ "half", 1, 2 },
+            .{ "divstep", 3, 2 },    .{ "divfinal", 4, 2 }, .{ "meta", 2, 3 }, .{ "digit_sum", 1, 1 },
+            .{ "mulmodstep", 4, 1 },
+        };
+        for (kernels) |k| try b.require(k[0], if (std.mem.eql(u8, k[0], "meta")) @max(width, 8) else width, k[1], k[2]);
+        if (family == .fixed_div) {
+            try b.require("scale10", width, 1, 1);
+        }
+        if (family == .fixed_div or family == .divexact) try b.require("round_div", width, 4, 1);
+        if (family == .fraction or family == .fixed_div) {
+            try b.require("format", 62, 2, 2);
+            try b.require("format", 128, 2, 2);
+        }
+        if (family == .fraction) try b.require("meta", 128, 2, 3);
+        if (family == .divmod) for ([_][]const u8{ "emit_first", "emit_last" }) |name|
+            try b.require(name, @max(width, 62), 1, 1);
+    }
 };
 
 fn slots(t: *Template) !void {
@@ -139,7 +206,7 @@ fn slots(t: *Template) !void {
         return error.GraphValueScale;
     if (t.circuit.tables.len != t.circuit.table_names.len) return error.GraphSlots;
     for (t.circuit.table_names, 0..) |name, table| {
-        if (std.mem.eql(u8, name, "output.cursor")) continue;
+        if (std.mem.startsWith(u8, name, "output.cursor")) continue;
         const input = std.mem.startsWith(u8, name, "in");
         const output = std.mem.startsWith(u8, name, "out");
         if (!input and !output) continue;
@@ -147,7 +214,7 @@ fn slots(t: *Template) !void {
         const dot = std.mem.indexOfScalarPos(u8, name, prefix, '.') orelse return error.GraphSlots;
         const logical = std.fmt.parseInt(u8, name[prefix..dot], 10) catch return error.GraphSlots;
         const offset = std.fmt.parseInt(u8, name[dot + 1 ..], 10) catch return error.GraphSlots;
-        if (logical >= packet.max_arity or (offset != 0 and offset != 31)) return error.GraphSlots;
+        if (logical >= packet.max_arity or offset % 31 != 0) return error.GraphSlots;
         if (offset >= t.width) return error.GraphSlots;
         const target = if (input) &t.in_slots else &t.out_slots;
         const group = offset / 31;
@@ -158,7 +225,7 @@ fn slots(t: *Template) !void {
         arity.* = @max(arity.*, logical + 1);
     }
     if (t.inputs == 0 or t.outputs == 0) return error.GraphSlots;
-    const groups: usize = if (t.width > 31) 2 else 1;
+    const groups = (@as(usize, t.width) + 30) / 31;
     for (t.in_slots[0..t.inputs]) |s| for (s[0..groups]) |idx| if (idx == missing) return error.GraphSlots;
     for (t.out_slots[0..t.outputs]) |s| for (s[0..groups]) |idx| if (idx == missing) return error.GraphSlots;
 }

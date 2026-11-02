@@ -70,6 +70,8 @@ pub const Backend = struct {
         cancel: *const fn (ctx: *anyopaque, job: JobId) void,
         /// The stream ended: drop its jobs, machines and buffers.
         release: *const fn (ctx: *anyopaque, stream: u64) void,
+        /// On the calling thread: the run's result if it ends within `quick` steps, else null (start it then).
+        now: ?*const fn (ctx: *anyopaque, program: Program, budget: u64, quick: u64) ?Result = null,
     };
 
     pub fn start(b: Backend, stream: u64, program: Program, budget: u64) error{ OutOfMemory, Busy }!JobId {
@@ -83,6 +85,11 @@ pub const Backend = struct {
     }
     pub fn release(b: Backend, stream: u64) void {
         b.vtable.release(b.ctx, stream);
+    }
+    /// A started job's result, when the backend runs it here within `quick` steps (`out` lives to the next call).
+    pub fn now(b: Backend, program: Program, budget: u64, quick: u64) ?Result {
+        const f = b.vtable.now orelse return null;
+        return f(b.ctx, program, budget, quick);
     }
 };
 

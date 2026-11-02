@@ -12,9 +12,12 @@ pub const probe = 8;
 pub const Settings = struct {
     on: bool = false, // TF_DSV41_SPEC_DRAFT
     nucleus: bool = false, // TF_DSV41_SPEC_NUCLEUS: rounds with top-p-without-top-k rows speculate too
+    hold: bool = false, // TF_DSV41_RUNNER_SPEC_HOLD: a held slot leaves unscored, a fed result's window speculates
 
     pub fn fromEnv() !Settings {
-        return parse(env("TF_DSV41_SPEC_DRAFT"), env("TF_DSV41_SPEC_NUCLEUS"));
+        var s = try parse(env("TF_DSV41_SPEC_DRAFT"), env("TF_DSV41_SPEC_NUCLEUS"));
+        s.hold = try flag(env("TF_DSV41_RUNNER_SPEC_HOLD"));
+        return s;
     }
 
     /// The knob values: 0 | 1 | on | off | true | false (case-insensitive), empty is 0.
@@ -56,6 +59,8 @@ pub const Stats = struct {
     ingests_skipped: u64 = 0,
     /// slots speculated over every launch (each ingested its window's rows once)
     launched_slots: u64 = 0,
+    held: u64 = 0, // slots a hold took out of the live speculation, unscored (Settings.hold)
+    fed: u64 = 0, // launches after a window that fed a forced result (Settings.hold)
 
     pub fn missed(s: Stats) u64 {
         var n: u64 = 0;
@@ -87,6 +92,7 @@ pub const Spec = struct {
     wins: []?Win,
     asks: []iface.Ask,
     n: usize = 0,
+    out: usize = 0, // of the n, slots a hold released (their asks stay, their windows are gone)
     live: bool = false,
     /// a pass begun on the device and not collected yet (`Pass.begin`)
     begun: bool = false,
@@ -156,13 +162,25 @@ pub const Spec = struct {
     }
 
     fn score(s: *Spec, hit: bool) void {
-        for (s.asks[0..s.n]) |a| s.rate[a.slot] = decay * s.rate[a.slot] + (1.0 - decay) * @as(f64, if (hit) 1.0 else 0.0);
+        for (s.asks[0..s.n]) |a| if (s.wins[a.slot] != null) {
+            s.rate[a.slot] = decay * s.rate[a.slot] + (1.0 - decay) * @as(f64, if (hit) 1.0 else 0.0);
+        };
     }
 
     fn end(s: *Spec) void {
         for (s.asks[0..s.n]) |a| s.wins[a.slot] = null;
         s.n = 0;
+        s.out = 0;
         s.live = false;
+    }
+
+    /// A slot held at a trigger (its window's commit was cut): it leaves the live speculation, its rate unscored.
+    pub fn release(s: *Spec, slot: u32) void {
+        if (!s.live or slot >= s.wins.len or s.wins[slot] == null) return;
+        s.wins[slot] = null;
+        s.out += 1;
+        s.stats.held += 1;
+        if (s.out == s.n) s.end();
     }
 
     fn drop(s: *Spec, why: Why) void {
@@ -257,7 +275,7 @@ pub const Spec = struct {
     pub fn take(s: *Spec, asks: []const iface.Ask, out: []iface.Proposal) bool {
         if (!s.live) return false;
         const why: ?Why = check: {
-            if (asks.len != s.n) break :check .slots;
+            if (asks.len != s.n - s.out) break :check .slots;
             for (asks) |a| if (a.slot >= s.wins.len or s.wins[a.slot] == null) break :check .slots;
             for (asks) |a| {
                 const w = s.wins[a.slot].?;
@@ -302,6 +320,7 @@ pub const Spec = struct {
         }
         if (!first) w.writeAll(")") catch return w.buffered();
         w.print(", {d} commit ingests skipped", .{st.ingests_skipped}) catch {};
+        if (s.settings.hold) w.print(", {d} held, {d} after a fed result", .{ st.held, st.fed }) catch {};
         return w.buffered();
     }
 };

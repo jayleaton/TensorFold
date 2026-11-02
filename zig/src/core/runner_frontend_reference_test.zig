@@ -12,7 +12,10 @@ const reference =
     \\    m = calc.machine(sys.argv[3], root / 'experimental/riscv/tests/data/rv/calc.elf')
     \\else:
     \\    m = ref.Machine.from_program(elf.program(sys.argv[3]))
-    \\m.run(100000)
+    \\tokens = 1
+    \\while not m.halted and tokens < 4000000:
+    \\    tokens += len(m.record())
+    \\assert tokens <= 4000000, tokens
     \\assert m.halted and m.fault is None and m.exit_code == 0, (m.halted, m.fault, m.exit_code)
     \\sys.stdout.buffer.write(bytes(m.out))
 ;

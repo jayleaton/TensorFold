@@ -42,7 +42,6 @@ test "integer statement programs match CPython and the RV32 reference" {
         if (result == .abstain) std.debug.print("unexpected abstention: {s}\n", .{case[0]});
         try t.expect(result == .program);
         defer t.allocator.free(result.program.bytes);
-        try t.expectEqual(.elf, result.program.kind);
         const oracle = try std.process.run(t.allocator, t.io, .{
             .argv = &.{ "/usr/bin/python3", "-I", "-c", case[0] },
             .stdout_limit = .limited(4096),

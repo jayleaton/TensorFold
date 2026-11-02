@@ -13,6 +13,7 @@ pub const Config = struct {
     float_window: u32 = 512, // tokens after a Python-float cue in which an inline span with `.` or `/` abstains
     trace: bool = false, // a computation the reasoning states, owned as `[exact: …]` where its hand trace starts
     trace_window: u32 = 512, // tokens after a stated computation's line in which a hand-trace cue counts
+    trace_repeat: u8 = 0, // a restated, already owned line is owned again up to this many times
 };
 
 /// Trace ownerships per reply, and trace cells (stated computations) a reply may open.
@@ -54,7 +55,7 @@ pub const Scanner = struct {
     tracer: ?trace.Tracer = null, // names and owned statements (form trace; made at the first reasoning line)
     trace_src: std.ArrayList(u8) = .empty, // the pending statement's Python source
     trace_disp: std.ArrayList(u8) = .empty,
-    trace_armed: std.ArrayList(u8) = .empty, // the source of the trace cell armed in this token
+    trace_armed: std.ArrayList(u8) = .empty, // the display of the trace cell armed in this token
     trace_cell: ?u32 = null, // the stated computation waiting for its cue
     trace_at: u32 = 0, // the token its line ended at
     trace_cells: u32 = 0,
@@ -163,15 +164,18 @@ pub const Scanner = struct {
 
     /// A reasoning prose line: a pending statement's cue fires it; the line's own statement opens a trace cell.
     fn traceLine(s: *Scanner, a: Allocator, ev: *Events, raw: []const u8) Allocator.Error!void {
-        if (s.tracer == null) s.tracer = trace.Tracer.init(a);
+        if (s.tracer == null) {
+            s.tracer = trace.Tracer.init(a);
+            s.tracer.?.repeat = s.cfg.trace_repeat;
+        }
         const t = &s.tracer.?;
         var fired = false;
         if (s.trace_cell != null and trace.cue(raw)) fired = try s.traceArm(a);
         const found = try t.line(raw) orelse return;
-        if (s.trace_cell != null and std.mem.eql(u8, found.source, s.trace_src.items)) return;
+        if (s.trace_cell != null and std.mem.eql(u8, found.display, s.trace_disp.items)) return;
         if (ev.closed != null or s.trace_cells >= trace_cells_max or s.trace_owned >= trace_owned_max) return;
         s.trace_src.clearRetainingCapacity();
-        try s.trace_src.appendSlice(a, found.source);
+        try s.trace_src.appendSlice(a, found.run);
         s.trace_disp.clearRetainingCapacity();
         try s.trace_disp.appendSlice(a, found.display);
         ev.closed = .{ .index = s.cells, .form = .repl, .lang = "python", .code = s.trace_src.items, .trace = .{ .display = s.trace_disp.items, .divmod = found.divmod } };
@@ -187,7 +191,7 @@ pub const Scanner = struct {
         if (s.armed != null) return false;
         s.armed = .{ .index = s.trace_cell.?, .trace = true };
         s.trace_armed.clearRetainingCapacity();
-        try s.trace_armed.appendSlice(a, s.trace_src.items);
+        try s.trace_armed.appendSlice(a, s.trace_disp.items);
         return true;
     }
 

@@ -74,8 +74,7 @@ pub const Request = struct {
     stop: ?Stop = null,
     /// false: one token a round and no drafts, the serial reference drafted replies must equal.
     drafts: bool = true,
-    /// Background work yields to foreground arrivals.
-    background: bool = false,
+    background: bool = false, // background work yields to foreground arrivals
     /// The prompt length its kept states count as (0: its own); a pass prefilling a reply carries that request's.
     born: u32 = 0,
     /// Prompt prefix lengths worth keeping for a later turn: the rendered history, then shared system blocks.
@@ -119,6 +118,7 @@ pub const Request = struct {
     /// At an EOS the stream holds for ``Engine.resumeHeld`` (a built-in tool's result) instead of finishing.
     hold_eos: bool = false,
     run_cells: bool = false, // code cells the reply writes run on the host's in-model runner (core/runner.zig)
+    run_trace: @import("runner.zig").TraceAsk = .{}, // with run_cells: the request's own say over form trace
 
     /// The prompt as the prompt cache matches it: an image request's placeholders stand for their images.
     pub fn cacheKey(r: *const Request) []const u32 {

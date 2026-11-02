@@ -4,6 +4,9 @@ const trace = @import("runner_trace.zig");
 const scan = @import("runner_scan.zig");
 const rapi = @import("runner_api.zig");
 const rt = @import("runner_test.zig");
+const graph = @import("runner_graph.zig");
+const route = @import("runner_graph_route.zig");
+const runner = @import("runner.zig");
 
 const gpa = std.testing.allocator;
 
@@ -76,7 +79,7 @@ test "runner trace: the display line and the owned text" {
     const f = (try t.line(bn019)).?;
     try std.testing.expect(f.divmod);
     try std.testing.expectEqualStrings("314159265358979323846264338327950288419716939937510 ÷ 271828182845904523536", f.display);
-    const line = (try trace.owned(gpa, f.display, true, "(1155727349790921717910215407028, 23663814570294126502)\n")).?;
+    const line = (try trace.owned(gpa, "", f.display, true, "(1155727349790921717910215407028, 23663814570294126502)\n")).?;
     defer gpa.free(line);
     try std.testing.expectEqualStrings("[exact: 314159265358979323846264338327950288419716939937510 ÷ 271828182845904523536 = 1155727349790921717910215407028 remainder 23663814570294126502]\n", line);
     const g = (try t.line(bn008)).?;
@@ -85,8 +88,8 @@ test "runner trace: the display line and the owned text" {
     defer fresh.deinit();
     const h = (try fresh.line(bn015)).?;
     try std.testing.expectEqualStrings("0xFEDCBA9876543210*2^64 + 0x0123456789ABCDEF", h.display);
-    for ([_][]const u8{ "3.75\n", "1\n2\n", "", "(1, 2)\n" }) |out| try std.testing.expectEqual(null, try trace.owned(gpa, "x", false, out));
-    for ([_][]const u8{ "(1, 2, 3)\n", "7\n", "(1,2)\n" }) |out| try std.testing.expectEqual(null, try trace.owned(gpa, "x", true, out));
+    for ([_][]const u8{ "3.75\n", "1\n2\n", "", "(1, 2)\n" }) |out| try std.testing.expectEqual(null, try trace.owned(gpa, "", "x", false, out));
+    for ([_][]const u8{ "(1, 2, 3)\n", "7\n", "(1,2)\n" }) |out| try std.testing.expectEqual(null, try trace.owned(gpa, "", "x", true, out));
 }
 
 test "runner trace: doubts, lists, hypotheticals and two readings abstain" {
@@ -113,6 +116,91 @@ test "runner trace: a name after an operator is no definition; a redefinition po
     try expectStated(&.{ "Let B = 5.", "A * B = 37,276,043,023,296,000 * 273,589,847,231,500,800.", "Need compute B*1000003." }, "(5)*1000003");
     try expectNone(&.{ "Let A = 5.", "Let A = 6.", "Need compute A*1000003." });
     try expectStated(&.{ "Let A = 12,345.", "A = 12345.", "Need compute A*1000003." }, "(12345)*1000003");
+}
+
+test "runner trace: an owned line restated through its names never fires again (live big-number-019)" {
+    var t = trace.Tracer.init(gpa);
+    defer t.deinit();
+    const f = (try t.line(bn019)).?;
+    try t.fire(f.display);
+    const again = "Need divide A by B. A has 6 base1e9 limbs, B 3 limbs. Quotient ~ A/B ~ (3.141e50)/(2.718e20)=1.155e30.";
+    try std.testing.expectEqual(null, try t.line(again));
+}
+
+test "runner trace: a restated owned line fires again only as often as the request's repeat allows" {
+    var t = trace.Tracer.init(gpa);
+    defer t.deinit();
+    t.repeat = 1;
+    const f = try gpa.dupe(u8, (try t.line(bn019)).?.display);
+    defer gpa.free(f);
+    try t.fire(f);
+    const again = "Need divide A by B. A has 6 base1e9 limbs, B 3 limbs. Quotient ~ A/B ~ (3.141e50)/(2.718e20)=1.155e30.";
+    const g = (try t.line(again)).?;
+    try std.testing.expectEqualStrings(f, g.display);
+    try t.fire(g.display);
+    try std.testing.expectEqual(null, try t.line(again));
+}
+
+/// A line's statement: Python source (checks, dedup), the frontend's source and the displayed expression.
+fn expectRun(lines: []const []const u8, source: []const u8, run: []const u8, display: []const u8) !void {
+    var t = trace.Tracer.init(gpa);
+    defer t.deinit();
+    var last: ?trace.Found = null;
+    for (lines) |l| last = try t.line(l);
+    const f = last orelse return error.TestExpectedStatement;
+    try std.testing.expectEqualStrings(source, f.source);
+    try std.testing.expectEqualStrings(run, f.run);
+    try std.testing.expectEqualStrings(display, f.display);
+}
+
+test "runner trace: a lone power mod m runs as pow(a, b, m), hex runs in decimal; the shown line keeps the model's text" {
+    try expectRun(&.{bn008}, "7**123%1000000007", "print(pow(7, 123, 1000000007))", "7^123 mod 1000000007");
+    try expectRun(&.{"Need compute 3^400 mod 10^18."}, "3**400%10**18", "print(pow(3, 400, 1000000000000000000))", "3^400 mod 10^18");
+    try expectRun(&.{"Need compute (12+5)^40 mod 1000000007."}, "(12+5)**40%1000000007", "print(pow((12+5), 40, 1000000007))", "(12 + 5)^40 mod 1000000007");
+    try expectRun(&.{"Need multiply 7^123 mod 1000000007 by 3."}, "(7**123%1000000007) * (3)", "(pow(7, 123, 1000000007)) * (3)", "(7^123 mod 1000000007) * 3");
+    try expectRun(&.{bn015}, "(0xFEDCBA9876543210)*2**64+(0x0123456789ABCDEF)", "(18364758544493064720)*2**64+(81985529216486895)", "0xFEDCBA9876543210*2^64 + 0x0123456789ABCDEF");
+    // not a lone power: Python's -a**b % m and a*b**c % m are not pow(a, b, m)
+    try expectRun(&.{"Need compute -7^123 mod 1000000007."}, "-7**123%1000000007", "-7**123%1000000007", "-7^123 mod 1000000007");
+    try expectRun(&.{"Need compute 2*7^123 mod 1000000007."}, "2*7**123%1000000007", "2*7**123%1000000007", "2*7^123 mod 1000000007");
+    try expectRun(&.{"Need divide 0x10 by 3."}, "divmod(0x10, 3)", "divmod(16, 3)", "0x10 ÷ 3");
+}
+
+test "runner trace: census pow and hex statements run exactly on the real frontend and graph bank (TF_RUNNER_GRAPH_BANK)" {
+    const path = std.c.getenv("TF_RUNNER_GRAPH_BANK") orelse return error.SkipZigTest;
+    var bank = try graph.Bank.load(gpa, std.mem.span(path));
+    defer bank.deinit();
+    const g = try graph.backend(gpa, &bank, 2);
+    defer graph.destroy(g);
+    var dispatch: route.Dispatch = .{ .gpa = gpa, .circuit = g, .graph = g };
+    defer dispatch.deinit();
+    var routed: route.Routed = .{ .inner = @import("runner_frontend.zig").frontend(), .bank = &bank };
+    const front = routed.frontend();
+    const cases = [_][3][]const u8{
+        .{ bn008, "7^123 mod 1000000007", "937329259\n" },
+        .{ "Need compute 3^400 mod 10^18.", "3^400 mod 10^18", "192443283334088001\n" },
+        .{ bn015, "0xFEDCBA9876543210*2^64 + 0x0123456789ABCDEF", "338770000845734292516042252062085074415\n" },
+        .{ "Let B=0x0123456789ABCDEF. Need compute (B+1)*2^64.", "(0x0123456789ABCDEF + 1)*2^64", "1512366075204170947414340898899623936\n" },
+    };
+    for (cases) |c| {
+        var t = trace.Tracer.init(gpa);
+        defer t.deinit();
+        const f = (try t.line(c[0])).?;
+        try std.testing.expectEqualStrings(c[1], f.display);
+        var cell = std.heap.ArenaAllocator.init(gpa); // as the runner translates: in the cell's arena
+        defer cell.deinit();
+        const tr = try front.translate(front.ctx, cell.allocator(), .{ .form = .repl, .lang = "python", .code = f.run });
+        std.debug.print("trace run {s}: {s}\n", .{ f.run, if (tr == .program) @tagName(tr.program.kind) else @tagName(tr.abstain) });
+        try std.testing.expect(tr == .program and tr.program.kind == .graph);
+        const d = dispatch.backend();
+        const job = try d.start(1, tr.program, 1 << 32);
+        const res = while (true) switch (d.poll(job)) {
+            .running => std.Thread.yield() catch {},
+            .done => |r| break r,
+        };
+        try std.testing.expectEqual(rapi.Status.ok, res.status);
+        try std.testing.expectEqualStrings(c[2], res.out);
+        d.release(1);
+    }
 }
 
 test "runner trace: negative controls: prose, code and small inline sums state nothing" {
@@ -184,7 +272,7 @@ const TraceBack = struct {
 
     const answers = [_][2][]const u8{
         .{ "(987654) * (137)", "135308598\n" },
-        .{ "7**123%1000000007", "937329259\n" },
+        .{ "pow(7, 123, 1000000007)", "937329259\n" }, // the fake frontend drops print( )
     };
 
     fn backend(b: *TraceBack) rapi.Backend {
@@ -214,12 +302,16 @@ const TraceBack = struct {
 
 /// One reply; `guess` is the model's own line after `lead` (a digit line is itself a cue).
 fn traced(lead: []const u8, guess: []const u8, on: bool, delay: u32, fault: bool) ![]u8 {
+    return tracedAsk(lead, guess, on, delay, fault, .{});
+}
+
+fn tracedAsk(lead: []const u8, guess: []const u8, on: bool, delay: u32, fault: bool, ask: runner.TraceAsk) ![]u8 {
     var back: TraceBack = .{ .delay = delay, .fault = fault };
     defer back.deinit();
     var unused: rt.Back = .{};
     defer unused.deinit();
     var m = [_]rt.Model{.{ .lead = lead, .guess = guess }};
-    const texts = try rt.replies(&m, .{ .trace = on, .backend = back.backend() }, &unused);
+    const texts = try rt.replies(&m, .{ .trace = on, .backend = back.backend(), .trace_ask = ask }, &unused);
     defer gpa.free(texts);
     return texts[0];
 }
@@ -255,6 +347,49 @@ test "runner trace: late runs give the same reply; faults, the form off and no c
     const digits = try traced(quiet, "135308598", true, 0, false); // the model's own digit line is a hand-work cue
     defer gpa.free(digits);
     try std.testing.expectEqualStrings(quiet ++ "135308598\n[exact: 987654 * 137 = 135308598]\n", digits);
+}
+
+test "runner trace: a request's repeat reaches the reply's tracer" {
+    var r: runner.Runner = .{ .gpa = gpa, .cfg = .{ .circuit = "test", .scan = .{ .trace = true } }, .frontend = undefined, .backend = undefined, .text = .{ .bytes = undefined, .encode = undefined } };
+    const s = (try r.session(.{ .repeat = 2 })).?;
+    defer gpa.destroy(s);
+    defer gpa.free(s.format);
+    defer s.scan.deinit(gpa);
+    try std.testing.expectEqual(@as(u8, 2), s.scan.cfg.trace_repeat);
+}
+
+test "runner trace: a request's wording frames the owned line; runner_trace false keeps the model's text" {
+    const worded = try tracedAsk(mul_lead, "ok", true, 0, false, .{ .format = "[exact, computed by the engine: {}]" });
+    defer gpa.free(worded);
+    try std.testing.expectEqualStrings(mul_lead ++ "[exact, computed by the engine: 987654 * 137 = 135308598]\nDone.", worded);
+    const noted = try tracedAsk(mul_lead, "ok", true, 0, false, .{ .format = "[exact: {}] (computed exactly by the engine)" });
+    defer gpa.free(noted);
+    try std.testing.expectEqualStrings(mul_lead ++ "[exact: 987654 * 137 = 135308598] (computed exactly by the engine)\nDone.", noted);
+    const default = try tracedAsk(mul_lead, "ok", true, 0, false, .{ .format = trace.default_format });
+    defer gpa.free(default);
+    const plain = try traced(mul_lead, "ok", true, 0, false);
+    defer gpa.free(plain);
+    try std.testing.expectEqualStrings(plain, default);
+    const off = try tracedAsk(mul_lead, "ok", true, 0, false, .{ .off = true, .format = "[engine: {}]" });
+    defer gpa.free(off);
+    try std.testing.expectEqualStrings(mul_lead ++ "ok\nDone.", off);
+}
+
+test "runner trace: wording around divmod's quotient and remainder; a request's wording must be one line with {} once" {
+    const line = (try trace.owned(gpa, "[exact, computed by the engine: {}]", "(10^30 - 1) ÷ 97", true, "(10309278350515463917525773195, 84)\n")).?;
+    defer gpa.free(line);
+    try std.testing.expectEqualStrings("[exact, computed by the engine: (10^30 - 1) ÷ 97 = 10309278350515463917525773195 remainder 84]\n", line);
+    const lead = (try trace.owned(gpa, "{} (exact)", "2^10", false, "1024\n")).?;
+    defer gpa.free(lead);
+    try std.testing.expectEqualStrings("2^10 = 1024 (exact)\n", lead);
+    try std.testing.expect(trace.validFormat("[exact: {}]"));
+    try std.testing.expect(trace.validFormat("{}"));
+    var long: [trace.max_format + 1]u8 = undefined;
+    @memset(&long, 'x');
+    long[0..2].* = "{}".*;
+    try std.testing.expect(trace.validFormat(long[0..trace.max_format]));
+    try std.testing.expect(!trace.validFormat(&long));
+    for ([_][]const u8{ "", "[exact]", "[{} = {}]", "[exact: {}]\nmore", "[exact: {}]\r" }) |bad| try std.testing.expect(!trace.validFormat(bad));
 }
 
 fn env(name: [:0]const u8) ?[]const u8 {

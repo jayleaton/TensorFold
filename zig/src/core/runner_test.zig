@@ -157,7 +157,7 @@ const Box = struct {
 };
 
 /// `frontend`/`backend`: real ones in place of the fakes (the proof test).
-pub const Opts = struct { runner: bool = true, run_cells: bool = true, delay: u32 = 0, planner: bool = false, streams: usize = 1, frontend: ?rapi.Frontend = null, backend: ?rapi.Backend = null, wait_s: u32 = 20, exact: bool = false, inline_math: bool = false, trace: bool = false, placer: ?*runner.place.Placer = null, summaries: ?[][]u8 = null };
+pub const Opts = struct { runner: bool = true, run_cells: bool = true, delay: u32 = 0, planner: bool = false, streams: usize = 1, frontend: ?rapi.Frontend = null, backend: ?rapi.Backend = null, wait_s: u32 = 20, exact: bool = false, inline_math: bool = false, trace: bool = false, trace_ask: runner.TraceAsk = .{}, placer: ?*runner.place.Placer = null, summaries: ?[][]u8 = null };
 
 /// Runs `models` (one request each, concurrently) on one host; the reply texts.
 pub fn replies(models: []Model, o: Opts, back: *Back) ![][]u8 {
@@ -186,7 +186,7 @@ pub fn replies(models: []Model, o: Opts, back: *Back) ![][]u8 {
     for (models, 0..) |_, i| {
         boxes[i] = .{};
         prompts[i] = prompt ++ [_]u32{@intCast(i)}; // the router tells the streams apart by their last prompt token
-        requests[i] = .{ .prompt = &prompts[i], .max_tokens = 400, .eos = &.{EOS}, .run_cells = o.run_cells };
+        requests[i] = .{ .prompt = &prompts[i], .max_tokens = 400, .eos = &.{EOS}, .run_cells = o.run_cells, .run_trace = o.trace_ask };
         try e.submit(@intCast(i + 1), &requests[i], .{ .ctx = &boxes[i], .event = Box.event });
     }
     const out = try gpa.alloc([]u8, models.len);
@@ -382,6 +382,9 @@ test "runner: a reply's runtime block counts its cells by form, owned tokens and
     // the product and its newline: one token a character
     try std.testing.expectEqualStrings("{\"fence\":{\"closed\":1,\"owned\":1,\"abstained\":0,\"owned_tokens\":61},\"repl\":{\"closed\":0,\"owned\":0,\"abstained\":0,\"owned_tokens\":0},\"inline\":{\"closed\":0,\"owned\":0,\"abstained\":0,\"owned_tokens\":0},\"trace\":{\"closed\":0,\"owned\":0,\"abstained\":0,\"owned_tokens\":0},\"owned_by\":{\"calc\":1,\"elf\":0,\"graph\":0},\"held_ms\":", sums[0][0 .. std.mem.lastIndexOf(u8, sums[0], "\"held_ms\":").? + 10]);
     try std.testing.expect(std.mem.startsWith(u8, sums[1], "{\"fence\":{\"closed\":1,\"owned\":0,\"abstained\":1,\"owned_tokens\":0}"));
+    // the owned product's tokens committed, then the model's own: its resume was timed; an abstain forces nothing
+    try std.testing.expect(std.mem.indexOf(u8, sums[0], ",\"resume_ms\":") != null);
+    try std.testing.expect(std.mem.endsWith(u8, sums[1], ",\"resume_ms\":0}"));
     var off: [1][]u8 = undefined;
     var lone = [_]Model{.{ .lead = mul_cell }};
     freeAll(try replies(&lone, .{ .runner = false, .summaries = &off }, &back));
@@ -398,7 +401,7 @@ test "runner: a held stream resumes as soon as its run settles, not after the id
     freeAll(try replies(&m, .{ .summaries = &sums, .delay = 40 }, &back));
     defer gpa.free(sums[0]);
     const at = std.mem.lastIndexOf(u8, sums[0], "\"held_ms\":").? + 10;
-    const held = try std.fmt.parseInt(u64, sums[0][at .. sums[0].len - 1], 10);
+    const held = try std.fmt.parseInt(u64, sums[0][at..std.mem.indexOfScalarPos(u8, sums[0], at, ',').?], 10);
     try std.testing.expect(held < 1000);
 }
 

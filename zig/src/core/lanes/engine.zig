@@ -12,6 +12,7 @@ const shape = @import("shape.zig");
 const plan_lanes = @import("plan_lanes.zig");
 const fill = @import("fill.zig");
 const trail = @import("trail.zig");
+const forced_drafts = @import("forced_drafts.zig");
 const lone_costs = @import("lone_costs.zig");
 const open = @import("open.zig");
 const handover = @import("handover.zig");
@@ -121,6 +122,7 @@ pub const Engine = struct {
     /// One round for every live stream (Python `_family_step`).
     pub fn step(e: *Engine) !void {
         _ = e.arena.reset(.retain_capacity);
+        if (@import("round_trace.zig").on()) @import("round_trace.zig").before(e);
         const a = e.arena.allocator();
         try trail.event(e, &.{ f("ev", str("step")), f("index", int(e.steps)) });
         e.steps += 1;
@@ -159,6 +161,7 @@ pub const Engine = struct {
             }
         }
         try trail.resolve(e);
+        if (@import("round_trace.zig").on()) @import("round_trace.zig").after(e);
         try e.sweep();
         try trail.state(e);
     }
@@ -330,10 +333,7 @@ pub const Engine = struct {
         var path: []u32 = undefined;
         var committed: std.ArrayList(u32) = .empty;
         if (p.kind == .forced) {
-            path = try a.alloc(u32, rows);
-            for (path, 0..) |*r, i| r.* = @intCast(i);
-            try committed.appendSlice(a, p.forced);
-            try committed.append(a, s.popForce() orelse sampled[rows - 1]);
+            path = try forced_drafts.conclude(e, s, p, tokens, sampled, &committed);
         } else {
             path = try accept.acceptPath(a, tokens, parents, sampled);
             for (path[1..]) |r| try committed.append(a, accept.targetPick(sampled, parents, r));
@@ -442,6 +442,7 @@ pub const Engine = struct {
     /// Read the kept rows with their following tokens and ask the head for the next round's drafts.
     fn draftLate(e: *Engine, s: *Stream, start: u64, follow: []const u32, path: []const u32, budget: ?i64) !void {
         var w = win.who(s);
+        w.forced_tail = forced_drafts.tail(e, s);
         const d: u32 = @intCast(try e.rule.headDepth(&w, budget, win.probe(e)));
         try e.askDrafts(&.{.{ .stream = s, .follow = follow, .rows = path, .start = start, .position = s.cache_len + 1, .depth = d }});
     }

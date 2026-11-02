@@ -10,7 +10,7 @@ from runner_export import HEADER, UPSTREAM, encode_node, features
 from runner_trace import load_upstream
 
 
-BUCKETS = (1, 2, 4, 8, 16, 32, 62)
+BUCKETS = (1, 2, 4, 8, 16, 32, 62, 128)
 
 
 @dataclass
@@ -22,8 +22,8 @@ class Value:
 
 class Builder:
     def __init__(self, width, core, ir, np):
-        if not 1 <= width <= 63:
-            raise ValueError("decimal width must be in [1,63]")
+        if not 1 <= width <= 128:
+            raise ValueError("decimal width must be in [1,128]")
         self.width, self.core, self.ir, self.np = width, core, ir, np
         self.c = core.RvCore()
         self.one, self.zero = self.c.one, self.c.one * 0
@@ -165,7 +165,7 @@ class Builder:
                 "order": "lsd_first", "sign_col": 126 if offset == 0 else None,
                 "error_col": 127 if offset == 0 else None}
 
-    def input(self, index):
+    def input(self, index, preserve_sign=False):
         if index in self.inputs:
             return self.inputs[index]
         digits, sign, error = [], self.zero, self.zero
@@ -189,16 +189,19 @@ class Builder:
                 digits.append(self.choose(bad, self.zero, digit))
             if offset == 0:
                 sign, error = bits[-2:]
-        value = self.normalize(Value(digits, sign, self.any([error, *invalid])))
+        value = Value(digits, sign, self.any([error, *invalid]))
+        if not preserve_sign:
+            value = self.normalize(value)
         self.inputs[index] = value
         return value
 
-    def _latch(self, index, value):
+    def _latch(self, index, value, preserve_sign=False):
         from chipformer.q35.prims import thead
 
         overflow = self.nz(value.digits[self.width:])
-        value = self.normalize(Value(self._pad(value.digits, self.width), value.sign,
-                                     self.any([value.error, overflow])))
+        value = Value(self._pad(value.digits, self.width), value.sign, self.any([value.error, overflow]))
+        if not preserve_sign:
+            value = self.normalize(value)
         stored, sign, error = [], self.zero, self.zero
         for offset in range(0, self.width, 31):
             group = value.digits[offset:offset + 31]
@@ -230,7 +233,7 @@ class Builder:
             c.ffn(c.t_const(-core.KAPPA) + [(2 * core.KAPPA, self.one, bit)],
                   f"exit.code{i}", into=code, min_level=level)
 
-    def _emit(self, value):
+    def _emit(self, value, prefix=b"", suffix=b"\n"):
         c, one, width = self.c, self.one, self.width
         occupied = [self.ge(d, 1, 0, 9) for d in value.digits]
         lengths = [(occupied[i], (i + 1) * one) for i in range(width)]
@@ -244,34 +247,47 @@ class Builder:
                     merged.append((self.any([low[0], high[0]]), self.choose(high[0], high[1], low[1])))
             lengths = merged
         length = self.choose(lengths[0][0], lengths[0][1], one)
-        limit = max(width + 3, 6)
+        limit = max(width + len(prefix) + len(suffix) + 2, 6)
         count = c.counter("output.cursor", c.fam["GO"], c.fam["BYTE"])
-        n = sum(c.thermo(count, c.fam["GO"], limit, "output.cursor"), self.zero)
-        index = length - one - n + value.sign
+        if limit <= 80:
+            n = sum(c.thermo(count, c.fam["GO"], limit, "output.cursor"), self.zero)
+        else:
+            low = c.thermo(count, c.fam["GO"], 65, "output.cursor.low")
+            reset = one - low[-1]
+            step = self.node([(1, c.fam["BYTE"], low[-1])], "output.cursor.high.step")
+            high = c.counter("output.cursor.high", reset, step)
+            n = sum(low[:64], self.zero) + sum(c.thermo(high, reset, limit - 64, "output.cursor.high"), self.zero)
+        position = n - len(prefix) * one
+        index = length - one - position + value.sign
         digit = self.node([(1, d, self.eq(index, i, -limit, width))
                            for i, d in enumerate(value.digits)], "emit.digit")
-        minus = self.node([(1, value.sign, self.eq(n, 0, 0, limit))], "emit.minus")
-        newline = self.eq(n - length - value.sign, 0, -width - 1, limit)
-        done = self.ge(n - length - value.sign, 1, -width - 1, limit)
+        minus = self.node([(1, value.sign, self.eq(position, 0, -len(prefix), limit))], "emit.minus")
+        tail = position - length - value.sign
+        done = self.ge(tail, len(suffix), -width - len(prefix) - 1, limit)
         err_done = self.ge(n, 6, 0, limit)
         halt = self.choose(value.error, err_done, done)
         payload = []
         for bit, terms in enumerate(c.fn_bits(digit, 0, 9, lambda d: 48 + d, 8, "ascii")):
-            normal = self.choose(newline, ((10 >> bit) & 1) * one, self.node(terms, "emit.ascii"))
+            normal = self.node(terms, "emit.ascii")
             normal = self.choose(minus, ((45 >> bit) & 1) * one, normal)
+            for i, byte in enumerate(prefix):
+                normal = self.choose(self.eq(n, i, 0, limit), ((byte >> bit) & 1) * one, normal)
+            for i, byte in enumerate(suffix):
+                normal = self.choose(self.eq(tail, i, -width - len(prefix) - 1, limit),
+                                     ((byte >> bit) & 1) * one, normal)
             error = self.node([term for i, byte in enumerate(b"error\n") if (byte >> bit) & 1
                                for term in c.t_eq(n, i, 0, limit)], "emit.error")
             payload.append(self.choose(value.error, error, normal))
         self._exit(halt, payload)
 
-    def finish(self, outputs, emit=False):
+    def finish(self, outputs, emit=False, prefix=b"", suffix=b"\n", preserve_sign=False):
         if isinstance(outputs, Value):
             outputs = [outputs]
         if not outputs or (emit and len(outputs) != 1):
             raise ValueError("finish requires outputs; emit requires exactly one Value")
-        latched = [self._latch(index, value) for index, value in enumerate(outputs)]
+        latched = [self._latch(index, value, preserve_sign=preserve_sign) for index, value in enumerate(outputs)]
         if emit:
-            self._emit(latched[0])
+            self._emit(latched[0], prefix, suffix)
         else:
             self._exit(self.one, [])
         self.c.nodes.sort(key=lambda node: node.level)
@@ -281,8 +297,13 @@ class Builder:
 def build_template(root, op, width):
     if width not in BUCKETS:
         raise ValueError(f"template width must be one of {BUCKETS}")
-    if op not in ("add", "sub", "mul", "select", "emit", "divstep", "divfinal"):
+    whole = ("format", "round_div", "decimal_mul", "compare", "min", "max", "scale10", "float_exact")
+    if op not in ("add", "sub", "mul", "select", "emit", "emit_first", "emit_last", "divstep", "divfinal", "meta", "half", "digit_sum", "mulmodstep", *whole):
         raise ValueError(f"unsupported ALU operation: {op}")
+    if op == "meta" and width < 8:
+        raise ValueError("meta template requires at least 8 digits")
+    if op == "format" and width not in (62, 128):
+        raise ValueError("format template requires width 62 or 128")
     root = Path(root).resolve()
     load_upstream(root)
     dirty = subprocess.check_output(["git", "-C", str(root), "status", "--porcelain", "--untracked-files=no"],
@@ -294,11 +315,19 @@ def build_template(root, op, width):
     from chipformer.rv import core, spec
 
     builder = Builder(width, core, ir, np)
-    if op.startswith("div"):
+    if op == "format":
+        outputs = [builder.input(i, preserve_sign=True) for i in range(2)]
+    elif op in whole:
+        module = importlib.import_module("runner_graph_whole")
+        outputs = module.build(builder, op)
+    elif op in ("meta", "half", "digit_sum", "mulmodstep"):
+        module = importlib.import_module("runner_graph_algorithms")
+        outputs = module.build(builder, op)
+    elif op.startswith("div"):
         module = importlib.import_module("runner_graph_div")
         arity = 3 if op == "divstep" else 4
         outputs = getattr(module, f"build_{op}")(builder, [builder.input(i) for i in range(arity)])
-    elif op == "emit":
+    elif op.startswith("emit"):
         outputs = builder.input(0)
     else:
         a, b = builder.input(0), builder.input(1)
@@ -308,7 +337,12 @@ def build_template(root, op, width):
             outputs.error = builder.any([outputs.error, condition.error])
         else:
             outputs = getattr(builder, f"signed_{op}")(a, b)
-    metadata = builder.finish(outputs, emit=op == "emit")
+    prefix, suffix = {"emit_first": (b"(", b", "), "emit_last": (b"", b")\n")}.get(op, (b"", b"\n"))
+    if op == "format":
+        metadata = importlib.import_module("runner_graph_format").finish(builder, outputs)
+    else:
+        metadata = builder.finish(outputs, emit=op.startswith("emit"), prefix=prefix, suffix=suffix,
+                                  preserve_sign=op in ("round_div", "decimal_mul", "scale10", "float_exact"))
     metadata.update(op=op, input_arity=len(builder.inputs))
     c = builder.c
     families = [{"name": name, "base": int(spec.FAMILIES[name][0]), "size": int(spec.FAMILIES[name][1])}

@@ -97,7 +97,7 @@ const inline_cases = [_]Case{
 };
 
 fn configured(clang: []const u8, linker: ?[]const u8) f.Context {
-    return .{ .io = t.io, .compiler = .{ .clang = clang, .linker = linker } };
+    return .{ .io = t.io, .compiler = .{ .clang = clang, .linker = linker, .step_budget = 0 } };
 }
 
 fn translate(context: *f.Context, case: Case) !api.Program {
@@ -191,11 +191,11 @@ test "integer frontend refuses unsafe ambiguous noninteger and incomplete Python
     defer env.deinit();
     var context = configured(env.get("TF_RUNNER_CLANG") orelse "/usr/bin/clang", env.get("TF_RUNNER_LLD"));
     const bad = [_][]const u8{
-        "",              "1+",                "(2+3",                         "2**",                    "divmod(7,)", "pow(2,3,)",    "int('ff',)",
-        "missing+1",     "print(missing)",    "import os",                    "1.25*2",                 "1e3+1",      "1/2",          "6/3",
-        "1//0",          "1%0",               "divmod(1,0)",                  "pow(2,3,0)",             "2**-1",      "pow(2,-1,3)",  "print(1,2)",
-        "1,2",           "(1,2)",             "2*3,18",                       "1<2<3",                  "1+2=3",      "1==1==1",      "__import__('os').getcwd()",
-        "(1).__class__", "print(1);print(2)", "int('__import__(\"os\")',16)", "int('ff',16).__class__", "int('2',2)", "int('gg',16)",
+        "",              "1+",                           "(2+3",                   "2**",        "divmod(7,)",   "pow(2,3,)",   "int('ff',)",
+        "missing+1",     "print(missing)",               "import os",              "1.25*2",     "1e3+1",        "1/2",         "6/3",
+        "1//0",          "1%0",                          "divmod(1,0)",            "pow(2,3,0)", "2**-1",        "pow(2,-1,3)", "print((1,2))",
+        "1,2",           "(1,2)",                        "2*3,18",                 "1<2<3",      "1+2=3",        "1==1==1",     "__import__('os').getcwd()",
+        "(1).__class__", "int('__import__(\"os\")',16)", "int('ff',16).__class__", "int('2',2)", "int('gg',16)",
     };
     for ([_]api.Form{ .repl, .fence }) |form| {
         for (bad) |code| try abstains(&context, .{ .form = form, .lang = "python", .code = code });

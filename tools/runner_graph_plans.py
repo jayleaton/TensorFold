@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 
 
-BUCKETS = (1, 2, 4, 8, 16, 32, 62)
+BUCKETS = (1, 2, 4, 8, 16, 32, 62, 128)
 OPS = {ast.Add: "add", ast.Sub: "sub", ast.Mult: "mul", ast.FloorDiv: "div", ast.Mod: "mod"}
 MAX_CALLS = 4096
 MAX_VALUES = 8192
@@ -22,7 +22,7 @@ class Unsupported(ValueError):
 
 
 def bucket(width):
-    return next(n for n in BUCKETS if n >= min(width, 62))
+    return next(n for n in BUCKETS if n >= min(width, BUCKETS[-1]))
 
 
 def signed_literal(node):
@@ -61,7 +61,7 @@ def single_binary(source):
     if a is None or b is None:
         return None
     op = "pow" if isinstance(node.op, ast.Pow) else OPS.get(type(node.op))
-    if op is None or max(len(a.lstrip("-")), len(b.lstrip("-"))) > 62:
+    if op is None or max(len(a.lstrip("-")), len(b.lstrip("-"))) > BUCKETS[-1]:
         return None
     if op == "pow" and (b.startswith("-") or len(b) > 3):
         return None
@@ -98,7 +98,7 @@ class Lowerer:
     def literal(self, text):
         sign = int(text.startswith("-"))
         digits = text.lstrip("+-").lstrip("0") or "0"
-        if not digits.isascii() or not digits.isdigit() or len(digits) > 62:
+        if not digits.isascii() or not digits.isdigit() or len(digits) > BUCKETS[-1]:
             raise Unsupported("literal exceeds the decimal register")
         text = ("-" if sign and digits != "0" else "") + digits
         if text not in self.literal_ids:
@@ -120,7 +120,7 @@ class Lowerer:
             raise Unsupported("arithmetic requires scalar operands")
         wa, wb = self.widths[self.key(a)], self.widths[self.key(b)]
         width = wa + wb if op == "mul" else max(wa, wb) + (op in ("add", "sub"))
-        width = min(width, 62)
+        width = min(width, BUCKETS[-1])
         if len(self.nodes) >= MAX_CALLS or len(self.literals) + len(self.nodes) >= MAX_VALUES:
             raise Unsupported("invocation plan exceeds native bounds")
         ref = {"node": len(self.nodes)}
@@ -367,7 +367,7 @@ def plan_id(op, width, exponent=None):
         raise Unsupported("unsupported binary family or width")
     if op == "pow":
         power_schedule(exponent)
-        return f"pow-{exponent}-62"
+        return f"pow-{exponent}-{max(62, width)}"
     return f"{op}-{width}"
 
 
@@ -378,14 +378,15 @@ def binary_plan(op, width, exponent=None):
         return {"name": name, "inputs": 2, "literals": [],
                 "ops": [{"op": op, "a": 0, "b": 1, "width": width}], "result": 2}
     if op == "pow":
+        width = max(62, width)
         steps = power_schedule(exponent)
         bindings, ops = {"base": 0, "one": 1}, []
         if exponent == 0:
             return {"name": name, "inputs": 1, "literals": ["1", "0"],
-                    "ops": [{"op": "mul", "a": 0, "b": 2, "width": 62},
-                            {"op": "add", "a": 3, "b": 1, "width": 62}], "result": 4}
+                    "ops": [{"op": "mul", "a": 0, "b": 2, "width": width},
+                            {"op": "add", "a": 3, "b": 1, "width": width}], "result": 4}
         for i, step in enumerate(steps["calls"]):
-            ops.append({"op": "mul", "a": bindings[step["a"]], "b": bindings[step["b"]], "width": 62})
+            ops.append({"op": "mul", "a": bindings[step["a"]], "b": bindings[step["b"]], "width": width})
             bindings[i] = 2 + i
         return {"name": name, "inputs": 1, "literals": ["1"], "ops": ops,
                 "result": bindings[steps["result"]]}
@@ -412,8 +413,10 @@ def binary_request(source):
         raise Unsupported("request is not a simple signed binary expression")
     op, a, b = detected["op"], detected["a"], detected["b"]
     wa, wb = len(a.lstrip("-")), len(b.lstrip("-"))
-    width = bucket(wa + wb if op == "mul" else max(wa, wb) + (op in ("add", "sub")))
     exponent = int(b) if op == "pow" else None
+    needed = (wa * max(1, exponent) if op == "pow" else wa + wb if op == "mul"
+              else max(wa, wb) + (op in ("add", "sub")))
+    width = bucket(needed)
     return {"version": 1, "plan": plan_id(op, width, exponent), "values": [a] if op == "pow" else [a, b]}
 
 
@@ -459,9 +462,9 @@ def loop_plan(shape, bound, width=62):
 
 def plan_catalog():
     plans = [binary_plan(op, width) for op in OPS.values() for width in BUCKETS]
-    plans += [binary_plan("pow", 62, exponent) for exponent in range(1000)]
-    plans += [loop_plan(shape, bound) for shape in ("sum", "squares", "factorial", "fib", "list_sum")
-              for bound in range(129)]
+    plans += [binary_plan("pow", width, exponent) for width in (62, 128) for exponent in range(1000)]
+    plans += [loop_plan(shape, bound, width) for width in (62, 128)
+              for shape in ("sum", "squares", "factorial", "fib", "list_sum") for bound in range(129)]
     return plans
 
 

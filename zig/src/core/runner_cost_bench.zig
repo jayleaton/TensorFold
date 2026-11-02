@@ -5,16 +5,16 @@ const rapi = @import("runner_api.zig");
 const frontend = @import("runner_frontend.zig");
 const dsv41 = @import("dsv41_tokenizer");
 
-const Reply = struct { tokens: []u32, think_end: usize };
+pub const Reply = struct { tokens: []u32, think_end: usize };
 
-const Table = struct {
+pub const Table = struct {
     tok: *dsv41.Tokenizer,
-    fn bytes(ctx: ?*anyopaque, token: u32) []const u8 {
+    pub fn bytes(ctx: ?*anyopaque, token: u32) []const u8 {
         const t: *Table = @ptrCast(@alignCast(ctx.?));
         if (token >= t.tok.vocabSize() or t.tok.isSpecial(token)) return "";
         return t.tok.bytes[t.tok.offsets[token]..t.tok.offsets[token + 1]];
     }
-    fn encode(ctx: ?*anyopaque, a: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error![]u32 {
+    pub fn encode(ctx: ?*anyopaque, a: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error![]u32 {
         const t: *Table = @ptrCast(@alignCast(ctx.?));
         const e = try t.tok.acquire();
         defer t.tok.release(e);
@@ -65,7 +65,7 @@ fn pass(gpa: std.mem.Allocator, r: *runner.Runner, replies: []const Reply, mode:
             t.tokens += rep.tokens.len;
             continue;
         }
-        const s = (try r.session()).?;
+        const s = (try r.session(.{})).?;
         defer s.destroy();
         const hook = s.hook();
         for (rep.tokens, 0..) |tok, i| {
@@ -93,6 +93,25 @@ fn pass(gpa: std.mem.Allocator, r: *runner.Runner, replies: []const Reply, mode:
     return t;
 }
 
+/// replies.jsonl's lines ({"reasoning": "...", "content": "..."}) as token ids; never freed (a bench's whole run).
+pub fn load(gpa: std.mem.Allocator, io: std.Io, table: *Table, path: []const u8) ![]Reply {
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 30));
+    var replies: std.ArrayList(Reply) = .empty;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var total: usize = 0;
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const p = try std.json.parseFromSlice(struct { reasoning: []const u8, content: []const u8 }, gpa, line, .{ .ignore_unknown_fields = true });
+        const a = try Table.encode(table, gpa, p.value.reasoning);
+        const b = try Table.encode(table, gpa, p.value.content);
+        const all = try std.mem.concat(gpa, u32, &.{ a, b });
+        try replies.append(gpa, .{ .tokens = all, .think_end = a.len });
+        total += all.len;
+    }
+    std.debug.print("{d} replies, {d} tokens\n", .{ replies.items.len, total });
+    return replies.items;
+}
+
 /// runner-cost-bench <tokenizer.json> <replies.jsonl> [repeats]; a line is {"reasoning": "...", "content": "..."}.
 pub fn main(init: std.process.Init) !u8 {
     const gpa = std.heap.c_allocator;
@@ -104,20 +123,7 @@ pub fn main(init: std.process.Init) !u8 {
     const repeats = if (argv.len > 3) try std.fmt.parseInt(u32, argv[3], 10) else 3;
     const tok = try dsv41.Tokenizer.load(gpa, init.io, argv[1]);
     var table: Table = .{ .tok = tok };
-    const text = try std.Io.Dir.cwd().readFileAlloc(init.io, argv[2], gpa, .limited(1 << 30));
-    var replies: std.ArrayList(Reply) = .empty;
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    var total: usize = 0;
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        const p = try std.json.parseFromSlice(struct { reasoning: []const u8, content: []const u8 }, gpa, line, .{ .ignore_unknown_fields = true });
-        const a = try Table.encode(&table, gpa, p.value.reasoning);
-        const b = try Table.encode(&table, gpa, p.value.content);
-        const all = try std.mem.concat(gpa, u32, &.{ a, b });
-        try replies.append(gpa, .{ .tokens = all, .think_end = a.len });
-        total += all.len;
-    }
-    std.debug.print("{d} replies, {d} tokens\n", .{ replies.items.len, total });
+    const replies = try load(gpa, init.io, &table, argv[2]);
     var ctx: frontend.Context = .{ .io = init.io };
     var r: runner.Runner = .{ .gpa = gpa, .cfg = .{ .circuit = "bench" }, .frontend = ctx.frontend(), .backend = Instant.backend(), .text = .{ .ctx = &table, .bytes = Table.bytes, .encode = Table.encode } };
     const Case = struct { name: []const u8, mode: Mode, inline_math: bool, poll_ns: u64 };
@@ -133,7 +139,7 @@ pub fn main(init: std.process.Init) !u8 {
         r.cfg.scan.inline_math = c.inline_math;
         var best: ?Totals = null;
         for (0..repeats) |_| {
-            const t = try pass(gpa, &r, replies.items, c.mode, c.poll_ns);
+            const t = try pass(gpa, &r, replies, c.mode, c.poll_ns);
             if (best == null or t.feed_ns < best.?.feed_ns) best = t;
         }
         const t = best.?;
