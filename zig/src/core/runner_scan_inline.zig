@@ -2,8 +2,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-/// A whole arithmetic expression ending the line at `=` or `= ` (no chain, comparison, word or gap).
-pub fn inlineExpr(line: []const u8, arith: bool) ?struct { expr: []const u8, space: bool, call: bool = false } {
+/// A whole arithmetic expression ending the line at `=` or `= ` (no comparison, word, gap; chain only with `chain`).
+pub fn inlineExpr(line: []const u8, arith: bool, chain: bool) ?struct { expr: []const u8, space: bool, call: bool = false } {
     var t = line;
     var space = true;
     if (std.mem.endsWith(u8, t, " ")) {
@@ -12,11 +12,23 @@ pub fn inlineExpr(line: []const u8, arith: bool) ?struct { expr: []const u8, spa
     }
     if (t.len < 4 or t[t.len - 1] != '=') return null;
     const before = t[0 .. t.len - 1];
-    if (std.mem.indexOfAny(u8, before, "=<>!") != null) return null;
-    if (arith) if (gcdCall(before)) |g| return .{ .expr = g, .space = space, .call = true };
+    // chain (opt-in): only the text after the last `=`, when that `=` ends a statement of its own (`chained` below)
+    var seg_from: usize = 0;
+    if (std.mem.lastIndexOfScalar(u8, before, '=')) |k| {
+        if (!chain or (k > 0 and before[k - 1] == '=')) return null;
+        seg_from = k + 1;
+    }
+    if (std.mem.indexOfAny(u8, before, "<>!") != null) return null;
+    if (arith and seg_from == 0) if (gcdCall(before)) |g| return .{ .expr = g, .space = space, .call = true };
     var start = before.len;
-    while (start > 0) {
+    var period_stop = false;
+    while (start > seg_from) {
         const b = before[start - 1];
+        // chain: `… = 5. 3*4 =`, a full stop before a space ends the sentence, not a decimal
+        if (chain and b == '.' and start < before.len and (before[start] == ' ' or before[start] == '\t')) {
+            period_stop = true;
+            break;
+        }
         if (std.ascii.isDigit(b) or std.mem.indexOfScalar(u8, " \t+-*/^().", b) != null) {
             start -= 1;
         } else if (arith and b == ',' and start >= 2 and std.ascii.isDigit(before[start - 2]) and start + 3 <= before.len and
@@ -44,7 +56,7 @@ pub fn inlineExpr(line: []const u8, arith: bool) ?struct { expr: []const u8, spa
         // after a word, an unspaced "12-20" is a range ("positions 12-20 ="), not a subtraction
         const word = std.mem.trimEnd(u8, lead, " \t");
         // the modulus of `A mod M` or `A % M` is not the whole expression (live bn-011: `3^400 mod 10^18 =`)
-        if (std.mem.endsWith(u8, word, "%") or (std.mem.endsWith(u8, word, "mod") and
+        if (std.mem.endsWith(u8, word, "%") or (word.len >= 3 and std.ascii.eqlIgnoreCase(word[word.len - 3 ..], "mod") and
             (word.len == 3 or !std.ascii.isAlphanumeric(word[word.len - 4])))) return null;
         // `1, 234 + 5 =`: the expression is the next item of a number list
         if (word.len >= 2 and word[word.len - 1] == ',' and std.ascii.isDigit(word[word.len - 2])) return null;
@@ -66,6 +78,9 @@ pub fn inlineExpr(line: []const u8, arith: bool) ?struct { expr: []const u8, spa
     // integers only with commas, so the value is CPython's: `/` and a point would be floats there
     if (std.mem.indexOfScalar(u8, expr, ',') != null and
         (std.mem.indexOfAny(u8, expr, "./") != null or std.mem.indexOf(u8, expr, "÷") != null)) return null;
+    // a cell only the chain knob opens: integers only, and its `=` statement must stand alone
+    if ((seg_from > 0 or period_stop) and chainUnsafe(expr)) return null;
+    if (seg_from > 0 and (!clauseBreak(before[seg_from..start]) or chainContext(lead))) return null;
     var depth: i32 = 0;
     var ops: u32 = 0;
     var prev: enum { none, num, op, open, close } = .none;
@@ -229,6 +244,105 @@ fn grouped(text: []const u8) bool {
         if (i + 4 < text.len and std.ascii.isDigit(text[i + 4])) return false;
     };
     return true;
+}
+
+/// A `.`, `;`, `?` or `:` ending a clause between an earlier `=` and the expression: not that statement's right side.
+fn clauseBreak(gap: []const u8) bool {
+    for (gap, 0..) |c, i| {
+        if (std.mem.indexOfScalar(u8, ".;?:", c) != null and (i + 1 == gap.len or gap[i + 1] == ' ' or gap[i + 1] == '\t'))
+            return true;
+    }
+    return false;
+}
+
+fn powAt(e: []const u8, i: usize) ?usize {
+    if (i < e.len and e[i] == '^') return 1;
+    if (i + 1 < e.len and e[i] == '*' and e[i + 1] == '*') return 2;
+    return null;
+}
+
+fn blank(e: []const u8, i: usize) usize {
+    var j = i;
+    while (j < e.len and (e[j] == ' ' or e[j] == '\t')) j += 1;
+    return j;
+}
+
+/// Not CPython's integer: a float (`.`, `/`, `÷`, `2^-53`), a zero-led literal (`014`) or a power tower (`3^20^20`).
+fn chainUnsafe(e: []const u8) bool {
+    if (std.mem.indexOfAny(u8, e, "./") != null or std.mem.indexOf(u8, e, "÷") != null) return true;
+    for (e, 0..) |c, i| {
+        const after_digit = i > 0 and (std.ascii.isDigit(e[i - 1]) or e[i - 1] == ',');
+        if (c == '0' and i + 1 < e.len and std.ascii.isDigit(e[i + 1]) and !after_digit) return true;
+    }
+    for (0..e.len) |i| {
+        const w = powAt(e, i) orelse continue;
+        var j = blank(e, i + w);
+        if (j < e.len and e[j] == '-') return true;
+        const d = j;
+        while (j < e.len and std.ascii.isDigit(e[j])) j += 1;
+        if (j > d and powAt(e, blank(e, j)) != null) return true;
+    }
+    return false;
+}
+
+fn wordChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_';
+}
+
+/// `mod 97 =` or `% 97 =`: an earlier residue chain, where `=` means congruent.
+fn residueChain(t: []const u8) bool {
+    for (0..t.len) |i| {
+        var j: usize = if (t[i] == '%') i + 1 else if (i + 3 <= t.len and std.ascii.eqlIgnoreCase(t[i .. i + 3], "mod") and
+            (i == 0 or !wordChar(t[i - 1]))) i + 3 else continue;
+        j = blank(t, j);
+        const d = j;
+        while (j < t.len and (std.ascii.isDigit(t[j]) or std.mem.indexOfScalar(u8, "^*e,", t[j]) != null)) j += 1;
+        if (j > d and blank(t, j) < t.len and t[blank(t, j)] == '=') return true;
+    }
+    return false;
+}
+
+/// A name beside an earlier `=` (`a6=7^64`, `= a6^2`): variable or modular bookkeeping, not plain values.
+fn nameBeside(t: []const u8) bool {
+    for (t, 0..) |c, k| {
+        if (c != '=') continue;
+        var j = k;
+        while (j > 0 and (t[j - 1] == ' ' or t[j - 1] == '\t')) j -= 1;
+        var s = j;
+        while (s > 0 and wordChar(t[s - 1])) s -= 1;
+        if (s < j and (std.ascii.isAlphabetic(t[s]) or t[s] == '_')) return true;
+        var r = blank(t, k + 1);
+        if (r < t.len and t[r] == '-') r += 1;
+        if (r < t.len and (std.ascii.isAlphabetic(t[r]) or t[r] == '_')) return true;
+    }
+    return false;
+}
+
+/// Words before the expression that make it an operand of something else (`Times 10^6 =`, `digits of 3^100 =`).
+const chain_words = [_][]const u8{
+    "of",         "by",     "times",   "plus", "minus", "add",  "adding", "subtract", "subtracting", "multiply",
+    "multiplied", "divide", "divided", "than", "to",    "from", "with",   "into",     "over",
+};
+
+/// Whether `w` (lowercase ASCII) occurs in `text`, either case.
+fn containsIgnoreCase(text: []const u8, w: []const u8) bool {
+    if (text.len < w.len) return false;
+    for (0..text.len - w.len + 1) |i| if (std.ascii.eqlIgnoreCase(text[i..][0..w.len], w)) return true;
+    return false;
+}
+
+/// Before a chained expression: congruence (`≡`, a residue chain), names, digit counts or pieces, operand words.
+fn chainContext(lead: []const u8) bool {
+    if (std.mem.indexOf(u8, lead, "≡") != null or residueChain(lead) or nameBeside(lead)) return true;
+    for ([_][]const u8{ "digit", "group", "concaten", "append", "length" }) |w| {
+        if (containsIgnoreCase(lead, w)) return true;
+    }
+    const word = std.mem.trimEnd(u8, lead, " \t:");
+    var s = word.len;
+    while (s > 0 and std.ascii.isAlphabetic(word[s - 1])) s -= 1;
+    if (s == word.len) return false;
+    for (chain_words) |w| if (std.ascii.eqlIgnoreCase(word[s..], w)) return true;
+    return false;
 }
 
 fn allDigits(text: []const u8) bool {

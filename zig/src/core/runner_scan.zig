@@ -14,6 +14,7 @@ pub const Config = struct {
     inline_math: bool = false, // `A op B =` at a line's end: the value after `=` (exact math semantics)
     inline_mod: bool = true, // with inline_math: `A mod M =` and `A % M =` on literals, after any earlier `=`
     inline_arith: bool = true, // with inline_math: thousands commas (`147,000+73`) and a whole `gcd(a, b)` on literals
+    inline_chain: bool = false, // opt-in, T5 decides: the last `<expr> =` after an earlier `=` statement
     float_window: u32 = 512, // tokens after a Python-float cue in which an inline span with `.` or `/` abstains
     trace: bool = false, // a computation the reasoning states, owned as `[exact: …]` where its hand trace starts
     trace_window: u32 = 512, // tokens after a stated computation's line in which a hand-trace cue counts
@@ -125,7 +126,7 @@ pub const Scanner = struct {
                 // Python reads 1e9 as a float: a reply reasoning in floats keeps its own value
                 ev.closed.?.float_context = floats and std.mem.indexOfScalar(u8, m.modulus, 'e') != null;
                 ev.trigger = .{ .index = ev.closed.?.index, .inline_space = m.space };
-            } else if (inline_scan.inlineExpr(s.line.items, s.cfg.inline_arith)) |x| {
+            } else if (inline_scan.inlineExpr(s.line.items, s.cfg.inline_arith, s.cfg.inline_chain)) |x| {
                 s.lang.clearRetainingCapacity();
                 try s.lang.appendSlice(a, "python");
                 s.code.clearRetainingCapacity();
