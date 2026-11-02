@@ -587,4 +587,5 @@ test {
     _ = @import("runner_inline_context_test.zig");
     _ = @import("runner_inline_hex_test.zig");
     _ = @import("runner_trace_stated_test.zig");
+    _ = @import("runner_trace_divmod_test.zig");
 }
