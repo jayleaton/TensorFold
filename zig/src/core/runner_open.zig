@@ -12,6 +12,7 @@ pub const Runner = runner.Runner;
 pub const Text = runner.Text;
 pub const TraceAsk = runner.TraceAsk;
 pub const validTraceFormat = @import("runner_trace.zig").validFormat;
+pub const maxTraceRepeat = @import("runner_trace.zig").max_repeat;
 pub const place = runner.place;
 
 const Opened = struct {

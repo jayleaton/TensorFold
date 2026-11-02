@@ -186,7 +186,7 @@ pub fn prepare(srv: *Server, cx: *Cx, given: Input, gone: anytype) Failure!Prepa
     // the in-model runner (TF_DSV41_RUNNER): code cells this reply writes run, their results owned in place
     request.run_cells = srv.info.runner != null;
     if (request.run_cells) request.run_trace = @import("runner_guide.zig").traceAsk(f) catch
-        return cx.refuse("runner_trace must be a boolean, runner_trace_format one line of at most 128 bytes with {} once");
+        return cx.refuse("runner_trace must be a boolean, runner_trace_format one line of at most 128 bytes with {} once, runner_trace_repeat 0 to 3");
     return .{ .input = input, .request = request, .prompt_len = rendered.ids.len, .received = received, .thinking = thinking, .effort = effort, .sampled = sampling != null, .drafts = drafts, .token_ids = flag(f, "return_token_ids") orelse false, .stops = stops_opt, .preparing = preparing, .guide = guided.guide };
 }
 

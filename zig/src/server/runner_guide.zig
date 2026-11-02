@@ -4,6 +4,7 @@ const json = @import("json");
 const Value = json.Value;
 const TraceAsk = @import("engine_api").runner.TraceAsk;
 const validTraceFormat = @import("engine_api").runner.validTraceFormat;
+const maxTraceRepeat = @import("engine_api").runner.maxTraceRepeat;
 
 /// RUNNER-GUIDE.md without its final newline (76 tokens on DeepSeek V4.1).
 pub const text = "Exact computation is available. Write the full expression inline as `<expr> =`, or a Python fenced cell with `print(<expr>)` followed by a `Result:` header. The exact value will follow. Request the whole computation early; wait for the result instead of working digits, loops, carries or long division by hand. Unsupported requests leave your own continuation.";
@@ -71,7 +72,7 @@ pub fn with(a: std.mem.Allocator, messages: Value, guide: []const u8) std.mem.Al
     return .{ .array = out };
 }
 
-/// A chat's "runner_trace" (false: no trace cells) and "runner_trace_format" (the owned line); null: as booted.
+/// A chat's "runner_trace" (false: none), "runner_trace_format" (the line), "runner_trace_repeat"; null: as booted.
 pub fn traceAsk(fields: Value) error{BadTrace}!TraceAsk {
     var ask: TraceAsk = .{};
     if (fields.get("runner_trace")) |v| switch (v) {
@@ -84,6 +85,12 @@ pub fn traceAsk(fields: Value) error{BadTrace}!TraceAsk {
         .string => |t| ask.format = if (validTraceFormat(t)) t else return error.BadTrace,
         else => return error.BadTrace,
     };
+    if (fields.get("runner_trace_repeat")) |v| switch (v) {
+        .null => {},
+        .int => ask.repeat = std.math.cast(u8, v.int64() orelse return error.BadTrace) orelse return error.BadTrace,
+        else => return error.BadTrace,
+    };
+    if (ask.repeat > maxTraceRepeat) return error.BadTrace;
     return ask;
 }
 
@@ -108,6 +115,13 @@ test "runner guide: a chat's runner_trace and runner_trace_format, and their ref
     try f.put(a, "runner_trace_format", .null);
     try f.put(a, "runner_trace", .{ .string = "off" });
     try std.testing.expectError(error.BadTrace, traceAsk(.{ .object = f }));
+    try f.put(a, "runner_trace", .null);
+    try f.put(a, "runner_trace_repeat", .{ .int = "1" });
+    try std.testing.expectEqual(@as(u8, 1), (try traceAsk(.{ .object = f })).repeat);
+    for ([_]Value{ .{ .int = "4" }, .{ .int = "-1" }, .{ .int = "300" }, .{ .string = "1" }, .{ .bool = true } }) |bad| {
+        try f.put(a, "runner_trace_repeat", bad);
+        try std.testing.expectError(error.BadTrace, traceAsk(.{ .object = f }));
+    }
 }
 
 test "runner guide: T5's RUNNER-GUIDE.md bytes; joins a system message or leads the chat" {

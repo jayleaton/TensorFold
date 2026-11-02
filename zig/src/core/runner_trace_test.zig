@@ -4,6 +4,8 @@ const trace = @import("runner_trace.zig");
 const scan = @import("runner_scan.zig");
 const rapi = @import("runner_api.zig");
 const rt = @import("runner_test.zig");
+const graph = @import("runner_graph.zig");
+const route = @import("runner_graph_route.zig");
 const runner = @import("runner.zig");
 
 const gpa = std.testing.allocator;
@@ -125,6 +127,82 @@ test "runner trace: an owned line restated through its names never fires again (
     try std.testing.expectEqual(null, try t.line(again));
 }
 
+test "runner trace: a restated owned line fires again only as often as the request's repeat allows" {
+    var t = trace.Tracer.init(gpa);
+    defer t.deinit();
+    t.repeat = 1;
+    const f = try gpa.dupe(u8, (try t.line(bn019)).?.display);
+    defer gpa.free(f);
+    try t.fire(f);
+    const again = "Need divide A by B. A has 6 base1e9 limbs, B 3 limbs. Quotient ~ A/B ~ (3.141e50)/(2.718e20)=1.155e30.";
+    const g = (try t.line(again)).?;
+    try std.testing.expectEqualStrings(f, g.display);
+    try t.fire(g.display);
+    try std.testing.expectEqual(null, try t.line(again));
+}
+
+/// A line's statement: Python source (checks, dedup), the frontend's source and the displayed expression.
+fn expectRun(lines: []const []const u8, source: []const u8, run: []const u8, display: []const u8) !void {
+    var t = trace.Tracer.init(gpa);
+    defer t.deinit();
+    var last: ?trace.Found = null;
+    for (lines) |l| last = try t.line(l);
+    const f = last orelse return error.TestExpectedStatement;
+    try std.testing.expectEqualStrings(source, f.source);
+    try std.testing.expectEqualStrings(run, f.run);
+    try std.testing.expectEqualStrings(display, f.display);
+}
+
+test "runner trace: a lone power mod m runs as pow(a, b, m), hex runs in decimal; the shown line keeps the model's text" {
+    try expectRun(&.{bn008}, "7**123%1000000007", "print(pow(7, 123, 1000000007))", "7^123 mod 1000000007");
+    try expectRun(&.{"Need compute 3^400 mod 10^18."}, "3**400%10**18", "print(pow(3, 400, 1000000000000000000))", "3^400 mod 10^18");
+    try expectRun(&.{"Need compute (12+5)^40 mod 1000000007."}, "(12+5)**40%1000000007", "print(pow((12+5), 40, 1000000007))", "(12 + 5)^40 mod 1000000007");
+    try expectRun(&.{"Need multiply 7^123 mod 1000000007 by 3."}, "(7**123%1000000007) * (3)", "(pow(7, 123, 1000000007)) * (3)", "(7^123 mod 1000000007) * 3");
+    try expectRun(&.{bn015}, "(0xFEDCBA9876543210)*2**64+(0x0123456789ABCDEF)", "(18364758544493064720)*2**64+(81985529216486895)", "0xFEDCBA9876543210*2^64 + 0x0123456789ABCDEF");
+    // not a lone power: Python's -a**b % m and a*b**c % m are not pow(a, b, m)
+    try expectRun(&.{"Need compute -7^123 mod 1000000007."}, "-7**123%1000000007", "-7**123%1000000007", "-7^123 mod 1000000007");
+    try expectRun(&.{"Need compute 2*7^123 mod 1000000007."}, "2*7**123%1000000007", "2*7**123%1000000007", "2*7^123 mod 1000000007");
+    try expectRun(&.{"Need divide 0x10 by 3."}, "divmod(0x10, 3)", "divmod(16, 3)", "0x10 ÷ 3");
+}
+
+test "runner trace: census pow and hex statements run exactly on the real frontend and graph bank (TF_RUNNER_GRAPH_BANK)" {
+    const path = std.c.getenv("TF_RUNNER_GRAPH_BANK") orelse return error.SkipZigTest;
+    var bank = try graph.Bank.load(gpa, std.mem.span(path));
+    defer bank.deinit();
+    const g = try graph.backend(gpa, &bank, 2);
+    defer graph.destroy(g);
+    var dispatch: route.Dispatch = .{ .gpa = gpa, .circuit = g, .graph = g };
+    defer dispatch.deinit();
+    var routed: route.Routed = .{ .inner = @import("runner_frontend.zig").frontend(), .bank = &bank };
+    const front = routed.frontend();
+    const cases = [_][3][]const u8{
+        .{ bn008, "7^123 mod 1000000007", "937329259\n" },
+        .{ "Need compute 3^400 mod 10^18.", "3^400 mod 10^18", "192443283334088001\n" },
+        .{ bn015, "0xFEDCBA9876543210*2^64 + 0x0123456789ABCDEF", "338770000845734292516042252062085074415\n" },
+        .{ "Let B=0x0123456789ABCDEF. Need compute (B+1)*2^64.", "(0x0123456789ABCDEF + 1)*2^64", "1512366075204170947414340898899623936\n" },
+    };
+    for (cases) |c| {
+        var t = trace.Tracer.init(gpa);
+        defer t.deinit();
+        const f = (try t.line(c[0])).?;
+        try std.testing.expectEqualStrings(c[1], f.display);
+        var cell = std.heap.ArenaAllocator.init(gpa); // as the runner translates: in the cell's arena
+        defer cell.deinit();
+        const tr = try front.translate(front.ctx, cell.allocator(), .{ .form = .repl, .lang = "python", .code = f.run });
+        std.debug.print("trace run {s}: {s}\n", .{ f.run, if (tr == .program) @tagName(tr.program.kind) else @tagName(tr.abstain) });
+        try std.testing.expect(tr == .program and tr.program.kind == .graph);
+        const d = dispatch.backend();
+        const job = try d.start(1, tr.program, 1 << 32);
+        const res = while (true) switch (d.poll(job)) {
+            .running => std.Thread.yield() catch {},
+            .done => |r| break r,
+        };
+        try std.testing.expectEqual(rapi.Status.ok, res.status);
+        try std.testing.expectEqualStrings(c[2], res.out);
+        d.release(1);
+    }
+}
+
 test "runner trace: negative controls: prose, code and small inline sums state nothing" {
     try expectNone(&.{"We need answer. Need be careful. Let's think about the algorithm."});
     try expectNone(&.{"for i in range(10): total = total * 3"});
@@ -194,7 +272,7 @@ const TraceBack = struct {
 
     const answers = [_][2][]const u8{
         .{ "(987654) * (137)", "135308598\n" },
-        .{ "7**123%1000000007", "937329259\n" },
+        .{ "pow(7, 123, 1000000007)", "937329259\n" }, // the fake frontend drops print( )
     };
 
     fn backend(b: *TraceBack) rapi.Backend {
@@ -269,6 +347,15 @@ test "runner trace: late runs give the same reply; faults, the form off and no c
     const digits = try traced(quiet, "135308598", true, 0, false); // the model's own digit line is a hand-work cue
     defer gpa.free(digits);
     try std.testing.expectEqualStrings(quiet ++ "135308598\n[exact: 987654 * 137 = 135308598]\n", digits);
+}
+
+test "runner trace: a request's repeat reaches the reply's tracer" {
+    var r: runner.Runner = .{ .gpa = gpa, .cfg = .{ .circuit = "test", .scan = .{ .trace = true } }, .frontend = undefined, .backend = undefined, .text = .{ .bytes = undefined, .encode = undefined } };
+    const s = (try r.session(.{ .repeat = 2 })).?;
+    defer gpa.destroy(s);
+    defer gpa.free(s.format);
+    defer s.scan.deinit(gpa);
+    try std.testing.expectEqual(@as(u8, 2), s.scan.cfg.trace_repeat);
 }
 
 test "runner trace: a request's wording frames the owned line; runner_trace false keeps the model's text" {

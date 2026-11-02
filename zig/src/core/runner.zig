@@ -90,6 +90,7 @@ pub const Text = struct {
 pub const TraceAsk = struct {
     off: bool = false, // no trace cells in this reply, though the server's forms have trace
     format: []const u8 = "", // the owned line, `{}` for `<expr> = <value>` (validFormat); "": `[exact: {}]`
+    repeat: u8 = 0, // a restated, already owned line is owned again up to this many times (0..max_repeat)
 };
 
 /// The server-wide runner: a frontend, a backend and the server's tokenizer (set at its start); sessions are per reply.
@@ -110,6 +111,7 @@ pub const Runner = struct {
         const s = try r.gpa.create(Session);
         var cfg = r.cfg.scan;
         if (ask.off) cfg.trace = false;
+        cfg.trace_repeat = ask.repeat;
         s.* = .{ .r = r, .id = r.next_id, .scan = .{ .cfg = cfg }, .format = format };
         r.next_id += 1;
         return s;
