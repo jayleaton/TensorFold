@@ -49,7 +49,7 @@ pub fn open(gpa: Allocator, cfg: Config) !*Runner {
         o.routed = .{ .inner = frontend, .bank = &o.bank };
         // settling holds: graph jobs leave the engine thread's CPU as the circuit's do (unplaced, they share its pin)
         const placer: ?*runner.place.Placer = if (cfg.settle_us > 0) &o.placer else null;
-        o.dispatch = .{ .gpa = gpa, .circuit = back, .graph = try graph.placed(gpa, &o.bank, cfg.workers, placer) };
+        o.dispatch = .{ .gpa = gpa, .circuit = back, .graph = try graph.placed(gpa, &o.bank, cfg.workers, placer), .bank = &o.bank };
         frontend = o.routed.frontend();
         backend = o.dispatch.backend();
         log.info("in-model runner: graph bank {s} loaded in {d} ms", .{ cfg.graph_bank, (nowNs() - t0) / std.time.ns_per_ms });

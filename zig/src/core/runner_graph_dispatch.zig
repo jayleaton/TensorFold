@@ -2,23 +2,30 @@
 const std = @import("std");
 const api = @import("runner_api.zig");
 const prog = @import("runner_graph_program.zig");
+const graph = @import("runner_graph.zig");
 const Allocator = std.mem.Allocator;
+const log = std.log.scoped(.runner_graph);
 
 pub const Dispatch = struct {
     gpa: Allocator,
     circuit: api.Backend,
     graph: api.Backend,
+    /// The bank TFGS2 templates lower on; without one a template piece faults.
+    bank: ?*const graph.Bank = null,
     seqs: std.ArrayList(*Seq) = .empty,
     next_seq: api.JobId = 1,
 
     const tag: api.JobId = 1 << 63;
     const seq_tag: api.JobId = 1 << 62;
 
-    /// One line of a sequence: a bank packet, or text ('L') printed as written; kind 0 is a malformed line.
+    /// One line of a sequence: a bank packet, a TFGS2 template, or text ('L') printed as written; kind 0 is malformed.
     const Piece = struct {
         kind: u8,
         sep: u8,
         body: []const u8,
+        template: bool = false,
+        value: [160]u8 = undefined,
+        value_len: ?usize = null, // the run's integer output, for later templates
         job: ?api.JobId = null,
         done: ?api.Result = null, // its run's status and counts; the printed value is in `text`
         text: [160]u8 = undefined,
@@ -89,28 +96,34 @@ pub const Dispatch = struct {
     fn start(ctx: *anyopaque, stream: u64, p: api.Program, budget: u64) error{ OutOfMemory, Busy }!api.JobId {
         const d: *Dispatch = @ptrCast(@alignCast(ctx));
         if (p.kind != .graph) return d.circuit.start(stream, p, budget);
-        if (!std.mem.startsWith(u8, p.bytes, prog.seq_magic)) return tag | try d.graph.start(stream, p, budget);
+        if (!std.mem.startsWith(u8, p.bytes, "TFGS")) return tag | try d.graph.start(stream, p, budget);
+        const v2 = std.mem.startsWith(u8, p.bytes, prog.seq_magic_v2);
+        const known = v2 or std.mem.startsWith(u8, p.bytes, prog.seq_magic);
+        // a sequence version this runner does not know faults where it would otherwise be read wrong
+        if (!known) log.warn("graph sequence {s}: unknown version, refused", .{p.bytes[0..@min(p.bytes.len, 6)]});
         d.forget(stream, false);
         const q = try d.gpa.create(Seq);
         errdefer d.gpa.destroy(q);
         const bytes = try d.gpa.dupe(u8, p.bytes);
         errdefer d.gpa.free(bytes);
-        const pieces = try split(d.gpa, bytes[prog.seq_magic.len..]);
+        const pieces = try split(d.gpa, if (known) bytes[prog.seq_magic.len..] else "", v2);
         errdefer d.gpa.free(pieces);
         q.* = .{ .id = d.next_seq, .stream = stream, .budget = budget, .pieces = pieces, .bytes = bytes };
+        if (!known) q.end = .{ .status = .fault };
         try d.seqs.append(d.gpa, q);
         d.next_seq += 1;
         d.step(q);
         return seq_tag | q.id;
     }
     /// A sequence's lines (`<kind><sep> <body>\n`); text after the last newline is not a piece.
-    fn split(gpa: Allocator, lines: []const u8) Allocator.Error![]Piece {
+    fn split(gpa: Allocator, lines: []const u8, v2: bool) Allocator.Error![]Piece {
         const n = std.mem.count(u8, lines, "\n");
         const pieces = try gpa.alloc(Piece, n);
         var it = std.mem.splitScalar(u8, lines, '\n');
         for (pieces) |*p| {
             const line = it.next().?;
             p.* = if (line.len < 4 or line[2] != ' ') .{ .kind = 0, .sep = 0, .body = "" } else .{ .kind = line[0], .sep = line[1], .body = line[3..] };
+            p.template = v2 and p.kind != 'L' and p.body[0] == '@';
         }
         return pieces;
     }
@@ -162,9 +175,14 @@ pub const Dispatch = struct {
                 p.job = null;
                 p.done = r;
                 p.done.?.out = "";
-                if (r.status == .ok) if (format(p.kind, std.mem.trimEnd(u8, r.out, "\n"), &p.text)) |text| {
+                const v = std.mem.trimEnd(u8, r.out, "\n");
+                if (r.status == .ok) if (format(p.kind, v, &p.text)) |text| {
                     p.len = text.len;
                 };
+                if (r.status == .ok and p.kind == 'I' and p.len != null and v.len <= p.value.len) {
+                    @memcpy(p.value[0..v.len], v);
+                    p.value_len = v.len;
+                }
             },
         };
     }
@@ -173,13 +191,50 @@ pub const Dispatch = struct {
         if (q.end != null) return;
         while (true) {
             var best: ?*Piece = null;
-            for (q.pieces[q.next..]) |*p| {
+            for (q.pieces[q.next..], q.next..) |*p, i| {
                 if (p.kind == 0 or p.kind == 'L' or p.job != null or p.done != null) continue;
+                if (p.template and !d.ready(q, i)) continue;
                 if (best == null or p.body.len > best.?.body.len) best = p;
             }
             const p = best orelse return;
-            p.job = d.graph.start(q.stream, .{ .kind = .graph, .bytes = p.body }, q.budget) catch return;
+            if (p.template) switch (d.bind(q, p)) {
+                .started, .ended => {},
+                .busy => return,
+            } else p.job = d.graph.start(q.stream, .{ .kind = .graph, .bytes = p.body }, q.budget) catch return;
         }
+    }
+    /// Whether every piece template `i` reads has its value (a missing one ends the run before `i` prints).
+    fn ready(_: *Dispatch, q: *Seq, i: usize) bool {
+        var it = std.mem.splitScalar(u8, q.pieces[i].body, '$');
+        _ = it.next();
+        while (it.next()) |rest| {
+            var n: usize = 0;
+            while (n < rest.len and std.ascii.isDigit(rest[n])) n += 1;
+            const k = std.fmt.parseInt(usize, rest[0..n], 10) catch return true;
+            // a reference to itself or a later piece is malformed: bind reports it
+            if (k >= i) return true;
+            if (q.pieces[k].value_len == null) return false;
+        }
+        return true;
+    }
+    /// Lowers a ready template on the bank and starts it; ended: it is done without a job (no bank, or no packet).
+    fn bind(d: *Dispatch, q: *Seq, p: *Piece) enum { started, ended, busy } {
+        const bank = d.bank orelse {
+            log.warn("graph sequence template without a bank", .{});
+            p.done = .{ .status = .fault };
+            return .ended;
+        };
+        var arena_state = std.heap.ArenaAllocator.init(d.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const values = arena.alloc(?[]const u8, q.pieces.len) catch return .busy;
+        for (q.pieces, values) |*o, *v| v.* = if (o != p and o.value_len != null) o.value[0..o.value_len.?] else null;
+        const bytes = (prog.bind(arena, bank, p.body, values) catch return .busy) orelse {
+            p.done = .{ .status = .abstain, .abstain = .unsupported };
+            return .ended;
+        };
+        p.job = d.graph.start(q.stream, .{ .kind = .graph, .bytes = bytes }, q.budget) catch return .busy;
+        return .started;
     }
     /// A piece's printed value: I as is, B as Python's bool, F with `.0`, `1`..`6` at that fixed Decimal scale.
     fn format(kind: u8, v: []const u8, buf: []u8) ?[]const u8 {
@@ -252,7 +307,7 @@ pub const Dispatch = struct {
     fn now(ctx: *anyopaque, p: api.Program, budget: u64, quick: u64) ?api.Result {
         const d: *Dispatch = @ptrCast(@alignCast(ctx));
         // one packet only: a sequence's pieces run as jobs
-        return if (p.kind == .graph and !std.mem.startsWith(u8, p.bytes, prog.seq_magic)) d.graph.now(p, budget, quick) else null;
+        return if (p.kind == .graph and !std.mem.startsWith(u8, p.bytes, "TFGS")) d.graph.now(p, budget, quick) else null;
     }
 };
 
@@ -393,4 +448,31 @@ test "runner graph dispatch: the first piece in print order that is not ok ends 
     try std.testing.expectEqual(api.Status.fault, finish(b, try b.start(4, .{ .kind = .graph, .bytes = "TFGS1\nBN 7:0\n" }, 100)).status);
     b.release(1);
     b.release(2);
+}
+
+test "runner graph dispatch: a TFGS2 template waits for the piece it reads; no bank or an unknown version faults" {
+    var c: Slots = .{ .workers = 1 };
+    var g: Slots = .{ .workers = 2 };
+    var d: Dispatch = .{ .gpa = std.testing.allocator, .circuit = c.backend(), .graph = g.backend() };
+    defer d.deinit();
+    const b = d.backend();
+    const id = try b.start(1, .{ .kind = .graph, .bytes = "TFGS2\nIS 7:2\nBN @=$0;7\n" }, 100);
+    // two workers, yet only the read piece runs: the template has no value to bind until it ends
+    try std.testing.expect(b.poll(id) == .running);
+    try std.testing.expectEqual(@as(u32, 1), g.n);
+    const r = finish(b, id);
+    try std.testing.expectEqual(api.Status.fault, r.status);
+    try std.testing.expectEqualStrings("7 ", r.out);
+    try std.testing.expectEqual(@as(u32, 1), g.n);
+    // a version this runner does not know is refused, never read as TFGS1 or as one packet
+    const later = finish(b, try b.start(2, .{ .kind = .graph, .bytes = "TFGS3\nIS 7:0\n" }, 100));
+    try std.testing.expectEqual(api.Status.fault, later.status);
+    try std.testing.expectEqualStrings("", later.out);
+    try std.testing.expectEqual(@as(u32, 1), g.n);
+    // in TFGS1 a body starting `@` is a packet like any other: it runs
+    _ = finish(b, try b.start(3, .{ .kind = .graph, .bytes = "TFGS1\nIN @:0\n" }, 100));
+    try std.testing.expectEqualStrings("@:0", g.started[1]);
+    b.release(1);
+    b.release(2);
+    b.release(3);
 }

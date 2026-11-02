@@ -48,6 +48,7 @@ test "runner proof: loop cells (a generator sum and an accumulator) print 285 th
 const rapi = @import("runner_api.zig");
 const graph = @import("runner_graph.zig");
 const route = @import("runner_graph_route.zig");
+const program = @import("runner_graph_program.zig");
 
 /// A backend that counts the jobs it starts.
 const Count = struct {
@@ -127,7 +128,7 @@ test "runner proof: a REPL bignum cell takes the graph route and gives the calc 
     var calc_fallback: Count = .{ .inner = both.calc };
     var on_graph: Count = .{ .inner = both.graph };
     var routed: route.Routed = .{ .inner = ctx.frontend(), .bank = &both.bank };
-    var dispatch: route.Dispatch = .{ .gpa = gpa, .circuit = calc_fallback.backend(), .graph = on_graph.backend() };
+    var dispatch: route.Dispatch = .{ .gpa = gpa, .circuit = calc_fallback.backend(), .graph = on_graph.backend(), .bank = &both.bank };
     defer dispatch.deinit();
     const graph_texts = try rt.replies(&models, .{ .frontend = routed.frontend(), .backend = dispatch.backend(), .wait_s = 600 }, &fake);
     defer rt.freeAll(graph_texts);
@@ -206,7 +207,7 @@ test "runner proof: a whole-problem divmod cell with a bool print is owned on th
     var calc_fallback: Count = .{ .inner = both.calc };
     var on_graph: Count = .{ .inner = both.graph };
     var routed: route.Routed = .{ .inner = ctx.frontend(), .bank = &both.bank };
-    var dispatch: route.Dispatch = .{ .gpa = gpa, .circuit = calc_fallback.backend(), .graph = on_graph.backend() };
+    var dispatch: route.Dispatch = .{ .gpa = gpa, .circuit = calc_fallback.backend(), .graph = on_graph.backend(), .bank = &both.bank };
     defer dispatch.deinit();
     const texts = try rt.replies(&models, .{ .frontend = routed.frontend(), .backend = dispatch.backend(), .wait_s = 600 }, &fake);
     defer rt.freeAll(texts);
@@ -219,7 +220,7 @@ test "runner proof: straight-line integer cells print Python's lines on the grap
     var both: Both = undefined;
     try both.open();
     defer both.close();
-    var dispatch: route.Dispatch = .{ .gpa = gpa, .circuit = both.calc, .graph = both.graph };
+    var dispatch: route.Dispatch = .{ .gpa = gpa, .circuit = both.calc, .graph = both.graph, .bank = &both.bank };
     defer dispatch.deinit();
     const b = dispatch.backend();
     for ([_][2][]const u8{
@@ -293,4 +294,42 @@ test "runner proof: big-number-020 past the frontend's 62 digits, inline and REP
         try std.testing.expectEqualStrings("24691357800000000000000000000000000000000000000000000000000000000000000015241578750190521\n", r.out);
     }
     both.graph.release(1);
+}
+
+test "runner proof: a print reads an earlier piece's value (TFGS2), so d_mirror's check reuses q and r; cheap names do not" {
+    var both: Both = undefined;
+    try both.open();
+    defer both.close();
+    const cell = divmod_cell[10 .. divmod_cell.len - 14];
+    const bytes = (try route.program(gpa, &both.bank, cell)).?;
+    defer gpa.free(bytes);
+    try std.testing.expectStringStartsWith(bytes, "TFGS2\n");
+    const want = "BN @=$0*271828182845904523536+$1;314159265358979323846264338327950288419716939937510\n";
+    try std.testing.expect(std.mem.endsWith(u8, bytes, want));
+    // a value with no division or power is recomputed beside the rest, as before
+    const cheap = (try route.program(gpa, &both.bank, "a = 7 + 3\nprint(a)\nprint(a * 2)")).?;
+    defer gpa.free(cheap);
+    try std.testing.expectStringStartsWith(cheap, "TFGS1\n");
+    // a template bound to the bank's values: the comparison reads them, so a wrong value moves the answer
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var dispatch: route.Dispatch = .{ .gpa = gpa, .circuit = both.calc, .graph = both.graph, .bank = &both.bank };
+    defer dispatch.deinit();
+    const b = dispatch.backend();
+    for ([_]struct { []const u8, [2]?[]const u8, []const u8 }{
+        .{ "@=$0*3+$1;14", .{ "4", "2" }, "1" },
+        .{ "@=$0*3+$1;14", .{ "4", "3" }, "0" },
+        .{ "@!$0;-5", .{ "-5", null }, "0" },
+        .{ "@I$0*$1-1", .{ "-12", "12" }, "-145" },
+    }) |c| {
+        const p = (try program.bind(arena, &both.bank, c[0], &c[1])).?;
+        const r = finish(b, try b.start(1, .{ .kind = .graph, .bytes = p }, 4_000_000));
+        try std.testing.expectEqualStrings(c[2], std.mem.trimEnd(u8, r.out, "\n"));
+    }
+    b.release(1);
+    // a reference past the values or to a missing one, and an unknown template op, bind nothing
+    try std.testing.expectEqual(null, try program.bind(arena, &both.bank, "@I$2+1", &.{ "1", "2" }));
+    try std.testing.expectEqual(null, try program.bind(arena, &both.bank, "@I$1+1", &.{ "1", null }));
+    try std.testing.expectEqual(null, try program.bind(arena, &both.bank, "@<$0;1", &.{"1"}));
 }
