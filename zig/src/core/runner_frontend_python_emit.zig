@@ -50,17 +50,7 @@ const runtime =
     \\ __asm__ volatile("ecall" : "+r"(a0) : "r"(a7));
     \\}
     \\static void py_text(const volatile char *s,int n) { for(int i=0;i<n;++i) py_out((unsigned char)s[i]); }
-    \\static void py_print(py_value a) {
-    \\ if(a.b) {
-    \\  if(a.n) { py_out('T'); py_out('r'); py_out('u'); py_out('e'); }
-    \\  else { py_out('F'); py_out('a'); py_out('l'); py_out('s'); py_out('e'); }
-    \\  return;
-    \\ }
-    \\ unsigned int u=a.n<0?0u-(unsigned int)a.n:(unsigned int)a.n; char d[10]; int k=0;
-    \\ do { d[k++]=(char)('0'+u%10); u/=10; } while(u);
-    \\ if(a.n<0) py_out('-');
-    \\ while(k) py_out(d[--k]);
-    \\}
+    \\static void py_print(py_value a) { char d[10]; tf_py_print(a.n,a.b,d); }
 ;
 
 pub fn emit(a: Allocator, p: *const ast.Program) Allocator.Error![]u8 {

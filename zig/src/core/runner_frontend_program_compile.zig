@@ -55,6 +55,7 @@ pub const runtime =
     \\#define true 1
     \\#define false 0
     \\#define NULL ((void*)0)
+    \\void tf_py_print(int n, int b, char *digits); // Python print of an int or bool: assembly, so every build runs the same steps
     \\void *memset(void *destination, int value, size_t count) {
     \\ typedef unsigned int __attribute__((may_alias)) word;
     \\ unsigned char *d = destination; size_t i = 0;
@@ -77,6 +78,17 @@ pub const runtime =
     \\ for(; i<count; ++i) d[i]=s[i];
     \\ return destination;
     \\}
+    \\__asm__(".text\n.globl tf_py_print\n.type tf_py_print,@function\n.p2align 2\ntf_py_print:\n"
+    \\ "li a7, 1; bnez a1, 3f; bgez a0, 1f; neg t0, a0; li a0, 45; ecall; mv a0, t0\n"
+    \\ "1: mv t1, a2; lui t2, 838861; addi t2, t2, -819\n"
+    \\ "2: mulhu t3, a0, t2; srli t3, t3, 3; sh2add t4, t3, t3; slli t4, t4, 1; sub t4, a0, t4\n"
+    \\ "addi t4, t4, 48; sb t4, 0(t1); addi t1, t1, 1; beqz t3, 4f\n"
+    \\ "mulhu a0, t3, t2; srli a0, a0, 3; sh2add t4, a0, a0; slli t4, t4, 1; sub t4, t3, t4\n"
+    \\ "addi t4, t4, 48; sb t4, 0(t1); addi t1, t1, 1; bnez a0, 2b\n"
+    \\ "4: addi t1, t1, -1; lbu a0, 0(t1); ecall; bne t1, a2, 4b; ret\n"
+    \\ "3: beqz a0, 5f; li a0, 84; ecall; li a0, 114; ecall; li a0, 117; ecall; li a0, 101; ecall; ret\n"
+    \\ "5: li a0, 70; ecall; li a0, 97; ecall; li a0, 108; ecall; li a0, 115; ecall; li a0, 101; ecall; ret\n"
+    \\ ".size tf_py_print, .-tf_py_print\n");
     \\static unsigned int tf_output_count;
     \\static int putchar(int c) {
     \\ ++tf_output_count;

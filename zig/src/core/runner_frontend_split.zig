@@ -9,14 +9,14 @@ const log = std.log.scoped(.runner_frontend);
 /// The whole file's runtime compiled alone: its static printf and helpers drop out, memset and memcpy stay.
 pub const runtime = compile.runtime;
 
-/// What a body sees of the runtime: its types and macros, and the two functions it may call.
+/// What a body sees of the runtime: its types, macros and Python's print, and the two functions it may call.
 pub const declarations = compile.runtime[0..std.mem.indexOf(u8, compile.runtime, "void *memset").?] ++
     \\void *memset(void *destination, int value, size_t count);
     \\void *memcpy(void *destination, const void *source, size_t count);
     \\
 ;
 
-/// A body may compile alone when it names none of the runtime's static functions or a call the whole file could inline.
+/// A body may compile alone when it names no runtime static or inlinable call; tf_py_print is assembly in both builds.
 pub fn eligible(body: []const u8) bool {
     var i: usize = 0;
     while (i < body.len) {
@@ -29,7 +29,7 @@ pub fn eligible(body: []const u8) bool {
         while (i < body.len and (std.ascii.isAlphanumeric(body[i]) or body[i] == '_')) i += 1;
         const word = body[start..i];
         for ([_][]const u8{ "printf", "putchar", "puts", "memset", "memcpy" }) |helper| if (std.mem.eql(u8, word, helper)) return false;
-        if (std.mem.startsWith(u8, word, "tf_")) return false;
+        if (std.mem.startsWith(u8, word, "tf_") and !std.mem.eql(u8, word, "tf_py_print")) return false;
     }
     return true;
 }
