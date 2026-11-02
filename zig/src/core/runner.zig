@@ -102,7 +102,7 @@ pub const Text = struct {
 /// A request's say over form trace (chat fields "runner_trace", "runner_trace_format"); defaults change nothing.
 pub const TraceAsk = struct {
     off: bool = false, // no trace cells in this reply, though the server's forms have trace
-    format: []const u8 = "", // the owned line, `{}` for `<expr> = <value>` (validFormat); "": `[exact: {}]`
+    format: []const u8 = "", // the owned line, `{}` for `<expr> = <value>` (validFormat); "": trace.default_format
     repeat: u8 = 0, // a restated, already owned line is owned again up to this many times (0..max_repeat)
 };
 
