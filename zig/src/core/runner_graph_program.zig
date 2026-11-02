@@ -385,8 +385,8 @@ test "runner graph route: decimals, true division, computed exponents or divisor
         "7//0",
         "7%(1+1)",
         "10**256", // past T1's 256-digit width (b047d48c8); a bank without it refuses at lowering
-        "(10**80+123456789)**2-10**161",
-        "(10**80+123456789)**3-10**160",
+        "(10**130+123456789)**2-10**261",
+        "(10**90+123456789)**3-10**270",
         "007+1",
         "x*2",
         "",
