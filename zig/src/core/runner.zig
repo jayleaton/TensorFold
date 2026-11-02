@@ -12,6 +12,7 @@ const log = std.log.scoped(.runner);
 pub const Config = struct {
     scan: scan.Config = .{},
     max_steps: u64 = 4_000_000, // per run (a step count: wall time never changes a result)
+    compile_steps: usize = 10522, // PREFIX_COMPILE_STEPS: frontend cost limit; opt-in maximum 32768, not an instruction cap
     max_tokens: u32 = 512, // owned result tokens before the cut note
     workers: u8 = 2,
     device: enum { cpu, cuda } = .cpu,
@@ -44,6 +45,7 @@ pub const Config = struct {
         };
         c.workers = try knob(u8, get, prefix ++ "_WORKERS", c.workers, 1, 64);
         c.max_steps = try knob(u64, get, prefix ++ "_MAX_STEPS", c.max_steps, 1, 1 << 40);
+        c.compile_steps = try knob(usize, get, prefix ++ "_COMPILE_STEPS", c.compile_steps, 1, 32768);
         c.max_tokens = try knob(u32, get, prefix ++ "_MAX_TOKENS", c.max_tokens, 1, 1 << 20);
         c.exact = try knob(u1, get, prefix ++ "_EXACT", 0, 0, 1) == 1;
         c.settle_us = try knob(u32, get, prefix ++ "_SETTLE_US", c.settle_us, 0, 100_000);

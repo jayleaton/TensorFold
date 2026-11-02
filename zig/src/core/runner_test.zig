@@ -432,6 +432,16 @@ test "runner: knobs parse; off unless the flag is 1 with a circuit" {
     K.set = &.{ .{ "TF_R", "1" }, .{ "TF_R_CIRCUIT", "/c.bin" }, .{ "TF_R_FORMS", "repl" }, .{ "TF_R_SPANS", "reasoning" }, .{ "TF_R_MAX_STEPS", "99" } };
     const c = (try runner.Config.parse(&K.get, "TF_R")).?;
     try std.testing.expect(!c.scan.fence and c.scan.repl and c.scan.reasoning_only and c.max_steps == 99 and !c.exact);
+    try std.testing.expectEqual(@as(usize, 10522), c.compile_steps);
+    K.set = &.{ .{ "TF_R", "1" }, .{ "TF_R_CIRCUIT", "/c.bin" }, .{ "TF_R_COMPILE_STEPS", "32768" } };
+    const wider = (try runner.Config.parse(&K.get, "TF_R")).?;
+    try std.testing.expectEqual(@as(usize, 32768), wider.compile_steps);
+    try std.testing.expectEqual(c.max_tokens, wider.max_tokens);
+    try std.testing.expectEqual(@as(u64, 4_000_000), wider.max_steps);
+    for ([_][]const u8{ "0", "32769", "-1", "18446744073709551616", "disabled" }) |value| {
+        K.set = &.{ .{ "TF_R", "1" }, .{ "TF_R_CIRCUIT", "/c.bin" }, .{ "TF_R_COMPILE_STEPS", value } };
+        try std.testing.expectError(error.BadKnob, runner.Config.parse(&K.get, "TF_R"));
+    }
     K.set = &.{ .{ "TF_R", "1" }, .{ "TF_R_CIRCUIT", "/c.bin" }, .{ "TF_R_FORMS", "fence,repl,inline" } };
     const f = (try runner.Config.parse(&K.get, "TF_R")).?;
     try std.testing.expect(f.scan.fence and f.scan.repl and f.scan.inline_math and !c.scan.inline_math);

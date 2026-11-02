@@ -27,8 +27,8 @@ const Opened = struct {
     routed: route.Routed = undefined,
     quick: route.Quick = undefined, // cfg.sync_graph: routed's engine-thread part
     dispatch: route.Dispatch = undefined,
-    threaded: std.Io.Threaded = undefined, // the no-compile frontend's io (cfg.compile false)
-    no_compile: frontend_mod.Context = undefined,
+    threaded: std.Io.Threaded = undefined, // a configured frontend's engine-lifetime io
+    configured_frontend: frontend_mod.Context = undefined,
     compiles: bool = true, // the frontend may build an ELF (clang); false under cfg.compile false
 };
 
@@ -75,13 +75,16 @@ pub fn openSharing(gpa: Allocator, cfg: Config, with: ?*Runner) !*Runner {
     errdefer if (o.circuit == &o.own_circuit) o.own_circuit.deinit(gpa);
     const back = try @import("runner_circuit_backend.zig").placed(gpa, o.circuit, cfg.workers, &o.placer);
     var frontend = frontend_mod.frontend();
-    if (!cfg.compile) {
-        // no scratch root: compile returns before clang, so a program the frontend would build as an ELF abstains
+    if (!cfg.compile or cfg.compile_steps != 10522) {
+        // Empty scratch root prevents new compiler runs; S3 also refuses cached ELF when disabled.
         o.threaded = .init(gpa, .{});
-        o.no_compile = .{ .io = o.threaded.io(), .compiler = .{ .scratch_root = "" } };
-        frontend = o.no_compile.frontend();
-        o.compiles = false;
-    } else {
+        o.configured_frontend = .{ .io = o.threaded.io() };
+        o.configured_frontend.compiler.step_budget = cfg.compile_steps;
+        if (!cfg.compile) o.configured_frontend.compiler.scratch_root = "";
+        frontend = o.configured_frontend.frontend();
+        o.compiles = cfg.compile;
+    }
+    if (cfg.compile) {
         // the compiler kept started and the fixed runtime compiled now, so no call pays clang's start or the runtime
         var warm_io: std.Io.Threaded = .init(gpa, .{});
         defer warm_io.deinit();

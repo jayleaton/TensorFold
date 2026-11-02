@@ -23,6 +23,10 @@ pub const cases = [_][2][]const u8{
     .{ "g={0:[1,2],1:[2],2:[]}; stack=[0]; seen=set(); order=[]\nwhile stack:\n    node=stack.pop()\n    if node not in seen:\n        seen.add(node); order.append(node)\n        for nxt in g[node]:\n            stack.append(nxt)\nprint(order)", "[0, 2, 1]\n" },
     .{ "a='ab'; b='ac'; d=[[0]*3 for i in range(3)]\nfor i in range(3):\n    d[i][0]=i; d[0][i]=i\nfor i in range(1,3):\n    for j in range(1,3):\n        d[i][j]=min(d[i-1][j]+1,d[i][j-1]+1,d[i-1][j-1]+(a[i-1]!=b[j-1]))\nprint(d)", "[[0, 1, 2], [1, 0, 1], [2, 1, 1]]\n" },
 };
+pub const budget_case = "def edit_distance(a, b):\n    if len(a) > len(b):\n        a, b = b, a          # a is the shorter string\n    m = len(a)\n    dp = list(range(m + 1))  # dp[j] = distance to a[:j]\n\n    for i, ch in enumerate(b, 1):\n        prev = dp[0]\n        dp[0] = i\n        for j in range(1, m + 1):\n            old = dp[j]\n            cost = 0 if a[j - 1] == ch else 1\n            dp[j] = min(\n                old + 1,          # delete/insert\n                dp[j - 1] + 1,    # insert/delete\n                prev + cost       # match/substitute\n            )\n            prev = old\n\n    return dp[m]\n\nprint(edit_distance(\"kitten\",\"sitting\"))";
+
+pub const over_budget_case = "a=[0]\ni=0\nwhile i<1000:\n    a[0]+=1\n    i+=1\nprint(a)";
+
 pub const negatives = [_][]const u8{
     "__debug__=1;print([__debug__])",
     "__builtins__={}\ndef f():\n    print([1])\nf()",
@@ -98,6 +102,25 @@ test "configured collections O1 ELF matches CPython and reference" {
         try t.expect(translated == .program);
         try reference.check(root, "/usr/bin/python3", translated.program, oracle.stdout);
     }
+    // Larger admission is opt-in; a cached high-budget ELF must not bypass either lower bound.
+    const cell: @import("runner_api.zig").Cell = .{ .form = .fence, .lang = "python", .code = budget_case };
+    context.compiler.step_budget = 10522;
+    try expectBudgetRefusal(front, cell);
+    context.compiler.step_budget = 32768;
+    const admitted = try front.translate(front.ctx, t.allocator, cell);
+    defer if (admitted == .program) t.allocator.free(admitted.program.bytes);
+    try t.expect(admitted == .program);
+    try reference.check(root, "/usr/bin/python3", admitted.program, "3\n");
+    context.compiler.step_budget = 28359;
+    try expectBudgetRefusal(front, cell);
+    context.compiler.step_budget = 10522;
+    try expectBudgetRefusal(front, cell);
+    const over: @import("runner_api.zig").Cell = .{ .form = .fence, .lang = "python", .code = over_budget_case };
+    const over_cost = (try collections.lowerWithCost(t.allocator, over_budget_case)) orelse return error.UnexpectedAbstention;
+    defer t.allocator.free(over_cost.source);
+    try t.expect(over_cost.estimated_steps > 32768);
+    context.compiler.step_budget = 32768;
+    try expectBudgetRefusal(front, over);
 }
 
 test "collections nested dictionary comparisons retain quadratic cost" {
@@ -117,4 +140,10 @@ test "collections O1 retains runtime work against O0 folding guards" {
         defer t.allocator.free(lowered.source);
         try @import("runner_frontend_optimization_test.zig").checkCollectionsOptimization(&env, lowered.source, fixture[1]);
     }
+}
+
+fn expectBudgetRefusal(front: @import("runner_api.zig").Frontend, cell: @import("runner_api.zig").Cell) !void {
+    const result = try front.translate(front.ctx, t.allocator, cell);
+    defer if (result == .program) t.allocator.free(result.program.bytes);
+    try t.expect(result == .abstain);
 }
