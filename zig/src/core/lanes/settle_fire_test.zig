@@ -24,7 +24,7 @@ const Hook = struct {
     result: std.ArrayList(u32) = .empty,
     at: ?usize = null, // a settled fire's emitted count at its trigger, until the round's end is seen
 
-    fn token(ptr: *anyopaque, _: u32, _: bool, can_hold: bool) bool {
+    fn token(ptr: *anyopaque, _: u32, _: bool, can_hold: bool, _: bool) bool {
         const h: *Hook = @ptrCast(@alignCast(ptr));
         defer h.seen += 1;
         return can_hold and std.mem.indexOfScalar(usize, &fires, h.seen) != null;

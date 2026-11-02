@@ -229,7 +229,8 @@ pub const LaneHost = struct {
 
     /// Hands a stream the tokens its rounds committed since the last delivery (their logprob rows first).
     pub fn send(h: *LaneHost, job: *Job) void {
-        const emitted = job.stream.emitted();
+        const all = job.stream.emitted();
+        const emitted = all[0 .. all.len - @intFromBool(job.stream.runner_eos_pending)];
         if (emitted.len > job.delivered) {
             if (job.stream.logprobs != null) emit(job, .{ .logprobs = job.stream.rows.items[job.delivered..emitted.len] });
             emit(job, .{ .tokens = emitted[job.delivered..] });

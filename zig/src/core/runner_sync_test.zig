@@ -94,7 +94,7 @@ fn run(sync: bool, back: *Back) !Run {
     var abstains_at: usize = 0; // a hold's abstain: the cell's own text
     for (reply) |ch| {
         const before = s.abstained_n;
-        if (!hook.token(hook.ptr, ch, false, true)) {
+        if (!hook.token(hook.ptr, ch, false, true, false)) {
             // settled as an abstain at the trigger: no hold, the model's own text stays
             if (s.abstained_n > before) {
                 try owned.appendSlice(gpa, "-|");

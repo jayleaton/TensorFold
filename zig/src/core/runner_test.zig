@@ -51,6 +51,7 @@ pub const Model = struct {
     lead: []const u8,
     guess: []const u8 = "42",
     tail: []const u8 = "Done.",
+    terminal: bool = false,
 
     fn next(ctx: *anyopaque, history: []const u32) u32 {
         const m: *Model = @ptrCast(@alignCast(ctx));
@@ -63,6 +64,7 @@ pub const Model = struct {
         };
         const r = buf[0..n];
         if (r.len < m.lead.len) return id(m.lead[r.len]);
+        if (m.terminal) return EOS;
         var rest = r[m.lead.len..];
         const nl = std.mem.indexOfScalar(u8, rest, '\n') orelse return if (rest.len < m.guess.len) id(m.guess[rest.len]) else id('\n');
         rest = rest[nl + 1 ..];
@@ -157,7 +159,7 @@ const Box = struct {
 };
 
 /// `frontend`/`backend`: real ones in place of the fakes (the proof test).
-pub const Opts = struct { runner: bool = true, run_cells: bool = true, delay: u32 = 0, planner: bool = false, streams: usize = 1, frontend: ?rapi.Frontend = null, backend: ?rapi.Backend = null, wait_s: u32 = 20, exact: bool = false, inline_math: bool = false, trace: bool = false, trace_ask: runner.TraceAsk = .{}, placer: ?*runner.place.Placer = null, summaries: ?[][]u8 = null };
+pub const Opts = struct { runner: bool = true, run_cells: bool = true, delay: u32 = 0, planner: bool = false, streams: usize = 1, max_tokens: u32 = 400, frontend: ?rapi.Frontend = null, backend: ?rapi.Backend = null, wait_s: u32 = 20, exact: bool = false, inline_math: bool = false, trace: bool = false, trace_ask: runner.TraceAsk = .{}, placer: ?*runner.place.Placer = null, summaries: ?[][]u8 = null };
 
 /// Runs `models` (one request each, concurrently) on one host; the reply texts.
 pub fn replies(models: []Model, o: Opts, back: *Back) ![][]u8 {
@@ -186,7 +188,7 @@ pub fn replies(models: []Model, o: Opts, back: *Back) ![][]u8 {
     for (models, 0..) |_, i| {
         boxes[i] = .{};
         prompts[i] = prompt ++ [_]u32{@intCast(i)}; // the router tells the streams apart by their last prompt token
-        requests[i] = .{ .prompt = &prompts[i], .max_tokens = 400, .eos = &.{EOS}, .run_cells = o.run_cells, .run_trace = o.trace_ask };
+        requests[i] = .{ .prompt = &prompts[i], .max_tokens = o.max_tokens, .eos = &.{EOS}, .run_cells = o.run_cells, .run_trace = o.trace_ask };
         try e.submit(@intCast(i + 1), &requests[i], .{ .ctx = &boxes[i], .event = Box.event });
     }
     const out = try gpa.alloc([]u8, models.len);
@@ -228,6 +230,16 @@ test "runner: the model's own Result: after a multiply cell is the exact product
     const got = try one(mul_cell, .{});
     defer gpa.free(got);
     try std.testing.expectEqualStrings(mul_cell ++ product ++ "\nDone.", got);
+}
+
+test "runner: a blank-delimited same-line result header owns the value before the model guess" {
+    const lead = "```python\nprint(2**100)\n```\nResult: ";
+    const got = try one(lead, .{});
+    defer gpa.free(got);
+    try std.testing.expectEqualStrings("```python\nprint(2**100)\n```\nResult:\n1267650600228229401496703205376\nDone.", got);
+    const off = try one(lead, .{ .runner = false });
+    defer gpa.free(off);
+    try std.testing.expectEqualStrings(lead ++ "42\nDone.", off);
 }
 
 test "runner: a loop cell's result is 285; a REPL line's next line is its value" {
@@ -288,7 +300,7 @@ test "runner: a held stream waits while another stream decodes to its end" {
     try std.testing.expect(!boxes[0].finished());
     const held = try decode(gpa, boxes[0].tokens.items);
     defer gpa.free(held);
-    try std.testing.expectEqualStrings(mul_cell, held); // it stopped exactly at its trigger
+    try std.testing.expectEqualStrings(mul_cell[0 .. mul_cell.len - 1], held); // it stopped exactly at its trigger
     back.gate.store(true, .release);
     try std.testing.expectEqual(Reason.stop, try boxes[0].wait(20));
     const got = try decode(gpa, boxes[0].tokens.items);
@@ -380,7 +392,7 @@ test "runner: a reply's runtime block counts its cells by form, owned tokens and
     freeAll(texts);
     defer for (sums) |s| gpa.free(s);
     // the product and its newline: one token a character
-    try std.testing.expectEqualStrings("{\"fence\":{\"closed\":1,\"owned\":1,\"abstained\":0,\"owned_tokens\":61},\"repl\":{\"closed\":0,\"owned\":0,\"abstained\":0,\"owned_tokens\":0},\"inline\":{\"closed\":0,\"owned\":0,\"abstained\":0,\"owned_tokens\":0},\"trace\":{\"closed\":0,\"owned\":0,\"abstained\":0,\"owned_tokens\":0},\"owned_by\":{\"calc\":1,\"elf\":0,\"graph\":0},\"held_ms\":", sums[0][0 .. std.mem.lastIndexOf(u8, sums[0], "\"held_ms\":").? + 10]);
+    try std.testing.expectEqualStrings("{\"fence\":{\"closed\":1,\"owned\":1,\"abstained\":0,\"owned_tokens\":62},\"repl\":{\"closed\":0,\"owned\":0,\"abstained\":0,\"owned_tokens\":0},\"inline\":{\"closed\":0,\"owned\":0,\"abstained\":0,\"owned_tokens\":0},\"trace\":{\"closed\":0,\"owned\":0,\"abstained\":0,\"owned_tokens\":0},\"owned_by\":{\"calc\":1,\"elf\":0,\"graph\":0},\"held_ms\":", sums[0][0 .. std.mem.lastIndexOf(u8, sums[0], "\"held_ms\":").? + 10]);
     try std.testing.expect(std.mem.startsWith(u8, sums[1], "{\"fence\":{\"closed\":1,\"owned\":0,\"abstained\":1,\"owned_tokens\":0}"));
     // the owned product's tokens committed, then the model's own: its resume was timed; an abstain forces nothing
     try std.testing.expect(std.mem.indexOf(u8, sums[0], ",\"resume_ms\":") != null);
@@ -442,4 +454,31 @@ test "runner: knobs parse; off unless the flag is 1 with a circuit" {
 
 test {
     _ = @import("runner.zig");
+}
+
+test "runner: a terminal closed fence emits its computed result before one final EOS" {
+    for ([_][]const u8{ "```python\nprint(2**100)\n```", "```python\nprint(2**100)\n```\n" }) |lead| {
+        var models = [_]Model{.{ .lead = lead, .terminal = true }};
+        var back: Back = .{};
+        defer back.deinit();
+        const got = try replies(&models, .{}, &back);
+        defer freeAll(got);
+        const want = try std.mem.concat(gpa, u8, &.{ lead, "\nResult:\n1267650600228229401496703205376\n" });
+        defer gpa.free(want);
+        try std.testing.expectEqualStrings(want, got[0]);
+    }
+}
+
+test "runner: terminal refusal off and exhausted budget preserve the original reply" {
+    for ([_]Opts{ .{}, .{ .runner = false }, .{ .max_tokens = 36 } }, 0..) |opts, i| {
+        const lead = if (i == 0) "```python\nprint(undefined_)\n```" else "```python\nprint(2**100)\n```";
+        var models = [_]Model{.{ .lead = lead, .terminal = true }};
+        var back: Back = .{};
+        defer back.deinit();
+        var o = opts;
+        if (i == 2) o.max_tokens = @intCast(lead.len + 1);
+        const got = try replies(&models, o, &back);
+        defer freeAll(got);
+        try std.testing.expectEqualStrings(lead, got[0]);
+    }
 }

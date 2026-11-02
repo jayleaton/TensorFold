@@ -68,7 +68,7 @@ fn pass(gpa: std.mem.Allocator, r: *runner.Runner, replies: []const cost.Reply, 
         const hook = s.hook();
         for (rep.tokens, 0..) |tok, i| {
             const t0 = now();
-            const held = hook.token(hook.ptr, tok, i < rep.think_end, true);
+            const held = hook.token(hook.ptr, tok, i < rep.think_end, true, false);
             const t1 = now();
             if (!held) continue;
             const cell = s.cells.items[s.waiting.?.index];

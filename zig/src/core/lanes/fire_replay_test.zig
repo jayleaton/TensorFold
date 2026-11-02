@@ -14,7 +14,7 @@ const foreign = [_]u32{ 7, 8, 9 };
 /// A runner hook holding the stream at the given emitted indices.
 const Hook = struct {
     seen: usize = 0,
-    fn token(ptr: *anyopaque, _: u32, _: bool, can_hold: bool) bool {
+    fn token(ptr: *anyopaque, _: u32, _: bool, can_hold: bool, _: bool) bool {
         const h: *Hook = @ptrCast(@alignCast(ptr));
         defer h.seen += 1;
         return can_hold and std.mem.indexOfScalar(usize, &fires, h.seen) != null;
