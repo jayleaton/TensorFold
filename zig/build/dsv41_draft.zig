@@ -45,7 +45,11 @@ pub fn steps(b: *std.Build) void {
 }
 
 fn server(b: *std.Build, target: std.Build.ResolvedTarget) *std.Build.Step.Compile {
-    return serverOn(b, target, .ReleaseSafe, @import("dsv41_cuda.zig").module(b, target, "serve_engine.zig", true));
+    const exe = serverOn(b, target, .ReleaseSafe, @import("dsv41_cuda.zig").module(b, target, "serve_engine.zig", true));
+    // never executed: the self-hosted backend links it in ~0.7 GiB; LLVM needs >2 GiB (dsv41-serve keeps LLVM)
+    exe.use_llvm = false;
+    exe.use_lld = false;
+    return exe;
 }
 
 /// tensorfold-dsv41, the native server over the DeepSeek lane `engine`, its own modules at `optimize`.
