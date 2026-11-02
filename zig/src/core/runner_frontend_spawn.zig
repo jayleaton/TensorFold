@@ -236,7 +236,11 @@ fn descendantsStop() !void {
         defer file.close(t.io);
         var buffer: [4096]u8 = undefined;
         var reader = file.readerStreaming(t.io, &buffer);
-        const stat = try reader.interface.allocRemaining(t.allocator, .limited(4096));
+        // the worker exiting between open and read fails the read (ESRCH): poll again, the open then finds it gone
+        const stat = reader.interface.allocRemaining(t.allocator, .limited(4096)) catch |err| switch (err) {
+            error.ReadFailed => if (now() < settled_by) continue else return err,
+            else => return err,
+        };
         defer t.allocator.free(stat);
         if (stat.len == 0) return;
         const end = std.mem.lastIndexOfScalar(u8, stat, ')') orelse return error.InvalidProcStat;
