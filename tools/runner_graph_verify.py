@@ -114,7 +114,7 @@ def prepare_cases(cases, goldens, manifest, allow_generic):
             require(len(plans[packet["plan"]]["ops"]) <= 4096, f"plan exceeds operation cap: {row['id']}")
         else:
             require(allow_generic, f"main corpus requires named packets: {row['id']}")
-            require(len(packet.get("ops", [])) <= 4096, f"packet exceeds operation cap: {row['id']}")
+            require(len(packet.get("ops", [])) <= 8192, f"packet exceeds operation cap: {row['id']}")
         prepared.append({"id": row["id"], "packet": packet, "expected_output": expected})
     require(prepared, "empty corpus")
     return prepared

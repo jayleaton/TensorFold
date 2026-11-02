@@ -2,7 +2,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 pub const max_packet = 1 << 20;
-pub const max_ops = 4096;
+pub const max_ops = 8192;
 pub const max_values = 8192;
 pub const max_arity = 16;
 pub const max_prints = 128;
