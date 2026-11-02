@@ -2,6 +2,7 @@
 const std = @import("std");
 const api = @import("runner_api.zig");
 const trace = @import("runner_trace.zig");
+const header = @import("runner_scan_boundary.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Config = struct {
@@ -29,7 +30,7 @@ pub const Closed = struct { index: u32, form: api.Form, lang: []const u8, code: 
 pub const Stated = struct { display: []const u8, divmod: bool };
 
 /// Cell `index`'s result begins: `fenced` closes a fence after it; `inline_space` (inline: value only) adds a space.
-pub const Trigger = struct { index: u32, fenced: bool = false, inline_space: ?bool = null, trace: bool = false }; // trace: `[exact: …]` line
+pub const Trigger = struct { index: u32, fenced: bool = false, inline_space: ?bool = null, trace: bool = false, newline_before: bool = false, terminal: bool = false }; // trace: `[exact: …]` line
 
 pub const Events = struct { closed: ?Closed = null, trigger: ?Trigger = null };
 
@@ -44,6 +45,7 @@ pub const Scanner = struct {
     cells: u32 = 0, // cells closed so far; the next one's index
     pending: u32 = 0, // the fence or REPL cell a result header refers to
     since: u32 = 0, // tokens since the pending cell closed (state .after)
+    terminal_ready: bool = false,
     armed: ?Trigger = null, // a trigger this token set; later non-blank bytes in the same token spoil it
     tokens: u32 = 0, // tokens fed
     float_at: ?u32 = null, // the token of the last float cue or closed code cell
@@ -88,6 +90,7 @@ pub const Scanner = struct {
         if (s.trace_cell != null and s.tokens - s.trace_at > s.cfg.trace_window) s.trace_cell = null;
         for (bytes) |b| {
             s.cue(b);
+            if (s.state == .after and !std.ascii.isWhitespace(b)) s.terminal_ready = false;
             if (s.armed != null and b != '\n' and b != ' ' and b != '\t' and b != '\r') s.armed = null;
             if (b != '\n') {
                 try s.line.append(a, b);
@@ -99,6 +102,11 @@ pub const Scanner = struct {
         ev.trigger = s.armed;
         if (ev.trigger) |t| if (t.trace) try s.traceSpent(t.index);
         const allowed = think_open or !s.cfg.reasoning_only;
+        if (ev.trigger == null and s.state == .after and allowed and header.ready(s.line.items)) {
+            s.fire(false);
+            ev.trigger = s.armed;
+            ev.trigger.?.newline_before = true;
+        }
         if (s.cfg.inline_math and allowed and s.state != .fence and ev.closed == null and ev.trigger == null and
             std.mem.indexOfScalar(u8, bytes, '=') != null)
         {
@@ -116,12 +124,29 @@ pub const Scanner = struct {
         return ev;
     }
 
+    pub fn finishEos(s: *Scanner, a: Allocator, think_open: bool) Allocator.Error!Events {
+        var ev: Events = .{};
+        s.tokens +|= 1;
+        if (s.state == .fence and header.fenceClose(std.mem.trimEnd(u8, s.line.items, "\r"))) {
+            try s.endLine(a, &ev, think_open);
+            s.line.clearRetainingCapacity();
+        }
+        if (s.state == .after and s.terminal_ready and s.since < s.cfg.lookahead and
+            (think_open or !s.cfg.reasoning_only))
+        {
+            s.fire(false);
+            ev.trigger = s.armed;
+            ev.trigger.?.terminal = true;
+        }
+        return ev;
+    }
+
     fn endLine(s: *Scanner, a: Allocator, ev: *Events, think_open: bool) Allocator.Error!void {
         const raw = std.mem.trimEnd(u8, s.line.items, "\r");
         const allowed = think_open or !s.cfg.reasoning_only;
         switch (s.state) {
             .fence => {
-                if (fenceClose(raw)) {
+                if (header.fenceClose(raw)) {
                     const prev = s.pending;
                     const had = s.code_cells > 0;
                     ev.closed = s.close(.fence);
@@ -129,6 +154,7 @@ pub const Scanner = struct {
                     if (had and runsPrevious(ev.closed.?.lang, ev.closed.?.code)) s.pending = prev;
                     s.state = .after;
                     s.since = 0;
+                    s.terminal_ready = true;
                 } else {
                     try s.code.appendSlice(a, raw);
                     try s.code.append(a, '\n');
@@ -137,9 +163,9 @@ pub const Scanner = struct {
             .prose, .after => {
                 if (s.state == .after and allowed) {
                     // a header line only: a bare output fence is no handoff (T6 census)
-                    if (header(raw)) return s.fire(false);
+                    if (header.complete(raw)) return s.fire(false);
                 }
-                if (s.cfg.fence) if (fenceOpen(raw)) |lang| {
+                if (s.cfg.fence) if (header.fenceOpen(raw)) |lang| {
                     s.lang.clearRetainingCapacity();
                     for (lang) |c| try s.lang.append(a, std.ascii.toLower(c));
                     s.code.clearRetainingCapacity();
@@ -224,6 +250,7 @@ pub const Scanner = struct {
     fn fire(s: *Scanner, fenced: bool) void {
         s.armed = .{ .index = s.pending, .fenced = fenced };
         s.state = .prose;
+        s.terminal_ready = false;
     }
 };
 
@@ -251,52 +278,6 @@ fn runsPrevious(lang: []const u8, code: []const u8) bool {
         }
     }
     return any;
-}
-
-fn indentOk(line: []const u8) ?[]const u8 {
-    var i: usize = 0;
-    while (i < line.len and line[i] == ' ') i += 1;
-    return if (i <= 3) line[i..] else null;
-}
-
-/// "```lang" (lang may be empty; result-like tags excluded): the lowercase-able tag, else null.
-fn fenceOpen(line: []const u8) ?[]const u8 {
-    const t = indentOk(line) orelse return null;
-    if (!std.mem.startsWith(u8, t, "```")) return null;
-    const tag = std.mem.trim(u8, t[3..], " \t");
-    for (tag) |c| if (!(std.ascii.isAlphanumeric(c) or c == '+' or c == '#' or c == '-' or c == '_' or c == '.')) return null;
-    if (isResultTag(tag)) return null;
-    return tag;
-}
-
-fn fenceClose(line: []const u8) bool {
-    const t = indentOk(line) orelse return false;
-    return std.mem.eql(u8, std.mem.trimEnd(u8, t, " \t"), "```");
-}
-
-const result_tags = [_][]const u8{ "output", "text", "console", "stdout", "plaintext", "txt", "result" };
-
-fn isResultTag(tag: []const u8) bool {
-    for (result_tags) |r| if (std.ascii.eqlIgnoreCase(tag, r)) return true;
-    return false;
-}
-
-const header_words = [_][]const u8{
-    "result",      "results",      "output",           "outputs",            "it prints",
-    "this prints", "prints",       "running it gives", "running this gives", "expected output",
-    "the output",  "this outputs", "it outputs",       "the result",         "output is",
-    "running it",  "running this", "executing it",     "executing this",
-};
-
-/// A short line naming the result and ending in ':' ("Result:", "**Output:**", "Running this gives:").
-fn header(line: []const u8) bool {
-    var t = std.mem.trim(u8, line, " \t*#->_");
-    if (t.len < 2 or t.len > 60 or t[t.len - 1] != ':') return false;
-    t = std.mem.trim(u8, t[0 .. t.len - 1], " \t*_");
-    var buf: [64]u8 = undefined;
-    const low = std.ascii.lowerString(&buf, t);
-    for (header_words) |w| if (std.mem.eql(u8, low, w)) return true;
-    return false;
 }
 
 /// A whole arithmetic expression ending the line at `=` or `= ` (no chain, comparison, word, list or gap).
@@ -386,7 +367,7 @@ fn inlineExpr(line: []const u8) ?struct { expr: []const u8, space: bool } {
 
 /// ">>> code" (one line, not opening a block): the code, else null.
 fn replLine(line: []const u8) ?[]const u8 {
-    const t = indentOk(line) orelse return null;
+    const t = header.indentOk(line) orelse return null;
     if (!std.mem.startsWith(u8, t, ">>> ")) return null;
     const src = std.mem.trim(u8, t[4..], " \t");
     if (src.len == 0 or src[src.len - 1] == ':') return null;
@@ -588,4 +569,8 @@ test "runner scan: a header after an inline cell still names the fence cell befo
     try std.testing.expectEqual(@as(u32, 1), e.trigger.?.index);
     _ = try s.feed(a, " 4\n", true);
     try std.testing.expectEqual(Trigger{ .index = 0, .fenced = false }, (try s.feed(a, "Output:\n", true)).trigger.?);
+}
+
+comptime {
+    _ = @import("runner_scan_result_test.zig");
 }

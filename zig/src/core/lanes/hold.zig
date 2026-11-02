@@ -40,6 +40,7 @@ pub fn resumeHeld(s: *Stream, gpa: Allocator, tokens: []const u32, think_open: b
 /// Continues a stream held at a runner trigger: `tokens` (cut to the room left) are forced next, then the model draws.
 pub fn resumeAwaiting(s: *Stream, gpa: Allocator, tokens: []const u32) Allocator.Error!bool {
     if (!s.awaiting or !s.held or s.finished) return false;
+    if (s.runner_eos_pending) return @import("runner_eos.zig").resumeResult(s, gpa, tokens);
     const room: usize = @intCast(@max(0, s.budgetLeft() - 1));
     try s.force.appendSlice(gpa, tokens[0..@min(tokens.len, room)]);
     s.held = false;

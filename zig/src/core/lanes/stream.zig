@@ -71,7 +71,8 @@ pub fn detectLoop(emitted: []const u32) ?u32 {
 /// The in-model runner's view of each committed token (core/runner.zig): true holds the stream for a result here.
 pub const RunnerHook = struct {
     ptr: *anyopaque,
-    token: *const fn (ptr: *anyopaque, token: u32, think_open: bool, can_hold: bool) bool,
+    token: *const fn (ptr: *anyopaque, token: u32, think_open: bool, can_hold: bool, think_end: bool) bool,
+    eos: ?*const fn (ptr: *anyopaque, think_open: bool, can_hold: bool) bool = null,
 };
 
 /// A stop-string check over the emitted tokens (the server's StopPolicy decodes their tail).
@@ -237,7 +238,8 @@ pub const Stream = struct {
     hold_eos: bool = false,
     held: bool = false, // paused at a committed EOS, which stays pending until hold.zig resumes or ends the stream
     runner: ?RunnerHook = null,
-    awaiting: bool = false, // held at a runner trigger (not an EOS): hold.resumeAwaiting continues it
+    awaiting: bool = false, // held at a runner trigger: hold.resumeAwaiting continues it
+    runner_eos_pending: bool = false,
     depth: ?State = null,
     mode: ?Mode = null,
     next: ?Held = null,
@@ -468,6 +470,7 @@ pub const Stream = struct {
             s.context.appendAssumeCapacity(t);
             if (rows.len > 0) s.rows.appendAssumeCapacity(rows[i]);
             landed += 1;
+            const ended_think = s.think_open and @as(i64, t) == s.think_end;
             if (@as(i64, t) == s.think_end) {
                 s.think_open = false;
                 if (s.answer_from == null) s.answer_from = s.emitted().len;
@@ -481,8 +484,9 @@ pub const Stream = struct {
             }
             const guarded = s.loop_guard and s.think_open and s.think_end >= 0 and s.loop_period == null;
             const fire = if (guarded) detectLoop(s.emitted()) orelse s.longCycle() else null;
+            if (@import("runner_eos.zig").hold(s, t, stopped)) break;
             const can_hold = !s.isEos(t) and s.force.items.len == 0 and s.budgetLeft() > 1;
-            if (s.runner) |r| if (r.token(r.ptr, t, s.think_open, can_hold) and can_hold) {
+            if (s.runner) |r| if (r.token(r.ptr, t, s.think_open, can_hold, ended_think) and can_hold) {
                 s.held = true;
                 s.awaiting = true;
                 s.paused = true;

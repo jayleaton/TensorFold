@@ -92,7 +92,7 @@ fn run(settle_us: u32, back: *Back, open_gate_at: ?u32) !Run {
     var ticks: [4]u32 = @splat(0);
     var holds: usize = 0;
     for (reply) |ch| {
-        if (!hook.token(hook.ptr, ch, false, true)) continue;
+        if (!hook.token(hook.ptr, ch, false, true, false)) continue;
         const cell = s.cells.items[s.waiting.?.index];
         // settling translates an inline value at its close, on this thread
         if (settle_us > 0 and cell.form == .inline_expr) try std.testing.expect(cell.thread == null and cell.translated.load(.acquire));
@@ -168,7 +168,7 @@ test "runner settle: a backend without a run here still settles in one tick when
     defer s.destroy();
     const hook = s.hook();
     var held = false;
-    for ("So 7*6 =") |ch| held = hook.token(hook.ptr, ch, false, true);
+    for ("So 7*6 =") |ch| held = hook.token(hook.ptr, ch, false, true, false);
     try std.testing.expect(held);
     const got = (try s.tick()).?;
     defer gpa.free(got);

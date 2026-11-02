@@ -136,22 +136,44 @@ pub const Session = struct {
     held_ticks: u32 = 0, // the current hold's ticks so far (the serving log's)
     forcing: ?struct { at: u64, left: usize, cell: u32 } = null, // an owned result's forced tokens still to commit
     resume_ms: u64 = 0, // summed: an owned result's settling to the model's first token after it
+    terminal_seen: bool = false,
     broken: bool = false, // out of memory once: no more cells, no more holds
 
     pub fn hook(s: *Session) lanes.stream.RunnerHook {
-        return .{ .ptr = s, .token = onToken };
+        return .{ .ptr = s, .token = onToken, .eos = onEos };
     }
 
-    fn onToken(ptr: *anyopaque, token: u32, think_open: bool, can_hold: bool) bool {
+    fn onToken(ptr: *anyopaque, token: u32, think_open: bool, can_hold: bool, think_end: bool) bool {
         const s: *Session = @ptrCast(@alignCast(ptr));
         if (s.broken) return false;
-        return s.feed(token, think_open, can_hold) catch {
+        return s.feed(token, think_open, can_hold, think_end) catch {
             s.broken = true;
             return false;
         };
     }
 
-    fn feed(s: *Session, token: u32, think_open: bool, can_hold: bool) Allocator.Error!bool {
+    fn onEos(ptr: *anyopaque, think_open: bool, can_hold: bool) bool {
+        const s: *Session = @ptrCast(@alignCast(ptr));
+        if (s.broken or s.terminal_seen) return false;
+        return s.finishEos(think_open, can_hold) catch {
+            s.broken = true;
+            return false;
+        };
+    }
+
+    fn finishEos(s: *Session, think_open: bool, can_hold: bool) Allocator.Error!bool {
+        const ev = try s.scan.finishEos(s.r.gpa, think_open);
+        if (ev.closed) |c| try s.open(c);
+        const trigger = ev.trigger orelse return false;
+        if (!can_hold or trigger.index >= s.cells.items.len) return false;
+        s.waiting = trigger;
+        s.held_at = nowNs();
+        s.held_ticks = 0;
+        s.terminal_seen = true;
+        return true;
+    }
+
+    fn feed(s: *Session, token: u32, think_open: bool, can_hold: bool, think_end: bool) Allocator.Error!bool {
         const tx = s.r.text.?;
         if (s.forcing) |*r| {
             // the forced tokens commit first; the next token is the model's own, one round after the result settled
@@ -162,7 +184,7 @@ pub const Session = struct {
                 s.forcing = null;
             }
         }
-        const ev = try s.scan.feed(s.r.gpa, tx.bytes(tx.ctx, token), think_open);
+        const ev = try s.scan.feed(s.r.gpa, if (think_end) "" else tx.bytes(tx.ctx, token), think_open);
         if (ev.closed) |c| try s.open(c);
         const t = ev.trigger orelse return false;
         if (!can_hold or t.index >= s.cells.items.len) return false;
@@ -373,6 +395,8 @@ pub const Session = struct {
             gpa.free(ids);
             return try gpa.alloc(u32, 0);
         }
+        if (w.terminal) try body.appendSlice(gpa, "\nResult:\n") else if (w.newline_before)
+            try body.append(gpa, '\n');
         try body.appendSlice(gpa, out);
         switch (res.status) {
             .ok, .abstain => {},

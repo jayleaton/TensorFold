@@ -70,7 +70,7 @@ fn pass(gpa: std.mem.Allocator, r: *runner.Runner, replies: []const Reply, mode:
         const hook = s.hook();
         for (rep.tokens, 0..) |tok, i| {
             const t0 = now();
-            const held = hook.token(hook.ptr, tok, i < rep.think_end, mode == .fire);
+            const held = hook.token(hook.ptr, tok, i < rep.think_end, mode == .fire, false);
             t.feed_ns += now() - t0;
             t.tokens += 1;
             if (!held) continue;
