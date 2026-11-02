@@ -3,9 +3,71 @@ const std = @import("std");
 const ast = @import("runner_frontend_integer_ast.zig");
 const Parser = ast.Parser;
 const Invalid = ast.Invalid;
+const node_cap = @typeInfo(@FieldType(Parser, "nodes")).array.len;
 
-/// items[start..][0..len] of the parser; a range object prints as `range(...)`, so it is never printed here.
-pub const List = struct { start: usize = 0, len: usize = 0, range: bool = false };
+/// items[start..][0..len]; a range never prints here; a filtered list's 0/1 masks follow (its len is a circuit value).
+pub const List = struct { start: usize = 0, len: usize = 0, range: bool = false, masked: bool = false };
+
+/// A list whose elements all exist: a filtered one only reaches sum() and len(), on the circuit.
+pub fn plain(p: *const Parser, li: usize) Invalid!List {
+    const l = p.lists[li];
+    if (l.masked) return error.Unsupported;
+    return l;
+}
+
+/// Whether node `i` is the script's text alone: no comparison (a filter's or a min's choice) beneath it.
+fn fixed(p: *const Parser, i: usize) bool {
+    var seen: [node_cap]bool = @splat(false);
+    return fixedAt(p, i, &seen);
+}
+
+fn fixedAt(p: *const Parser, i: usize, seen: *[node_cap]bool) bool {
+    if (i >= p.count) return false;
+    if (seen[i]) return true;
+    seen[i] = true;
+    const n = p.nodes[i];
+    return switch (n.op) {
+        .literal => true,
+        .eq, .ne, .lt, .le, .gt, .ge => false,
+        .neg, .digits, .isqrt, .factorial, .digit_sum => fixedAt(p, n.l, seen),
+        .powmod, .range_product => fixedAt(p, n.l, seen) and fixedAt(p, n.r, seen) and fixedAt(p, n.k, seen),
+        else => fixedAt(p, n.l, seen) and fixedAt(p, n.r, seen),
+    };
+}
+
+/// `acc` or `e`, chosen on the circuit: acc + (e - acc) * (e < acc), or `>` for max; a tie keeps acc (Python's first).
+fn pick(p: *Parser, acc: usize, e: usize, largest: bool) Invalid!usize {
+    const better = try p.add(.{ .op = if (largest) .gt else .lt, .l = e, .r = acc });
+    const step = try p.add(.{ .op = .mul, .l = try p.add(.{ .op = .sub, .l = e, .r = acc }), .r = better });
+    return p.add(.{ .op = .add, .l = acc, .r = step });
+}
+
+/// min and max of a and b on the circuit: t = (b - a) * (b < a); min = a + t, max = b - t.
+fn exchange(p: *Parser, a: usize, b: usize) Invalid![2]usize {
+    const t = try p.add(.{ .op = .mul, .l = try p.add(.{ .op = .sub, .l = b, .r = a }), .r = try p.add(.{ .op = .lt, .l = b, .r = a }) });
+    return .{ try p.add(.{ .op = .add, .l = a, .r = t }), try p.add(.{ .op = .sub, .l = b, .r = t }) };
+}
+
+/// sorted() as a compare-exchange network, each output a circuit value; its depth sets the packet's size.
+fn network(p: *Parser, elems: []usize, reverse: bool) Invalid!void {
+    for (elems) |e| if (p.boolean(e)) return error.Unsupported; // sorted([True, 0]) keeps its bools
+    if (elems.len == 4) {
+        // the depth-3 network for four (transposition's depth 4 outgrows a packet)
+        for ([_][2]usize{ .{ 0, 1 }, .{ 2, 3 }, .{ 0, 2 }, .{ 1, 3 }, .{ 1, 2 } }) |c| {
+            const lo, const hi = try exchange(p, elems[c[0]], elems[c[1]]);
+            elems[c[0]], elems[c[1]] = if (reverse) .{ hi, lo } else .{ lo, hi };
+        }
+        return;
+    }
+    // odd-even transposition: n rounds
+    for (0..elems.len) |round| {
+        var i = round % 2;
+        while (i + 1 < elems.len) : (i += 2) {
+            const lo, const hi = try exchange(p, elems[i], elems[i + 1]);
+            elems[i], elems[i + 1] = if (reverse) .{ hi, lo } else .{ lo, hi };
+        }
+    }
+}
 
 /// Small literals the lowering itself makes (an index, a length): their text, as a literal node must carry one.
 const digits = blk: {
@@ -52,7 +114,7 @@ pub fn whole(p: *Parser, text: []const u8) Invalid!usize {
     return li;
 }
 
-/// A list expression here. Never a node: its length, filter and order come from the exact proof, its values from code.
+/// A list expression here. Never a node: its length is the script's shape; its filter and order are circuit values.
 pub fn parse(p: *Parser, depth: usize) Invalid!usize {
     if (depth > 12) return error.Unsupported;
     p.space();
@@ -81,20 +143,10 @@ pub fn parse(p: *Parser, depth: usize) Invalid!usize {
         } else if (!generator and separator(content) != null) return error.Unsupported;
         const src = try argument(p, arg, depth);
         if (p.check_only) return src;
-        const l = p.lists[src];
+        const l = try plain(p, src);
         var elems: [ast.max_items]usize = undefined;
         @memcpy(elems[0..l.len], p.items[l.start..][0..l.len]);
-        if (sorting) {
-            const Ctx = struct { p: *Parser, reverse: bool };
-            // stable, as Python's sort: equal ints keep their order either way
-            std.sort.insertion(usize, elems[0..l.len], Ctx{ .p = p, .reverse = reverse }, struct {
-                fn less(c: Ctx, x: usize, y: usize) bool {
-                    const a = c.p.nodes[x].value;
-                    const b = c.p.nodes[y].value;
-                    return if (c.reverse) a > b else a < b;
-                }
-            }.less);
-        }
+        if (sorting) try network(p, elems[0..l.len], reverse);
         return make(p, elems[0..l.len], false);
     }
     const name = try p.identifier();
@@ -144,6 +196,19 @@ pub fn make(p: *Parser, elems: []const usize, is_range: bool) Invalid!usize {
     return p.list_count - 1;
 }
 
+/// A comprehension's list with each element's 0/1 keep mask (every element proved: one a filter drops may refuse).
+fn filtered(p: *Parser, elems: []const usize, masks: []const usize) Invalid!usize {
+    if (p.item_count + 2 * elems.len > p.items.len) return error.Unsupported;
+    const li = try make(p, elems, false);
+    for (masks) |m| if (!p.check_only) {
+        _ = try p.prove(m, m);
+    };
+    @memcpy(p.items[p.item_count..][0..masks.len], masks);
+    p.item_count += masks.len;
+    p.lists[li].masked = true;
+    return li;
+}
+
 fn literal(p: *Parser, content: []const u8, depth: usize) Invalid!usize {
     var elems: [ast.max_items]usize = undefined;
     var n: usize = 0;
@@ -179,7 +244,8 @@ fn range(p: *Parser, depth: usize) Invalid!usize {
         try p.need(",");
     }
     if (p.check_only) return placeholder(p);
-    for (args[0..n]) |a| if (p.boolean(a) or p.nodes[a].op == .divmod) return error.Unsupported;
+    // the length is a shape: never from a circuit choice (a filter's len, a min)
+    for (args[0..n]) |a| if (p.boolean(a) or p.nodes[a].op == .divmod or !fixed(p, a)) return error.Unsupported;
     const start: ?usize = if (n == 1) null else args[0];
     const stop = if (n == 1) args[0] else args[1];
     const step: ?usize = if (n == 3) args[2] else null;
@@ -251,20 +317,20 @@ fn comprehension(p: *Parser, content: []const u8, depth: usize) Invalid!usize {
             const args = try parenthesized(p);
             const comma = separator(args) orelse return error.Unsupported;
             if (separator(args[comma + 1 ..]) != null) return error.Unsupported;
-            columns[0] = p.lists[try nested(p, args[0..comma], depth)];
-            columns[1] = p.lists[try nested(p, args[comma + 1 ..], depth)];
+            columns[0] = try plain(p, try nested(p, args[0..comma], depth));
+            columns[1] = try plain(p, try nested(p, args[comma + 1 ..], depth));
             pairs = .zip;
         } else if (p.word("enumerate")) {
             const args = try parenthesized(p);
             const comma = separator(args);
-            columns[1] = p.lists[try nested(p, args[0 .. comma orelse args.len], depth)];
+            columns[1] = try plain(p, try nested(p, args[0 .. comma orelse args.len], depth));
             if (comma) |c| {
                 first = try sub(p, std.mem.trim(u8, args[c + 1 ..], " \t"), depth);
                 if (p.boolean(first.?) or p.nodes[first.?].op == .divmod) return error.Unsupported;
             }
             pairs = .enumerate;
         } else {
-            columns[0] = p.lists[try parse(p, depth + 1)];
+            columns[0] = try plain(p, try parse(p, depth + 1));
         }
         p.space();
         if (p.pos != p.source.len) return error.Unsupported;
@@ -276,7 +342,7 @@ fn comprehension(p: *Parser, content: []const u8, depth: usize) Invalid!usize {
         .enumerate => columns[1].len,
     };
     var out: [ast.max_items]usize = undefined;
-    var kept: usize = 0;
+    var masks: [ast.max_items]usize = undefined;
     var counter: usize = 0; // enumerate's count from its start: the start, then one more each element
     const one = if (first != null and len > 1) try number(p, 1) else 0;
     for (0..len) |k| {
@@ -299,22 +365,21 @@ fn comprehension(p: *Parser, content: []const u8, depth: usize) Invalid!usize {
             p.kinds[p.binding_count] = false;
             p.binding_count += 1;
         }
-        // a condition only selects, by its exact value: its nodes never print, so they are dropped after the proof
-        var keep = true;
+        // the conditions' product is the element's keep mask, a circuit value: the host never chooses what stays
+        var mask: ?usize = null;
         for (conds[0..nconds]) |cond| {
-            const m = p.mark();
             const c = try sub(p, cond, depth);
             if (p.nodes[c].op == .divmod) return error.Unsupported;
-            if (!p.check_only and try p.prove(c, c) == 0) keep = false;
-            p.reset(m);
-            if (!keep) break;
+            // an int condition is its truth: nonzero
+            const truth = if (p.boolean(c)) c else try p.add(.{ .op = .ne, .l = c, .r = try number(p, 0) });
+            mask = if (mask) |m| try p.add(.{ .op = .mul, .l = m, .r = truth }) else truth;
         }
-        if (!keep) continue;
-        if (kept == out.len) return error.Unsupported;
-        out[kept] = try sub(p, body, depth);
-        kept += 1;
+        if (k == out.len) return error.Unsupported;
+        if (mask) |m| masks[k] = m;
+        out[k] = try sub(p, body, depth);
     }
-    return make(p, out[0..kept], false);
+    if (nconds == 0) return make(p, out[0..len], false);
+    return filtered(p, out[0..len], masks[0..len]);
 }
 
 /// An int expression over `text`, the parser's position kept.
@@ -351,16 +416,22 @@ fn parenthesized(p: *Parser) Invalid![]const u8 {
 
 // ---- int consumers, called from the parser's atoms ----
 
-/// len(xs): the list's static length, a literal; the list's own new nodes are dropped.
+/// len(xs): the list's static length, a literal (its new nodes dropped); a filtered list's is its masks' sum.
 pub fn length(p: *Parser, depth: usize) Invalid!usize {
     const content = try parenthesized(p);
     // len() of a generator is a TypeError
     if (top(content, "for", 0) != null or separator(content) != null) return error.Unsupported;
     const m = p.mark();
     const li = try nested(p, content, depth);
-    const len = if (p.check_only) 1 else p.lists[li].len;
-    p.reset(m);
-    return number(p, len);
+    const l = p.lists[li];
+    if (p.check_only or !l.masked) {
+        p.reset(m);
+        return number(p, if (p.check_only) 1 else l.len);
+    }
+    // from 0: one mask alone would print as a bool
+    var acc = try number(p, 0);
+    for (p.items[l.start + l.len ..][0..l.len]) |mask| acc = try p.add(.{ .op = .add, .l = acc, .r = mask });
+    return acc;
 }
 
 /// sum(xs) or sum(generator): 0 for none, else the elements added left to right (start= refuses).
@@ -368,6 +439,13 @@ pub fn sum(p: *Parser, depth: usize) Invalid!usize {
     const content = try parenthesized(p);
     if (top(content, "for", 0) == null and separator(content) != null) return error.Unsupported;
     const l = p.lists[try argument(p, content, depth)];
+    if (l.masked) {
+        // each element times its keep mask, from 0
+        var acc = try number(p, 0);
+        for (p.items[l.start..][0..l.len], p.items[l.start + l.len ..][0..l.len]) |e, mask|
+            acc = try p.add(.{ .op = .add, .l = acc, .r = try p.add(.{ .op = .mul, .l = e, .r = mask }) });
+        return acc;
+    }
     if (l.len == 0) return number(p, 0);
     var acc = p.items[l.start];
     // sum([True]) is 1, an int
@@ -376,7 +454,7 @@ pub fn sum(p: *Parser, depth: usize) Invalid!usize {
     return acc;
 }
 
-/// min/max of one list or generator, or of two or more ints: the first extreme element (an empty list refuses).
+/// min/max of one list or generator, or of two or more ints: chosen on the circuit, pairwise (an empty list refuses).
 pub fn extreme(p: *Parser, depth: usize, comptime largest: bool) Invalid!usize {
     p.listed = true;
     const content = try parenthesized(p);
@@ -394,21 +472,15 @@ pub fn extreme(p: *Parser, depth: usize, comptime largest: bool) Invalid!usize {
             if (comma) |c| rest = rest[c + 1 ..] else break;
         }
     } else {
-        const l = p.lists[try argument(p, content, depth)];
+        const l = try plain(p, try argument(p, content, depth));
         @memcpy(elems[0..l.len], p.items[l.start..][0..l.len]);
         n = l.len;
     }
     if (n == 0) return error.Unsupported; // ValueError
-    if (p.check_only) return elems[0];
+    for (elems[0..n]) |e| if (p.boolean(e)) return error.Unsupported; // min(True, 2) is True, a bool
     var best = elems[0];
-    var value = try p.prove(best, best);
-    for (elems[1..n]) |e| {
-        const v = try p.prove(e, e);
-        if (if (largest) v > value else v < value) {
-            best = e;
-            value = v;
-        }
-    }
+    for (elems[1..n]) |e| best = try pick(p, best, e, largest);
+    if (!p.check_only) _ = try p.prove(best, best);
     return best;
 }
 
@@ -418,8 +490,9 @@ pub fn index(p: *Parser, li: usize, depth: usize) Invalid!usize {
     const i = try p.expr(depth + 1);
     try p.need("]");
     if (p.check_only) return i;
-    if (p.boolean(i) or p.nodes[i].op == .divmod) return error.Unsupported;
-    const l = p.lists[li];
+    // which element is a shape: never from a circuit choice
+    if (p.boolean(i) or p.nodes[i].op == .divmod or !fixed(p, i)) return error.Unsupported;
+    const l = try plain(p, li);
     const v = try p.prove(i, i);
     const at = if (v < 0) v + @as(i512, @intCast(l.len)) else v;
     if (at < 0 or at >= l.len) return error.Unsupported;
