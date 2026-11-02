@@ -101,7 +101,7 @@ pub fn prepare(srv: *Server, cx: *Cx, given: Input, gone: anytype) Failure!Prepa
     var input = given;
     // the runner guide (runner_guide.zig): the request's "runner_guide" or the boot default, with the runner on
     const guided = @import("runner_guide.zig").apply(a, if (srv.info.runner != null and input.prompt == null) &srv.guides else null, input.fields.get("runner_guide"), input.messages) catch |e| switch (e) {
-        error.BadGuide => return cx.refuse("runner_guide must be a string of at most 512 bytes"),
+        error.BadGuide => return cx.refuse(try srv.guides.refusal(a)),
         error.OutOfMemory => return error.OutOfMemory,
     };
     input.messages = guided.messages;

@@ -23,6 +23,7 @@ pub const Config = struct {
     place: place.Config = .{}, // PREFIX_CPUS / PREFIX_NICE: where the runner's threads run (core/runner_place.zig)
     settle_us: u32 = 0, // PREFIX_SETTLE_US: a held tick waits this long for its cell; 0: one stage per tick (as before)
     guide: []const u8 = "", // PREFIX_GUIDE: "1" RUNNER-GUIDE.md, else a file, as chats' default guide (server/runner_guide.zig)
+    guide_max_bytes: usize = 512, // PREFIX_GUIDE_MAX_BYTES: request guide cap, opt-in up to 2048 bytes
     compile: bool = true, // false: the frontend never builds an ELF (no clang); calc and graph programs only (S3)
     sync_graph: bool = false, // PREFIX_SYNC_GRAPH: a graph result settles at its trigger token, in that round (no hold)
     cells: bool = true, // PREFIX_CELLS: the receipt records each owned cell's span, route and landed value (runner_receipt.zig)
@@ -54,6 +55,7 @@ pub const Config = struct {
         c.cells = try knob(u1, get, prefix ++ "_CELLS", 1, 0, 1) == 1;
         c.guide = get(prefix ++ "_GUIDE") orelse "";
         if (std.mem.eql(u8, c.guide, "0")) c.guide = "";
+        c.guide_max_bytes = try knob(usize, get, prefix ++ "_GUIDE_MAX_BYTES", c.guide_max_bytes, 512, 2048);
         c.place = try place.Config.parse(get, prefix);
         c.scan.lookahead = try knob(u32, get, prefix ++ "_LOOKAHEAD", c.scan.lookahead, 1, 4096);
         c.scan.float_window = try knob(u32, get, prefix ++ "_FLOAT_WINDOW", c.scan.float_window, 0, 65536);

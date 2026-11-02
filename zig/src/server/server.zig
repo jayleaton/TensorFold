@@ -197,6 +197,7 @@ pub const Server = struct {
         if (srv.info.runner) |r| {
             try @import("runner_text.zig").attach(srv.arena.allocator(), text, r);
             srv.guides = try @import("runner_guide.zig").Set.load(srv.arena.allocator(), io, r.cfg.guide);
+            srv.guides.max_request_bytes = r.cfg.guide_max_bytes;
             srv.guides.describe();
         }
         if (config.cortheon) srv.cortheon = try cortheon.State.init(gpa, io, "TensorFold-Cortheon (+https://github.com/ashhart/TensorFold)", config.cortheon_search_key);

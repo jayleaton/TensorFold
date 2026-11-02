@@ -460,6 +460,15 @@ test "runner: knobs parse; off unless the flag is 1 with a circuit" {
     try std.testing.expectEqualStrings("/g/a.md", (try runner.Config.parse(&K.get, "TF_R")).?.guide);
     K.set = &.{ .{ "TF_R", "1" }, .{ "TF_R_CIRCUIT", "/c.bin" }, .{ "TF_R_GUIDE", "0" } };
     try std.testing.expectEqualStrings("", (try runner.Config.parse(&K.get, "TF_R")).?.guide);
+    try std.testing.expectEqual(@as(usize, 512), (try runner.Config.parse(&K.get, "TF_R")).?.guide_max_bytes);
+    for ([_][]const u8{ "512", "586", "1024", "2048" }) |value| {
+        K.set = &.{ .{ "TF_R", "1" }, .{ "TF_R_CIRCUIT", "/c.bin" }, .{ "TF_R_GUIDE_MAX_BYTES", value } };
+        try std.testing.expectEqual(try std.fmt.parseInt(usize, value, 10), (try runner.Config.parse(&K.get, "TF_R")).?.guide_max_bytes);
+    }
+    for ([_][]const u8{ "0", "511", "2049", "-1", "bogus" }) |value| {
+        K.set = &.{ .{ "TF_R", "1" }, .{ "TF_R_CIRCUIT", "/c.bin" }, .{ "TF_R_GUIDE_MAX_BYTES", value } };
+        try std.testing.expectError(error.BadKnob, runner.Config.parse(&K.get, "TF_R"));
+    }
 }
 
 test {

@@ -15,6 +15,7 @@ pub const max_request = 512;
 /// The server's default guide, read once at boot from TF_DSV41_RUNNER_GUIDE: "1" is `text`, any other value a file.
 pub const Set = struct {
     default: []const u8 = "", // "": chats get no guide unless they ask
+    max_request_bytes: usize = max_request,
 
     pub fn load(a: std.mem.Allocator, io: std.Io, knob: []const u8) !Set {
         if (knob.len == 0) return .{};
@@ -23,8 +24,12 @@ pub const Set = struct {
         return .{ .default = trim(bytes) };
     }
 
+    pub fn refusal(s: Set, a: std.mem.Allocator) std.mem.Allocator.Error![]const u8 {
+        return std.fmt.allocPrint(a, "runner_guide must be a string of at most {d} bytes", .{s.max_request_bytes});
+    }
+
     pub fn describe(s: Set) void {
-        @import("log.zig").line("runner guide: default {d} bytes", .{s.default.len});
+        @import("log.zig").line("runner guide: default {d} bytes, request limit {d} bytes", .{ s.default.len, s.max_request_bytes });
     }
 };
 
@@ -43,7 +48,7 @@ pub fn apply(a: std.mem.Allocator, set: ?*const Set, asked: ?Value, messages: Va
     const s = set orelse return .{ .messages = messages, .guide = null };
     const chosen = if (asked) |v| switch (v) {
         .null => s.default,
-        .string => |t| if (t.len <= max_request) trim(t) else return error.BadGuide,
+        .string => |t| if (t.len <= s.max_request_bytes) trim(t) else return error.BadGuide,
         else => return error.BadGuide,
     } else s.default;
     return .{ .messages = if (chosen.len > 0) try with(a, messages, chosen) else messages, .guide = chosen };
@@ -196,4 +201,52 @@ test "runner guide: boot default, a request's override, an empty one and the run
     try std.testing.expectError(error.BadGuide, apply(a, &builtin, .{ .string = long }, chat));
     _ = try apply(a, &builtin, .{ .string = long[0..max_request] }, chat);
     try std.testing.expectError(error.BadGuide, apply(a, &builtin, .{ .bool = true }, chat));
+}
+
+test "runner guide: opt-in request byte boundaries preserve injection and off behavior" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const user = try json.newObject(a);
+    try user.put(a, "role", .{ .string = "user" });
+    try user.put(a, "content", .{ .string = "Compute 47*83." });
+    var one = [_]Value{.{ .object = user }};
+    const chat: Value = .{ .array = &one };
+    const bytes = try a.alloc(u8, 2049);
+    @memset(bytes, 'x');
+    const Case = struct { limit: usize, len: usize, accept: bool };
+    for ([_]Case{
+        .{ .limit = 512, .len = 512, .accept = true },
+        .{ .limit = 512, .len = 586, .accept = false },
+        .{ .limit = 1024, .len = 586, .accept = true },
+        .{ .limit = 2048, .len = 512, .accept = true },
+        .{ .limit = 2048, .len = 586, .accept = true },
+        .{ .limit = 2048, .len = 2048, .accept = true },
+        .{ .limit = 2048, .len = 2049, .accept = false },
+    }) |c| {
+        const set: Set = .{ .default = "Boot guide", .max_request_bytes = c.limit };
+        try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "runner_guide must be a string of at most {d} bytes", .{c.limit}), try set.refusal(a));
+        const asked: Value = .{ .string = bytes[0..c.len] };
+        if (c.accept) {
+            const got = try apply(a, &set, asked, chat);
+            try std.testing.expectEqualStrings(bytes[0..c.len], got.guide.?);
+            try std.testing.expectEqualStrings(bytes[0..c.len], got.messages.array[0].strField("content").?);
+            try std.testing.expectEqualStrings("Compute 47*83.", got.messages.array[1].strField("content").?);
+        } else try std.testing.expectError(error.BadGuide, apply(a, &set, asked, chat));
+        const off = try apply(a, null, asked, chat);
+        try std.testing.expect(off.guide == null);
+        try std.testing.expectEqualStrings(try json.stringify(a, chat, .{}), try json.stringify(a, off.messages, .{}));
+        try std.testing.expectEqualStrings("Boot guide", (try apply(a, &set, .null, chat)).guide.?);
+        try std.testing.expectEqualStrings("", (try apply(a, &set, .{ .string = "" }, chat)).guide.?);
+    }
+    const capped: Set = .{ .max_request_bytes = 2048 };
+    @memset(bytes, ' ');
+    try std.testing.expectError(error.BadGuide, apply(a, &capped, .{ .string = bytes }, chat));
+    for (0..1024) |i| {
+        bytes[2 * i] = 0xc3;
+        bytes[2 * i + 1] = 0xa9;
+    }
+    bytes[2048] = 'x';
+    try std.testing.expectEqual(@as(usize, 2048), (try apply(a, &capped, .{ .string = bytes[0..2048] }, chat)).guide.?.len);
+    try std.testing.expectError(error.BadGuide, apply(a, &capped, .{ .string = bytes }, chat));
 }
