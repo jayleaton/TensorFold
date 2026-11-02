@@ -199,9 +199,11 @@ test "configured assertion cells match exact CPython stdout through fence dispat
         );
     }
     for (refused) |code| {
-        const result = try front.translate(front.ctx, t.allocator, .{ .form = .fence, .lang = "python", .code = code });
-        defer if (result == .program) t.allocator.free(result.program.bytes);
-        try t.expect(result == .abstain);
+        try @import("runner_frontend_collections_compat_test.zig").checkRejectionOrExact(
+            &env,
+            &front,
+            .{ .form = .fence, .lang = "python", .code = code },
+        );
     }
 }
 

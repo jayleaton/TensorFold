@@ -192,11 +192,11 @@ test "integer frontend refuses unsafe ambiguous noninteger and incomplete Python
     defer env.deinit();
     var context = configured(env.get("TF_RUNNER_CLANG") orelse "/usr/bin/clang", env.get("TF_RUNNER_LLD"));
     const bad = [_][]const u8{
-        "",              "1+",                           "(2+3",                   "2**",        "divmod(7,)",   "pow(2,3,)",   "int('ff',)",
-        "missing+1",     "print(missing)",               "import os",              "1.25*2",     "1e3+1",        "1/2",         "6/3",
-        "1//0",          "1%0",                          "divmod(1,0)",            "pow(2,3,0)", "2**-1",        "pow(2,-1,3)", "print((1,2))",
-        "1,2",           "(1,2)",                        "2*3,18",                 "1<2<3",      "1+2=3",        "1==1==1",     "__import__('os').getcwd()",
-        "(1).__class__", "int('__import__(\"os\")',16)", "int('ff',16).__class__", "int('2',2)", "int('gg',16)",
+        "",                             "1+",                     "(2+3",        "2**",          "divmod(7,)", "pow(2,3,)",                 "int('ff',)",
+        "missing+1",                    "print(missing)",         "import os",   "1.25*2",       "1e3+1",      "1/2",                       "6/3",
+        "1//0",                         "1%0",                    "divmod(1,0)", "pow(2,3,0)",   "2**-1",      "pow(2,-1,3)",               "1,2",
+        "(1,2)",                        "2*3,18",                 "1<2<3",       "1+2=3",        "1==1==1",    "__import__('os').getcwd()", "(1).__class__",
+        "int('__import__(\"os\")',16)", "int('ff',16).__class__", "int('2',2)",  "int('gg',16)",
     };
     for ([_]api.Form{ .repl, .fence }) |form| {
         for (bad) |code| try abstains(&context, .{ .form = form, .lang = "python", .code = code });
@@ -205,6 +205,19 @@ test "integer frontend refuses unsafe ambiguous noninteger and incomplete Python
         "1+",                        "(2+3",                         "missing+1", "1,2", "1<2<3", "1+2=3", "2**-1", "1%0",
         "__import__('os').getcwd()", "int('__import__(\"os\")',16)",
     }) |code| try abstains(&context, .{ .form = .inline_expr, .lang = "python", .code = code });
+}
+
+test "configured integer frontend prints tuple and list representations exactly like CPython" {
+    var env = try t.environ.createMap(t.allocator);
+    defer env.deinit();
+    var context = configured(try requiredClang(&env), env.get("TF_RUNNER_LLD"));
+    for ([_]api.Form{ .repl, .fence }) |form| {
+        for ([_][]const u8{ "print((1,2))", "print([1,2])" }) |code| {
+            const program = try translate(&context, .{ .form = form, .code = code, .expected = "" });
+            defer t.allocator.free(program.bytes);
+            try @import("runner_frontend_collections_compat_test.zig").checkExact(&env, program, code);
+        }
+    }
 }
 
 test "integer frontend refuses prior cells that can shadow integer builtins" {

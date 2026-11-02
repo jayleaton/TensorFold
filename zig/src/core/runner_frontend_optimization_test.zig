@@ -150,8 +150,17 @@ pub fn checkOptimization(env: *const Env, source: []const u8, expected: []const 
     return checkWithFloor(env, source, expected, trusted, 8);
 }
 
+pub fn checkCollectionsOptimization(env: *const Env, source: []const u8, expected: []const u8) !void {
+    return checkWithStack(env, source, expected, true, 8, true);
+}
+
 fn checkWithFloor(env: *const Env, source: []const u8, expected: []const u8, trusted: bool, divisor: u64) !void {
+    return checkWithStack(env, source, expected, trusted, divisor, false);
+}
+
+fn checkWithStack(env: *const Env, source: []const u8, expected: []const u8, trusted: bool, divisor: u64, collection_stack: bool) !void {
     var config = try settings(env, trusted);
+    config.collection_stack = collection_stack;
     config.optimize = .O0;
     const baseline = try build(source, config);
     defer t.allocator.free(baseline);

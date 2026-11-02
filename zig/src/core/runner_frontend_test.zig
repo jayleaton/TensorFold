@@ -218,3 +218,7 @@ test "inline typographic operators normalize without changing Python syntax or t
         try t.expect((try front.translate(null, t.allocator, .{ .form = .inline_expr, .lang = "python", .code = code })) == .abstain);
     }
 }
+
+comptime {
+    _ = @import("runner_frontend_collections_test.zig");
+}

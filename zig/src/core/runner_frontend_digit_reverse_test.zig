@@ -163,8 +163,10 @@ test "configured digit reversal frontend matches CPython and the RV32 reference"
         try @import("runner_frontend_reference_test.zig").check(root, python, result.program, oracle.stdout);
     }
     for (refused) |code| {
-        const result = try front.translate(front.ctx, t.allocator, .{ .form = .fence, .lang = "python", .code = code });
-        defer if (result == .program) t.allocator.free(result.program.bytes);
-        try t.expect(result == .abstain);
+        try @import("runner_frontend_collections_compat_test.zig").checkRejectionOrExact(
+            &env,
+            &front,
+            .{ .form = .fence, .lang = "python", .code = code },
+        );
     }
 }

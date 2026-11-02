@@ -24,13 +24,13 @@ pub fn wanted(opaque_inputs: bool, step_budget: usize, estimated_steps: ?usize) 
 }
 
 /// Everything besides the fixed runtime that changes the image or its acceptance.
-pub fn key(normalized: []const u8, clang: []const u8, linker: ?[]const u8, optimize: u8, stack_limit: usize) Key {
+pub fn key(normalized: []const u8, clang: []const u8, linker: ?[]const u8, optimize: u8, stack_limit: usize, collection_stack: bool) Key {
     var h = std.crypto.hash.sha2.Sha256.init(.{});
     for ([_][]const u8{ clang, linker orelse "", normalized }) |part| {
         h.update(std.mem.asBytes(&part.len));
         h.update(part);
     }
-    h.update(&.{optimize});
+    h.update(&.{ optimize, @intFromBool(collection_stack) });
     h.update(std.mem.asBytes(&stack_limit));
     h.update(if (linker == null) "lld" else "path");
     var out: Key = undefined;
@@ -92,13 +92,14 @@ test "elf cache: only opaque inputs with a known admission, distinct settings ne
     try t.expect(!wanted(false, 0, 5));
     reset(t.io);
     defer reset(t.io);
-    const k = key("int main(void) {\n}\n", "/usr/bin/clang", null, 1, 0);
+    const k = key("int main(void) {\n}\n", "/usr/bin/clang", null, 1, 0, false);
     for ([_]Key{
-        key("int main(void) {\n }\n", "/usr/bin/clang", null, 1, 0),
-        key("int main(void) {\n}\n", "/usr/bin/clang-18", null, 1, 0),
-        key("int main(void) {\n}\n", "/usr/bin/clang", "", 1, 0),
-        key("int main(void) {\n}\n", "/usr/bin/clang", null, 2, 0),
-        key("int main(void) {\n}\n", "/usr/bin/clang", null, 1, 4096),
+        key("int main(void) {\n }\n", "/usr/bin/clang", null, 1, 0, false),
+        key("int main(void) {\n}\n", "/usr/bin/clang-18", null, 1, 0, false),
+        key("int main(void) {\n}\n", "/usr/bin/clang", "", 1, 0, false),
+        key("int main(void) {\n}\n", "/usr/bin/clang", null, 2, 0, false),
+        key("int main(void) {\n}\n", "/usr/bin/clang", null, 1, 4096, false),
+        key("int main(void) {\n}\n", "/usr/bin/clang", null, 1, 0, true),
     }) |other| try t.expect(!std.mem.eql(u8, &k, &other));
     try t.expectEqual(@as(?[]u8, null), try get(t.allocator, t.io, k));
     put(t.io, k, "image one");
@@ -109,9 +110,9 @@ test "elf cache: only opaque inputs with a known admission, distinct settings ne
     try t.expectEqual(@as(u64, 1), hitCount(t.io));
     const big = try t.allocator.alloc(u8, max_image + 1);
     defer t.allocator.free(big);
-    const kb = key("big", "c", null, 1, 0);
+    const kb = key("big", "c", null, 1, 0, false);
     put(t.io, kb, big);
     try t.expectEqual(@as(?[]u8, null), try get(t.allocator, t.io, kb));
-    for (0..slots) |i| put(t.io, key(std.mem.asBytes(&i), "c", null, 1, 0), "filler");
+    for (0..slots) |i| put(t.io, key(std.mem.asBytes(&i), "c", null, 1, 0, false), "filler");
     try t.expectEqual(@as(?[]u8, null), try get(t.allocator, t.io, k));
 }

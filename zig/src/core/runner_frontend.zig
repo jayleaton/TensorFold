@@ -94,6 +94,7 @@ fn translateImpl(raw: ?*anyopaque, a: std.mem.Allocator, cell: Cell) std.mem.All
     var source: []const u8 = cell.code;
     var owned: ?[]u8 = null;
     var structured = false;
+    var collections_mode = false;
     var estimated_steps: ?usize = null;
     defer if (owned) |bytes| a.free(bytes);
     if (lang == .python) {
@@ -102,9 +103,14 @@ fn translateImpl(raw: ?*anyopaque, a: std.mem.Allocator, cell: Cell) std.mem.All
             owned = try program.wrapBody(a, body.source);
             estimated_steps = body.estimated_steps;
         } else {
-            const body = try blocks.lowerWithCost(a, cell.code) orelse return .{ .abstain = .unsupported };
-            owned = body.source;
-            estimated_steps = body.estimated_steps;
+            if (try blocks.lowerWithCost(a, cell.code)) |body| {
+                owned = body.source;
+                estimated_steps = body.estimated_steps;
+            } else if (try @import("runner_frontend_collections.zig").lowerWithCost(a, cell.code)) |body| {
+                owned = body.source;
+                estimated_steps = body.estimated_steps;
+                collections_mode = true;
+            } else return .{ .abstain = .unsupported };
             structured = true;
         }
         source = owned.?;
@@ -115,6 +121,8 @@ fn translateImpl(raw: ?*anyopaque, a: std.mem.Allocator, cell: Cell) std.mem.All
     const bytes = if (context) |ctx| blk: {
         var settings = ctx.compiler;
         if (structured) settings.stack_limit = 4096;
+        settings.collection_stack = collections_mode;
+        if (collections_mode and settings.optimize != .O0) settings.optimize = .O1;
         settings.opaque_inputs = lang == .python;
         settings.estimated_steps = estimated_steps;
         break :blk try program.compile(a, ctx.io, source, settings);
@@ -124,6 +132,7 @@ fn translateImpl(raw: ?*anyopaque, a: std.mem.Allocator, cell: Cell) std.mem.All
         break :blk try program.compile(a, threaded.io(), source, .{
             .clang = "/usr/bin/clang",
             .stack_limit = if (structured) 4096 else 0,
+            .collection_stack = collections_mode,
             .opaque_inputs = lang == .python,
             .estimated_steps = estimated_steps,
         });

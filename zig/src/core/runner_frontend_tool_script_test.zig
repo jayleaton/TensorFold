@@ -112,11 +112,11 @@ test "configured whole division script passes optimized work and rodata folding 
     try optimization.checkOptimization(&env, source, expected, true);
 }
 
-test "configured Boolean coercion falls back with integer unary plus semantics" {
+test "configured Boolean coercion preserves CPython semantics through generic fallback" {
     var env = try t.environ.createMap(t.allocator);
     defer env.deinit();
     const clang = env.get("TF_RUNNER_CLANG") orelse return error.SkipZigTest;
-    const root = env.get("TF_RUNNER_QWENPUTER") orelse return error.SkipZigTest;
+    _ = env.get("TF_RUNNER_QWENPUTER") orelse return error.SkipZigTest;
     var context: frontend.Context = .{ .io = t.io, .compiler = .{
         .clang = clang,
         .linker = env.get("TF_RUNNER_LLD"),
@@ -127,10 +127,17 @@ test "configured Boolean coercion falls back with integer unary plus semantics" 
         .lang = "python",
         .code = "print(+(1==1))",
     });
+    defer if (result == .program) t.allocator.free(result.program.bytes);
     try t.expect(result == .program);
-    defer t.allocator.free(result.program.bytes);
-    try reference.check(root, env.get("TF_RUNNER_REFERENCE_PYTHON") orelse "/usr/bin/python3", result.program, "1\n");
-    for ([_][]const u8{ "print(len(str(1==1)))", "print(sum(map(int,str(1==1))))" }) |code| {
-        try t.expect((try f.translate(f.ctx, t.allocator, .{ .form = .fence, .lang = "python", .code = code })) == .abstain);
+    const compat = @import("runner_frontend_collections_compat_test.zig");
+    try compat.checkExact(&env, result.program, "print(+(1==1))");
+    for ([_][]const u8{
+        "print(+True)",
+        "print(-True)",
+        "print(len(str(1==1)))",
+        "x=1==1;print(len(str(x)))",
+        "print(sum(map(int,str(1==1))))",
+    }) |code| {
+        try compat.checkRejectionOrExact(&env, &f, .{ .form = .fence, .lang = "python", .code = code });
     }
 }

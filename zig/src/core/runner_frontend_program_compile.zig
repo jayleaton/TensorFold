@@ -17,6 +17,7 @@ pub const Config = struct {
     scratch_root: []const u8 = "/tmp",
     optimize: enum { O0, O1, O2 } = .O1,
     stack_limit: usize = 0,
+    collection_stack: bool = false,
     opaque_inputs: bool = false,
     estimated_steps: ?usize = null,
     step_budget: usize = 10522,
@@ -268,7 +269,7 @@ pub fn compile(a: Allocator, io: std.Io, source: []const u8, config: Config) All
             else => return null,
         };
         defer a.free(usage);
-        if (!safeStackUsage(usage, config.stack_limit)) return null;
+        if (!stackUsage(usage, config.stack_limit, config.collection_stack)) return null;
     }
     const bytes = dir.readFileAlloc(io, "program.elf", a, .limited(1 << 20)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -299,7 +300,7 @@ pub fn scratch(io: std.Io, parent: std.Io.Dir, buf: *[64]u8) ?[]const u8 {
 
 fn imageKey(normalized: []const u8, config: Config) ?elf_cache.Key {
     if (!elf_cache.wanted(config.opaque_inputs, config.step_budget, config.estimated_steps)) return null;
-    return elf_cache.key(normalized, config.clang, config.linker, @backingInt(config.optimize), config.stack_limit);
+    return elf_cache.key(normalized, config.clang, config.linker, @backingInt(config.optimize), config.stack_limit, config.collection_stack);
 }
 
 /// The image-cache key compile() uses for `source` under `config`, or null when it would not cache (tests).
@@ -319,6 +320,10 @@ fn remaining(io: std.Io, config: Config, milliseconds: i64) ?std.Io.Duration {
 
 // Summed static frames bound every call chain in the trusted, recursion-free Python lowering.
 pub fn safeStackUsage(report: []const u8, limit: usize) bool {
+    return stackUsage(report, limit, false);
+}
+
+fn stackUsage(report: []const u8, limit: usize, collections: bool) bool {
     var total: usize = 0;
     var functions: usize = 0;
     var lines = std.mem.splitScalar(u8, report, '\n');
@@ -326,11 +331,16 @@ pub fn safeStackUsage(report: []const u8, limit: usize) bool {
         const line = std.mem.trim(u8, raw, "\r");
         if (line.len == 0) continue;
         var fields = std.mem.splitScalar(u8, line, '\t');
-        _ = fields.next() orelse return false;
+        const label = fields.next() orelse return false;
+        const name_start = if (std.mem.lastIndexOfScalar(u8, label, ':')) |at| at + 1 else 0;
+        const name = label[name_start..];
+        const recursive = std.mem.startsWith(u8, name, "equal") or std.mem.startsWith(u8, name, "compare") or
+            std.mem.startsWith(u8, name, "repr");
+        const factor: usize = if (collections and recursive) 9 else 1;
         const size = std.fmt.parseInt(usize, fields.next() orelse return false, 10) catch return false;
         const kind = fields.next() orelse return false;
-        if (fields.next() != null or !std.mem.eql(u8, kind, "static") or size > limit - total) return false;
-        total += size;
+        if (fields.next() != null or !std.mem.eql(u8, kind, "static") or size > (limit - total) / factor) return false;
+        total += size * factor;
         functions += 1;
     }
     return functions != 0;
@@ -553,4 +563,14 @@ test "generated support has a bounded size allowance while raw cells retain thei
     defer a.free(oversized);
     @memset(oversized, ' ');
     try std.testing.expectEqual(@as(?[]u8, null), try normalizeWithTrust(a, oversized, true));
+}
+
+// The closed collections runtime allows at most nine frames through its recursive value walkers.
+test "collections stack admission charges every bounded recursive frame" {
+    const report = "p.c:1:main\t128\tstatic\np.c:2:equal\t32\tstatic\n" ++
+        "p.c:3:compare.specialized\t48\tstatic\np.c:4:repr\t64\tstatic\n";
+    try std.testing.expect(safeStackUsage(report, 272));
+    try std.testing.expect(stackUsage(report, 1424, true));
+    try std.testing.expect(!stackUsage(report, 1423, true));
+    try std.testing.expect(!stackUsage("p.c:2:equal\t32\tdynamic\n", 4096, true));
 }
