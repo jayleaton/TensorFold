@@ -18,6 +18,7 @@ pub const Tracer = struct {
     names: std.ArrayList(expr.Name) = .empty,
     fired: std.ArrayList([]const u8) = .empty,
     repeat: u8 = 0, // times a displayed line may be owned again when the reasoning restates it (TraceAsk.repeat)
+    whole: bool = false, // TF_DSV41_RUNNER_STATED: also comma sentences, gcd(x, y), `L = R.` restated and a hex value
 
     pub fn init(gpa: Allocator) Tracer {
         return .{ .keep = .init(gpa), .scratch = .init(gpa) };
@@ -60,7 +61,7 @@ pub const Tracer = struct {
         try t.definitions(clean, &define);
         var heads: std.ArrayList(text.Head) = .empty;
         try text.goalHeads(a, clean, &heads);
-        try text.bareHeads(a, clean, &heads);
+        try text.bareHeads(a, clean, t.whole, &heads);
         std.mem.sort(text.Head, heads.items, {}, text.Head.less);
         var first: ?Found = null;
         var last_head: usize = 0;
@@ -69,8 +70,13 @@ pub const Tracer = struct {
             if (first != null) continue;
             if (try t.statement(clean, h)) |f| first = f;
         }
+        var tail = last_head;
+        if (first == null and t.whole) if (try t.wholeShape(clean)) |w| {
+            first = w.found;
+            tail = w.end;
+        };
         if (first) |*f| {
-            f.same_line = text.cueIn(clean[last_head..]);
+            f.same_line = text.cueIn(clean[tail..]);
             f.run = try printed(a, f.run);
             return f.*;
         }
@@ -111,7 +117,7 @@ pub const Tracer = struct {
     fn statement(t: *Tracer, clean: []const u8, h: text.Head) Allocator.Error!?Found {
         const a = t.scratch.allocator();
         const rest = clean[h.end..];
-        const ph = text.phrase(rest) orelse return null;
+        const ph = text.phrase(rest, t.whole) orelse return null;
         if (text.approx(rest[0..ph.end])) return null;
         if (text.listed(rest, ph)) return null;
         if (std.mem.indexOfScalar(u8, text.sentenceAt(clean, h.end), '?') != null) return null;
@@ -133,6 +139,10 @@ pub const Tracer = struct {
                 f = .{ .source = try std.fmt.allocPrint(a, "({s}) * ({s})", .{ parts[0].source, parts[1].source }), .display = try std.fmt.allocPrint(a, "{s} * {s}", .{ try wrapped(a, parts[0]), try wrapped(a, parts[1]) }), .run = try std.fmt.allocPrint(a, "({s}) * ({s})", .{ parts[0].run, parts[1].run }) };
                 bound = expr.sat(parts[0].bound + parts[1].bound);
             },
+            .gcd => {
+                f = .{ .source = try std.fmt.allocPrint(a, "gcd({s}, {s})", .{ parts[0].source, parts[1].source }), .display = try std.fmt.allocPrint(a, "gcd({s}, {s})", .{ parts[0].display, parts[1].display }), .run = try std.fmt.allocPrint(a, "from math import gcd\nprint(gcd({s}, {s}))", .{ parts[0].run, parts[1].run }) };
+                bound = @max(parts[0].bound, parts[1].bound);
+            },
             .subfrom => {
                 f = .{ .source = try std.fmt.allocPrint(a, "({s}) - ({s})", .{ parts[1].source, parts[0].source }), .display = try std.fmt.allocPrint(a, "{s} - {s}", .{ try wrapped(a, parts[1]), try wrapped(a, parts[0]) }), .run = try std.fmt.allocPrint(a, "({s}) - ({s})", .{ parts[1].run, parts[0].run }) };
                 bound = expr.sat(@max(parts[0].bound, parts[1].bound) + 1);
@@ -142,6 +152,48 @@ pub const Tracer = struct {
         // a bare sentence counts only when it is plainly a computation: a power or a six-digit literal
         if (h.bare and std.mem.indexOf(u8, f.source, "**") == null and !hasDigitRun(f.source, 6)) return null;
         return f;
+    }
+
+    /// TF_DSV41_RUNNER_STATED's line shapes: `L = R.` with L over names and literally R, or a hex literal's value.
+    fn wholeShape(t: *Tracer, clean: []const u8) Allocator.Error!?struct { found: Found, end: usize } {
+        const a = t.scratch.allocator();
+        for (clean, 0..) |c, k| {
+            if (c != '=' or (k > 0 and std.mem.indexOfScalar(u8, "=<>!", clean[k - 1]) != null)) continue;
+            if (k + 1 < clean.len and clean[k + 1] == '=') continue;
+            const sentence = text.sentenceAt(clean, k);
+            if (text.hypothetical(sentence)) continue;
+            const from = @intFromPtr(sentence.ptr) - @intFromPtr(clean.ptr);
+            // the left side: names and operators only (a definition or a stated literal is not a restatement)
+            const left = std.mem.trim(u8, clean[from..k], " \t");
+            if (left.len == 0 or std.mem.indexOfAny(u8, left, "0123456789") != null) continue;
+            const l = try t.parse(left) orelse continue;
+            if (l.ops == 0) continue;
+            var r0 = k + 1;
+            while (r0 < clean.len and text.isSpace(clean[r0])) r0 += 1;
+            const rest = clean[r0..];
+            const ph = text.phrase(rest, false) orelse continue;
+            if (ph.kind != .expr or text.approx(rest[0..ph.end])) continue;
+            const r = try t.parse(rest[ph.parts[0][0]..ph.parts[0][1]]) orelse continue;
+            if (r.ops == 0 or r.bound > max_digits or t.firedHas(r.display)) continue;
+            if (!std.mem.eql(u8, try literalParens(a, l.source), r.source)) continue;
+            return .{ .found = .{ .source = r.source, .display = r.display, .run = r.run }, .end = r0 + ph.end };
+        }
+        // `Hex = 0x….` / `This is 0x….`: ten or more hex digits ending a sentence; the radix runs on the circuit
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, clean, i, "0x")) |h| : (i = h + 2) {
+            const lead = std.mem.trimEnd(u8, clean[0..h], " \t");
+            if (h > 0 and !text.isSpace(clean[h - 1])) continue;
+            if (!std.mem.endsWith(u8, lead, "=") and !(lead.len >= 2 and text.wordAt(lead, lead.len - 2, "is", true))) continue;
+            var j = h + 2;
+            while (j < clean.len and std.ascii.isHex(clean[j])) j += 1;
+            if (j - h - 2 < 10 or j - h - 2 > 100 or (j < clean.len and text.isWord(clean[j]))) continue;
+            if (!text.sentenceEndsAt(clean, j)) continue;
+            const lit = clean[h..j];
+            const e = try t.parse(lit) orelse continue;
+            if (e.bound > max_digits or t.firedHas(lit)) continue;
+            return .{ .found = .{ .source = try a.dupe(u8, lit), .display = try a.dupe(u8, lit), .run = try a.dupe(u8, lit) }, .end = j };
+        }
+        return null;
     }
 
     fn parse(t: *Tracer, s: []const u8) Allocator.Error!?Expr {
@@ -203,6 +255,25 @@ fn printed(a: Allocator, run: []const u8) Allocator.Error![]const u8 {
         if (depth == 0) return run; // pow(...) is only part of the statement
     }
     return std.mem.concat(a, u8, &.{ "print(", run, ")" });
+}
+
+/// A name's source with the brackets around each plain literal dropped: `(98765432109)*(12345678901)` reads as written.
+fn literalParens(a: Allocator, source: []const u8) Allocator.Error![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < source.len) : (i += 1) {
+        if (source[i] == '(') {
+            var j = i + 1;
+            while (j < source.len and std.ascii.isDigit(source[j])) j += 1;
+            if (j > i + 1 and j < source.len and source[j] == ')') {
+                try out.appendSlice(a, source[i + 1 .. j]);
+                i = j;
+                continue;
+            }
+        }
+        try out.append(a, source[i]);
+    }
+    return out.items;
 }
 
 fn hasArith(source: []const u8) bool {

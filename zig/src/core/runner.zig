@@ -56,6 +56,7 @@ pub const Config = struct {
         c.scan.inline_arith = try knob(u1, get, prefix ++ "_INLINE_ARITH", 1, 0, 1) == 1;
         c.scan.inline_chain = try knob(u1, get, prefix ++ "_INLINE_CHAIN", 0, 0, 1) == 1;
         c.scan.trace_window = try knob(u32, get, prefix ++ "_TRACE_WINDOW", c.scan.trace_window, 1, 65536);
+        c.scan.trace_whole = try knob(u1, get, prefix ++ "_STATED", 0, 0, 1) == 1;
         if (get(prefix ++ "_FORMS")) |f| if (f.len > 0) {
             c.scan.fence = false;
             c.scan.repl = false;
@@ -66,6 +67,8 @@ pub const Config = struct {
                 if (std.mem.eql(u8, form, "fence")) c.scan.fence = true else if (std.mem.eql(u8, form, "repl")) c.scan.repl = true else if (std.mem.eql(u8, form, "inline")) c.scan.inline_math = true else if (std.mem.eql(u8, form, "trace")) c.scan.trace = true else return bad(prefix ++ "_FORMS", f);
             }
         };
+        // the knob widens form trace's statements: without the form it would do nothing
+        if (c.scan.trace_whole and !c.scan.trace) return bad(prefix ++ "_STATED", "1 (form trace is off)");
         if (get(prefix ++ "_SPANS")) |sp| if (sp.len > 0) {
             if (std.mem.eql(u8, sp, "reasoning")) c.scan.reasoning_only = true else if (!std.mem.eql(u8, sp, "all")) return bad(prefix ++ "_SPANS", sp);
         };
@@ -587,4 +590,5 @@ test {
     _ = @import("runner_inline_chain_test.zig");
     _ = @import("runner_inline_context_test.zig");
     _ = @import("runner_inline_hex_test.zig");
+    _ = @import("runner_trace_stated_test.zig");
 }
