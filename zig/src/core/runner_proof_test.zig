@@ -314,6 +314,7 @@ test "runner proof: S1's and S2's six saved cells take the graph route and print
         .{ "print(7**123%1000000007)", "937329259\n" },
         .{ "print(3**400%10**18)", "192443283334088001\n" },
         .{ "print(0xFEDCBA9876543210*2**64+0x0123456789ABCDEF)", "338770000845734292516042252062085074415\n" },
+        .{ "a=3\nprint(100//(a+1))\n", "25\n" }, // a computed divisor (T2's table refused it before graph-v4)
     }) |c| {
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
@@ -327,6 +328,15 @@ test "runner proof: S1's and S2's six saved cells take the graph route and print
             std.debug.print("{s}: {t} '{s}'\n", .{ c[0], r.status, r.out });
             return error.TestExpectedEqual;
         }
+    }
+    // a zero divisor is Python's ZeroDivisionError: no printed value is owned
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const z = try front.translate(front.ctx, arena.allocator(), .{ .form = .fence, .lang = "python", .code = "a=-1\nprint(100//(a+1))\n" });
+    if (z == .program) {
+        const r = finish(b, try b.start(1, z.program, 4_000_000));
+        std.debug.print("zero divisor: {t} '{s}'\n", .{ r.status, r.out });
+        try std.testing.expect(r.status != .ok);
     }
     b.release(1);
 }
