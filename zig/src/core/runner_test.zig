@@ -128,7 +128,7 @@ const Box = struct {
     mutex: std.Io.Mutex = .init,
     tokens: std.ArrayList(u32) = .empty,
     done: ?Reason = null,
-    cells: [512]u8 = undefined, // the finished event's runner summary
+    cells: [8192]u8 = undefined, // the finished event's runner receipt
     cells_len: usize = 0,
     fn event(ctx: *anyopaque, _: api.Id, e: *const api.Event) void {
         const b: *@This() = @ptrCast(@alignCast(ctx));
@@ -396,7 +396,7 @@ test "runner: a reply's runtime block counts its cells by form, owned tokens and
     try std.testing.expect(std.mem.startsWith(u8, sums[1], "{\"fence\":{\"closed\":1,\"owned\":0,\"abstained\":1,\"owned_tokens\":0}"));
     // the owned product's tokens committed, then the model's own: its resume was timed; an abstain forces nothing
     try std.testing.expect(std.mem.indexOf(u8, sums[0], ",\"resume_ms\":") != null);
-    try std.testing.expect(std.mem.endsWith(u8, sums[1], ",\"resume_ms\":0}"));
+    try std.testing.expect(std.mem.endsWith(u8, sums[1], ",\"resume_ms\":0,\"cells\":[]}"));
     var off: [1][]u8 = undefined;
     var lone = [_]Model{.{ .lead = mul_cell }};
     freeAll(try replies(&lone, .{ .runner = false, .summaries = &off }, &back));

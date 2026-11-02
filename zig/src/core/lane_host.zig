@@ -264,8 +264,7 @@ pub const LaneHost = struct {
         const stats: Stats = if (job.started) .{ .rounds = s.rounds, .drafted = s.drafted, .accepted = s.accepted, .min_rows = s.min_rows, .loop_period = s.loop_period, .gpu_seconds = s.gpu_seconds, .prefill_seconds = if (job.prefilled) |done| @as(f64, @floatFromInt(@as(i64, @intCast(@max(0, done - job.began))))) / 1e9 else null } else .{};
         var told = if (job.started) recalls.finished(h, job, reason, stats) else stats;
         told.queued_seconds = if (job.admitted_ns) |at| @as(f64, @floatFromInt(@max(0, at - job.submitted))) / 1e9 else 0;
-        var cells: [512]u8 = undefined;
-        const summary = if (job.runner) |rs| rs.summary(&cells) else "";
+        const summary = if (job.runner) |rs| rs.receipt() else ""; // the session's buffer: freed with it, after the emit
         emit(job, .{ .finished = .{ .reason = reason, .stats = told, .message = message, .runner = summary } });
         if (job.started) {
             if (s.grammar) |g| g.deinit(h.gpa);
