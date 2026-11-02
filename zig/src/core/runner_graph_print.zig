@@ -93,11 +93,6 @@ fn part(m: anytype, ref: u32, style: packet.Style, precision: u8, ending: packet
     const control = @as(u32, precision) + mode * 100 + @as(u32, @backingInt(ending)) * 1000 + @as(u32, @intFromBool(prefix)) * 10000;
     var text: [16]u8 = undefined;
     m.values[0] = try packet.literal(try std.fmt.bufPrint(&text, "{d}", .{control}));
-    var wide = false;
-    for (62..packet.max_digits) |digit| {
-        const bits = m.values[ref][digit / 31][2 + digit % 31 * 4 ..][0..4];
-        for (bits) |bit| wide = wide or bit != 0;
-    }
-    const t = m.bank.find("format", if (wide) 128 else 62) orelse return error.GraphEmitMissing;
+    const t = m.bank.find("format", packet.outputWidth(&m.values[ref])) orelse return error.GraphEmitMissing;
     return m.invoke(t, &.{ ref, 0 }, 0, budget, out, cancel, true);
 }

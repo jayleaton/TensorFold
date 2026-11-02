@@ -51,6 +51,10 @@ def _controls(b, value, control, max_precision=18):
     error = b.any([value.error, control.error, control.sign, b.nz(digits[5:]),
                    b.ge(precision, max_precision + 1, 0, 99), b.ge(digits[2], 5, 0, 9),
                    b.ge(digits[3], len(ENDINGS), 0, 9), b.ge(prefix, 2, 0, 9), invalid_precision, invalid_bool])
+    if b.width > 128:
+        precision = b.choose(error, b.zero, precision)
+        prefix = b.choose(error, b.zero, prefix)
+        fixed = b.choose(error, b.zero, fixed)
     return precision, modes, endings, prefix, fixed, error
 
 

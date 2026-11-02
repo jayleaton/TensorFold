@@ -10,7 +10,7 @@ pub const Slots = lazy.Slots;
 
 pub const Template = struct {
     name: []const u8,
-    width: u8,
+    width: u16,
     circuit: model.Circuit,
     inputs: u8,
     outputs: u8,
@@ -64,7 +64,7 @@ const Preparation = struct {
         const t = p.owner;
         var circuit = try binary.loadPinned(p.gpa, p.path, t.name, t.width, &p.header);
         errdefer circuit.deinit(p.gpa);
-        const layout = try lazy.Binding.inspect(&circuit, t.width);
+        const layout = try lazy.Binding.inspect(&circuit, try binary.bindingWidth(t.width));
         if ((t.inputs != 0 and layout.inputs != t.inputs) or (t.outputs != 0 and layout.outputs != t.outputs))
             return error.GraphSlotArity;
         if (t.inputs == 0) t.inputs = layout.inputs;
@@ -81,7 +81,7 @@ pub const LoadMode = enum { lazy, eager };
 
 const Descriptor = struct {
     name: []const u8,
-    width: u8,
+    width: u16,
     path: []const u8,
     inputs: ?u8 = null,
     outputs: ?u8 = null,
@@ -94,7 +94,7 @@ pub const PreparedPlan = struct {
     constants: []const packet.Value,
     total_values: usize,
     algorithm: ?[]const u8,
-    width: u8,
+    width: u16,
     precision: u8,
 };
 
@@ -135,7 +135,7 @@ pub const Bank = struct {
             if (t.isPrepared()) t.circuit.deinit(a);
         };
         for (doc.templates, templates, preparations) |d, *t, *preparation| {
-            if (!packet.widthValid(d.width) or d.name.len == 0 or d.path.len == 0) return error.GraphTemplate;
+            if (!packet.widthValid(d.width) or d.width == 255 or d.name.len == 0 or d.path.len == 0) return error.GraphTemplate;
             if (d.inputs) |n| if (n == 0 or n > packet.max_arity) return error.GraphSlotArity;
             if (d.outputs) |n| if (n == 0 or n > packet.max_arity) return error.GraphSlotArity;
             for (templates[0..loaded]) |prior| if (prior.width == d.width and std.mem.eql(u8, prior.name, d.name))
@@ -179,6 +179,11 @@ pub const Bank = struct {
             if (wide.inputs != 1 or wide.outputs != 1) return error.GraphSlotArity;
             break;
         };
+        for (templates) |t| if (t.width == 256) {
+            try bank.require("emit", 256, 1, 1);
+            try bank.require("format", 256, 2, 2);
+            break;
+        };
         bank.arena = arena;
         if (mode == .eager) try bank.prepareAll();
         return bank;
@@ -210,7 +215,7 @@ pub const Bank = struct {
     }
 
     /// Clears only a cached failure; the next use retries the pinned pack and successful circuits are never replaced.
-    pub fn retryFailed(b: *const Bank, name: []const u8, width: u8) !void {
+    pub fn retryFailed(b: *const Bank, name: []const u8, width: u16) !void {
         const t = b.find(name, width) orelse return error.GraphTemplate;
         const p = t.preparation orelse return error.GraphAlreadyPrepared;
         var threaded: std.Io.Threaded = .init_single_threaded;
@@ -223,7 +228,7 @@ pub const Bank = struct {
     }
 
     /// Lookup reads metadata only; call Template.prepare before accessing its circuit or logical slots.
-    pub fn find(b: *const Bank, name: []const u8, width: u8) ?*const Template {
+    pub fn find(b: *const Bank, name: []const u8, width: u16) ?*const Template {
         for (b.templates) |*t| if (t.width == width and std.mem.eql(u8, t.name, name)) return t;
         return null;
     }
@@ -300,14 +305,22 @@ pub const Bank = struct {
         }
     }
 
-    fn require(b: *const Bank, name: []const u8, width: u8, inputs: u8, outputs: u8) !void {
+    fn require(b: *const Bank, name: []const u8, width: u16, inputs: u8, outputs: u8) !void {
         const t = b.find(name, width) orelse return error.GraphTemplate;
         if (t.inputs != inputs or t.outputs != outputs) return error.GraphSlotArity;
     }
 
-    fn validateAlgorithm(b: *const Bank, family: packet.Algorithm, width: u8, precision: u8) !void {
-        if (!packet.widthValid(width) or precision > 18 or (family != .fixed_div and precision != 0))
+    fn validateAlgorithm(b: *const Bank, family: packet.Algorithm, width: u16, precision: u8) !void {
+        if (!packet.algorithmWidthValid(family, width) or precision > 18 or (family != .fixed_div and precision != 0))
             return error.GraphAlgorithm;
+        if (width == 256) {
+            try b.require("meta", width, 2, 3);
+            try b.require("divstep", width, 3, 2);
+            try b.require("divfinal", width, 4, 2);
+            try b.require("emit_first", width, 1, 1);
+            try b.require("emit_last", width, 1, 1);
+            return;
+        }
         if (std.mem.startsWith(u8, @tagName(family), "f64_")) {
             if (width != 128) return error.GraphAlgorithm;
             try b.require("raw_meta", 128, 2, 3);

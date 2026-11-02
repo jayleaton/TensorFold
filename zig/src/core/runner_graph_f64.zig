@@ -8,7 +8,7 @@ const printing = @import("runner_graph_f64_print.zig");
 const End = @FieldType(api.RunEnd, "end");
 const Cancel = ?*const std.atomic.Value(bool);
 
-pub fn compute(m: anytype, kind: []const u8, width: u8, refs: []const u32, dest: usize, budget: u64, out: *std.ArrayList(u8), cancel: Cancel) !End {
+pub fn compute(m: anytype, kind: []const u8, width: u16, refs: []const u32, dest: usize, budget: u64, out: *std.ArrayList(u8), cancel: Cancel) !End {
     if (width != 128 or std.mem.eql(u8, kind, "f64_repr")) return error.GraphAlgorithm;
     const family = std.meta.stringToEnum(packet.Algorithm, kind) orelse return error.GraphAlgorithm;
     const outputs = packet.algorithmOutputs(family);

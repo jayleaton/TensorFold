@@ -7,12 +7,12 @@ const End = @FieldType(api.RunEnd, "end");
 const Cancel = ?*const std.atomic.Value(bool);
 
 /// Executes an algorithm in request-local scratch and copies only its typed outputs back to the caller.
-pub fn compute(m: anytype, kind: []const u8, width: u8, precision: u8, refs: []const u32, dest: usize, budget: u64, out: *std.ArrayList(u8), cancel: Cancel) !End {
+pub fn compute(m: anytype, kind: []const u8, width: u16, precision: u8, refs: []const u32, dest: usize, budget: u64, out: *std.ArrayList(u8), cancel: Cancel) !End {
     if (std.mem.startsWith(u8, kind, "f64_")) return @import("runner_graph_f64.zig").compute(m, kind, width, refs, dest, budget, out, cancel);
     if (std.mem.eql(u8, kind, "factorize")) return error.GraphAlgorithm;
     const family = std.meta.stringToEnum(packet.Algorithm, kind) orelse return error.GraphAlgorithm;
     const outputs = packet.algorithmOutputs(family);
-    if (!packet.widthValid(width) or refs.len != packet.algorithmArity(family) or dest + outputs > m.values.len)
+    if (!packet.algorithmWidthValid(family, width) or refs.len != packet.algorithmArity(family) or dest + outputs > m.values.len)
         return error.GraphAlgorithmScratch;
     if (precision > 18 or (family != .fixed_div and precision != 0)) return error.GraphPrecision;
     const original = m.values;
@@ -46,7 +46,7 @@ pub fn compute(m: anytype, kind: []const u8, width: u8, precision: u8, refs: []c
 }
 
 /// Named legacy algorithms retain their token schedules; new fractional formats use the compiled formatter.
-pub fn run(m: anytype, kind: []const u8, width: u8, budget: u64, out: *std.ArrayList(u8), cancel: Cancel) !api.RunEnd {
+pub fn run(m: anytype, kind: []const u8, width: u16, budget: u64, out: *std.ArrayList(u8), cancel: Cancel) !api.RunEnd {
     if (std.mem.startsWith(u8, kind, "f64_")) return @import("runner_graph_f64.zig").run(m, kind, budget, out, cancel);
     if (std.mem.eql(u8, kind, "factorize")) return runFactorize(m, width, budget, out, cancel);
     const family = std.meta.stringToEnum(packet.Algorithm, kind) orelse return error.GraphAlgorithm;
@@ -80,8 +80,8 @@ pub fn run(m: anytype, kind: []const u8, width: u8, budget: u64, out: *std.Array
     return .{ .end = .halted, .steps = m.steps };
 }
 
-fn runFactorize(m: anytype, width: u8, budget: u64, out: *std.ArrayList(u8), cancel: Cancel) !api.RunEnd {
-    if (!packet.widthValid(width) or m.values.len < 2) return error.GraphAlgorithmScratch;
+fn runFactorize(m: anytype, width: u16, budget: u64, out: *std.ArrayList(u8), cancel: Cancel) !api.RunEnd {
+    if (!packet.widthValid(width) or width > 128 or m.values.len < 2) return error.GraphAlgorithmScratch;
     if (m.precision != 0) return error.GraphPrecision;
     const original = m.values;
     const zero = try packet.literal("0");
@@ -113,7 +113,7 @@ fn runFactorize(m: anytype, width: u8, budget: u64, out: *std.ArrayList(u8), can
 fn Context(comptime M: type) type {
     return struct {
         m: M,
-        width: u8,
+        width: u16,
         budget: u64,
         out: *std.ArrayList(u8),
         cancel: Cancel,
@@ -146,7 +146,7 @@ fn Context(comptime M: type) type {
 
         fn emitNamed(c: *Self, name: []const u8, ref: u32) !void {
             const needed = if (c.m.adaptive_widths) occupiedDigits(&c.m.values[ref]) else c.width;
-            const width: u8 = if (needed > 62) 128 else 62;
+            const width: u16 = if (needed > 128) 256 else if (needed > 62) 128 else 62;
             const t = c.m.bank.find(name, width) orelse return error.GraphEmitMissing;
             c.end = try c.m.invoke(t, &.{ref}, 0, c.budget, c.out, c.cancel, true);
             if (c.end != .halted) return error.GraphAlgorithmStopped;
@@ -382,8 +382,8 @@ fn occupiedDigits(value: *const packet.Value) usize {
     return digits;
 }
 
-fn bucket(needed: usize) u8 {
-    for ([_]u8{ 1, 2, 4, 8, 16, 32, 62, 128 }) |width| if (needed <= width) return width;
+fn bucket(needed: usize) u16 {
+    for ([_]u16{ 1, 2, 4, 8, 16, 32, 62, 128, 256 }) |width| if (needed <= width) return width;
     unreachable;
 }
 

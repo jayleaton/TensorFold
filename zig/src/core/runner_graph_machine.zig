@@ -25,7 +25,7 @@ pub const Machine = struct {
     reuse_states: bool = true,
     adaptive_widths: bool = true,
     algorithm: ?[]const u8 = null,
-    width: u8 = 62,
+    width: u16 = 62,
     precision: u8 = 0,
     prints: []const packet.Print = &.{},
 
@@ -40,7 +40,7 @@ pub const Machine = struct {
         var constants: []const packet.Value = &.{};
         var prepared_count: ?usize = null;
         var algorithm: ?[]const u8 = null;
-        var width: u8 = 62;
+        var width: u16 = 62;
         var precision: u8 = 0;
         if (p.plan) |name| {
             if (p.ops.len != 0 or p.result != 0 or p.prints.len != 0) return error.GraphNamedPlanOverride;
@@ -114,10 +114,7 @@ pub const Machine = struct {
             }
             return .{ .end = .halted, .steps = m.steps };
         }
-        const width: u8 = blk: {
-            fits(&m.values[m.result], 62) catch break :blk 128;
-            break :blk 62;
-        };
+        const width = packet.outputWidth(&m.values[m.result]);
         const emitter = m.bank.find("emit", width) orelse return error.GraphEmitMissing;
         const end = try m.invoke(emitter, &.{m.result}, 0, budget, out, cancel, true);
         return .{ .end = end, .steps = m.steps };
@@ -181,7 +178,7 @@ fn cancelled(flag: ?*const std.atomic.Value(bool)) bool {
     return if (flag) |f| f.load(.acquire) else false;
 }
 
-fn fits(v: *const packet.Value, width: u8) !void {
+fn fits(v: *const packet.Value, width: u16) !void {
     for (width..packet.max_digits) |digit| {
         const bits = v[digit / 31][2 + digit % 31 * 4 ..][0..4];
         for (bits) |bit| if (bit != 0) return error.GraphNarrowBinding;

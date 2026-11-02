@@ -137,7 +137,7 @@ def negative_controls(cases, manifest):
     require(text and text[-1] in "0123456789", "control seed is not signed decimal")
     bad_operand["values"][0] = text[:-1] + ("1" if text[-1] == "0" else "0")
     bad_literal = copy.deepcopy(seed["packet"])
-    bad_literal["values"][0] = "0" * 129
+    bad_literal["values"][0] = "0" * 257
     override = copy.deepcopy(seed["packet"])
     override["ops"] = [{"op": "add", "width": 4, "a": 0, "b": 1}]
     missing = "__graph_verify_missing_plan__"

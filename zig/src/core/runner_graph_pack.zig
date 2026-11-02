@@ -3,7 +3,7 @@ const std = @import("std");
 const model = @import("steps_v1/runner_circuit_model.zig");
 const binary = @import("runner_graph_binary.zig");
 const loader = @import("steps_v1/runner_circuit_load.zig");
-const Identity = struct { experimental: struct { kind: []const u8, contract: struct { op: []const u8, width: u8 } } };
+const Identity = struct { experimental: struct { kind: []const u8, contract: struct { op: []const u8, width: u16 } } };
 
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
@@ -15,7 +15,7 @@ pub fn main(init: std.process.Init) !void {
     defer identity.deinit();
     const contract = identity.value.experimental.contract;
     if (!std.mem.eql(u8, identity.value.experimental.kind, "graph_template") or
-        !@import("runner_graph_packet.zig").widthValid(contract.width)) return error.ExpectedGraphTemplate;
+        !@import("runner_graph_packet.zig").widthValid(contract.width) or contract.width == 255) return error.ExpectedGraphTemplate;
     var circuit = try loader.fromBytes(init.gpa, source);
     defer circuit.deinit(init.gpa);
     try requireGraph(&circuit, contract.width);
@@ -31,7 +31,7 @@ pub fn main(init: std.process.Init) !void {
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = args[2], .data = bytes });
 }
 
-fn requireGraph(c: *const model.Circuit, width: u8) !void {
+fn requireGraph(c: *const model.Circuit, width: u16) !void {
     var input = false;
     var output = false;
     for (c.table_names) |name| {

@@ -252,7 +252,7 @@ const Parser = struct {
         const text = p.source[start..p.at];
         if (!hex and text.len > 1 and text[0] == '0')
             for (text) |ch| if (ch != '0') return error.Unsupported;
-        const value = std.fmt.parseInt(u512, if (hex) text[2..] else text, if (hex) 16 else 10) catch return error.Unsupported;
+        const value = std.fmt.parseInt(u1024, if (hex) text[2..] else text, if (hex) 16 else 10) catch return error.Unsupported;
         const decimal = try std.fmt.allocPrint(p.a, "{d}", .{value});
         if (decimal.len > packet.max_digits) return error.Unsupported;
         return p.push(.{ .kind = .literal, .text = decimal });
@@ -277,14 +277,16 @@ const Lower = struct {
     fn initialize(l: *Lower) Failure!void {
         try l.values.appendSlice(l.a, &.{ "0", "1" });
         for (l.nodes, 0..) |node, i| if (node.kind == .literal) {
+            if (node.text.len > 128 and l.bank.find("format", 256) == null) return error.Unsupported;
             l.literals[i] = @intCast(l.values.items.len);
             try l.values.append(l.a, node.text);
         };
     }
 
-    fn width(digits: usize) Failure!u8 {
-        for ([_]u8{ 1, 2, 4, 8, 16, 32, 62, 128 }) |w| if (digits <= w) return w;
-        return error.Unsupported;
+    fn width(digits: usize) Failure!u16 {
+        for ([_]u16{ 1, 2, 4, 8, 16, 32, 62, 128 }) |w| if (digits <= w) return w;
+        // Conservative bounds may saturate; checked compiled kernels still refuse actual overflow.
+        return 256;
     }
 
     fn operation(l: *Lower, name: []const u8, args: []const u32, digits: usize) Failure!Bound {
@@ -298,7 +300,7 @@ const Lower = struct {
         const ref: u32 = @intCast(l.values.items.len + l.produced);
         try l.ops.append(l.a, .{ .op = name, .width = w, .args = refs, .checked = true });
         l.produced += 1;
-        return .{ .ref = ref, .digits = digits };
+        return .{ .ref = ref, .digits = @min(digits, packet.max_digits) };
     }
 
     fn modular(l: *Lower, a: u32, b: u32, c: u32) Failure!Bound {

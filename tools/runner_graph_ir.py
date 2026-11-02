@@ -11,6 +11,7 @@ from runner_trace import load_upstream
 
 
 BUCKETS = (1, 2, 4, 8, 16, 32, 62, 128)
+OPTIONAL_BUCKETS = (256,)
 
 
 @dataclass
@@ -22,8 +23,8 @@ class Value:
 
 class Builder:
     def __init__(self, width, core, ir, np):
-        if not 1 <= width <= 128:
-            raise ValueError("decimal width must be in [1,128]")
+        if not 1 <= width <= 256:
+            raise ValueError("decimal width must be in [1,256]")
         self.width, self.core, self.ir, self.np = width, core, ir, np
         self.c = core.RvCore()
         self.one, self.zero = self.c.one, self.c.one * 0
@@ -36,9 +37,21 @@ class Builder:
         return self.c.node(terms, f"alu.{self.serial}.{name}")
 
     def ge(self, z, t, lo, hi):
+        if self.width > 128 and min(t - lo, hi - t + 1) > 256:
+            # Clamp the lower tail to keep selected corrections and positive ramps in [0,256].
+            pivot = t - 256
+            if not 0 < pivot - lo <= 256:
+                raise ValueError("wide comparison exceeds the exact clamp range")
+            below = self.node(self.c.t_lt(z, pivot, lo, hi), "ge.below")
+            correction = self.node([(1, pivot * self.one - z, below)], "ge.clamp")
+            return self.node(self.c.t_ge(z + correction, t, pivot, hi), "ge")
         return self.node(self.c.t_ge(z, t, lo, hi), "ge")
 
     def eq(self, z, t, lo, hi):
+        if self.width > 128 and hi - lo > 511:
+            lower = self.ge(z, t, lo, hi)
+            upper = self.ge(z, t + 1, lo, hi)
+            return self.node([(1, lower - upper, self.one)], "eq")
         return self.node(self.c.t_eq(z, t, lo, hi), "eq")
 
     def choose(self, flag, a, b):
@@ -98,6 +111,8 @@ class Builder:
             raise ValueError("product width must be positive")
         if not a or not b:
             return [self.zero] * width, self.zero
+        if self.width == 256 and width == 256:
+            return self.mul_bounded(a, b, width)
         full_width = max(width, len(a) + len(b))
         rows = []
         errors = []
@@ -128,6 +143,54 @@ class Builder:
             rows = merged
         digits, carry = self.add(rows[0], rows[1])
         return digits[:width], self.any([*errors, carry, self.nz(digits[width:])])
+
+    def mul_bounded(self, a, b, width):
+        """Low product plus exact overflow, without building discarded high digits."""
+        suffix = [self.zero] * (len(a) + 1)
+        for i in range(len(a) - 1, -1, -1):
+            suffix[i] = self.any([self.ge(a[i], 1, 0, 9), suffix[i + 1]])
+        rows, errors = [], []
+        for j, bj in enumerate(b):
+            boundary = max(0, width - j)
+            if boundary < len(a):
+                errors.append(self.node([(1, suffix[boundary], self.ge(bj, 1, 0, 9))],
+                                        "mul.high_product"))
+            if j >= width:
+                continue
+            ones, tens = [self.zero] * width, [self.zero] * width
+            for i, ai in enumerate(a[:boundary]):
+                product = self.node([(1, ai, bj)], "mul.product")
+                ten = self.node([term for threshold in range(10, 81, 10)
+                                 for term in self.c.t_ge(product, threshold, 0, 81)], "mul.tens")
+                ones[i + j] = self.node([(1, product - 10 * ten, self.one)], "mul.ones")
+                if i + j + 1 < width:
+                    tens[i + j + 1] = ten
+                else:
+                    errors.append(self.ge(ten, 1, 0, 8))
+            rows.extend((ones, tens))
+        while len(rows) > 2:
+            merged = []
+            for i in range(0, len(rows), 3):
+                if i + 2 >= len(rows):
+                    merged.extend(rows[i:])
+                    break
+                low, high = [], [self.zero]
+                for digits in zip(*rows[i:i + 3]):
+                    active = [digit for digit in digits if digit.terms]
+                    if len(active) < 2:
+                        low.append(active[0] if active else self.zero)
+                        high.append(self.zero)
+                        continue
+                    total = sum(digits, self.zero)
+                    carry = self.node(self.c.t_ge(total, 10, 0, 27)
+                                      + self.c.t_ge(total, 20, 0, 27), "mul.compress.carry")
+                    low.append(self.node([(1, total - 10 * carry, self.one)], "mul.compress.digit"))
+                    high.append(carry)
+                errors.append(self.ge(high[-1], 1, 0, 2))
+                merged.extend((low, high[:-1]))
+            rows = merged
+        digits, carry = self.add(rows[0], rows[1])
+        return digits, self.any([*errors, carry])
 
     def normalize(self, value):
         sign = self.node([(1, value.sign, self.nz(value.digits))], "normalize.sign")
@@ -248,18 +311,22 @@ class Builder:
             lengths = merged
         length = self.choose(lengths[0][0], lengths[0][1], one)
         limit = max(width + len(prefix) + len(suffix) + 2, 6)
-        count = c.counter("output.cursor", c.fam["GO"], c.fam["BYTE"])
-        if limit <= 80:
-            n = sum(c.thermo(count, c.fam["GO"], limit, "output.cursor"), self.zero)
+        if width > 128:
+            n = importlib.import_module("runner_graph_format")._cursor(self, limit)
         else:
-            low = c.thermo(count, c.fam["GO"], 65, "output.cursor.low")
-            reset = one - low[-1]
-            step = self.node([(1, c.fam["BYTE"], low[-1])], "output.cursor.high.step")
-            high = c.counter("output.cursor.high", reset, step)
-            n = sum(low[:64], self.zero) + sum(c.thermo(high, reset, limit - 64, "output.cursor.high"), self.zero)
+            count = c.counter("output.cursor", c.fam["GO"], c.fam["BYTE"])
+            if limit <= 80:
+                n = sum(c.thermo(count, c.fam["GO"], limit, "output.cursor"), self.zero)
+            else:
+                low = c.thermo(count, c.fam["GO"], 65, "output.cursor.low")
+                reset = one - low[-1]
+                step = self.node([(1, c.fam["BYTE"], low[-1])], "output.cursor.high.step")
+                high = c.counter("output.cursor.high", reset, step)
+                n = sum(low[:64], self.zero) + sum(c.thermo(high, reset, limit - 64, "output.cursor.high"), self.zero)
         position = n - len(prefix) * one
         index = length - one - position + value.sign
-        digit = self.node([(1, d, self.eq(index, i, -limit, width))
+        index_hi = width + len(prefix) if width > 128 else width
+        digit = self.node([(1, d, self.eq(index, i, -limit, index_hi))
                            for i, d in enumerate(value.digits)], "emit.digit")
         minus = self.node([(1, value.sign, self.eq(position, 0, -len(prefix), limit))], "emit.minus")
         tail = position - length - value.sign
@@ -294,16 +361,29 @@ class Builder:
         return {"width": self.width, "input_slots": self.input_slots, "output_slots": self.output_slots}
 
 
+def encoded_nodes(c, ir, width):
+    if width not in OPTIONAL_BUCKETS:
+        return [encode_node(node, ir) for node in c.nodes]
+    nodes = []
+    c.nodes.reverse()
+    while c.nodes:
+        nodes.append(encode_node(c.nodes.pop(), ir))
+    return nodes
+
+
 def build_template(root, op, width):
-    if width not in BUCKETS:
-        raise ValueError(f"template width must be one of {BUCKETS}")
+    if width not in (*BUCKETS, *OPTIONAL_BUCKETS):
+        raise ValueError(f"template width must be one of {(*BUCKETS, *OPTIONAL_BUCKETS)}")
+    optional_ops = ("add", "sub", "mul", "emit", "format", "meta", "divstep", "divfinal", "emit_first", "emit_last")
+    if width in OPTIONAL_BUCKETS and op not in optional_ops:
+        raise ValueError(f"optional width supports only {optional_ops}")
     whole = ("format", "format_f64", "round_div", "decimal_mul", "compare", "min", "max", "scale10", "float_exact", "reverse_decimal", "assert_true")
     if op not in ("add", "sub", "mul", "select", "emit", "emit_first", "emit_last", "divstep", "divfinal", "meta", "half", "digit_sum", "mulmodstep", "emit_byte", "byte_check", "raw_meta", *whole):
         raise ValueError(f"unsupported ALU operation: {op}")
     if op in ("meta", "raw_meta") and width < 8:
         raise ValueError("meta template requires at least 8 digits")
-    if op in ("format", "format_f64") and width not in (62, 128):
-        raise ValueError("format template requires width 62 or 128")
+    if op in ("format", "format_f64") and width not in (62, 128, 256):
+        raise ValueError("format template requires width 62, 128 or 256")
     root = Path(root).resolve()
     load_upstream(root)
     dirty = subprocess.check_output(["git", "-C", str(root), "status", "--porcelain", "--untracked-files=no"],
@@ -345,6 +425,12 @@ def build_template(root, op, width):
     prefix, suffix = {"emit_first": (b"(", b", "), "emit_last": (b"", b")\n")}.get(op, (b"", b"\n"))
     if op == "emit_byte":
         metadata = importlib.import_module("runner_graph_byte").finish(builder, outputs)
+    elif op == "format" and width == 256:
+        module = importlib.import_module("runner_graph_format")
+        latched = [builder._latch(i, value, preserve_sign=True) for i, value in enumerate(outputs)]
+        module._emit(builder, *latched)
+        builder.c.nodes.sort(key=lambda node: node.level)
+        metadata = {"width": width, "input_slots": builder.input_slots, "output_slots": builder.output_slots}
     elif op in ("format", "format_f64"):
         metadata = importlib.import_module("runner_graph_format").finish(
             builder, outputs, max_precision=20 if op == "format_f64" else 18)
@@ -363,7 +449,7 @@ def build_template(root, op, width):
                                               "a_bit": float(ir.A_BIT), "ref_cols": list(ir.REF_COLS),
                                               "swiglu_k": float(ir.K), "kappa": float(core.KAPPA)},
            "dims": [{"name": d.name, "kind": d.kind, "level": d.level} for d in c.dims],
-           "features": features(c, ir, core, spec), "nodes": [encode_node(n, ir) for n in c.nodes],
+           "features": features(c, ir, core, spec), "nodes": encoded_nodes(c, ir, width),
            "tokens": {"vocab": spec.VOCAB, "families": families, "go": spec.tok("GO"),
                       "halt": spec.tok("HALT"), "byte_family": core.FAM_ID["BYTE"]},
            "output": {"family_bits": core.NFAM, "payload_bits": core.NPAY, "families": families,

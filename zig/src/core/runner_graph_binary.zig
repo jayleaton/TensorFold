@@ -232,26 +232,27 @@ const Decoder = struct {
     }
 };
 
-pub fn encode(a: Allocator, c: model.Circuit, name: []const u8, width: u8) ![]u8 {
+pub fn encode(a: Allocator, c: model.Circuit, name: []const u8, width: u16) ![]u8 {
     if (name.len == 0) return error.GraphPackIdentity;
-    const layout = try binding.Binding.inspect(&c, width);
+    const code = try encodedWidth(width);
+    const layout = try binding.Binding.inspect(&c, try bindingWidth(width));
     var e: Encoder = .{ .a = a };
     errdefer e.bytes.deinit(a);
     try e.bytes.appendNTimes(a, 0, header);
-    try e.put(Prepared, .{ .name = name, .width = width, .circuit = c });
+    try e.put(Prepared, .{ .name = name, .width = code, .circuit = c });
     @memcpy(e.bytes.items[0..8], "TFGRPH02");
     std.mem.writeInt(u64, e.bytes.items[8..16], e.bytes.items.len - header, .little);
     @memcpy(e.bytes.items[16..48], &schemaHash());
     Hash.hash(e.bytes.items[header..], e.bytes.items[48..80], .{});
     e.bytes.items[80] = layout.inputs;
     e.bytes.items[81] = layout.outputs;
-    e.bytes.items[82] = width;
+    e.bytes.items[82] = code;
     Hash.hash(name, e.bytes.items[96..128], .{});
     Hash.hash(e.bytes.items[0..128], e.bytes.items[128..160], .{});
     return e.bytes.toOwnedSlice(a);
 }
 
-pub fn decode(a: Allocator, bytes: []const u8, name: []const u8, width: u8) !model.Circuit {
+pub fn decode(a: Allocator, bytes: []const u8, name: []const u8, width: u16) !model.Circuit {
     if (bytes.len < 80) return error.GraphPackTruncated;
     var h: Header = @splat(0);
     @memcpy(h[0..80], bytes[0..80]);
@@ -267,16 +268,17 @@ pub fn decode(a: Allocator, bytes: []const u8, name: []const u8, width: u8) !mod
     errdefer arena.deinit();
     var d: Decoder = .{ .a = arena.allocator(), .bytes = bytes[offset..] };
     const prepared = try d.get(Prepared);
-    if (prepared.width != width or !std.mem.eql(u8, prepared.name, name)) return error.GraphPackIdentity;
+    if (prepared.width != (try encodedWidth(width)) or !std.mem.eql(u8, prepared.name, name)) return error.GraphPackIdentity;
     var out = prepared.circuit;
     if (d.at != d.bytes.len) return error.GraphPackTrailing;
-    const layout = try binding.Binding.inspect(&out, width);
+    const layout = try binding.Binding.inspect(&out, try bindingWidth(width));
     if (!legacy and (layout.inputs != h[80] or layout.outputs != h[81])) return error.GraphSlotArity;
     out.arena = arena;
     return out;
 }
 
-fn validateHeader(h: *const Header, size: u64, name: []const u8, width: u8, expected_schema: [32]u8) !void {
+fn validateHeader(h: *const Header, size: u64, name: []const u8, width: u16, expected_schema: [32]u8) !void {
+    const code = try encodedWidth(width);
     const legacy = isLegacy(h);
     if (!legacy and !std.mem.eql(u8, h[0..8], "TFGRPH02")) return error.GraphPackMagic;
     const offset: u64 = if (legacy) 80 else header;
@@ -289,7 +291,7 @@ fn validateHeader(h: *const Header, size: u64, name: []const u8, width: u8, expe
     Hash.hash(h[0..128], &digest, .{});
     if (!std.mem.eql(u8, h[128..160], &digest)) return error.GraphPackChecksum;
     Hash.hash(name, &digest, .{});
-    if (name.len == 0 or width != h[82] or !std.mem.eql(u8, h[96..128], &digest))
+    if (name.len == 0 or code != h[82] or !std.mem.eql(u8, h[96..128], &digest))
         return error.GraphPackIdentity;
     if (h[80] == 0 or h[80] > 16 or h[81] == 0 or h[81] > 16) return error.GraphSlotArity;
     for (h[83..96]) |v| if (v != 0) return error.GraphPackEncoding;
@@ -300,7 +302,7 @@ pub fn isLegacy(h: *const Header) bool {
 }
 
 /// Reads only the checksummed descriptor header; payload verification is mandatory before first execution.
-pub fn inspect(path: []const u8, name: []const u8, width: u8, expected_schema: [32]u8) !Header {
+pub fn inspect(path: []const u8, name: []const u8, width: u16, expected_schema: [32]u8) !Header {
     var threaded: std.Io.Threaded = .init_single_threaded;
     const io = threaded.io();
     const file = try std.Io.Dir.cwd().openFile(io, path, .{});
@@ -315,7 +317,7 @@ pub fn inspect(path: []const u8, name: []const u8, width: u8, expected_schema: [
 }
 
 /// Pins deferred loading to the exact header accepted at bank boot, including its payload digest.
-pub fn loadPinned(a: Allocator, path: []const u8, name: []const u8, width: u8, expected: *const Header) !model.Circuit {
+pub fn loadPinned(a: Allocator, path: []const u8, name: []const u8, width: u16, expected: *const Header) !model.Circuit {
     var threaded: std.Io.Threaded = .init_single_threaded;
     const bytes = try std.Io.Dir.cwd().readFileAlloc(threaded.io(), path, a, .limited(max_bytes));
     defer a.free(bytes);
@@ -325,9 +327,35 @@ pub fn loadPinned(a: Allocator, path: []const u8, name: []const u8, width: u8, e
     return decode(a, bytes, name, width);
 }
 
-pub fn load(a: Allocator, path: []const u8, name: []const u8, width: u8) !model.Circuit {
+pub fn load(a: Allocator, path: []const u8, name: []const u8, width: u16) !model.Circuit {
     var threaded: std.Io.Threaded = .init_single_threaded;
     const bytes = try std.Io.Dir.cwd().readFileAlloc(threaded.io(), path, a, .limited(max_bytes));
     defer a.free(bytes);
     return decode(a, bytes, name, width);
+}
+
+// The deployed schema keeps Prepared.width as u8; zero was never a valid old width.
+fn encodedWidth(width: u16) !u8 {
+    if (!@import("runner_graph_packet.zig").widthValid(width) or width == 255) return error.GraphPackIdentity;
+    return if (width == 256) 0 else @intCast(width);
+}
+
+/// Slot inspection needs only the same nine group heads; numeric bounds always retain width 256.
+pub fn bindingWidth(width: u16) !u8 {
+    _ = try encodedWidth(width);
+    return if (width == 256) 255 else @intCast(width);
+}
+
+test "prepared width extension retains byte codes and reserves zero for 256" {
+    const t = std.testing;
+    for ([_]u16{ 1, 2, 4, 8, 16, 32, 62, 128 }) |width| {
+        try t.expectEqual(@as(u8, @intCast(width)), try encodedWidth(width));
+        try t.expectEqual(@as(u8, @intCast(width)), try bindingWidth(width));
+    }
+    try t.expectEqual(@as(u8, 0), try encodedWidth(256));
+    try t.expectEqual(@as(u8, 255), try bindingWidth(256));
+    for ([_]u16{ 0, 129, 191, 255, 257 }) |width| {
+        try t.expectError(error.GraphPackIdentity, encodedWidth(width));
+        try t.expectError(error.GraphPackIdentity, bindingWidth(width));
+    }
 }

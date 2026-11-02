@@ -7,7 +7,7 @@ pub const max_values = 8192;
 pub const max_arity = 16;
 pub const max_prints = 128;
 pub const max_output = 4096;
-pub const max_digits: usize = 128;
+pub const max_digits: usize = 256;
 pub const max_groups = (max_digits + 30) / 31;
 pub const Value = [max_groups][128]f32;
 pub const bit_scale: f32 = 128;
@@ -15,14 +15,14 @@ pub const reference_scale: f32 = 16777216;
 
 pub const Copy = struct {
     ref: u32,
-    from: u8 = 0,
-    to: u8 = 0,
-    digits: u8 = 62,
+    from: u16 = 0,
+    to: u16 = 0,
+    digits: u16 = 62,
 };
 
 pub const Op = struct {
     op: []const u8,
-    width: u8 = 62,
+    width: u16 = 62,
     a: u32 = 0,
     b: ?u32 = null,
     args: ?[]const u32 = null,
@@ -60,7 +60,7 @@ pub const Plan = struct {
     ops: []const Op,
     result: u32,
     algorithm: ?[]const u8 = null,
-    width: u8 = 62,
+    width: u16 = 62,
     precision: u8 = 0,
 };
 
@@ -91,15 +91,23 @@ pub const Builder = struct {
 
     /// Selects a preloaded plan from operand metadata without evaluating its answer.
     pub fn binary(a: Allocator, family: Family, lhs: []const u8, rhs: []const u8) ![]u8 {
+        return binaryWidth(a, family, lhs, rhs, 128);
+    }
+
+    /// Optional basic capacity is explicit; callers select 256 only with an extended loaded bank.
+    pub fn binaryWidth(a: Allocator, family: Family, lhs: []const u8, rhs: []const u8, max_width: u16) ![]u8 {
+        if (max_width != 128 and max_width != 256) return error.GraphTemplate;
         _ = try literal(lhs);
         _ = try literal(rhs);
         const wa = lhs.len - @intFromBool(lhs[0] == '-' or lhs[0] == '+');
         const wb = rhs.len - @intFromBool(rhs[0] == '-' or rhs[0] == '+');
+        if (wa > max_width or wb > max_width) return error.GraphLiteral;
         if (family == .pow) {
             const exponent = std.fmt.parseInt(i16, rhs, 10) catch return error.GraphExponent;
             if (exponent < 0 or exponent > 999) return error.GraphExponent;
-            const needed = wa * @max(@as(usize, 1), @as(usize, @intCast(exponent)));
-            const width: u8 = if (needed > 62) 128 else 62;
+            const legacy_needed = wa * @max(@as(usize, 1), @as(usize, @intCast(exponent)));
+            const needed = if (max_width == 256 and legacy_needed > 128) @max(@as(usize, 128), @max(wa, powerDigits(lhs, @intCast(exponent)))) else legacy_needed;
+            const width: u16 = if (max_width == 256 and needed > 128) 256 else if (needed > 62) 128 else 62;
             const name = try std.fmt.allocPrint(a, "pow-{d}-{d}", .{ exponent, width });
             defer a.free(name);
             return named(a, name, &.{lhs});
@@ -110,8 +118,8 @@ pub const Builder = struct {
             .div, .mod => @max(wa, wb),
             .pow => unreachable,
         };
-        const width = for ([_]u8{ 1, 2, 4, 8, 16, 32, 62, 128 }) |n| {
-            if (n >= @min(max_digits, needed)) break n;
+        const width = for ([_]u16{ 1, 2, 4, 8, 16, 32, 62, 128, 256 }) |n| {
+            if (n >= @min(@as(usize, max_width), needed)) break n;
         } else unreachable;
         const name = try std.fmt.allocPrint(a, "{s}-{d}", .{ @tagName(family), width });
         defer a.free(name);
@@ -127,9 +135,10 @@ pub const Builder = struct {
         for (operands) |operand| {
             _ = try literal(operand);
             const digits = operand.len - @intFromBool(operand[0] == '-' or operand[0] == '+');
+            if (digits > 128) return error.GraphLiteral;
             needed = @max(needed, digits);
         }
-        const width: u8 = if (family == .factorial or family == .range_product or
+        const width: u16 = if (family == .factorial or family == .range_product or
             std.mem.startsWith(u8, @tagName(family), "f64_")) 128 else blk: {
             for ([_]u8{ 1, 2, 4, 8, 16, 32, 62, 128 }) |n| if (needed <= n) break :blk n;
             unreachable;
@@ -144,9 +153,12 @@ pub const Builder = struct {
         if (places > 18) return error.GraphPrecision;
         _ = try literal(lhs);
         _ = try literal(rhs);
+        if (lhs.len - @intFromBool(lhs[0] == '-' or lhs[0] == '+') > 128 or
+            rhs.len - @intFromBool(rhs[0] == '-' or rhs[0] == '+') > 128)
+            return error.GraphNarrowBinding;
         const needed = @max(lhs.len - @intFromBool(lhs[0] == '-' or lhs[0] == '+') + places + 1, rhs.len - @intFromBool(rhs[0] == '-' or rhs[0] == '+'));
         const width = for ([_]u8{ 1, 2, 4, 8, 16, 32, 62, 128 }) |n| {
-            if (n >= @min(max_digits, needed)) break n;
+            if (n >= @min(@as(usize, 128), needed)) break n;
         } else unreachable;
         const name = try std.fmt.allocPrint(a, "fixed_div-{d}-{d}", .{ places, width });
         defer a.free(name);
@@ -158,13 +170,17 @@ pub const Builder = struct {
         return loopWidth(a, shape, bound, values, 62);
     }
 
-    pub fn loopWidth(a: Allocator, shape: Shape, bound: u16, values: []const []const u8, width: u8) ![]u8 {
+    pub fn loopWidth(a: Allocator, shape: Shape, bound: u16, values: []const []const u8, width: u16) ![]u8 {
         if (shape == .sorted_distance) {
-            if (!widthValid(width) or bound > 16) return error.GraphLoop;
+            if (!widthValid(width) or width > 128 or bound > 16) return error.GraphLoop;
         } else if (width != 62 and width != 128) return error.GraphLoop;
         if (bound > 128 or values.len != (if (shape == .list_sum or shape == .sorted_distance) @as(usize, bound) else 0))
             return error.GraphLoop;
-        for (values) |value| _ = try literal(value);
+        for (values) |value| {
+            _ = try literal(value);
+            if (value.len - @intFromBool(value[0] == '-' or value[0] == '+') > 128)
+                return error.GraphNarrowBinding;
+        }
         const name = try std.fmt.allocPrint(a, "loop-{s}-{d}-{d}", .{ @tagName(shape), bound, width });
         defer a.free(name);
         return named(a, name, values);
@@ -176,13 +192,15 @@ pub const Builder = struct {
         var digits: usize = 1;
         for (values) |value| {
             _ = try literal(value);
-            digits = @max(digits, value.len - @intFromBool(value[0] == '-' or value[0] == '+'));
+            const occupied = value.len - @intFromBool(value[0] == '-' or value[0] == '+');
+            if (occupied > 128) return error.GraphNarrowBinding;
+            digits = @max(digits, occupied);
         }
         var text: [8]u8 = undefined;
         const pairs = values.len * (values.len -| 1);
         const overhead = (try std.fmt.bufPrint(&text, "{d}", .{pairs})).len;
         const width = for ([_]u8{ 1, 2, 4, 8, 16, 32, 62, 128 }) |n| {
-            if (n >= @min(max_digits, digits + overhead)) break n;
+            if (n >= @min(@as(usize, 128), digits + overhead)) break n;
         } else unreachable;
         return loopWidth(a, .sorted_distance, @intCast(values.len), values, width);
     }
@@ -203,9 +221,14 @@ pub fn algorithmOutputs(family: Algorithm) u8 {
     return if (family == .divmod or family == .fraction or family == .f64_ratio or family == .f64_mul or family == .f64_sub or family == .f64_format) 2 else 1;
 }
 
-pub fn widthValid(n: u8) bool {
+pub fn algorithmWidthValid(family: Algorithm, width: u16) bool {
+    return widthValid(width) and (width <= 128 or (width == 256 and family == .divmod));
+}
+
+// Width 255 is an internal alias for unchanged lazy binding head coverage; public banks reject it.
+pub fn widthValid(n: u16) bool {
     return switch (n) {
-        1, 2, 4, 8, 16, 32, 62, 128 => true,
+        1, 2, 4, 8, 16, 32, 62, 128, 255, 256 => true,
         else => false,
     };
 }
@@ -228,6 +251,29 @@ pub fn literal(text: []const u8) !Value {
             if ((ch - '0') >> @as(u3, @intCast(bit)) & 1 != 0) bit_scale else 0;
     }
     return value;
+}
+
+/// A literal magnitude bound chooses storage; no power result is evaluated on the host.
+fn powerDigits(text: []const u8, exponent: u16) usize {
+    if (exponent == 0) return 1;
+    const digits = text[@intFromBool(text[0] == '-' or text[0] == '+')..];
+    const magnitude = std.fmt.parseInt(u1024, digits, 10) catch return digits.len * exponent;
+    const bits: usize = if (magnitude <= 1) 0 else 1024 - @as(usize, @clz(magnitude - 1));
+    // 30103/100000 is a strict upper bound on log10(2).
+    return bits * exponent * 30103 / 100000 + 1;
+}
+
+/// Chooses an output template from occupied tensor bits without decoding the integer.
+pub fn outputWidth(value: *const Value) u16 {
+    var width: u16 = 62;
+    for (62..max_digits) |digit| {
+        const bits = value[digit / 31][2 + digit % 31 * 4 ..][0..4];
+        for (bits) |bit| if (bit != 0) {
+            if (digit >= 128) return 256;
+            width = 128;
+        };
+    }
+    return width;
 }
 
 pub fn copyBits(out: *Value, source: *const Value, c: Copy) void {
@@ -257,7 +303,7 @@ test "frontend binding selects offline plans and rejects invalid controls" {
 
 test "128 digit bindings span five groups and retain explicit wide plans" {
     const t = std.testing;
-    const text: [max_digits]u8 = @splat('9');
+    const text: [128]u8 = @splat('9');
     const too_wide: [max_digits + 1]u8 = @splat('9');
     const value = try literal(&text);
     try t.expectEqual(bit_scale, value[4][14]);
@@ -277,6 +323,67 @@ test "128 digit bindings span five groups and retain explicit wide plans" {
     defer t.allocator.free(loop);
     try t.expect(std.mem.indexOf(u8, loop, "loop-factorial-80-128") != null);
     try t.expectError(error.GraphLoop, Builder.loopWidth(t.allocator, .fib, 10, &.{}, 32));
+}
+
+test "256 digit basic bindings preserve the final group and refuse unsupported algorithms" {
+    const t = std.testing;
+    const text: [256]u8 = @splat('9');
+    const value = try literal(&text);
+    try t.expectEqual(@as(usize, 9), max_groups);
+    try t.expect(widthValid(256));
+    try t.expect(algorithmWidthValid(.divmod, 256));
+    try t.expect(!algorithmWidthValid(.gcd, 256));
+    try t.expect(!algorithmWidthValid(.divmod, 255));
+    try t.expect(!widthValid(257));
+    try t.expectError(error.GraphTemplate, Builder.binaryWidth(t.allocator, .add, "1", "1", 255));
+    try t.expectEqual(@as(u16, 256), outputWidth(&value));
+    try t.expectEqual(bit_scale, value[8][30]);
+    try t.expectEqual(@as(f32, 0), value[8][31]);
+    var copied: Value = @splat(@splat(0));
+    copyBits(&copied, &value, .{ .ref = 0, .from = 248, .to = 248, .digits = 8 });
+    try t.expectEqual(bit_scale, copied[8][30]);
+    try t.expectEqual(@as(u16, 256), outputWidth(&copied));
+    var complete: Value = @splat(@splat(0));
+    copyBits(&complete, &value, .{ .ref = 0, .digits = 256 });
+    try t.expectEqual(bit_scale, complete[8][30]);
+    const excessive: [257]u8 = @splat('9');
+    try t.expectError(error.GraphLiteral, literal(&excessive));
+    try t.expectError(error.GraphLiteral, Builder.binaryWidth(t.allocator, .mul, &excessive, "1", 256));
+    for ([_]usize{ 129, 191, 256 }) |digits| {
+        const boundary = try literal(text[0..digits]);
+        try t.expectEqual(@as(u16, 256), outputWidth(&boundary));
+        const product = try Builder.binaryWidth(t.allocator, .mul, text[0..digits], "1", 256);
+        defer t.allocator.free(product);
+        try t.expect(std.mem.indexOf(u8, product, "mul-256") != null);
+    }
+    const narrow = try literal("1");
+    try t.expectEqual(@as(u16, 62), outputWidth(&narrow));
+    const old: [128]u8 = @splat('9');
+    const old_value = try literal(&old);
+    try t.expectEqual(@as(u16, 128), outputWidth(&old_value));
+    const sum = try Builder.binaryWidth(t.allocator, .add, &text, "1", 256);
+    defer t.allocator.free(sum);
+    try t.expect(std.mem.indexOf(u8, sum, "add-256") != null);
+    const power = try Builder.binaryWidth(t.allocator, .pow, "3", "400", 256);
+    defer t.allocator.free(power);
+    try t.expect(std.mem.indexOf(u8, power, "pow-400-256") != null);
+    const zero_power = try Builder.binaryWidth(t.allocator, .pow, &text, "0", 256);
+    defer t.allocator.free(zero_power);
+    try t.expect(std.mem.indexOf(u8, zero_power, "pow-0-256") != null);
+    try t.expectError(error.GraphLiteral, Builder.binary(t.allocator, .add, &text, "0"));
+    const narrow_power = try Builder.binaryWidth(t.allocator, .pow, "2", "400", 256);
+    defer t.allocator.free(narrow_power);
+    try t.expect(std.mem.indexOf(u8, narrow_power, "pow-400-128") != null);
+    const division = try Builder.binaryWidth(t.allocator, .div, &text, "1", 256);
+    defer t.allocator.free(division);
+    try t.expect(std.mem.indexOf(u8, division, "div-256") != null);
+    const remainder = try Builder.binaryWidth(t.allocator, .mod, &text, "1", 256);
+    defer t.allocator.free(remainder);
+    try t.expect(std.mem.indexOf(u8, remainder, "mod-256") != null);
+    try t.expectError(error.GraphNarrowBinding, Builder.fixedDivision(t.allocator, &text, "1", 0));
+    try t.expectError(error.GraphLiteral, Builder.integer(t.allocator, .gcd, &.{ &text, "1" }));
+    try t.expectError(error.GraphLoop, Builder.loopWidth(t.allocator, .sorted_distance, 0, &.{}, 256));
+    try t.expectError(error.GraphNarrowBinding, Builder.sortedDistance(t.allocator, &.{&text}));
 }
 
 test "integer algorithms bind arity and maximum operand width" {
