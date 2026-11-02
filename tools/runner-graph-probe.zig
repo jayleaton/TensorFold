@@ -51,11 +51,15 @@ const Options = struct {
     algorithm_lifecycle: bool = false,
     fresh_states: bool = false,
     fixed_widths: bool = false,
+    eager_bank: bool = false,
 };
 const Report = struct {
     pass: bool,
     reuse_states: bool,
     adaptive_widths: bool,
+    boot_prepared: usize,
+    prepared_templates: usize,
+    template_load_attempts: u64,
     boot_wall_ns: u64,
     boot_process_cpu_ns: u64,
     run_wall_ns: u64,
@@ -110,6 +114,10 @@ fn options(args: []const []const u8) !Options {
     var o: Options = .{ .manifest = args[1], .cases = args[2] };
     var i: usize = 3;
     while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--eager-bank")) {
+            o.eager_bank = true;
+            continue;
+        }
         if (std.mem.eql(u8, args[i], "--lifecycle")) {
             o.lifecycle = true;
             continue;
@@ -142,7 +150,8 @@ fn options(args: []const []const u8) !Options {
 }
 
 fn canonicalBank(bank: *const graph.Bank) !void {
-    for (bank.templates) |t| {
+    for (bank.templates) |*t| {
+        if (!t.isPrepared()) continue;
         if (t.circuit.halt != halt or t.circuit.byte_family != 6) return error.NoncanonicalBank;
         const family, const payload = t.circuit.split(byte_base + 255) orelse return error.NoncanonicalBank;
         if (family != 6 or payload != 255) return error.NoncanonicalBank;
@@ -287,6 +296,7 @@ fn cacheClean(cache: *const state_cache.Cache) bool {
 
 fn resetProof(a: Allocator, bank: *const graph.Bank) !void {
     const t = &bank.templates[0];
+    try t.prepare();
     var first: state_cache.Cache = .{};
     defer first.deinit(a);
     var second: state_cache.Cache = .{};
@@ -441,9 +451,10 @@ fn run(init: std.process.Init) !u8 {
     const o = try options(args);
     const boot_start = now();
     const boot_cpu_start = cpuNow();
-    var bank = try graph.Bank.load(a, o.manifest);
+    var bank = try graph.Bank.loadWithMode(a, o.manifest, if (o.eager_bank) .eager else .lazy);
     const boot_cpu_ns = cpuNow() - boot_cpu_start;
     const boot_ns = now() - boot_start;
+    const boot_prepared = bank.preparedCount();
     defer bank.deinit();
     try canonicalBank(&bank);
     const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, o.cases, a, .limited(128 << 20));
@@ -494,7 +505,11 @@ fn run(init: std.process.Init) !u8 {
         life.pass = life.error_name.len == 0 and life.checks == (if (seeds.items.len == 4) @as(usize, 10) else 9) and
             (!o.algorithm_lifecycle or seeds.items.len == 4);
     }
+    try canonicalBank(&bank);
     const report: Report = .{
+        .boot_prepared = boot_prepared,
+        .prepared_templates = bank.preparedCount(),
+        .template_load_attempts = bank.loadAttempts(),
         .pass = rows.items.len > 0 and failed == 0 and (!o.lifecycle or life.pass),
         .reuse_states = !o.fresh_states,
         .adaptive_widths = !o.fixed_widths,

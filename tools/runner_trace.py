@@ -66,7 +66,7 @@ def gzip_stream(stack, path):
     return stack.enter_context(gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0, compresslevel=6))
 
 
-def record_case(machine, spec, token_stream, interval, case_id):
+def record_case(machine, spec, token_stream, interval, case_id, token_limit=TOKEN_LIMIT):
     """Hash every token prefix and retain checkpoints at exact token counts."""
     digest = hashlib.sha256()
     window = deque(maxlen=WINDOW)
@@ -93,8 +93,8 @@ def record_case(machine, spec, token_stream, interval, case_id):
     append(spec.tok("GO"))
     while not machine.halted:
         record = machine.record()
-        if not record or count + len(record) > TOKEN_LIMIT:
-            raise ValueError(f"{case_id}: empty record or trace exceeds {TOKEN_LIMIT} tokens")
+        if not record or count + len(record) > token_limit:
+            raise ValueError(f"{case_id}: empty record or trace exceeds {token_limit} tokens")
         for token in record:
             append(token)
     if checkpoints[-1]["token_count"] != count:

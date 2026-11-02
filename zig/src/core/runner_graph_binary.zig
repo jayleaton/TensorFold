@@ -1,10 +1,12 @@
-//! Offline prepared circuit encoding; boot restores exact runtime fields without compiling graph IR.
+//! Offline prepared circuit encoding; lazy loading restores exact runtime fields without compiling graph IR.
 const std = @import("std");
 const builtin = @import("builtin");
 const model = @import("steps_v1/runner_circuit_model.zig");
+const binding = @import("runner_graph_lazy.zig");
 const Allocator = std.mem.Allocator;
 const Hash = std.crypto.hash.sha2.Sha256;
-const header = 80;
+const header = 160;
+pub const Header = [header]u8;
 const max_bytes = 1 << 30;
 const Prepared = struct { name: []const u8, width: u8, circuit: model.Circuit };
 
@@ -50,12 +52,17 @@ fn schema(comptime T: type, h: *Hash) void {
 }
 
 pub fn schemaHash() [32]u8 {
+    return versionedSchemaHash(false);
+}
+
+fn versionedSchemaHash(legacy: bool) [32]u8 {
     var h = Hash.init(.{});
-    h.update("runner-graph-prepared-v1-rle:");
+    h.update(if (legacy) "runner-graph-prepared-v1-rle:" else "runner-graph-prepared-v2-rle-bindings:");
     h.update(builtin.zig_version_string);
     h.update(@embedFile("steps_v1/runner_circuit_model.zig"));
     h.update(@embedFile("steps_v1/runner_circuit_state.zig"));
     h.update(@embedFile("steps_v1/runner_circuit_eval.zig"));
+    if (!legacy) h.update(@embedFile("runner_graph_lazy.zig"));
     schema(Prepared, &h);
     return h.finalResult();
 }
@@ -226,33 +233,96 @@ const Decoder = struct {
 };
 
 pub fn encode(a: Allocator, c: model.Circuit, name: []const u8, width: u8) ![]u8 {
+    if (name.len == 0) return error.GraphPackIdentity;
+    const layout = try binding.Binding.inspect(&c, width);
     var e: Encoder = .{ .a = a };
     errdefer e.bytes.deinit(a);
     try e.bytes.appendNTimes(a, 0, header);
     try e.put(Prepared, .{ .name = name, .width = width, .circuit = c });
-    @memcpy(e.bytes.items[0..8], "TFGRPH01");
+    @memcpy(e.bytes.items[0..8], "TFGRPH02");
     std.mem.writeInt(u64, e.bytes.items[8..16], e.bytes.items.len - header, .little);
     @memcpy(e.bytes.items[16..48], &schemaHash());
     Hash.hash(e.bytes.items[header..], e.bytes.items[48..80], .{});
+    e.bytes.items[80] = layout.inputs;
+    e.bytes.items[81] = layout.outputs;
+    e.bytes.items[82] = width;
+    Hash.hash(name, e.bytes.items[96..128], .{});
+    Hash.hash(e.bytes.items[0..128], e.bytes.items[128..160], .{});
     return e.bytes.toOwnedSlice(a);
 }
 
 pub fn decode(a: Allocator, bytes: []const u8, name: []const u8, width: u8) !model.Circuit {
-    if (bytes.len < header or !std.mem.eql(u8, bytes[0..8], "TFGRPH01")) return error.GraphPackMagic;
-    if (std.mem.readInt(u64, bytes[8..16], .little) != bytes.len - header) return error.GraphPackSize;
-    if (!std.mem.eql(u8, bytes[16..48], &schemaHash())) return error.GraphPackSchema;
+    if (bytes.len < 80) return error.GraphPackTruncated;
+    var h: Header = @splat(0);
+    @memcpy(h[0..80], bytes[0..80]);
+    const legacy = isLegacy(&h);
+    const offset: usize = if (legacy) 80 else header;
+    if (bytes.len < offset) return error.GraphPackTruncated;
+    @memcpy(h[0..offset], bytes[0..offset]);
+    try validateHeader(&h, bytes.len, name, width, schemaHash());
     var digest: [32]u8 = undefined;
-    Hash.hash(bytes[header..], &digest, .{});
+    Hash.hash(bytes[offset..], &digest, .{});
     if (!std.mem.eql(u8, bytes[48..80], &digest)) return error.GraphPackChecksum;
     var arena = std.heap.ArenaAllocator.init(a);
     errdefer arena.deinit();
-    var d: Decoder = .{ .a = arena.allocator(), .bytes = bytes[header..] };
+    var d: Decoder = .{ .a = arena.allocator(), .bytes = bytes[offset..] };
     const prepared = try d.get(Prepared);
     if (prepared.width != width or !std.mem.eql(u8, prepared.name, name)) return error.GraphPackIdentity;
     var out = prepared.circuit;
     if (d.at != d.bytes.len) return error.GraphPackTrailing;
+    const layout = try binding.Binding.inspect(&out, width);
+    if (!legacy and (layout.inputs != h[80] or layout.outputs != h[81])) return error.GraphSlotArity;
     out.arena = arena;
     return out;
+}
+
+fn validateHeader(h: *const Header, size: u64, name: []const u8, width: u8, expected_schema: [32]u8) !void {
+    const legacy = isLegacy(h);
+    if (!legacy and !std.mem.eql(u8, h[0..8], "TFGRPH02")) return error.GraphPackMagic;
+    const offset: u64 = if (legacy) 80 else header;
+    if (size < offset or size > max_bytes or std.mem.readInt(u64, h[8..16], .little) != size - offset)
+        return error.GraphPackSize;
+    const expected = if (legacy) versionedSchemaHash(true) else expected_schema;
+    if (!std.mem.eql(u8, h[16..48], &expected)) return error.GraphPackSchema;
+    if (legacy) return;
+    var digest: [32]u8 = undefined;
+    Hash.hash(h[0..128], &digest, .{});
+    if (!std.mem.eql(u8, h[128..160], &digest)) return error.GraphPackChecksum;
+    Hash.hash(name, &digest, .{});
+    if (name.len == 0 or width != h[82] or !std.mem.eql(u8, h[96..128], &digest))
+        return error.GraphPackIdentity;
+    if (h[80] == 0 or h[80] > 16 or h[81] == 0 or h[81] > 16) return error.GraphSlotArity;
+    for (h[83..96]) |v| if (v != 0) return error.GraphPackEncoding;
+}
+
+pub fn isLegacy(h: *const Header) bool {
+    return std.mem.eql(u8, h[0..8], "TFGRPH01");
+}
+
+/// Reads only the checksummed descriptor header; payload verification is mandatory before first execution.
+pub fn inspect(path: []const u8, name: []const u8, width: u8, expected_schema: [32]u8) !Header {
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const io = threaded.io();
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    const size = (try file.stat(io)).size;
+    var h: Header = @splat(0);
+    if (try file.readPositionalAll(io, h[0..80], 0) != 80) return error.GraphPackTruncated;
+    if (!isLegacy(&h) and (try file.readPositionalAll(io, h[80..], 80)) != header - 80)
+        return error.GraphPackTruncated;
+    try validateHeader(&h, size, name, width, expected_schema);
+    return h;
+}
+
+/// Pins deferred loading to the exact header accepted at bank boot, including its payload digest.
+pub fn loadPinned(a: Allocator, path: []const u8, name: []const u8, width: u8, expected: *const Header) !model.Circuit {
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(threaded.io(), path, a, .limited(max_bytes));
+    defer a.free(bytes);
+    const offset: usize = if (isLegacy(expected)) 80 else header;
+    if (bytes.len < offset or !std.mem.eql(u8, bytes[0..offset], expected[0..offset]))
+        return error.GraphPackChanged;
+    return decode(a, bytes, name, width);
 }
 
 pub fn load(a: Allocator, path: []const u8, name: []const u8, width: u8) !model.Circuit {

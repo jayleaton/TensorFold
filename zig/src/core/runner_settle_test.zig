@@ -84,7 +84,7 @@ const Run = struct { owned: []u8, ticks: [4]u32, started: u32, here: u32 };
 fn run(settle_us: u32, back: *Back, open_gate_at: ?u32) !Run {
     var r: runner.Runner = .{ .gpa = gpa, .cfg = .{ .settle_us = settle_us }, .frontend = .{ .translate = translate }, .backend = back.backend(), .text = .{ .bytes = bytes, .encode = encode } };
     r.cfg.scan.inline_math = true;
-    const s = (try r.session()).?;
+    const s = (try r.session(.{})).?;
     defer s.destroy();
     const hook = s.hook();
     var owned: std.ArrayList(u8) = .empty;
@@ -164,7 +164,7 @@ test "runner settle: a backend without a run here still settles in one tick when
     try std.testing.expectEqual(null, plain.now(.{ .kind = .graph, .bytes = "7*6" }, 10, 10));
     var r: runner.Runner = .{ .gpa = gpa, .cfg = .{ .settle_us = 3000 }, .frontend = .{ .translate = translate }, .backend = plain, .text = .{ .bytes = bytes, .encode = encode } };
     r.cfg.scan.inline_math = true;
-    const s = (try r.session()).?;
+    const s = (try r.session(.{})).?;
     defer s.destroy();
     const hook = s.hook();
     var held = false;

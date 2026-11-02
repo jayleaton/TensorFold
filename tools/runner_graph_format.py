@@ -35,7 +35,7 @@ def _cursor(b, limit):
     return b.node([(1, sum(pieces, b.zero), b.one)], "format.cursor")
 
 
-def _controls(b, value, control):
+def _controls(b, value, control, max_precision=18):
     digits = control.digits
     precision = b.node([(1, digits[0] + 10 * digits[1], b.one)], "format.precision")
     modes = [b.eq(digits[2], mode, 0, 9) for mode in range(5)]
@@ -49,7 +49,7 @@ def _controls(b, value, control):
                            b.node([(1, value.sign, b.nz(value.digits))], "format.bool.negative")]))],
                           "format.bool.invalid")
     error = b.any([value.error, control.error, control.sign, b.nz(digits[5:]),
-                   b.ge(precision, 19, 0, 99), b.ge(digits[2], 5, 0, 9),
+                   b.ge(precision, max_precision + 1, 0, 99), b.ge(digits[2], 5, 0, 9),
                    b.ge(digits[3], len(ENDINGS), 0, 9), b.ge(prefix, 2, 0, 9), invalid_precision, invalid_bool])
     return precision, modes, endings, prefix, fixed, error
 
@@ -94,8 +94,8 @@ def _numeric(b, value, n, precision, modes, fixed, layout, prefix, limit):
     return digit, comma, dot, float_zero, minus, position
 
 
-def _emit(b, value, control):
-    precision, modes, endings, prefix, fixed, error = _controls(b, value, control)
+def _emit(b, value, control, max_precision=18):
+    precision, modes, endings, prefix, fixed, error = _controls(b, value, control, max_precision)
     layout = _layout(b, value, precision, modes, fixed)
     length, coefficient_length, groups, truth, body_length, sign = layout
     limit = b.width + (b.width - 1) // 3 + 8
@@ -129,11 +129,11 @@ def _emit(b, value, control):
     b._exit(halt, payload)
 
 
-def finish(builder, inputs):
+def finish(builder, inputs, max_precision=18):
     """Latch coefficient and control as two output Values before emitting any BYTE steps."""
     if builder.width not in (62, 128) or len(inputs) != 2:
         raise ValueError("format requires width 62 or 128 and two input Values")
     latched = [builder._latch(i, value, preserve_sign=True) for i, value in enumerate(inputs)]
-    _emit(builder, *latched)
+    _emit(builder, *latched, max_precision=max_precision)
     builder.c.nodes.sort(key=lambda node: node.level)
     return {"width": builder.width, "input_slots": builder.input_slots, "output_slots": builder.output_slots}

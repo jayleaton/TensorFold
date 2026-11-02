@@ -1,11 +1,12 @@
-//! Boot-loaded immutable prepared weights, logical table slots and validated named binding plans.
+//! Stable template descriptors with once-only lazy prepared weights and validated named binding plans.
 const std = @import("std");
 const model = @import("steps_v1/runner_circuit_model.zig");
 const binary = @import("runner_graph_binary.zig");
 const packet = @import("runner_graph_packet.zig");
+const lazy = @import("runner_graph_lazy.zig");
 const Allocator = std.mem.Allocator;
 const missing = std.math.maxInt(u32);
-pub const Slots = [packet.max_arity][packet.max_groups]u32;
+pub const Slots = lazy.Slots;
 
 pub const Template = struct {
     name: []const u8,
@@ -15,7 +16,68 @@ pub const Template = struct {
     outputs: u8,
     in_slots: Slots,
     out_slots: Slots,
+    preparation: ?*Preparation = null,
+    materialized: bool = true,
+
+    /// Circuit fields and logical slots may be read only after this succeeds; prepared copies keep their own circuit.
+    pub fn prepare(t: *const Template) !void {
+        const p = t.preparation orelse return;
+        if (p.ready.load(.acquire)) {
+            if (t != p.owner and !t.materialized) return error.GraphUnpreparedCopy;
+            return;
+        }
+        if (t != p.owner) return error.GraphUnpreparedCopy;
+        var threaded: std.Io.Threaded = .init_single_threaded;
+        const io = threaded.io();
+        p.mutex.lockUncancelable(io);
+        defer p.mutex.unlock(io);
+        if (p.ready.load(.acquire)) return;
+        if (p.failure) |err| return err;
+        _ = p.attempts.fetchAdd(1, .monotonic);
+        p.publish() catch |err| {
+            p.failure = err;
+            return err;
+        };
+    }
+
+    pub fn isPrepared(t: *const Template) bool {
+        const p = t.preparation orelse return true;
+        return p.ready.load(.acquire) and (t == p.owner or t.materialized);
+    }
+
+    pub fn loadAttempts(t: *const Template) u32 {
+        return if (t.preparation) |p| p.attempts.load(.monotonic) else 0;
+    }
 };
+
+const Preparation = struct {
+    gpa: Allocator,
+    owner: *Template,
+    path: []const u8,
+    header: binary.Header,
+    mutex: std.Io.Mutex = .init,
+    ready: std.atomic.Value(bool) = .init(false),
+    attempts: std.atomic.Value(u32) = .init(0),
+    failure: ?anyerror = null,
+
+    fn publish(p: *Preparation) !void {
+        const t = p.owner;
+        var circuit = try binary.loadPinned(p.gpa, p.path, t.name, t.width, &p.header);
+        errdefer circuit.deinit(p.gpa);
+        const layout = try lazy.Binding.inspect(&circuit, t.width);
+        if ((t.inputs != 0 and layout.inputs != t.inputs) or (t.outputs != 0 and layout.outputs != t.outputs))
+            return error.GraphSlotArity;
+        if (t.inputs == 0) t.inputs = layout.inputs;
+        if (t.outputs == 0) t.outputs = layout.outputs;
+        t.circuit = circuit;
+        t.in_slots = layout.in_slots;
+        t.out_slots = layout.out_slots;
+        t.materialized = true;
+        p.ready.store(true, .release);
+    }
+};
+
+pub const LoadMode = enum { lazy, eager };
 
 const Descriptor = struct {
     name: []const u8,
@@ -49,6 +111,15 @@ pub const Bank = struct {
     plans: []const PreparedPlan,
 
     pub fn load(a: Allocator, path: []const u8) !Bank {
+        return loadWithMode(a, path, .lazy);
+    }
+
+    pub fn loadEager(a: Allocator, path: []const u8) !Bank {
+        return loadWithMode(a, path, .eager);
+    }
+
+    /// The allocator must support concurrent stream allocations; the bank owns all loaded circuits until deinit.
+    pub fn loadWithMode(a: Allocator, path: []const u8, mode: LoadMode) !Bank {
         var threaded: std.Io.Threaded = .init_single_threaded;
         const bytes = try std.Io.Dir.cwd().readFileAlloc(threaded.io(), path, a, .limited(32 << 20));
         defer a.free(bytes);
@@ -57,19 +128,30 @@ pub const Bank = struct {
         const doc = try std.json.parseFromSliceLeaky(Manifest, arena.allocator(), bytes, .{ .allocate = .alloc_always });
         if (doc.version != 1 or doc.templates.len == 0 or doc.templates.len > 256) return error.GraphManifest;
         const templates = try arena.allocator().alloc(Template, doc.templates.len);
+        const preparations = try arena.allocator().alloc(Preparation, doc.templates.len);
+        const expected_schema = binary.schemaHash();
         var loaded: usize = 0;
-        errdefer for (templates[0..loaded]) |*t| t.circuit.deinit(a);
-        for (doc.templates, templates) |d, *t| {
-            if (!packet.widthValid(d.width) or d.name.len == 0) return error.GraphTemplate;
+        errdefer for (templates[0..loaded]) |*t| {
+            if (t.isPrepared()) t.circuit.deinit(a);
+        };
+        for (doc.templates, templates, preparations) |d, *t, *preparation| {
+            if (!packet.widthValid(d.width) or d.name.len == 0 or d.path.len == 0) return error.GraphTemplate;
+            if (d.inputs) |n| if (n == 0 or n > packet.max_arity) return error.GraphSlotArity;
+            if (d.outputs) |n| if (n == 0 or n > packet.max_arity) return error.GraphSlotArity;
             for (templates[0..loaded]) |prior| if (prior.width == d.width and std.mem.eql(u8, prior.name, d.name))
                 return error.GraphDuplicateTemplate;
-            const resolved = if (std.fs.path.isAbsolute(d.path)) try a.dupe(u8, d.path) else try std.fs.path.join(a, &.{ std.fs.path.dirname(path) orelse ".", d.path });
-            defer a.free(resolved);
-            t.* = .{ .name = d.name, .width = d.width, .circuit = try binary.load(a, resolved, d.name, d.width), .inputs = 0, .outputs = 0, .in_slots = @splat(@splat(missing)), .out_slots = @splat(@splat(missing)) };
+            const joined = if (std.fs.path.isAbsolute(d.path)) d.path else try std.fs.path.join(arena.allocator(), &.{ std.fs.path.dirname(path) orelse ".", d.path });
+            const resolved = try std.Io.Dir.cwd().realPathFileAlloc(threaded.io(), joined, arena.allocator());
+            const h = try binary.inspect(resolved, d.name, d.width, expected_schema);
+            const legacy = binary.isLegacy(&h);
+            const inputs = d.inputs orelse if (legacy) @as(u8, 0) else return error.GraphSlotArity;
+            const outputs = d.outputs orelse if (legacy) @as(u8, 0) else return error.GraphSlotArity;
+            if (!legacy and (inputs != h[80] or outputs != h[81])) return error.GraphSlotArity;
+            preparation.* = .{ .gpa = a, .owner = t, .path = resolved, .header = h };
+            t.* = .{ .name = d.name, .width = d.width, .circuit = undefined, .inputs = inputs, .outputs = outputs, .in_slots = @splat(@splat(missing)), .out_slots = @splat(@splat(missing)), .preparation = preparation, .materialized = false };
             loaded += 1;
-            try slots(t);
-            if (d.inputs) |n| if (n != t.inputs) return error.GraphSlotArity;
-            if (d.outputs) |n| if (n != t.outputs) return error.GraphSlotArity;
+            // Legacy headers omit bindings; validate the complete payload before exposing the descriptor.
+            if (legacy) try t.prepare();
         }
         const plans = try arena.allocator().alloc(PreparedPlan, doc.plans.len);
         var bank: Bank = .{ .gpa = a, .arena = arena, .templates = templates, .plans = plans };
@@ -98,15 +180,49 @@ pub const Bank = struct {
             break;
         };
         bank.arena = arena;
+        if (mode == .eager) try bank.prepareAll();
         return bank;
     }
 
+    /// Destroy every backend and machine before freeing the bank; prepared copies borrow its circuit allocations.
     pub fn deinit(b: *Bank) void {
-        for (b.templates) |*t| t.circuit.deinit(b.gpa);
+        for (b.templates) |*t| {
+            if (t.isPrepared()) t.circuit.deinit(b.gpa);
+        }
         b.arena.deinit();
         b.* = undefined;
     }
 
+    pub fn prepareAll(b: *const Bank) !void {
+        for (b.templates) |*t| try t.prepare();
+    }
+
+    pub fn preparedCount(b: *const Bank) usize {
+        var count: usize = 0;
+        for (b.templates) |*t| count += @intFromBool(t.isPrepared());
+        return count;
+    }
+
+    pub fn loadAttempts(b: *const Bank) u64 {
+        var count: u64 = 0;
+        for (b.templates) |*t| count += t.loadAttempts();
+        return count;
+    }
+
+    /// Clears only a cached failure; the next use retries the pinned pack and successful circuits are never replaced.
+    pub fn retryFailed(b: *const Bank, name: []const u8, width: u8) !void {
+        const t = b.find(name, width) orelse return error.GraphTemplate;
+        const p = t.preparation orelse return error.GraphAlreadyPrepared;
+        var threaded: std.Io.Threaded = .init_single_threaded;
+        const io = threaded.io();
+        p.mutex.lockUncancelable(io);
+        defer p.mutex.unlock(io);
+        if (p.ready.load(.acquire)) return error.GraphAlreadyPrepared;
+        if (p.failure == null) return error.GraphNotFailed;
+        p.failure = null;
+    }
+
+    /// Lookup reads metadata only; call Template.prepare before accessing its circuit or logical slots.
     pub fn find(b: *const Bank, name: []const u8, width: u8) ?*const Template {
         for (b.templates) |*t| if (t.width == width and std.mem.eql(u8, t.name, name)) return t;
         return null;
@@ -131,7 +247,8 @@ pub const Bank = struct {
                     return error.GraphBinding;
                 if (op.flags) |r| if (r >= count) return error.GraphReference;
             } else {
-                if (std.mem.startsWith(u8, op.op, "emit") or std.mem.eql(u8, op.op, "format") or op.copies.len != 0 or op.flags != null)
+                if (std.mem.eql(u8, op.op, "factorize") or std.mem.eql(u8, op.op, "f64_repr")) return error.GraphAlgorithm;
+                if (std.mem.startsWith(u8, op.op, "emit") or (std.mem.eql(u8, op.op, "format") or std.mem.eql(u8, op.op, "format_f64")) or op.copies.len != 0 or op.flags != null)
                     return error.GraphTemplate;
                 const arity: u8 = if (std.meta.stringToEnum(packet.Algorithm, op.op)) |family| blk: {
                     try b.validateAlgorithm(family, op.width, op.precision);
@@ -165,7 +282,17 @@ pub const Bank = struct {
         try b.require("format", 128, 2, 2);
         for (prints) |p| {
             if (p.ref >= count or p.precision > 18 or (p.style != .fixed and p.precision != 0)) return error.GraphPrint;
-            if ((p.style == .fraction or p.style == .tuple) != (p.second != null)) return error.GraphPrint;
+            if (p.style == .byte) {
+                if (p.precision != 0 or p.prefix or p.ending != .empty or p.second != null) return error.GraphPrint;
+                try b.require("byte_check", 128, 1, 1);
+                try b.require("emit_byte", 4, 1, 1);
+                continue;
+            }
+            if (p.style == .prepared) {
+                try b.require("format_f64", 62, 2, 2);
+                if (p.prefix or p.precision != 0 or p.ending != .newline or p.second == null) return error.GraphPrint;
+            }
+            if ((p.style == .fraction or p.style == .tuple or p.style == .prepared) != (p.second != null)) return error.GraphPrint;
             if (p.second) |ref| if (ref >= count) return error.GraphReference;
             if (p.style == .fraction) try b.require("meta", 128, 2, 3);
             if (p.style == .tuple and (p.prefix or (p.ending != .newline and p.ending != .space and p.ending != .empty and p.ending != .comma_space)))
@@ -181,17 +308,42 @@ pub const Bank = struct {
     fn validateAlgorithm(b: *const Bank, family: packet.Algorithm, width: u8, precision: u8) !void {
         if (!packet.widthValid(width) or precision > 18 or (family != .fixed_div and precision != 0))
             return error.GraphAlgorithm;
+        if (std.mem.startsWith(u8, @tagName(family), "f64_")) {
+            if (width != 128) return error.GraphAlgorithm;
+            try b.require("raw_meta", 128, 2, 3);
+            try b.require("format_f64", 62, 2, 2);
+            try b.require("decimal_mul", 128, 2, 1);
+            try b.require("compare", 128, 2, 1);
+            try b.require("round_div", 128, 4, 1);
+            try b.require("add", 128, 2, 1);
+            try b.require("sub", 128, 2, 1);
+            try b.require("half", 128, 1, 2);
+            try b.require("divstep", 128, 3, 2);
+            try b.require("format", 62, 2, 2);
+            return;
+        }
+        const factor = family == .smallest_factor or family == .factorize;
+        const work_width = if (factor) @max(width, 8) else width;
+        if (factor) {
+            try b.require("add", work_width, 2, 1);
+            try b.require("half", work_width, 1, 2);
+            try b.require("divstep", work_width, 3, 2);
+            try b.require("meta", work_width, 2, 3);
+            try b.require("format", 62, 2, 2);
+            try b.require("format", 128, 2, 2);
+            return;
+        }
         const kernels = [_]struct { []const u8, u8, u8 }{
             .{ "add", 2, 1 },        .{ "sub", 2, 1 },      .{ "mul", 2, 1 },  .{ "half", 1, 2 },
             .{ "divstep", 3, 2 },    .{ "divfinal", 4, 2 }, .{ "meta", 2, 3 }, .{ "digit_sum", 1, 1 },
             .{ "mulmodstep", 4, 1 },
         };
-        for (kernels) |k| try b.require(k[0], if (std.mem.eql(u8, k[0], "meta")) @max(width, 8) else width, k[1], k[2]);
+        for (kernels) |k| try b.require(k[0], if (std.mem.eql(u8, k[0], "meta")) @max(work_width, 8) else work_width, k[1], k[2]);
         if (family == .fixed_div) {
             try b.require("scale10", width, 1, 1);
         }
         if (family == .fixed_div or family == .divexact) try b.require("round_div", width, 4, 1);
-        if (family == .fraction or family == .fixed_div) {
+        if (family == .fraction or family == .fixed_div or factor) {
             try b.require("format", 62, 2, 2);
             try b.require("format", 128, 2, 2);
         }
@@ -200,32 +352,3 @@ pub const Bank = struct {
             try b.require(name, @max(width, 62), 1, 1);
     }
 };
-
-fn slots(t: *Template) !void {
-    if (t.circuit.program.a_bit != packet.bit_scale or t.circuit.program.a_ref != packet.reference_scale)
-        return error.GraphValueScale;
-    if (t.circuit.tables.len != t.circuit.table_names.len) return error.GraphSlots;
-    for (t.circuit.table_names, 0..) |name, table| {
-        if (std.mem.startsWith(u8, name, "output.cursor")) continue;
-        const input = std.mem.startsWith(u8, name, "in");
-        const output = std.mem.startsWith(u8, name, "out");
-        if (!input and !output) continue;
-        const prefix: usize = if (input) 2 else 3;
-        const dot = std.mem.indexOfScalarPos(u8, name, prefix, '.') orelse return error.GraphSlots;
-        const logical = std.fmt.parseInt(u8, name[prefix..dot], 10) catch return error.GraphSlots;
-        const offset = std.fmt.parseInt(u8, name[dot + 1 ..], 10) catch return error.GraphSlots;
-        if (logical >= packet.max_arity or offset % 31 != 0) return error.GraphSlots;
-        if (offset >= t.width) return error.GraphSlots;
-        const target = if (input) &t.in_slots else &t.out_slots;
-        const group = offset / 31;
-        if (target[logical][group] != missing) return error.GraphSlots;
-        if (t.circuit.tables[table].rows.len != 128 * 128) return error.GraphSlots;
-        target[logical][group] = @intCast(table);
-        const arity = if (input) &t.inputs else &t.outputs;
-        arity.* = @max(arity.*, logical + 1);
-    }
-    if (t.inputs == 0 or t.outputs == 0) return error.GraphSlots;
-    const groups = (@as(usize, t.width) + 30) / 31;
-    for (t.in_slots[0..t.inputs]) |s| for (s[0..groups]) |idx| if (idx == missing) return error.GraphSlots;
-    for (t.out_slots[0..t.outputs]) |s| for (s[0..groups]) |idx| if (idx == missing) return error.GraphSlots;
-}

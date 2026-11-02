@@ -21,7 +21,7 @@ from runner_graph_algorithms import OPERATIONS as INTEGER_KERNELS, catalog
 from runner_graph_whole import OPERATIONS as WHOLE_KERNELS, plans as whole_plans
 
 
-OPERATIONS = ("add", "sub", "mul", "divstep", "divfinal", *INTEGER_KERNELS, *WHOLE_KERNELS)
+OPERATIONS = ("add", "sub", "mul", "select", "divstep", "divfinal", *INTEGER_KERNELS, *WHOLE_KERNELS)
 
 
 def bridge(doc, baseline):
@@ -35,7 +35,7 @@ def bridge(doc, baseline):
 def export(args):
     args.output.mkdir(parents=True, exist_ok=args.resume)
     sources = ("runner_graph_ir.py", "runner_graph_algorithms.py", "runner_graph_div.py",
-               "runner_graph_export.py", "runner_graph_plans.py", "runner_graph_whole.py", "runner_graph_format.py")
+               "runner_graph_byte.py", "runner_graph_export.py", "runner_graph_plans.py", "runner_graph_whole.py", "runner_graph_format.py")
     identity = {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest() for name in sources}
     identity["widths"] = args.widths
     legacy = json.loads(Path(__file__).with_name("runner-graph-legacy.json").read_text())
@@ -52,9 +52,11 @@ def export(args):
     descriptors, receipts = [], []
     selections = [(op, width) for op in OPERATIONS for width in args.widths if op != "meta" or width >= 8]
     if any(width < 8 for width in args.widths) and 8 not in args.widths:
-        selections.append(("meta", 8))
+        selections.extend((op, 8) for op in ("meta", "add", "half", "divstep"))
     if ("meta", 128) not in selections:
         selections.append(("meta", 128))
+    selections += [("byte_check", 128), ("emit_byte", 4), ("format_f64", 62)]
+    selections += [("raw_meta", width) for width in (8, 16, 32, 62, 128)]
     selections += [(op, width) for op in ("emit", "format") for width in (62, 128)]
     selections += [(op, width) for op in ("emit_first", "emit_last") for width in (62, 128)
                    if width == 62 or width in args.widths]

@@ -157,7 +157,7 @@ const Box = struct {
 };
 
 /// `frontend`/`backend`: real ones in place of the fakes (the proof test).
-pub const Opts = struct { runner: bool = true, run_cells: bool = true, delay: u32 = 0, planner: bool = false, streams: usize = 1, frontend: ?rapi.Frontend = null, backend: ?rapi.Backend = null, wait_s: u32 = 20, exact: bool = false, inline_math: bool = false, trace: bool = false, placer: ?*runner.place.Placer = null, summaries: ?[][]u8 = null };
+pub const Opts = struct { runner: bool = true, run_cells: bool = true, delay: u32 = 0, planner: bool = false, streams: usize = 1, frontend: ?rapi.Frontend = null, backend: ?rapi.Backend = null, wait_s: u32 = 20, exact: bool = false, inline_math: bool = false, trace: bool = false, trace_ask: runner.TraceAsk = .{}, placer: ?*runner.place.Placer = null, summaries: ?[][]u8 = null };
 
 /// Runs `models` (one request each, concurrently) on one host; the reply texts.
 pub fn replies(models: []Model, o: Opts, back: *Back) ![][]u8 {
@@ -186,7 +186,7 @@ pub fn replies(models: []Model, o: Opts, back: *Back) ![][]u8 {
     for (models, 0..) |_, i| {
         boxes[i] = .{};
         prompts[i] = prompt ++ [_]u32{@intCast(i)}; // the router tells the streams apart by their last prompt token
-        requests[i] = .{ .prompt = &prompts[i], .max_tokens = 400, .eos = &.{EOS}, .run_cells = o.run_cells };
+        requests[i] = .{ .prompt = &prompts[i], .max_tokens = 400, .eos = &.{EOS}, .run_cells = o.run_cells, .run_trace = o.trace_ask };
         try e.submit(@intCast(i + 1), &requests[i], .{ .ctx = &boxes[i], .event = Box.event });
     }
     const out = try gpa.alloc([]u8, models.len);
