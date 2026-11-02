@@ -21,6 +21,7 @@ const Front = struct {
         f.cells += 1;
         f.last = cell;
         if (std.mem.startsWith(u8, cell.code, "abstain:")) return .{ .abstain = std.meta.stringToEnum(api.Abstain, cell.code["abstain:".len..]).? };
+        if (std.mem.startsWith(u8, cell.code, "elf:")) return .{ .program = .{ .kind = .elf, .bytes = cell.code["elf:".len..] } };
         return .{ .program = .{ .kind = .calc, .bytes = cell.code } };
     }
 };
@@ -111,6 +112,16 @@ test "compute runner: a run that halts ok is the lane's body: one trailing newli
     const o = try f.run(.{}, "ok:x\n", null);
     try std.testing.expectEqual(s3.Kind.calc, o.owned.kind);
     try std.testing.expectEqual(@as(u64, 7), o.owned.steps);
+}
+
+test "compute runner: an ELF program runs only with _ELF on; off, it declines as elf and starts nothing" {
+    var f: Fixture = .{};
+    defer f.arena.deinit();
+    try expectDeclined(.elf, try f.run(.{}, "elf:ok:42\n", null));
+    try std.testing.expectEqual(@as(u32, 0), f.back.started);
+    const o = try f.run(.{ .elf = true }, "elf:ok:42\n", null);
+    try expectOwned("42", o);
+    try std.testing.expectEqual(s3.Kind.elf, o.owned.kind);
 }
 
 test "compute runner: a lane call is a fresh python fence cell: no earlier call's names" {

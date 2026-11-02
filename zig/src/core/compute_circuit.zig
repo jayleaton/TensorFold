@@ -41,8 +41,8 @@ pub const Config = struct {
 /// What the engine hands the server: the runner S3 opened for itself (its own backend) and S3's knobs.
 pub const Setup = struct { runner: *runner.Runner, cfg: Config };
 
-/// Why a call went to the sandbox: the frontend's or backend's abstain, a non-ok run, no slot, the wall net, or gone.
-pub const Decline = enum { language, unsupported, syntax, name, too_long, too_big, context, abstain, budget, fault, busy, wall, cancelled };
+/// Why a call went to the sandbox: an abstain, an ELF with _ELF off, a non-ok run, no slot, the wall net, or gone.
+pub const Decline = enum { language, unsupported, syntax, name, too_long, too_big, context, abstain, elf, budget, fault, busy, wall, cancelled };
 pub const Kind = @FieldType(api.Program, "kind");
 /// A call the circuit ran to its halt: the lane's result body made of its stdout, and what ran it.
 pub const Owned = struct { body: []const u8, kind: Kind, steps: u64, exec_ns: u64 };
@@ -68,6 +68,8 @@ pub const Exec = struct {
             .program => |p| p,
             .abstain => |why| return .{ .declined = from(why) },
         };
+        // the no-compile frontend builds none, yet a cached ELF may come back: S3 runs one only under _ELF=1
+        if (program.kind == .elf and !e.cfg.elf) return .{ .declined = .elf };
         const stream = e.next_stream.fetchAdd(1, .monotonic);
         defer e.release(stream);
         const t0 = nowNs();
