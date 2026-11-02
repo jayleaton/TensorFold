@@ -236,9 +236,12 @@ fn descendantsStop() !void {
         defer file.close(t.io);
         var buffer: [4096]u8 = undefined;
         var reader = file.readerStreaming(t.io, &buffer);
-        // the worker exiting between open and read fails the read (ESRCH): poll again, the open then finds it gone
+        // a stat that opens but fails to read (ESRCH) belongs to a task already gone; the open can keep succeeding
         const stat = reader.interface.allocRemaining(t.allocator, .limited(4096)) catch |err| switch (err) {
-            error.ReadFailed => if (now() < settled_by) continue else return err,
+            error.ReadFailed => {
+                alive = false;
+                break;
+            },
             else => return err,
         };
         defer t.allocator.free(stat);
