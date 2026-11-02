@@ -14,7 +14,7 @@ const p2 = [_]u32{ 2, 7, 1, 8, 2, 8, 1, 8, 2, 8, 4, 5, 9, 0, 4, 5 };
 /// A runner hook holding its stream at the given emitted indices.
 const Hook = struct {
     seen: usize = 0,
-    fn token(ptr: *anyopaque, _: u32, _: bool, can_hold: bool) bool {
+    fn token(ptr: *anyopaque, _: u32, _: bool, can_hold: bool, _: bool) bool {
         const h: *Hook = @ptrCast(@alignCast(ptr));
         defer h.seen += 1;
         return can_hold and std.mem.indexOfScalar(usize, &fires, h.seen) != null;
