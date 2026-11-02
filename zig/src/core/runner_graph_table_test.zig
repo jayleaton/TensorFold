@@ -106,7 +106,7 @@ const cases = [_][2][]const u8{
     .{ "import math\nprint(math.gcd(-12, 18), math.gcd(12, -18))\n", "6 6\n" },
 };
 
-/// Scripts the bank must leave to the frontend's own route: a fraction, a computed divisor, a string.
+/// Scripts the table leaves to the route behind it: a fraction, a computed divisor (T1's binding owns it), a string.
 const refused = [_][]const u8{ "print(7/2)\n", "a=3\nprint(100//(a+1))\n", "print(len(str(2**100)))\n" };
 
 fn openBank() !graph.Bank {
@@ -197,7 +197,21 @@ test "runner graph table: Routed takes a checked fence script before the compile
     const t = try fe.translate(fe.ctx, a, .{ .form = .fence, .lang = "python", .code = cases[0][0] });
     try std.testing.expect(t == .program and t.program.kind == .graph);
     try std.testing.expectEqual(@as(u32, 0), inner.calls);
-    _ = try fe.translate(fe.ctx, a, .{ .form = .fence, .lang = "python", .code = refused[1] });
+    // a computed divisor: T1's direct binding owns it before the compile and prints CPython's 25
+    const owned = try fe.translate(fe.ctx, a, .{ .form = .fence, .lang = "python", .code = refused[1] });
+    try std.testing.expect(owned == .program and owned.program.kind == .graph);
+    try std.testing.expectEqual(@as(u32, 0), inner.calls);
+    const g = try graph.backend(gpa, &bank, 2);
+    defer graph.destroy(g);
+    var d: route.Dispatch = .{ .gpa = gpa, .circuit = Never.backend(), .graph = g };
+    defer d.deinit();
+    const r = try run(&d, owned.program.bytes);
+    defer gpa.free(r.out);
+    try std.testing.expectEqual(api.Status.ok, r.status);
+    try std.testing.expectEqualStrings("25\n", r.out);
+    // a string the bank cannot hold: no route takes it, so the frontend is asked
+    const declined = try fe.translate(fe.ctx, a, .{ .form = .fence, .lang = "python", .code = refused[2] });
+    try std.testing.expect(declined == .abstain);
     try std.testing.expectEqual(@as(u32, 1), inner.calls);
     // a later cell could have rebound a name the script uses: the frontend's own checks decide
     _ = try fe.translate(fe.ctx, a, .{ .form = .fence, .lang = "python", .code = cases[0][0], .prior = &.{"divmod = max\n"} });
