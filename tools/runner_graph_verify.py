@@ -20,7 +20,7 @@ LAYOUT = (("V", 32768), ("F0", 32768), ("F1", 32768), ("F2", 4),
           ("ST1", 1), ("SS0", 1), ("SS1", 1), ("HALT", 1), ("GO", 1), ("SC", 1))
 BYTE = sum(size for _, size in LAYOUT[:6])
 HALT = sum(size for _, size in LAYOUT[:17])
-RUNTIME_FILES = ("runner_graph.zig", "runner_graph_bank.zig", "runner_graph_machine.zig",
+RUNTIME_FILES = ("runner_graph_bind.zig", "runner_graph_frontend.zig", "runner_graph.zig", "runner_graph_bank.zig", "runner_graph_machine.zig",
                  "runner_graph_binary.zig", "runner_graph_packet.zig", "runner_graph_algorithms.zig",
                  "runner_graph_state_cache.zig", "runner_graph_print.zig",
                  "runner_graph_factor.zig", "runner_graph_lazy.zig", "runner_graph_f64.zig",

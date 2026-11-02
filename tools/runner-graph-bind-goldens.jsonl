@@ -1,0 +1,94 @@
+{"id":"s2-pow7","expression":"7**123%1000000007","expected_output":"937329259\n","reference_code_sha256":"cc86a17da246651d56767e887542359e5fe538b3c084c0b683c4b05e807e8486"}
+{"id":"s2-pow3","expression":"3**400%10**18","expected_output":"192443283334088001\n","reference_code_sha256":"24b311d99ee6aa2a183a84d551aa95aae1151137cbde5fb62a70cb6dd8a0012e"}
+{"id":"s2-hex","expression":"0xFEDCBA9876543210*2**64+0x0123456789ABCDEF","expected_output":"338770000845734292516042252062085074415\n","reference_code_sha256":"d2b7a5ff33d9d70a9c3dd5f5b166b26c0c748b9b3028c5051f411e418d1a4f22"}
+{"id":"math-modpow","expression":"7^123 mod 1000000007","expected_output":"937329259\n","reference_code_sha256":"f497fbdd99193aa90c25a2edf22a68c71e134cb3c8a143681674b0718132a833"}
+{"id":"math-power-modulus","expression":"3^400 mod 10^18","expected_output":"192443283334088001\n","reference_code_sha256":"24723c40516de664feb2dfee743cd65ecda36e61d8c21da278485a2c3ff21e81"}
+{"id":"math-gcd","expression":"gcd(12345678901234567890,98765432109876543210)","expected_output":"900000000090\n","reference_code_sha256":"5d09b0dd5dd30a7252eb9580c28d11280f4cea966a0a51e668104b2934bb2a33"}
+{"id":"math-isqrt","expression":"isqrt(123456789012345678901234)","expected_output":"351364182882\n","reference_code_sha256":"d0b51626ad1fbf6641635a758234b463fba2794cc0e98649acc11261e44bebec"}
+{"id":"python-pow","expression":"pow(7,123,1000000007)","syntax":"python","expected_output":"937329259\n","reference_code_sha256":"d78063bca6dd82abca434111f07333ba92b8f042e752970177d72ef30afe32c1"}
+{"id":"python-signed-mod","expression":"-7%3","syntax":"python","expected_output":"2\n","reference_code_sha256":"a254672d5873591e20d530b668b340b67a01f826324f17f471ad0c56e2da4b8b"}
+{"id":"python-signed-div","expression":"7//-3","syntax":"python","expected_output":"-3\n","reference_code_sha256":"0cfd23e4ed8aa89b69fccc02ccf31fb3ef4929538ae97a4e2114088be36a27eb"}
+{"id":"unary-binding","expression":"-2**2","syntax":"python","expected_output":"-4\n","reference_code_sha256":"819fb4bb6f208d45469a2bc9ba4981535ee4bd3bf9e7a36fdbcd48a10f7ac4ba"}
+{"id":"minus-base","expression":"(-2)**3%5","syntax":"python","expected_output":"2\n","reference_code_sha256":"00ccaf00e842d37278ef1e954699d33b8ed045cfd33f513328d5c209d5ef7daa"}
+{"id":"repl-prefix","cell":{"form":"repl","code":">>> 7**123%1000000007","lang":"python"},"expected_output":"937329259\n","reference_code_sha256":"cc86a17da246651d56767e887542359e5fe538b3c084c0b683c4b05e807e8486"}
+{"id":"assignments","script":"x=12\nx=x+1\nprint(x,x*x)\n","expected_output":"13 169\n","reference_code_sha256":"5ed3b2cb3044ecd987a7cdfffef7294d3ba1cd374967dc2efed9067124570750"}
+{"id":"math-imports","script":"from math import gcd, isqrt\nprint(gcd(48,18),isqrt(99))","expected_output":"6 9\n","reference_code_sha256":"5bd4239eb920f773e485471f9d37b59c24a1ae2acf53067678e64eb66557baf5"}
+{"id":"s1-modpow","cell":{"form":"fence","code":"print(pow(7, 83, 1000000007))\n","lang":"python"},"origin":"d_mirror-c1-g2-modpow.json","origin_sha256":"f39e11b3e10fefd7972b5afe76496c0f5f2847dc8cd981a0f0219ec6d0b3cfa5","source_sha256":"938c38d934299c6ae6b26db186703b5f02e1356b4a498a901ff1f4960ec76b51","oracle_output":"269823221\n","oracle_sha256":"45a865ee4d70510620042823c9fd8bf1cb74ff523f2b35b847067d7bc94e33f6","source_receipt":"S1-UNOWNED-CELLS.md","source_receipt_sha256":"b68baaa1e8561fe18ebe1585652e8923af6d534a1a98c2d1aed0f53f65a77c58","expected_output":"269823221\n","reference_code_sha256":"938c38d934299c6ae6b26db186703b5f02e1356b4a498a901ff1f4960ec76b51"}
+{"id":"s1-gcd","cell":{"form":"fence","code":"import math\na=12345678901234567890\nb=98765432109876543210\nprint(math.gcd(a,b))\n","lang":"python"},"origin":"d_mirror-c1-g2-gcd.json","origin_sha256":"272876c53eb529bd2bbc761a0e5169ec6b50da5fca695b2d50aa517a26cf12b9","source_sha256":"854380acefd2eeb6d5cddcf06a882f3df4aba61f37ff489036ba7110624d21ed","oracle_output":"900000000090\n","oracle_sha256":"f576577de92635f2c71a5708b748980a9216c73e59dee8c29c12a0cbedbdc112","source_receipt":"S1-UNOWNED-CELLS.md","source_receipt_sha256":"b68baaa1e8561fe18ebe1585652e8923af6d534a1a98c2d1aed0f53f65a77c58","expected_output":"900000000090\n","reference_code_sha256":"854380acefd2eeb6d5cddcf06a882f3df4aba61f37ff489036ba7110624d21ed"}
+{"id":"s1-isqrt","cell":{"form":"fence","code":"import math\nn = 123456789012345678901234\nr = math.isqrt(n)\nprint(r)\nprint(r*r)\nprint((r+1)*(r+1))\nprint(n - r*r)\n","lang":"python"},"origin":"d_mirror-c1-g2-isqrt.json","origin_sha256":"2aab61f88dacd6bc51312ed40bcd8ad5aae3b27940688105bb74b516a85cdc72","source_sha256":"5999d4659c3f14059e3550319a9b982192ee4840cd2b32666909ebd99f31e58f","oracle_output":"351364182882\n123456789012335541825924\n123456789013038270191689\n10137075310\n","oracle_sha256":"e6ae004db8b724cf9b5e159de0b60d43642672596d5079aecd58ec354bb4f949","source_receipt":"S1-UNOWNED-CELLS.md","source_receipt_sha256":"b68baaa1e8561fe18ebe1585652e8923af6d534a1a98c2d1aed0f53f65a77c58","expected_output":"351364182882\n123456789012335541825924\n123456789013038270191689\n10137075310\n","reference_code_sha256":"5999d4659c3f14059e3550319a9b982192ee4840cd2b32666909ebd99f31e58f"}
+{"id":"general-0","expression":"1+2*3","syntax":"python","expected_output":"7\n","reference_code_sha256":"478c340a8fb67bb8860906cd37c9320c4882431bd23ece4360d8905c1e58dabc"}
+{"id":"general-1","expression":"(1+2)*3","syntax":"python","expected_output":"9\n","reference_code_sha256":"ca7ed3c94371f88a974efe710bf3eb6f71d16f8de5d0e63d4450a41ff6956ef6"}
+{"id":"general-2","expression":"0**0","syntax":"python","expected_output":"1\n","reference_code_sha256":"d5cc7a686b5744c1282e26c0c9b773949ea9f5a2fd23dba301f79c191b79eaa5"}
+{"id":"general-3","expression":"0x0","syntax":"python","expected_output":"0\n","reference_code_sha256":"af8801b60849a544427e6ae2569ee520fe586bc0b2f662039756286e6c63eb20"}
+{"id":"general-4","expression":"0XFF+1","syntax":"python","expected_output":"256\n","reference_code_sha256":"4469f2bd729f941893964cafd4f3fd2153799f24ab9739a5e207171c6a7d39dc"}
+{"id":"general-5","expression":"-0x10*3","syntax":"python","expected_output":"-48\n","reference_code_sha256":"7be7bbe46bd051f4150021956260707f37c21d55d01f67133123d4d471f82e95"}
+{"id":"general-6","expression":"pow(0,0,1)","syntax":"python","expected_output":"0\n","reference_code_sha256":"b5181f73cb5e1bfa852a8b5aa026319ca9683639fe8e7b8313a23ce370b41d52"}
+{"id":"general-7","expression":"pow(2,100,17)","syntax":"python","expected_output":"16\n","reference_code_sha256":"beee550dd2e3f1045b4a5479b4b647c0a442f2ca250276bcc713c39dcfff35a8"}
+{"id":"general-8","expression":"pow(7,0,1000000007)","syntax":"python","expected_output":"1\n","reference_code_sha256":"2c742ef9ce8e9b8f13c5a5913588925e9b5650d73c8d9d52c457c75e194e3512"}
+{"id":"general-9","expression":"(7**3)%5","syntax":"python","expected_output":"3\n","reference_code_sha256":"efedcbdb5049851159b525b1d1c469e19ecbd0f79ac4237ae256d67e2dc09be2"}
+{"id":"general-10","expression":"(7**3)*2%5","syntax":"python","expected_output":"1\n","reference_code_sha256":"8538c23fafbe57bc81dd25bd133a73d683c870e81b581b4e7348bef4073cc80f"}
+{"id":"general-11","expression":"-7**3%5","syntax":"python","expected_output":"2\n","reference_code_sha256":"354f21c3e8b41118e6cfd0c8f7405d8cb5e1647c65d726123861223fbf45918b"}
+{"id":"general-12","expression":"1%3","syntax":"python","expected_output":"1\n","reference_code_sha256":"479498bcbabd5d7ce9106d5d1e8650212c433ca038b2bd801a85c4f4997fa5cd"}
+{"id":"general-13","expression":"0//2","syntax":"python","expected_output":"0\n","reference_code_sha256":"287c89c36aedbc4b82bba813294b4e967af68f97f082d4c715d4af8c6934390e"}
+{"id":"semicolon-valid-0","script":"x=12; print(x);","expected_output":"12\n","reference_code_sha256":"741f1fe542dbd79dd7c1154d80987f0415ad3963cd45fb927826641d0fa0dfad"}
+{"id":"semicolon-valid-1","script":"print(1);\nprint(2)","expected_output":"1\n2\n","reference_code_sha256":"9784abef798ff318818b8dc034edf1602da071803acde101bcfb15fd57f35eb7"}
+{"id":"inline-caret","cell":{"form":"inline_expr","code":"2^3","lang":"python"},"expected_output":"8\n","reference_code_sha256":"55b3a0c5db911ddcdde9ea483749bdda01645065e9a0131a558f808d5a567f50"}
+{"id":"python-percent-sign","cell":{"form":"repl","code":"50%+2","lang":"python"},"expected_output":"0\n","reference_code_sha256":"df3d9230eef7ace20a6e7dda2a78c45c6311997837781940ca1f8d8e1233dc3b"}
+{"id":"script-percent-sign","cell":{"form":"fence","code":"print(50%+2)","lang":"python"},"expected_output":"0\n","reference_code_sha256":"09e1b81bb50a27a3e9a5c34b81113c92cf8bacac4f6932c47f6659f79767ab11"}
+{"id":"refuse-expression-0","expression":"7^123%1000000007","syntax":"python","expected_status":"unsupported","expected_output":""}
+{"id":"refuse-expression-1","expression":"1/2","syntax":"python","expected_status":"unsupported","expected_output":""}
+{"id":"refuse-expression-2","expression":"1.0+2","syntax":"python","expected_status":"unsupported","expected_output":""}
+{"id":"refuse-expression-3","expression":"1e3","syntax":"python","expected_status":"unsupported","expected_output":""}
+{"id":"refuse-expression-4","expression":"True+1","syntax":"python","expected_status":"unsupported","expected_output":""}
+{"id":"refuse-expression-5","expression":"7%","syntax":"python","expected_status":"unsupported","expected_output":""}
+{"id":"refuse-expression-6","expression":"2***3","syntax":"python","expected_status":"unsupported","expected_output":""}
+{"id":"refuse-expression-7","expression":"pow(7,123)","syntax":"python","expected_status":"unsupported","expected_output":""}
+{"id":"refuse-expression-8","expression":"pow(7,123,5,2)","syntax":"python","expected_status":"unsupported","expected_output":""}
+{"id":"refuse-expression-9","expression":"0x","syntax":"python","expected_status":"unsupported","expected_output":""}
+{"id":"refuse-expression-10","expression":"0xG","syntax":"python","expected_status":"unsupported","expected_output":""}
+{"id":"refuse-expression-11","expression":"00x1","syntax":"python","expected_status":"unsupported","expected_output":""}
+{"id":"refuse-expression-12","expression":"09","syntax":"python","expected_status":"unsupported","expected_output":""}
+{"id":"refuse-expression-13","expression":"1_000","syntax":"python","expected_status":"unsupported","expected_output":""}
+{"id":"refuse-expression-14","expression":"a+1","syntax":"python","expected_status":"unsupported","expected_output":""}
+{"id":"refuse-expression-15","expression":"print(1)","syntax":"python","expected_status":"unsupported","expected_output":""}
+{"id":"refuse-expression-16","expression":"__import__(1)","syntax":"python","expected_status":"unsupported","expected_output":""}
+{"id":"refuse-expression-17","expression":"2 << 3","syntax":"python","expected_status":"unsupported","expected_output":""}
+{"id":"refuse-expression-18","expression":"2**-1","syntax":"python","expected_status":"unsupported","expected_output":""}
+{"id":"refuse-expression-19","expression":"0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","syntax":"python","expected_status":"unsupported","expected_output":""}
+{"id":"refuse-expression-20","expression":"((((((((((((((((((((((((((((((((((1))))))))))))))))))))))))))))))))))","syntax":"python","expected_status":"unsupported","expected_output":""}
+{"id":"refuse-script-0","script":"math.gcd(2,4)","expected_status":"unsupported","expected_output":""}
+{"id":"refuse-script-1","script":"gcd(2,4)","expected_status":"unsupported","expected_output":""}
+{"id":"refuse-script-2","script":"import os\nprint(1)","expected_status":"unsupported","expected_output":""}
+{"id":"refuse-script-3","script":"pow=1\nprint(pow)","expected_status":"unsupported","expected_output":""}
+{"id":"refuse-script-4","script":"print=1\nprint(1)","expected_status":"unsupported","expected_output":""}
+{"id":"refuse-script-5","script":"if=1\nprint(if)","expected_status":"unsupported","expected_output":""}
+{"id":"refuse-script-6","script":" print(1)","expected_status":"unsupported","expected_output":""}
+{"id":"refuse-script-7","script":"x=unknown(1)\nprint(2)","expected_status":"unsupported","expected_output":""}
+{"id":"refuse-script-8","script":"import math\nmath=1\nprint(1)","expected_status":"unsupported","expected_output":""}
+{"id":"refuse-script-9","script":"print(1)\nraise ValueError","expected_status":"unsupported","expected_output":""}
+{"id":"refuse-script-11","script":"def f():\n return 1","expected_status":"unsupported","expected_output":""}
+{"id":"refuse-script-12","script":"x=1","expected_status":"unsupported","expected_output":""}
+{"id":"refuse-script-13","script":"import math\nprint(math.pi)","expected_status":"unsupported","expected_output":""}
+{"id":"refuse-script-14","script":"print(1,sep=2)","expected_status":"unsupported","expected_output":""}
+{"id":"refuse-cell-0","cell":{"form":"inline_expr","code":"pow(7,83,1000000007)","prior":["pow=lambda *x:10"],"lang":"python"},"expected_status":"unsupported","expected_output":""}
+{"id":"refuse-cell-1","cell":{"form":"fence","lang":"c","code":"print(42)"},"expected_status":"unsupported","expected_output":""}
+{"id":"refuse-cell-2","cell":{"form":"fence","code":"print(pow(7,83,1000000007))","prior":["pow=0"],"lang":"python"},"expected_status":"unsupported","expected_output":""}
+{"id":"review-refuse-0","script":";print(1)","expected_status":"unsupported","expected_output":""}
+{"id":"review-refuse-1","script":"print(1);;print(2)","expected_status":"unsupported","expected_output":""}
+{"id":"review-refuse-2","script":"print(1);;","expected_status":"unsupported","expected_output":""}
+{"id":"review-refuse-3","script":"__debug__=1\nprint(__debug__)","expected_status":"unsupported","expected_output":""}
+{"id":"repl-caret","cell":{"form":"repl","code":"2^3","lang":"python"},"expected_status":"unsupported","expected_output":""}
+{"id":"fence-caret","cell":{"form":"fence","code":"print(2^3)","lang":"python"},"expected_status":"unsupported","expected_output":""}
+{"id":"right-assoc","expression":"2**3**2","syntax":"python","expected_status":"unsupported","expected_output":""}
+{"id":"percentage-ambiguous-0","cell":{"form":"inline_expr","code":"50%+2","lang":"python"},"expected_status":"unsupported","expected_output":""}
+{"id":"percentage-ambiguous-1","cell":{"form":"inline_expr","code":"50% - 2","lang":"python"},"expected_status":"unsupported","expected_output":""}
+{"id":"percentage-ambiguous-2","cell":{"form":"inline_expr","code":"(50)% +2","lang":"python"},"expected_status":"unsupported","expected_output":""}
+{"id":"unused-division-error","script":"x=1//0\nprint(42)","expected_status":"error:GraphArithmetic","expected_output":""}
+{"id":"later-division-error","script":"print(42)\nx=1//0","expected_status":"error:GraphArithmetic","expected_output":""}
+{"id":"negative-isqrt","script":"import math\nprint(math.isqrt(-1))","expected_status":"error:GraphArithmetic","expected_output":""}
+{"id":"negative-exponent","expression":"pow(2,-1,7)","syntax":"python","expected_status":"error:GraphArithmetic","expected_output":""}
+{"id":"wrong-model-s1-modpow","cell":{"form":"fence","code":"print(pow(7, 83, 1000000007))\n","lang":"python"},"origin":"d_mirror-c1-g2-modpow.json","origin_sha256":"f39e11b3e10fefd7972b5afe76496c0f5f2847dc8cd981a0f0219ec6d0b3cfa5","source_sha256":"938c38d934299c6ae6b26db186703b5f02e1356b4a498a901ff1f4960ec76b51","oracle_output":"269823221\n","oracle_sha256":"45a865ee4d70510620042823c9fd8bf1cb74ff523f2b35b847067d7bc94e33f6","source_receipt":"S1-UNOWNED-CELLS.md","source_receipt_sha256":"b68baaa1e8561fe18ebe1585652e8923af6d534a1a98c2d1aed0f53f65a77c58","expected_output":"640025692\n","reference_code_sha256":"938c38d934299c6ae6b26db186703b5f02e1356b4a498a901ff1f4960ec76b51","expect_mismatch":true}
+{"id":"wrong-model-s1-gcd","cell":{"form":"fence","code":"import math\na=12345678901234567890\nb=98765432109876543210\nprint(math.gcd(a,b))\n","lang":"python"},"origin":"d_mirror-c1-g2-gcd.json","origin_sha256":"272876c53eb529bd2bbc761a0e5169ec6b50da5fca695b2d50aa517a26cf12b9","source_sha256":"854380acefd2eeb6d5cddcf06a882f3df4aba61f37ff489036ba7110624d21ed","oracle_output":"900000000090\n","oracle_sha256":"f576577de92635f2c71a5708b748980a9216c73e59dee8c29c12a0cbedbdc112","source_receipt":"S1-UNOWNED-CELLS.md","source_receipt_sha256":"b68baaa1e8561fe18ebe1585652e8923af6d534a1a98c2d1aed0f53f65a77c58","expected_output":"10\n","reference_code_sha256":"854380acefd2eeb6d5cddcf06a882f3df4aba61f37ff489036ba7110624d21ed","expect_mismatch":true}
+{"id":"operand-s2-pow7","expression":"7**124%1000000007","expected_output":"937329259\n","reference_code_sha256":"cc86a17da246651d56767e887542359e5fe538b3c084c0b683c4b05e807e8486","expect_mismatch":true}
+{"id":"operand-s2-hex","expression":"0xFEDCBA9876543210*2**64+0x0123456789ABCDEE","expected_output":"338770000845734292516042252062085074415\n","reference_code_sha256":"d2b7a5ff33d9d70a9c3dd5f5b166b26c0c748b9b3028c5051f411e418d1a4f22","expect_mismatch":true}
+{"id":"operand-s1-gcd","cell":{"form":"fence","code":"import math\na=12345678901234567891\nb=98765432109876543210\nprint(math.gcd(a,b))\n","lang":"python"},"origin":"d_mirror-c1-g2-gcd.json","origin_sha256":"272876c53eb529bd2bbc761a0e5169ec6b50da5fca695b2d50aa517a26cf12b9","source_sha256":"854380acefd2eeb6d5cddcf06a882f3df4aba61f37ff489036ba7110624d21ed","oracle_output":"900000000090\n","oracle_sha256":"f576577de92635f2c71a5708b748980a9216c73e59dee8c29c12a0cbedbdc112","source_receipt":"S1-UNOWNED-CELLS.md","source_receipt_sha256":"b68baaa1e8561fe18ebe1585652e8923af6d534a1a98c2d1aed0f53f65a77c58","expected_output":"900000000090\n","reference_code_sha256":"854380acefd2eeb6d5cddcf06a882f3df4aba61f37ff489036ba7110624d21ed","expect_mismatch":true}
