@@ -374,7 +374,7 @@ test "runner graph route: pure-integer calc programs become bank plans sized fro
     }
 }
 
-test "runner graph route: decimals, true division, computed exponents or divisors and values past 128 digits stay on calc" {
+test "runner graph route: decimals, true division, computed exponents or divisors and values past 256 digits stay on calc" {
     const a = std.testing.allocator;
     for ([_][]const u8{
         "1/2",
@@ -384,7 +384,7 @@ test "runner graph route: decimals, true division, computed exponents or divisor
         "2**(3)",
         "7//0",
         "7%(1+1)",
-        "10**128",
+        "10**256", // past T1's 256-digit width (b047d48c8); a bank without it refuses at lowering
         "(10**80+123456789)**2-10**161",
         "(10**80+123456789)**3-10**160",
         "007+1",
