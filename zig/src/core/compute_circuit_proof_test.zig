@@ -14,7 +14,7 @@ const File = struct { source: []const u8, calls: []const Recorded };
 
 /// Calls each route must own, so the proof is never empty: calc lowers these on any backend.
 const calc_owned = [_][]const u8{ "add30-06", "add30-11", "add30-22", "add30-23", "add30-25", "add30-30", "add30-33", "add30-40", "mul30-14", "mul30-16", "mul_big-05", "mul_big-30", "mul_big-40", "bignum-18" };
-/// Two prints: one graph sequence on the bank; the circuit route declines it, ELF or not.
+/// Two prints: one graph sequence on the bank, or an ELF when compiling (the build has the whole translate deadline).
 const bank_owned = [_][]const u8{"bignum-10"};
 /// Floor division with divmod and Fraction, Decimal: the graph bank's, or an ELF's when compiling.
 const graph_owned = [_][]const u8{ "div_big-04", "div_big-08", "div_big-20", "div_big-23", "div_big-32", "div_big-36", "mul_big-08", "mul_big-17", "mul_big-18" };
@@ -58,7 +58,7 @@ fn proof(elf: bool) !void {
     if (with_bank) |g| {
         bank = try graph.Bank.load(gpa, std.mem.span(g));
         routed = .{ .inner = e.frontend, .bank = &bank };
-        dispatch = .{ .gpa = gpa, .circuit = b, .graph = try graph.backend(gpa, &bank, 2) };
+        dispatch = .{ .gpa = gpa, .circuit = b, .graph = try graph.backend(gpa, &bank, 2), .bank = &bank };
         e.frontend = routed.frontend();
         e.backend = dispatch.backend();
     }
@@ -90,7 +90,7 @@ fn proof(elf: bool) !void {
             },
             .declined => |why| std.debug.print("{s}#{d}: code tool ({t})\n", .{ r.task, r.call, why }),
         }
-        const must = listed(&calc_owned, r.task) or (listed(&bank_owned, r.task) and with_bank != null) or
+        const must = listed(&calc_owned, r.task) or (listed(&bank_owned, r.task) and (with_bank != null or elf)) or
             (listed(&graph_owned, r.task) and (with_bank != null or elf)) or (listed(&elf_owned, r.task) and elf);
         if (must and got != .owned) {
             std.debug.print("  MUST OWN: {s} went to the code tool\n", .{r.task});

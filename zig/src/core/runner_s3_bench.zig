@@ -35,7 +35,7 @@ const Cell = struct { id: []const u8, code: []const u8, want: []const u8 };
 /// The route a program takes on the served backend: one bank packet, a sequence of them, calc or ELF on the circuit.
 fn route(p: api.Program) []const u8 {
     return switch (p.kind) {
-        .graph => if (std.mem.startsWith(u8, p.bytes, prog.seq_magic)) "graph-seq" else "graph",
+        .graph => if (std.mem.startsWith(u8, p.bytes, prog.seq_magic_v2)) "graph-seq2" else if (std.mem.startsWith(u8, p.bytes, prog.seq_magic)) "graph-seq" else "graph",
         .calc => "calc",
         .elf => "elf",
     };
@@ -43,7 +43,7 @@ fn route(p: api.Program) []const u8 {
 
 /// Pieces in a graph sequence (1 for anything else).
 fn pieces(p: api.Program) usize {
-    if (p.kind != .graph or !std.mem.startsWith(u8, p.bytes, prog.seq_magic)) return 1;
+    if (p.kind != .graph or !std.mem.startsWith(u8, p.bytes, "TFGS")) return 1;
     return std.mem.count(u8, p.bytes[prog.seq_magic.len..], "\n");
 }
 

@@ -6,8 +6,10 @@ const packet = @import("runner_graph_packet.zig");
 const api = @import("runner_api.zig");
 const Allocator = std.mem.Allocator;
 
-/// A straight-line cell's prints run as packets in turn; each piece is `<I|B><N|S> <packet>` on its own line.
+/// A straight-line cell's prints run as packets; each piece is `<I|B><N|S> <packet>` on its own line.
 pub const seq_magic = "TFGS1\n";
+/// As TFGS1, and a piece may be a template (`@` body) over earlier pieces' printed values, lowered when they finish.
+pub const seq_magic_v2 = "TFGS2\n";
 
 /// Straight-line integer Python (assignments, divmod, `;`, prints) as graph bytes over literals; null: other shapes.
 pub fn program(a: Allocator, bank: *const graph.Bank, code: []const u8) Allocator.Error!?[]u8 {
@@ -21,6 +23,9 @@ pub fn program(a: Allocator, bank: *const graph.Bank, code: []const u8) Allocato
     _ = std.mem.replace(u8, code, "math.", "math_", text);
     if (std.mem.indexOfAny(u8, text, "'\"\\[]{}.:") != null) return null;
     var defs: std.StringHashMapUnmanaged([]const u8) = .empty;
+    // names whose value an earlier 'I' piece printed: later pieces read it there instead of recomputing it
+    var printed: std.StringHashMapUnmanaged(usize) = .empty;
+    var templated = false;
     var pieces: std.ArrayList(u8) = .empty;
     var n_pieces: usize = 0;
     var lone: ?[]const u8 = null;
@@ -46,9 +51,14 @@ pub fn program(a: Allocator, bank: *const graph.Bank, code: []const u8) Allocato
                 if (args.len == 0) return null;
                 for (args, 0..) |arg, i| {
                     const last = i + 1 == args.len;
-                    const one = try call(arena, &defs, math_names, arg) orelse try piece(arena, bank, &defs, arg) orelse return null;
+                    var one = try call(arena, &defs, math_names, arg) orelse try piece(arena, bank, &defs, arg) orelse return null;
+                    if (one.from_piece) if (try template(arena, &defs, &printed, arg)) |tmpl| {
+                        one.packet = tmpl;
+                        templated = true;
+                    };
                     if (n_pieces >= 16) return null;
                     try pieces.print(arena, "{c}{c} {s}\n", .{ one.kind, @as(u8, if (last) 'N' else 'S'), one.packet });
+                    if (one.kind == 'I' and name(arg)) if (defs.get(arg)) |def| if (costly(def)) try printed.put(arena, arg, n_pieces);
                     lone = if (n_pieces == 0 and one.kind == 'I' and last) one.packet else null;
                     n_pieces += 1;
                 }
@@ -69,6 +79,8 @@ pub fn program(a: Allocator, bank: *const graph.Bank, code: []const u8) Allocato
                 const y = try expand(arena, &defs, args[1]) orelse return null;
                 try defs.put(arena, q, try std.mem.concat(arena, u8, &.{ "(", x, "//", y, ")" }));
                 try defs.put(arena, rem, try std.mem.concat(arena, u8, &.{ "(", x, "%", y, ")" }));
+                _ = printed.remove(q);
+                _ = printed.remove(rem);
                 continue;
             }
             if (!name(lhs)) return null;
@@ -78,14 +90,15 @@ pub fn program(a: Allocator, bank: *const graph.Bank, code: []const u8) Allocato
                 if (!std.ascii.isDigit(c)) break false;
             } else true;
             try defs.put(arena, lhs, if (bare) v else try std.mem.concat(arena, u8, &.{ "(", v, ")" }));
+            _ = printed.remove(lhs);
         }
     }
     if (n_pieces == 0) return null;
     if (n_pieces == 1) if (lone) |p| return try a.dupe(u8, p);
-    return try std.mem.concat(a, u8, &.{ seq_magic, pieces.items });
+    return try std.mem.concat(a, u8, &.{ if (templated) seq_magic_v2 else seq_magic, pieces.items });
 }
 
-const Piece = struct { kind: u8, packet: []const u8 };
+const Piece = struct { kind: u8, packet: []const u8, from_piece: bool = false };
 
 /// The math functions a cell may call: `math.f` after `import math`, a bare `f` after `from math import f`.
 const Calls = struct {
@@ -143,11 +156,16 @@ fn piece(arena: Allocator, bank: *const graph.Bank, defs: anytype, arg: []const 
     const cmp = std.mem.indexOf(u8, arg, "==") orelse std.mem.indexOf(u8, arg, "!=");
     if (cmp == null) {
         const e = try expand(arena, defs, arg) orelse return null;
-        return .{ .kind = 'I', .packet = try route.lower(arena, bank, e) orelse return null };
+        return .{ .kind = 'I', .packet = try route.lower(arena, bank, e) orelse return null, .from_piece = true };
     }
     const at = cmp.?;
     const l = try expand(arena, defs, arg[0..at]) orelse return null;
     const r = try expand(arena, defs, arg[at + 2 ..]) orelse return null;
+    return .{ .kind = 'B', .packet = try compare(arena, bank, l, r, arg[at] == '=') orelse return null, .from_piece = true };
+}
+
+/// `l == r` (or `l != r`) over calc input as one packet printing 1 or 0; null when the bank cannot say it.
+pub fn compare(arena: Allocator, bank: *const graph.Bank, l: []const u8, r: []const u8, eq: bool) Allocator.Error!?[]u8 {
     if (std.mem.indexOfAny(u8, l, "=!<>") != null or std.mem.indexOfAny(u8, r, "=!<>") != null) return null;
     // d = l - r; with M = 10^D above |d|, (d+M)%M is 0 only at d = 0, so ((d+M)%M+M-1)//M is d != 0 (d read once)
     const d = try std.mem.concat(arena, u8, &.{ "(", l, ")-(", r, ")" });
@@ -158,8 +176,67 @@ fn piece(arena: Allocator, bank: *const graph.Bank, defs: anytype, arg: []const 
     m[0] = '1';
     @memset(m[1..], '0');
     const nz = try std.mem.concat(arena, u8, &.{ "((", d, "+", m, ")%", m, "+", m, "-1)//", m });
-    const e = if (arg[at] == '=') try std.mem.concat(arena, u8, &.{ "1-(", nz, ")" }) else nz;
-    return .{ .kind = 'B', .packet = try route.lower(arena, bank, e) orelse return null };
+    const e = if (eq) try std.mem.concat(arena, u8, &.{ "1-(", nz, ")" }) else nz;
+    return route.lower(arena, bank, e);
+}
+
+/// `@I<expr>`, `@=<l>;<r>` or `@!<l>;<r>` with `$k` for piece k's printed value; null when `arg` reads none.
+fn template(arena: Allocator, defs: anytype, printed: anytype, arg: []const u8) Allocator.Error!?[]const u8 {
+    var any = false;
+    const cmp = std.mem.indexOf(u8, arg, "==") orelse std.mem.indexOf(u8, arg, "!=");
+    const parts: [2][]const u8 = if (cmp) |at| .{ arg[0..at], arg[at + 2 ..] } else .{ arg, "" };
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(arena, if (cmp) |at| if (arg[at] == '=') "@=" else "@!" else "@I");
+    for (parts, 0..) |part, side| {
+        if (side == 1 and cmp == null) break;
+        if (side == 1) try out.append(arena, ';');
+        var i: usize = 0;
+        while (i < part.len) {
+            const c = part[i];
+            if (std.ascii.isAlphabetic(c) or c == '_') {
+                const start = i;
+                while (i < part.len and (std.ascii.isAlphanumeric(part[i]) or part[i] == '_')) i += 1;
+                if (printed.get(part[start..i])) |k| {
+                    try out.print(arena, "${d}", .{k});
+                    any = true;
+                } else try out.appendSlice(arena, defs.get(part[start..i]) orelse return null);
+                continue;
+            }
+            if (c != ' ' and c != '\t') try out.append(arena, c);
+            i += 1;
+        }
+    }
+    return if (any) out.items else null;
+}
+
+/// A template piece's packet with each `$k` bound to `values[k]` (decimal text); null for a bad template or index.
+pub fn bind(arena: Allocator, bank: *const graph.Bank, body: []const u8, values: []const ?[]const u8) Allocator.Error!?[]u8 {
+    if (body.len < 2 or body[0] != '@') return null;
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 2;
+    while (i < body.len) {
+        if (body[i] != '$') {
+            try out.append(arena, body[i]);
+            i += 1;
+            continue;
+        }
+        const start = i + 1;
+        i = start;
+        while (i < body.len and std.ascii.isDigit(body[i])) i += 1;
+        const k = std.fmt.parseInt(usize, body[start..i], 10) catch return null;
+        if (k >= values.len) return null;
+        const v = values[k] orelse return null;
+        try out.print(arena, "({s})", .{v});
+    }
+    const text = out.items;
+    return switch (body[1]) {
+        'I' => route.lower(arena, bank, text),
+        '=', '!' => {
+            const semi = std.mem.indexOfScalar(u8, text, ';') orelse return null;
+            return compare(arena, bank, text[0..semi], text[semi + 1 ..], body[1] == '=');
+        },
+        else => null,
+    };
 }
 
 /// `src` with every name replaced by its definition and blanks dropped (calc input); null for an undefined name.
@@ -198,6 +275,11 @@ fn splitArgs(arena: Allocator, src: []const u8) Allocator.Error!?[]const []const
     const last = std.mem.trim(u8, src[start..], " \t");
     if (last.len > 0) try out.append(arena, last) else if (out.items.len > 0) return null;
     return out.items;
+}
+
+/// A definition worth reading from an earlier piece rather than recomputing: it divides or raises to a power.
+fn costly(def: []const u8) bool {
+    return std.mem.indexOf(u8, def, "//") != null or std.mem.indexOfScalar(u8, def, '%') != null or std.mem.indexOf(u8, def, "**") != null;
 }
 
 fn name(s: []const u8) bool {

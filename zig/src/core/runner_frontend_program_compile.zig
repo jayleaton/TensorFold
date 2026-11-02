@@ -5,6 +5,10 @@ const inputs = @import("runner_frontend_c_inputs.zig");
 const cost = @import("runner_frontend_c_cost.zig");
 const spawn = @import("runner_frontend_spawn.zig");
 const elf_cache = @import("runner_frontend_elf_cache.zig");
+const log = std.log.scoped(.runner_frontend);
+
+/// The build's own cap, a hang guard: under a translate deadline the build may use all that is left of it.
+pub const build_cap_ms = 1900;
 
 pub const Config = struct {
     clang: []const u8 = "/usr/bin/clang",
@@ -206,6 +210,8 @@ pub fn compile(a: Allocator, io: std.Io, source: []const u8, config: Config) All
             file.writeStreamingAll(io, rewritten) catch return null;
         }
     }
+    const build_timeout = remaining(io, config, build_cap_ms) orelse return null;
+    const build_start = std.Io.Clock.awake.now(io);
     const result = try spawn.run(a, io, &.{
         config.clang,           "--target=riscv32-unknown-elf", "-march=rv32im_zba",   "-mabi=ilp32",
         switch (config.optimize) {
@@ -219,7 +225,12 @@ pub fn compile(a: Allocator, io: std.Io, source: []const u8, config: Config) All
         linker_arg,             "-Wl,--no-relax",               "-Wl,--build-id=none", "-Wl,-T",
         link_path,              "-x",                           "c",                   src,
         "-o",                   elf,
-    }, .{ .stdout = 4096, .stderr = 16384, .timeout = remaining(io, config, 1000) orelse return null }) orelse return null;
+    }, .{ .stdout = 4096, .stderr = 16384, .timeout = build_timeout }) orelse {
+        const spent = build_start.durationTo(std.Io.Clock.awake.now(io));
+        if (spent.toNanoseconds() >= build_timeout.toNanoseconds())
+            log.warn("clang stopped after {d} ms by the compile time limit; the call declines", .{@divTrunc(spent.toNanoseconds(), std.time.ns_per_ms)});
+        return null;
+    };
     defer result.deinit(a);
     if (!result.ok) return null;
     if (config.stack_limit != 0) {
