@@ -295,4 +295,5 @@ test "runner proof: big-number-020 past the frontend's 62 digits, inline and REP
 comptime {
     _ = @import("runner_frontend_inline_regression_test.zig");
     _ = @import("runner_inline_mod_test.zig");
+    _ = @import("runner_inline_arith_test.zig");
 }

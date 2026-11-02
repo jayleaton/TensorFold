@@ -352,10 +352,17 @@ pub const Routed = struct {
         const r: *Routed = @ptrCast(@alignCast(ctx.?));
         if (cell.form != .inline_expr and std.mem.eql(u8, cell.lang, "python") and !prog.shadowed(cell.prior))
             if (try prog.program(a, r.bank, cell.code)) |bytes| return .{ .program = .{ .kind = .graph, .bytes = bytes } };
+        // an inline `gcd(a, b) =` (the scanner's literal call) is math.gcd's plan, as the printed Python call
+        if (cell.form == .inline_expr and std.mem.startsWith(u8, cell.code, "gcd(") and cell.code.len <= 160) {
+            var src: [200]u8 = undefined;
+            const py = std.fmt.bufPrint(&src, "from math import gcd\nprint({s})", .{cell.code}) catch unreachable;
+            if (try prog.program(a, r.bank, py)) |bytes| return .{ .program = .{ .kind = .graph, .bytes = bytes } };
+        }
         const t = try r.inner.translate(r.inner.ctx, a, cell);
         if (t == .abstain) if (try prog.direct(a, r.bank, cell, t.abstain)) |bytes| return .{ .program = .{ .kind = .graph, .bytes = bytes } };
         if (t != .program or t.program.kind != .calc) return t;
         const bytes = try lower(a, r.bank, t.program.bytes) orelse return t;
+        a.free(t.program.bytes); // the calc program the graph replaces
         return .{ .program = .{ .kind = .graph, .bytes = bytes } };
     }
 };
