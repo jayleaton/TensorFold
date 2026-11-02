@@ -45,15 +45,28 @@ const runtime =
     \\ return a->items[i.n<0?a->len+i.n:i.n];
     \\}
     \\static void py_append(py_list *a,py_value v) { a->items[a->len++]=v; }
-    \\static void py_text(const volatile char *s,int n) { for(int i=0;i<n;++i) printf("%c",(unsigned char)s[i]); }
+    \\static void py_out(int c) {
+    \\ register int a0 __asm__("a0")=c; register int a7 __asm__("a7")=1;
+    \\ __asm__ volatile("ecall" : "+r"(a0) : "r"(a7));
+    \\}
+    \\static void py_text(const volatile char *s,int n) { for(int i=0;i<n;++i) py_out((unsigned char)s[i]); }
     \\static void py_print(py_value a) {
-    \\ if(a.b) printf("%s",a.n?"True":"False"); else printf("%d",a.n);
+    \\ if(a.b) {
+    \\  if(a.n) { py_out('T'); py_out('r'); py_out('u'); py_out('e'); }
+    \\  else { py_out('F'); py_out('a'); py_out('l'); py_out('s'); py_out('e'); }
+    \\  return;
+    \\ }
+    \\ unsigned int u=a.n<0?0u-(unsigned int)a.n:(unsigned int)a.n; char d[10]; int k=0;
+    \\ do { d[k++]=(char)('0'+u%10); u/=10; } while(u);
+    \\ if(a.n<0) py_out('-');
+    \\ while(k) py_out(d[--k]);
     \\}
 ;
 
 pub fn emit(a: Allocator, p: *const ast.Program) Allocator.Error![]u8 {
     var e: Emitter = .{ .a = a, .p = p };
     errdefer e.out.deinit(a);
+    defer e.literals.deinit(a);
     try e.put(runtime);
     try e.put("\n");
     try e.put("static volatile int py_inputs[]={");
@@ -119,6 +132,7 @@ const Emitter = struct {
     next_id: usize = 0,
     generators: [8]Generator = undefined,
     generators_len: usize = 0,
+    literals: std.ArrayList(usize) = .empty, // list literals passed by pointer, declared around their statement
 
     fn isParam(e: *const Emitter, name: []const u8) bool {
         for (e.params) |param| if (std.mem.eql(u8, param, name)) return true;
@@ -199,16 +213,16 @@ const Emitter = struct {
             return e.variable(n.text);
         }
         std.debug.assert(n.tag == .list);
-        try e.put("&(py_list){");
-        if (n.args.len != 0) {
-            try e.put(".items={");
-            for (n.args, 0..) |arg, i| {
-                if (i != 0) try e.put(",");
-                try e.expr(arg);
-            }
-            try e.put("},");
+        // only len and the items are written: a compound literal would zero all 128 items, a memset per call
+        const tmp = e.fresh();
+        try e.literals.append(e.a, tmp);
+        try e.out.print(e.a, "({{py_literal{d}.len={d};", .{ tmp, n.args.len });
+        for (n.args, 0..) |item, i| {
+            try e.out.print(e.a, "py_literal{d}.items[{d}]=", .{ tmp, i });
+            try e.expr(item);
+            try e.put(";");
         }
-        try e.out.print(e.a, ".len={d}}}", .{n.args.len});
+        try e.out.print(e.a, "&py_literal{d};}})", .{tmp});
     }
 
     fn listCall(e: *Emitter, helper: []const u8, list: usize, index: ?usize) Allocator.Error!void {
@@ -387,7 +401,25 @@ const Emitter = struct {
     }
 
     fn statements(e: *Emitter, body: []const ast.Stmt) Allocator.Error!void {
-        for (body) |s| switch (s.tag) {
+        for (body) |s| {
+            const at = e.out.items.len;
+            const mark = e.literals.items.len;
+            try e.statement(s);
+            // the statement's own list literals live in a block around it, so their pointers outlive every use
+            if (e.literals.items.len == mark) continue;
+            var decls: std.ArrayList(u8) = .empty;
+            defer decls.deinit(e.a);
+            try decls.append(e.a, '{');
+            for (e.literals.items[mark..]) |tmp| try decls.print(e.a, "py_list py_literal{d};", .{tmp});
+            try decls.append(e.a, '\n');
+            try e.out.insertSlice(e.a, at, decls.items);
+            try e.put("}\n");
+            e.literals.shrinkRetainingCapacity(mark);
+        }
+    }
+
+    fn statement(e: *Emitter, s: ast.Stmt) Allocator.Error!void {
+        switch (s.tag) {
             .assign => {
                 const n = e.p.nodes.items[s.expr];
                 if (n.tag == .list) {
@@ -449,10 +481,10 @@ const Emitter = struct {
             },
             .print => {
                 for (s.args, 0..) |arg, i| {
-                    if (i != 0) try e.put("printf(\"%s\",\" \");\n");
+                    if (i != 0) try e.put("py_out(' ');\n");
                     try e.printPart(arg);
                 }
-                try e.put("printf(\"%s\",\"\\n\");\n");
+                try e.put("py_out('\\n');\n");
             },
             .assertion => {
                 try e.put("if(!(");
@@ -461,7 +493,7 @@ const Emitter = struct {
             },
             .raise => try e.put(if (e.scope == null) "return 1;\n" else "return py_int(0);\n"),
             .function, .math_import => {},
-        };
+        }
     }
 
     fn each(e: *Emitter, s: ast.Stmt) Allocator.Error!void {

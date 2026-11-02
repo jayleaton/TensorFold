@@ -81,6 +81,11 @@ pub fn openSharing(gpa: Allocator, cfg: Config, with: ?*Runner) !*Runner {
         o.no_compile = .{ .io = o.threaded.io(), .compiler = .{ .scratch_root = "" } };
         frontend = o.no_compile.frontend();
         o.compiles = false;
+    } else {
+        // the compiler kept started and the fixed runtime compiled now, so no call pays clang's start or the runtime
+        var warm_io: std.Io.Threaded = .init(gpa, .{});
+        defer warm_io.deinit();
+        try @import("runner_frontend_split.zig").warm(gpa, warm_io.io(), .{});
     }
     var backend = back;
     // backend graph: T1's bank loads once here; pure-integer calc programs run on it, the rest on the circuit

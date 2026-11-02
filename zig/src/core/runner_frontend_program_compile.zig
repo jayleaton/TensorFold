@@ -3,8 +3,9 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const inputs = @import("runner_frontend_c_inputs.zig");
 const cost = @import("runner_frontend_c_cost.zig");
-const spawn = @import("runner_frontend_spawn.zig");
 const elf_cache = @import("runner_frontend_elf_cache.zig");
+const forkserver = @import("runner_frontend_forkserver.zig");
+const split = @import("runner_frontend_split.zig");
 const log = std.log.scoped(.runner_frontend);
 
 /// The build's own cap, a hang guard: under a translate deadline the build may use all that is left of it.
@@ -40,7 +41,7 @@ pub const linker_script =
     \\}
 ;
 
-const runtime =
+pub const runtime =
     \\typedef unsigned int size_t;
     \\typedef signed char int8_t;
     \\typedef unsigned char uint8_t;
@@ -55,13 +56,25 @@ const runtime =
     \\#define false 0
     \\#define NULL ((void*)0)
     \\void *memset(void *destination, int value, size_t count) {
-    \\ unsigned char *d = destination;
-    \\ for(size_t i=0;i<count;++i) d[i]=(unsigned char)value;
+    \\ typedef unsigned int __attribute__((may_alias)) word;
+    \\ unsigned char *d = destination; size_t i = 0;
+    \\ if(!((size_t)d & 3)) {
+    \\  word *w = destination, *end = w + count / 4; word v = (unsigned char)value * 0x01010101u;
+    \\  while(w != end) *w++ = v;
+    \\  i = count & ~(size_t)3;
+    \\ }
+    \\ for(; i<count; ++i) d[i]=(unsigned char)value;
     \\ return destination;
     \\}
     \\void *memcpy(void *destination, const void *source, size_t count) {
-    \\ unsigned char *d = destination; const unsigned char *s = source;
-    \\ for(size_t i=0;i<count;++i) d[i]=s[i];
+    \\ typedef unsigned int __attribute__((may_alias)) word;
+    \\ unsigned char *d = destination; const unsigned char *s = source; size_t i = 0;
+    \\ if(!(((size_t)d | (size_t)s) & 3)) {
+    \\  word *w = destination, *end = w + count / 4; const word *v = source;
+    \\  while(w != end) *w++ = *v++;
+    \\  i = count & ~(size_t)3;
+    \\ }
+    \\ for(; i<count; ++i) d[i]=s[i];
     \\ return destination;
     \\}
     \\static unsigned int tf_output_count;
@@ -82,12 +95,11 @@ const runtime =
     \\ else tf_unsigned((unsigned int)n);
     \\}
     \\static unsigned long long tf_div10(unsigned long long n, unsigned int *remainder) {
-    \\ unsigned long long q = 0; unsigned int r = 0;
-    \\ for(int bit = 0; bit < 64; ++bit) {
-    \\  r = (r << 1) | (unsigned int)(n >> 63); n <<= 1; q <<= 1;
-    \\  if(r >= 10) { r -= 10; q |= 1; }
-    \\ }
-    \\ *remainder = r; return q;
+    \\ unsigned int high = (unsigned int)(n >> 32), low = (unsigned int)n, r = high % 10;
+    \\ unsigned int t = (r << 16) | (low >> 16), q1 = t / 10;
+    \\ t = ((t % 10) << 16) | (low & 65535u);
+    \\ *remainder = t % 10;
+    \\ return ((unsigned long long)(high / 10) << 32) | (q1 << 16) | (t / 10);
     \\}
     \\static void tf_unsigned_wide(unsigned long long n) {
     \\ if(n <= 0xffffffffULL) { tf_unsigned((unsigned int)n); return; }
@@ -144,21 +156,8 @@ pub fn compile(a: Allocator, io: std.Io, source: []const u8, config: Config) All
     if (!std.fs.path.isAbsolute(config.scratch_root)) return null;
     const parent = std.Io.Dir.cwd().openDir(io, config.scratch_root, .{}) catch return null;
     defer parent.close(io);
-    var nonce: [16]u8 = undefined;
     var name_buf: [64]u8 = undefined;
-    var name: []const u8 = undefined;
-    var created = false;
-    for (0..8) |_| {
-        io.random(&nonce);
-        name = std.fmt.bufPrint(&name_buf, "tf-rv32-{x}", .{std.mem.readInt(u128, &nonce, .little)}) catch unreachable;
-        parent.createDir(io, name, .fromMode(0o700)) catch |err| switch (err) {
-            error.PathAlreadyExists => continue,
-            else => return null,
-        };
-        created = true;
-        break;
-    }
-    if (!created) return null;
+    const name = scratch(io, parent, &name_buf) orelse return null;
     defer parent.deleteTree(io, name) catch {};
     const dir = parent.openDir(io, name, .{ .follow_symlinks = false }) catch return null;
     defer dir.close(io);
@@ -182,7 +181,7 @@ pub fn compile(a: Allocator, io: std.Io, source: []const u8, config: Config) All
         if (config.estimated_steps) |steps| if (steps > config.step_budget) return null;
     }
     if (!config.opaque_inputs or (config.step_budget != 0 and config.estimated_steps == null)) {
-        const ast = try spawn.run(a, io, &.{ config.clang, "--target=riscv32-unknown-elf", "-march=rv32im_zba", "-mabi=ilp32", "-ffreestanding", "-fno-builtin", "-nostdinc", "-Werror=format", "-fsyntax-only", "-Xclang", "-ast-dump=json", "-x", "c", src }, .{
+        const ast = try forkserver.run(a, io, path, &.{ config.clang, "--target=riscv32-unknown-elf", "-march=rv32im_zba", "-mabi=ilp32", "-ffreestanding", "-fno-builtin", "-nostdinc", "-Werror=format", "-fsyntax-only", "-Xclang", "-ast-dump=json", "-x", "c", src }, .{
             .stdout = 4 * 1024 * 1024,
             .stderr = 16384,
             .timeout = remaining(io, config, 500) orelse return null,
@@ -210,9 +209,27 @@ pub fn compile(a: Allocator, io: std.Io, source: []const u8, config: Config) All
             file.writeStreamingAll(io, rewritten) catch return null;
         }
     }
-    const build_timeout = remaining(io, config, build_cap_ms) orelse return null;
     const build_start = std.Io.Clock.awake.now(io);
-    const result = try spawn.run(a, io, &.{
+    if (config.opaque_inputs and split.eligible(normalized)) {
+        const split_timeout = remaining(io, config, build_cap_ms) orelse return null;
+        if (try split.build(a, io, path, normalized, config, split_timeout)) |built| {
+            defer a.free(built.su);
+            if (config.stack_limit != 0 and !safeStackUsage(built.su, config.stack_limit)) {
+                a.free(built.elf);
+                return null;
+            }
+            if (validElf(built.elf)) {
+                if (cached) |k| elf_cache.put(io, k, built.elf);
+                return built.elf;
+            }
+            a.free(built.elf);
+        }
+    }
+    const build_timeout = remaining(io, config, build_cap_ms) orelse {
+        log.warn("clang stopped after {d} ms by the compile time limit; the call declines", .{@divTrunc(build_start.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds(), std.time.ns_per_ms)});
+        return null;
+    };
+    const result = try forkserver.run(a, io, path, &.{
         config.clang,           "--target=riscv32-unknown-elf", "-march=rv32im_zba",   "-mabi=ilp32",
         switch (config.optimize) {
             .O0 => "-O0",
@@ -251,6 +268,21 @@ pub fn compile(a: Allocator, io: std.Io, source: []const u8, config: Config) All
     }
     if (cached) |k| elf_cache.put(io, k, bytes);
     return bytes;
+}
+
+/// A fresh private directory under `parent` (tf-rv32-<random>); its name lives in `buf`.
+pub fn scratch(io: std.Io, parent: std.Io.Dir, buf: *[64]u8) ?[]const u8 {
+    var nonce: [16]u8 = undefined;
+    for (0..8) |_| {
+        io.random(&nonce);
+        const name = std.fmt.bufPrint(buf, "tf-rv32-{x}", .{std.mem.readInt(u128, &nonce, .little)}) catch unreachable;
+        parent.createDir(io, name, .fromMode(0o700)) catch |err| switch (err) {
+            error.PathAlreadyExists => continue,
+            else => return null,
+        };
+        return name;
+    }
+    return null;
 }
 
 fn imageKey(normalized: []const u8, config: Config) ?elf_cache.Key {
@@ -311,7 +343,7 @@ fn normalize(a: Allocator, source: []const u8) Allocator.Error!?[]u8 {
     return normalizeWithTrust(a, source, false);
 }
 
-fn normalizeWithTrust(a: Allocator, source: []const u8, trusted: bool) Allocator.Error!?[]u8 {
+pub fn normalizeWithTrust(a: Allocator, source: []const u8, trusted: bool) Allocator.Error!?[]u8 {
     // Fixed integer support plus bounded DAG data may exceed the raw-cell source limit.
     const max_source: usize = if (trusted) 32768 else 16384;
     if (source.len == 0 or source.len > max_source or std.mem.indexOfScalar(u8, source, 0) != null) return null;
