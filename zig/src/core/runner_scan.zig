@@ -3,6 +3,7 @@ const std = @import("std");
 const api = @import("runner_api.zig");
 const trace = @import("runner_trace.zig");
 const header = @import("runner_scan_boundary.zig");
+const inline_mod = @import("runner_scan_mod.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Config = struct {
@@ -11,6 +12,7 @@ pub const Config = struct {
     lookahead: u32 = 64, // tokens after a closed fence in which a result header counts
     reasoning_only: bool = false, // triggers only while the think block is open
     inline_math: bool = false, // `A op B =` at a line's end: the value after `=` (exact math semantics)
+    inline_mod: bool = true, // with inline_math: `A mod M =` and `A % M =` on literals, after any earlier `=`
     float_window: u32 = 512, // tokens after a Python-float cue in which an inline span with `.` or `/` abstains
     trace: bool = false, // a computation the reasoning states, owned as `[exact: …]` where its hand trace starts
     trace_window: u32 = 512, // tokens after a stated computation's line in which a hand-trace cue counts
@@ -111,14 +113,24 @@ pub const Scanner = struct {
         if (s.cfg.inline_math and allowed and s.state != .fence and ev.closed == null and ev.trigger == null and
             std.mem.indexOfScalar(u8, bytes, '=') != null)
         {
-            if (inlineExpr(s.line.items)) |x| {
+            const floats = s.float_at != null and s.tokens - s.float_at.? <= s.cfg.float_window;
+            // a modular step first: inlineExpr alone would take `10^18` of `3^400 mod 10^18 =` for the whole
+            if (if (s.cfg.inline_mod) inline_mod.inlineMod(s.line.items) else null) |m| {
+                s.lang.clearRetainingCapacity();
+                try s.lang.appendSlice(a, "python");
+                s.code.clearRetainingCapacity();
+                try m.code(a, &s.code);
+                ev.closed = s.close(.inline_expr);
+                // Python reads 1e9 as a float: a reply reasoning in floats keeps its own value
+                ev.closed.?.float_context = floats and std.mem.indexOfScalar(u8, m.modulus, 'e') != null;
+                ev.trigger = .{ .index = ev.closed.?.index, .inline_space = m.space };
+            } else if (inlineExpr(s.line.items)) |x| {
                 s.lang.clearRetainingCapacity();
                 try s.lang.appendSlice(a, "python");
                 s.code.clearRetainingCapacity();
                 try s.code.appendSlice(a, x.expr);
                 ev.closed = s.close(.inline_expr);
-                ev.closed.?.float_context = s.float_at != null and s.tokens - s.float_at.? <= s.cfg.float_window and
-                    std.mem.indexOfAny(u8, x.expr, "./") != null;
+                ev.closed.?.float_context = floats and std.mem.indexOfAny(u8, x.expr, "./") != null;
                 ev.trigger = .{ .index = ev.closed.?.index, .inline_space = x.space };
             }
         }
@@ -318,6 +330,9 @@ fn inlineExpr(line: []const u8) ?struct { expr: []const u8, space: bool } {
         }
         // after a word, an unspaced "12-20" is a range ("positions 12-20 ="), not a subtraction
         const word = std.mem.trimEnd(u8, lead, " \t");
+        // the modulus of `A mod M` or `A % M` is not the whole expression (live bn-011: `3^400 mod 10^18 =`)
+        if (std.mem.endsWith(u8, word, "%") or (std.mem.endsWith(u8, word, "mod") and
+            (word.len == 3 or !std.ascii.isAlphanumeric(word[word.len - 4])))) return null;
         if (word.len > 0 and std.ascii.isAlphabetic(word[word.len - 1])) {
             for (1..expr.len - 1) |k| {
                 if (expr[k] == '-' and std.ascii.isDigit(expr[k - 1]) and std.ascii.isDigit(expr[k + 1])) return null;
