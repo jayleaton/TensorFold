@@ -369,13 +369,13 @@ fn launch(a: Allocator, tool: []const u8, so: []const u8, control: linux.fd_t) A
 /// addclosefrom_np is glibc 2.34, past the serve targets' glibc: one addclose per fd open from `from` instead.
 fn closeFrom(actions: *Opaque, from: c_int) c_int {
     const opened = linux.open("/proc/self/fd", .{ .DIRECTORY = true, .CLOEXEC = true }, 0);
-    if (linux.errno(opened) != .SUCCESS) return @intFromEnum(linux.errno(opened));
+    if (linux.errno(opened) != .SUCCESS) return @backingInt(linux.errno(opened));
     const dir: linux.fd_t = @intCast(opened);
     defer _ = linux.close(dir);
     var buf: [4096]u8 align(8) = undefined;
     while (true) {
         const n = linux.getdents64(dir, &buf, buf.len);
-        if (linux.errno(n) != .SUCCESS) return @intFromEnum(linux.errno(n));
+        if (linux.errno(n) != .SUCCESS) return @backingInt(linux.errno(n));
         if (n == 0) return 0;
         var at: usize = 0;
         while (at < n) {
