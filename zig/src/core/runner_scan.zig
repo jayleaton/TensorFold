@@ -19,6 +19,7 @@ pub const Config = struct {
     trace: bool = false, // a computation the reasoning states, owned as `[exact: …]` where its hand trace starts
     trace_window: u32 = 512, // tokens after a stated computation's line in which a hand-trace cue counts
     trace_repeat: u8 = 0, // a restated, already owned line is owned again up to this many times
+    trace_whole: bool = false, // opt-in (TF_DSV41_RUNNER_STATED): trace also takes the whole-statement shapes
 };
 
 /// Trace ownerships per reply, and trace cells (stated computations) a reply may open.
@@ -223,6 +224,7 @@ pub const Scanner = struct {
         if (s.tracer == null) {
             s.tracer = trace.Tracer.init(a);
             s.tracer.?.repeat = s.cfg.trace_repeat;
+            s.tracer.?.whole = s.cfg.trace_whole;
         }
         const t = &s.tracer.?;
         var fired = false;

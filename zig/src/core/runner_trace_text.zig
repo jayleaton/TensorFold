@@ -252,8 +252,8 @@ pub fn goalHeads(a: Allocator, s: []const u8, out: *std.ArrayList(Head)) Allocat
     }
 }
 
-/// A sentence that is only an expression: starts with a digit or `(`, ends with a digit or `)` right before ". ".
-pub fn bareHeads(a: Allocator, s: []const u8, out: *std.ArrayList(Head)) Allocator.Error!void {
+/// A sentence that is only an expression: a digit or `(` to a digit or `)` before ". " (`commas`: thousands groups).
+pub fn bareHeads(a: Allocator, s: []const u8, commas: bool, out: *std.ArrayList(Head)) Allocator.Error!void {
     var i: usize = 0;
     while (i < s.len) : (i += 1) {
         if (!(i == 0 or (i >= 2 and s[i - 2] == '.' and s[i - 1] == ' '))) continue;
@@ -262,6 +262,8 @@ pub fn bareHeads(a: Allocator, s: []const u8, out: *std.ArrayList(Head)) Allocat
         while (j < s.len) {
             const c = s[j];
             if (std.ascii.isAlphanumeric(c) or std.mem.indexOfScalar(u8, "^*+-() ", c) != null) {
+                j += 1;
+            } else if (commas and thousandsAt(s, j)) {
                 j += 1;
             } else if (std.mem.startsWith(u8, s[j..], "×")) {
                 j += 2;
@@ -274,13 +276,13 @@ pub fn bareHeads(a: Allocator, s: []const u8, out: *std.ArrayList(Head)) Allocat
     }
 }
 
-pub const Phrase = struct { kind: enum { divmod, mul, subfrom, expr }, parts: [2][2]usize = undefined, n: usize = 1, end: usize };
+pub const Phrase = struct { kind: enum { divmod, mul, subfrom, expr, gcd }, parts: [2][2]usize = undefined, n: usize = 1, end: usize };
 
 const fill_words = [_][]const u8{ "the", "answer", "exact", "exactly", "value", "of", "integer", "decimal", "product", "sum", "difference", "result", "floor", "huge", "number", "big" };
 const trail_words = [_][]const u8{ "exactly", "exact", "accurately", "carefully", "precisely", "manually" };
 
-/// The phrase a head introduces, up to the first sentence end (`.,;:` then a space, or the line's end).
-pub fn phrase(rest: []const u8) ?Phrase {
+/// The phrase a head introduces, up to the first sentence end (`.,;:` then a space, or the line's end; `whole`: gcd).
+pub fn phrase(rest: []const u8, whole: bool) ?Phrase {
     var i: usize = 0;
     var n: usize = 0;
     while (n < 4) : (n += 1) {
@@ -297,6 +299,7 @@ pub fn phrase(rest: []const u8) ?Phrase {
     if (verbPhrase(rest, i, "multiply", &.{ "by", "and", "with" })) |p| return .{ .kind = .mul, .parts = p.parts, .n = 2, .end = p.end };
     if (multiplyDefs(rest, i)) |p| return .{ .kind = .mul, .parts = p.parts, .n = 2, .end = p.end };
     if (verbPhrase(rest, i, "subtract", &.{"from"})) |p| return .{ .kind = .subfrom, .parts = p.parts, .n = 2, .end = p.end };
+    if (whole) if (gcdCall(rest, i)) |p| return .{ .kind = .gcd, .parts = p.parts, .n = 2, .end = p.end };
     const e = lazyEnd(rest, i) orelse return null;
     return .{ .kind = .expr, .parts = .{ .{ i, e.text }, undefined }, .end = e.end };
 }
@@ -341,6 +344,31 @@ fn verbPhrase(s: []const u8, i: usize, verb: []const u8, seps: []const []const u
     return null;
 }
 
+/// `gcd(X, Y)` then a sentence end: X and Y split at the call's one top-level comma.
+fn gcdCall(s: []const u8, i: usize) ?Two {
+    const open = seq(s, i, &.{"gcd("}) orelse return null;
+    var depth: usize = 0;
+    var comma: ?usize = null;
+    var k = open;
+    while (k < s.len) : (k += 1) {
+        switch (s[k]) {
+            '(' => depth += 1,
+            ')' => {
+                if (depth == 0) break;
+                depth -= 1;
+            },
+            ',' => if (depth == 0) {
+                if (comma != null) return null; // three arguments, or a thousands comma: not one reading
+                comma = k;
+            },
+            else => {},
+        }
+    } else return null;
+    const c = comma orelse return null;
+    const e = endAt(s, k + 1) orelse return null;
+    return .{ .parts = .{ .{ open, c }, .{ c + 1, k } }, .end = e };
+}
+
 /// `multiply A=x B=y`: two definitions side by side.
 fn multiplyDefs(s: []const u8, i: usize) ?Two {
     var j = seq(s, i, &.{"multiply"}) orelse return null;
@@ -382,6 +410,13 @@ fn endAt(s: []const u8, k: usize) ?usize {
         return if (j + 1 < s.len) j + 2 else j + 1;
     }
     return null;
+}
+
+/// A thousands comma at `j`: a digit before it, exactly three digits after it.
+pub fn thousandsAt(s: []const u8, j: usize) bool {
+    if (j == 0 or j + 4 > s.len or s[j] != ',' or !std.ascii.isDigit(s[j - 1])) return false;
+    for (s[j + 1 .. j + 4]) |c| if (!std.ascii.isDigit(c)) return false;
+    return j + 4 == s.len or !std.ascii.isDigit(s[j + 4]);
 }
 
 /// "Compute D*349, D*350": a phrase ending in a comma before another candidate is a list, not one computation.
