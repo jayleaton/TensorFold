@@ -184,7 +184,7 @@ test "runner scan: a Python-float reply marks an e-notation modulus, not a liter
         defer s.deinit(a);
         _ = try s.feed(a, "x = float(n)\n", true);
         const e = try s.feed(a, c[0], true);
-        try t.expectEqual(c[1], e.closed.?.float_context);
+        try t.expectEqual(c[1], e.closed.?.own_context);
     }
 }
 

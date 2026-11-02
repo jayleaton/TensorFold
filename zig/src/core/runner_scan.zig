@@ -25,11 +25,15 @@ pub const Config = struct {
 const trace_owned_max = 16;
 const trace_cells_max = 32;
 
-/// Text that puts the reply in a language's float semantics, where exact inline math would contradict it.
-const float_cues = [_][]const u8{ "float", "Decimal(", "sum(", "round(", "0.1+0.2", "0.1 + 0.2" };
+/// Text after which a reply keeps its own decimals and fractions: Python floats, or a common denominator.
+const float_cues = [_][]const u8{ "float", "Decimal(", "sum(", "round(", "0.1+0.2", "0.1 + 0.2", "lcm", "LCM", "LCD", "denominator" };
+/// Text after which `a + b` may join digits rather than add them (live: `Concatenate: … 1119 + 392 = 1119392`).
+const join_cues = [_][]const u8{ "oncatenat", "join", "Join" };
+/// Lines after a join cue in which a bare `a + b` opening its line keeps the model's own value.
+const join_lines = 2;
 
 /// A closed cell; `lang` and `code` live in the scanner until the next `feed`.
-pub const Closed = struct { index: u32, form: api.Form, lang: []const u8, code: []const u8, float_context: bool = false, trace: ?Stated = null };
+pub const Closed = struct { index: u32, form: api.Form, lang: []const u8, code: []const u8, own_context: bool = false, trace: ?Stated = null }; // own_context: the reply keeps its value
 
 /// A trace cell's line text: what `[exact: … = value]` shows, and whether the value is a (quotient, remainder) pair.
 pub const Stated = struct { display: []const u8, divmod: bool };
@@ -54,6 +58,8 @@ pub const Scanner = struct {
     armed: ?Trigger = null, // a trigger this token set; later non-blank bytes in the same token spoil it
     tokens: u32 = 0, // tokens fed
     float_at: ?u32 = null, // the token of the last float cue or closed code cell
+    lines: u32 = 0, // newlines fed
+    join_line: ?u32 = null, // the line of the last join cue
     tail: [16]u8 = undefined, // the last bytes fed, for cues split across tokens
     tail_len: usize = 0,
     think: bool = false, // the think block was open at the last token
@@ -101,6 +107,7 @@ pub const Scanner = struct {
                 try s.line.append(a, b);
                 continue;
             }
+            s.lines +|= 1;
             try s.endLine(a, &ev, think_open);
             s.line.clearRetainingCapacity();
         }
@@ -124,7 +131,7 @@ pub const Scanner = struct {
                 try m.code(a, &s.code);
                 ev.closed = s.close(.inline_expr);
                 // Python reads 1e9 as a float: a reply reasoning in floats keeps its own value
-                ev.closed.?.float_context = floats and std.mem.indexOfScalar(u8, m.modulus, 'e') != null;
+                ev.closed.?.own_context = floats and std.mem.indexOfScalar(u8, m.modulus, 'e') != null;
                 ev.trigger = .{ .index = ev.closed.?.index, .inline_space = m.space };
             } else if (inline_scan.inlineExpr(s.line.items, s.cfg.inline_arith, s.cfg.inline_chain)) |x| {
                 s.lang.clearRetainingCapacity();
@@ -137,7 +144,11 @@ pub const Scanner = struct {
                     if (c != ',') try s.code.append(a, c);
                 }
                 ev.closed = s.close(.inline_expr);
-                ev.closed.?.float_context = floats and std.mem.indexOfAny(u8, x.expr, "./") != null;
+                // `1119 + 392 =` opening its line, just after a join cue: the model may be joining digit groups
+                const lead = std.mem.trim(u8, s.line.items[0 .. @intFromPtr(x.expr.ptr) - @intFromPtr(s.line.items.ptr)], " \t");
+                const joined = s.join_line != null and s.lines - s.join_line.? <= join_lines and lead.len == 0 and
+                    inline_scan.twoInts(x.expr);
+                ev.closed.?.own_context = joined or (floats and std.mem.indexOfAny(u8, x.expr, "./") != null);
                 ev.trigger = .{ .index = ev.closed.?.index, .inline_space = x.space };
             }
         }
@@ -256,6 +267,9 @@ pub const Scanner = struct {
         s.tail_len += 1;
         for (float_cues) |c| if (std.mem.endsWith(u8, s.tail[0..s.tail_len], c)) {
             s.float_at = s.tokens;
+        };
+        for (join_cues) |c| if (std.mem.endsWith(u8, s.tail[0..s.tail_len], c)) {
+            s.join_line = s.lines;
         };
     }
 
@@ -453,24 +467,24 @@ test "runner scan: a Python-float reply marks inline decimals and fractions, not
     for ([_][]const u8{ "Actually Python:\n", ">>> sum([0.1]*10)\n", "0.9999999999999999\n", "I think yes. ", "Let's recall common: " }) |t|
         _ = try s.feed(a, t, true);
     const live = try s.feed(a, "0.1+0.2 =", true);
-    try std.testing.expect(live.closed.?.form == .inline_expr and live.closed.?.float_context);
+    try std.testing.expect(live.closed.?.form == .inline_expr and live.closed.?.own_context);
     _ = try s.feed(a, " 0.3\n", true);
     for ([_][]const u8{ "7/12 =", "6 * 7 =" }, [_]bool{ true, false }) |t, want| {
         const e = try s.feed(a, t, true);
-        try std.testing.expectEqual(want, e.closed.?.float_context);
+        try std.testing.expectEqual(want, e.closed.?.own_context);
         _ = try s.feed(a, " 1\n", true);
     }
     var far: Scanner = .{ .cfg = .{ .inline_math = true, .float_window = 4 } };
     defer far.deinit(a);
     _ = try far.feed(a, "a flo", true);
     _ = try far.feed(a, "at\n", true); // a cue split across tokens
-    try std.testing.expect((try far.feed(a, "1.5+2 =", true)).closed.?.float_context);
+    try std.testing.expect((try far.feed(a, "1.5+2 =", true)).closed.?.own_context);
     _ = try far.feed(a, " 3.5\n", true);
     for (0..4) |_| _ = try far.feed(a, "ok\n", true);
-    try std.testing.expect(!(try far.feed(a, "1.5+2 =", true)).closed.?.float_context);
+    try std.testing.expect(!(try far.feed(a, "1.5+2 =", true)).closed.?.own_context);
     var plain: Scanner = .{ .cfg = .{ .inline_math = true } };
     defer plain.deinit(a);
-    try std.testing.expect(!(try plain.feed(a, "Discount: 889.35*0.075 =", true)).closed.?.float_context);
+    try std.testing.expect(!(try plain.feed(a, "Discount: 889.35*0.075 =", true)).closed.?.own_context);
 }
 
 test "runner scan: an answer's first fence opens a cell when the reasoning ended mid-line (live run-check-004)" {
