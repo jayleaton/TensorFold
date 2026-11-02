@@ -163,41 +163,86 @@ test "runner proof: trace stated: isqrt runs on the bank's plan and prints CPyth
     }
 }
 
-test "runner proof: trace stated: edit distance runs as RV32, past the default budget only with the opt-in, and a mutated string follows (TF_RUNNER_GRAPH_BANK)" {
+fn nowNs() u64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+/// Deterministic printable strings (no `"` or `\`) for the larger goldens: a small alphabet plus a few edge bytes.
+fn text(rand: std.Random, buf: []u8) []const u8 {
+    const alphabet = " ~{}'abcdeABC019";
+    for (buf) |*c| c.* = alphabet[rand.intRangeLessThan(usize, 0, alphabet.len)];
+    return buf;
+}
+
+test "runner proof: trace stated: edit distance runs on the bank as a DP packet at the default budget, up to 32x32; a mutated character follows (TF_RUNNER_GRAPH_BANK)" {
     const e = try Engine.open() orelse return error.SkipZigTest;
-    // kitten/sitting costs 28,360 estimated steps: over the default 10,522, so only the opt-in admits it
-    if (try e.translate(live[4].want[1], 10522)) |p| {
-        gpa.free(p.bytes);
-        return error.TestDefaultBudget;
-    }
-    for ([_]struct { want: [2][]const u8 }{ .{ .want = live[4].want }, .{ .want = live[5].want }, .{ .want = edit("abc", "yabd") } }) |c| {
-        const p = (try e.translate(c.want[1], 32768)) orelse {
-            std.debug.print("opt-in budget refused {s}\n", .{c.want[0]});
-            return error.TestExpectedProgram;
-        };
-        defer gpa.free(p.bytes);
-        try std.testing.expect(p.kind == .elf);
-        const want = try python(c.want[1]);
+    const packet = @import("runner_graph_packet.zig");
+    const dp = @import("runner_graph_edit.zig");
+    var prng = std.Random.DefaultPrng.init(20261103);
+    const rand = prng.random();
+    var bufs: [7][2][dp.max_len]u8 = undefined;
+    const sizes = [_][2]usize{ .{ 1, 1 }, .{ 1, 32 }, .{ 32, 1 }, .{ 17, 31 }, .{ 25, 32 }, .{ 28, 28 }, .{ 32, 32 } };
+    const pairs = [_][2][]const u8{ .{ "kitten", "sitting" }, .{ "flaw", "lawn" }, .{ "intention", "execution" }, .{ "algorithm", "logarithm" }, .{ "abc", "yabd" } };
+    var cases: [pairs.len + sizes.len][2][]const u8 = undefined;
+    @memcpy(cases[0..pairs.len], &pairs);
+    for (sizes, 0..) |s, k| cases[pairs.len + k] = .{ text(rand, bufs[k][0][0..s[0]]), text(rand, bufs[k][1][0..s[1]]) };
+    // the engine's own frontend (runner_open: routed, default compile budget) and its Dispatch backend
+    const f = e.runner.frontend;
+    for (cases) |c| {
+        const code = try std.fmt.allocPrint(gpa, trace.edit_program, .{ c[0], c[1] });
+        defer gpa.free(code);
+        const want = try python(code);
         defer gpa.free(want);
-        const out = try e.exec(p);
+        const t0 = nowNs();
+        const tr = try f.translate(f.ctx, gpa, .{ .form = .repl, .lang = "python", .code = code });
+        const t1 = nowNs();
+        if (c[0].len * c[1].len * dp.ops_per_cell > packet.max_ops) {
+            // past a packet's ops: never the graph (the RV32 frontend keeps the cell, and refuses this size)
+            if (tr == .program) {
+                defer gpa.free(tr.program.bytes);
+                try std.testing.expect(tr.program.kind != .graph);
+            }
+            std.debug.print("EDWALL\t{d}x{d}\tover max_ops {d}: not graph\n", .{ c[0].len, c[1].len, packet.max_ops });
+            continue;
+        }
+        if (tr != .program or tr.program.kind != .graph) {
+            std.debug.print("not a graph program: {d}x{d}\n", .{ c[0].len, c[1].len });
+            return error.TestExpectedGraph;
+        }
+        defer gpa.free(tr.program.bytes);
+        const out = try e.exec(tr.program);
         defer gpa.free(out);
+        const t2 = nowNs();
         try std.testing.expectEqualStrings(want, out);
-        const line = (try trace.owned(gpa, "[exact: {}]", c.want[0], false, out)) orelse return error.TestExpectedOwned;
+        std.debug.print("EDWALL\t{d}x{d}\ttranslate_ms={d:.1}\trun_ms={d:.1}\tbytes={d}\tout={s}", .{ c[0].len, c[1].len, @as(f64, @floatFromInt(t1 - t0)) / 1e6, @as(f64, @floatFromInt(t2 - t1)) / 1e6, tr.program.bytes.len, out });
+        const display = try std.fmt.allocPrint(gpa, "edit_distance(\"{s}\", \"{s}\")", .{ c[0], c[1] });
+        defer gpa.free(display);
+        const line = (try trace.owned(gpa, "[exact: {}]", display, false, out)) orelse return error.TestExpectedOwned;
         defer gpa.free(line);
-        const golden = try std.fmt.allocPrint(gpa, "[exact: {s} = {s}]\n", .{ c.want[0], std.mem.trimEnd(u8, want, "\n") });
+        const golden = try std.fmt.allocPrint(gpa, "[exact: {s} = {s}]\n", .{ display, std.mem.trimEnd(u8, want, "\n") });
         defer gpa.free(golden);
         try std.testing.expectEqualStrings(golden, line);
+        // the circuit compares the characters: the first one changed in the packet prints CPython's distance for it
+        if (c[0].len == 0) continue;
+        const swap: u8 = if (c[0][0] == 'q') 'r' else 'q';
+        const from = try std.fmt.allocPrint(gpa, "\"values\":[\"{d}\"", .{c[0][0]});
+        defer gpa.free(from);
+        const to = try std.fmt.allocPrint(gpa, "\"values\":[\"{d}\"", .{swap});
+        defer gpa.free(to);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, tr.program.bytes, from));
+        const mutated = try std.mem.replaceOwned(u8, gpa, tr.program.bytes, from, to);
+        defer gpa.free(mutated);
+        const changed = try gpa.dupe(u8, c[0]);
+        defer gpa.free(changed);
+        changed[0] = swap;
+        const src = try std.fmt.allocPrint(gpa, trace.edit_program, .{ changed, c[1] });
+        defer gpa.free(src);
+        const want2 = try python(src);
+        defer gpa.free(want2);
+        const out2 = try e.exec(.{ .kind = .graph, .bytes = mutated });
+        defer gpa.free(out2);
+        try std.testing.expectEqualStrings(want2, out2);
     }
-    // the circuit computes the distance: "kitten" read as "sitten" in the ELF prints CPython's 2, not the source's 3
-    const p = (try e.translate(live[4].want[1], 32768)) orelse return error.TestExpectedProgram;
-    defer gpa.free(p.bytes);
-    if (std.mem.count(u8, p.bytes, "kitten") != 1) {
-        std.debug.print("\"kitten\" {d} times in the ELF\n", .{std.mem.count(u8, p.bytes, "kitten")});
-        return error.TestExpectedInput;
-    }
-    const mutated = try std.mem.replaceOwned(u8, gpa, p.bytes, "kitten", "sitten");
-    defer gpa.free(mutated);
-    const out = try e.exec(.{ .kind = .elf, .bytes = mutated });
-    defer gpa.free(out);
-    try std.testing.expectEqualStrings("2\n", out);
 }

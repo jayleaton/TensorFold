@@ -385,6 +385,7 @@ pub const Routed = struct {
     /// The graph steps before the inner frontend (no compile): T1's binding, a straight-line program, a whole script.
     fn graphFirst(r: *const Routed, a: Allocator, cell: api.Cell) Allocator.Error!?[]u8 {
         if (try hexLiteral(a, r.bank, cell)) |bytes| return bytes;
+        if (try @import("runner_graph_edit.zig").cell(a, r.bank, cell)) |bytes| return bytes;
         if (try graph.bindCell(a, r.bank, cell)) |bytes| return bytes;
         if (cell.form != .inline_expr and std.mem.eql(u8, cell.lang, "python") and !prog.shadowed(cell.prior))
             if (try prog.program(a, r.bank, cell.code)) |bytes| return bytes;

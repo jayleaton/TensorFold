@@ -221,24 +221,8 @@ pub const Tracer = struct {
     }
 };
 
-/// Levenshtein distance: T5's census program; past the default compile budget it needs TF_DSV41_RUNNER_COMPILE_STEPS.
-pub const edit_program =
-    \\def edit_distance(a,b):
-    \\    if len(a) > len(b):
-    \\        a,b = b,a
-    \\    m = len(a)
-    \\    dp = list(range(m+1))
-    \\    for i, ch in enumerate(b, 1):
-    \\        prev = dp[0]
-    \\        dp[0] = i
-    \\        for j in range(1, m+1):
-    \\            old = dp[j]
-    \\            cost = 0 if a[j-1] == ch else 1
-    \\            dp[j] = min(old + 1, dp[j-1] + 1, prev + cost)
-    \\            prev = old
-    \\    return dp[m]
-    \\print(edit_distance("{s}", "{s}"))
-;
+/// Levenshtein distance (T5's census program): the graph route runs it as a DP packet (runner_graph_edit.zig).
+pub const edit_program = @import("runner_graph_edit.zig").program;
 
 /// The owned line's default wording (`{}` is `<display> = <value>`); seeded S2 round 3: 42% fewer tokens than off.
 pub const default_format = "[exact, computed by the engine: {}]";
