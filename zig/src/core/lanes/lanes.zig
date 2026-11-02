@@ -57,6 +57,7 @@ test {
     _ = @import("handover_test.zig");
     _ = @import("hold_test.zig");
     _ = @import("fire_replay_test.zig");
+    _ = @import("round_trace_test.zig");
     _ = @import("open_first_test.zig");
     _ = @import("recorder_test.zig");
     _ = @import("gpu_full_test.zig");
