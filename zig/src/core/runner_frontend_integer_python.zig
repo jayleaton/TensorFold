@@ -242,7 +242,7 @@ fn printRoots(parser: *ast.Parser, outputs: *Outputs, text: []const u8, multiple
         if (v.list) {
             // Python's repr: [1, -2, True]; an empty list or a range object prints no value, so it refuses
             const l = parser.lists[v.index];
-            if (!multiple or l.range or l.len == 0 or outputs.count + l.len > outputs.roots.len) return error.Unsupported;
+            if (!multiple or l.range or l.masked or l.len == 0 or outputs.count + l.len > outputs.roots.len) return error.Unsupported;
             for (parser.items[l.start..][0..l.len], 0..) |e, i| {
                 outputs.roots[outputs.count] = e;
                 outputs.endings[outputs.count] = if (i + 1 == l.len) ending else ',';
