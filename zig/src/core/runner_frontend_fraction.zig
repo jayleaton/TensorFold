@@ -41,6 +41,7 @@ fn checked(a: Allocator, code: []const u8, budget: usize) Failure!integer.Lowere
             script.scales[0..script.output_count],
         ),
         .estimated_steps = steps,
+        .table = integer.table(&script.parser, roots, script.endings[0..script.output_count], script.styles[0..script.output_count], script.scales[0..script.output_count]),
     };
 }
 
