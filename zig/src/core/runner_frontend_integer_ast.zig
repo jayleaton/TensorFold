@@ -42,6 +42,7 @@ pub const Parser = struct {
     module_count: usize = 0, // the module's names: bindings[0..module_count] outside any frame or comprehension
     allow_lists: bool = false, // the whole-script lowering's lists and min/max; every other parser keeps its grammar
     listed: bool = false, // a list or min/max parsed: the graph route's script only (calc and ELF keep their own)
+    asserted: bool = false, // an `assert` proved: like a def or a list, the graph route's script only
 
     /// `def name(params): return <expr>`, inlined at each call; `body` borrows the script.
     pub const Function = struct { name: []const u8, params: [4][]const u8 = undefined, arity: usize = 0, body: []const u8 };

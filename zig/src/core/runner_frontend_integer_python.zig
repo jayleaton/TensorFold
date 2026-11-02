@@ -32,8 +32,8 @@ fn checked(a: Allocator, code: []const u8, budget: usize) Failure!integer.Lowere
     const endings = script.endings[0..script.count];
     var t = integer.table(parser, roots, endings, null, null);
     @memcpy(t.brackets[0..script.count], script.brackets[0..script.count]);
-    // lists, or more than the C runtime's eight outputs: only the graph route's table (calc and ELF keep their routes)
-    if (parser.listed or script.count > 8) {
+    // lists, defs, asserts or over eight outputs: only the graph route's table (calc and ELF keep their routes)
+    if (parser.listed or parser.function_count != 0 or parser.asserted or script.count > 8) {
         if (budget != 0) return error.Unsupported;
         return .{ .source = try a.alloc(u8, 0), .estimated_steps = null, .table = t, .graph_only = true };
     }
@@ -44,7 +44,7 @@ fn checked(a: Allocator, code: []const u8, budget: usize) Failure!integer.Lowere
 // Shares whole-script validation with the RV32 path, including unused assignments and import gates.
 pub fn lowerCalc(a: Allocator, code: []const u8) Allocator.Error!?[]u8 {
     var script = parseScript(code) catch return null;
-    if (script.parser.listed) return null;
+    if (script.parser.listed or script.parser.function_count != 0 or script.parser.asserted) return null;
     return @import("runner_frontend_integer_calc.zig").lower(a, &script.parser, script.root);
 }
 
@@ -229,6 +229,7 @@ fn check(parser: *ast.Parser, text: []const u8) ast.Invalid!void {
     const root = try expression(parser, text);
     if (!parser.boolean(root) or parser.nodes[root].value == 0) return error.Unsupported;
     parser.reset(m); // its nodes only proved it: they never print
+    parser.asserted = true;
 
 }
 
