@@ -324,7 +324,8 @@ fn inlineExpr(line: []const u8) ?struct { expr: []const u8, space: bool } {
     if (lead.len > 0) {
         const stop = lead[lead.len - 1];
         // a word glued to the expression (x3, f(2), $5) or a list (1673, +10) is not a whole expression
-        if (stop == ',' or stop == '$' or stop == '%' or stop == '_' or std.ascii.isAlphanumeric(stop)) {
+        // a non-ASCII letter glued on is a word too (live bn-011: `φ(2^18)=` wrote 2^18's value for Euler's φ)
+        if (stop == ',' or stop == '$' or stop == '%' or stop == '_' or std.ascii.isAlphanumeric(stop) or stop >= 0x80) {
             if (before[start] != ' ' and before[start] != '\t') return null;
             if (stop == ',') return null;
         }
@@ -485,7 +486,8 @@ test "runner scan: an inline expression at a line's end is a cell and its own tr
         .{ "3 * -4 =", "3 * -4" },
         .{ "43210 − 98765 + 1 =", "43210 − 98765 + 1" },
         .{ "So 9876 - 4321 =", "9876 - 4321" },         .{ "9876-4321=", "9876-4321" },
-        .{ "2^100 - 3^50 =", "2^100 - 3^50" },
+        .{ "2^100 - 3^50 =", "2^100 - 3^50" },          .{ "≈ 2*3 =", "2*3" },
+        .{ "φ: 2^18 =", "2^18" },
     }) |c| {
         const got = inlineOf(c[0]) orelse return error.TestExpectedInline;
         defer a.free(got);
@@ -498,7 +500,7 @@ test "runner scan: inline refuses chains, comparisons, words, lists and incomple
         "a = 3*4 =",                     "15*16 = 240*17 =", "3*4 ==",    "x <= 3*4 =",    "2x + 3 =",  "x3*4 =",   "f(2)*3 =",
         "1673, +10 =",                   "1,234 + 5 =",      "a - 3*4 =", "3 + 4 + ... =", "3 4 + 5 =", "(3 + 4 =", "3 + =",
         "42 =",                          "$5 + 3 =",         "50% * 2 =", "3 *",           "**3*4** =", "2(3+4) =", "3*4 = 12",
-        "Rightmost 9 positions 12-20 =", "pages 3-5 + 1 =",
+        "Rightmost 9 positions 12-20 =", "pages 3-5 + 1 =", "Since φ(2^18)=", "φ(5^18) =", "λ(10^18)=",
     }) |line| {
         if (inlineOf(line)) |got| {
             std.testing.allocator.free(got);
