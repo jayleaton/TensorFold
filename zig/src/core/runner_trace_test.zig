@@ -118,6 +118,36 @@ test "runner trace: a name after an operator is no definition; a redefinition po
     try expectStated(&.{ "Let A = 12,345.", "A = 12345.", "Need compute A*1000003." }, "(12345)*1000003");
 }
 
+test "runner trace: any reassignment poisons a name, so a stale value never states (live big-number-015)" {
+    // `Step k N=`: a label before the name (trace3 run2 s3 claimed 280223976814164*65536, 12,816 off the model's N)
+    try expectNone(&.{ "Let N=280,223,976,814,164.", "Step3 N=18,364,758,544,493,064,720.", "Compute N*65536." });
+    // `N = f(N)`: a loop rule moves N every step (trace4a s2 claimed 0*256 + 118)
+    try expectNone(&.{ "N=0.", "N = N*256 + b.", "b5=118. Need N*256+118." });
+    // `N =` and `Let N =` with another value
+    try expectNone(&.{ "N = 280223976814164.", "N = 18364758544493064720.", "Need compute N*65536." });
+    try expectNone(&.{ "N = 5.", "Let N = 6.", "Need compute N*1000003." });
+    // a first assignment that binds nothing (a note, a hypothesis) blocks a later value too
+    try expectNone(&.{ "Let A = 12345678901 (≈1.2e10).", "A = 12345678901.", "Need compute A*1000003." });
+    try expectNone(&.{ "If A = 6 then fine.", "Let A = 5.", "Need compute A*1000003." });
+    // kept: the same value again, with a note or a label, and a name after an operator assigns nothing
+    try expectStated(&.{ "Let N=280,223,976,814,164.", "N=280,223,976,814,164 (~2.802e14).", "Compute N*65536." }, "(280223976814164)*65536");
+    try expectStated(&.{ "Let N=280,223,976,814,164.", "Step3 N=280,223,976,814,164.", "Compute N*65536." }, "(280223976814164)*65536");
+    try expectStated(&.{ "Let B = 5.", "2 * B = 10.", "Need compute B*1000003." }, "(5)*1000003");
+    // the same line's own computation never reads the old value: `N = N*256 + 118` states nothing
+    try expectNone(&.{ "N=0.", "N = N*256 + 118." });
+    try expectNone(&.{ "N = 280,223,976,814,164.", "N = N*65536 + 12,816." });
+    // as before, only a name's first definition states its computation; a reassignment's never does
+    try expectNone(&.{ "Let N = 5.", "N = 280,223,976,814,164 * 3." });
+    // kept: a reassigned name's line still states its own literal computation (it binds nothing)
+    try expectStated(&.{ "L = b1*b2.", "Compute L = 899,435,521 * 109,096,961." }, "899435521*109096961");
+    // notation the parser refuses poisons, never normalizes: `1|2` may be OR, `12|345` may be OR, 1eN is not read
+    try expectNone(&.{ "Let D=12.", "D=1|2.", "Need compute D*1000003." });
+    try expectNone(&.{ "Let D = 12345.", "D=12|345.", "Need compute D*1000003." });
+    try expectNone(&.{ "Let M = 1,000,000,007.", "M = 1e9+7.", "Need compute M*1000003." });
+    // kept: the same value in another form, doubted (live R4 product-b)
+    try expectStated(&.{ "Let B = 12,345,678,901.", "B = 12,000,000,000 + 345,678,901? Or use pattern.", "Need compute B*1000003." }, "(12345678901)*1000003");
+}
+
 test "runner trace: an owned line restated through its names never fires again (live big-number-019)" {
     var t = trace.Tracer.init(gpa);
     defer t.deinit();

@@ -182,6 +182,14 @@ pub fn defLeftOk(left: []const u8) bool {
     return !std.mem.endsWith(u8, l, "×");
 }
 
+/// `Name =` here assigns the name (a label, `Let` or a digit may lead: "Step3 N = …"); after an operator it states one.
+pub fn assignLeft(left: []const u8) bool {
+    const l = std.mem.trimEnd(u8, left, " \t");
+    if (l.len == 0) return true;
+    if (std.mem.indexOfScalar(u8, "+-*/^=", l[l.len - 1]) != null) return false;
+    return !std.mem.endsWith(u8, l, "×");
+}
+
 /// The shortest right side followed by a sentence end, ", ", " (", or " by|from|and|then|is|which|so|has".
 pub fn defEnd(s: []const u8, rhs: usize) ?usize {
     var k = rhs + 1;

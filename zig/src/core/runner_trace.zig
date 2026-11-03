@@ -2,6 +2,7 @@
 const std = @import("std");
 const text = @import("runner_trace_text.zig");
 const expr = @import("runner_trace_expr.zig");
+const value = @import("runner_trace_value.zig");
 const Allocator = std.mem.Allocator;
 const Expr = expr.Expr;
 
@@ -17,6 +18,7 @@ pub const Tracer = struct {
     scratch: std.heap.ArenaAllocator,
     names: std.ArrayList(expr.Name) = .empty,
     fired: std.ArrayList([]const u8) = .empty,
+    stated: std.ArrayList([]const u8) = .empty, // names whose first bindable definition was looked at as a statement
     repeat: u8 = 0, // times a displayed line may be owned again when the reasoning restates it (TraceAsk.repeat)
     whole: bool = false, // TF_DSV41_RUNNER_STATED: also comma sentences, gcd(x, y), `L = R.` restated and a hex value
 
@@ -45,6 +47,11 @@ pub const Tracer = struct {
         for (t.names.items) |*m| if (std.mem.eql(u8, m.name, n)) {
             m.expr = null;
         };
+    }
+
+    fn wasStated(t: *const Tracer, n: []const u8) bool {
+        for (t.stated.items) |m| if (std.mem.eql(u8, m, n)) return true;
+        return false;
     }
 
     fn lookup(t: *const Tracer, n: []const u8) ?*const expr.Name {
@@ -93,25 +100,54 @@ pub const Tracer = struct {
                 continue;
             };
             i = d.rhs;
-            if (!text.defLeftOk(clean[0..d.start])) continue;
-            const txt_end = text.defEnd(clean, d.rhs) orelse continue;
-            const txt = clean[d.rhs..txt_end];
-            if (text.approx(clean[d.rhs..charsOn(clean, txt_end, 3)])) continue;
-            if (std.mem.indexOfAny(u8, txt, "[]") != null) continue;
-            if (text.hypothetical(text.sentenceAt(clean, d.start))) continue;
-            const e = try t.parse(txt) orelse continue;
+            // `A * B = …` states a value; every other `Name =` assigns, even one that binds nothing
+            if (!text.assignLeft(clean[0..d.start])) continue;
             const n = clean[d.start..d.name_end];
-            if (t.lookup(n)) |old| {
-                // a second definition by other text poisons the name
-                if (old.expr != null and !std.mem.eql(u8, old.expr.?.source, e.source)) t.poison(n);
-                continue;
+            const known = t.lookup(n) != null;
+            // any assignment but the same value again poisons: a stale value is wrong for what the model means
+            if (t.lookup(n)) |old| if (old.expr) |o| if (!try t.restates(clean, d, o.source)) t.poison(n);
+            const b = if (text.defLeftOk(clean[0..d.start])) try t.bindable(clean, d) else null;
+            if (!known) {
+                if (b) |v| {
+                    const e = v.e;
+                    const kept: Expr = .{ .source = try a.dupe(u8, e.source), .display = try a.dupe(u8, e.display), .bound = e.bound, .ops = e.ops, .constant = e.constant, .run = try a.dupe(u8, e.run) };
+                    try t.names.append(a, .{ .name = try a.dupe(u8, n), .expr = kept });
+                } else {
+                    // an assignment that binds nothing still blocks the name: a later value may not be the one meant
+                    try t.names.append(a, .{ .name = try a.dupe(u8, n), .expr = null });
+                }
             }
-            const kept: Expr = .{ .source = try a.dupe(u8, e.source), .display = try a.dupe(u8, e.display), .bound = e.bound, .ops = e.ops, .constant = e.constant, .run = try a.dupe(u8, e.run) };
-            try t.names.append(a, .{ .name = try a.dupe(u8, n), .expr = kept });
-            // a first wide definition with nothing after it states that computation ("N = A*2^64 + B.")
-            if (hasArith(e.source) and e.bound >= 12 and e.bound <= max_digits and text.sentenceEndsAt(clean, txt_end) and
-                !t.firedHas(e.display)) define.* = .{ .source = e.source, .display = e.display, .run = e.run };
+            // a name's first wide definition with nothing after it states it, bound or not ("N = A*2^64 + B.")
+            const x = b orelse continue;
+            if (t.wasStated(n)) continue;
+            try t.stated.append(a, try a.dupe(u8, n));
+            if (hasArith(x.e.source) and x.e.bound >= 12 and x.e.bound <= max_digits and text.sentenceEndsAt(clean, x.end) and
+                !t.firedHas(x.e.display)) define.* = .{ .source = x.e.source, .display = x.e.display, .run = x.e.run };
         }
+    }
+
+    /// The value a definition binds and its text's end; null if approximate, bracketed, hypothetical or unparsed.
+    fn bindable(t: *Tracer, clean: []const u8, d: text.Def) Allocator.Error!?struct { e: Expr, end: usize } {
+        const txt_end = text.defEnd(clean, d.rhs) orelse return null;
+        const txt = clean[d.rhs..txt_end];
+        if (text.approx(clean[d.rhs..charsOn(clean, txt_end, 3)])) return null;
+        if (std.mem.indexOfAny(u8, txt, "[]") != null) return null;
+        if (text.hypothetical(text.sentenceAt(clean, d.start))) return null;
+        const e = try t.parse(txt) orelse return null;
+        return .{ .e = e, .end = txt_end };
+    }
+
+    /// The assignment's right side is the value `source` has, in any form ("B = 12,000,000,000 + 345,678,901?").
+    fn restates(t: *Tracer, clean: []const u8, d: text.Def, source: []const u8) Allocator.Error!bool {
+        const txt_end = text.defEnd(clean, d.rhs) orelse return false;
+        var txt = clean[d.rhs..txt_end];
+        // a doubt ends the value it doubts: "12,000,000,000 + 345,678,901? Or use pattern"
+        for ([_][]const u8{ "?", "~", "≈" }) |m| if (std.mem.indexOf(u8, txt, m)) |k| {
+            txt = txt[0..k];
+        };
+        // notation the parser refuses ("D = 1|2" may be OR, "M = 1e9+7") is no restatement: the name is poisoned
+        const e = try t.parse(txt) orelse return false;
+        return std.mem.eql(u8, e.source, source) or try value.same(t.scratch.allocator(), e.source, source);
     }
 
     fn statement(t: *Tracer, clean: []const u8, h: text.Head) Allocator.Error!?Found {
