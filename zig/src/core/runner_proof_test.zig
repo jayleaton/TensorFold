@@ -504,4 +504,5 @@ test {
     _ = @import("runner_proof_wide_test.zig");
     _ = @import("runner_proof_exact_test.zig");
     _ = @import("runner_proof_point_test.zig");
+    _ = @import("runner_proof_rational_test.zig");
 }
