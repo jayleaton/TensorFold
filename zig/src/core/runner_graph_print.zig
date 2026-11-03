@@ -42,7 +42,8 @@ pub fn emit(m: anytype, p: packet.Print, budget: u64, out: *std.ArrayList(u8), c
         return part(m, 2, .integer, 0, .newline, false, budget, out, cancel);
     }
     if (p.style == .prepared) {
-        const t = m.bank.find("format_f64", 62) orelse return error.GraphTemplate;
+        const width = packet.outputWidth(&scratch[2]);
+        const t = m.bank.find(if (width <= 62) "format_f64" else "format", width) orelse return error.GraphTemplate;
         return m.invoke(t, &.{ 2, 3 }, 0, budget, out, cancel, true);
     }
     if (p.style == .byte) {

@@ -54,8 +54,6 @@ def reference(code):
     source = normalize(code)
     tree = ast.parse(source, mode="eval")
     value = evaluate(tree, source)
-    decimal = any(isinstance(n, ast.Constant) and type(n.value) is float for n in ast.walk(tree))
-    if not decimal: return str(value) + "\n"
     rest = value.denominator
     for factor in (2, 5):
         while rest % factor == 0: rest //= factor
@@ -71,10 +69,14 @@ def generate():
     if platform.python_implementation() != "CPython": raise ValueError("CPython required")
     rows = []
     for index, code in enumerate(CORPUS + BOUNDARIES):
-        expected = reference(code)
+        try: expected = reference(code)
+        except (ValueError, ZeroDivisionError):
+            rows.append({"id": f"exact-{index}", "cell": {"form": "inline_expr", "lang": "python", "code": code, "prior": []},
+                         "expected_output": "", "expected_status": "error:GraphArithmetic"})
+            expected = None
         base = {"id": f"exact-{index}", "cell": {"form": "inline_expr", "lang": "python", "code": code, "prior": []},
                 "expected_output": expected, "expected_status": "halted"}
-        rows.append(base)
+        if expected is not None: rows.append(base)
         # Change each original operand independently; do not replace an expression with its answer.
         source = normalize(code)
         tree = ast.parse(source, mode="eval")
@@ -88,11 +90,14 @@ def generate():
                 replacement = str(value) if is_exponent else "(" + str(value) + ")"
                 expression = source[:node.col_offset] + replacement + source[node.end_col_offset:]
                 try: changed = reference(expression)
-                except (ValueError, ZeroDivisionError): continue
+                except (ValueError, ZeroDivisionError):
+                    rows.append({**base, "id": f"exact-{index}-leaf-{li}-{delta}",
+                                 "cell": {**base["cell"], "code": expression}, "expected_status": "error:GraphArithmetic", "expected_output": ""})
+                    continue
                 mutation = {**base, "id": f"exact-{index}-leaf-{li}-{delta}",
                             "cell": {**base["cell"], "code": expression}, "expected_output": changed}
                 rows.append(mutation)
-                if changed != expected:
+                if expected is not None and changed != expected:
                     rows.append({**mutation, "id": mutation["id"] + "-stale-answer", "expected_output": expected, "expect_mismatch": True})
     for index, code in enumerate(("1/0", "1/(1/0)", "(1/0)^0", "0.1/3", "1.0/3")):
         rows.append({"id": f"exact-domain-{index}", "cell": {"form": "inline_expr", "lang": "python", "code": code, "prior": []},
