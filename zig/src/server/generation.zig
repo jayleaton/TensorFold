@@ -59,6 +59,8 @@ pub const Generation = struct {
     skip: []const u32 = &.{}, // a resumed segment's first tokens: the inserted tool result, checked and not shown
     cells_sent: usize = 0, // the runner records the stream sent last: a prefix the client has every landed byte of
     cells_sig: u64 = 0, // their Mailbox.covered sig
+    deadline_ns: ?i96 = null, // "deadline_s": when the server ends the reply itself
+    deadline_hit: bool = false, // it did: the engine was cancelled there; what it gave before its end still lands
 
     fn eos(g: *const Generation, t: u32) bool {
         return !g.ignore_eos and std.mem.indexOfScalar(u32, g.srv.eos, t) != null;
@@ -202,6 +204,10 @@ pub const Generation = struct {
                 g.cancel();
                 return error.Cancelled;
             }
+            if (g.deadline_ns) |d| if (!g.deadline_hit and nowNs(g.srv.io) >= d) {
+                g.deadline_hit = true;
+                g.srv.engine.cancel(g.id); // the engine ends the stream: its tokens, usage and receipt stay whole
+            };
             if (chunk == null) if (g.sink) |sink| try g.liveCells(sink);
             if (chunk == null and @hasDecl(Gone, "beat")) {
                 // queueing and a long prefill send nothing: a client that times out a silent stream would leave
@@ -268,7 +274,7 @@ pub const Generation = struct {
             .stop => "stop",
             .length => "length",
             .silence => return cx.other("the text engine returned a speech-only finish reason"),
-            .cancelled => "cancelled",
+            .cancelled => if (g.deadline_hit) "deadline" else "cancelled",
             .failed => return cx.other(if (m.message.len > 0) try a.dupe(u8, m.message) else "the reply failed"),
         };
         const stopped: ?u32 = if (g.loop_stop) m.stats.loop_period else null;

@@ -93,6 +93,7 @@ pub const Prepared = struct {
     guide: ?[]const u8 = null,
     stops: fields_mod.Stops,
     preparing: bool,
+    deadline_ns: ?i96 = null, // "deadline_s": the server ends the reply there itself (finish_reason "deadline")
 };
 
 /// Render ``input`` and run every check that can refuse it, before anything reaches the client or the engine.
@@ -188,7 +189,12 @@ pub fn prepare(srv: *Server, cx: *Cx, given: Input, gone: anytype) Failure!Prepa
     if (request.run_cells and thinking and srv.think_close.len > 0) request.think_end = srv.think_close_end;
     if (request.run_cells) request.run_trace = @import("runner_guide.zig").traceAsk(f) catch
         return cx.refuse("runner_trace must be a boolean, runner_trace_format one line of at most 128 bytes with {} once, runner_trace_repeat 0 to 3");
-    return .{ .input = input, .request = request, .prompt_len = rendered.ids.len, .received = received, .thinking = thinking, .effort = effort, .sampled = sampling != null, .drafts = drafts, .token_ids = flag(f, "return_token_ids") orelse false, .stops = stops_opt, .preparing = preparing, .guide = guided.guide };
+    const deadline: ?i96 = if (f.get("deadline_s")) |v| blk: {
+        const s = (if (v == .bool) null else v.float64()) orelse return cx.refuse("deadline_s must be a number of seconds");
+        if (!(s > 0 and s <= 1e6)) return cx.refuse("deadline_s must be more than 0 and at most 1000000 seconds");
+        break :blk received + @as(i96, @intFromFloat(s * std.time.ns_per_s));
+    } else null;
+    return .{ .input = input, .request = request, .prompt_len = rendered.ids.len, .received = received, .thinking = thinking, .effort = effort, .sampled = sampling != null, .drafts = drafts, .token_ids = flag(f, "return_token_ids") orelse false, .stops = stops_opt, .preparing = preparing, .guide = guided.guide, .deadline_ns = deadline };
 }
 
 /// Submit a prepared request and collect its reply; ``sink`` hears the stream (null: not streamed).
@@ -234,7 +240,7 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
     preparing = false;
     var filter: @import("compute_turns.zig").Filter = .{ .a = a, .inner = if (sink) |s| s else undefined };
     const shown: ?Sink = if (request.hold_eos and sink != null) filter.sink() else sink; // built-in calls stay hidden
-    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .seed = if (request.sampling) |v| v.seed else null, .sink = shown, .hold = request.hold_eos, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .token_ids = prepared.token_ids, .guide = prepared.guide, .lp = if (request.logprobs != null) .{} else null, .loop_stop = request.loop_stop };
+    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .seed = if (request.sampling) |v| v.seed else null, .sink = shown, .hold = request.hold_eos, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .token_ids = prepared.token_ids, .guide = prepared.guide, .lp = if (request.logprobs != null) .{} else null, .loop_stop = request.loop_stop, .deadline_ns = prepared.deadline_ns };
     defer srv.noteRequest(prepared.prompt_len, box.cached orelse 0, gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
     const result: Failure!Reply = blk: {
