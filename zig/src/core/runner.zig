@@ -526,8 +526,9 @@ pub const Session = struct {
         const gpa = s.r.gpa;
         gpa.free(s.sync_ids);
         if (s.cells.items.len > 0) log.info("reply {d}: {d} cells closed, {d} owned, {d} abstained at a header, {d} never claimed", .{ s.id, s.cells.items.len, s.owned_n, s.abstained_n, s.cells.items.len - s.owned_n - s.abstained_n });
+        // every translation first: a later cell's borrows earlier cells' code as its prior
+        for (s.cells.items) |c| if (c.thread) |th| th.join();
         for (s.cells.items) |c| {
-            if (c.thread) |th| th.join();
             if (c.job) |j| s.r.backend.cancel(j);
             gpa.free(c.lang);
             gpa.free(c.code);

@@ -504,4 +504,5 @@ test "runner: terminal refusal off and exhausted budget preserve the original re
 
 test {
     _ = @import("runner_handoff_native_test.zig");
+    _ = @import("runner_teardown_test.zig");
 }
