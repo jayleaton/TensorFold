@@ -190,7 +190,8 @@ test "request deadline: HTTP without deadline_s, or with one the reply never mee
         var s_off: Script = .{ .hangs = false };
         var s_late: Script = .{ .hangs = false };
         const off = try post(a, &s_off, c, 100, "");
-        const late = try post(a, &s_late, c, 100, ",\"deadline_s\":100");
+        // the largest deadline_s (11.6 days): no SIGSTOP or QUIET pause reaches it before the script ends by itself
+        const late = try post(a, &s_late, c, 100, ",\"deadline_s\":1000000");
         for ([_]Got{ off, late }, [_]*Script{ &s_off, &s_late }) |g, s| {
             try std.testing.expect(!s.cancelled);
             try std.testing.expectEqualStrings("stop", g.finish);

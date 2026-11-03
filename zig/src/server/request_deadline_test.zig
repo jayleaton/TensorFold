@@ -145,7 +145,8 @@ test "request deadline: without deadline_s, or with one the reply ends before, t
     defer arena.deinit();
     const a = arena.allocator();
     const off = try run(a, null);
-    const late = try run(a, .{ .int = "100" });
+    // the largest deadline_s (11.6 days): no SIGSTOP or QUIET pause reaches it; the engine ends at the 40th check
+    const late = try run(a, .{ .int = "1000000" });
     for ([_]Run{ off, late }) |r| {
         try std.testing.expect(!r.cancelled);
         try std.testing.expectEqualStrings("stop", r.reply.finish_reason);
