@@ -1,4 +1,4 @@
-//! T1's exact rational rendering and computed exponents (4794f2249) on the exact inline kernels, through the real frontend and Dispatch.
+//! T1's exact rational rendering and computed exponents (4794f2249) through the real frontend and Dispatch.
 const std = @import("std");
 const pt = @import("runner_proof_test.zig");
 const frontend = @import("runner_frontend.zig");
