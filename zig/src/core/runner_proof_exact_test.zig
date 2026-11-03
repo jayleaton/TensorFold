@@ -477,8 +477,8 @@ test "runner proof: exact inline domain width refusal and Python form separation
     const bind = @import("runner_graph_bind.zig");
     const unsupported = [_][]const u8{
         "1e-5",
-        ".5*2",
-        "5.*2",
+        ".*2",
+        "5..*2",
         "x/2",
         "2**2**2/3",
         "2**-2/3",
