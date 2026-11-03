@@ -271,6 +271,7 @@ const Run = struct {
     prose_sent: std.ArrayList(u8) = .empty, // the content a tool stream sent
     text_offset: usize = 0, // characters a completion stream's logprob rows have covered
     turn: ?*cortheon.Turn = null, // --cortheon's work on this request
+    sent: @import("runner_projection.zig").Sent = .{}, // the fields a stream sent, for the runner's field map
 
     fn chunk(r: *Run, delta: ?Value, finish: ?[]const u8) Allocator.Error!Value {
         const a = r.a;
@@ -300,7 +301,7 @@ const Run = struct {
     }
 
     fn emit(r: *Run, payload: Value) error{Closed}!void {
-        return r.out.vt.event(r.out.ctx, payload);
+        return r.out.vt.event(r.out.ctx, r.sent.seen(r.a, payload) catch return error.Closed);
     }
 
     fn usage(r: *Run, reply: *const chat.Reply) Allocator.Error!Value {
@@ -323,7 +324,7 @@ const Run = struct {
         try o.put(r.a, "exact_mode", .{ .string = "exact" });
         if (reply.stop_sequence) |s| try o.put(r.a, "stop_sequence", .{ .string = s });
         if (r.srv.config.spark_stats) try @import("spark_wire.zig").add(r.a, reply);
-        try o.put(r.a, "tensorfold", reply.runtime);
+        try o.put(r.a, "tensorfold", try @import("runner_projection.zig").runtimeOf(r.a, reply, &r.sent, r.is_chat));
         try o.put(r.a, "speculative", reply.speculative);
         if (r.turn) |t| try o.put(r.a, "cortheon", try t.summary(r.a));
     }

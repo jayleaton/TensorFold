@@ -65,6 +65,7 @@ pub const Reply = struct {
     /// ``choices[0].prompt_logprobs`` (vLLM's form) for a request that asked; null otherwise.
     prompt_logprobs: ?Value = null,
     loop_stop: ?u32 = null, // the loop period when --loop-guard-stop ended the reply in its reasoning
+    runner_raw: ?[2][]const u8 = null, // with abstain records: the runner's raw field bytes (runner_projection.zig)
 };
 
 pub const Failure = error{ Refused, Cancelled, Failed, OutOfMemory };

@@ -11,10 +11,10 @@ const Allocator = std.mem.Allocator;
 const close_id: u32 = 300;
 const eos_id: u32 = 301;
 
-/// One byte a token below 256; 300 is the model's own `</think>` token and 301 its EOS.
+/// One byte a token below 256 (255 decodes lossily to U+FFFD, its token bytes stay FF); 300 is `</think>`, 301 EOS.
 const Bytes = struct {
     fn text(t: *Bytes) model_text.Text {
-        return .{ .ctx = t, .vtable = &.{ .encode = encode, .decode = decode, .token_id = tokenId, .token_string = tokenString, .vocab_size = vocab, .eos_ids = eos, .render = render, .template_source = template } };
+        return .{ .ctx = t, .vtable = &.{ .encode = encode, .decode = decode, .token_id = tokenId, .token_string = tokenString, .vocab_size = vocab, .eos_ids = eos, .render = render, .template_source = template, .token_bytes = tokenBytes } };
     }
     fn encode(_: *anyopaque, a: Allocator, input: []const u8, _: bool) model_text.Error![]u32 {
         const ids = try a.alloc(u32, input.len);
@@ -23,8 +23,12 @@ const Bytes = struct {
     }
     fn decode(_: *anyopaque, a: Allocator, ids: []const u32) Allocator.Error![]u8 {
         var out: std.ArrayList(u8) = .empty;
-        for (ids) |id| if (id == close_id) try out.appendSlice(a, "</think>") else if (id < 256) try out.append(a, @intCast(id));
+        for (ids) |id| if (id == close_id) try out.appendSlice(a, "</think>") else if (id == 255) try out.appendSlice(a, "\u{fffd}") else if (id < 256) try out.append(a, @intCast(id));
         return out.items;
+    }
+    fn tokenBytes(_: *anyopaque, a: Allocator, id: u32) Allocator.Error!?[]u8 {
+        if (id == close_id) return try a.dupe(u8, "</think>");
+        return if (id < 256) try a.dupe(u8, &.{@intCast(id)}) else null;
     }
     fn tokenId(_: *anyopaque, piece: []const u8) ?u32 {
         return if (std.mem.eql(u8, piece, "</think>")) close_id else null;
@@ -91,11 +95,16 @@ const Reply = struct {
     }
 };
 
-/// The client's fields, as a whole reply gives them or its stream's deltas add up to, and the receipt's runner block.
-const Got = struct { reasoning: []const u8, content: []const u8, runner: json.Value };
+/// The client's fields (whole, or the stream's deltas added up), the receipt's runner block, and any tool calls.
+const Got = struct { reasoning: []const u8, content: []const u8, runner: json.Value, calls: bool = false };
 
 /// A thinking chat reply of `reasoning`, the close token and `content`, through openai.run.
 fn post(a: Allocator, reasoning: []const u8, content: []const u8, receipt: []const u8, stream: bool) !Got {
+    return postWith(a, reasoning, content, receipt, stream, "");
+}
+
+/// As `post`; `extra`: more request fields, each led by a comma (tools).
+fn postWith(a: Allocator, reasoning: []const u8, content: []const u8, receipt: []const u8, stream: bool, extra: []const u8) !Got {
     var ids: std.ArrayList(u32) = .empty;
     for (reasoning) |b| try ids.append(a, b);
     try ids.append(a, close_id);
@@ -105,17 +114,18 @@ fn post(a: Allocator, reasoning: []const u8, content: []const u8, receipt: []con
     var bytes: Bytes = .{};
     const srv = try Server.init(std.testing.allocator, std.testing.io, s.engine(), bytes.text(), .{ .served_name = "m", .model_ids = &.{"m"}, .use_drafts = false }, null);
     defer srv.deinit();
-    const text = try std.fmt.allocPrint(a, "{{\"model\":\"m\",\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}],\"max_tokens\":500,\"stream\":{}}}", .{stream});
+    const text = try std.fmt.allocPrint(a, "{{\"model\":\"m\",\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}],\"max_tokens\":500,\"stream\":{}{s}}}", .{ stream, extra });
     var conn = Conn{ .fd = -1, .peer = "", .buf = &.{}, .gpa = a };
     var response = Reply{ .a = a };
     openai.run(srv, a, response.out(), .{ .conn = &conn }, true, (try json.parse(a, text)).ok);
     if (!stream) {
         const m = response.whole.?.get("choices").?.array[0].get("message").?;
-        return .{ .reasoning = json.strOr(m.get("reasoning_content")), .content = json.strOr(m.get("content")), .runner = response.whole.?.get("tensorfold").?.get("runner").? };
+        return .{ .reasoning = json.strOr(m.get("reasoning_content")), .content = json.strOr(m.get("content")), .runner = response.whole.?.get("tensorfold").?.get("runner").?, .calls = m.get("tool_calls") != null };
     }
     var r: std.ArrayList(u8) = .empty;
     var c: std.ArrayList(u8) = .empty;
     var runner: ?json.Value = null;
+    var calls = false;
     for (response.events.items) |v| {
         if (v.get("tensorfold")) |t| if (t.get("runner")) |x| if (x.get("live") == null) {
             runner = x;
@@ -123,10 +133,11 @@ fn post(a: Allocator, reasoning: []const u8, content: []const u8, receipt: []con
         const cs = (v.get("choices") orelse continue).array;
         if (cs.len == 0) continue;
         const d = cs[0].get("delta") orelse continue;
+        calls = calls or d.get("tool_calls") != null;
         try r.appendSlice(a, json.strOr(d.get("reasoning_content")));
         try c.appendSlice(a, json.strOr(d.get("content")));
     }
-    return .{ .reasoning = r.items, .content = c.items, .runner = runner orelse return error.MissingReceipt };
+    return .{ .reasoning = r.items, .content = c.items, .runner = runner orelse return error.MissingReceipt, .calls = calls };
 }
 
 fn num(v: json.Value, key: []const u8) ?i64 {
@@ -204,4 +215,51 @@ test "runner projection: HTTP a receipt without abstain records keeps its bytes"
         const got = try post(a, "plan", t5_content, receipt, stream);
         try std.testing.expectEqualStrings(try json.stringify(a, (try json.parse(a, receipt)).ok, .{}), try json.stringify(a, got.runner, .{}));
     }
+}
+
+// T5's r10 fixtures (T5-ORACLE-R10-REVIEW.md): the map is taken after tool parsing, on the fields the client gets
+const tool_text = "<tool_call>{\"name\":\"f\",\"arguments\":{}}</tool_call>\n```python\nprint(undefined_total)\n```\n";
+const tools = ",\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"f\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}}]";
+
+test "runner projection: HTTP a tool envelope cut from the content moves the anchors to the content sent, whole and streamed" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const source = "print(undefined_total)\n";
+    const at = std.mem.indexOf(u8, tool_text, source).?;
+    const receipt = try std.fmt.allocPrint(a, "{{\"cells\":[],\"abstains\":[{s}]}}", .{try abstain(a, "content", .{ at, at + source.len, tool_text.len }, "content", tool_text.len)});
+    for ([_]bool{ false, true }) |stream| {
+        const got = try postWith(a, "plan", tool_text, receipt, stream, tools);
+        try std.testing.expect(got.calls); // the tool path ran: the envelope became a call
+        const actual = std.mem.indexOf(u8, got.content, source).?;
+        const x = got.runner.get("abstains").?.array[0];
+        try std.testing.expectEqual(@as(?i64, @as(i64, @intCast(actual))), num(x, "source_at"));
+        try std.testing.expectEqual(@as(?i64, @as(i64, @intCast(at))), num(x, "raw_source_at"));
+    }
+}
+
+test "runner projection: HTTP a lossy decode (FF as U+FFFD) publishes no map for that field, its raw anchors kept" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const text = "\xff\n```python\nprint(undefined_total)\n```\n";
+    const at = std.mem.indexOf(u8, text, "print").?;
+    const receipt = try std.fmt.allocPrint(a, "{{\"cells\":[],\"abstains\":[{s}]}}", .{try abstain(a, "content", .{ at, at + 23, text.len }, "content", text.len)});
+    for ([_]bool{ false, true }) |stream| {
+        const got = try post(a, "plan", text, receipt, stream);
+        try std.testing.expect(std.mem.startsWith(u8, got.content, "\u{fffd}"));
+        try std.testing.expect(got.runner.get("field_projection").?.get("content").? == .null);
+        try std.testing.expect(got.runner.get("field_projection").?.get("reasoning").? != .null);
+        try expectAbstain(got, 0, "", .{ @as(i64, @intCast(at)), @as(i64, @intCast(at + 23)), @as(i64, @intCast(text.len)), @as(i64, @intCast(text.len)) }, .{ null, null, null, null });
+    }
+}
+
+test "runner projection: HTTP a raw anchor past the rebuilt raw bytes leaves its field unmapped" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const receipt = try std.fmt.allocPrint(a, "{{\"cells\":[],\"abstains\":[{s}]}}", .{try abstain(a, "content", .{ 12, 35, 39 }, "content", 1000)});
+    const got = try post(a, "plan", t5_content, receipt, false);
+    try std.testing.expect(got.runner.get("field_projection").?.get("content").? == .null);
+    try expectAbstain(got, 0, "", .{ 12, 35, 39, 1000 }, .{ null, null, null, null });
 }
