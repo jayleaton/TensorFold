@@ -338,3 +338,41 @@ test "runner projection: a run is mapped only with blanks and whole envelopes ou
     const arg = "<tool_call>{\"x\":\"ab\"}</tool_call>"; // the run again inside a cut argument is no second origin
     try std.testing.expectEqual(@as(?projection.Map, .{ .raw = arg.len + 2, .lead = 0, .kept = 2 }), try projection.mapOf(a, "ab" ++ arg, "ab", ""));
 }
+
+test "runner projection: an unfinished envelope (to EOF) proves no deletion, though kept whole in the run it maps" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const open = "<\u{ff5c}DSML\u{ff5c}tool_calls><\u{ff5c}DSML\u{ff5c}invoke name=\"f\"><\u{ff5c}DSML\u{ff5c}parameter name=\"x\" string=\"true\">KEEP";
+    try std.testing.expectEqual(@as(?projection.Map, null), try projection.mapOf(a, open, "", "")); // T5's direct case
+    try std.testing.expectEqual(@as(?projection.Map, null), try projection.mapOf(a, "ab\n" ++ open, "ab", ""));
+    try std.testing.expectEqual(@as(?projection.Map, .{ .raw = open.len + 1, .lead = 1, .kept = open.len }), try projection.mapOf(a, "\n" ++ open, open, ""));
+}
+
+/// Replies of `n` calls then `f`: every call holds an `f` the final `f` must not map into.
+const Many = struct {
+    raws: [2][]const u8,
+    fn run(m: *const Many, i: usize) anyerror!void {
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        const got = (try projection.mapOf(arena.allocator(), m.raws[i], "f", "")).?;
+        try std.testing.expectEqual(m.raws[i].len - 1, got.lead);
+    }
+};
+
+test "runner projection: a final run among many envelopes is placed in one pass, not again per match" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const env = "<tool_call>{\"name\":\"f\",\"arguments\":{}}</tool_call>";
+    var m: Many = .{ .raws = undefined };
+    for (&m.raws, [_]usize{ 625, 5000 }) |*raw, n| {
+        const r = try a.alloc(u8, n * env.len + 1);
+        for (0..n) |i| @memcpy(r[i * env.len ..][0..env.len], env);
+        r[r.len - 1] = 'f';
+        raw.* = r;
+    }
+    const ns = try @import("linear_time.zig").fastest(5, @as(*const Many, &m), Many.run);
+    // 8x the envelopes: within 24x the time (or 20 ms), not 64x
+    try std.testing.expect(ns[1] <= 20 * std.time.ns_per_ms or ns[1] <= 24 * ns[0]);
+}

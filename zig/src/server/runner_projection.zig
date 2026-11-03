@@ -30,29 +30,58 @@ pub fn rawFields(a: Allocator, text: model_text.Text, tokens: []const u32, think
 pub fn mapOf(a: Allocator, raw: []const u8, final: []const u8, open: []const u8) Allocator.Error!?Map {
     if (!std.unicode.utf8ValidateSlice(raw)) return null;
     const body: usize = if (open.len > 0 and std.mem.startsWith(u8, raw, open)) open.len else 0;
-    const envs = try tool_parse.envelopes(a, raw);
-    if (final.len == 0) return if (deleted(raw, envs, body, raw.len)) .{ .raw = raw.len, .lead = raw.len, .kept = 0 } else null;
+    const cut = try Cut.of(a, raw, try tool_parse.envelopes(a, raw), body);
+    if (final.len == 0) return if (cut.before[raw.len]) .{ .raw = raw.len, .lead = raw.len, .kept = 0 } else null;
     var found: ?Map = null;
     var from = body;
     while (std.mem.indexOfPos(u8, raw, from, final)) |lead| : (from = lead + 1) {
-        if (!deleted(raw, envs, body, lead) or !deleted(raw, envs, lead + final.len, raw.len)) continue;
+        if (!cut.before[lead] or !cut.after[lead + final.len]) continue;
         if (found != null) return null; // two runs fit: no provenance
         found = .{ .raw = raw.len, .lead = lead, .kept = final.len };
     }
     return found;
 }
 
-/// raw[from..to] is only blanks and whole envelopes (envs sorted and apart); one across an end: a run in deleted text.
-fn deleted(raw: []const u8, envs: []const tool_parse.Envelope, from: usize, to: usize) bool {
-    var p = from;
-    for (envs) |e| {
-        if (e.end <= p or e.start >= to) continue;
-        if (e.start < p or e.end > to) return false;
-        if (reply_text.pyStrip(raw[p..e.start]).len > 0) return false;
-        p = e.end;
+/// Per raw byte p: raw[body..p] (`before`) and raw[p..] (`after`) are only blanks and whole envelopes, none across p.
+const Cut = struct {
+    before: []bool,
+    after: []bool,
+
+    /// One pass each way over the envelopes (sorted, apart); an unfinished one (to EOF) is no proof of deletion.
+    fn of(a: Allocator, raw: []const u8, envs: []const tool_parse.Envelope, body: usize) Allocator.Error!Cut {
+        const c: Cut = .{ .before = try a.alloc(bool, raw.len + 1), .after = try a.alloc(bool, raw.len + 1) };
+        @memset(c.before, false);
+        @memset(c.after, false);
+        var ok = true;
+        var p = body;
+        for (envs) |e| if (e.end > body) {
+            ok = if (e.start < body) false else gap(c.before, raw, p, e.start, ok, true) and e.complete;
+            p = e.end;
+        };
+        _ = gap(c.before, raw, p, raw.len, ok, true);
+        ok = true;
+        var q = raw.len;
+        var i = envs.len;
+        while (i > 0 and envs[i - 1].end > body) : (i -= 1) {
+            const e = envs[i - 1];
+            ok = gap(c.after, raw, e.end, q, ok, false) and e.complete;
+            q = e.start;
+            if (q < body) return c;
+        }
+        _ = gap(c.after, raw, body, q, ok, false);
+        return c;
     }
-    return reply_text.pyStrip(raw[p..to]).len == 0;
-}
+
+    /// Marks the bytes of raw[from..to] reached from its envelope side through blanks alone; true when all are blank.
+    fn gap(marks: []bool, raw: []const u8, from: usize, to: usize, ok: bool, head: bool) bool {
+        const g = raw[from..to];
+        const s = reply_text.pyStrip(g);
+        const lead = if (s.len == 0) g.len else @intFromPtr(s.ptr) - @intFromPtr(g.ptr);
+        const tail = if (s.len == 0) g.len else g.len - lead - s.len;
+        if (ok) @memset(if (head) marks[from .. from + lead + 1] else marks[to - tail .. to + 1], true);
+        return ok and s.len == 0;
+    }
+};
 
 /// The reasoning and content a stream sent, read off each chunk as the client gets it.
 pub const Sent = struct {
