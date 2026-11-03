@@ -81,6 +81,18 @@ pub const Tracer = struct {
         };
     }
 
+    /// Binding k's dependencies with `more` added, each once.
+    fn withDeps(t: *Tracer, k: usize, more: []const []const u8) Allocator.Error![]const []const u8 {
+        const a = t.scratch.allocator();
+        var all: std.ArrayList([]const u8) = .empty;
+        try all.appendSlice(a, t.binds.items[k].deps);
+        next: for (more) |d| {
+            for (all.items) |x| if (std.mem.eql(u8, x, d)) continue :next;
+            try all.append(a, d);
+        }
+        return all.items;
+    }
+
     fn movedIn(t: *const Tracer, s: []const u8) bool {
         for (t.moved.items) |n| {
             var i: usize = 0;
@@ -185,16 +197,18 @@ pub const Tracer = struct {
             .soft => if (st == null)
                 try t.set(n, .tentative, null, &.{})
             else if (st == .exact)
-                // R2: an unprovable restatement keeps the value aside until a plain one restates it
-                try t.set(n, if (t.rules.r2) .quarantined else .hard, t.binds.items[k.?].kept, &.{}),
+                // R2: an unprovable restatement keeps the value aside (and what it read) until a plain one restates it
+                try t.set(n, if (t.rules.r2) .quarantined else .hard, t.binds.items[k.?].kept, t.binds.items[k.?].deps),
             .value => |v| {
                 if (held) {
                     const kept = t.binds.items[k.?].kept.?;
                     if (!std.mem.eql(u8, v.e.source, kept.source) and !try value.same(t.scratch.allocator(), v.e.source, kept.source))
                         return t.set(n, .hard, null, &.{});
+                    // a proved restatement reads its names as much as the declaration did: any of them moving moves n
+                    const ds = try t.withDeps(k.?, v.deps);
                     // R2: only a plain declaration of the same value clears a quarantine
-                    if (st == .quarantined and !doubt and !v.restate) try t.set(n, .exact, v.e, v.deps);
-                    return;
+                    if (st == .quarantined and !doubt and !v.restate) return t.set(n, .exact, v.e, ds);
+                    return t.set(n, st.?, kept, ds);
                 }
                 // a hypothesis, a question, an approximation or a layout note never makes a binding
                 if (doubt or v.restate) {
