@@ -5,6 +5,7 @@ const api = @import("runner_api.zig");
 const scan = @import("runner_scan.zig");
 const trace = @import("runner_trace.zig");
 const records = @import("runner_receipt.zig");
+const abstain = @import("runner_abstain.zig");
 pub const place = @import("runner_place.zig");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.runner);
@@ -32,6 +33,7 @@ pub const Config = struct {
     inline_mark: bool = false, // PREFIX_INLINE_MARK: tag owned inline values; off preserves their bytes
     sync_graph: bool = false, // PREFIX_SYNC_GRAPH: a graph result settles at its trigger token, in that round (no hold)
     cells: bool = true, // PREFIX_CELLS: the receipt records each owned cell's span, route and landed value (runner_receipt.zig)
+    abstains: bool = false, // PREFIX_ABSTAINS: with cells, each abstained cell's source, reason and stage (runner_abstain.zig)
 
     /// PREFIX "1" enables (unset, "" or "0": null); PREFIX_* knobs override defaults; a bad value is error.BadKnob.
     pub fn parse(get: *const fn ([]const u8) ?[]const u8, comptime prefix: []const u8) error{BadKnob}!?Config {
@@ -59,6 +61,7 @@ pub const Config = struct {
         c.sync_graph = try knob(u1, get, prefix ++ "_SYNC_GRAPH", 0, 0, 1) == 1;
         if (c.sync_graph and c.backend != .graph) return bad(prefix ++ "_SYNC_GRAPH", "1 (backend is not graph)");
         c.cells = try knob(u1, get, prefix ++ "_CELLS", 1, 0, 1) == 1;
+        c.abstains = try knob(u1, get, prefix ++ "_ABSTAINS", 0, 0, 1) == 1;
         c.guide = get(prefix ++ "_GUIDE") orelse "";
         if (std.mem.eql(u8, c.guide, "0")) c.guide = "";
         c.guide_max_bytes = try knob(usize, get, prefix ++ "_GUIDE_MAX_BYTES", c.guide_max_bytes, 512, 2048);
@@ -128,7 +131,7 @@ pub const Runner = struct {
         var cfg = r.cfg.scan;
         if (ask.off) cfg.trace = false;
         cfg.trace_repeat = ask.repeat;
-        s.* = .{ .r = r, .id = r.next_id, .scan = .{ .cfg = cfg }, .format = format, .check = ask.check, .rec = .{ .on = r.cfg.cells } };
+        s.* = .{ .r = r, .id = r.next_id, .scan = .{ .cfg = cfg }, .format = format, .check = ask.check, .rec = .{ .on = r.cfg.cells, .abstains_on = r.cfg.abstains } };
         r.next_id += 1;
         return s;
     }
@@ -273,6 +276,7 @@ pub const Session = struct {
             n += 1;
         };
         try s.cells.append(gpa, cell);
+        s.rec.closed(gpa, c.index);
         // a stated computation is literals only: no notebook names to shadow
         if (c.trace) |st| {
             cell.stated = .{ .display = try cell.arena.allocator().dupe(u8, st.display), .divmod = st.divmod };
@@ -360,17 +364,14 @@ pub const Session = struct {
                 c.abstained = true;
         }
         if (c.abstained) {
-            s.abstained_n += 1;
-            c.told = .abstained;
+            abstain.told(s, c, w.index, held_ms, null);
             log.info("reply {d} cell {d} ({s} {t}): abstain ({s}), held {d} ms, ticks {d}", .{ s.id, w.index, c.lang, c.form, why(c), held_ms, s.held_ticks });
             return try s.r.gpa.alloc(u32, 0);
         }
         const res = c.result.?;
         const ids = try s.owned(res, w);
         if (s.r.cfg.inline_mark and w.inline_space != null and ids.len == 0) {
-            c.abstained = true;
-            c.told = .abstained;
-            s.abstained_n += 1;
+            abstain.told(s, c, w.index, held_ms, .token_cap);
             log.info("reply {d} cell {d}: marked inline value exceeds token cap", .{ s.id, w.index });
             return ids;
         }
@@ -415,9 +416,7 @@ pub const Session = struct {
             }
             gpa.free(ids);
         }
-        c.abstained = true;
-        s.abstained_n += 1;
-        c.told = .abstained;
+        abstain.told(s, c, index, held_ms, if (line != null) .token_cap else if (c.result != null and c.result.?.status == .ok and !c.abstained) .trace_shape else null);
         log.info("reply {d} cell {d} (trace): abstain ({s}), held {d} ms, ticks {d}", .{ s.id, index, if (c.result != null and c.result.?.status == .ok) "not one value" else why(c), held_ms, s.held_ticks });
         return try gpa.alloc(u32, 0);
     }

@@ -7,6 +7,10 @@ const rt = @import("runner_test.zig");
 
 const gpa = std.testing.allocator;
 
+test {
+    _ = @import("runner_abstain_test.zig");
+}
+
 /// The first record of a receipt, parsed.
 const Rec = struct { cell: u32, form: []const u8, route: []const u8, status: []const u8, lang: []const u8, span: []const u8, value: []const u8, field: []const u8, at: u64, token: u32, ids: u32, landed: u32, drafted: u32, forced: u32, path: []const u8 };
 

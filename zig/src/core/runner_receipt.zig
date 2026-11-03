@@ -1,5 +1,6 @@
 //! A reply's runner receipt (runtime.runner): cell counts, holds and a record per owned cell's span, route and write.
 const std = @import("std");
+const abstain = @import("runner_abstain.zig");
 const Allocator = std.mem.Allocator;
 
 /// A span longer than this is recorded as its sha256 and length: the reply holds it in full.
@@ -35,11 +36,20 @@ pub const Log = struct {
     out: std.ArrayList(u8) = .empty, // the receipt JSON (write)
     live: std.ArrayList(u8) = .empty, // the JSON `notes` gave last
     notes: std.ArrayList(Note) = .empty,
+    abstains_on: bool = false, // PREFIX_ABSTAINS (records on): abstained cells too, with their sources (runner_abstain.zig)
+    text: [2]std.ArrayList(u8) = .{ .empty, .empty }, // abstain records: per field, the reply's bytes (to find sources)
+    closes: std.ArrayList(abstain.Close) = .empty, // abstain records: where each cell's source closed
+    abstains: std.ArrayList(abstain.Abstain) = .empty,
+    dropped: u32 = 0, // abstain records out of memory
+    anchors_lost: bool = false, // a source anchor out of memory: the records stand, the census is incomplete
 
     /// A committed token: counted in its field, and matched against a write still landing.
     pub fn token(l: *Log, gpa: Allocator, id: u32, bytes: []const u8, think_open: bool) Allocator.Error!void {
         if (!l.on) return;
         l.content = !think_open;
+        if (l.abstains_on) l.text[@intFromBool(l.content)].appendSlice(gpa, bytes) catch {
+            l.anchors_lost = true;
+        };
         defer {
             l.tokens += 1;
             l.bytes[@intFromBool(l.content)] += bytes.len;
@@ -69,6 +79,27 @@ pub const Log = struct {
         if (l.records.items.len > 0) l.records.items[l.records.items.len - 1].sync = true;
     }
 
+    /// Cell `cell`'s source closed with the token fed last (abstain records: where to find it).
+    pub fn closed(l: *Log, gpa: Allocator, cell: u32) void {
+        if (!l.on or !l.abstains_on) return;
+        l.closes.append(gpa, .{ .cell = cell, .content = l.content, .end = l.bytes[@intFromBool(l.content)] }) catch {
+            l.anchors_lost = true;
+        };
+    }
+
+    /// Cell `a.cell` abstained here: the reply's field, bytes, tokens and rounds at its decision (abstain records).
+    pub fn abstained(l: *Log, gpa: Allocator, a: abstain.Abstain) void {
+        if (!l.on or !l.abstains_on) return;
+        var x = a;
+        x.content = l.content;
+        x.at = l.bytes[@intFromBool(l.content)];
+        x.token = l.tokens;
+        x.round = l.rounds;
+        l.abstains.append(gpa, x) catch {
+            l.dropped += 1;
+        };
+    }
+
     pub fn deinit(l: *Log, gpa: Allocator) void {
         for (l.records.items) |*r| {
             gpa.free(r.want);
@@ -78,6 +109,9 @@ pub const Log = struct {
         l.out.deinit(gpa);
         l.live.deinit(gpa);
         l.notes.deinit(gpa);
+        for (&l.text) |*t| t.deinit(gpa);
+        l.closes.deinit(gpa);
+        l.abstains.deinit(gpa);
     }
 };
 
@@ -85,7 +119,8 @@ pub const Log = struct {
 pub fn write(s: anytype) []const u8 {
     const l = &s.rec;
     l.out.clearRetainingCapacity();
-    put(s.cells.items, l, s.r.gpa, s.held_ms, s.resume_ms) catch return "";
+    const cfg = if (comptime @typeInfo(@TypeOf(s.r)) == .pointer) &s.r.cfg else null;
+    put(s.cells.items, l, s.r.gpa, s.held_ms, s.resume_ms, cfg) catch return "";
     return l.out.items;
 }
 
@@ -113,9 +148,9 @@ fn fresh(cells: anytype, l: *Log, gpa: Allocator) Allocator.Error!void {
     }
 }
 
-const form_names = [_][]const u8{ "fence", "repl", "inline", "trace" };
+pub const form_names = [_][]const u8{ "fence", "repl", "inline", "trace" };
 
-fn put(cells: anytype, l: *Log, gpa: Allocator, held_ms: u64, resume_ms: u64) Allocator.Error!void {
+fn put(cells: anytype, l: *Log, gpa: Allocator, held_ms: u64, resume_ms: u64, cfg: anytype) Allocator.Error!void {
     var forms = std.mem.zeroes([4][4]u32);
     var kinds = std.mem.zeroes([3]u32);
     for (cells) |c| {
@@ -143,6 +178,7 @@ fn put(cells: anytype, l: *Log, gpa: Allocator, held_ms: u64, resume_ms: u64) Al
             try record(o, gpa, cells, r);
         }
         try o.append(gpa, ']');
+        if (l.abstains_on) try abstain.write(o, gpa, cells, l, cfg);
     }
     try o.append(gpa, '}');
 }
@@ -165,18 +201,30 @@ fn record(o: *std.ArrayList(u8), gpa: Allocator, cells: anytype, r: Record) Allo
 }
 
 /// `"name":"bytes",` as a JSON string; bytes that are not UTF-8 (a cut mid-character) go as `"name_hex"` instead.
-fn text(o: *std.ArrayList(u8), gpa: Allocator, name: []const u8, bytes: []const u8) Allocator.Error!void {
+pub fn text(o: *std.ArrayList(u8), gpa: Allocator, name: []const u8, bytes: []const u8) Allocator.Error!void {
     if (!std.unicode.utf8ValidateSlice(bytes)) {
         try o.print(gpa, "\"{s}_hex\":\"", .{name});
         for (bytes) |b| try o.print(gpa, "{x:0>2}", .{b});
         return o.appendSlice(gpa, "\",");
     }
-    try o.print(gpa, "\"{s}\":\"", .{name});
+    try o.print(gpa, "\"{s}\":", .{name});
+    try quoted(o, gpa, bytes);
+    try o.append(gpa, ',');
+}
+
+/// `bytes` as one JSON value: a string, or `{"hex":"…"}` when they are not UTF-8.
+pub fn quoted(o: *std.ArrayList(u8), gpa: Allocator, bytes: []const u8) Allocator.Error!void {
+    if (!std.unicode.utf8ValidateSlice(bytes)) {
+        try o.appendSlice(gpa, "{\"hex\":\"");
+        for (bytes) |b| try o.print(gpa, "{x:0>2}", .{b});
+        return o.appendSlice(gpa, "\"}");
+    }
+    try o.append(gpa, '"');
     for (bytes) |b| switch (b) {
         '"' => try o.appendSlice(gpa, "\\\""),
         '\\' => try o.appendSlice(gpa, "\\\\"),
         0...0x1f, 0x7f => try o.print(gpa, "\\u{x:0>4}", .{b}),
         else => try o.append(gpa, b),
     };
-    try o.appendSlice(gpa, "\",");
+    try o.append(gpa, '"');
 }
