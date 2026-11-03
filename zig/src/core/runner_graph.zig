@@ -136,6 +136,7 @@ fn now(ctx: *anyopaque, program: api.Program, budget: u64, quick: u64) ?api.Resu
     _ = std.c.clock_gettime(.MONOTONIC, &t0);
     var m = Machine.boot(c.gpa, c.bank, program.bytes) catch return null;
     defer m.deinit();
+    m.decode = false; // the engine thread: a template's first decode (0.1-0.4 s wide) is the job's, in a hold
     const cap = @min(budget, quick);
     const end = m.run(cap, &c.now_out, null) catch return null;
     if (end.end == .budget and cap < budget) return null;

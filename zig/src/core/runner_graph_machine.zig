@@ -28,6 +28,7 @@ pub const Machine = struct {
     width: u16 = 62,
     precision: u8 = 0,
     prints: []const packet.Print = &.{},
+    decode: bool = true, // false: a template not yet prepared is error.GraphUnprepared, never decoded on this thread
 
     pub fn boot(a: Allocator, bank: *const bank_mod.Bank, bytes: []const u8) !Machine {
         if (bytes.len > packet.max_packet) return error.GraphPacketSize;
@@ -125,6 +126,7 @@ pub const Machine = struct {
         if (m.steps >= budget) return .budget;
         if (cancelled(cancel)) return .cancelled;
         for (refs) |ref| try fits(&m.values[ref], t.width);
+        if (!m.decode and !t.isPrepared()) return error.GraphUnprepared;
         try t.prepare();
         if (cancelled(cancel)) return .cancelled;
         var fresh: State = undefined;

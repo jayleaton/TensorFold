@@ -297,6 +297,30 @@ test "runner proof: big-number-020 past the frontend's 62 digits, inline and REP
     both.graph.release(1);
 }
 
+test "runner proof: a sync run (now) never decodes a template; the job decodes it in its hold, then now runs it" {
+    var both: Both = undefined;
+    try both.open();
+    defer both.close();
+    var ctx: frontend.Context = .{ .io = std.testing.io };
+    if (std.c.getenv("TF_RUNNER_LLD")) |l| ctx.compiler.linker = std.mem.span(l);
+    var routed: route.Routed = .{ .inner = ctx.frontend(), .bank = &both.bank };
+    const front = routed.frontend();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const t = try front.translate(front.ctx, arena.allocator(), .{ .form = .inline_expr, .lang = "python", .code = "2^114" });
+    try std.testing.expect(t == .program and t.program.kind == .graph);
+    // a fresh bank decodes each template at its first use: cold, now declines (the cell holds) and decodes nothing
+    const cold = both.bank.preparedCount();
+    try std.testing.expect(both.graph.now(t.program, 4_000_000, 100_000) == null);
+    try std.testing.expectEqual(cold, both.bank.preparedCount());
+    const r = finish(both.graph, try both.graph.start(1, t.program, 4_000_000));
+    try std.testing.expectEqualStrings("20769187434139310514121985316880384\n", r.out);
+    try std.testing.expect(both.bank.preparedCount() > cold);
+    const warm = both.graph.now(t.program, 4_000_000, 100_000) orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings(r.out, warm.out);
+    both.graph.release(1);
+}
+
 test "runner proof: bn-011's inline cells (smoke r0-583d0cd875f6): powers through 3^400 own CPython's value" {
     var both: Both = undefined;
     try both.open();
