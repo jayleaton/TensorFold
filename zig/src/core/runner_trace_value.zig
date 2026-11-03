@@ -6,7 +6,7 @@ const Int = std.math.big.int.Managed;
 /// The widest value evaluated: a wider source is never called the same (the name it would keep is poisoned instead).
 const max_bits = 4096;
 
-/// `x` and `y` (sources over + - * ** %, brackets, decimal and 0x literals) are one integer; `a` should be an arena.
+/// `x` and `y` (sources over + - * ** % /, brackets, decimal and 0x literals) are one integer; `a` should be an arena.
 pub fn same(a: Allocator, x: []const u8, y: []const u8) Allocator.Error!bool {
     const u = try value(a, x) orelse return false;
     const v = try value(a, y) orelse return false;
@@ -22,7 +22,7 @@ fn value(a: Allocator, s: []const u8) Allocator.Error!?Int {
     return if (p.i == s.len) v else null;
 }
 
-/// Python's precedence: sum := term (+|- term)*; term := unary (*|% unary)*; unary := -unary | atom [** digits].
+/// Python's precedence: sum := term (+|- term)*; term := unary (*|%|/ unary)*; unary := -unary | atom [** digits].
 const Eval = struct {
     a: Allocator,
     s: []const u8,
@@ -59,7 +59,7 @@ const Eval = struct {
 
     fn term(p: *Eval) Error!Int {
         var v = try p.unary();
-        while (p.i < p.s.len and (p.s[p.i] == '%' or (p.s[p.i] == '*' and !std.mem.startsWith(u8, p.s[p.i..], "**")))) {
+        while (p.i < p.s.len and (p.s[p.i] == '%' or p.s[p.i] == '/' or (p.s[p.i] == '*' and !std.mem.startsWith(u8, p.s[p.i..], "**")))) {
             const op = p.s[p.i];
             p.i += 1;
             const r = try p.unary();
@@ -70,6 +70,10 @@ const Eval = struct {
                 if (r.eqlZero()) return error.Refused;
                 var q = Int.init(p.a) catch |e| return fail(e);
                 q.divFloor(&out, &v, &r) catch |e| return fail(e); // Python's % takes the divisor's sign
+                if (op == '/') {
+                    if (!out.eqlZero()) return error.Refused; // a quotient only when nothing is left over
+                    out.swap(&q);
+                }
             }
             v = try wide(out);
         }
@@ -121,4 +125,7 @@ test "runner trace value: a restatement in another form is the same integer; a d
     try std.testing.expect(!try same(a, "2**100000", "2**100000")); // too wide to evaluate: poisoned, never kept
     try std.testing.expect(!try same(a, "5%0", "5"));
     try std.testing.expect(!try same(a, "12+", "12"));
+    try std.testing.expect(try same(a, "(10**30-85)/97", "10309278350515463917525773195"));
+    try std.testing.expect(!try same(a, "(10**30-86)/97", "10309278350515463917525773195")); // not exact: refused
+    try std.testing.expect(!try same(a, "7/0", "0"));
 }

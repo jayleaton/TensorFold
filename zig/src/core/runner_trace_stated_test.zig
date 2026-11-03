@@ -102,7 +102,7 @@ test "runner trace stated: gcd in prose takes two literals only: names, expressi
     }) |line| try expect(true, &.{line}, null);
 }
 
-fn python(code: []const u8) ![]u8 {
+pub fn python(code: []const u8) ![]u8 {
     const src = if (std.mem.startsWith(u8, code, "from ")) try gpa.dupe(u8, code) else try std.fmt.allocPrint(gpa, "print({s})", .{code});
     defer gpa.free(src);
     const r = try std.process.run(gpa, std.testing.io, .{ .argv = &.{ "/usr/bin/python3", "-I", "-S", "-c", src }, .stdout_limit = .limited(4096), .stderr_limit = .limited(4096) });
@@ -112,12 +112,12 @@ fn python(code: []const u8) ![]u8 {
     return r.stdout;
 }
 
-const Bank = struct {
+pub const Bank = struct {
     bank: graph.Bank,
     backend: api.Backend,
     job: u64 = 0,
 
-    fn translate(b: *Bank, a: std.mem.Allocator, code: []const u8) ![]const u8 {
+    pub fn translate(b: *Bank, a: std.mem.Allocator, code: []const u8) ![]const u8 {
         var routed: route.Routed = .{ .inner = @import("runner_frontend.zig").frontend(), .bank = &b.bank };
         const f = routed.frontend();
         const tr = try f.translate(f.ctx, a, .{ .form = .repl, .lang = "python", .code = code });
@@ -129,7 +129,7 @@ const Bank = struct {
         return tr.program.bytes;
     }
 
-    fn run(b: *Bank, bytes: []const u8) ![]u8 {
+    pub fn run(b: *Bank, bytes: []const u8) ![]u8 {
         b.job += 1;
         const job = try b.backend.start(b.job, .{ .kind = .graph, .bytes = bytes }, 1 << 32);
         const res = while (true) switch (b.backend.poll(job)) {
@@ -142,7 +142,7 @@ const Bank = struct {
     }
 };
 
-fn openBank() !?*Bank {
+pub fn openBank() !?*Bank {
     const path = std.c.getenv("TF_RUNNER_GRAPH_BANK") orelse return null;
     const b = try gpa.create(Bank);
     errdefer gpa.destroy(b);
@@ -151,7 +151,7 @@ fn openBank() !?*Bank {
     return b;
 }
 
-fn closeBank(b: *Bank) void {
+pub fn closeBank(b: *Bank) void {
     graph.destroy(b.backend);
     b.bank.deinit();
     gpa.destroy(b);

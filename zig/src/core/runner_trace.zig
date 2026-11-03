@@ -4,6 +4,7 @@ const text = @import("runner_trace_text.zig");
 const expr = @import("runner_trace_expr.zig");
 const value = @import("runner_trace_value.zig");
 const checks = @import("runner_trace_check.zig");
+const bind = @import("runner_trace_bind.zig");
 const Allocator = std.mem.Allocator;
 const Expr = expr.Expr;
 
@@ -13,13 +14,19 @@ pub const max_digits = 62;
 /// A stated computation: Python source for the frontend, the expression shown to the model, divmod's re-shaping.
 pub const Found = struct { source: []const u8, display: []const u8, divmod: bool = false, same_line: bool = false, run: []const u8 };
 
+/// A name's binding state; `names` holds the same name with its expression only while exact.
+const Bind = struct { state: bind.State, kept: ?Expr = null, deps: []const []const u8 = &.{} };
+
 /// Per reply: the names the reasoning defined and the sources already owned (`keep`); one line's work (`scratch`).
 pub const Tracer = struct {
     keep: std.heap.ArenaAllocator,
     scratch: std.heap.ArenaAllocator,
-    names: std.ArrayList(expr.Name) = .empty,
+    names: std.ArrayList(expr.Name) = .empty, // what the parser reads: an expression only for an exact name
+    binds: std.ArrayList(Bind) = .empty, // index-aligned with `names`
+    rules: bind.Rules = .{}, // the recovery rules (all in the runner; tests run each alone)
     fired: std.ArrayList([]const u8) = .empty,
     stated: std.ArrayList([]const u8) = .empty, // names whose first bindable definition was looked at as a statement
+    moved: std.ArrayList([]const u8) = .empty, // this line's names that left exact after its statement (scratch)
     repeat: u8 = 0, // times a displayed line may be owned again when the reasoning restates it (TraceAsk.repeat)
     whole: bool = false, // TF_DSV41_RUNNER_STATED: also comma sentences, gcd(x, y), `L = R.` restated and a hex value
 
@@ -44,10 +51,44 @@ pub const Tracer = struct {
         return n > t.repeat;
     }
 
-    fn poison(t: *Tracer, n: []const u8) void {
-        for (t.names.items) |*m| if (std.mem.eql(u8, m.name, n)) {
-            m.expr = null;
+    fn find(t: *const Tracer, n: []const u8) ?usize {
+        for (t.names.items, 0..) |m, k| if (std.mem.eql(u8, m.name, n)) return k;
+        return null;
+    }
+
+    /// Moves `n` to `state`; leaving exact makes what read `n` stale, transitively (restoring `n` restores none).
+    fn set(t: *Tracer, n: []const u8, state: bind.State, kept: ?Expr, deps: []const []const u8) Allocator.Error!void {
+        const a = t.keep.allocator();
+        const k = t.find(n) orelse blk: {
+            try t.names.append(a, .{ .name = try a.dupe(u8, n), .expr = null });
+            try t.binds.append(a, .{ .state = .tentative });
+            break :blk t.names.items.len - 1;
         };
+        const was = t.binds.items[k].state;
+        if (was == .exact and state != .exact) try t.moved.append(t.scratch.allocator(), t.names.items[k].name);
+        var v = kept;
+        if (v) |e| if (!(t.binds.items[k].kept != null and t.binds.items[k].kept.?.source.ptr == e.source.ptr)) {
+            v = .{ .source = try a.dupe(u8, e.source), .display = try a.dupe(u8, e.display), .bound = e.bound, .ops = e.ops, .constant = e.constant, .run = try a.dupe(u8, e.run) };
+        };
+        const ds = try a.alloc([]const u8, deps.len);
+        for (deps, ds) |d, *o| o.* = try a.dupe(u8, d);
+        t.binds.items[k] = .{ .state = state, .kept = if (state == .exact or state == .quarantined) v else null, .deps = ds };
+        t.names.items[k].expr = if (state == .exact) v else null;
+        if (was != .exact or state == .exact) return;
+        for (t.binds.items, t.names.items) |b, m| if (b.state == .exact) for (b.deps) |d| if (std.mem.eql(u8, d, n)) {
+            try t.set(m.name, .stale, null, &.{});
+            break;
+        };
+    }
+
+    fn movedIn(t: *const Tracer, s: []const u8) bool {
+        for (t.moved.items) |n| {
+            var i: usize = 0;
+            while (std.mem.indexOfPos(u8, s, i, n)) |j| : (i = j + 1) {
+                if ((j == 0 or !text.isWord(s[j - 1])) and (j + n.len == s.len or !text.isWord(s[j + n.len]))) return true;
+            }
+        }
+        return false;
     }
 
     fn wasStated(t: *const Tracer, n: []const u8) bool {
@@ -55,29 +96,33 @@ pub const Tracer = struct {
         return false;
     }
 
-    fn lookup(t: *const Tracer, n: []const u8) ?*const expr.Name {
-        for (t.names.items) |*e| if (std.mem.eql(u8, e.name, n)) return e;
-        return null;
-    }
-
-    /// One completed reasoning line: its definitions, then its first viable statement; text valid until the next call.
+    /// One reasoning line, definitions and requests in source order: its first statement; valid until the next call.
     pub fn line(t: *Tracer, raw: []const u8) Allocator.Error!?Found {
         _ = t.scratch.reset(.retain_capacity);
         const a = t.scratch.allocator();
         const clean = try text.stripNotes(a, raw);
         var define: ?Found = null;
-        try t.definitions(clean, &define);
         var heads: std.ArrayList(text.Head) = .empty;
         try text.goalHeads(a, clean, &heads);
         try text.bareHeads(a, clean, t.whole, &heads);
         std.mem.sort(text.Head, heads.items, {}, text.Head.less);
         var first: ?Found = null;
+        var asked: []const u8 = ""; // the statement's sentence
         var last_head: usize = 0;
+        var read: usize = 0; // definitions before this byte are bound: one after a request never supplies it
+        t.moved = .empty;
         for (heads.items) |h| {
             last_head = @max(last_head, h.end);
+            try t.definitions(clean, raw, &read, h.end, &define);
+            // a name the request read moved later on its line (`Need N mod p. N=…`): neither value is the one meant
+            if (first != null and t.movedIn(asked)) first = null;
             if (first != null) continue;
-            if (try t.statement(clean, h)) |f| first = f;
+            t.moved = .empty;
+            first = try t.statement(clean, h);
+            asked = text.sentenceAt(clean, h.end);
         }
+        try t.definitions(clean, raw, &read, clean.len, &define);
+        if (first != null and t.movedIn(asked)) first = null;
         var tail = last_head;
         if (first == null and t.whole) if (try t.wholeShape(clean)) |w| {
             first = w.found;
@@ -92,39 +137,153 @@ pub const Tracer = struct {
         return define;
     }
 
-    fn definitions(t: *Tracer, clean: []const u8, define: *?Found) Allocator.Error!void {
+    fn definitions(t: *Tracer, clean: []const u8, raw: []const u8, from: *usize, upto: usize, define: *?Found) Allocator.Error!void {
         const a = t.keep.allocator();
-        var i: usize = 0;
-        while (i < clean.len) {
+        var i = from.*;
+        defer from.* = @max(from.*, i);
+        while (i < upto) {
+            // `N += b`, `N *= 2`, `N++`: an update in place moves the name for good
+            if (bind.updateAt(clean, i)) |n| {
+                try t.set(clean[i .. i + n], .hard, null, &.{});
+                i += n;
+                continue;
+            }
             const d = text.defAt(clean, i) orelse {
                 i += 1;
                 continue;
             };
             i = d.rhs;
-            // `A * B = …` states a value; every other `Name =` assigns, even one that binds nothing
+            // `A * B = …` and (R4) `B mod A = …` state a value; any other `Name =` assigns, even binding nothing
             if (!text.assignLeft(clean[0..d.start])) continue;
+            if (t.rules.r4 and bind.compoundLeft(clean[0..d.start])) continue;
             const n = clean[d.start..d.name_end];
-            const known = t.lookup(n) != null;
-            // any assignment but the same value again poisons: a stale value is wrong for what the model means
-            if (t.lookup(n)) |old| if (old.expr) |o| if (!try t.restates(clean, d, o.source)) t.poison(n);
-            const b = if (text.defLeftOk(clean[0..d.start])) try t.bindable(clean, d) else null;
-            if (!known) {
-                if (b) |v| {
-                    const e = v.e;
-                    const kept: Expr = .{ .source = try a.dupe(u8, e.source), .display = try a.dupe(u8, e.display), .bound = e.bound, .ops = e.ops, .constant = e.constant, .run = try a.dupe(u8, e.run) };
-                    try t.names.append(a, .{ .name = try a.dupe(u8, n), .expr = kept });
-                } else {
-                    // an assignment that binds nothing still blocks the name: a later value may not be the one meant
-                    try t.names.append(a, .{ .name = try a.dupe(u8, n), .expr = null });
-                }
-            }
+            try t.sight(clean, raw, d);
             // a name's first wide definition with nothing after it states it, bound or not ("N = A*2^64 + B.")
-            const x = b orelse continue;
+            const x = (if (text.defLeftOk(clean[0..d.start])) try t.bindable(clean, d) else null) orelse continue;
             if (t.wasStated(n)) continue;
             try t.stated.append(a, try a.dupe(u8, n));
             if (hasArith(x.e.source) and x.e.bound >= 12 and x.e.bound <= max_digits and text.sentenceEndsAt(clean, x.end) and
                 !t.firedHas(x.e.display)) define.* = .{ .source = x.e.source, .display = x.e.display, .run = x.e.run };
         }
+    }
+
+    /// One `Name = …` moves the binding (T5-BINDING-RECOVERY.md): bind, restate, stay tentative, quarantine or block.
+    fn sight(t: *Tracer, clean: []const u8, raw: []const u8, d: text.Def) Allocator.Error!void {
+        const n = clean[d.start..d.name_end];
+        const k = t.find(n);
+        const st: ?bind.State = if (k) |j| t.binds.items[j].state else null;
+        if (st == .hard) return;
+        const list = if (t.rules.r2) bind.layoutList(clean, d.rhs) else null;
+        const end = text.defEnd(clean, list orelse d.rhs) orelse clean.len;
+        const txt = clean[d.rhs..if (t.rules.r3) d.rhs + bind.nextDef(clean[d.rhs..end]) else end];
+        const doubt = text.approx(clean[d.rhs..charsOn(clean, end, 3)]) or std.mem.indexOfAny(u8, txt, "[]") != null or
+            text.hypothetical(text.sentenceAt(clean, d.start));
+        const held = st == .exact or st == .quarantined;
+        const r = try t.reading(raw, n, txt, doubt, if (held) t.binds.items[k.?].kept else null);
+        switch (r) {
+            .hard => try t.set(n, .hard, null, &.{}),
+            .soft => if (st == null)
+                try t.set(n, .tentative, null, &.{})
+            else if (st == .exact)
+                // R2: an unprovable restatement keeps the value aside until a plain one restates it
+                try t.set(n, if (t.rules.r2) .quarantined else .hard, t.binds.items[k.?].kept, &.{}),
+            .value => |v| {
+                if (held) {
+                    const kept = t.binds.items[k.?].kept.?;
+                    if (!std.mem.eql(u8, v.e.source, kept.source) and !try value.same(t.scratch.allocator(), v.e.source, kept.source))
+                        return t.set(n, .hard, null, &.{});
+                    // R2: only a plain declaration of the same value clears a quarantine
+                    if (st == .quarantined and !doubt and !v.restate) try t.set(n, .exact, v.e, v.deps);
+                    return;
+                }
+                // a hypothesis, a question, an approximation or a layout note never makes a binding
+                if (doubt or v.restate) {
+                    if (st == null) try t.set(n, .tentative, null, &.{});
+                    return;
+                }
+                // a value after a label or an operator (`Step3 N=…`) binds nothing and blocks the name, as before
+                const left = clean[0..d.start];
+                if (!text.defLeftOk(left) and !(t.rules.r3 and bind.afterValue(left)))
+                    return if (st == null) t.set(n, .hard, null, &.{}) else {};
+                // R1: the first exact binding after tentative sightings; a stale name rebinds at a new declaration
+                if (st == null or st == .stale or t.rules.r1) try t.set(n, .exact, v.e, v.deps);
+            },
+        }
+    }
+
+    const Reading = union(enum) { hard, soft, value: struct { e: Expr, deps: []const []const u8, restate: bool } };
+
+    /// A right side: one integer (a chain all equal, R3), a doubted or unresolved formula, or a hard block.
+    fn reading(t: *Tracer, raw: []const u8, n: []const u8, txt: []const u8, doubt: bool, kept: ?Expr) Allocator.Error!Reading {
+        const a = t.scratch.allocator();
+        // a doubt ends the value it doubts: "12,000,000,000 + 345,678,901? Or use pattern"
+        var v = txt;
+        for ([_][]const u8{ "?", "~", "≈" }) |m| if (std.mem.indexOf(u8, v, m)) |j| {
+            v = v[0..j];
+        };
+        var ps: std.ArrayList([]const u8) = .empty;
+        if (t.rules.r3) try bind.pieces(v, &ps, a) else try ps.append(a, v);
+        var first: ?Expr = null;
+        var deps: std.ArrayList([]const u8) = .empty;
+        var restate = false; // typed metadata or spaced groups: proves a value equal, never binds one
+        var layout = false; // after a metadata word, unparsed pieces describe the layout (`= 192|443|…`)
+        var soft = false;
+        for (ps.items) |p0| {
+            var p = std.mem.trim(u8, p0, " \t");
+            if (t.rules.r3) p = bind.unclosed(p);
+            if (p.len == 0) continue; // the chain goes on past the right side's end (`Q = (…)/97 = (…`)
+            if (t.rules.r2) {
+                const m = bind.metadata(p);
+                if (m.cut) {
+                    restate = true;
+                    layout = true;
+                    p = m.value;
+                    if (p.len == 0) continue;
+                }
+            }
+            const f = bind.formula(p, n);
+            if (f.self or f.sci) return .hard;
+            var e = try t.parse(p);
+            if (e == null and t.rules.r2) if (try bind.spaced(a, p, raw)) |digits| {
+                e = try t.parse(digits);
+                restate = true;
+            };
+            // R2: an exact quotient proves a held value restated (`Q = (10^30 - 85)/97`), never binds one
+            if (e == null and t.rules.r2 and f.div and f.end == p.len) if (kept) |k| if (try bind.plain(a, p)) |s| {
+                if (try value.same(a, s, k.source)) {
+                    e = k;
+                    restate = true;
+                }
+            };
+            const x = e orelse {
+                if (layout) continue;
+                // a value that opens a list (`base B=10^9:`) is a sighting; a later declaration binds (R1)
+                if (p[p.len - 1] == ':' and !f.pipe) {
+                    soft = true;
+                    continue;
+                }
+                // pipes (`D=1|2` may be OR) and other notation: never read; a doubted one only quarantines a held value
+                if (f.pipe and !doubt) return .hard;
+                if (!doubt and (f.decimal or f.end == 0 or !(f.names or f.div))) return .hard;
+                soft = true;
+                continue;
+            };
+            if (first) |e0| {
+                if (!std.mem.eql(u8, e0.source, x.source) and !try value.same(a, e0.source, x.source)) return .hard;
+                continue;
+            }
+            first = x;
+            var j: usize = 0;
+            while (j < p.len) : (j += 1) {
+                const l = text.nameLen(p, j);
+                if (l == 0 or (j > 0 and text.isWord(p[j - 1])) or (j + l < p.len and text.isWord(p[j + l]))) continue;
+                try deps.append(a, p[j .. j + l]);
+                j += l;
+            }
+        }
+        if (soft) return .soft;
+        const e = first orelse return .soft;
+        return .{ .value = .{ .e = e, .deps = deps.items, .restate = restate } };
     }
 
     /// The value a definition binds and its text's end; null if approximate, bracketed, hypothetical or unparsed.
@@ -136,19 +295,6 @@ pub const Tracer = struct {
         if (text.hypothetical(text.sentenceAt(clean, d.start))) return null;
         const e = try t.parse(txt) orelse return null;
         return .{ .e = e, .end = txt_end };
-    }
-
-    /// The assignment's right side is the value `source` has, in any form ("B = 12,000,000,000 + 345,678,901?").
-    fn restates(t: *Tracer, clean: []const u8, d: text.Def, source: []const u8) Allocator.Error!bool {
-        const txt_end = text.defEnd(clean, d.rhs) orelse return false;
-        var txt = clean[d.rhs..txt_end];
-        // a doubt ends the value it doubts: "12,000,000,000 + 345,678,901? Or use pattern"
-        for ([_][]const u8{ "?", "~", "≈" }) |m| if (std.mem.indexOf(u8, txt, m)) |k| {
-            txt = txt[0..k];
-        };
-        // notation the parser refuses ("D = 1|2" may be OR, "M = 1e9+7") is no restatement: the name is poisoned
-        const e = try t.parse(txt) orelse return false;
-        return std.mem.eql(u8, e.source, source) or try value.same(t.scratch.allocator(), e.source, source);
     }
 
     fn statement(t: *Tracer, clean: []const u8, h: text.Head) Allocator.Error!?Found {

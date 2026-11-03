@@ -10,6 +10,10 @@ const runner = @import("runner.zig");
 
 const gpa = std.testing.allocator;
 
+test {
+    _ = @import("runner_trace_bind_test.zig"); // binding recovery, from here: runner.zig stays at 600 lines
+}
+
 /// The Python source a line states (after `lines` defined its names), or null.
 fn stated(lines: []const []const u8) !?[]u8 {
     var t = trace.Tracer.init(gpa);
@@ -126,9 +130,10 @@ test "runner trace: any reassignment poisons a name, so a stale value never stat
     // `N =` and `Let N =` with another value
     try expectNone(&.{ "N = 280223976814164.", "N = 18364758544493064720.", "Need compute N*65536." });
     try expectNone(&.{ "N = 5.", "Let N = 6.", "Need compute N*1000003." });
-    // a first assignment that binds nothing (a note, a hypothesis) blocks a later value too
-    try expectNone(&.{ "Let A = 12345678901 (≈1.2e10).", "A = 12345678901.", "Need compute A*1000003." });
-    try expectNone(&.{ "If A = 6 then fine.", "Let A = 5.", "Need compute A*1000003." });
+    // a note or a hypothesis binds nothing, a later plain value does (R1); a value after a label still blocks
+    try expectStated(&.{ "Let A = 12345678901 (≈1.2e10).", "A = 12345678901.", "Need compute A*1000003." }, "(12345678901)*1000003");
+    try expectStated(&.{ "If A = 6 then fine.", "Let A = 5.", "Need compute A*1000003." }, "(5)*1000003");
+    try expectNone(&.{ "Step3 A = 5.", "A = 5.", "Need compute A*1000003." });
     // kept: the same value again, with a note or a label, and a name after an operator assigns nothing
     try expectStated(&.{ "Let N=280,223,976,814,164.", "N=280,223,976,814,164 (~2.802e14).", "Compute N*65536." }, "(280223976814164)*65536");
     try expectStated(&.{ "Let N=280,223,976,814,164.", "Step3 N=280,223,976,814,164.", "Compute N*65536." }, "(280223976814164)*65536");
