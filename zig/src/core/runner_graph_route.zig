@@ -411,6 +411,12 @@ pub const Routed = struct {
 
     fn translate(ctx: ?*anyopaque, a: Allocator, cell: api.Cell) Allocator.Error!api.Translation {
         const r: *Routed = @ptrCast(@alignCast(ctx.?));
+        // R5: a literal-only inline value (`140 mod 9`, `10^9 mod 11`) reads no earlier cell, so it runs without them
+        if (cell.form == .inline_expr and cell.prior.len != 0 and closedLiteral(cell.code)) {
+            var alone = cell;
+            alone.prior = &.{};
+            return translate(ctx, a, alone);
+        }
         if (try r.graphFirst(a, cell)) |bytes| return .{ .program = .{ .kind = .graph, .bytes = bytes } };
         const t = try r.inner.translate(r.inner.ctx, a, cell);
         if (t == .abstain) if (try prog.direct(a, r.bank, cell, t.abstain)) |bytes| return .{ .program = .{ .kind = .graph, .bytes = bytes } };
@@ -420,6 +426,24 @@ pub const Routed = struct {
         return .{ .program = .{ .kind = .graph, .bytes = bytes } };
     }
 };
+
+/// An inline value of literals only: digits, `+ - * ^`, brackets, the word `mod`; no name, call, `%`, `.`, `/` or `e`.
+pub fn closedLiteral(code: []const u8) bool {
+    var i: usize = 0;
+    var digit = false;
+    while (i < code.len) : (i += 1) {
+        if (std.mem.startsWith(u8, code[i..], " mod ")) {
+            i += 4;
+            continue;
+        }
+        switch (code[i]) {
+            '0'...'9' => digit = true,
+            ' ', '(', ')', '+', '-', '*', '^' => {},
+            else => return false,
+        }
+    }
+    return digit;
+}
 
 /// TF_DSV41_RUNNER_SYNC_GRAPH on the engine thread: the whole route for an inline value, else its graph steps only.
 pub const Quick = struct {
