@@ -3,6 +3,7 @@ const std = @import("std");
 const api = @import("engine_api");
 const json = @import("json");
 const openai = @import("openai.zig");
+const projection = @import("runner_projection.zig");
 const Server = @import("server.zig").Server;
 const Conn = @import("http_conn.zig").Conn;
 const model_text = @import("model_text.zig");
@@ -262,4 +263,78 @@ test "runner projection: HTTP a raw anchor past the rebuilt raw bytes leaves its
     const got = try post(a, "plan", t5_content, receipt, false);
     try std.testing.expect(got.runner.get("field_projection").?.get("content").? == .null);
     try expectAbstain(got, 0, "", .{ 12, 35, 39, 1000 }, .{ null, null, null, null });
+}
+
+test "runner projection: HTTP a run found only inside a deleted tool argument is never mapped, whole and streamed" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // T5: the content is the FF's U+FFFD (raw byte 0); a literal U+FFFD in the cut argument (raw byte 42) is no origin
+    const text = "\xff<tool_call>{\"name\":\"f\",\"arguments\":{\"x\":\"\u{fffd}\"}}</tool_call>";
+    const receipt = try std.fmt.allocPrint(a, "{{\"cells\":[],\"abstains\":[{s}]}}", .{try abstain(a, "content", .{ 0, 1, text.len }, "content", text.len)});
+    for ([_]bool{ false, true }) |stream| {
+        const got = try postWith(a, "plan", text, receipt, stream, tools);
+        try std.testing.expect(got.calls);
+        try std.testing.expectEqualStrings("\u{fffd}", got.content);
+        try std.testing.expect(got.runner.get("field_projection").?.get("content").? == .null);
+    }
+}
+
+test "runner projection: HTTP content the tool parse joined across an envelope is never mapped onto the argument" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const text = "a<tool_call>{\"name\":\"f\",\"arguments\":{\"x\":\"ab\"}}</tool_call>b"; // "ab" only in the cut
+    const receipt = try std.fmt.allocPrint(a, "{{\"cells\":[],\"abstains\":[{s}]}}", .{try abstain(a, "content", .{ 0, 1, text.len }, "content", text.len)});
+    for ([_]bool{ false, true }) |stream| {
+        const got = try postWith(a, "plan", text, receipt, stream, tools);
+        try std.testing.expect(got.calls);
+        if (!stream) try std.testing.expectEqualStrings("ab", got.content);
+        try std.testing.expect(got.runner.get("field_projection").?.get("content").? == .null);
+    }
+}
+
+test "runner projection: HTTP raw invalid UTF-8 publishes no map even inside a deleted envelope, whole and streamed" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const text = "<tool_call>{\"name\":\"f\",\"arguments\":{\"x\":\"\xff\"}}</tool_call>\nok";
+    const at = std.mem.indexOf(u8, text, "ok").?;
+    const receipt = try std.fmt.allocPrint(a, "{{\"cells\":[],\"abstains\":[{s}]}}", .{try abstain(a, "content", .{ at, at + 2, text.len }, "content", text.len)});
+    for ([_]bool{ false, true }) |stream| {
+        const got = try postWith(a, "plan", text, receipt, stream, tools);
+        try std.testing.expect(got.calls);
+        try std.testing.expectEqualStrings("ok", got.content);
+        try std.testing.expect(got.runner.get("field_projection").?.get("content").? == .null);
+        try std.testing.expect(got.runner.get("field_projection").?.get("reasoning").? != .null);
+    }
+}
+
+test "runner projection: HTTP a non-null raw anchor past i64 (2^63) leaves its field unmapped; a null one does not" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const big = try std.fmt.allocPrint(a, "{{\"cells\":[],\"abstains\":[{s}]}}", .{try abstain(a, "content", .{ 12, 35, @as(usize, 1) << 63 }, "content", 47)});
+    for ([_]bool{ false, true }) |stream| {
+        const got = try post(a, "plan", t5_content, big, stream);
+        try std.testing.expect(got.runner.get("field_projection").?.get("content").? == .null);
+    }
+    const none = try std.fmt.allocPrint(a, "{{\"cells\":[],\"abstains\":[{s}]}}", .{try abstain(a, "content", .{ null, null, null }, "content", 39)});
+    const got = try post(a, "plan", t5_content, none, false);
+    try std.testing.expect(got.runner.get("field_projection").?.get("content").? != .null);
+}
+
+test "runner projection: a run is mapped only with blanks and whole envelopes outside it, and only when one run fits" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqual(@as(?projection.Map, null), try projection.mapOf(a, "xab", "ab", "")); // kept text cut
+    try std.testing.expectEqual(@as(?projection.Map, null), try projection.mapOf(a, "\n\n", "\n", "")); // two runs fit
+    const env = "<tool_call>{}</tool_call>";
+    const kept = "x " ++ env ++ " y"; // an envelope the parse kept sits inside the run
+    try std.testing.expectEqual(@as(?projection.Map, .{ .raw = kept.len + 1, .lead = 1, .kept = kept.len }), try projection.mapOf(a, "\n" ++ kept, kept, ""));
+    try std.testing.expectEqual(@as(?projection.Map, .{ .raw = env.len + 3, .lead = env.len + 1, .kept = 2 }), try projection.mapOf(a, env ++ "\nab", "ab", ""));
+    try std.testing.expectEqual(@as(?projection.Map, .{ .raw = 11, .lead = 9, .kept = 2 }), try projection.mapOf(a, "<think>\n\nab", "ab", "<think>"));
+    const arg = "<tool_call>{\"x\":\"ab\"}</tool_call>"; // the run again inside a cut argument is no second origin
+    try std.testing.expectEqual(@as(?projection.Map, .{ .raw = arg.len + 2, .lead = 0, .kept = 2 }), try projection.mapOf(a, "ab" ++ arg, "ab", ""));
 }

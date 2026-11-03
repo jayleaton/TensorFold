@@ -2,6 +2,7 @@
 const std = @import("std");
 const json = @import("json");
 const reply_text = @import("reply_text.zig");
+const tool_parse = @import("tool_parse.zig");
 const model_text = @import("model_text.zig");
 const chat = @import("chat.zig");
 const Value = json.Value;
@@ -25,14 +26,32 @@ pub fn rawFields(a: Allocator, text: model_text.Text, tokens: []const u32, think
     return .{ fields[0].items, fields[1].items };
 }
 
-/// The final field as one raw run after a blank head, or after any head when it occurs once; else null (U+FFFD, cuts).
-pub fn mapOf(raw: []const u8, final: []const u8, open: []const u8) ?Map {
-    const lead = if (final.len == 0) raw.len else std.mem.indexOf(u8, raw, final) orelse return null;
-    var head = raw[0..lead];
-    if (open.len > 0 and std.mem.startsWith(u8, head, open)) head = head[open.len..];
-    const once = final.len > 0 and std.mem.indexOfPos(u8, raw, lead + 1, final) == null;
-    if (reply_text.pyStrip(head).len > 0 and !once) return null;
-    return .{ .raw = raw.len, .lead = lead, .kept = final.len };
+/// The final field as the one raw run with only blanks and whole tool envelopes outside; else null (bad UTF-8, cuts).
+pub fn mapOf(a: Allocator, raw: []const u8, final: []const u8, open: []const u8) Allocator.Error!?Map {
+    if (!std.unicode.utf8ValidateSlice(raw)) return null;
+    const body: usize = if (open.len > 0 and std.mem.startsWith(u8, raw, open)) open.len else 0;
+    const envs = try tool_parse.envelopes(a, raw);
+    if (final.len == 0) return if (deleted(raw, envs, body, raw.len)) .{ .raw = raw.len, .lead = raw.len, .kept = 0 } else null;
+    var found: ?Map = null;
+    var from = body;
+    while (std.mem.indexOfPos(u8, raw, from, final)) |lead| : (from = lead + 1) {
+        if (!deleted(raw, envs, body, lead) or !deleted(raw, envs, lead + final.len, raw.len)) continue;
+        if (found != null) return null; // two runs fit: no provenance
+        found = .{ .raw = raw.len, .lead = lead, .kept = final.len };
+    }
+    return found;
+}
+
+/// raw[from..to] is only blanks and whole envelopes (envs sorted and apart); one across an end: a run in deleted text.
+fn deleted(raw: []const u8, envs: []const tool_parse.Envelope, from: usize, to: usize) bool {
+    var p = from;
+    for (envs) |e| {
+        if (e.end <= p or e.start >= to) continue;
+        if (e.start < p or e.end > to) return false;
+        if (reply_text.pyStrip(raw[p..e.start]).len > 0) return false;
+        p = e.end;
+    }
+    return reply_text.pyStrip(raw[p..to]).len == 0;
 }
 
 /// The reasoning and content a stream sent, read off each chunk as the client gets it.
@@ -58,7 +77,7 @@ pub fn runtimeOf(a: Allocator, reply: *const chat.Reply, sent: *const Sent, is_c
     const raw = reply.runner_raw orelse return reply.runtime;
     const runner = reply.runtime.get("runner") orelse return reply.runtime;
     const got: [2][]const u8 = if (sent.streamed) .{ sent.fields[0].items, sent.fields[1].items } else .{ if (is_chat) reply.reasoning orelse "" else "", reply.content };
-    try apply(a, runner, .{ mapOf(raw[0], got[0], "<think>"), mapOf(raw[1], got[1], "") });
+    try apply(a, runner, .{ try mapOf(a, raw[0], got[0], "<think>"), try mapOf(a, raw[1], got[1], "") });
     return reply.runtime;
 }
 
@@ -91,11 +110,15 @@ fn fieldOf(v: Value, key: []const u8) ?usize {
 
 const anchors = [_][]const u8{ "source_at", "source_end", "source_close_at", "resume_at" };
 
-/// A raw anchor past the bytes rebuilt here (tokens the runner fed that the reply dropped): that field has no map.
+/// A raw anchor that is no byte offset (negative, past the bytes rebuilt here, not an i64): that field has no map.
 fn bound(maps: *[2]?Map, i: ?usize, raw: ?Value) void {
     const f = i orelse return;
     const m = maps[f] orelse return;
-    const r = (raw orelse return).int64() orelse return;
+    const v = raw orelse return;
+    if (v == .null) return;
+    const r = v.int64() orelse return {
+        maps[f] = null;
+    };
     if (r < 0 or r > m.raw) maps[f] = null;
 }
 
