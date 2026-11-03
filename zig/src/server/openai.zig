@@ -279,6 +279,7 @@ const Run = struct {
         try o.put(a, "object", .{ .string = if (r.is_chat) "chat.completion.chunk" else "text_completion" });
         try o.put(a, "created", try json.intValue(a, r.created));
         try o.put(a, "model", .{ .string = r.plan.named });
+        if (delta) |v| if (v == .object) if (v.object.fetchOrderedRemove("tensorfold")) |kv| try o.put(a, kv.key, kv.value); // live records
         const choice = try json.newObject(a);
         try choice.put(a, "index", .{ .int = "0" });
         if (r.is_chat) {
@@ -294,9 +295,7 @@ const Run = struct {
             try choice.put(a, "finish_reason", if (finish) |f| .{ .string = f } else .null);
             try choice.put(a, "logprobs", if (rows) |v| try @import("logprobs.zig").legacy(a, v, &r.text_offset) else .null);
         }
-        const list = try a.alloc(Value, 1);
-        list[0] = .{ .object = choice };
-        try o.put(a, "choices", .{ .array = list });
+        try o.put(a, "choices", .{ .array = try a.dupe(Value, &.{.{ .object = choice }}) });
         return .{ .object = o };
     }
 
@@ -461,7 +460,7 @@ const Run = struct {
             if (!s.opened) return s.pending.append(r.a, delta) catch error.Closed;
             if (!s.tools) {
                 // completions stream text only, with its logprob rows when asked
-                if (!r.is_chat and delta != .string and (delta != .object or delta.object.get("content") == null)) return;
+                if (!r.is_chat and delta != .string and (delta != .object or (delta.object.get("content") == null and delta.object.get("tensorfold") == null))) return;
                 return r.emit(r.chunk(delta, null) catch return error.Closed);
             }
             const filtered = r.policyDelta(delta) catch return error.Closed;

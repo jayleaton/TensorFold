@@ -134,3 +134,71 @@ test "runner receipt: escapes, a long span as sha256, bytes cut mid-character as
     try off.rec.token(gpa, 1, "1", false);
     try std.testing.expect(std.mem.endsWith(u8, records.write(&off), "\"resume_ms\":0}"));
 }
+
+test "runner receipt: each record reaches the stream as it lands, byte for byte as the finished receipt writes it" {
+    var back: rt.Back = .{};
+    defer back.deinit();
+    var m = [_]rt.Model{ .{ .lead = rt.mul_cell }, .{ .lead = "Exact: 1.5+2.25 =" } };
+    var sums: [2][]u8 = undefined;
+    var live: [2][]u8 = undefined;
+    const texts = try rt.replies(&m, .{ .summaries = &sums, .live = &live, .inline_math = true }, &back);
+    defer rt.freeAll(texts);
+    for (sums, live) |sum, notes| {
+        defer gpa.free(sum);
+        defer gpa.free(notes);
+        try std.testing.expect(notes.len > 0);
+        const cells = try std.mem.concat(gpa, u8, &.{ "\"cells\":[", notes, "]}" });
+        defer gpa.free(cells);
+        try std.testing.expect(std.mem.endsWith(u8, sum, cells));
+    }
+    // records off: no note, and the same tokens
+    var off_sums: [2][]u8 = undefined;
+    var off_live: [2][]u8 = undefined;
+    const off = try rt.replies(&m, .{ .summaries = &off_sums, .live = &off_live, .inline_math = true, .cells = false }, &back);
+    defer rt.freeAll(off);
+    for (off_sums, off_live, texts, off) |sum, notes, on_text, off_text| {
+        defer gpa.free(sum);
+        defer gpa.free(notes);
+        try std.testing.expectEqual(0, notes.len);
+        try std.testing.expect(std.mem.indexOf(u8, sum, "\"cells\"") == null);
+        try std.testing.expectEqualStrings(on_text, off_text);
+    }
+}
+
+test "runner receipt: notes give a record when owned and each time it grows, never twice, none when records are off" {
+    var cell: FakeCell = .{};
+    var s: FakeSession = .{ .cells = .{ .items = &.{&cell} } };
+    defer s.rec.deinit(gpa);
+    try std.testing.expect(records.notes(&s) == null);
+    try s.rec.token(gpa, 1, "ab", true);
+    try s.rec.owned(gpa, 0, &.{ 7, 8 });
+    const owned = records.notes(&s).?;
+    try std.testing.expectEqual(1, owned.len);
+    try std.testing.expectEqual(2, owned[0].end); // nothing landed: it ends where it starts
+    try std.testing.expect(std.mem.indexOf(u8, owned[0].json, "\"value\":\"\",") != null);
+    try std.testing.expect(records.notes(&s) == null);
+    try s.rec.token(gpa, 7, "25", true);
+    const grown = records.notes(&s).?;
+    try std.testing.expectEqual(0, grown[0].index);
+    try std.testing.expectEqual(4, grown[0].end);
+    try std.testing.expect(!grown[0].content);
+    try std.testing.expect(std.mem.indexOf(u8, grown[0].json, "\"value\":\"25\",") != null);
+    try std.testing.expect(std.mem.indexOf(u8, grown[0].json, "\"landed\":1,") != null);
+    try std.testing.expect(records.notes(&s) == null);
+    try s.rec.token(gpa, 3, "!", true); // not the result's: the record stops growing
+    try std.testing.expect(records.notes(&s) == null);
+    try s.rec.owned(gpa, 0, &.{9});
+    try s.rec.token(gpa, 9, "6", true);
+    const second = records.notes(&s).?;
+    try std.testing.expectEqual(1, second.len);
+    try std.testing.expectEqual(1, second[0].index);
+    const receipt = records.write(&s);
+    const tail = try std.mem.concat(gpa, u8, &.{ second[0].json, "]}" });
+    defer gpa.free(tail);
+    try std.testing.expect(std.mem.endsWith(u8, receipt, tail));
+    var off: FakeSession = .{ .cells = .{ .items = &.{&cell} }, .rec = .{ .on = false } };
+    defer off.rec.deinit(gpa);
+    try off.rec.owned(gpa, 0, &.{1});
+    try off.rec.token(gpa, 1, "1", false);
+    try std.testing.expect(records.notes(&off) == null);
+}

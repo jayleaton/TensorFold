@@ -231,6 +231,8 @@ pub const LaneHost = struct {
     pub fn send(h: *LaneHost, job: *Job) void {
         const all = job.stream.emitted();
         const emitted = all[0 .. all.len - @intFromBool(job.stream.runner_eos_pending)];
+        // the runner records as they stand (records on), ahead of the tokens they land: a cut stream keeps them
+        if (job.runner) |rs| if (@import("runner_receipt.zig").notes(rs)) |n| emit(job, .{ .cells = n });
         if (emitted.len > job.delivered) {
             if (job.stream.logprobs != null) emit(job, .{ .logprobs = job.stream.rows.items[job.delivered..emitted.len] });
             emit(job, .{ .tokens = emitted[job.delivered..] });

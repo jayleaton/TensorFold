@@ -132,12 +132,20 @@ const Box = struct {
     done: ?Reason = null,
     cells: [8192]u8 = undefined, // the finished event's runner receipt
     cells_len: usize = 0,
+    keep: bool = false, // keep `live` (Opts.live): the caller frees it
+    live: [32][]u8 = @splat(&.{}), // each record's newest Event.cells note (gpa)
+    live_n: usize = 0,
     fn event(ctx: *anyopaque, _: api.Id, e: *const api.Event) void {
         const b: *@This() = @ptrCast(@alignCast(ctx));
         b.mutex.lockUncancelable(std.testing.io);
         defer b.mutex.unlock(std.testing.io);
         switch (e.*) {
             .tokens => |t| b.tokens.appendSlice(gpa, t) catch {},
+            .cells => |notes| for (notes) |n| if (b.keep and n.index < b.live.len) {
+                gpa.free(b.live[n.index]);
+                b.live[n.index] = gpa.dupe(u8, n.json) catch &.{};
+                b.live_n = @max(b.live_n, n.index + 1);
+            },
             .finished => |f| {
                 @memcpy(b.cells[0..f.runner.len], f.runner);
                 b.cells_len = f.runner.len;
@@ -161,7 +169,7 @@ const Box = struct {
 };
 
 /// `frontend`/`backend`: real ones in place of the fakes (the proof test).
-pub const Opts = struct { runner: bool = true, run_cells: bool = true, delay: u32 = 0, planner: bool = false, streams: usize = 1, max_tokens: u32 = 400, frontend: ?rapi.Frontend = null, backend: ?rapi.Backend = null, wait_s: u32 = 20, exact: bool = false, inline_mark: bool = false, result_tokens: u32 = 512, inline_math: bool = false, trace: bool = false, trace_ask: runner.TraceAsk = .{}, placer: ?*runner.place.Placer = null, summaries: ?[][]u8 = null };
+pub const Opts = struct { runner: bool = true, run_cells: bool = true, delay: u32 = 0, planner: bool = false, streams: usize = 1, max_tokens: u32 = 400, frontend: ?rapi.Frontend = null, backend: ?rapi.Backend = null, wait_s: u32 = 20, exact: bool = false, inline_mark: bool = false, result_tokens: u32 = 512, inline_math: bool = false, trace: bool = false, trace_ask: runner.TraceAsk = .{}, placer: ?*runner.place.Placer = null, summaries: ?[][]u8 = null, cells: bool = true, live: ?[][]u8 = null };
 
 /// Runs `models` (one request each, concurrently) on one host; the reply texts.
 pub fn replies(models: []Model, o: Opts, back: *Back) ![][]u8 {
@@ -176,7 +184,7 @@ pub fn replies(models: []Model, o: Opts, back: *Back) ![][]u8 {
     defer core.deinit();
     var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 4 });
     back.delay = o.delay;
-    var run: runner.Runner = .{ .gpa = gpa, .cfg = .{ .circuit = "test", .exact = o.exact, .inline_mark = o.inline_mark, .max_tokens = o.result_tokens, .scan = .{ .inline_math = o.inline_math, .trace = o.trace } }, .frontend = o.frontend orelse .{ .translate = translate }, .backend = o.backend orelse back.backend(), .text = .{ .bytes = tokenBytes, .encode = encode }, .placer = o.placer };
+    var run: runner.Runner = .{ .gpa = gpa, .cfg = .{ .circuit = "test", .exact = o.exact, .inline_mark = o.inline_mark, .max_tokens = o.result_tokens, .cells = o.cells, .scan = .{ .inline_math = o.inline_math, .trace = o.trace } }, .frontend = o.frontend orelse .{ .translate = translate }, .backend = o.backend orelse back.backend(), .text = .{ .bytes = tokenBytes, .encode = encode }, .placer = o.placer };
     if (o.runner) host.runner = &run;
     const boxes = try gpa.alloc(Box, models.len);
     defer gpa.free(boxes);
@@ -188,7 +196,7 @@ pub fn replies(models: []Model, o: Opts, back: *Back) ![][]u8 {
     try host.start();
     defer host.stop();
     for (models, 0..) |_, i| {
-        boxes[i] = .{};
+        boxes[i] = .{ .keep = o.live != null };
         prompts[i] = prompt ++ [_]u32{@intCast(i)}; // the router tells the streams apart by their last prompt token
         requests[i] = .{ .prompt = &prompts[i], .max_tokens = o.max_tokens, .eos = &.{EOS}, .run_cells = o.run_cells, .run_trace = o.trace_ask };
         try e.submit(@intCast(i + 1), &requests[i], .{ .ctx = &boxes[i], .event = Box.event });
@@ -201,6 +209,8 @@ pub fn replies(models: []Model, o: Opts, back: *Back) ![][]u8 {
     }
     for (boxes, 0..) |*b, i| {
         if (o.summaries) |s| s[i] = try gpa.dupe(u8, b.cells[0..b.cells_len]);
+        if (o.live) |s| s[i] = try std.mem.join(gpa, ",", b.live[0..b.live_n]);
+        for (b.live[0..b.live_n]) |n| gpa.free(n);
     }
     return out;
 }

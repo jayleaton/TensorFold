@@ -57,6 +57,8 @@ pub const Generation = struct {
     hold: bool = false, // the engine holds the reply at an EOS (Request.hold_eos): this segment ends there
     held: bool = false, // it did: the engine has not finished, and compute_turns.zig resumes or ends it
     skip: []const u32 = &.{}, // a resumed segment's first tokens: the inserted tool result, checked and not shown
+    cells_sent: usize = 0, // the runner records the stream sent last: a prefix the client has every landed byte of
+    cells_sig: u64 = 0, // their Mailbox.covered sig
 
     fn eos(g: *const Generation, t: u32) bool {
         return !g.ignore_eos and std.mem.indexOfScalar(u32, g.srv.eos, t) != null;
@@ -200,6 +202,7 @@ pub const Generation = struct {
                 g.cancel();
                 return error.Cancelled;
             }
+            if (chunk == null) if (g.sink) |sink| try g.liveCells(sink);
             if (chunk == null and @hasDecl(Gone, "beat")) {
                 // queueing and a long prefill send nothing: a client that times out a silent stream would leave
                 const now = nowNs(g.srv.io);
@@ -212,8 +215,37 @@ pub const Generation = struct {
             }
             const tokens = try g.skipInserted(chunk orelse continue);
             if (g.reason == null) try g.commit(tokens);
+            if (g.sink) |sink| try g.liveCells(sink);
             if (g.held) return;
         }
+    }
+
+    /// Sends the runner records whose bytes the client has (`tensorfold.runner.cells`), so a cut stream keeps them.
+    pub fn liveCells(g: *Generation, sink: Sink) Failure!void {
+        const m = g.box;
+        var text: std.ArrayList(u8) = .empty;
+        {
+            m.mutex.lockUncancelable(m.io);
+            defer m.mutex.unlock(m.io);
+            const got = m.covered(.{ g.streamed_reasoning.text.items.len, g.streamed.text.items.len });
+            // never fewer than sent: the text may have been replaced shorter (a stop string's held prefix)
+            if (got.n < g.cells_sent or got.sig == g.cells_sig) return; // records off: n 0, sig 0, so never
+            try text.appendSlice(g.a, "{\"runner\":{\"live\":true,\"cells\":[");
+            for (m.cells.items[0..got.n], 0..) |versions, i| {
+                if (i > 0) try text.append(g.a, ',');
+                try text.appendSlice(g.a, versions.items[0].json);
+            }
+            try text.appendSlice(g.a, "]}}");
+            g.cells_sent = got.n;
+            g.cells_sig = got.sig;
+        }
+        const v = switch (try json.parse(g.a, text.items)) {
+            .ok => |v| v,
+            .err => return,
+        };
+        const delta = try json.newObject(g.a);
+        try delta.put(g.a, "tensorfold", v); // openai.zig's chunk puts it beside the choices, as the final chunk's receipt
+        try g.emit(sink, .{ .object = delta });
     }
 
     /// Drops the inserted result that opens a resumed segment; a different token there fails the reply.

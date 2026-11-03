@@ -56,7 +56,7 @@ test "Frame cache: identical image content under another frame cannot resume its
             defer b.mutex.unlock(std.testing.io);
             switch (e.*) {
                 .prefilled => |c| b.cached = c,
-                .logprobs, .prompt_logprobs, .audio => {},
+                .logprobs, .prompt_logprobs, .audio, .cells => {},
                 .tokens => |t| b.tokens.appendSlice(gpa, t) catch {},
                 .finished => |f| b.done = f.reason,
             }

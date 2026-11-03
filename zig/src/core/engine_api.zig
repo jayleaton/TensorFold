@@ -143,7 +143,6 @@ pub const SpeechRequest = @import("speech_api.zig").SpeechRequest;
 pub const SpeechResult = @import("speech_api.zig").SpeechResult;
 pub const SpeechInfo = @import("speech_api.zig").SpeechInfo;
 pub const SpeechSubmitError = error{ Closed, Busy, InvalidRequest, Unsupported };
-
 pub const Reason = enum { stop, length, cancelled, failed, silence };
 pub const speech_guard = @import("speech_guard.zig");
 
@@ -178,6 +177,7 @@ pub const Event = union(enum) {
     /// Tokens committed for this request, in order; valid only during the call.
     tokens: []const u32,
     audio: usize,
+    cells: []const @import("runner_receipt.zig").Note, // runner records new or grown, ahead of the tokens they land; valid during the call
     /// The reply ended; nothing follows. ``message`` says why a failed reply failed.
     finished: struct { reason: Reason, stats: Stats = .{}, message: []const u8 = "", runner: []const u8 = "" },
 };

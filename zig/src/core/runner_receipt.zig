@@ -17,7 +17,11 @@ const Record = struct {
     drafted: u32 = 0, // of those, committed in the trigger's own commit: the model's verify agreed (sync, never held)
     sync: bool = false, // settled at its trigger (sync_graph), else held and forced after the hold
     value: std.ArrayList(u8) = .empty, // the landed tokens' bytes
+    told: ?u32 = null, // landed when `notes` last gave it to the stream (null: never)
 };
+
+/// A record as it stands, for the stream (`notes`): its field, the field's bytes through its last landed byte, JSON.
+pub const Note = struct { index: u32, content: bool, end: u64, json: []const u8 };
 
 /// The records and the counters they need; every committed token passes through `token` (Session.feed).
 pub const Log = struct {
@@ -29,6 +33,8 @@ pub const Log = struct {
     writing: bool = false, // the last record's tokens are still landing
     records: std.ArrayList(Record) = .empty,
     out: std.ArrayList(u8) = .empty, // the receipt JSON (write)
+    live: std.ArrayList(u8) = .empty, // the JSON `notes` gave last
+    notes: std.ArrayList(Note) = .empty,
 
     /// A committed token: counted in its field, and matched against a write still landing.
     pub fn token(l: *Log, gpa: Allocator, id: u32, bytes: []const u8, think_open: bool) Allocator.Error!void {
@@ -70,6 +76,8 @@ pub const Log = struct {
         }
         l.records.deinit(gpa);
         l.out.deinit(gpa);
+        l.live.deinit(gpa);
+        l.notes.deinit(gpa);
     }
 };
 
@@ -79,6 +87,30 @@ pub fn write(s: anytype) []const u8 {
     l.out.clearRetainingCapacity();
     put(s.cells.items, l, s.r.gpa, s.held_ms, s.resume_ms) catch return "";
     return l.out.items;
+}
+
+/// Session `s`'s records new or grown since the last call (null: none, or records off), for a stream cut early.
+pub fn notes(s: anytype) ?[]const Note {
+    const l = &s.rec;
+    if (!l.on) return null;
+    fresh(s.cells.items, l, s.r.gpa) catch return null; // out of memory: the next call gives them again
+    return if (l.notes.items.len > 0) l.notes.items else null;
+}
+
+fn fresh(cells: anytype, l: *Log, gpa: Allocator) Allocator.Error!void {
+    l.notes.clearRetainingCapacity();
+    l.live.clearRetainingCapacity();
+    for (l.records.items, 0..) |r, i| if (r.told != r.landed) {
+        const from = l.live.items.len;
+        try record(&l.live, gpa, cells, r);
+        try l.notes.append(gpa, .{ .index = @intCast(i), .content = r.content, .end = r.at + r.value.items.len, .json = l.live.items[from..] });
+    };
+    var from: usize = 0;
+    for (l.notes.items) |*n| {
+        n.json = l.live.items[from..][0..n.json.len]; // the buffer may have moved as it grew
+        from += n.json.len;
+        l.records.items[n.index].told = l.records.items[n.index].landed;
+    }
 }
 
 const form_names = [_][]const u8{ "fence", "repl", "inline", "trace" };
@@ -107,24 +139,29 @@ fn put(cells: anytype, l: *Log, gpa: Allocator, held_ms: u64, resume_ms: u64) Al
     if (l.on) {
         try o.appendSlice(gpa, ",\"cells\":[");
         for (l.records.items, 0..) |r, i| {
-            const c = cells[r.cell];
             if (i > 0) try o.append(gpa, ',');
-            const route = if (c.translation == .program) @tagName(c.translation.program.kind) else "none";
-            const status = if (c.result) |res| @tagName(res.status) else "none";
-            try o.print(gpa, "{{\"cell\":{d},\"form\":\"{s}\",\"route\":\"{s}\",\"status\":\"{s}\",", .{ r.cell, form_names[if (c.stated != null) 3 else @backingInt(c.form)], route, status });
-            try text(o, gpa, "lang", c.lang);
-            if (c.code.len <= span_max) try text(o, gpa, "span", c.code) else {
-                var digest: [32]u8 = undefined;
-                std.crypto.hash.sha2.Sha256.hash(c.code, &digest, .{});
-                try o.print(gpa, "\"span_sha256\":\"{s}\",\"span_len\":{d},", .{ std.fmt.bytesToHex(digest, .lower), c.code.len });
-            }
-            if (c.stated) |st| try text(o, gpa, "display", st.display);
-            try text(o, gpa, "value", r.value.items);
-            try o.print(gpa, "\"field\":\"{s}\",\"at\":{d},\"token\":{d},\"ids\":{d},\"landed\":{d},\"drafted\":{d},\"forced\":{d},\"path\":\"{s}\"}}", .{ if (r.content) "content" else "reasoning", r.at, r.token, r.want.len, r.landed, r.drafted, r.landed - r.drafted, if (r.sync) "sync" else "held" });
+            try record(o, gpa, cells, r);
         }
         try o.append(gpa, ']');
     }
     try o.append(gpa, '}');
+}
+
+/// One record's JSON object, as the receipt's `cells` and the stream's notes give it.
+fn record(o: *std.ArrayList(u8), gpa: Allocator, cells: anytype, r: Record) Allocator.Error!void {
+    const c = cells[r.cell];
+    const route = if (c.translation == .program) @tagName(c.translation.program.kind) else "none";
+    const status = if (c.result) |res| @tagName(res.status) else "none";
+    try o.print(gpa, "{{\"cell\":{d},\"form\":\"{s}\",\"route\":\"{s}\",\"status\":\"{s}\",", .{ r.cell, form_names[if (c.stated != null) 3 else @backingInt(c.form)], route, status });
+    try text(o, gpa, "lang", c.lang);
+    if (c.code.len <= span_max) try text(o, gpa, "span", c.code) else {
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(c.code, &digest, .{});
+        try o.print(gpa, "\"span_sha256\":\"{s}\",\"span_len\":{d},", .{ std.fmt.bytesToHex(digest, .lower), c.code.len });
+    }
+    if (c.stated) |st| try text(o, gpa, "display", st.display);
+    try text(o, gpa, "value", r.value.items);
+    try o.print(gpa, "\"field\":\"{s}\",\"at\":{d},\"token\":{d},\"ids\":{d},\"landed\":{d},\"drafted\":{d},\"forced\":{d},\"path\":\"{s}\"}}", .{ if (r.content) "content" else "reasoning", r.at, r.token, r.want.len, r.landed, r.drafted, r.landed - r.drafted, if (r.sync) "sync" else "held" });
 }
 
 /// `"name":"bytes",` as a JSON string; bytes that are not UTF-8 (a cut mid-character) go as `"name_hex"` instead.
