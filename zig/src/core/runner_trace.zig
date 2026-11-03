@@ -270,9 +270,8 @@ pub const Tracer = struct {
             };
             if (first) |e0| {
                 if (!std.mem.eql(u8, e0.source, x.source) and !try value.same(a, e0.source, x.source)) return .hard;
-                continue;
-            }
-            first = x;
+            } else first = x;
+            // every proved piece's names are dependencies (`B=12345678901=A.` reads A as much as `B=A=…` does)
             var j: usize = 0;
             while (j < p.len) : (j += 1) {
                 const l = text.nameLen(p, j);

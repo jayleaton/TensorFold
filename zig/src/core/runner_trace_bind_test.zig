@@ -179,7 +179,13 @@ test "runner trace bind: adversarial controls never state an old, doubted, unpro
         &.{ "Let M = 1,000,000,007.", "M = 1e9+7.", "M = 1,000,000,007.", "Need compute M*1000003." },
         // a definition after the request on the same line never supplies it
         &.{"Need compute N*1000003. N = 12345."},
-        // a dependency moved: what read it is stale, and restoring the dependency does not restore it
+        // a dependency moved: what read it is stale, restoring it restores nothing (a name in any equal piece counts)
+        &.{ "A=12345678901.", "B=12345678901=A.", "C=B*3.", "A=7.", "Need compute C*1000003." },
+        &.{ "A=12345678901.", "B=A=12345678901.", "C=B*3.", "A=7.", "Need compute C*1000003." },
+        &.{ "A=12345678901.", "B=12345678901=A.", "A=7.", "Need compute B*1000003." },
+        // an unresolved piece or a dependency left unresolved never proves a restatement (T5 review fixtures)
+        &.{ "B=12345678901.", "B=Y=12345678901.", "Need compute B*1000003." },
+        &.{ "A=12345678901.", "B=12345678901.", "A=Y+1.", "B=A.", "Need compute B*1000003." },
         &.{ "A = 12345678901.", "B = A*3.", "A = 5.", "Need compute B*1000003." },
         &.{ "A = 12345678901.", "B = A*3.", "A = N*q + r.", "A = 12345678901.", "Need compute B*1000003." },
         &.{ "A = 12345678901.", "B = A*3.", "C = B + 1.", "A = 7.", "Need compute C*1000003." },
@@ -211,6 +217,9 @@ test "runner trace bind: what the guards keep: later declarations, restorations,
     try expectSource(all, &.{ "Let D=12.", "D=1|2?", "D = 12.", "Need compute D*1000003." }, "(12)*1000003");
     // the same value after the request moves nothing; after a moved request, the line's next statement is read
     try expectSource(all, &.{ "Let N = 12345.", "Need compute N*1000003. N = 12,345." }, "(12345)*1000003");
+    // the permuted chain still binds when nothing it read moves
+    try expectSource(all, &.{ "A=12345678901.", "B=12345678901=A.", "C=B*3.", "Need compute C*1000003." }, "((12345678901)*3)*1000003");
+    try expectSource(all, &.{ "A=12345678901.", "B=A=12345678901.", "C=B*3.", "Need compute C*1000003." }, "(((12345678901))*3)*1000003");
     try expectSource(all, &.{ "A=12345678901234567890", "B=98765432109876543210", "Compute B mod A. B = 8*A? 8A = 98,765,431,209,876,543,120? Let's calculate A*8:" }, "(12345678901234567890)*8");
 }
 
