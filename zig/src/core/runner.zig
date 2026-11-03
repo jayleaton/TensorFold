@@ -597,5 +597,4 @@ test {
     _ = @import("runner_trace_divmod_test.zig");
     _ = @import("runner_trace_named_test.zig");
     _ = @import("runner_graph_edit.zig");
-    _ = @import("runner_trace_value.zig");
 }

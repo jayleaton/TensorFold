@@ -484,3 +484,7 @@ test "runner trace: the reply's runtime block counts a trace cell under trace, n
     try std.testing.expect(std.mem.indexOf(u8, sums[0], "\"repl\":{\"closed\":0,\"owned\":0,") != null);
     try std.testing.expect(std.mem.indexOf(u8, sums[0], "\"trace\":{\"closed\":1,\"owned\":1,\"abstained\":0,") != null);
 }
+
+test {
+    _ = @import("runner_trace_value.zig");
+}
