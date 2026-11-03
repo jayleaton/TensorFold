@@ -17,10 +17,11 @@ import sys
 WIDTH = 256
 OPERATIONS = ("add", "sub", "mul", "emit", "format")
 DIVISION_OPERATIONS = ("meta", "divstep", "divfinal", "emit_first", "emit_last")
+POWMOD_OPERATIONS = ("half", "mulmodstep")
 
 
 def family_operations(family):
-    return OPERATIONS if family == "basic" else DIVISION_OPERATIONS
+    return {"basic": OPERATIONS, "division": DIVISION_OPERATIONS, "powmod": POWMOD_OPERATIONS}[family]
 WORKER_MIB = 1792
 PARENT_MIB = 192
 SOURCES = ("runner_graph_extend.py", "runner_graph_ir.py", "runner_graph_registers.py", "runner_graph_format.py",
@@ -49,6 +50,10 @@ def limited_child():
 
 
 def extension_plans(family="basic"):
+    if family == "powmod":
+        return [{"name": f"powmod-{WIDTH}", "inputs": 3, "literals": [], "ops": [],
+                 "result": 0, "algorithm": "powmod", "width": WIDTH}]
+
     if family == "division":
         from runner_graph_div import optional_plans
         return optional_plans(WIDTH)
@@ -220,6 +225,16 @@ def validate_base(args, identity):
         paths.add(path.as_posix())
     if paths != {name for name in identity["old_bank"] if name.endswith(".tfgp")}:
         raise ValueError("old bank contains unreferenced packed payloads")
+    if args.family == "powmod":
+        required = (("meta", 2, 3), ("divstep", 3, 2), ("divfinal", 4, 2),
+                    ("sub", 2, 1), ("emit", 1, 1), ("format", 2, 2))
+        for name, inputs, outputs in required:
+            matches = [t for t in manifest["templates"] if t["name"] == name and t["width"] == WIDTH]
+            if len(matches) != 1 or matches[0].get("inputs") != inputs or matches[0].get("outputs") != outputs:
+                raise ValueError(f"powmod requires division-bank dependency {name}-{WIDTH} with correct arity")
+        if not any(p["name"] == f"divmod-{WIDTH}" and p.get("algorithm") == "divmod"
+                   and p.get("width") == WIDTH for p in manifest["plans"]):
+            raise ValueError("powmod requires the division-bank base")
     plans = extension_plans(args.family)
     if {item["name"] for item in plans} & {item["name"] for item in manifest["plans"]}:
         raise ValueError("new plan names collide with old plans")
@@ -326,8 +341,8 @@ def main():
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--publish-only", action="store_true",
                         help="Publish completed packs, retaining their original compiler provenance")
-    parser.add_argument("--family", choices=("basic", "division"), default="basic")
-    parser.add_argument("--worker", choices=OPERATIONS + DIVISION_OPERATIONS, help=argparse.SUPPRESS)
+    parser.add_argument("--family", choices=("basic", "division", "powmod"), default="basic")
+    parser.add_argument("--worker", choices=OPERATIONS + DIVISION_OPERATIONS + POWMOD_OPERATIONS, help=argparse.SUPPRESS)
     args = parser.parse_args()
     for name in ("bank", "qwenputer", "baseline", "packer", "output"):
         value = getattr(args, name)

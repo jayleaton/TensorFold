@@ -135,7 +135,7 @@ pub const Builder = struct {
         for (operands) |operand| {
             _ = try literal(operand);
             const digits = operand.len - @intFromBool(operand[0] == '-' or operand[0] == '+');
-            if (digits > (if (family == .divmod) @as(usize, 256) else 128)) return error.GraphLiteral;
+            if (digits > (if (family == .divmod or family == .powmod) @as(usize, 256) else 128)) return error.GraphLiteral;
             needed = @max(needed, digits);
         }
         const width: u16 = if (family == .factorial or family == .range_product or
@@ -222,7 +222,7 @@ pub fn algorithmOutputs(family: Algorithm) u8 {
 }
 
 pub fn algorithmWidthValid(family: Algorithm, width: u16) bool {
-    return widthValid(width) and (width <= 128 or (width == 256 and family == .divmod));
+    return widthValid(width) and (width <= 128 or (width == 256 and (family == .divmod or family == .powmod)));
 }
 
 // Width 255 is an internal alias for unchanged lazy binding head coverage; public banks reject it.
@@ -332,6 +332,11 @@ test "256 digit basic bindings preserve the final group and refuse unsupported a
     try t.expectEqual(@as(usize, 9), max_groups);
     try t.expect(widthValid(256));
     try t.expect(algorithmWidthValid(.divmod, 256));
+    try t.expect(algorithmWidthValid(.powmod, 256));
+    const modular = try Builder.integer(t.allocator, .powmod, &.{ &text, "3", &text });
+    defer t.allocator.free(modular);
+    try t.expect(std.mem.indexOf(u8, modular, "powmod-256") != null);
+    try t.expectError(error.GraphLiteral, Builder.integer(t.allocator, .gcd, &.{ &text, "1" }));
     try t.expect(!algorithmWidthValid(.gcd, 256));
     try t.expect(!algorithmWidthValid(.divmod, 255));
     try t.expect(!widthValid(257));

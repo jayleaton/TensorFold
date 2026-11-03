@@ -374,7 +374,8 @@ def encoded_nodes(c, ir, width):
 def build_template(root, op, width):
     if width not in (*BUCKETS, *OPTIONAL_BUCKETS):
         raise ValueError(f"template width must be one of {(*BUCKETS, *OPTIONAL_BUCKETS)}")
-    optional_ops = ("add", "sub", "mul", "emit", "format", "meta", "divstep", "divfinal", "emit_first", "emit_last")
+    optional_ops = ("add", "sub", "mul", "emit", "format", "meta", "divstep", "divfinal",
+                    "emit_first", "emit_last", "half", "mulmodstep")
     if width in OPTIONAL_BUCKETS and op not in optional_ops:
         raise ValueError(f"optional width supports only {optional_ops}")
     whole = ("format", "format_f64", "round_div", "decimal_mul", "compare", "min", "max", "scale10", "float_exact", "reverse_decimal", "assert_true")

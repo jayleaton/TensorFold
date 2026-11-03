@@ -17,7 +17,8 @@ pub fn cell(a: Allocator, bank: *const Bank, request: anytype) Allocator.Error!?
     const syntax: Syntax = if (request.form == .inline_expr) .math else if (request.form == .repl) .python else return null;
     var source = std.mem.trim(u8, request.code, " \t");
     if (request.form == .repl and std.mem.startsWith(u8, source, ">>>")) source = std.mem.trim(u8, source[3..], " \t");
-    return expression(a, bank, source, syntax);
+    if (try expression(a, bank, source, syntax)) |bound| return bound;
+    return if (request.form == .repl) script(a, bank, source) else null;
 }
 
 /// Parses literals and selects schedules; no expression answer, circuit weights or executable IR is built here.

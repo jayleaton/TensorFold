@@ -310,17 +310,26 @@ pub const Bank = struct {
         if (t.inputs != inputs or t.outputs != outputs) return error.GraphSlotArity;
     }
 
+    fn validateAlgorithm256(b: *const Bank, family: packet.Algorithm) !void {
+        if (family != .divmod and family != .powmod) return error.GraphAlgorithm;
+        try b.require("meta", 256, 2, 3);
+        try b.require("divstep", 256, 3, 2);
+        try b.require("divfinal", 256, 4, 2);
+        if (family == .divmod) {
+            try b.require("emit_first", 256, 1, 1);
+            try b.require("emit_last", 256, 1, 1);
+        } else {
+            try b.require("half", 256, 1, 2);
+            try b.require("mulmodstep", 256, 4, 1);
+            try b.require("sub", 256, 2, 1);
+            try b.require("emit", 256, 1, 1);
+        }
+    }
+
     fn validateAlgorithm(b: *const Bank, family: packet.Algorithm, width: u16, precision: u8) !void {
         if (!packet.algorithmWidthValid(family, width) or precision > 18 or (family != .fixed_div and precision != 0))
             return error.GraphAlgorithm;
-        if (width == 256) {
-            try b.require("meta", width, 2, 3);
-            try b.require("divstep", width, 3, 2);
-            try b.require("divfinal", width, 4, 2);
-            try b.require("emit_first", width, 1, 1);
-            try b.require("emit_last", width, 1, 1);
-            return;
-        }
+        if (width == 256) return b.validateAlgorithm256(family);
         if (std.mem.startsWith(u8, @tagName(family), "f64_")) {
             if (width != 128) return error.GraphAlgorithm;
             try b.require("raw_meta", 128, 2, 3);
