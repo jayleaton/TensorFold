@@ -28,7 +28,7 @@ pub fn rawFields(a: Allocator, text: model_text.Text, tokens: []const u32, think
 
 /// The final field as the one raw run with only blanks and whole tool envelopes outside; else null (bad UTF-8, cuts).
 pub fn mapOf(a: Allocator, raw: []const u8, final: []const u8, open: []const u8) Allocator.Error!?Map {
-    if (!std.unicode.utf8ValidateSlice(raw)) return null;
+    if (!std.unicode.utf8ValidateSlice(raw) or !std.unicode.utf8ValidateSlice(final)) return null;
     const body: usize = if (open.len > 0 and std.mem.startsWith(u8, raw, open)) open.len else 0;
     const cut = try Cut.of(a, raw, try tool_parse.envelopes(a, raw), body);
     if (final.len == 0) return if (cut.before[raw.len]) .{ .raw = raw.len, .lead = raw.len, .kept = 0 } else null;
@@ -72,13 +72,16 @@ const Cut = struct {
         return c;
     }
 
-    /// Marks the bytes of raw[from..to] reached from its envelope side through blanks alone; true when all are blank.
+    /// Marks the code point starts of raw[from..to] reached from its envelope side through blanks; true when all blank.
     fn gap(marks: []bool, raw: []const u8, from: usize, to: usize, ok: bool, head: bool) bool {
         const g = raw[from..to];
         const s = reply_text.pyStrip(g);
         const lead = if (s.len == 0) g.len else @intFromPtr(s.ptr) - @intFromPtr(g.ptr);
         const tail = if (s.len == 0) g.len else g.len - lead - s.len;
-        if (ok) @memset(if (head) marks[from .. from + lead + 1] else marks[to - tail .. to + 1], true);
+        const lo, const hi = if (head) .{ from, from + lead + 1 } else .{ to - tail, to + 1 };
+        if (ok) for (lo..hi) |i| {
+            marks[i] = i == raw.len or raw[i] & 0xc0 != 0x80; // inside a multibyte blank: half of it is no deletion
+        };
         return ok and s.len == 0;
     }
 };
@@ -173,4 +176,17 @@ pub fn apply(a: Allocator, runner: Value, given: [2]?Map) !void {
         try x.object.put(a, try std.mem.concat(a, u8, &.{ "raw_", key }), raw);
         try put(a, x.object, key, project(if (f) |i| maps[i] else null, raw.int64()));
     };
+}
+
+test "runner projection: deletable cuts fall only between code points, never inside a multibyte blank" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "\u{a0}", "\u{3000}" }) |blank| { // two- and three-byte blanks (none takes four bytes)
+        const c = try Cut.of(a, blank, &.{}, 0);
+        for (0..blank.len + 1) |i| {
+            try std.testing.expectEqual(i == 0 or i == blank.len, c.before[i]);
+            try std.testing.expectEqual(i == 0 or i == blank.len, c.after[i]);
+        }
+    }
 }

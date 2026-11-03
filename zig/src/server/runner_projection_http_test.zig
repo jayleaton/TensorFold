@@ -376,3 +376,62 @@ test "runner projection: a final run among many envelopes is placed in one pass,
     // 8x the envelopes: within 24x the time (or 20 ms), not 64x
     try std.testing.expect(ns[1] <= 20 * std.time.ns_per_ms or ns[1] <= 24 * ns[0]);
 }
+
+test "runner projection: a final cut inside a multibyte blank or code point is never mapped, on either side" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cases = [_][2][]const u8{ // raw, final; no blank takes four bytes: U+1F600 stands in at that width
+        .{ "\xc2\xa0", "\xa0" },               .{ "\xc2\xa0", "\xc2" }, // T5's NBSP case, and its other side
+        .{ "\u{3000}", "\x80\x80" },           .{ "\u{3000}", "\xe3\x80" },
+        .{ "\u{1f600}", "\x98\x80" },          .{ "\u{1f600}", "\xf0\x9f" },
+        .{ "\u{3000}x\u{3000}", "\x80x\xe3" }, .{ "x\u{a0}", "x\xc2" },
+        .{ "\u{a0}x", "\xa0x" },
+    };
+    for (cases) |c| try std.testing.expectEqual(@as(?projection.Map, null), try projection.mapOf(a, c[0], c[1], ""));
+    try std.testing.expectEqual(@as(?projection.Map, .{ .raw = 7, .lead = 3, .kept = 1 }), try projection.mapOf(a, "\u{3000}x\u{3000}", "x", ""));
+}
+
+/// T5's slice-based reference (T5-PROJECTION-R4-REVIEW.md): each candidate's prefix and suffix checked afresh.
+fn refDeleted(raw: []const u8, envs: []const @import("tool_parse.zig").Envelope, from: usize, to: usize) bool {
+    var p = from;
+    for (envs) |e| {
+        if (e.end <= p or e.start >= to) continue;
+        if (e.start < p or e.end > to or !e.complete) return false;
+        if (@import("reply_text.zig").pyStrip(raw[p..e.start]).len > 0) return false;
+        p = e.end;
+    }
+    return @import("reply_text.zig").pyStrip(raw[p..to]).len == 0;
+}
+
+fn refMap(a: Allocator, raw: []const u8, final: []const u8, open: []const u8) !?projection.Map {
+    if (!std.unicode.utf8ValidateSlice(raw)) return null;
+    const body = if (open.len > 0 and std.mem.startsWith(u8, raw, open)) open.len else 0;
+    const envs = try @import("tool_parse.zig").envelopes(a, raw);
+    if (final.len == 0) return if (refDeleted(raw, envs, body, raw.len)) .{ .raw = raw.len, .lead = raw.len, .kept = 0 } else null;
+    var found: ?projection.Map = null;
+    var from = body;
+    while (std.mem.indexOfPos(u8, raw, from, final)) |lead| : (from = lead + 1) {
+        if (!refDeleted(raw, envs, body, lead) or !refDeleted(raw, envs, lead + final.len, raw.len)) continue;
+        if (found != null) return null;
+        found = .{ .raw = raw.len, .lead = lead, .kept = final.len };
+    }
+    return found;
+}
+
+test "runner projection: the one-pass map equals the slice reference over blanks, envelopes and split code points" {
+    const pieces = [_][]const u8{ " ", "x", "y", "<think>", "<tool_call>f</tool_call>", "<\u{ff5c}DSML\u{ff5c}tool_calls>", "\u{2003}", "\u{a0}", "\u{3000}", "\u{1f600}" };
+    var checked: usize = 0;
+    for (pieces) |x| for (pieces) |y| for (pieces) |z| {
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const raw = try std.mem.concat(a, u8, &.{ x, y, z });
+        const finals = [_][]const u8{ "", raw, @import("reply_text.zig").pyStrip(raw), "x", "y", "f", x, y, z, raw[x.len..], raw[1..], raw[0 .. raw.len - 1] };
+        for (finals) |final| for ([_][]const u8{ "", "<think>" }) |open| {
+            try std.testing.expectEqualDeep(try refMap(a, raw, final, open), try projection.mapOf(a, raw, final, open));
+            checked += 1;
+        };
+    };
+    try std.testing.expectEqual(10 * 10 * 10 * 12 * 2, checked);
+}
