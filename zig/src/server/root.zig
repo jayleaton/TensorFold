@@ -31,6 +31,7 @@ test {
     _ = @import("runner_live_test.zig");
     _ = @import("request_deadline_test.zig");
     _ = @import("request_deadline_http_test.zig");
+    _ = @import("runner_projection_http_test.zig");
     _ = @import("drain_test.zig");
     _ = @import("keepalive_test.zig");
     _ = @import("idle_unload.zig");

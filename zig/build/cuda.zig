@@ -424,6 +424,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     b.step("test-runner-guide-host", "TF_DSV41_RUNNER_GUIDE: T5's guide text in a chat's system message").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"runner guide:"} })).step);
     b.step("test-runner-live-host", "Runner records streamed as they land: a client that leaves mid-write keeps them").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"runner live records:"} })).step);
     b.step("test-request-deadline-host", "deadline_s: the server ends a reply at its deadline with usage, ids and receipt").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"request deadline:"} })).step);
+    b.step("test-runner-projection-host", "Abstain anchors projected from the runner's raw field bytes into the reply's fields").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"runner projection:"} })).step);
     b.step("test-prompt-interior-host", "Last-user metadata excludes later messages without shaders").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"interior prompt:"} })).step);
     const server_test = b.addRunArtifact(b.addTest(.{ .root_module = server_tests }));
     b.step("test-done-times-host", "Request-local done line times and lane admission on the CPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"done times:"} })).step);

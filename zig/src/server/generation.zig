@@ -10,6 +10,7 @@ const tool_lfm2 = @import("tool_lfm2.zig");
 const log = @import("log.zig");
 const clock = @import("clock.zig");
 const chat = @import("chat.zig");
+const projection = @import("runner_projection.zig");
 const Server = @import("server.zig").Server;
 const Mailbox = @import("mailbox.zig").Mailbox;
 const Value = json.Value;
@@ -301,12 +302,14 @@ pub const Generation = struct {
             reasoning = h.reasoning;
         }
         content = try tool_lfm2.dsml(a, content, g.tools, true);
+        var finals: [2][]const u8 = .{ reasoning orelse "", content }; // the fields the client has, as streamed
         if (g.sink) |sink| {
             const thought = g.streamed_reasoning.text.items;
             if (reasoning) |r| if (std.mem.startsWith(u8, r, thought) and r.len > thought.len)
                 try g.emit(sink, try deltaOf(a, "reasoning_content", r[thought.len..]));
             const shown = if (g.calls != null) try tool_stream.endProse(a, content, if (g.thinking) content else text, g.tools, reason) else content;
             const sent = g.streamed.text.items;
+            finals = .{ if (reasoning != null and std.mem.startsWith(u8, reasoning.?, thought)) reasoning.? else thought, if (std.mem.startsWith(u8, shown, sent)) shown else sent };
             const rest = if (std.mem.startsWith(u8, shown, sent) and shown.len > sent.len) shown[sent.len..] else "";
             if (g.lp) |*l| (if (try l.delta(g.srv, a, g.thinking, g.ignore_eos, g.collected.items, rest, shown.len, true)) |d| try g.emit(sink, d)) else if (rest.len > 0) try g.emit(sink, .{ .string = rest });
             if (g.calls) |*c| if (close.len > 0 or std.mem.eql(u8, reason, "length")) {
@@ -355,7 +358,15 @@ pub const Generation = struct {
         }
         const cells = try a.dupe(u8, m.runner);
         if (cells.len > 0) switch (try json.parse(a, cells)) {
-            .ok => |v| try runtime.put(a, "runner", v),
+            .ok => |v| {
+                // abstain anchors index the runner's raw field bytes; the reply drops what the think split trims
+                if (v.get("abstains") != null) {
+                    const fields = try projection.rawFields(a, reply_text.decodeText, g.srv.text, content_tokens, if (g.thinking) g.srv.think_close_end else null);
+                    const open = if (g.srv.markers.open.len > 0) g.srv.markers.open else "<think>";
+                    try projection.apply(a, v, .{ projection.mapOf(fields[0], finals[0], open), projection.mapOf(fields[1], finals[1], "") });
+                }
+                try runtime.put(a, "runner", v);
+            },
             .err => {},
         };
         if (g.guide) |given| {
