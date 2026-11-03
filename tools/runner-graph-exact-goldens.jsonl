@@ -1,0 +1,358 @@
+{"cell": {"code": "8613/9", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "957\n", "expected_status": "halted", "id": "exact-0"}
+{"cell": {"code": "(8612)/9", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "8612/9\n", "expected_status": "halted", "id": "exact-0-leaf-0--1"}
+{"cell": {"code": "(8612)/9", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "957\n", "expected_status": "halted", "id": "exact-0-leaf-0--1-stale-answer"}
+{"cell": {"code": "(8614)/9", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "8614/9\n", "expected_status": "halted", "id": "exact-0-leaf-0-1"}
+{"cell": {"code": "(8614)/9", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "957\n", "expected_status": "halted", "id": "exact-0-leaf-0-1-stale-answer"}
+{"cell": {"code": "8613/(8)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "8613/8\n", "expected_status": "halted", "id": "exact-0-leaf-1--1"}
+{"cell": {"code": "8613/(8)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "957\n", "expected_status": "halted", "id": "exact-0-leaf-1--1-stale-answer"}
+{"cell": {"code": "8613/(10)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "8613/10\n", "expected_status": "halted", "id": "exact-0-leaf-1-1"}
+{"cell": {"code": "8613/(10)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "957\n", "expected_status": "halted", "id": "exact-0-leaf-1-1-stale-answer"}
+{"cell": {"code": "112 /29", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "112/29\n", "expected_status": "halted", "id": "exact-1"}
+{"cell": {"code": "(111) /29", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "111/29\n", "expected_status": "halted", "id": "exact-1-leaf-0--1"}
+{"cell": {"code": "(111) /29", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "112/29\n", "expected_status": "halted", "id": "exact-1-leaf-0--1-stale-answer"}
+{"cell": {"code": "(113) /29", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "113/29\n", "expected_status": "halted", "id": "exact-1-leaf-0-1"}
+{"cell": {"code": "(113) /29", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "112/29\n", "expected_status": "halted", "id": "exact-1-leaf-0-1-stale-answer"}
+{"cell": {"code": "112 /(28)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "4\n", "expected_status": "halted", "id": "exact-1-leaf-1--1"}
+{"cell": {"code": "112 /(28)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "112/29\n", "expected_status": "halted", "id": "exact-1-leaf-1--1-stale-answer"}
+{"cell": {"code": "112 /(30)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "56/15\n", "expected_status": "halted", "id": "exact-1-leaf-1-1"}
+{"cell": {"code": "112 /(30)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "112/29\n", "expected_status": "halted", "id": "exact-1-leaf-1-1-stale-answer"}
+{"cell": {"code": "(-23777868243178464)/(-41832496)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "568406634\n", "expected_status": "halted", "id": "exact-2"}
+{"cell": {"code": "(-(23777868243178463))/(-41832496)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "23777868243178463/41832496\n", "expected_status": "halted", "id": "exact-2-leaf-0--1"}
+{"cell": {"code": "(-(23777868243178463))/(-41832496)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "568406634\n", "expected_status": "halted", "id": "exact-2-leaf-0--1-stale-answer"}
+{"cell": {"code": "(-(23777868243178465))/(-41832496)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "23777868243178465/41832496\n", "expected_status": "halted", "id": "exact-2-leaf-0-1"}
+{"cell": {"code": "(-(23777868243178465))/(-41832496)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "568406634\n", "expected_status": "halted", "id": "exact-2-leaf-0-1-stale-answer"}
+{"cell": {"code": "(-23777868243178464)/(-(41832495))", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "7925956081059488/13944165\n", "expected_status": "halted", "id": "exact-2-leaf-1--1"}
+{"cell": {"code": "(-23777868243178464)/(-(41832495))", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "568406634\n", "expected_status": "halted", "id": "exact-2-leaf-1--1-stale-answer"}
+{"cell": {"code": "(-23777868243178464)/(-(41832497))", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "23777868243178464/41832497\n", "expected_status": "halted", "id": "exact-2-leaf-1-1"}
+{"cell": {"code": "(-23777868243178464)/(-(41832497))", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "568406634\n", "expected_status": "halted", "id": "exact-2-leaf-1-1-stale-answer"}
+{"cell": {"code": "392764052 ÷ 116", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "3385897\n", "expected_status": "halted", "id": "exact-3"}
+{"cell": {"code": "(392764051) / 116", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "392764051/116\n", "expected_status": "halted", "id": "exact-3-leaf-0--1"}
+{"cell": {"code": "(392764051) / 116", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "3385897\n", "expected_status": "halted", "id": "exact-3-leaf-0--1-stale-answer"}
+{"cell": {"code": "(392764053) / 116", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "392764053/116\n", "expected_status": "halted", "id": "exact-3-leaf-0-1"}
+{"cell": {"code": "(392764053) / 116", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "3385897\n", "expected_status": "halted", "id": "exact-3-leaf-0-1-stale-answer"}
+{"cell": {"code": "392764052 / (115)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "392764052/115\n", "expected_status": "halted", "id": "exact-3-leaf-1--1"}
+{"cell": {"code": "392764052 / (115)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "3385897\n", "expected_status": "halted", "id": "exact-3-leaf-1--1-stale-answer"}
+{"cell": {"code": "392764052 / (117)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "392764052/117\n", "expected_status": "halted", "id": "exact-3-leaf-1-1"}
+{"cell": {"code": "392764052 / (117)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "3385897\n", "expected_status": "halted", "id": "exact-3-leaf-1-1-stale-answer"}
+{"cell": {"code": "8.3168*5.4828", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "45.59935104\n", "expected_status": "halted", "id": "exact-4"}
+{"cell": {"code": "(4573/625)*5.4828", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "40.11655104\n", "expected_status": "halted", "id": "exact-4-leaf-0--1"}
+{"cell": {"code": "(4573/625)*5.4828", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "45.59935104\n", "expected_status": "halted", "id": "exact-4-leaf-0--1-stale-answer"}
+{"cell": {"code": "(5823/625)*5.4828", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "51.08215104\n", "expected_status": "halted", "id": "exact-4-leaf-0-1"}
+{"cell": {"code": "(5823/625)*5.4828", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "45.59935104\n", "expected_status": "halted", "id": "exact-4-leaf-0-1-stale-answer"}
+{"cell": {"code": "8.3168*(11207/2500)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "37.28255104\n", "expected_status": "halted", "id": "exact-4-leaf-1--1"}
+{"cell": {"code": "8.3168*(11207/2500)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "45.59935104\n", "expected_status": "halted", "id": "exact-4-leaf-1--1-stale-answer"}
+{"cell": {"code": "8.3168*(16207/2500)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "53.91615104\n", "expected_status": "halted", "id": "exact-4-leaf-1-1"}
+{"cell": {"code": "8.3168*(16207/2500)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "45.59935104\n", "expected_status": "halted", "id": "exact-4-leaf-1-1-stale-answer"}
+{"cell": {"code": "0.752 × 22.17", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "16.67184\n", "expected_status": "halted", "id": "exact-5"}
+{"cell": {"code": "(-31/125) * 22.17", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-5.49816\n", "expected_status": "halted", "id": "exact-5-leaf-0--1"}
+{"cell": {"code": "(-31/125) * 22.17", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "16.67184\n", "expected_status": "halted", "id": "exact-5-leaf-0--1-stale-answer"}
+{"cell": {"code": "(219/125) * 22.17", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "38.84184\n", "expected_status": "halted", "id": "exact-5-leaf-0-1"}
+{"cell": {"code": "(219/125) * 22.17", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "16.67184\n", "expected_status": "halted", "id": "exact-5-leaf-0-1-stale-answer"}
+{"cell": {"code": "0.752 * (2117/100)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "15.91984\n", "expected_status": "halted", "id": "exact-5-leaf-1--1"}
+{"cell": {"code": "0.752 * (2117/100)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "16.67184\n", "expected_status": "halted", "id": "exact-5-leaf-1--1-stale-answer"}
+{"cell": {"code": "0.752 * (2317/100)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "17.42384\n", "expected_status": "halted", "id": "exact-5-leaf-1-1"}
+{"cell": {"code": "0.752 * (2317/100)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "16.67184\n", "expected_status": "halted", "id": "exact-5-leaf-1-1-stale-answer"}
+{"cell": {"code": "7/12", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "7/12\n", "expected_status": "halted", "id": "exact-6"}
+{"cell": {"code": "(6)/12", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "1/2\n", "expected_status": "halted", "id": "exact-6-leaf-0--1"}
+{"cell": {"code": "(6)/12", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "7/12\n", "expected_status": "halted", "id": "exact-6-leaf-0--1-stale-answer"}
+{"cell": {"code": "(8)/12", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "2/3\n", "expected_status": "halted", "id": "exact-6-leaf-0-1"}
+{"cell": {"code": "(8)/12", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "7/12\n", "expected_status": "halted", "id": "exact-6-leaf-0-1-stale-answer"}
+{"cell": {"code": "7/(11)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "7/11\n", "expected_status": "halted", "id": "exact-6-leaf-1--1"}
+{"cell": {"code": "7/(11)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "7/12\n", "expected_status": "halted", "id": "exact-6-leaf-1--1-stale-answer"}
+{"cell": {"code": "7/(13)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "7/13\n", "expected_status": "halted", "id": "exact-6-leaf-1-1"}
+{"cell": {"code": "7/(13)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "7/12\n", "expected_status": "halted", "id": "exact-6-leaf-1-1-stale-answer"}
+{"cell": {"code": "11/18 *4/4", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "11/18\n", "expected_status": "halted", "id": "exact-7"}
+{"cell": {"code": "11/18 *4/(3)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "22/27\n", "expected_status": "halted", "id": "exact-7-leaf-0--1"}
+{"cell": {"code": "11/18 *4/(3)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "11/18\n", "expected_status": "halted", "id": "exact-7-leaf-0--1-stale-answer"}
+{"cell": {"code": "11/18 *4/(5)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "22/45\n", "expected_status": "halted", "id": "exact-7-leaf-0-1"}
+{"cell": {"code": "11/18 *4/(5)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "11/18\n", "expected_status": "halted", "id": "exact-7-leaf-0-1-stale-answer"}
+{"cell": {"code": "11/18 *(3)/4", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "11/24\n", "expected_status": "halted", "id": "exact-7-leaf-1--1"}
+{"cell": {"code": "11/18 *(3)/4", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "11/18\n", "expected_status": "halted", "id": "exact-7-leaf-1--1-stale-answer"}
+{"cell": {"code": "11/18 *(5)/4", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "55/72\n", "expected_status": "halted", "id": "exact-7-leaf-1-1"}
+{"cell": {"code": "11/18 *(5)/4", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "11/18\n", "expected_status": "halted", "id": "exact-7-leaf-1-1-stale-answer"}
+{"cell": {"code": "(10)/18 *4/4", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "5/9\n", "expected_status": "halted", "id": "exact-7-leaf-2--1"}
+{"cell": {"code": "(10)/18 *4/4", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "11/18\n", "expected_status": "halted", "id": "exact-7-leaf-2--1-stale-answer"}
+{"cell": {"code": "(12)/18 *4/4", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "2/3\n", "expected_status": "halted", "id": "exact-7-leaf-2-1"}
+{"cell": {"code": "(12)/18 *4/4", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "11/18\n", "expected_status": "halted", "id": "exact-7-leaf-2-1-stale-answer"}
+{"cell": {"code": "11/(17) *4/4", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "11/17\n", "expected_status": "halted", "id": "exact-7-leaf-3--1"}
+{"cell": {"code": "11/(17) *4/4", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "11/18\n", "expected_status": "halted", "id": "exact-7-leaf-3--1-stale-answer"}
+{"cell": {"code": "11/(19) *4/4", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "11/19\n", "expected_status": "halted", "id": "exact-7-leaf-3-1"}
+{"cell": {"code": "11/(19) *4/4", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "11/18\n", "expected_status": "halted", "id": "exact-7-leaf-3-1-stale-answer"}
+{"cell": {"code": "5/24 *3/3", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "5/24\n", "expected_status": "halted", "id": "exact-8"}
+{"cell": {"code": "5/24 *3/(2)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "5/16\n", "expected_status": "halted", "id": "exact-8-leaf-0--1"}
+{"cell": {"code": "5/24 *3/(2)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "5/24\n", "expected_status": "halted", "id": "exact-8-leaf-0--1-stale-answer"}
+{"cell": {"code": "5/24 *3/(4)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "5/32\n", "expected_status": "halted", "id": "exact-8-leaf-0-1"}
+{"cell": {"code": "5/24 *3/(4)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "5/24\n", "expected_status": "halted", "id": "exact-8-leaf-0-1-stale-answer"}
+{"cell": {"code": "5/24 *(2)/3", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "5/36\n", "expected_status": "halted", "id": "exact-8-leaf-1--1"}
+{"cell": {"code": "5/24 *(2)/3", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "5/24\n", "expected_status": "halted", "id": "exact-8-leaf-1--1-stale-answer"}
+{"cell": {"code": "5/24 *(4)/3", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "5/18\n", "expected_status": "halted", "id": "exact-8-leaf-1-1"}
+{"cell": {"code": "5/24 *(4)/3", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "5/24\n", "expected_status": "halted", "id": "exact-8-leaf-1-1-stale-answer"}
+{"cell": {"code": "(4)/24 *3/3", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "1/6\n", "expected_status": "halted", "id": "exact-8-leaf-2--1"}
+{"cell": {"code": "(4)/24 *3/3", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "5/24\n", "expected_status": "halted", "id": "exact-8-leaf-2--1-stale-answer"}
+{"cell": {"code": "(6)/24 *3/3", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "1/4\n", "expected_status": "halted", "id": "exact-8-leaf-2-1"}
+{"cell": {"code": "(6)/24 *3/3", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "5/24\n", "expected_status": "halted", "id": "exact-8-leaf-2-1-stale-answer"}
+{"cell": {"code": "5/(23) *3/3", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "5/23\n", "expected_status": "halted", "id": "exact-8-leaf-3--1"}
+{"cell": {"code": "5/(23) *3/3", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "5/24\n", "expected_status": "halted", "id": "exact-8-leaf-3--1-stale-answer"}
+{"cell": {"code": "5/(25) *3/3", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "1/5\n", "expected_status": "halted", "id": "exact-8-leaf-3-1"}
+{"cell": {"code": "5/(25) *3/3", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "5/24\n", "expected_status": "halted", "id": "exact-8-leaf-3-1-stale-answer"}
+{"cell": {"code": "(1 -1/2)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "1/2\n", "expected_status": "halted", "id": "exact-9"}
+{"cell": {"code": "((0) -1/2)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-1/2\n", "expected_status": "halted", "id": "exact-9-leaf-0--1"}
+{"cell": {"code": "((0) -1/2)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "1/2\n", "expected_status": "halted", "id": "exact-9-leaf-0--1-stale-answer"}
+{"cell": {"code": "((2) -1/2)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "3/2\n", "expected_status": "halted", "id": "exact-9-leaf-0-1"}
+{"cell": {"code": "((2) -1/2)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "1/2\n", "expected_status": "halted", "id": "exact-9-leaf-0-1-stale-answer"}
+{"cell": {"code": "(1 -(0)/2)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "1\n", "expected_status": "halted", "id": "exact-9-leaf-1--1"}
+{"cell": {"code": "(1 -(0)/2)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "1/2\n", "expected_status": "halted", "id": "exact-9-leaf-1--1-stale-answer"}
+{"cell": {"code": "(1 -(2)/2)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "0\n", "expected_status": "halted", "id": "exact-9-leaf-1-1"}
+{"cell": {"code": "(1 -(2)/2)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "1/2\n", "expected_status": "halted", "id": "exact-9-leaf-1-1-stale-answer"}
+{"cell": {"code": "(1 -1/(1))", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "0\n", "expected_status": "halted", "id": "exact-9-leaf-2--1"}
+{"cell": {"code": "(1 -1/(1))", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "1/2\n", "expected_status": "halted", "id": "exact-9-leaf-2--1-stale-answer"}
+{"cell": {"code": "(1 -1/(3))", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "2/3\n", "expected_status": "halted", "id": "exact-9-leaf-2-1"}
+{"cell": {"code": "(1 -1/(3))", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "1/2\n", "expected_status": "halted", "id": "exact-9-leaf-2-1-stale-answer"}
+{"cell": {"code": "-1/4", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-1/4\n", "expected_status": "halted", "id": "exact-10"}
+{"cell": {"code": "-1/(3)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-1/3\n", "expected_status": "halted", "id": "exact-10-leaf-0--1"}
+{"cell": {"code": "-1/(3)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "-1/4\n", "expected_status": "halted", "id": "exact-10-leaf-0--1-stale-answer"}
+{"cell": {"code": "-1/(5)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-1/5\n", "expected_status": "halted", "id": "exact-10-leaf-0-1"}
+{"cell": {"code": "-1/(5)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "-1/4\n", "expected_status": "halted", "id": "exact-10-leaf-0-1-stale-answer"}
+{"cell": {"code": "-(0)/4", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "0\n", "expected_status": "halted", "id": "exact-10-leaf-1--1"}
+{"cell": {"code": "-(0)/4", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "-1/4\n", "expected_status": "halted", "id": "exact-10-leaf-1--1-stale-answer"}
+{"cell": {"code": "-(2)/4", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-1/2\n", "expected_status": "halted", "id": "exact-10-leaf-1-1"}
+{"cell": {"code": "-(2)/4", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "-1/4\n", "expected_status": "halted", "id": "exact-10-leaf-1-1-stale-answer"}
+{"cell": {"code": "-1/6", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-1/6\n", "expected_status": "halted", "id": "exact-11"}
+{"cell": {"code": "-1/(5)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-1/5\n", "expected_status": "halted", "id": "exact-11-leaf-0--1"}
+{"cell": {"code": "-1/(5)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "-1/6\n", "expected_status": "halted", "id": "exact-11-leaf-0--1-stale-answer"}
+{"cell": {"code": "-1/(7)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-1/7\n", "expected_status": "halted", "id": "exact-11-leaf-0-1"}
+{"cell": {"code": "-1/(7)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "-1/6\n", "expected_status": "halted", "id": "exact-11-leaf-0-1-stale-answer"}
+{"cell": {"code": "-(0)/6", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "0\n", "expected_status": "halted", "id": "exact-11-leaf-1--1"}
+{"cell": {"code": "-(0)/6", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "-1/6\n", "expected_status": "halted", "id": "exact-11-leaf-1--1-stale-answer"}
+{"cell": {"code": "-(2)/6", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-1/3\n", "expected_status": "halted", "id": "exact-11-leaf-1-1"}
+{"cell": {"code": "-(2)/6", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "-1/6\n", "expected_status": "halted", "id": "exact-11-leaf-1-1-stale-answer"}
+{"cell": {"code": "-1/8", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-1/8\n", "expected_status": "halted", "id": "exact-12"}
+{"cell": {"code": "-1/(7)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-1/7\n", "expected_status": "halted", "id": "exact-12-leaf-0--1"}
+{"cell": {"code": "-1/(7)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "-1/8\n", "expected_status": "halted", "id": "exact-12-leaf-0--1-stale-answer"}
+{"cell": {"code": "-1/(9)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-1/9\n", "expected_status": "halted", "id": "exact-12-leaf-0-1"}
+{"cell": {"code": "-1/(9)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "-1/8\n", "expected_status": "halted", "id": "exact-12-leaf-0-1-stale-answer"}
+{"cell": {"code": "-(0)/8", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "0\n", "expected_status": "halted", "id": "exact-12-leaf-1--1"}
+{"cell": {"code": "-(0)/8", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "-1/8\n", "expected_status": "halted", "id": "exact-12-leaf-1--1-stale-answer"}
+{"cell": {"code": "-(2)/8", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-1/4\n", "expected_status": "halted", "id": "exact-12-leaf-1-1"}
+{"cell": {"code": "-(2)/8", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "-1/8\n", "expected_status": "halted", "id": "exact-12-leaf-1-1-stale-answer"}
+{"cell": {"code": "37*19.95", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "738.15\n", "expected_status": "halted", "id": "exact-13"}
+{"cell": {"code": "(36)*19.95", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "718.2\n", "expected_status": "halted", "id": "exact-13-leaf-0--1"}
+{"cell": {"code": "(36)*19.95", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "738.15\n", "expected_status": "halted", "id": "exact-13-leaf-0--1-stale-answer"}
+{"cell": {"code": "(38)*19.95", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "758.1\n", "expected_status": "halted", "id": "exact-13-leaf-0-1"}
+{"cell": {"code": "(38)*19.95", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "738.15\n", "expected_status": "halted", "id": "exact-13-leaf-0-1-stale-answer"}
+{"cell": {"code": "37*(379/20)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "14023/20\n", "expected_status": "halted", "id": "exact-13-leaf-1--1"}
+{"cell": {"code": "37*(379/20)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "738.15\n", "expected_status": "halted", "id": "exact-13-leaf-1--1-stale-answer"}
+{"cell": {"code": "37*(419/20)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "15503/20\n", "expected_status": "halted", "id": "exact-13-leaf-1-1"}
+{"cell": {"code": "37*(419/20)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "738.15\n", "expected_status": "halted", "id": "exact-13-leaf-1-1-stale-answer"}
+{"cell": {"code": "18*8.40", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "151.2\n", "expected_status": "halted", "id": "exact-14"}
+{"cell": {"code": "(17)*8.40", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "142.8\n", "expected_status": "halted", "id": "exact-14-leaf-0--1"}
+{"cell": {"code": "(17)*8.40", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "151.2\n", "expected_status": "halted", "id": "exact-14-leaf-0--1-stale-answer"}
+{"cell": {"code": "(19)*8.40", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "159.6\n", "expected_status": "halted", "id": "exact-14-leaf-0-1"}
+{"cell": {"code": "(19)*8.40", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "151.2\n", "expected_status": "halted", "id": "exact-14-leaf-0-1-stale-answer"}
+{"cell": {"code": "18*(37/5)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "666/5\n", "expected_status": "halted", "id": "exact-14-leaf-1--1"}
+{"cell": {"code": "18*(37/5)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "151.2\n", "expected_status": "halted", "id": "exact-14-leaf-1--1-stale-answer"}
+{"cell": {"code": "18*(47/5)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "846/5\n", "expected_status": "halted", "id": "exact-14-leaf-1-1"}
+{"cell": {"code": "18*(47/5)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "151.2\n", "expected_status": "halted", "id": "exact-14-leaf-1-1-stale-answer"}
+{"cell": {"code": "0/3", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "0\n", "expected_status": "halted", "id": "exact-15"}
+{"cell": {"code": "(-1)/3", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-1/3\n", "expected_status": "halted", "id": "exact-15-leaf-0--1"}
+{"cell": {"code": "(-1)/3", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "0\n", "expected_status": "halted", "id": "exact-15-leaf-0--1-stale-answer"}
+{"cell": {"code": "(1)/3", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "1/3\n", "expected_status": "halted", "id": "exact-15-leaf-0-1"}
+{"cell": {"code": "(1)/3", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "0\n", "expected_status": "halted", "id": "exact-15-leaf-0-1-stale-answer"}
+{"cell": {"code": "0/(2)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "0\n", "expected_status": "halted", "id": "exact-15-leaf-1--1"}
+{"cell": {"code": "0/(4)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "0\n", "expected_status": "halted", "id": "exact-15-leaf-1-1"}
+{"cell": {"code": "-0.00*2.0", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "0\n", "expected_status": "halted", "id": "exact-16"}
+{"cell": {"code": "-0.00*(1)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "0\n", "expected_status": "halted", "id": "exact-16-leaf-0--1"}
+{"cell": {"code": "-0.00*(3)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "0\n", "expected_status": "halted", "id": "exact-16-leaf-0-1"}
+{"cell": {"code": "-(-1)*2.0", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "2\n", "expected_status": "halted", "id": "exact-16-leaf-1--1"}
+{"cell": {"code": "-(-1)*2.0", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "0\n", "expected_status": "halted", "id": "exact-16-leaf-1--1-stale-answer"}
+{"cell": {"code": "-(1)*2.0", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-2\n", "expected_status": "halted", "id": "exact-16-leaf-1-1"}
+{"cell": {"code": "-(1)*2.0", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "0\n", "expected_status": "halted", "id": "exact-16-leaf-1-1-stale-answer"}
+{"cell": {"code": "-2^2/3", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-4/3\n", "expected_status": "halted", "id": "exact-17"}
+{"cell": {"code": "-2**2/(2)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-2\n", "expected_status": "halted", "id": "exact-17-leaf-0--1"}
+{"cell": {"code": "-2**2/(2)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "-4/3\n", "expected_status": "halted", "id": "exact-17-leaf-0--1-stale-answer"}
+{"cell": {"code": "-2**2/(4)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-1\n", "expected_status": "halted", "id": "exact-17-leaf-0-1"}
+{"cell": {"code": "-2**2/(4)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "-4/3\n", "expected_status": "halted", "id": "exact-17-leaf-0-1-stale-answer"}
+{"cell": {"code": "-(1)**2/3", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-1/3\n", "expected_status": "halted", "id": "exact-17-leaf-1--1"}
+{"cell": {"code": "-(1)**2/3", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "-4/3\n", "expected_status": "halted", "id": "exact-17-leaf-1--1-stale-answer"}
+{"cell": {"code": "-(3)**2/3", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-3\n", "expected_status": "halted", "id": "exact-17-leaf-1-1"}
+{"cell": {"code": "-(3)**2/3", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "-4/3\n", "expected_status": "halted", "id": "exact-17-leaf-1-1-stale-answer"}
+{"cell": {"code": "-2**1/3", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-2/3\n", "expected_status": "halted", "id": "exact-17-leaf-2--1"}
+{"cell": {"code": "-2**1/3", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "-4/3\n", "expected_status": "halted", "id": "exact-17-leaf-2--1-stale-answer"}
+{"cell": {"code": "-2**3/3", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-8/3\n", "expected_status": "halted", "id": "exact-17-leaf-2-1"}
+{"cell": {"code": "-2**3/3", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "-4/3\n", "expected_status": "halted", "id": "exact-17-leaf-2-1-stale-answer"}
+{"cell": {"code": "(-2)^2/3", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "4/3\n", "expected_status": "halted", "id": "exact-18"}
+{"cell": {"code": "(-2)**2/(2)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "2\n", "expected_status": "halted", "id": "exact-18-leaf-0--1"}
+{"cell": {"code": "(-2)**2/(2)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "4/3\n", "expected_status": "halted", "id": "exact-18-leaf-0--1-stale-answer"}
+{"cell": {"code": "(-2)**2/(4)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "1\n", "expected_status": "halted", "id": "exact-18-leaf-0-1"}
+{"cell": {"code": "(-2)**2/(4)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "4/3\n", "expected_status": "halted", "id": "exact-18-leaf-0-1-stale-answer"}
+{"cell": {"code": "(-2)**1/3", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-2/3\n", "expected_status": "halted", "id": "exact-18-leaf-1--1"}
+{"cell": {"code": "(-2)**1/3", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "4/3\n", "expected_status": "halted", "id": "exact-18-leaf-1--1-stale-answer"}
+{"cell": {"code": "(-2)**3/3", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-8/3\n", "expected_status": "halted", "id": "exact-18-leaf-1-1"}
+{"cell": {"code": "(-2)**3/3", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "4/3\n", "expected_status": "halted", "id": "exact-18-leaf-1-1-stale-answer"}
+{"cell": {"code": "(-(1))**2/3", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "1/3\n", "expected_status": "halted", "id": "exact-18-leaf-2--1"}
+{"cell": {"code": "(-(1))**2/3", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "4/3\n", "expected_status": "halted", "id": "exact-18-leaf-2--1-stale-answer"}
+{"cell": {"code": "(-(3))**2/3", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "3\n", "expected_status": "halted", "id": "exact-18-leaf-2-1"}
+{"cell": {"code": "(-(3))**2/3", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "4/3\n", "expected_status": "halted", "id": "exact-18-leaf-2-1-stale-answer"}
+{"cell": {"code": "1/-3", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-1/3\n", "expected_status": "halted", "id": "exact-19"}
+{"cell": {"code": "(0)/-3", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "0\n", "expected_status": "halted", "id": "exact-19-leaf-0--1"}
+{"cell": {"code": "(0)/-3", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "-1/3\n", "expected_status": "halted", "id": "exact-19-leaf-0--1-stale-answer"}
+{"cell": {"code": "(2)/-3", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-2/3\n", "expected_status": "halted", "id": "exact-19-leaf-0-1"}
+{"cell": {"code": "(2)/-3", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "-1/3\n", "expected_status": "halted", "id": "exact-19-leaf-0-1-stale-answer"}
+{"cell": {"code": "1/-(2)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-1/2\n", "expected_status": "halted", "id": "exact-19-leaf-1--1"}
+{"cell": {"code": "1/-(2)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "-1/3\n", "expected_status": "halted", "id": "exact-19-leaf-1--1-stale-answer"}
+{"cell": {"code": "1/-(4)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-1/4\n", "expected_status": "halted", "id": "exact-19-leaf-1-1"}
+{"cell": {"code": "1/-(4)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "-1/3\n", "expected_status": "halted", "id": "exact-19-leaf-1-1-stale-answer"}
+{"cell": {"code": "-1/-3", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "1/3\n", "expected_status": "halted", "id": "exact-20"}
+{"cell": {"code": "-(0)/-3", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "0\n", "expected_status": "halted", "id": "exact-20-leaf-0--1"}
+{"cell": {"code": "-(0)/-3", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "1/3\n", "expected_status": "halted", "id": "exact-20-leaf-0--1-stale-answer"}
+{"cell": {"code": "-(2)/-3", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "2/3\n", "expected_status": "halted", "id": "exact-20-leaf-0-1"}
+{"cell": {"code": "-(2)/-3", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "1/3\n", "expected_status": "halted", "id": "exact-20-leaf-0-1-stale-answer"}
+{"cell": {"code": "-1/-(2)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "1/2\n", "expected_status": "halted", "id": "exact-20-leaf-1--1"}
+{"cell": {"code": "-1/-(2)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "1/3\n", "expected_status": "halted", "id": "exact-20-leaf-1--1-stale-answer"}
+{"cell": {"code": "-1/-(4)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "1/4\n", "expected_status": "halted", "id": "exact-20-leaf-1-1"}
+{"cell": {"code": "-1/-(4)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "1/3\n", "expected_status": "halted", "id": "exact-20-leaf-1-1-stale-answer"}
+{"cell": {"code": "0.1+0.2", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "0.3\n", "expected_status": "halted", "id": "exact-21"}
+{"cell": {"code": "(-9/10)+0.2", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-0.7\n", "expected_status": "halted", "id": "exact-21-leaf-0--1"}
+{"cell": {"code": "(-9/10)+0.2", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "0.3\n", "expected_status": "halted", "id": "exact-21-leaf-0--1-stale-answer"}
+{"cell": {"code": "(11/10)+0.2", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "1.3\n", "expected_status": "halted", "id": "exact-21-leaf-0-1"}
+{"cell": {"code": "(11/10)+0.2", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "0.3\n", "expected_status": "halted", "id": "exact-21-leaf-0-1-stale-answer"}
+{"cell": {"code": "0.1+(-4/5)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-0.7\n", "expected_status": "halted", "id": "exact-21-leaf-1--1"}
+{"cell": {"code": "0.1+(-4/5)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "0.3\n", "expected_status": "halted", "id": "exact-21-leaf-1--1-stale-answer"}
+{"cell": {"code": "0.1+(6/5)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "1.3\n", "expected_status": "halted", "id": "exact-21-leaf-1-1"}
+{"cell": {"code": "0.1+(6/5)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "0.3\n", "expected_status": "halted", "id": "exact-21-leaf-1-1-stale-answer"}
+{"cell": {"code": "999.99+0.01", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "1000\n", "expected_status": "halted", "id": "exact-22"}
+{"cell": {"code": "(99899/100)+0.01", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "999\n", "expected_status": "halted", "id": "exact-22-leaf-0--1"}
+{"cell": {"code": "(99899/100)+0.01", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "1000\n", "expected_status": "halted", "id": "exact-22-leaf-0--1-stale-answer"}
+{"cell": {"code": "(100099/100)+0.01", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "1001\n", "expected_status": "halted", "id": "exact-22-leaf-0-1"}
+{"cell": {"code": "(100099/100)+0.01", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "1000\n", "expected_status": "halted", "id": "exact-22-leaf-0-1-stale-answer"}
+{"cell": {"code": "999.99+(-99/100)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "999\n", "expected_status": "halted", "id": "exact-22-leaf-1--1"}
+{"cell": {"code": "999.99+(-99/100)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "1000\n", "expected_status": "halted", "id": "exact-22-leaf-1--1-stale-answer"}
+{"cell": {"code": "999.99+(101/100)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "1001\n", "expected_status": "halted", "id": "exact-22-leaf-1-1"}
+{"cell": {"code": "999.99+(101/100)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "1000\n", "expected_status": "halted", "id": "exact-22-leaf-1-1-stale-answer"}
+{"cell": {"code": "1.0/4", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "0.25\n", "expected_status": "halted", "id": "exact-23"}
+{"cell": {"code": "(0)/4", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "0\n", "expected_status": "halted", "id": "exact-23-leaf-0--1"}
+{"cell": {"code": "(0)/4", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "0.25\n", "expected_status": "halted", "id": "exact-23-leaf-0--1-stale-answer"}
+{"cell": {"code": "(2)/4", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "1/2\n", "expected_status": "halted", "id": "exact-23-leaf-0-1"}
+{"cell": {"code": "(2)/4", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "0.25\n", "expected_status": "halted", "id": "exact-23-leaf-0-1-stale-answer"}
+{"cell": {"code": "1.0/(5)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "0.2\n", "expected_status": "halted", "id": "exact-23-leaf-1-1"}
+{"cell": {"code": "1.0/(5)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "0.25\n", "expected_status": "halted", "id": "exact-23-leaf-1-1-stale-answer"}
+{"cell": {"code": "0.000000000000000001*1", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "0.000000000000000001\n", "expected_status": "halted", "id": "exact-24"}
+{"cell": {"code": "(-999999999999999999/1000000000000000000)*1", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-999999999999999999/1000000000000000000\n", "expected_status": "halted", "id": "exact-24-leaf-0--1"}
+{"cell": {"code": "(-999999999999999999/1000000000000000000)*1", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "0.000000000000000001\n", "expected_status": "halted", "id": "exact-24-leaf-0--1-stale-answer"}
+{"cell": {"code": "(1000000000000000001/1000000000000000000)*1", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "1000000000000000001/1000000000000000000\n", "expected_status": "halted", "id": "exact-24-leaf-0-1"}
+{"cell": {"code": "(1000000000000000001/1000000000000000000)*1", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "0.000000000000000001\n", "expected_status": "halted", "id": "exact-24-leaf-0-1-stale-answer"}
+{"cell": {"code": "0.000000000000000001*(0)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "0\n", "expected_status": "halted", "id": "exact-24-leaf-1--1"}
+{"cell": {"code": "0.000000000000000001*(0)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "0.000000000000000001\n", "expected_status": "halted", "id": "exact-24-leaf-1--1-stale-answer"}
+{"cell": {"code": "0.000000000000000001*(2)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "0.000000000000000002\n", "expected_status": "halted", "id": "exact-24-leaf-1-1"}
+{"cell": {"code": "0.000000000000000001*(2)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "0.000000000000000001\n", "expected_status": "halted", "id": "exact-24-leaf-1-1-stale-answer"}
+{"cell": {"code": "1.5-2.75", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-1.25\n", "expected_status": "halted", "id": "exact-25"}
+{"cell": {"code": "(1/2)-2.75", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-2.25\n", "expected_status": "halted", "id": "exact-25-leaf-0--1"}
+{"cell": {"code": "(1/2)-2.75", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "-1.25\n", "expected_status": "halted", "id": "exact-25-leaf-0--1-stale-answer"}
+{"cell": {"code": "(5/2)-2.75", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-0.25\n", "expected_status": "halted", "id": "exact-25-leaf-0-1"}
+{"cell": {"code": "(5/2)-2.75", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "-1.25\n", "expected_status": "halted", "id": "exact-25-leaf-0-1-stale-answer"}
+{"cell": {"code": "1.5-(7/4)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-0.25\n", "expected_status": "halted", "id": "exact-25-leaf-1--1"}
+{"cell": {"code": "1.5-(7/4)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "-1.25\n", "expected_status": "halted", "id": "exact-25-leaf-1--1-stale-answer"}
+{"cell": {"code": "1.5-(15/4)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-2.25\n", "expected_status": "halted", "id": "exact-25-leaf-1-1"}
+{"cell": {"code": "1.5-(15/4)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "-1.25\n", "expected_status": "halted", "id": "exact-25-leaf-1-1-stale-answer"}
+{"cell": {"code": "(1/2)+(1/3)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "5/6\n", "expected_status": "halted", "id": "exact-26"}
+{"cell": {"code": "((0)/2)+(1/3)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "1/3\n", "expected_status": "halted", "id": "exact-26-leaf-0--1"}
+{"cell": {"code": "((0)/2)+(1/3)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "5/6\n", "expected_status": "halted", "id": "exact-26-leaf-0--1-stale-answer"}
+{"cell": {"code": "((2)/2)+(1/3)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "4/3\n", "expected_status": "halted", "id": "exact-26-leaf-0-1"}
+{"cell": {"code": "((2)/2)+(1/3)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "5/6\n", "expected_status": "halted", "id": "exact-26-leaf-0-1-stale-answer"}
+{"cell": {"code": "(1/(1))+(1/3)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "4/3\n", "expected_status": "halted", "id": "exact-26-leaf-1--1"}
+{"cell": {"code": "(1/(1))+(1/3)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "5/6\n", "expected_status": "halted", "id": "exact-26-leaf-1--1-stale-answer"}
+{"cell": {"code": "(1/(3))+(1/3)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "2/3\n", "expected_status": "halted", "id": "exact-26-leaf-1-1"}
+{"cell": {"code": "(1/(3))+(1/3)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "5/6\n", "expected_status": "halted", "id": "exact-26-leaf-1-1-stale-answer"}
+{"cell": {"code": "(1/2)+((0)/3)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "1/2\n", "expected_status": "halted", "id": "exact-26-leaf-2--1"}
+{"cell": {"code": "(1/2)+((0)/3)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "5/6\n", "expected_status": "halted", "id": "exact-26-leaf-2--1-stale-answer"}
+{"cell": {"code": "(1/2)+((2)/3)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "7/6\n", "expected_status": "halted", "id": "exact-26-leaf-2-1"}
+{"cell": {"code": "(1/2)+((2)/3)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "5/6\n", "expected_status": "halted", "id": "exact-26-leaf-2-1-stale-answer"}
+{"cell": {"code": "(1/2)+(1/(2))", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "1\n", "expected_status": "halted", "id": "exact-26-leaf-3--1"}
+{"cell": {"code": "(1/2)+(1/(2))", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "5/6\n", "expected_status": "halted", "id": "exact-26-leaf-3--1-stale-answer"}
+{"cell": {"code": "(1/2)+(1/(4))", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "3/4\n", "expected_status": "halted", "id": "exact-26-leaf-3-1"}
+{"cell": {"code": "(1/2)+(1/(4))", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "5/6\n", "expected_status": "halted", "id": "exact-26-leaf-3-1-stale-answer"}
+{"cell": {"code": "(1/2)/(3/4)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "2/3\n", "expected_status": "halted", "id": "exact-27"}
+{"cell": {"code": "((0)/2)/(3/4)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "0\n", "expected_status": "halted", "id": "exact-27-leaf-0--1"}
+{"cell": {"code": "((0)/2)/(3/4)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "2/3\n", "expected_status": "halted", "id": "exact-27-leaf-0--1-stale-answer"}
+{"cell": {"code": "((2)/2)/(3/4)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "4/3\n", "expected_status": "halted", "id": "exact-27-leaf-0-1"}
+{"cell": {"code": "((2)/2)/(3/4)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "2/3\n", "expected_status": "halted", "id": "exact-27-leaf-0-1-stale-answer"}
+{"cell": {"code": "(1/(1))/(3/4)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "4/3\n", "expected_status": "halted", "id": "exact-27-leaf-1--1"}
+{"cell": {"code": "(1/(1))/(3/4)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "2/3\n", "expected_status": "halted", "id": "exact-27-leaf-1--1-stale-answer"}
+{"cell": {"code": "(1/(3))/(3/4)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "4/9\n", "expected_status": "halted", "id": "exact-27-leaf-1-1"}
+{"cell": {"code": "(1/(3))/(3/4)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "2/3\n", "expected_status": "halted", "id": "exact-27-leaf-1-1-stale-answer"}
+{"cell": {"code": "(1/2)/((2)/4)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "1\n", "expected_status": "halted", "id": "exact-27-leaf-2--1"}
+{"cell": {"code": "(1/2)/((2)/4)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "2/3\n", "expected_status": "halted", "id": "exact-27-leaf-2--1-stale-answer"}
+{"cell": {"code": "(1/2)/((4)/4)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "1/2\n", "expected_status": "halted", "id": "exact-27-leaf-2-1"}
+{"cell": {"code": "(1/2)/((4)/4)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "2/3\n", "expected_status": "halted", "id": "exact-27-leaf-2-1-stale-answer"}
+{"cell": {"code": "(1/2)/(3/(3))", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "1/2\n", "expected_status": "halted", "id": "exact-27-leaf-3--1"}
+{"cell": {"code": "(1/2)/(3/(3))", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "2/3\n", "expected_status": "halted", "id": "exact-27-leaf-3--1-stale-answer"}
+{"cell": {"code": "(1/2)/(3/(5))", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "5/6\n", "expected_status": "halted", "id": "exact-27-leaf-3-1"}
+{"cell": {"code": "(1/2)/(3/(5))", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "2/3\n", "expected_status": "halted", "id": "exact-27-leaf-3-1-stale-answer"}
+{"cell": {"code": "(2/3)^3", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "8/27\n", "expected_status": "halted", "id": "exact-28"}
+{"cell": {"code": "(2/3)**2", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "4/9\n", "expected_status": "halted", "id": "exact-28-leaf-0--1"}
+{"cell": {"code": "(2/3)**2", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "8/27\n", "expected_status": "halted", "id": "exact-28-leaf-0--1-stale-answer"}
+{"cell": {"code": "(2/3)**4", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "16/81\n", "expected_status": "halted", "id": "exact-28-leaf-0-1"}
+{"cell": {"code": "(2/3)**4", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "8/27\n", "expected_status": "halted", "id": "exact-28-leaf-0-1-stale-answer"}
+{"cell": {"code": "((1)/3)**3", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "1/27\n", "expected_status": "halted", "id": "exact-28-leaf-1--1"}
+{"cell": {"code": "((1)/3)**3", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "8/27\n", "expected_status": "halted", "id": "exact-28-leaf-1--1-stale-answer"}
+{"cell": {"code": "((3)/3)**3", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "1\n", "expected_status": "halted", "id": "exact-28-leaf-1-1"}
+{"cell": {"code": "((3)/3)**3", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "8/27\n", "expected_status": "halted", "id": "exact-28-leaf-1-1-stale-answer"}
+{"cell": {"code": "(2/(2))**3", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "1\n", "expected_status": "halted", "id": "exact-28-leaf-2--1"}
+{"cell": {"code": "(2/(2))**3", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "8/27\n", "expected_status": "halted", "id": "exact-28-leaf-2--1-stale-answer"}
+{"cell": {"code": "(2/(4))**3", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "1/8\n", "expected_status": "halted", "id": "exact-28-leaf-2-1"}
+{"cell": {"code": "(2/(4))**3", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "8/27\n", "expected_status": "halted", "id": "exact-28-leaf-2-1-stale-answer"}
+{"cell": {"code": "(0.1/2)+(0.3/2)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "0.2\n", "expected_status": "halted", "id": "exact-29"}
+{"cell": {"code": "((-9/10)/2)+(0.3/2)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-0.3\n", "expected_status": "halted", "id": "exact-29-leaf-0--1"}
+{"cell": {"code": "((-9/10)/2)+(0.3/2)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "0.2\n", "expected_status": "halted", "id": "exact-29-leaf-0--1-stale-answer"}
+{"cell": {"code": "((11/10)/2)+(0.3/2)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "0.7\n", "expected_status": "halted", "id": "exact-29-leaf-0-1"}
+{"cell": {"code": "((11/10)/2)+(0.3/2)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "0.2\n", "expected_status": "halted", "id": "exact-29-leaf-0-1-stale-answer"}
+{"cell": {"code": "(0.1/(1))+(0.3/2)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "0.25\n", "expected_status": "halted", "id": "exact-29-leaf-1--1"}
+{"cell": {"code": "(0.1/(1))+(0.3/2)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "0.2\n", "expected_status": "halted", "id": "exact-29-leaf-1--1-stale-answer"}
+{"cell": {"code": "(0.1/2)+((-7/10)/2)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-0.3\n", "expected_status": "halted", "id": "exact-29-leaf-2--1"}
+{"cell": {"code": "(0.1/2)+((-7/10)/2)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "0.2\n", "expected_status": "halted", "id": "exact-29-leaf-2--1-stale-answer"}
+{"cell": {"code": "(0.1/2)+((13/10)/2)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "0.7\n", "expected_status": "halted", "id": "exact-29-leaf-2-1"}
+{"cell": {"code": "(0.1/2)+((13/10)/2)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "0.2\n", "expected_status": "halted", "id": "exact-29-leaf-2-1-stale-answer"}
+{"cell": {"code": "(0.1/2)+(0.3/(1))", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "0.35\n", "expected_status": "halted", "id": "exact-29-leaf-3--1"}
+{"cell": {"code": "(0.1/2)+(0.3/(1))", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "0.2\n", "expected_status": "halted", "id": "exact-29-leaf-3--1-stale-answer"}
+{"cell": {"code": "(0.1/2)+(0.3/(3))", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "0.15\n", "expected_status": "halted", "id": "exact-29-leaf-3-1"}
+{"cell": {"code": "(0.1/2)+(0.3/(3))", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "0.2\n", "expected_status": "halted", "id": "exact-29-leaf-3-1-stale-answer"}
+{"cell": {"code": "889.35*0.075", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "66.70125\n", "expected_status": "halted", "id": "exact-30"}
+{"cell": {"code": "(17767/20)*0.075", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "66.62625\n", "expected_status": "halted", "id": "exact-30-leaf-0--1"}
+{"cell": {"code": "(17767/20)*0.075", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "66.70125\n", "expected_status": "halted", "id": "exact-30-leaf-0--1-stale-answer"}
+{"cell": {"code": "(17807/20)*0.075", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "66.77625\n", "expected_status": "halted", "id": "exact-30-leaf-0-1"}
+{"cell": {"code": "(17807/20)*0.075", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "66.70125\n", "expected_status": "halted", "id": "exact-30-leaf-0-1-stale-answer"}
+{"cell": {"code": "889.35*(-37/40)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-822.64875\n", "expected_status": "halted", "id": "exact-30-leaf-1--1"}
+{"cell": {"code": "889.35*(-37/40)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "66.70125\n", "expected_status": "halted", "id": "exact-30-leaf-1--1-stale-answer"}
+{"cell": {"code": "889.35*(43/40)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "956.05125\n", "expected_status": "halted", "id": "exact-30-leaf-1-1"}
+{"cell": {"code": "889.35*(43/40)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "66.70125\n", "expected_status": "halted", "id": "exact-30-leaf-1-1-stale-answer"}
+{"cell": {"code": "889.35*0.925", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "822.64875\n", "expected_status": "halted", "id": "exact-31"}
+{"cell": {"code": "(17767/20)*0.925", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "821.72375\n", "expected_status": "halted", "id": "exact-31-leaf-0--1"}
+{"cell": {"code": "(17767/20)*0.925", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "822.64875\n", "expected_status": "halted", "id": "exact-31-leaf-0--1-stale-answer"}
+{"cell": {"code": "(17807/20)*0.925", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "823.57375\n", "expected_status": "halted", "id": "exact-31-leaf-0-1"}
+{"cell": {"code": "(17807/20)*0.925", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "822.64875\n", "expected_status": "halted", "id": "exact-31-leaf-0-1-stale-answer"}
+{"cell": {"code": "889.35*(-3/40)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "-66.70125\n", "expected_status": "halted", "id": "exact-31-leaf-1--1"}
+{"cell": {"code": "889.35*(-3/40)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "822.64875\n", "expected_status": "halted", "id": "exact-31-leaf-1--1-stale-answer"}
+{"cell": {"code": "889.35*(77/40)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "1711.99875\n", "expected_status": "halted", "id": "exact-31-leaf-1-1"}
+{"cell": {"code": "889.35*(77/40)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "822.64875\n", "expected_status": "halted", "id": "exact-31-leaf-1-1-stale-answer"}
+{"cell": {"code": "822.64875*1.06", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "872.007675\n", "expected_status": "halted", "id": "exact-32"}
+{"cell": {"code": "(657319/800)*1.06", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "870.947675\n", "expected_status": "halted", "id": "exact-32-leaf-0--1"}
+{"cell": {"code": "(657319/800)*1.06", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "872.007675\n", "expected_status": "halted", "id": "exact-32-leaf-0--1-stale-answer"}
+{"cell": {"code": "(658919/800)*1.06", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "873.067675\n", "expected_status": "halted", "id": "exact-32-leaf-0-1"}
+{"cell": {"code": "(658919/800)*1.06", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "872.007675\n", "expected_status": "halted", "id": "exact-32-leaf-0-1-stale-answer"}
+{"cell": {"code": "822.64875*(3/50)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "49.358925\n", "expected_status": "halted", "id": "exact-32-leaf-1--1"}
+{"cell": {"code": "822.64875*(3/50)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "872.007675\n", "expected_status": "halted", "id": "exact-32-leaf-1--1-stale-answer"}
+{"cell": {"code": "822.64875*(103/50)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "1694.656425\n", "expected_status": "halted", "id": "exact-32-leaf-1-1"}
+{"cell": {"code": "822.64875*(103/50)", "form": "inline_expr", "lang": "python", "prior": []}, "expect_mismatch": true, "expected_output": "872.007675\n", "expected_status": "halted", "id": "exact-32-leaf-1-1-stale-answer"}
+{"cell": {"code": "1/0", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "", "expected_status": "error:GraphArithmetic", "id": "exact-domain-0"}
+{"cell": {"code": "1/(1/0)", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "", "expected_status": "error:GraphArithmetic", "id": "exact-domain-1"}
+{"cell": {"code": "(1/0)^0", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "", "expected_status": "error:GraphArithmetic", "id": "exact-domain-2"}
+{"cell": {"code": "0.1/3", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "", "expected_status": "error:GraphArithmetic", "id": "exact-domain-3"}
+{"cell": {"code": "1.0/3", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "", "expected_status": "error:GraphArithmetic", "id": "exact-domain-4"}
+{"cell": {"code": "1e-5", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "", "expected_status": "unsupported", "id": "exact-width-syntax-0"}
+{"cell": {"code": ".5*2", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "", "expected_status": "unsupported", "id": "exact-width-syntax-1"}
+{"cell": {"code": "5.*2", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "", "expected_status": "unsupported", "id": "exact-width-syntax-2"}
+{"cell": {"code": "x/2", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "", "expected_status": "unsupported", "id": "exact-width-syntax-3"}
+{"cell": {"code": "2**2**2/3", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "", "expected_status": "unsupported", "id": "exact-width-syntax-4"}
+{"cell": {"code": "2**-2/3", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "", "expected_status": "unsupported", "id": "exact-width-syntax-5"}
+{"cell": {"code": "999999999999999999999999999999999999999999999999999999999999999/2", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "", "expected_status": "unsupported", "id": "exact-width-syntax-6"}
+{"cell": {"code": "0.0000000000000000001", "form": "inline_expr", "lang": "python", "prior": []}, "expected_output": "", "expected_status": "unsupported", "id": "exact-width-syntax-7"}

@@ -18,6 +18,7 @@ pub fn cell(a: Allocator, bank: *const Bank, request: anytype) Allocator.Error!?
     var source = std.mem.trim(u8, request.code, " \t");
     if (request.form == .repl and std.mem.startsWith(u8, source, ">>>")) source = std.mem.trim(u8, source[3..], " \t");
     if (try expression(a, bank, source, syntax)) |bound| return bound;
+    if (syntax == .math) return @import("runner_graph_exact.zig").expression(a, bank, source);
     return if (request.form == .repl) script(a, bank, source) else null;
 }
 
