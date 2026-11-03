@@ -73,8 +73,10 @@ pub const Scanner = struct {
     trace_at: u32 = 0, // the token its line ended at
     trace_cells: u32 = 0,
     trace_owned: u32 = 0,
+    above: [3]std.ArrayList(u8) = .{ .empty, .empty, .empty }, // with STATED: the last three lines, newest first
 
     pub fn deinit(s: *Scanner, a: Allocator) void {
+        for (&s.above) |*l| l.deinit(a);
         s.line.deinit(a);
         s.lang.deinit(a);
         s.code.deinit(a);
@@ -92,6 +94,7 @@ pub const Scanner = struct {
         // the think block's end has no bytes of its own, yet the answer starts on a new line
         if (s.think and !think_open and s.line.items.len > 0) {
             try s.endLine(a, &ev, true);
+            try s.keepLine(a);
             s.line.clearRetainingCapacity();
         }
         s.think = think_open;
@@ -110,6 +113,7 @@ pub const Scanner = struct {
             }
             s.lines +|= 1;
             try s.endLine(a, &ev, think_open);
+            try s.keepLine(a);
             s.line.clearRetainingCapacity();
         }
         ev.trigger = s.armed;
@@ -151,9 +155,33 @@ pub const Scanner = struct {
                     inline_scan.twoInts(x.expr);
                 ev.closed.?.own_context = joined or (floats and std.mem.indexOfAny(u8, x.expr, "./") != null);
                 ev.trigger = .{ .index = ev.closed.?.index, .inline_space = x.space };
+            } else if (if (s.cfg.trace_whole) inline_scan.stacked(s.line.items, s.above[2].items, s.above[1].items, s.above[0].items) else null) |c| {
+                // STATED: a stacked column (`264,278,…` / `+771,565,…` / `= ?`), the `=` alone on its line
+                s.lang.clearRetainingCapacity();
+                try s.lang.appendSlice(a, "python");
+                s.code.clearRetainingCapacity();
+                for (c.x) |d| if (d != ',') try s.code.append(a, d);
+                try s.code.append(a, c.op);
+                for (c.y) |d| if (d != ',') try s.code.append(a, d);
+                ev.closed = s.close(.inline_expr);
+                // a join cue just above the column: its two lines may be digit groups to join, as for `1119 + 392 =`
+                ev.closed.?.own_context = c.op == '+' and s.join_line != null and s.lines - s.join_line.? <= join_lines + 2;
+                ev.trigger = .{ .index = ev.closed.?.index, .inline_space = c.space };
             }
         }
         return ev;
+    }
+
+    /// STATED keeps the last three lines for a stacked column; a line too long for one is kept as a non-number.
+    fn keepLine(s: *Scanner, a: Allocator) Allocator.Error!void {
+        if (!s.cfg.trace_whole) return;
+        const oldest = s.above[2];
+        s.above[2] = s.above[1];
+        s.above[1] = s.above[0];
+        s.above[0] = oldest;
+        s.above[0].clearRetainingCapacity();
+        const l = std.mem.trimEnd(u8, s.line.items, "\r");
+        try s.above[0].appendSlice(a, if (l.len > 200) "-" else l);
     }
 
     pub fn finishEos(s: *Scanner, a: Allocator, think_open: bool) Allocator.Error!Events {

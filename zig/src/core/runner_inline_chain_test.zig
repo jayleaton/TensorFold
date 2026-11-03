@@ -6,6 +6,10 @@ const frontend = @import("runner_frontend.zig");
 const scan = @import("runner_scan.zig");
 const t = std.testing;
 
+test {
+    _ = @import("runner_inline_stacked_test.zig"); // STATED's stacked column, from here: runner.zig stays at 600 lines
+}
+
 const on: scan.Config = .{ .inline_math = true, .inline_chain = true };
 
 /// The line up to the model's `=`, the cell code, and CPython's value of it (`^` read as `**`).

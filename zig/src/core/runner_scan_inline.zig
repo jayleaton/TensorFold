@@ -238,6 +238,37 @@ pub fn inlineMod(line: []const u8) ?Mod {
     return .{ .left = left, .modulus = modulus, .space = space };
 }
 
+/// A stacked column at a lone `=`: `first` a literal, `second` an operator (`+ - * ×`) and a literal, as `x op y`.
+pub const Stacked = struct { x: []const u8, op: u8, y: []const u8, space: bool };
+
+/// `line` only `=` (or `= `) under `first` and `second`; `before`, the line above, may not be one of the column's own.
+pub fn stacked(line: []const u8, before: []const u8, first: []const u8, second: []const u8) ?Stacked {
+    const l = std.mem.trimStart(u8, line, " \t");
+    if (!std.mem.eql(u8, l, "=") and !std.mem.eql(u8, l, "= ")) return null;
+    // a longer column or a multiplication table: which lines the `=` sums is the model's layout, not one reading
+    if (columnLiteral(before) != null or columnOperand(before) != null) return null;
+    const x = columnLiteral(first) orelse return null;
+    const o = columnOperand(second) orelse return null;
+    return .{ .x = x, .op = o.op, .y = o.y, .space = l.len == 1 };
+}
+
+/// A line that is one plain non-negative integer: digits or thousands groups, no leading zero, at most 120 bytes.
+fn columnLiteral(line: []const u8) ?[]const u8 {
+    const t = std.mem.trim(u8, line, " \t\r");
+    if (t.len == 0 or t.len > 120 or (t[0] == '0' and t.len > 1) or !std.ascii.isDigit(t[0])) return null;
+    for (t) |c| if (!std.ascii.isDigit(c) and c != ',') return null;
+    if (std.mem.indexOfScalar(u8, t, ',')) |first| if (first > 3 or !grouped(t)) return null;
+    return t;
+}
+
+/// A line that is an operator, then a column literal (`+771,565,…`, `× 48`).
+fn columnOperand(line: []const u8) ?struct { op: u8, y: []const u8 } {
+    const t = std.mem.trimStart(u8, line, " \t");
+    if (std.mem.startsWith(u8, t, "×")) return .{ .op = '*', .y = columnLiteral(t[2..]) orelse return null };
+    if (t.len < 2 or std.mem.indexOfScalar(u8, "+-*", t[0]) == null) return null;
+    return .{ .op = t[0], .y = columnLiteral(t[1..]) orelse return null };
+}
+
 /// Thousands groups only: each `,` has a digit before it and exactly three digits after it.
 fn grouped(text: []const u8) bool {
     for (text, 0..) |c, i| if (c == ',') {
