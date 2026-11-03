@@ -117,7 +117,7 @@ test "runner proof: trace divmod: each R4 divmod cell runs on the bank and owns 
         defer gpa.free(out);
         if (!std.mem.eql(u8, want, out)) std.debug.print("{s}: '{s}', CPython '{s}'\n", .{ code, out, want });
         try std.testing.expectEqualStrings(want, out);
-        const line = (try trace.owned(gpa, "[exact: {}]", code, true, out)) orelse return error.TestExpectedOwned;
+        const line = (try trace.owned(gpa, "[exact: {}]", code, true, out, false)) orelse return error.TestExpectedOwned;
         defer gpa.free(line);
         const golden = try ownedLine(code, want);
         defer gpa.free(golden);

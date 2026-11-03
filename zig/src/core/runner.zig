@@ -105,12 +105,8 @@ pub const Config = struct {
 /// The engine's tokenizer as the runner needs it: one token's bytes, and text to token ids.
 pub const Text = output.Text;
 
-/// A request's say over form trace (chat fields "runner_trace", "runner_trace_format"); defaults change nothing.
-pub const TraceAsk = struct {
-    off: bool = false, // no trace cells in this reply, though the server's forms have trace
-    format: []const u8 = "", // the owned line, `{}` for `<expr> = <value>` (validFormat); "": trace.default_format
-    repeat: u8 = 0, // a restated, already owned line is owned again up to this many times (0..max_repeat)
-};
+/// A request's say over form trace (runner_trace.zig); defaults change nothing.
+pub const TraceAsk = trace.Ask;
 
 /// The server-wide runner: a frontend, a backend and the server's tokenizer (set at its start); sessions are per reply.
 pub const Runner = struct {
@@ -132,7 +128,7 @@ pub const Runner = struct {
         var cfg = r.cfg.scan;
         if (ask.off) cfg.trace = false;
         cfg.trace_repeat = ask.repeat;
-        s.* = .{ .r = r, .id = r.next_id, .scan = .{ .cfg = cfg }, .format = format, .rec = .{ .on = r.cfg.cells } };
+        s.* = .{ .r = r, .id = r.next_id, .scan = .{ .cfg = cfg }, .format = format, .check = ask.check, .rec = .{ .on = r.cfg.cells } };
         r.next_id += 1;
         return s;
     }
@@ -177,6 +173,7 @@ pub const Session = struct {
     broken: bool = false, // out of memory once: no more cells, no more holds
     sync_ids: []u32 = &.{}, // cfg.sync_graph: the result a trigger settled with, forced by the stream (hook.settled)
     format: []u8, // TraceAsk.format, owned
+    check: bool = false, // TraceAsk.check
     rec: records.Log = .{}, // the receipt's per-cell records
 
     pub fn hook(s: *Session) lanes.stream.RunnerHook {
@@ -400,7 +397,7 @@ pub const Session = struct {
     fn ownTrace(s: *Session, c: *Cell, index: u32, held_ms: u64) Allocator.Error![]u32 {
         const gpa = s.r.gpa;
         const tx = s.r.text.?;
-        const line = if (!c.abstained and c.result.?.status == .ok) try trace.owned(gpa, s.format, c.stated.?.display, c.stated.?.divmod, c.result.?.out) else null;
+        const line = if (!c.abstained and c.result.?.status == .ok) try trace.owned(gpa, s.format, c.stated.?.display, c.stated.?.divmod, c.result.?.out, s.check) else null;
         if (line) |text| {
             defer gpa.free(text);
             const ids = try tx.encode(tx.ctx, gpa, text);
@@ -596,5 +593,6 @@ test {
     _ = @import("runner_trace_stated_test.zig");
     _ = @import("runner_trace_divmod_test.zig");
     _ = @import("runner_trace_named_test.zig");
+    _ = @import("runner_trace_check_test.zig");
     _ = @import("runner_graph_edit.zig");
 }

@@ -87,7 +87,7 @@ test "runner proof: retained TRACE divmod and modulo requests on graph-v7 Dispat
         defer run.release(1);
         try std.testing.expectEqual(rapi.Status.ok, result.status);
         try std.testing.expectEqualStrings(c.want, result.out);
-        const owned = (try @import("runner_trace.zig").owned(gpa, "[exact: {}]", c.display, c.tuple, result.out)) orelse return error.TestExpectedOwned;
+        const owned = (try @import("runner_trace.zig").owned(gpa, "[exact: {}]", c.display, c.tuple, result.out, false)) orelse return error.TestExpectedOwned;
         defer gpa.free(owned);
         std.debug.print("TRACE Dispatch exact {s}: {s}", .{ c.code, result.out });
     }

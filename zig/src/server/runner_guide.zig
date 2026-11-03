@@ -77,7 +77,7 @@ pub fn with(a: std.mem.Allocator, messages: Value, guide: []const u8) std.mem.Al
     return .{ .array = out };
 }
 
-/// A chat's "runner_trace" (false: none), "runner_trace_format" (the line), "runner_trace_repeat"; null: as booted.
+/// A chat's "runner_trace" (false: none) and "runner_trace_format", "_check", "_repeat"; null: as booted.
 pub fn traceAsk(fields: Value) error{BadTrace}!TraceAsk {
     var ask: TraceAsk = .{};
     if (fields.get("runner_trace")) |v| switch (v) {
@@ -88,6 +88,11 @@ pub fn traceAsk(fields: Value) error{BadTrace}!TraceAsk {
     if (fields.get("runner_trace_format")) |v| switch (v) {
         .null => {},
         .string => |t| ask.format = if (validTraceFormat(t)) t else return error.BadTrace,
+        else => return error.BadTrace,
+    };
+    if (fields.get("runner_trace_check")) |v| switch (v) {
+        .null => {},
+        .bool => |on| ask.check = on,
         else => return error.BadTrace,
     };
     if (fields.get("runner_trace_repeat")) |v| switch (v) {
@@ -121,6 +126,11 @@ test "runner guide: a chat's runner_trace and runner_trace_format, and their ref
     try f.put(a, "runner_trace", .{ .string = "off" });
     try std.testing.expectError(error.BadTrace, traceAsk(.{ .object = f }));
     try f.put(a, "runner_trace", .null);
+    try f.put(a, "runner_trace_check", .{ .bool = true });
+    try std.testing.expect((try traceAsk(.{ .object = f })).check);
+    try f.put(a, "runner_trace_check", .{ .string = "true" });
+    try std.testing.expectError(error.BadTrace, traceAsk(.{ .object = f }));
+    try f.put(a, "runner_trace_check", .null);
     try f.put(a, "runner_trace_repeat", .{ .int = "1" });
     try std.testing.expectEqual(@as(u8, 1), (try traceAsk(.{ .object = f })).repeat);
     for ([_]Value{ .{ .int = "4" }, .{ .int = "-1" }, .{ .int = "300" }, .{ .string = "1" }, .{ .bool = true } }) |bad| {

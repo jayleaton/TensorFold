@@ -219,7 +219,7 @@ test "runner proof: trace stated: edit distance runs on the bank as a DP packet 
         std.debug.print("EDWALL\t{d}x{d}\ttranslate_ms={d:.1}\trun_ms={d:.1}\tbytes={d}\tout={s}", .{ c[0].len, c[1].len, @as(f64, @floatFromInt(t1 - t0)) / 1e6, @as(f64, @floatFromInt(t2 - t1)) / 1e6, tr.program.bytes.len, out });
         const display = try std.fmt.allocPrint(gpa, "edit_distance(\"{s}\", \"{s}\")", .{ c[0], c[1] });
         defer gpa.free(display);
-        const line = (try trace.owned(gpa, "[exact: {}]", display, false, out)) orelse return error.TestExpectedOwned;
+        const line = (try trace.owned(gpa, "[exact: {}]", display, false, out, false)) orelse return error.TestExpectedOwned;
         defer gpa.free(line);
         const golden = try std.fmt.allocPrint(gpa, "[exact: {s} = {s}]\n", .{ display, std.mem.trimEnd(u8, want, "\n") });
         defer gpa.free(golden);
