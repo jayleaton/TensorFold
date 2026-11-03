@@ -146,7 +146,6 @@ const Parser = struct {
         p.space();
         const start = p.at;
         while (p.at < p.source.len and std.ascii.isDigit(p.source[p.at])) p.at += 1;
-        if (p.at == start) return error.Unsupported;
         const whole_end = p.at;
         var decimal = false;
         var scale: usize = 0;
@@ -156,8 +155,9 @@ const Parser = struct {
             const fraction_start = p.at;
             while (p.at < p.source.len and std.ascii.isDigit(p.source[p.at])) p.at += 1;
             scale = p.at - fraction_start;
-            if (scale == 0 or scale > 18) return error.Unsupported;
+            if (scale > 18) return error.Unsupported;
         }
+        if (whole_end == start and scale == 0) return error.Unsupported;
         if (whole_end - start + scale > 62) return error.Unsupported;
         const text = try p.a.alloc(u8, whole_end - start + scale);
         @memcpy(text[0 .. whole_end - start], p.source[start..whole_end]);

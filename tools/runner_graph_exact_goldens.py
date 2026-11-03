@@ -20,6 +20,8 @@ BOUNDARIES = [
     "0.1+0.2", "999.99+0.01", "1.0/4", "0.000000000000000001*1",
     "1.5-2.75", "(1/2)+(1/3)", "(1/2)/(3/4)", "(2/3)^3",
     "(0.1/2)+(0.3/2)", "889.35*0.075", "889.35*0.925", "822.64875*1.06",
+    "80. /2", "134709035556. /1000", ".5*2", "5.*2", ".75/.25",
+    "-0.*2.0", "1.+2.", "5./4", "-.125*8", "(.5+.25)*4",
 ]
 
 
@@ -95,7 +97,7 @@ def generate():
     for index, code in enumerate(("1/0", "1/(1/0)", "(1/0)^0", "0.1/3", "1.0/3")):
         rows.append({"id": f"exact-domain-{index}", "cell": {"form": "inline_expr", "lang": "python", "code": code, "prior": []},
                      "expected_output": "", "expected_status": "error:GraphArithmetic"})
-    for index, code in enumerate(("1e-5", ".5*2", "5.*2", "x/2", "2**2**2/3", "2**-2/3", "9"*63 + "/2", "0."+"0"*18+"1")):
+    for index, code in enumerate(("1e-5", ".*2", "5..*2", "x/2", "2**2**2/3", "2**-2/3", "9"*63 + "/2", "0."+"0"*18+"1")):
         rows.append({"id": f"exact-width-syntax-{index}", "cell": {"form": "inline_expr", "lang": "python", "code": code, "prior": []},
                      "expected_output": "", "expected_status": "unsupported"})
     return rows
