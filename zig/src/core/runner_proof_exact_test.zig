@@ -12,8 +12,6 @@ const finish = pt.finish;
 
 const gpa = std.testing.allocator;
 
-++ b/zig/src/core/runner_proof_test.zig
-
 test "runner proof: retained TRACE divmod and modulo requests on graph-v7 Dispatch" {
     var both: Both = undefined;
     try both.open();
