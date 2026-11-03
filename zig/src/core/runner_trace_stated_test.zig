@@ -32,6 +32,11 @@ const product_b = [_][]const u8{ "Let A = 98,765,432,109", "B = 12,345,678,901",
 const gcd_a = "We need gcd(123456789012345, 987654321012345).";
 const gcd_b = "Let's compute carefully. Need gcd(1122334455667788, 9988776655443322).";
 const hex_b = "Hex = 0x123456789ABCDEF012345.";
+// S2 R5 (s2-trace-ab5): the replies name the gcd in prose, the literals written after names
+const gcd_of_a = "We need gcd of A=123456789012345, B=987654321012345.";
+const gcd_of_b = "We need gcd of A=1122334455667788 and B=9988776655443322.";
+const gcd_of_c = "Need final with explanation and final JSON. Need ensure number. Let's compute gcd of A=1122334455667788, B=9988776655443322.";
+const gcd_of_d = "Need the greatest common divisor of 1,122,334,455,667,788 and 9,988,776,655,443,322 exactly.";
 
 /// The live rank-1a lines with the knob: display, then the source the cell runs (hex as written: the circuit converts).
 const live = [_]struct { lines: []const []const u8, want: [2][]const u8 }{
@@ -40,6 +45,10 @@ const live = [_]struct { lines: []const []const u8, want: [2][]const u8 }{
     .{ .lines = &.{gcd_a}, .want = .{ "gcd(123456789012345, 987654321012345)", "from math import gcd\nprint(gcd(123456789012345, 987654321012345))" } },
     .{ .lines = &.{gcd_b}, .want = .{ "gcd(1122334455667788, 9988776655443322)", "from math import gcd\nprint(gcd(1122334455667788, 9988776655443322))" } },
     .{ .lines = &.{hex_b}, .want = .{ "0x123456789ABCDEF012345", "0x123456789ABCDEF012345" } },
+    .{ .lines = &.{gcd_of_a}, .want = .{ "gcd(123456789012345, 987654321012345)", "from math import gcd\nprint(gcd(123456789012345, 987654321012345))" } },
+    .{ .lines = &.{gcd_of_b}, .want = .{ "gcd(1122334455667788, 9988776655443322)", "from math import gcd\nprint(gcd(1122334455667788, 9988776655443322))" } },
+    .{ .lines = &.{gcd_of_c}, .want = .{ "gcd(1122334455667788, 9988776655443322)", "from math import gcd\nprint(gcd(1122334455667788, 9988776655443322))" } },
+    .{ .lines = &.{gcd_of_d}, .want = .{ "gcd(1122334455667788, 9988776655443322)", "from math import gcd\nprint(gcd(1122334455667788, 9988776655443322))" } },
 };
 
 test "runner trace stated: the R4 rank-1a lines are stated with TF_DSV41_RUNNER_STATED and not without it" {
@@ -72,6 +81,24 @@ test "runner trace stated: a restatement that is not literally its names, a list
         "Hex = 0x123456789.",                        "Hex = 0x123456789ABCDEF012345?",
         "Hex = 0x123456789ABCDEF012345 + 1 is big.", "Hex = 0x123456789ABCDEF012345G.",
         "Low part 0x123456789ABCDEF012345.",         "Hex =0x123456789ABCDEF012345x.",
+    }) |line| try expect(true, &.{line}, null);
+}
+
+test "runner trace stated: gcd in prose takes two literals only: names, expressions, a third number or a claim refuse" {
+    for ([_][]const u8{
+        "Need gcd of A and B.",                                 "Need gcd of A=123456789012 and B.",
+        "Need gcd of 123456789012 and A.",                      "Need gcd of two large numbers.",
+        "Need gcd of 12, 18 and 30.",                           "Need gcd of 12, 18, 30.",
+        "Need gcd of 12 and 18 and 30.",                        "Need gcd of 12,345, 18.",
+        "Need gcd of 123456789012 and 18, then lcm.",           "Need gcd of 123456789012 and 18 is 6.",
+        "Need gcd of 2^64 and 10^9+7.",                         "Need gcd of 2^64 and 123456789012.",
+        "Need gcd of 123456789012 and 2*3.",                    "Need gcd of 0x1F and 123456789012.",
+        "Need gcd of 123456789012 and 1.5.",                    "Need gcd of -12 and 123456789012.",
+        "Need gcd of 012 and 123456789012.",                    "Need gcd of 123456789012x and 18.",
+        "Need lcm of 123456789012 and 18.",                     "Need gcd of 123456789012 and 654321?",
+        "Need gcd of about 123456789012 and 18.",               "Need gcd of 123456789012 and 18 maybe.",
+        "Need gcd of coefficients 13,717,421 and 109,739,369.", "Need gcd of 123456789012 or 18.",
+        "Need greatest common divisor 123456789012 and 18.",
     }) |line| try expect(true, &.{line}, null);
 }
 
@@ -150,6 +177,7 @@ test "runner proof: trace stated: the circuit owns gcd and the restated product:
     for ([_][4][]const u8{
         .{ live[2].want[1], "123456789012345", "123456789012340", "from math import gcd\nprint(gcd(123456789012340, 987654321012345))" },
         .{ live[1].want[1], "98765432109", "98765432119", "98765432119*12345678901" },
+        .{ live[6].want[1], "9988776655443322", "9988776655443323", "from math import gcd\nprint(gcd(1122334455667788, 9988776655443323))" },
     }) |m| {
         const bytes = try b.translate(gpa, m[0]);
         defer gpa.free(bytes);

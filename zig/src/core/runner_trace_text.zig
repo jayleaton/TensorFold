@@ -310,6 +310,7 @@ pub fn phrase(rest: []const u8, whole: bool) ?Phrase {
     if (multiplyDefs(rest, i)) |p| return .{ .kind = .mul, .parts = p.parts, .n = 2, .end = p.end };
     if (verbPhrase(rest, i, "subtract", &.{"from"})) |p| return .{ .kind = .subfrom, .parts = p.parts, .n = 2, .end = p.end };
     if (whole) if (gcdCall(rest, i)) |p| return .{ .kind = .gcd, .parts = p.parts, .n = 2, .end = p.end };
+    if (whole) if (gcdOf(rest, i)) |p| return .{ .kind = .gcd, .parts = p.parts, .n = 2, .end = p.end };
     if (whole) if (isqrtOf(rest, i, integral)) |p| return .{ .kind = .isqrt, .parts = p.parts, .end = p.end };
     if (whole) if (editDistance(rest, i)) |p| return .{ .kind = .edit, .parts = p.parts, .n = 2, .end = p.end };
     const e = lazyEnd(rest, i) orelse return null;
@@ -379,6 +380,33 @@ fn gcdCall(s: []const u8, i: usize) ?Two {
     const c = comma orelse return null;
     const e = endAt(s, k + 1) orelse return null;
     return .{ .parts = .{ .{ open, c }, .{ c + 1, k } }, .end = e };
+}
+
+/// `gcd of X and Y` / `greatest common divisor of X, Y` then a sentence end: two literals, each maybe after `Name=`.
+fn gcdOf(s: []const u8, i: usize) ?Two {
+    var j = seq(s, i, &.{ "gcd", "of" }) orelse seq(s, i, &.{ "greatest", "common", "divisor", "of" }) orelse return null;
+    j = spaces(s, j) orelse return null;
+    const x = literal(s, skipDef(s, j)) orelse return null;
+    const comma = x[1] < s.len and s[x[1]] == ',';
+    const sep = spaces(s, x[1] + @intFromBool(comma)) orelse return null;
+    const y0 = if (comma) sep else spaces(s, seq(s, sep, &.{"and"}) orelse return null) orelse return null;
+    const y = literal(s, skipDef(s, y0)) orelse return null;
+    // "gcd of 12,345, 18" may be three numbers, as in gcd(12,345, 18): a comma splits only plain literals
+    if (comma and (std.mem.indexOfScalar(u8, s[x[0]..x[1]], ',') != null or std.mem.indexOfScalar(u8, s[y[0]..y[1]], ',') != null)) return null;
+    // a third argument after a comma ("gcd of 12, 18, 30") is not a gcd of two
+    var k = y[1];
+    while (k < s.len and isSpace(s[k])) k += 1;
+    if (k < s.len and s[k] == ',') return null;
+    const e = trailEnd(s, y[1]) orelse return null;
+    return .{ .parts = .{ x, y }, .end = e };
+}
+
+/// A decimal integer literal at `i` (thousands commas, not zero-led) that no word character continues.
+fn literal(s: []const u8, i: usize) ?[2]usize {
+    var j = i;
+    while (j < s.len and (std.ascii.isDigit(s[j]) or thousandsAt(s, j))) j += 1;
+    if (j == i or (s[i] == '0' and j > i + 1) or (j < s.len and isWord(s[j]))) return null;
+    return .{ i, j };
 }
 
 /// `isqrt(N)`, or `sqrt of N` / `square root of N` after "integer" or "floor" (bare, it may mean the real root).
