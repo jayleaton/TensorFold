@@ -1,4 +1,4 @@
-//! T1's 256-digit division and powmod proofs on the real frontend, bank and Dispatch (split from runner_proof_test.zig).
+//! T1's 256-digit division and powmod proofs through the real frontend, bank and Dispatch.
 const std = @import("std");
 const pt = @import("runner_proof_test.zig");
 const frontend = @import("runner_frontend.zig");

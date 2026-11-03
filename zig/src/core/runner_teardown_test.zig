@@ -1,5 +1,4 @@
-//! Session.destroy and borrowed notebook history: a later cell's translation reads earlier cells' code, so destroy
-//! joins every translation before it frees any cell (S1's length-cap/cancel teardown, T5's gdb reproduction).
+//! Session.destroy joins every translation before it frees a cell: a later cell's prior borrows earlier code.
 const std = @import("std");
 const rapi = @import("runner_api.zig");
 const runner = @import("runner.zig");
