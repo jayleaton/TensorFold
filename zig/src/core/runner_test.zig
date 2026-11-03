@@ -89,6 +89,7 @@ pub const Back = struct {
     gate: std.atomic.Value(bool) = .init(true),
     jobs: std.ArrayList(struct { prog: []u8, polls: u32 }) = .empty,
     started: u32 = 0,
+    result: ?rapi.Result = null,
 
     const answers = [_][2][]const u8{
         .{ "123456789012345678901234567890 * 987654321098765432109876543210", product ++ "\n" },
@@ -113,6 +114,7 @@ pub const Back = struct {
         const j = &b.jobs.items[job];
         j.polls += 1;
         if (j.polls <= b.delay or !b.gate.load(.acquire)) return .running;
+        if (b.result) |result| return .{ .done = result };
         for (answers) |x| if (std.mem.eql(u8, x[0], j.prog)) return .{ .done = .{ .status = .ok, .out = x[1], .steps = 100 } };
         return .{ .done = .{ .status = .fault, .out = "" } };
     }
@@ -159,7 +161,7 @@ const Box = struct {
 };
 
 /// `frontend`/`backend`: real ones in place of the fakes (the proof test).
-pub const Opts = struct { runner: bool = true, run_cells: bool = true, delay: u32 = 0, planner: bool = false, streams: usize = 1, max_tokens: u32 = 400, frontend: ?rapi.Frontend = null, backend: ?rapi.Backend = null, wait_s: u32 = 20, exact: bool = false, inline_math: bool = false, trace: bool = false, trace_ask: runner.TraceAsk = .{}, placer: ?*runner.place.Placer = null, summaries: ?[][]u8 = null };
+pub const Opts = struct { runner: bool = true, run_cells: bool = true, delay: u32 = 0, planner: bool = false, streams: usize = 1, max_tokens: u32 = 400, frontend: ?rapi.Frontend = null, backend: ?rapi.Backend = null, wait_s: u32 = 20, exact: bool = false, inline_mark: bool = false, result_tokens: u32 = 512, inline_math: bool = false, trace: bool = false, trace_ask: runner.TraceAsk = .{}, placer: ?*runner.place.Placer = null, summaries: ?[][]u8 = null };
 
 /// Runs `models` (one request each, concurrently) on one host; the reply texts.
 pub fn replies(models: []Model, o: Opts, back: *Back) ![][]u8 {
@@ -174,7 +176,7 @@ pub fn replies(models: []Model, o: Opts, back: *Back) ![][]u8 {
     defer core.deinit();
     var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 4 });
     back.delay = o.delay;
-    var run: runner.Runner = .{ .gpa = gpa, .cfg = .{ .circuit = "test", .exact = o.exact, .scan = .{ .inline_math = o.inline_math, .trace = o.trace } }, .frontend = o.frontend orelse .{ .translate = translate }, .backend = o.backend orelse back.backend(), .text = .{ .bytes = tokenBytes, .encode = encode }, .placer = o.placer };
+    var run: runner.Runner = .{ .gpa = gpa, .cfg = .{ .circuit = "test", .exact = o.exact, .inline_mark = o.inline_mark, .max_tokens = o.result_tokens, .scan = .{ .inline_math = o.inline_math, .trace = o.trace } }, .frontend = o.frontend orelse .{ .translate = translate }, .backend = o.backend orelse back.backend(), .text = .{ .bytes = tokenBytes, .encode = encode }, .placer = o.placer };
     if (o.runner) host.runner = &run;
     const boxes = try gpa.alloc(Box, models.len);
     defer gpa.free(boxes);
@@ -433,6 +435,14 @@ test "runner: knobs parse; off unless the flag is 1 with a circuit" {
     const c = (try runner.Config.parse(&K.get, "TF_R")).?;
     try std.testing.expect(!c.scan.fence and c.scan.repl and c.scan.reasoning_only and c.max_steps == 99 and !c.exact);
     try std.testing.expectEqual(@as(usize, 10522), c.compile_steps);
+    try std.testing.expect(!c.inline_mark);
+    for ([_][]const u8{ "0", "1" }) |value| {
+        K.set = &.{ .{ "TF_R", "1" }, .{ "TF_R_CIRCUIT", "/c.bin" }, .{ "TF_R_INLINE_MARK", value } };
+        try std.testing.expectEqual(std.mem.eql(u8, value, "1"), (try runner.Config.parse(&K.get, "TF_R")).?.inline_mark);
+    }
+    K.set = &.{ .{ "TF_R", "1" }, .{ "TF_R_CIRCUIT", "/c.bin" }, .{ "TF_R_INLINE_MARK", "2" } };
+    try std.testing.expectError(error.BadKnob, runner.Config.parse(&K.get, "TF_R"));
+
     K.set = &.{ .{ "TF_R", "1" }, .{ "TF_R_CIRCUIT", "/c.bin" }, .{ "TF_R_COMPILE_STEPS", "32768" } };
     const wider = (try runner.Config.parse(&K.get, "TF_R")).?;
     try std.testing.expectEqual(@as(usize, 32768), wider.compile_steps);
@@ -505,4 +515,59 @@ test "runner: terminal refusal off and exhausted budget preserve the original re
 test {
     _ = @import("runner_handoff_native_test.zig");
     _ = @import("runner_teardown_test.zig");
+}
+
+test "runner: inline provenance tags only successful owned inline values" {
+    const t = std.testing;
+    for ([_][]const u8{ "So 47 * 83 =", "So 47 * 83 = " }) |lead| {
+        const got = try one(lead, .{ .inline_math = true, .inline_mark = true });
+        defer gpa.free(got);
+        try t.expectEqualStrings("So 47 * 83 = 3901 @engine\nDone.", got);
+        const off = try one(lead, .{ .inline_math = true });
+        defer gpa.free(off);
+        try t.expectEqualStrings("So 47 * 83 = 3901\nDone.", off);
+    }
+    for ([_][]const u8{ "No computation here.", "So 99 * 13 =", "So 47 * undefined_x =" }) |lead| {
+        const got = try one(lead, .{ .inline_math = true, .inline_mark = true });
+        defer gpa.free(got);
+        const off = try one(lead, .{ .inline_math = true });
+        defer gpa.free(off);
+        try t.expectEqualStrings(off, got);
+        try t.expect(std.mem.indexOf(u8, got, runner.inline_mark_suffix) == null);
+    }
+    const cell = "```python\nprint(2**100)\n```\nResult:\n";
+    const marked = try one(cell, .{ .inline_mark = true });
+    defer gpa.free(marked);
+    const plain = try one(cell, .{});
+    defer gpa.free(plain);
+    try t.expectEqualStrings(plain, marked);
+    const disabled = try one("So 47 * 83 =", .{ .inline_math = true, .inline_mark = true, .runner = false });
+    defer gpa.free(disabled);
+    try t.expectEqualStrings("So 47 * 83 =42\nDone.", disabled);
+}
+
+test "runner: inline provenance refuses a payload that cannot fit its complete marker" {
+    const got = try one("So 47 * 83 =", .{ .inline_math = true, .inline_mark = true, .result_tokens = 5 });
+    defer gpa.free(got);
+    try std.testing.expectEqualStrings("So 47 * 83 =42\nDone.", got);
+}
+
+test "runner: inline provenance never tags an empty multiline failed or refused result" {
+    for ([_]rapi.Result{
+        .{ .status = .ok, .out = "\n" },
+        .{ .status = .ok, .out = " \n" },
+        .{ .status = .ok, .out = "3901\n\n" },
+        .{ .status = .ok, .out = "3\n4\n" },
+        .{ .status = .fault, .out = "3901" },
+        .{ .status = .budget, .out = "3901" },
+        .{ .status = .abstain, .out = "3901" },
+    }) |res| {
+        var back: Back = .{ .result = res };
+        defer back.deinit();
+        var models = [_]Model{.{ .lead = "So 47 * 83 =" }};
+        const got = try replies(&models, .{ .inline_math = true, .inline_mark = true }, &back);
+        defer gpa.free(got);
+        defer gpa.free(got[0]);
+        try std.testing.expectEqualStrings("So 47 * 83 =42\nDone.", got[0]);
+    }
 }

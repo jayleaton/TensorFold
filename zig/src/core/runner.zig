@@ -8,6 +8,10 @@ const records = @import("runner_receipt.zig");
 pub const place = @import("runner_place.zig");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.runner);
+const output = @import("runner_output.zig");
+
+/// Opt-in attribution on a successfully owned inline value; plain-text tokens, not a special token.
+pub const inline_mark_suffix = output.suffix;
 
 pub const Config = struct {
     scan: scan.Config = .{},
@@ -25,6 +29,7 @@ pub const Config = struct {
     guide: []const u8 = "", // PREFIX_GUIDE: "1" RUNNER-GUIDE.md, else a file, as chats' default guide (server/runner_guide.zig)
     guide_max_bytes: usize = 512, // PREFIX_GUIDE_MAX_BYTES: request guide cap, opt-in up to 2048 bytes
     compile: bool = true, // false: the frontend never builds an ELF (no clang); calc and graph programs only (S3)
+    inline_mark: bool = false, // PREFIX_INLINE_MARK: tag owned inline values; off preserves their bytes
     sync_graph: bool = false, // PREFIX_SYNC_GRAPH: a graph result settles at its trigger token, in that round (no hold)
     cells: bool = true, // PREFIX_CELLS: the receipt records each owned cell's span, route and landed value (runner_receipt.zig)
 
@@ -50,6 +55,7 @@ pub const Config = struct {
         c.max_tokens = try knob(u32, get, prefix ++ "_MAX_TOKENS", c.max_tokens, 1, 1 << 20);
         c.exact = try knob(u1, get, prefix ++ "_EXACT", 0, 0, 1) == 1;
         c.settle_us = try knob(u32, get, prefix ++ "_SETTLE_US", c.settle_us, 0, 100_000);
+        c.inline_mark = try knob(u1, get, prefix ++ "_INLINE_MARK", 0, 0, 1) == 1;
         c.sync_graph = try knob(u1, get, prefix ++ "_SYNC_GRAPH", 0, 0, 1) == 1;
         if (c.sync_graph and c.backend != .graph) return bad(prefix ++ "_SYNC_GRAPH", "1 (backend is not graph)");
         c.cells = try knob(u1, get, prefix ++ "_CELLS", 1, 0, 1) == 1;
@@ -97,11 +103,7 @@ pub const Config = struct {
 };
 
 /// The engine's tokenizer as the runner needs it: one token's bytes, and text to token ids.
-pub const Text = struct {
-    ctx: ?*anyopaque = null,
-    bytes: *const fn (ctx: ?*anyopaque, token: u32) []const u8,
-    encode: *const fn (ctx: ?*anyopaque, a: Allocator, text: []const u8) Allocator.Error![]u32,
-};
+pub const Text = output.Text;
 
 /// A request's say over form trace (chat fields "runner_trace", "runner_trace_format"); defaults change nothing.
 pub const TraceAsk = struct {
@@ -164,7 +166,12 @@ pub const Session = struct {
     abstained_n: u32 = 0,
     held_ms: u64 = 0, // summed over the reply's holds
     held_ticks: u32 = 0, // the current hold's ticks so far (the serving log's)
-    forcing: ?struct { at: u64, left: usize, cell: u32 } = null, // an owned result's forced tokens still to commit
+    forcing: ?struct {
+        at: u64,
+        left: usize,
+        cell: u32,
+        inline_bytes_left: ?usize = null,
+    } = null, // an owned result's forced tokens still to commit
     resume_ms: u64 = 0, // summed: an owned result's settling to the model's first token after it
     terminal_seen: bool = false,
     broken: bool = false, // out of memory once: no more cells, no more holds
@@ -229,7 +236,9 @@ pub const Session = struct {
         }
         const bytes = if (think_end) "" else tx.bytes(tx.ctx, token);
         try s.rec.token(s.r.gpa, token, bytes, think_open);
-        const ev = try s.scan.feed(s.r.gpa, bytes, think_open);
+        const scanning = if (s.forcing) |*r| output.scanning(&r.inline_bytes_left, bytes) else bytes;
+        if (scanning.len == 0 and bytes.len > 0) return false;
+        const ev = try s.scan.feed(s.r.gpa, scanning, think_open);
         if (ev.closed) |c| try s.open(c);
         const t = ev.trigger orelse return false;
         if (!can_hold or t.index >= s.cells.items.len) return false;
@@ -348,6 +357,11 @@ pub const Session = struct {
         if (w.trace) return try s.ownTrace(c, w.index, held_ms);
         // an inline value is owned only when the run halted with a one-line value
         if (!c.abstained and w.inline_space != null and (c.result.?.status != .ok or std.mem.indexOfScalar(u8, std.mem.trimEnd(u8, c.result.?.out, "\n"), '\n') != null)) c.abstained = true;
+        if (!c.abstained and s.r.cfg.inline_mark and w.inline_space != null) {
+            const value = output.value(c.result.?.out);
+            if (std.mem.trim(u8, value, " \t\r").len == 0 or std.mem.indexOfAny(u8, value, "\r\n") != null)
+                c.abstained = true;
+        }
         if (c.abstained) {
             s.abstained_n += 1;
             c.told = .abstained;
@@ -356,13 +370,28 @@ pub const Session = struct {
         }
         const res = c.result.?;
         const ids = try s.owned(res, w);
+        if (s.r.cfg.inline_mark and w.inline_space != null and ids.len == 0) {
+            c.abstained = true;
+            c.told = .abstained;
+            s.abstained_n += 1;
+            log.info("reply {d} cell {d}: marked inline value exceeds token cap", .{ s.id, w.index });
+            return ids;
+        }
         s.owned_n += 1;
         c.told = .owned;
         c.owned_tokens = @intCast(ids.len);
         s.rec.owned(s.r.gpa, w.index, ids) catch {
             s.rec.on = false; // out of memory: this reply's receipt has no records
         };
-        s.forcing = .{ .at = nowNs(), .left = ids.len, .cell = w.index };
+        s.forcing = .{
+            .at = nowNs(),
+            .left = ids.len,
+            .cell = w.index,
+            .inline_bytes_left = if (s.r.cfg.inline_mark and w.inline_space != null)
+                output.value(res.out).len + @intFromBool(w.inline_space.?)
+            else
+                null,
+        };
         log.info("reply {d} cell {d} ({s} {t}): owned {d} tokens, {t} after {d} steps, run {d} ms, held {d} ms, ticks {d}", .{ s.id, w.index, c.lang, c.form, ids.len, res.status, res.steps, res.exec_ns / std.time.ns_per_ms, held_ms, s.held_ticks });
         return ids;
     }
@@ -477,38 +506,12 @@ pub const Session = struct {
         if (res.status == .abstain or (res.status == .ok and res.out.len == 0)) c.abstained = true;
     }
 
-    /// The owned text for a settled run (INTERFACES.md §5), as token ids within the token cap.
+    /// The owned text for a settled run, as token ids within the token cap.
     fn owned(s: *Session, res: api.Result, w: scan.Trigger) Allocator.Error![]u32 {
-        const gpa = s.r.gpa;
-        const tx = s.r.text.?;
-        var body: std.ArrayList(u8) = .empty;
-        defer body.deinit(gpa);
-        const out = if (std.mem.endsWith(u8, res.out, "\n")) res.out[0 .. res.out.len - 1] else res.out;
-        if (w.inline_space) |space| {
-            // only the value after `=`; past the cap it is the model's own text again
-            try body.appendSlice(gpa, if (space) " " else "");
-            try body.appendSlice(gpa, out);
-            const ids = try tx.encode(tx.ctx, gpa, body.items);
-            if (ids.len <= s.r.cfg.max_tokens) return ids;
-            gpa.free(ids);
-            return try gpa.alloc(u32, 0);
-        }
-        if (w.terminal) try body.appendSlice(gpa, "\nResult:\n") else if (w.newline_before)
-            try body.append(gpa, '\n');
-        try body.appendSlice(gpa, out);
-        switch (res.status) {
-            .ok, .abstain => {},
-            .budget => try body.print(gpa, "\n[stopped after {d} steps]", .{res.steps}),
-            .fault => try body.appendSlice(gpa, "\n[machine fault]"),
-        }
-        const ids = try tx.encode(tx.ctx, gpa, body.items);
-        defer gpa.free(ids);
-        const tail = try tx.encode(tx.ctx, gpa, if (w.fenced) "\n```\n" else "\n");
-        defer gpa.free(tail);
-        const note = if (ids.len > s.r.cfg.max_tokens) try tx.encode(tx.ctx, gpa, "\n[output cut]") else try gpa.alloc(u32, 0);
-        defer gpa.free(note);
-        const keep = ids[0..@min(ids.len, s.r.cfg.max_tokens)];
-        return std.mem.concat(gpa, u32, &.{ keep, note, tail });
+        return output.owned(s.r.gpa, s.r.text.?, res, w, .{
+            .max_tokens = s.r.cfg.max_tokens,
+            .inline_mark = s.r.cfg.inline_mark,
+        });
     }
 
     /// Whether the session waits on a run (its stream is held at a trigger).
@@ -526,8 +529,7 @@ pub const Session = struct {
         const gpa = s.r.gpa;
         gpa.free(s.sync_ids);
         if (s.cells.items.len > 0) log.info("reply {d}: {d} cells closed, {d} owned, {d} abstained at a header, {d} never claimed", .{ s.id, s.cells.items.len, s.owned_n, s.abstained_n, s.cells.items.len - s.owned_n - s.abstained_n });
-        // every translation first: a later cell's borrows earlier cells' code as its prior
-        for (s.cells.items) |c| if (c.thread) |th| th.join();
+        for (s.cells.items) |c| if (c.thread) |th| th.join(); // all first: a later cell's prior borrows earlier code
         for (s.cells.items) |c| {
             if (c.job) |j| s.r.backend.cancel(j);
             gpa.free(c.lang);
