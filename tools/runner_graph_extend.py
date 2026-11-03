@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Append five optional 256-digit arithmetic/output templates to a qualified bank without recompiling old payloads."""
+"""Append optional 256-digit operation families to a qualified bank without recompiling old payloads."""
 
 import argparse
 import copy
@@ -16,6 +16,11 @@ import sys
 
 WIDTH = 256
 OPERATIONS = ("add", "sub", "mul", "emit", "format")
+DIVISION_OPERATIONS = ("meta", "divstep", "divfinal", "emit_first", "emit_last")
+
+
+def family_operations(family):
+    return OPERATIONS if family == "basic" else DIVISION_OPERATIONS
 WORKER_MIB = 1792
 PARENT_MIB = 192
 SOURCES = ("runner_graph_extend.py", "runner_graph_ir.py", "runner_graph_registers.py", "runner_graph_format.py",
@@ -43,7 +48,11 @@ def limited_child():
     resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
 
 
-def extension_plans():
+def extension_plans(family="basic"):
+    if family == "division":
+        from runner_graph_div import optional_plans
+        return optional_plans(WIDTH)
+
     from runner_graph_plans import binary_plan
 
     plans = [binary_plan(op, 128) for op in ("add", "sub", "mul")]
@@ -179,7 +188,7 @@ def input_identity(args):
         ["git", "-C", str(args.qwenputer), "ls-files", "-z"], text=True).split("\0")
     upstream = {name: digest(args.qwenputer / name) for name in names if name}
     return {"format": "tensorfold.runner.graph-extension-build", "version": 1,
-            "width": WIDTH, "operations": list(OPERATIONS), "old_bank": bank_snapshot(args.bank),
+            "width": WIDTH, "operations": list(family_operations(args.family)), "old_bank": bank_snapshot(args.bank),
             "compiler_sources": {name: digest(Path(__file__).with_name(name)) for name in SOURCES},
             "qwenputer_commit": revision, "qwenputer_sources": upstream,
             "baseline_sha256": digest(args.baseline), "packer_sha256": digest(args.packer)}
@@ -203,7 +212,7 @@ def validate_base(args, identity):
             raise ValueError("unsafe or missing old template payload")
         if len(path.parts) != 1 or path.suffix != ".tfgp":
             raise ValueError("extension requires the qualified bank's flat packed-payload layout")
-        if path.name in {f"{op}-{WIDTH}.tfgp" for op in OPERATIONS}:
+        if path.name in {f"{op}-{WIDTH}.tfgp" for op in family_operations(args.family)}:
             raise ValueError("old payload path collides with a new template")
         receipt = receipts[f"{template['name']}-{template['width']}"]
         if identity["old_bank"][path.as_posix()] != receipt["packed_sha256"]:
@@ -211,9 +220,7 @@ def validate_base(args, identity):
         paths.add(path.as_posix())
     if paths != {name for name in identity["old_bank"] if name.endswith(".tfgp")}:
         raise ValueError("old bank contains unreferenced packed payloads")
-    if any(item["width"] == WIDTH for item in manifest["templates"]):
-        raise ValueError("input bank already contains optional-width templates")
-    plans = extension_plans()
+    plans = extension_plans(args.family)
     if {item["name"] for item in plans} & {item["name"] for item in manifest["plans"]}:
         raise ValueError("new plan names collide with old plans")
     return raw, manifest, provenance, paths, plans
@@ -252,14 +259,15 @@ def export(args):
             copy_verified(args.bank / name, args.output / "extension-base" / name, checksum)
     for name in sorted(paths | {"Qwenputer-MIT.txt"}):
         copy_verified(args.bank / name, args.output / name, identity["old_bank"][name])
+    operations = family_operations(args.family)
     progress_file = args.output / "extension-progress.json"
     progress = json.loads(progress_file.read_text()) if progress_file.exists() else []
-    if [row["name"] for row in progress] != [f"{op}-{WIDTH}" for op in OPERATIONS[:len(progress)]]:
+    if [row["name"] for row in progress] != [f"{op}-{WIDTH}" for op in operations[:len(progress)]]:
         raise ValueError("invalid extension progress order")
-    if args.publish_only and len(progress) != len(OPERATIONS):
+    if args.publish_only and len(progress) != len(operations):
         raise ValueError("publication requires every template already packed")
     descriptors, receipts = [], []
-    for index, op in enumerate(OPERATIONS):
+    for index, op in enumerate(operations):
         stem = f"{op}-{WIDTH}"
         packed = args.output / f"{stem}.tfgp"
         if index < len(progress):
@@ -267,7 +275,7 @@ def export(args):
             if digest(packed) != receipt["packed_sha256"]:
                 raise ValueError(f"resume checksum mismatch: {stem}")
         else:
-            command = [sys.executable, str(Path(__file__).resolve()), "--worker", op,
+            command = [sys.executable, str(Path(__file__).resolve()), "--worker", op, "--family", args.family,
                        "--qwenputer", str(args.qwenputer), "--baseline", str(args.baseline),
                        "--output", str(args.output)]
             subprocess.run(command, check=True, preexec_fn=limited_child)
@@ -296,7 +304,7 @@ def export(args):
     extended = copy.deepcopy(provenance)
     extended["templates"] += receipts
     extended["plans"] = len(manifest["plans"]) + len(plans)
-    extended["widths"] = [*provenance["widths"], WIDTH]
+    extended["widths"] = list(dict.fromkeys([*provenance["widths"], WIDTH]))
     extended["extension"] = {"identity": identity, "base_manifest": "extension-base/bank.json",
                              "new_templates": receipts, "new_plans": len(plans),
                              "request_graph_compilation": False, "measured_cost": None,
@@ -318,13 +326,16 @@ def main():
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--publish-only", action="store_true",
                         help="Publish completed packs, retaining their original compiler provenance")
-    parser.add_argument("--worker", choices=OPERATIONS, help=argparse.SUPPRESS)
+    parser.add_argument("--family", choices=("basic", "division"), default="basic")
+    parser.add_argument("--worker", choices=OPERATIONS + DIVISION_OPERATIONS, help=argparse.SUPPRESS)
     args = parser.parse_args()
     for name in ("bank", "qwenputer", "baseline", "packer", "output"):
         value = getattr(args, name)
         if value is not None:
             setattr(args, name, value.resolve())
     if args.worker:
+        if args.worker not in family_operations(args.family):
+            parser.error("worker does not belong to the selected family")
         build_one(args)
     elif args.bank is None or args.packer is None:
         parser.error("--bank and --packer are required")

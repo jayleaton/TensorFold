@@ -135,12 +135,12 @@ pub const Builder = struct {
         for (operands) |operand| {
             _ = try literal(operand);
             const digits = operand.len - @intFromBool(operand[0] == '-' or operand[0] == '+');
-            if (digits > 128) return error.GraphLiteral;
+            if (digits > (if (family == .divmod) @as(usize, 256) else 128)) return error.GraphLiteral;
             needed = @max(needed, digits);
         }
         const width: u16 = if (family == .factorial or family == .range_product or
             std.mem.startsWith(u8, @tagName(family), "f64_")) 128 else blk: {
-            for ([_]u8{ 1, 2, 4, 8, 16, 32, 62, 128 }) |n| if (needed <= n) break :blk n;
+            for ([_]u16{ 1, 2, 4, 8, 16, 32, 62, 128, 256 }) |n| if (needed <= n) break :blk n;
             unreachable;
         };
         const name = try std.fmt.allocPrint(a, "{s}-{d}", .{ @tagName(family), width });

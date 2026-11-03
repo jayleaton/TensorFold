@@ -6,9 +6,9 @@ const Allocator = std.mem.Allocator;
 const Failure = error{ OutOfMemory, Unsupported };
 
 pub const Syntax = enum { math, python };
-const Kind = enum { literal, add, sub, mul, div, mod, pow, powmod, gcd, isqrt, neg };
+const Kind = enum { literal, add, sub, mul, div, mod, pow, powmod, divmod, gcd, isqrt, neg };
 const Node = struct { kind: Kind, a: u32 = 0, b: u32 = 0, c: u32 = 0, text: []const u8 = "" };
-const Bound = struct { ref: u32, digits: usize };
+const Bound = struct { ref: u32, digits: usize, second: ?u32 = null };
 
 /// Only empty-context Python inline/REPL cells qualify; callers retain their ordinary refusal path.
 pub fn cell(a: Allocator, bank: *const Bank, request: anytype) Allocator.Error!?[]u8 {
@@ -33,7 +33,7 @@ pub fn expression(a: Allocator, bank: *const Bank, source: []const u8, syntax: S
     var lower: Lower = .{ .a = arena, .bank = bank, .nodes = p.nodes.items };
     const result = lower.build(root) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else null;
     _ = bank.validate(lower.values.items.len, lower.ops.items, result.ref) catch return null;
-    return packet.Builder.program(a, lower.values.items, lower.ops.items, &.{.{ .ref = result.ref }}) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else null;
+    return packet.Builder.program(a, lower.values.items, lower.ops.items, &.{.{ .ref = result.ref, .style = if (result.second != null) .tuple else .integer, .second = result.second }}) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else null;
 }
 
 /// Straight-line integer cells retain original operands, assignments, declared math intrinsics and print order.
@@ -93,7 +93,7 @@ pub fn script(a: Allocator, bank: *const Bank, source: []const u8) Allocator.Err
     var prints: std.ArrayList(packet.Print) = .empty;
     for (roots.items) |root| {
         const value = lower.emit(root.node) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else null;
-        try prints.append(arena, .{ .ref = value.ref, .ending = root.ending });
+        try prints.append(arena, .{ .ref = value.ref, .ending = root.ending, .style = if (value.second != null) .tuple else .integer, .second = value.second });
     }
     _ = bank.validate(lower.values.items.len, lower.ops.items, prints.items[0].ref) catch return null;
     return packet.Builder.program(a, lower.values.items, lower.ops.items, prints.items) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else null;
@@ -130,7 +130,7 @@ fn splitStatements(a: Allocator, source: []const u8) Failure![]const []const u8 
 }
 
 fn reserved(text: []const u8) bool {
-    for ([_][]const u8{ "__debug__", "math", "pow", "print", "gcd", "isqrt", "False", "None", "True", "and", "as", "assert", "async", "await", "break", "class", "continue", "def", "del", "elif", "else", "except", "finally", "for", "from", "global", "if", "import", "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise", "return", "try", "while", "with", "yield" }) |name|
+    for ([_][]const u8{ "__debug__", "math", "pow", "divmod", "print", "gcd", "isqrt", "False", "None", "True", "and", "as", "assert", "async", "await", "break", "class", "continue", "def", "del", "elif", "else", "except", "finally", "for", "from", "global", "if", "import", "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise", "return", "try", "while", "with", "yield" }) |name|
         if (std.mem.eql(u8, text, name)) return true;
     return false;
 }
@@ -212,6 +212,13 @@ const Parser = struct {
             const result = try p.sum();
             if (!p.take(")")) return error.Unsupported;
             return result;
+        }
+        if (p.take("divmod(")) {
+            const a = try p.sum();
+            if (!p.take(",")) return error.Unsupported;
+            const b = try p.sum();
+            if (!p.take(")")) return error.Unsupported;
+            return p.push(.{ .kind = .divmod, .a = a, .b = b });
         }
         if (p.take("pow(")) {
             const a = try p.sum();
@@ -307,6 +314,7 @@ const Lower = struct {
         const base = try l.emit(a);
         const exponent = try l.emit(b);
         const modulus = try l.emit(c);
+        if (base.second != null or exponent.second != null or modulus.second != null) return error.Unsupported;
         return l.operation("powmod", &.{ base.ref, exponent.ref, modulus.ref }, @max(base.digits, @max(exponent.digits, modulus.digits)));
     }
 
@@ -326,6 +334,7 @@ const Lower = struct {
         }
         if (node.kind == .powmod) return l.modular(node.a, node.b, node.c);
         const lhs = try l.emit(node.a);
+        if (lhs.second != null) return error.Unsupported;
         if (node.kind == .neg) return l.operation("sub", &.{ 0, lhs.ref }, lhs.digits);
         if (node.kind == .isqrt) return l.operation("isqrt", &.{lhs.ref}, lhs.digits);
         if (node.kind == .pow) {
@@ -343,8 +352,9 @@ const Lower = struct {
             return result;
         }
         const rhs = try l.emit(node.b);
+        if (rhs.second != null) return error.Unsupported;
         if (node.kind == .gcd) return l.operation("gcd", &.{ lhs.ref, rhs.ref }, @max(lhs.digits, rhs.digits));
-        if (node.kind == .div or node.kind == .mod) {
+        if (node.kind == .div or node.kind == .mod or node.kind == .divmod) {
             const w = try width(@max(lhs.digits, rhs.digits));
             const plan = try std.fmt.allocPrint(l.a, "divmod-{d}", .{w});
             if (l.bank.plan(plan) == null or l.ops.items.len >= 1024) return error.Unsupported;
@@ -352,7 +362,7 @@ const Lower = struct {
             const ref: u32 = @intCast(l.values.items.len + l.produced);
             try l.ops.append(l.a, .{ .op = "divmod", .args = refs, .outputs = 2, .width = w, .checked = true });
             l.produced += 2;
-            return .{ .ref = ref + @intFromBool(node.kind == .mod), .digits = @max(lhs.digits, rhs.digits) };
+            return .{ .ref = ref + @intFromBool(node.kind == .mod), .digits = @max(lhs.digits, rhs.digits), .second = if (node.kind == .divmod) ref + 1 else null };
         }
         const digits = switch (node.kind) {
             .add, .sub => @max(lhs.digits, rhs.digits) + 1,

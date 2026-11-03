@@ -3,6 +3,33 @@
 from runner_graph_ir import Value
 
 
+def optional_plans(width):
+    """Build checked wide division schedules without changing the default plan catalog."""
+    from runner_graph_ir import OPTIONAL_BUCKETS
+
+    if width not in OPTIONAL_BUCKETS:
+        raise ValueError("division extension requires an optional width")
+    ops, nextref, remainder, quotient = [], 3, 2, 2
+    for digit in reversed(range(width)):
+        ops.append({"op": "bind", "copies": [{"ref": 0, "from": digit, "to": 0, "digits": 1}], "flags": 0})
+        extracted = nextref
+        ops.append({"op": "divstep", "args": [remainder, 1, extracted],
+                    "width": width, "outputs": 2, "checked": True})
+        remainder, qdigit = nextref + 1, nextref + 2
+        ops.append({"op": "bind", "copies": [{"ref": quotient, "from": 0, "to": 0, "digits": width},
+                                               {"ref": qdigit, "from": 0, "to": digit, "digits": 1}],
+                    "flags": qdigit})
+        quotient = nextref + 3
+        nextref += 4
+    ops.append({"op": "divfinal", "args": [quotient, remainder, 0, 1],
+                "width": width, "outputs": 2, "checked": True})
+    plans = [{"name": f"{op}-{width}", "inputs": 2, "literals": ["0"], "ops": ops,
+              "result": nextref + (op == "mod")} for op in ("div", "mod")]
+    plans.append({"name": f"divmod-{width}", "inputs": 2, "literals": [], "ops": [],
+                  "result": 0, "algorithm": "divmod", "width": width})
+    return plans
+
+
 def build(b, op):
     """Create division inputs and return outputs using the reusable Builder template hook."""
     if op not in ("divstep", "divfinal"):
