@@ -1,4 +1,4 @@
-//! Form trace's `divmod(a, b)` cells (S1 R4) on the bank: a TFGS1 tuple sequence, run as the engine runs it (Dispatch).
+//! Form trace's `divmod(a, b)` cells (S1 R4) on the bank, run as the engine runs packets and sequences (Dispatch).
 const std = @import("std");
 const api = @import("runner_api.zig");
 const graph = @import("runner_graph.zig");
@@ -54,15 +54,15 @@ const Bank = struct {
     dispatch: route.Dispatch,
     job: u64 = 0,
 
-    /// The cell as trace hands it to the runner (a repl line, no prior); it must be a graph sequence.
+    /// The cell as trace hands it to the runner (a repl line, no prior); it must stay on the graph backend.
     fn translate(b: *Bank, code: []const u8) ![]const u8 {
         var routed: route.Routed = .{ .inner = @import("runner_frontend.zig").frontend(), .bank = &b.bank };
         const f = routed.frontend();
         const tr = try f.translate(f.ctx, gpa, .{ .form = .repl, .lang = "python", .code = code });
-        if (tr != .program or tr.program.kind != .graph or !std.mem.startsWith(u8, tr.program.bytes, "TFGS1\n")) {
-            std.debug.print("not a bank sequence: {s}\n", .{code});
+        if (tr != .program or tr.program.kind != .graph) {
+            std.debug.print("not a bank program: {s}\n", .{code});
             if (tr == .program) gpa.free(tr.program.bytes);
-            return error.TestExpectedSequence;
+            return error.TestExpectedGraph;
         }
         return tr.program.bytes;
     }
@@ -138,9 +138,9 @@ test "runner proof: trace divmod: the circuit owns both halves: a mutated divide
         defer gpa.free(from);
         const to = try std.fmt.allocPrint(gpa, "\"{s}\"", .{m[2]});
         defer gpa.free(to);
-        // the quotient's piece and the remainder's piece each bind the dividend
-        if (std.mem.count(u8, bytes, from) < 2) {
-            std.debug.print("dividend {s} not in both pieces: {s}\n", .{ m[1], bytes });
+        // A single divmod packet binds once for both outputs; split sequences may bind it in both pieces.
+        if (std.mem.count(u8, bytes, from) < 1) {
+            std.debug.print("dividend {s} not bound in the graph program: {s}\n", .{ m[1], bytes });
             return error.TestExpectedInput;
         }
         const mutated = try std.mem.replaceOwned(u8, gpa, bytes, from, to);

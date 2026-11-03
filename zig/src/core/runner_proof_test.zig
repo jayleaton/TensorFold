@@ -52,11 +52,11 @@ const route = @import("runner_graph_route.zig");
 const program = @import("runner_graph_program.zig");
 
 /// A backend that counts the jobs it starts.
-const Count = struct {
+pub const Count = struct {
     inner: rapi.Backend,
     started: u32 = 0,
 
-    fn backend(c: *Count) rapi.Backend {
+    pub fn backend(c: *Count) rapi.Backend {
         return .{ .ctx = c, .vtable = &.{ .start = start, .poll = poll, .cancel = cancel, .release = release } };
     }
     fn start(ctx: *anyopaque, stream: u64, p: rapi.Program, budget: u64) error{ OutOfMemory, Busy }!rapi.JobId {
@@ -81,13 +81,13 @@ const Count = struct {
 };
 
 /// The real circuit (TF_RUNNER_CIRCUIT) and graph bank (TF_RUNNER_GRAPH_BANK), or a skip.
-const Both = struct {
+pub const Both = struct {
     circuit: circuit.Circuit,
     bank: graph.Bank,
     calc: rapi.Backend,
     graph: rapi.Backend,
 
-    fn open(b: *Both) !void {
+    pub fn open(b: *Both) !void {
         const c = std.c.getenv("TF_RUNNER_CIRCUIT") orelse return error.SkipZigTest;
         const g = std.c.getenv("TF_RUNNER_GRAPH_BANK") orelse return error.SkipZigTest;
         b.circuit = try circuit.Circuit.load(gpa, std.mem.span(c));
@@ -98,7 +98,7 @@ const Both = struct {
         errdefer backend.destroy(b.calc);
         b.graph = try graph.backend(gpa, &b.bank, 2);
     }
-    fn close(b: *Both) void {
+    pub fn close(b: *Both) void {
         graph.destroy(b.graph);
         backend.destroy(b.calc);
         b.bank.deinit();
@@ -106,7 +106,7 @@ const Both = struct {
     }
 };
 
-fn finish(b: rapi.Backend, job: rapi.JobId) rapi.Result {
+pub fn finish(b: rapi.Backend, job: rapi.JobId) rapi.Result {
     while (true) switch (b.poll(job)) {
         .running => std.Thread.yield() catch {},
         .done => |r| return r,
@@ -279,7 +279,7 @@ test "runner proof: big-number-020 past the frontend's 62 digits, inline and REP
         .{ .form = .inline_expr, .code = "(10^80+123456789)^2-10^160", .graph = true },
         .{ .form = .repl, .code = "(10**80 + 123456789)**2 - 10**160", .graph = true },
         .{ .form = .repl, .code = "(10^80+123456789)^2-10^160", .graph = false }, // XOR in Python
-        .{ .form = .inline_expr, .code = "(10^80+123456789)^2 % 7", .graph = false },
+        .{ .form = .inline_expr, .code = "(10^80+123456789)^2 % 7", .graph = both.bank.plan("powmod-256") != null, .want = "2\n" },
         .{ .form = .inline_expr, .code = "10^200 + 1", .graph = both.bank.find("add", 256) != null, .want = "100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001\n" },
     }) |c| {
         var arena = std.heap.ArenaAllocator.init(gpa);
@@ -498,4 +498,8 @@ test "runner proof: 256-digit add sub mul own nonidentity boundaries and refuse 
     try std.testing.expectEqual(rapi.Abstain.unsupported, overflow.abstain.?);
     try std.testing.expectEqualStrings("", overflow.out);
     both.graph.release(1);
+}
+
+test {
+    _ = @import("runner_proof_wide_test.zig");
 }
