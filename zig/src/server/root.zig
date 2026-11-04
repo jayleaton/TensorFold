@@ -38,6 +38,7 @@ test {
     _ = @import("idle_unload_test.zig");
     _ = @import("name_priority_http_test.zig");
     _ = @import("runner_guide.zig");
+    _ = @import("runner_commit_ask.zig");
     @import("std").testing.refAllDecls(@This());
     _ = @import("json");
     _ = @import("std_options.zig");

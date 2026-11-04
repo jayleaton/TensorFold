@@ -112,10 +112,10 @@ pub const Request = struct {
     images: []const Image = &.{},
     /// The prompt as the prompt cache matches it (each image's placeholders by its content); empty: ``prompt``.
     cache_key: []const u32 = &.{},
-    /// At an EOS the stream holds for ``Engine.resumeHeld`` (a built-in tool's result) instead of finishing.
-    hold_eos: bool = false,
+    hold_eos: bool = false, // at an EOS the stream holds for ``Engine.resumeHeld`` (a built-in tool's result), not finishing
     run_cells: bool = false, // code cells the reply writes run on the host's in-model runner (core/runner.zig)
     run_trace: @import("runner.zig").TraceAsk = .{}, // with run_cells: the request's own say over form trace
+    run_commit: @import("runner_commit.zig").Ask = .{}, // with run_cells: the answer-commit's settings (PREFIX_COMMIT)
 
     /// The prompt as the prompt cache matches it: an image request's placeholders stand for their images.
     pub fn cacheKey(r: *const Request) []const u32 {

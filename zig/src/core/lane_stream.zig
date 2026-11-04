@@ -39,6 +39,7 @@ pub fn open(h: *LaneHost, job: *Job) bool {
     // forced result rows would leave a grammar, and logprob rows would rank tokens the model never drew
     if (h.runner) |rn| if (r.run_cells and r.structure == null and r.logprobs == null) {
         job.runner = rn.session(r.run_trace) catch return !h.drop(job, "out of memory");
+        if (job.runner) |s| s.commit.ask = r.run_commit;
     };
     job.stream = lanes.Stream.init(h.gpa, .{
         .id = "request",

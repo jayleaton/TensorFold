@@ -14,7 +14,7 @@ pub const product = "12193263113702179522618503273362292333223746380111126352690
 pub const mul_cell = "Let me check.\n```python\nprint(123456789012345678901234567890 * 987654321098765432109876543210)\n```\nResult:\n";
 
 /// Character tokens: printable ASCII 32..126 are 0..94, newline 95, EOS 96 (the fake's vocab is 97).
-fn id(c: u8) u32 {
+pub fn id(c: u8) u32 {
     return if (c == '\n') 95 else c - 32;
 }
 
@@ -74,7 +74,7 @@ pub const Model = struct {
 };
 
 /// `print(X)` and REPL `X` become calc X; code naming `undefined_` abstains.
-fn translate(_: ?*anyopaque, a: std.mem.Allocator, cell: rapi.Cell) std.mem.Allocator.Error!rapi.Translation {
+pub fn translate(_: ?*anyopaque, a: std.mem.Allocator, cell: rapi.Cell) std.mem.Allocator.Error!rapi.Translation {
     if (std.mem.indexOf(u8, cell.code, "undefined_") != null) return .{ .abstain = .name };
     // like T5's frontend: a cell after earlier code cells abstains
     if (std.mem.eql(u8, cell.code, "2**99") and cell.prior.len != 0) return .{ .abstain = .unsupported };
@@ -100,7 +100,7 @@ pub const Back = struct {
         .{ "2**99", "633825300114114700748351602688\n" },
     };
 
-    fn backend(b: *Back) rapi.Backend {
+    pub fn backend(b: *Back) rapi.Backend {
         return .{ .ctx = b, .vtable = &.{ .start = start, .poll = poll, .cancel = cancel, .release = release } };
     }
     fn start(ctx: *anyopaque, _: u64, p: rapi.Program, _: u64) error{ OutOfMemory, Busy }!rapi.JobId {
@@ -169,7 +169,7 @@ const Box = struct {
 };
 
 /// `frontend`/`backend`: real ones in place of the fakes (the proof test).
-pub const Opts = struct { runner: bool = true, run_cells: bool = true, delay: u32 = 0, planner: bool = false, streams: usize = 1, max_tokens: u32 = 400, frontend: ?rapi.Frontend = null, backend: ?rapi.Backend = null, wait_s: u32 = 20, exact: bool = false, inline_mark: bool = false, result_tokens: u32 = 512, inline_math: bool = false, trace: bool = false, trace_ask: runner.TraceAsk = .{}, placer: ?*runner.place.Placer = null, summaries: ?[][]u8 = null, cells: bool = true, live: ?[][]u8 = null, abstains: bool = false };
+pub const Opts = struct { runner: bool = true, run_cells: bool = true, delay: u32 = 0, planner: bool = false, streams: usize = 1, max_tokens: u32 = 400, frontend: ?rapi.Frontend = null, backend: ?rapi.Backend = null, wait_s: u32 = 20, exact: bool = false, inline_mark: bool = false, result_tokens: u32 = 512, inline_math: bool = false, trace: bool = false, trace_ask: runner.TraceAsk = .{}, placer: ?*runner.place.Placer = null, summaries: ?[][]u8 = null, cells: bool = true, live: ?[][]u8 = null, abstains: bool = false, commit: bool = false, commit_ask: @import("runner_commit.zig").Ask = .{}, think_end: ?u32 = null };
 
 /// Runs `models` (one request each, concurrently) on one host; the reply texts.
 pub fn replies(models: []Model, o: Opts, back: *Back) ![][]u8 {
@@ -184,7 +184,7 @@ pub fn replies(models: []Model, o: Opts, back: *Back) ![][]u8 {
     defer core.deinit();
     var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 4 });
     back.delay = o.delay;
-    var run: runner.Runner = .{ .gpa = gpa, .cfg = .{ .circuit = "test", .exact = o.exact, .inline_mark = o.inline_mark, .max_tokens = o.result_tokens, .cells = o.cells, .abstains = o.abstains, .scan = .{ .inline_math = o.inline_math, .trace = o.trace } }, .frontend = o.frontend orelse .{ .translate = translate }, .backend = o.backend orelse back.backend(), .text = .{ .bytes = tokenBytes, .encode = encode }, .placer = o.placer };
+    var run: runner.Runner = .{ .gpa = gpa, .cfg = .{ .circuit = "test", .exact = o.exact, .inline_mark = o.inline_mark, .max_tokens = o.result_tokens, .cells = o.cells, .abstains = o.abstains, .commit = o.commit, .scan = .{ .inline_math = o.inline_math, .trace = o.trace } }, .frontend = o.frontend orelse .{ .translate = translate }, .backend = o.backend orelse back.backend(), .text = .{ .bytes = tokenBytes, .encode = encode }, .placer = o.placer };
     if (o.runner) host.runner = &run;
     const boxes = try gpa.alloc(Box, models.len);
     defer gpa.free(boxes);
@@ -198,7 +198,7 @@ pub fn replies(models: []Model, o: Opts, back: *Back) ![][]u8 {
     for (models, 0..) |_, i| {
         boxes[i] = .{ .keep = o.live != null };
         prompts[i] = prompt ++ [_]u32{@intCast(i)}; // the router tells the streams apart by their last prompt token
-        requests[i] = .{ .prompt = &prompts[i], .max_tokens = o.max_tokens, .eos = &.{EOS}, .run_cells = o.run_cells, .run_trace = o.trace_ask };
+        requests[i] = .{ .prompt = &prompts[i], .max_tokens = o.max_tokens, .eos = &.{EOS}, .run_cells = o.run_cells, .run_trace = o.trace_ask, .think_end = o.think_end, .run_commit = o.commit_ask };
         try e.submit(@intCast(i + 1), &requests[i], .{ .ctx = &boxes[i], .event = Box.event });
     }
     const out = try gpa.alloc([]u8, models.len);

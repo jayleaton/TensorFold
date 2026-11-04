@@ -10,6 +10,7 @@ pub const place = @import("runner_place.zig");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.runner);
 const output = @import("runner_output.zig");
+const answer = @import("runner_commit.zig");
 
 /// Opt-in attribution on a successfully owned inline value; plain-text tokens, not a special token.
 pub const inline_mark_suffix = output.suffix;
@@ -34,6 +35,7 @@ pub const Config = struct {
     sync_graph: bool = false, // PREFIX_SYNC_GRAPH: a graph result settles at its trigger token, in that round (no hold)
     cells: bool = true, // PREFIX_CELLS: the receipt records each owned cell's span, route and landed value (runner_receipt.zig)
     abstains: bool = false, // PREFIX_ABSTAINS: with cells, each abstained cell's source, reason and stage (runner_abstain.zig)
+    commit: bool = false, // PREFIX_COMMIT: an owned value of the task's own expression closes the think and is the answer
 
     /// PREFIX "1" enables (unset, "" or "0": null); PREFIX_* knobs override defaults; a bad value is error.BadKnob.
     pub fn parse(get: *const fn ([]const u8) ?[]const u8, comptime prefix: []const u8) error{BadKnob}!?Config {
@@ -62,6 +64,7 @@ pub const Config = struct {
         if (c.sync_graph and c.backend != .graph) return bad(prefix ++ "_SYNC_GRAPH", "1 (backend is not graph)");
         c.cells = try knob(u1, get, prefix ++ "_CELLS", 1, 0, 1) == 1;
         c.abstains = try knob(u1, get, prefix ++ "_ABSTAINS", 0, 0, 1) == 1;
+        c.commit = try knob(u1, get, prefix ++ "_COMMIT", 0, 0, 1) == 1;
         c.guide = get(prefix ++ "_GUIDE") orelse "";
         if (std.mem.eql(u8, c.guide, "0")) c.guide = "";
         c.guide_max_bytes = try knob(usize, get, prefix ++ "_GUIDE_MAX_BYTES", c.guide_max_bytes, 512, 2048);
@@ -165,12 +168,8 @@ pub const Session = struct {
     abstained_n: u32 = 0,
     held_ms: u64 = 0, // summed over the reply's holds
     held_ticks: u32 = 0, // the current hold's ticks so far (the serving log's)
-    forcing: ?struct {
-        at: u64,
-        left: usize,
-        cell: u32,
-        inline_bytes_left: ?usize = null,
-    } = null, // an owned result's forced tokens still to commit
+    /// An owned result's forced tokens still to commit.
+    forcing: ?struct { at: u64, left: usize, cell: u32, inline_bytes_left: ?usize = null } = null,
     resume_ms: u64 = 0, // summed: an owned result's settling to the model's first token after it
     terminal_seen: bool = false,
     broken: bool = false, // out of memory once: no more cells, no more holds
@@ -178,6 +177,7 @@ pub const Session = struct {
     format: []u8, // TraceAsk.format, owned
     check: bool = false, // TraceAsk.check
     rec: records.Log = .{}, // the receipt's per-cell records
+    commit: answer.State = .{}, // PREFIX_COMMIT: the request's ask (lane_stream), the think state, whether it fired
 
     pub fn hook(s: *Session) lanes.stream.RunnerHook {
         return .{ .ptr = s, .token = onToken, .settled = if (s.r.cfg.sync_graph) settled else null, .eos = onEos };
@@ -200,7 +200,7 @@ pub const Session = struct {
 
     fn onEos(ptr: *anyopaque, think_open: bool, can_hold: bool) bool {
         const s: *Session = @ptrCast(@alignCast(ptr));
-        if (s.broken or s.terminal_seen) return false;
+        if (s.broken or s.terminal_seen or s.commit.fired) return false;
         return s.finishEos(think_open, can_hold) catch {
             s.broken = true;
             return false;
@@ -236,6 +236,7 @@ pub const Session = struct {
         }
         const bytes = if (think_end) "" else tx.bytes(tx.ctx, token);
         try s.rec.token(s.r.gpa, token, bytes, think_open);
+        if (answer.skip(&s.commit, think_open)) return false;
         const scanning = if (s.forcing) |*r| output.scanning(&r.inline_bytes_left, bytes) else bytes;
         if (scanning.len == 0 and bytes.len > 0) return false;
         const ev = try s.scan.feed(s.r.gpa, scanning, think_open);
@@ -391,7 +392,7 @@ pub const Session = struct {
                 null,
         };
         log.info("reply {d} cell {d} ({s} {t}): owned {d} tokens, {t} after {d} steps, run {d} ms, held {d} ms, ticks {d}", .{ s.id, w.index, c.lang, c.form, ids.len, res.status, res.steps, res.exec_ns / std.time.ns_per_ms, held_ms, s.held_ticks });
-        return ids;
+        return answer.after(s, c, w, w.index, ids);
     }
 
     /// Form trace: one `[exact: <expr> = <value>]` line, or nothing (abstain) unless the run printed one integer value.
@@ -594,4 +595,5 @@ test {
     _ = @import("runner_trace_named_test.zig");
     _ = @import("runner_trace_check_test.zig");
     _ = @import("runner_graph_edit.zig");
+    _ = @import("runner_commit.zig");
 }

@@ -1,6 +1,7 @@
 //! A reply's runner receipt (runtime.runner): cell counts, holds and a record per owned cell's span, route and write.
 const std = @import("std");
 const abstain = @import("runner_abstain.zig");
+const answer = @import("runner_commit.zig");
 const Allocator = std.mem.Allocator;
 
 /// A span longer than this is recorded as its sha256 and length: the reply holds it in full.
@@ -42,6 +43,7 @@ pub const Log = struct {
     abstains: std.ArrayList(abstain.Abstain) = .empty,
     dropped: u32 = 0, // abstain records out of memory
     anchors_lost: bool = false, // a source anchor out of memory: the records stand, the census is incomplete
+    commit: ?answer.Record = null, // PREFIX_COMMIT fired: its close and answer, landing after its cell's write
 
     /// A committed token: counted in its field, and matched against a write still landing.
     pub fn token(l: *Log, gpa: Allocator, id: u32, bytes: []const u8, think_open: bool) Allocator.Error!void {
@@ -54,7 +56,7 @@ pub const Log = struct {
             l.tokens += 1;
             l.bytes[@intFromBool(l.content)] += bytes.len;
         }
-        if (!l.writing) return;
+        if (!l.writing) return if (l.commit) |*c| c.land(gpa, id, bytes, l.bytes[1], l.tokens);
         const r = &l.records.items[l.records.items.len - 1];
         l.writing = r.want[r.landed] == id;
         if (!l.writing) return;
@@ -106,6 +108,7 @@ pub const Log = struct {
             r.value.deinit(gpa);
         }
         l.records.deinit(gpa);
+        if (l.commit) |*c| c.deinit(gpa);
         l.out.deinit(gpa);
         l.live.deinit(gpa);
         l.notes.deinit(gpa);
@@ -179,6 +182,7 @@ fn put(cells: anytype, l: *Log, gpa: Allocator, held_ms: u64, resume_ms: u64, cf
         }
         try o.append(gpa, ']');
         if (l.abstains_on) try abstain.write(o, gpa, cells, l, cfg);
+        if (l.commit) |c| try answer.write(o, gpa, cells, c);
     }
     try o.append(gpa, '}');
 }
