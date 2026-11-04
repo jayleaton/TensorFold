@@ -261,7 +261,16 @@ pub const Owned = struct {
 /// ``pyRstrip(s).len``, never below an owned byte (the engine's, so its span stays in the text the client gets).
 fn keptEnd(s: []const u8, owned: ?Owned) usize {
     const o = owned orelse return pyRstrip(s).len;
-    return if (o.hi <= s.len) @max(pyRstrip(s).len, o.hi) else pyRstrip(s).len; // a span past `s`: not its offsets
+    return if (o.hi <= s.len) @max(pyRstrip(s).len, aligned(s, o).hi) else pyRstrip(s).len; // a span past `s`: not its offsets
+}
+
+/// `o` widened to whole code points of `s`, so a trim never splits one (the bytes it adds are kept, not owned).
+fn aligned(s: []const u8, o: Owned) Owned {
+    var lo = o.lo;
+    var hi = o.hi;
+    while (lo > 0 and lo < s.len and s[lo] & 0xc0 == 0x80) lo -= 1;
+    while (hi < s.len and s[hi] & 0xc0 == 0x80) hi += 1;
+    return .{ .lo = lo, .hi = hi };
 }
 
 /// ``pyStrip(s)`` with the engine's owned bytes kept: `owned` is in `s`'s offsets (Owned.shift moves it).
@@ -269,7 +278,7 @@ pub fn stripOwned(s: []const u8, owned: ?Owned) []const u8 {
     const lead = s.len - pyLstrip(s).len;
     const o = owned orelse return pyStrip(s);
     if (o.hi > s.len) return pyStrip(s);
-    return s[@min(lead, o.lo)..keptEnd(s, o)];
+    return s[@min(lead, aligned(s, o).lo)..keptEnd(s, o)];
 }
 
 const harmony_final = "<|channel|>final<|message|>";
