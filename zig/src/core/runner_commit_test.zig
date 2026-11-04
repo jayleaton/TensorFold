@@ -16,7 +16,7 @@ const ask: answer.Ask = .{ .close = &close, .task = task, .eos = 96, .max_new = 
 const Commit = struct { cell: u32, why: []const u8, span: []const u8, value: []const u8, field: []const u8, at: u64, token: u32, close_token: u32, ids: u32, landed: u32, closed: bool, ended: bool };
 const Receipt = struct { commit: ?Commit = null, cells: []const struct { cell: u32, value: []const u8, landed: u32, ids: u32 } = &.{} };
 
-/// One reply and its receipt (both gpa).
+/// One reply and its receipt with its wall-clock fields as 0 (both gpa).
 fn reply(text: []const u8, o: rt.Opts) !struct { text: []u8, receipt: []u8 } {
     var back: rt.Back = .{};
     defer back.deinit();
@@ -26,7 +26,30 @@ fn reply(text: []const u8, o: rt.Opts) !struct { text: []u8, receipt: []u8 } {
     opts.summaries = &sums;
     const texts = try rt.replies(&m, opts, &back);
     defer gpa.free(texts);
-    return .{ .text = texts[0], .receipt = sums[0] };
+    defer gpa.free(sums[0]);
+    return .{ .text = texts[0], .receipt = try untimed(sums[0]) };
+}
+
+/// `receipt` with `held_ms` and `resume_ms` as 0: a loaded host's hold is longer, the reply the same.
+fn untimed(receipt: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var i: usize = 0;
+    while (i < receipt.len) {
+        const at = for ([_][]const u8{ "\"held_ms\":", "\"resume_ms\":" }) |key| {
+            if (std.mem.startsWith(u8, receipt[i..], key)) break key.len;
+        } else null;
+        if (at) |n| {
+            try out.appendSlice(gpa, receipt[i .. i + n]);
+            try out.append(gpa, '0');
+            i += n;
+            while (i < receipt.len and std.ascii.isDigit(receipt[i])) i += 1;
+            continue;
+        }
+        try out.append(gpa, receipt[i]);
+        i += 1;
+    }
+    return out.toOwnedSlice(gpa);
 }
 
 fn parse(receipt: []const u8) !std.json.Parsed(Receipt) {

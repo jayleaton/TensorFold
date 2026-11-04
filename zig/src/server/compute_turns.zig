@@ -14,7 +14,7 @@ const Allocator = std.mem.Allocator;
 /// The built-in tool's name, the type a request lists to opt in, and its description (which marks it as ours).
 pub const name = "python";
 pub const opt_in = "code_interpreter";
-const description = "Run Python 3 code in a sandbox with no network, no files and no installs, and get its stdout and " ++
+pub const description = "Run Python 3 code in a sandbox with no network, no files and no installs, and get its stdout and " ++
     "stderr. print() what you need; the value of a final bare expression is printed too.";
 const definition =
     \\{"type":"function","function":{"name":"python","description":"

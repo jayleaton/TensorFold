@@ -190,7 +190,7 @@ pub fn prepare(srv: *Server, cx: *Cx, given: Input, gone: anytype) Failure!Prepa
     if (request.run_cells and thinking and srv.think_close.len > 0) request.think_end = srv.think_close_end;
     if (request.run_cells) request.run_trace = @import("runner_guide.zig").traceAsk(f) catch
         return cx.refuse("runner_trace must be a boolean, runner_trace_format one line of at most 128 bytes with {} once, runner_trace_check a boolean, runner_trace_repeat 0 to 3");
-    if (thinking) request.run_commit = try @import("runner_commit_ask.zig").of(a, srv.info.runner, srv.think_close, input.messages, input.tools.len > 0, &request);
+    if (thinking) request.run_commit = try @import("runner_commit_ask.zig").of(a, srv.info.runner, srv.think_close, input.messages, input.tools, &request);
     const deadline: ?i96 = if (f.get("deadline_s")) |v| blk: {
         const s = (if (v == .bool) null else v.float64()) orelse return cx.refuse("deadline_s must be a number of seconds");
         if (!(s > 0 and s <= 1e6)) return cx.refuse("deadline_s must be more than 0 and at most 1000000 seconds");
