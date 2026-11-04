@@ -68,16 +68,16 @@ const Reply = struct {
     }
 };
 
-fn obj(a: Allocator, text: []const u8) !json.Value {
+pub fn obj(a: Allocator, text: []const u8) !json.Value {
     return (try json.parseText(a, text)).ok;
 }
 
-fn appendTo(a: Allocator, list: json.Value, more: []const json.Value) !json.Value {
+pub fn appendTo(a: Allocator, list: json.Value, more: []const json.Value) !json.Value {
     return .{ .array = try std.mem.concat(a, json.Value, &.{ list.array, more }) };
 }
 
 /// The mini DeepSeek tokenizer, byte-level both ways so a reply decodes back to its text, and its EOS.
-fn fixture(a: Allocator) !f.Fixture {
+pub fn fixture(a: Allocator) !f.Fixture {
     var out = try f.Fixture.init(a, t.io, null);
     errdefer out.deinit();
     const bytes = try std.Io.Dir.cwd().readFileAlloc(t.io, "zig/src/families/deepseek_v41/fixtures/serve/mini_tokenizer.json", a, .limited(1 << 20));

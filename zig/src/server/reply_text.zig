@@ -227,18 +227,49 @@ pub fn heldBack(text: []const u8, tools: bool) []const u8 {
 }
 
 /// Prose safe to send before final parsing settles the first hidden closed envelope.
-pub fn finishedProse(a: Allocator, text: []const u8) Allocator.Error![]const u8 {
+pub fn finishedProse(a: Allocator, text: []const u8, owned: ?Owned) Allocator.Error![]const u8 {
     // attachCalls has not yet decided whether to strip the reply's content.
     if (pyLstrip(text).len != text.len) return text[0..0];
     var out: std.ArrayList(u8) = .empty;
     const prose = try hideInto(a, &out, text, true, true);
-    return if (prose.len != text.len) prose[0..pyRstrip(prose).len] else prose;
+    return if (prose.len != text.len) prose[0..keptEnd(prose, owned)] else prose;
 }
 
 /// A reply max_tokens cut inside a call it returns: the open envelope is that call, not text (#1238).
-pub fn cutProse(a: Allocator, text: []const u8) Allocator.Error![]const u8 {
+pub fn cutProse(a: Allocator, text: []const u8, owned: ?Owned) Allocator.Error![]const u8 {
     const prose = try hideToolCalls(a, text, false);
-    return if (prose.len != text.len) prose[0..pyRstrip(prose).len] else prose;
+    return if (prose.len != text.len) prose[0..keptEnd(prose, owned)] else prose;
+}
+
+/// Runner cells' bytes in a reply's text: [lo, hi) from the first owned byte to the last, before any call block.
+pub const Owned = struct {
+    lo: usize,
+    hi: usize,
+
+    pub fn join(x: ?Owned, y: ?Owned) ?Owned {
+        const p = x orelse return y;
+        const q = y orelse return p;
+        return .{ .lo = @min(p.lo, q.lo), .hi = @max(p.hi, q.hi) };
+    }
+
+    pub fn shift(x: ?Owned, by: usize) ?Owned {
+        const o = x orelse return null;
+        return .{ .lo = o.lo + by, .hi = o.hi + by };
+    }
+};
+
+/// ``pyRstrip(s).len``, never below an owned byte (the engine's, so its span stays in the text the client gets).
+fn keptEnd(s: []const u8, owned: ?Owned) usize {
+    const o = owned orelse return pyRstrip(s).len;
+    return if (o.hi <= s.len) @max(pyRstrip(s).len, o.hi) else pyRstrip(s).len; // a span past `s`: not its offsets
+}
+
+/// ``pyStrip(s)`` with the engine's owned bytes kept: `owned` is in `s`'s offsets (Owned.shift moves it).
+pub fn stripOwned(s: []const u8, owned: ?Owned) []const u8 {
+    const lead = s.len - pyLstrip(s).len;
+    const o = owned orelse return pyStrip(s);
+    if (o.hi > s.len) return pyStrip(s);
+    return s[@min(lead, o.lo)..keptEnd(s, o)];
 }
 
 const harmony_final = "<|channel|>final<|message|>";
@@ -501,7 +532,7 @@ test "an opener the reply names in prose keeps the text after it, streamed and w
     defer arena.deinit();
     const a = arena.allocator();
     const prose = "Gemma writes <|tool_call>call:f{...} and DSML uses <\u{ff5c}DSML\u{ff5c}tool_calls>. The rest of my answer.";
-    try std.testing.expectEqualStrings(prose, try finishedProse(a, prose));
+    try std.testing.expectEqualStrings(prose, try finishedProse(a, prose, null));
     const named = "Gemma opens a call with <|tool_call> and DSML with <\u{ff5c}DSML\u{ff5c}tool_calls> too.";
     try std.testing.expectEqualStrings(named, try hideToolCalls(a, named, false));
     const spaced = "DeepSeek-V4.1 opens its block with <\u{ff5c}DSML\u{ff5c} calls> instead.";
@@ -519,5 +550,5 @@ test "an opener the reply names in prose keeps the text after it, streamed and w
     try std.testing.expectEqualStrings("a ", try hideToolCalls(a, "a <tool_call>{\"name\"", false));
     try std.testing.expectEqualStrings("a b", try hideToolCalls(a, "a <|tool_call>call:f{x:1}<tool_call|>b", false));
     // a finished reply's unclosed envelope is text, as tool_parse.parse keeps it in the content
-    try std.testing.expectEqualStrings("a <tool_call>{\"name\"", try finishedProse(a, "a <tool_call>{\"name\""));
+    try std.testing.expectEqualStrings("a <tool_call>{\"name\"", try finishedProse(a, "a <tool_call>{\"name\"", null));
 }

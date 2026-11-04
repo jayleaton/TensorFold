@@ -66,6 +66,7 @@ pub const Reply = struct {
     prompt_logprobs: ?Value = null,
     loop_stop: ?u32 = null, // the loop period when --loop-guard-stop ended the reply in its reasoning
     runner_raw: ?[2][]const u8 = null, // with abstain records: the runner's raw field bytes (runner_projection.zig)
+    owned: ?@import("reply_text.zig").Owned = null, // runner cells' bytes in `content`, which no strip may cut
 };
 
 pub const Failure = error{ Refused, Cancelled, Failed, OutOfMemory };

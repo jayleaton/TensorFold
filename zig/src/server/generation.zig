@@ -62,6 +62,7 @@ pub const Generation = struct {
     cells_sig: u64 = 0, // their Mailbox.covered sig
     deadline_ns: ?i96 = null, // "deadline_s": when the server ends the reply itself
     deadline_hit: bool = false, // it did: the engine was cancelled there; what it gave before its end still lands
+    base: usize = 0, // the reply's tokens before this segment's (compute_segments.zig): the runner records count them
 
     fn eos(g: *const Generation, t: u32) bool {
         return !g.ignore_eos and std.mem.indexOfScalar(u32, g.srv.eos, t) != null;
@@ -267,6 +268,23 @@ pub const Generation = struct {
         return tokens[n..];
     }
 
+    /// The engine-owned bytes of `content` (runner_owned.zig), from the runner records the stream has had so far.
+    fn ownedOf(g: *Generation, tokens: []const u32, raw: []const u8, content: []const u8) Allocator.Error!?reply_text.Owned {
+        if (g.srv.text.vtable.token_bytes == null) return null;
+        var records: std.ArrayList([]const u8) = .empty;
+        {
+            const m = g.box;
+            m.mutex.lockUncancelable(m.io);
+            defer m.mutex.unlock(m.io);
+            for (m.cells.items) |versions| if (versions.items.len > 0)
+                try records.append(g.a, try g.a.dupe(u8, versions.items[versions.items.len - 1].json));
+        }
+        if (records.items.len == 0) return null;
+        const pieces = try g.a.alloc([]const u8, tokens.len);
+        for (tokens, pieces) |t, *p| p.* = (try g.srv.text.tokenBytes(g.a, t)) orelse return null;
+        return @import("runner_owned.zig").of(g.a, records.items, g.base, pieces, raw, content);
+    }
+
     pub fn finish(g: *Generation, cx: *Cx, prompt_len: usize, received: i96, thinking: bool, effort: ?[]const u8, exact: bool, drafts: bool) Failure!Reply {
         const a = g.a;
         const m = g.box;
@@ -302,11 +320,12 @@ pub const Generation = struct {
             reasoning = h.reasoning;
         }
         content = try tool_lfm2.dsml(a, content, g.tools, true);
+        const owned = try g.ownedOf(content_tokens, raw, content);
         if (g.sink) |sink| {
             const thought = g.streamed_reasoning.text.items;
             if (reasoning) |r| if (std.mem.startsWith(u8, r, thought) and r.len > thought.len)
                 try g.emit(sink, try deltaOf(a, "reasoning_content", r[thought.len..]));
-            const shown = if (g.calls != null) try tool_stream.endProse(a, content, if (g.thinking) content else text, g.tools, reason) else content;
+            const shown = if (g.calls != null) try tool_stream.endProse(a, content, if (g.thinking) content else text, g.tools, reason, owned) else content;
             const sent = g.streamed.text.items;
             const rest = if (std.mem.startsWith(u8, shown, sent) and shown.len > sent.len) shown[sent.len..] else "";
             if (g.lp) |*l| (if (try l.delta(g.srv, a, g.thinking, g.ignore_eos, g.collected.items, rest, shown.len, true)) |d| try g.emit(sink, d)) else if (rest.len > 0) try g.emit(sink, .{ .string = rest });
@@ -402,6 +421,7 @@ pub const Generation = struct {
             .prompt_logprobs = if (m.prompt_rows) |r| try @import("logprobs.zig").promptValue(g.srv, a, r) else null,
             .loop_stop = stopped,
             .runner_raw = runner_raw,
+            .owned = owned,
         };
         if (std.mem.eql(u8, reason, "length") and thinking and reply_text.pyStrip(content).len == 0)
             log.line("warning: a reply reached max_tokens while still thinking, so its content is empty and its text is all in reasoning_content; raise max_tokens, or send chat_template_kwargs {{\"enable_thinking\": false}} (server: --no-thinking)", .{});

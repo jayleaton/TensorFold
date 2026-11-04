@@ -27,6 +27,7 @@ const Merge = struct {
     reasoning_tokens: usize = 0,
     ids: std.ArrayList(u32) = .empty, // the engine's whole continuation: segments and inserted results
     inserted: usize = 0,
+    owned: ?reply_text.Owned = null, // the segments' runner bytes in `content` (Generation.ownedOf)
     calls: std.ArrayList(Value) = .empty, // one report a call
     history: std.ArrayList(Value) = .empty, // the request's messages, then each segment's call turn and results
 };
@@ -77,6 +78,7 @@ pub fn rest(first: *Generation, cx: *Cx, p: chat.Prepared, filter: *turns.Filter
             if (g.sink != null) filter.direct(try reportDelta(a, r)) catch return error.Cancelled;
         }
         g = try next(g, s, p.request.max_tokens - (used + s.len));
+        g.base = m.ids.items.len; // the runner records' token indices count every segment and result before it
         filter.nextSegment();
         try g.loop(gone);
     }
@@ -283,7 +285,9 @@ fn lost(e: anyerror) chat.Failure!?[]const u32 {
 
 /// A finished held segment into the merge: its words, its tokens and the result inserted after it.
 fn note(a: Allocator, m: *Merge, g: *const Generation, seg: chat.Reply, inserted: []const u32) Allocator.Error!void {
-    try m.content.appendSlice(a, (try tool_parse.parse(a, seg.content, g.tools, null)).content);
+    const parsed = try tool_parse.parseOwned(a, seg.content, g.tools, null, seg.owned);
+    m.owned = reply_text.Owned.join(m.owned, reply_text.Owned.shift(parsed.owned, m.content.items.len));
+    try m.content.appendSlice(a, parsed.content);
     if (seg.reasoning) |r| try m.reasoning.appendSlice(a, r);
     m.completion += seg.completion_tokens;
     m.reasoning_tokens += seg.reasoning_tokens;
@@ -296,6 +300,7 @@ fn note(a: Allocator, m: *Merge, g: *const Generation, seg: chat.Reply, inserted
 fn merge(a: Allocator, m: *Merge, last: chat.Reply, last_ids: []const u32) chat.Failure!chat.Reply {
     var r = last;
     if (m.content.items.len > 0) r.content = try std.mem.concat(a, u8, &.{ m.content.items, last.content });
+    r.owned = reply_text.Owned.join(m.owned, reply_text.Owned.shift(last.owned, m.content.items.len));
     if (m.reasoning.items.len > 0) r.reasoning = try std.mem.concat(a, u8, &.{ m.reasoning.items, last.reasoning orelse "" });
     r.completion_tokens += m.completion;
     r.reasoning_tokens += m.reasoning_tokens;

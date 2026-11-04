@@ -13,8 +13,8 @@ const close_id: u32 = 300;
 const eos_id: u32 = 301;
 
 /// One byte a token below 256 (255 decodes lossily to U+FFFD, its token bytes stay FF); 300 is `</think>`, 301 EOS.
-const Bytes = struct {
-    fn text(t: *Bytes) model_text.Text {
+pub const Bytes = struct {
+    pub fn text(t: *Bytes) model_text.Text {
         return .{ .ctx = t, .vtable = &.{ .encode = encode, .decode = decode, .token_id = tokenId, .token_string = tokenString, .vocab_size = vocab, .eos_ids = eos, .render = render, .template_source = template, .token_bytes = tokenBytes } };
     }
     fn encode(_: *anyopaque, a: Allocator, input: []const u8, _: bool) model_text.Error![]u32 {

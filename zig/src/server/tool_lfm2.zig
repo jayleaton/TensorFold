@@ -361,7 +361,7 @@ test "tool_lfm2: a block of one call is the call, and no content is left" {
     try std.testing.expectEqualStrings("{\"query\":\"fast\",\"limit\":4}", function.get("arguments").?.string);
     // the stream hides the block as LFM2 wrote it, while it streams and once it ends
     try std.testing.expectEqualStrings("", try reply_text.hideToolCalls(a, reply, false));
-    try std.testing.expectEqualStrings("", try reply_text.finishedProse(a, reply));
+    try std.testing.expectEqualStrings("", try reply_text.finishedProse(a, reply, null));
 }
 
 test "tool_lfm2: positional and keyword arguments, nested values in either spelling, two calls in one list" {
@@ -427,7 +427,7 @@ test "tool_lfm2: a block still being written is held back while streaming and st
     try std.testing.expect(r.calls == null);
     try std.testing.expectEqualStrings(cut, r.content);
     // a finished reply's unclosed envelope is text (#1243), as the content above keeps it
-    try std.testing.expectEqualStrings(cut, try reply_text.finishedProse(a, cut));
+    try std.testing.expectEqualStrings(cut, try reply_text.finishedProse(a, cut, null));
 }
 
 /// Each call a stream sends when `reply` arrives a byte at a time, as `name arguments`.

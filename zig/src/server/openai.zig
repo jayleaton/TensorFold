@@ -333,11 +333,11 @@ const Run = struct {
     fn attachCalls(r: *Run, reply: *chat.Reply) Allocator.Error!?[]Value {
         const tools = r.plan.input.tools;
         if (tools.len == 0) return null;
-        const parsed = try tool_parse.parse(r.a, reply.content, tools, r.plan.policy.maxCalls());
+        const parsed = try tool_parse.parseOwned(r.a, reply.content, tools, r.plan.policy.maxCalls(), reply.owned);
         if (parsed.rejected_envelopes > 0) log.line("warning: kept {d} malformed or unoffered tool envelopes as content", .{parsed.rejected_envelopes});
         // max_tokens cut a call the stream had begun: the whole reply returns it cut too, as the stream did (#1238)
         const cut = if (!r.plan.policy.single and std.mem.eql(u8, reply.finish_reason, "length")) try tool_stream.cutCalls(r.a, reply.content, tools) else null;
-        if (cut != null) reply.content = try @import("reply_text.zig").cutProse(r.a, reply.content);
+        if (cut != null) reply.content = try @import("reply_text.zig").cutProse(r.a, reply.content, reply.owned);
         const found = cut orelse parsed.calls;
         const calls = (if (r.turn != null) cortheon.clientCalls(found) else found) orelse {
             if (r.plan.policy.single or parsed.calls != null) reply.content = try r.plan.policy.parsedContent(r.a, parsed.content);

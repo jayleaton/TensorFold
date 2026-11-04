@@ -319,9 +319,9 @@ pub const Streamer = struct {
 };
 
 /// A streamed reply's final prose: ``cutProse`` when max_tokens left a call open, else ``finishedProse``.
-pub fn endProse(a: Allocator, content: []const u8, text: []const u8, tools: []const Value, reason: []const u8) Allocator.Error![]const u8 {
+pub fn endProse(a: Allocator, content: []const u8, text: []const u8, tools: []const Value, reason: []const u8, owned: ?reply_text.Owned) Allocator.Error![]const u8 {
     const cut = std.mem.eql(u8, reason, "length") and (try cutCalls(a, text, tools)) != null;
-    return if (cut) reply_text.cutProse(a, content) else reply_text.finishedProse(a, content);
+    return if (cut) reply_text.cutProse(a, content, owned) else reply_text.finishedProse(a, content, owned);
 }
 
 /// A reply max_tokens cut inside a call: the calls its stream sent, the cut one included; null when none was left open.
