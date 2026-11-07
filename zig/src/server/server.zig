@@ -198,6 +198,8 @@ pub const Server = struct {
             try @import("runner_text.zig").attach(srv.arena.allocator(), text, r);
             srv.guides = try @import("runner_guide.zig").Set.load(srv.arena.allocator(), io, r.cfg.guide);
             srv.guides.max_request_bytes = r.cfg.guide_max_bytes;
+            // the compute default (TF_DSV41_COMPUTE_LANE_DEFAULT): AB3's trust guide unless the boot names one
+            if (srv.compute != null and srv.info.compute.?.default and srv.guides.default.len == 0) srv.guides.default = @import("runner_guide.zig").trust;
             srv.guides.describe();
         }
         if (config.cortheon) srv.cortheon = try cortheon.State.init(gpa, io, "TensorFold-Cortheon (+https://github.com/ashhart/TensorFold)", config.cortheon_search_key);

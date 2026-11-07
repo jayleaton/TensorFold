@@ -16,7 +16,7 @@ pub const name = "python";
 pub const opt_in = "code_interpreter";
 pub const description = "Run Python 3 code in a sandbox with no network, no files and no installs, and get its stdout and " ++
     "stderr. print() what you need; the value of a final bare expression is printed too.";
-const definition =
+pub const definition =
     \\{"type":"function","function":{"name":"python","description":"
 ++ description ++
     \\","parameters":{"type":"object","properties":{"code":{"type":"string","description":"Python 3 source to run"}},"required":["code"]}}}
@@ -36,30 +36,72 @@ pub fn open(srv: *Server, cfg: lane.Config) !lane.Pool {
         return error.ComputeLaneUnavailable;
     };
     std.log.info("compute lane: {s} in a sandbox, {d} at a time, {d} ms, {d} MiB, results up to {d} tokens, {d} calls a reply", .{ cfg.python, cfg.workers, cfg.max_ms, cfg.mem_mb, cfg.max_result_tokens, cfg.max_calls });
+    if (cfg.default) std.log.info("compute default: every chat gets the built-in tool and the runner's guide, whatever it sends", .{});
     return pool;
 }
 
-/// The request's tools as tool_specs reads them, with `{"type": "code_interpreter"}` turned into the built-in tool.
+/// Whether the server gives every chat the built-in tool and the runner's guide (TF_DSV41_COMPUTE_LANE_DEFAULT=1).
+pub fn forced(srv: *const Server) bool {
+    return srv.compute != null and srv.info.compute.?.default;
+}
+
+/// The request's own "runner_guide", or null (the boot's guide) under the compute default, whatever the request sends.
+pub fn guideAsked(srv: *const Server, fields: Value) ?Value {
+    return if (forced(srv)) null else fields.get("runner_guide");
+}
+
+/// The request's tools with `{"type": "code_interpreter"}` as the built-in tool (in every chat under the default).
 pub fn tools(srv: *Server, cx: *Cx, raw: ?Value, choice: ?Value) errors.Refused![]Value {
-    const list = (raw orelse return tool_specs.active(cx, raw, choice));
-    if (list != .array) return tool_specs.active(cx, raw, choice);
+    const always = forced(srv);
+    const list = raw orelse Value{ .array = &.{} };
+    if (list != .array and !always) return tool_specs.active(cx, raw, choice);
     var rest: std.ArrayList(Value) = .empty;
-    var asked = false;
-    for (list.array) |t| {
+    var asked = always;
+    if (list == .array) for (list.array) |t| {
         const kind = if (t == .object) t.strField("type") orelse "" else "";
         if (std.mem.eql(u8, kind, opt_in)) asked = true else try rest.append(cx.a, t);
-    }
+    };
     if (!asked) return tool_specs.active(cx, raw, choice);
     if (srv.compute == null) return cx.other("code_interpreter is not enabled on this server");
-    const specs = try tool_specs.active(cx, .{ .array = rest.items }, choice);
+    var specs = try tool_specs.active(cx, if (list == .array) .{ .array = rest.items } else raw, choice);
+    // a client's own copy of the built-in definition is the same tool: one declaration, not a refusal (default only)
+    if (always) specs = try withoutBuiltIn(cx.a, specs);
     for (specs) |t| if (std.mem.eql(u8, toolName(t), name)) return cx.other("a request with code_interpreter cannot also offer a function named python");
-    // only an automatic choice lets the model call it: "none", "required" and a named function leave it out
-    if (choice) |c| if (!(c == .null or (c == .string and std.mem.eql(u8, c.string, "auto")))) return specs;
+    // only an automatic choice offers it ("required" and a named function do not); the default also offers it on "none"
+    if (choice) |c| if (!(c == .null or (c == .string and std.mem.eql(u8, c.string, "auto")) or
+        (always and c == .string and std.mem.eql(u8, c.string, "none")))) return specs;
     const built = switch (try json.parse(cx.a, definition)) {
         .ok => |v| v,
         .err => unreachable,
     };
     return std.mem.concat(cx.a, Value, &.{ specs, &.{built} });
+}
+
+/// The receipt's cell forms (runner_receipt.zig form_names): each counts the cells the engine wrote a value for.
+const forms = [_][]const u8{ "fence", "repl", "inline", "trace" };
+
+/// `runtime.compute_executed` under the compute default: built-in calls run plus runner cells written, 0 when none.
+pub fn countExecuted(a: Allocator, runtime: Value) Allocator.Error!void {
+    if (runtime != .object) return;
+    var calls: i64 = 0;
+    if (runtime.get("compute")) |c| if (c.get("calls")) |list| if (list == .array) {
+        calls = @intCast(list.array.len);
+    };
+    var cells: i64 = 0;
+    if (runtime.get("runner")) |r| for (forms) |form| if (r.get(form)) |f| if (f.get("owned")) |n| {
+        cells += n.int64() orelse 0;
+    };
+    const o = try json.newObject(a);
+    try o.put(a, "calls", try json.intValue(a, calls));
+    try o.put(a, "runner_cells", try json.intValue(a, cells));
+    try o.put(a, "total", try json.intValue(a, calls + cells));
+    try runtime.object.put(a, "compute_executed", .{ .object = o });
+}
+
+fn withoutBuiltIn(a: Allocator, specs: []Value) Allocator.Error![]Value {
+    var out: std.ArrayList(Value) = .empty;
+    for (specs) |t| if (!isBuiltIn(t)) try out.append(a, t);
+    return out.items;
 }
 
 fn toolName(t: Value) []const u8 {

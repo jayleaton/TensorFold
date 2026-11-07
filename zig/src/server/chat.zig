@@ -102,8 +102,9 @@ pub const Prepared = struct {
 pub fn prepare(srv: *Server, cx: *Cx, given: Input, gone: anytype) Failure!Prepared {
     const a = cx.a;
     var input = given;
-    // the runner guide (runner_guide.zig): the request's "runner_guide" or the boot default, with the runner on
-    const guided = @import("runner_guide.zig").apply(a, if (srv.info.runner != null and input.prompt == null) &srv.guides else null, input.fields.get("runner_guide"), input.messages) catch |e| switch (e) {
+    // the runner guide (runner_guide.zig) with the runner on: the request's, or the boot's under the compute default
+    const asked_guide = @import("compute_turns.zig").guideAsked(srv, input.fields);
+    const guided = @import("runner_guide.zig").apply(a, if (srv.info.runner != null and input.prompt == null) &srv.guides else null, asked_guide, input.messages) catch |e| switch (e) {
         error.BadGuide => return cx.refuse(try srv.guides.refusal(a)),
         error.OutOfMemory => return error.OutOfMemory,
     };
@@ -253,7 +254,9 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
         if (gen.held) break :blk @import("compute_segments.zig").rest(&gen, cx, prepared, &filter, gone);
         break :blk gen.finish(cx, prepared.prompt_len, received, thinking, effort, prepared.sampled, prepared.drafts);
     };
-    if (result) |_| {} else |e| logEnded(input.id, e, cx.message, prepared.prompt_len, gen.collected.items.len, seconds(nowNs(io) - received));
+    if (result) |r| {
+        if (@import("compute_turns.zig").forced(srv)) try @import("compute_turns.zig").countExecuted(a, r.runtime);
+    } else |e| logEnded(input.id, e, cx.message, prepared.prompt_len, gen.collected.items.len, seconds(nowNs(io) - received));
     return result;
 }
 

@@ -10,16 +10,17 @@ const t = std.testing;
 const Allocator = std.mem.Allocator;
 
 /// An engine whose reply calls python, holds at the EOS, and after the result answers and holds again.
-const Script = struct {
+pub const Script = struct {
     a: Allocator,
     call: []const u32, // the call segment, its EOS last
     answer: []const u32, // the answer segment, its EOS last
     sink: ?api.Sink = null,
     id: api.Id = 0,
     held_asked: bool = false,
+    prompt: []const u32 = &.{}, // the submitted prompt's ids
     resumes: std.ArrayList([]const u32) = .empty,
 
-    fn engine(s: *@This()) api.Engine {
+    pub fn engine(s: *@This()) api.Engine {
         return .{ .ctx = s, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory, .resume_held = resumeHeld } };
     }
     fn info(_: *anyopaque) api.Info {
@@ -28,6 +29,7 @@ const Script = struct {
     fn submit(ctx: *anyopaque, id: api.Id, request: *const api.Request, sink: api.Sink) api.SubmitError!void {
         const s: *@This() = @ptrCast(@alignCast(ctx));
         s.held_asked = request.hold_eos;
+        s.prompt = s.a.dupe(u32, request.prompt) catch unreachable;
         s.sink = sink;
         s.id = id;
         sink.event(sink.ctx, id, &.{ .prefilled = 0 });
@@ -52,11 +54,11 @@ const Script = struct {
     }
 };
 
-const Reply = struct {
+pub const Reply = struct {
     a: Allocator,
     code: u16 = 0,
     body: json.Value = .null,
-    fn out(r: *@This()) @import("openai.zig").Out {
+    pub fn out(r: *@This()) @import("openai.zig").Out {
         return .{ .ctx = r, .vt = &.{ .open = open, .event = event, .reply = reply } };
     }
     fn open(_: *anyopaque, _: usize) error{Closed}!void {}
