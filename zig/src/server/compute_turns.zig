@@ -56,17 +56,21 @@ pub fn tools(srv: *Server, cx: *Cx, raw: ?Value, choice: ?Value) errors.Refused!
     const list = raw orelse Value{ .array = &.{} };
     if (list != .array and !always) return tool_specs.active(cx, raw, choice);
     var rest: std.ArrayList(Value) = .empty;
-    var asked = always;
+    var listed = false;
     if (list == .array) for (list.array) |t| {
         const kind = if (t == .object) t.strField("type") orelse "" else "";
-        if (std.mem.eql(u8, kind, opt_in)) asked = true else try rest.append(cx.a, t);
+        if (std.mem.eql(u8, kind, opt_in)) listed = true else try rest.append(cx.a, t);
     };
-    if (!asked) return tool_specs.active(cx, raw, choice);
+    if (!listed and !always) return tool_specs.active(cx, raw, choice);
     if (srv.compute == null) return cx.other("code_interpreter is not enabled on this server");
     var specs = try tool_specs.active(cx, if (list == .array) .{ .array = rest.items } else raw, choice);
     // a client's own copy of the built-in definition is the same tool: one declaration, not a refusal (default only)
     if (always) specs = try withoutBuiltIn(cx.a, specs);
-    for (specs) |t| if (std.mem.eql(u8, toolName(t), name)) return cx.other("a request with code_interpreter cannot also offer a function named python");
+    for (specs) |t| if (std.mem.eql(u8, toolName(t), name)) {
+        // a call names only its tool: the default leaves `python` to the client that offers it (the runner stays on)
+        if (always and !listed) return specs;
+        return cx.other("a request with code_interpreter cannot also offer a function named python");
+    };
     // only an automatic choice offers it ("required" and a named function do not); the default also offers it on "none"
     if (choice) |c| if (!(c == .null or (c == .string and std.mem.eql(u8, c.string, "auto")) or
         (always and c == .string and std.mem.eql(u8, c.string, "none")))) return specs;
@@ -80,13 +84,10 @@ pub fn tools(srv: *Server, cx: *Cx, raw: ?Value, choice: ?Value) errors.Refused!
 /// The receipt's cell forms (runner_receipt.zig form_names): each counts the cells the engine wrote a value for.
 const forms = [_][]const u8{ "fence", "repl", "inline", "trace" };
 
-/// `runtime.compute_executed` under the compute default: built-in calls run plus runner cells written, 0 when none.
-pub fn countExecuted(a: Allocator, runtime: Value) Allocator.Error!void {
+/// `runtime.compute_executed` under the compute default: built-in calls run (`ran`) plus runner cells written, 0: none.
+pub fn countExecuted(a: Allocator, runtime: Value, ran: usize) Allocator.Error!void {
     if (runtime != .object) return;
-    var calls: i64 = 0;
-    if (runtime.get("compute")) |c| if (c.get("calls")) |list| if (list == .array) {
-        calls = @intCast(list.array.len);
-    };
+    const calls: i64 = @intCast(ran);
     var cells: i64 = 0;
     if (runtime.get("runner")) |r| for (forms) |form| if (r.get(form)) |f| if (f.get("owned")) |n| {
         cells += n.int64() orelse 0;

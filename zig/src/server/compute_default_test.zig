@@ -16,12 +16,12 @@ const bash_tool =
 ;
 
 /// What one chat through the route did: its status, body, the prompt the engine got and the resumes it saw.
-const Run = struct { code: u16, body: json.Value, prompt: []const u32, held: bool, resumes: usize };
+const Run = struct { code: u16, body: json.Value, prompt: []const u32, held: bool, resumes: usize, run_cells: bool };
 
-/// The model's first segment: a python call, a bash call, or a plain answer; then "It is 42." after any result.
-const Model = enum { python_call, bash_call, answer };
+/// The model's first segment: a python call, one with no code, a bash call, or a plain answer; then "It is 42.".
+const Model = enum { python_call, no_code, bash_call, answer };
 
-const Ask = struct { default: bool, tools: ?[]const u8 = null, choice: ?[]const u8 = null, model: Model = .answer };
+const Ask = struct { default: bool, tools: ?[]const u8 = null, choice: ?[]const u8 = null, model: Model = .answer, max_calls: u32 = 8, runner: bool = false };
 
 fn chat(a: Allocator, ask: Ask) !Run {
     std.Io.Dir.accessAbsolute(t.io, python, .{}) catch return error.SkipZigTest;
@@ -37,6 +37,9 @@ fn chat(a: Allocator, ask: Ask) !Run {
         .python_call =>
         \\{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"python","arguments":"{\"code\":\"print(6*7)\"}"}}]}
         ,
+        .no_code =>
+        \\{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"python","arguments":"{}"}}]}
+        ,
         .bash_call =>
         \\{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}]}
         ,
@@ -51,9 +54,15 @@ fn chat(a: Allocator, ask: Ask) !Run {
     script.* = .{ .a = a, .call = called[asked.len..], .answer = answer };
     const srv = try @import("server.zig").Server.init(a, t.io, script.engine(), text, .{ .served_name = "m", .model_ids = &.{"m"}, .enable_thinking = false, .use_drafts = false }, null);
     defer srv.deinit();
-    const cfg: lane.Config = .{ .python = python, .default = ask.default };
+    const cfg: lane.Config = .{ .python = python, .default = ask.default, .max_calls = ask.max_calls };
     srv.info.compute = cfg;
     srv.compute = lane.Pool.init(cfg, &.{ "/bin/sh", "-c", "exec \"$0\" -I -B -u -c \"$1\"", python, lane.runner.runner });
+    // the in-model runner on (its cells are the engine's: the fixture only reads that the request asks for them)
+    var rn: api.runner.Runner = undefined;
+    if (ask.runner) {
+        rn.cfg = .{};
+        srv.info.runner = &rn;
+    }
     var reply: h.Reply = .{ .a = a };
     var conn = try @import("http_conn.zig").Conn.init(a, -1, "fixture");
     defer conn.deinit();
@@ -65,7 +74,7 @@ fn chat(a: Allocator, ask: Ask) !Run {
     if (ask.choice) |c| try body.put(a, "tool_choice", try h.obj(a, c));
     @import("openai.zig").run(srv, a, reply.out(), .{ .conn = &conn }, true, .{ .object = body });
     errdefer std.debug.print("COMPUTE_DEFAULT_REPLY {s}\n", .{json.stringify(a, reply.body, .{}) catch ""});
-    return .{ .code = reply.code, .body = reply.body, .prompt = script.prompt, .held = script.held_asked, .resumes = script.resumes.items.len };
+    return .{ .code = reply.code, .body = reply.body, .prompt = script.prompt, .held = script.held_asked, .resumes = script.resumes.items.len, .run_cells = script.run_cells };
 }
 
 fn executed(r: Run) ?json.Value {
@@ -133,9 +142,54 @@ test "compute lane: under the default a client's own code_interpreter or built-i
     try t.expectEqual(@as(u16, 200), copy.code);
     try t.expectEqualSlices(u32, none.prompt, twice.prompt);
     try t.expectEqualSlices(u32, none.prompt, copy.prompt);
-    // a client's own different python function still refuses next to the built-in
-    const other = try chat(a, .{ .default = true, .tools = "[{\"type\":\"function\",\"function\":{\"name\":\"python\",\"parameters\":{\"type\":\"object\"}}}]" });
-    try t.expect(other.code >= 400);
+    // its python call runs in the engine and counts
+    const ran = try chat(a, .{ .default = true, .tools = "[{\"type\":\"code_interpreter\"}]", .model = .python_call });
+    try t.expectEqual(@as(u16, 200), ran.code);
+    try t.expectEqual(@as(usize, 2), ran.resumes);
+    try t.expectEqual(@as(i64, 1), try count(ran, "total"));
+    // code_interpreter next to the client's own python function refuses as it does with the default off
+    const both = "[{\"type\":\"code_interpreter\"}," ++ client_python ++ "]";
+    try t.expect((try chat(a, .{ .default = true, .tools = both })).code >= 400);
+    try t.expect((try chat(a, .{ .default = false, .tools = both })).code >= 400);
+}
+
+const client_python =
+    \\{"type":"function","function":{"name":"python","description":"Run Python on my machine","parameters":{"type":"object","properties":{"code":{"type":"string"}},"required":["code"]}}}
+;
+
+test "compute lane: under the default a client's own python function keeps the name, its call goes back, the runner runs" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tools = "[" ++ client_python ++ "]";
+    const r = try chat(a, .{ .default = true, .tools = tools, .model = .python_call, .runner = true });
+    try t.expectEqual(@as(u16, 200), r.code);
+    try t.expect(!r.held); // no built-in tool: nothing holds, nothing runs in the sandbox
+    try t.expect(r.run_cells);
+    const choice = r.body.get("choices").?.array[0];
+    try t.expectEqualStrings("tool_calls", choice.get("finish_reason").?.string);
+    const call = choice.get("message").?.get("tool_calls").?.array[0];
+    try t.expectEqualStrings("python", call.get("function").?.strField("name").?);
+    try t.expect(std.mem.indexOf(u8, call.get("function").?.strField("arguments").?, "print(6*7)") != null);
+    try t.expectEqual(@as(i64, 0), try count(r, "total"));
+    // the prompt is the client's own, as with the default off
+    const off = try chat(a, .{ .default = false, .tools = tools, .model = .python_call, .runner = true });
+    try t.expectEqualSlices(u32, off.prompt, r.prompt);
+}
+
+test "compute lane: the executed counter skips a call with no code and a call past the cap" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const malformed = try chat(a, .{ .default = true, .model = .no_code });
+    try t.expectEqual(@as(u16, 200), malformed.code);
+    try t.expectEqual(@as(usize, 1), malformed.body.get("tensorfold").?.get("compute").?.get("calls").?.array.len);
+    try t.expectEqual(@as(i64, 0), try count(malformed, "calls"));
+    try t.expectEqual(@as(i64, 0), try count(malformed, "total"));
+    const capped = try chat(a, .{ .default = true, .model = .python_call, .max_calls = 0 });
+    try t.expectEqual(@as(u16, 200), capped.code);
+    try t.expectEqual(@as(usize, 1), capped.body.get("tensorfold").?.get("compute").?.get("calls").?.array.len);
+    try t.expectEqual(@as(i64, 0), try count(capped, "total"));
 }
 
 test "compute lane: under the default tool_choice none hides the client's tools but not the built-in" {
@@ -192,19 +246,25 @@ test "compute lane: the default takes the boot's guide over a request's runner_g
     try t.expect(turns.guideAsked(srv, fields) == null);
 }
 
-test "compute lane: the executed counter adds built-in calls and the runner cells the engine wrote" {
+test "compute lane: the executed counter adds built-in calls run and the runner cells the engine wrote" {
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    // three reports, two of them run: the counter takes the runs, not the reports
     const runtime = try h.obj(a,
-        \\{"compute":{"calls":[{"name":"python"},{"name":"python"}]},"runner":{"fence":{"closed":3,"owned":2,"abstained":1,"owned_tokens":9},"repl":{"closed":0,"owned":0,"abstained":0,"owned_tokens":0},"inline":{"closed":1,"owned":1,"abstained":0,"owned_tokens":2},"trace":{"closed":0,"owned":0,"abstained":0,"owned_tokens":0}}}
+        \\{"compute":{"calls":[{"name":"python"},{"name":"python"},{"name":"python"}]},"runner":{"fence":{"closed":3,"owned":2,"abstained":1,"owned_tokens":9},"repl":{"closed":0,"owned":0,"abstained":0,"owned_tokens":0},"inline":{"closed":1,"owned":1,"abstained":0,"owned_tokens":2},"trace":{"closed":0,"owned":0,"abstained":0,"owned_tokens":0}}}
     );
-    try turns.countExecuted(a, runtime);
+    try turns.countExecuted(a, runtime, 2);
     const c = runtime.get("compute_executed").?;
     try t.expectEqual(@as(i64, 2), c.get("calls").?.int64().?);
     try t.expectEqual(@as(i64, 3), c.get("runner_cells").?.int64().?);
     try t.expectEqual(@as(i64, 5), c.get("total").?.int64().?);
     const empty = try h.obj(a, "{}");
-    try turns.countExecuted(a, empty);
+    try turns.countExecuted(a, empty, 0);
     try t.expectEqual(@as(i64, 0), empty.get("compute_executed").?.get("total").?.int64().?);
+    const cell = try h.obj(a,
+        \\{"runner":{"fence":{"closed":1,"owned":1,"abstained":0,"owned_tokens":3}}}
+    );
+    try turns.countExecuted(a, cell, 0);
+    try t.expectEqual(@as(i64, 1), cell.get("compute_executed").?.get("total").?.int64().?);
 }

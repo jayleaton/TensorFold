@@ -17,6 +17,7 @@ pub const Script = struct {
     sink: ?api.Sink = null,
     id: api.Id = 0,
     held_asked: bool = false,
+    run_cells: bool = false,
     prompt: []const u32 = &.{}, // the submitted prompt's ids
     resumes: std.ArrayList([]const u32) = .empty,
 
@@ -29,6 +30,7 @@ pub const Script = struct {
     fn submit(ctx: *anyopaque, id: api.Id, request: *const api.Request, sink: api.Sink) api.SubmitError!void {
         const s: *@This() = @ptrCast(@alignCast(ctx));
         s.held_asked = request.hold_eos;
+        s.run_cells = request.run_cells;
         s.prompt = s.a.dupe(u32, request.prompt) catch unreachable;
         s.sink = sink;
         s.id = id;

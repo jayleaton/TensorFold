@@ -67,6 +67,7 @@ pub const Reply = struct {
     loop_stop: ?u32 = null, // the loop period when --loop-guard-stop ended the reply in its reasoning
     runner_raw: ?[2][]const u8 = null, // with abstain records: the runner's raw field bytes (runner_projection.zig)
     owned: ?@import("reply_text.zig").Owned = null, // runner cells' bytes in `content`, which no strip may cut
+    compute_ran: usize = 0, // the lane's built-in calls the runner or the sandbox ran (not malformed or past the cap)
 };
 
 pub const Failure = error{ Refused, Cancelled, Failed, OutOfMemory };
@@ -255,7 +256,7 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
         break :blk gen.finish(cx, prepared.prompt_len, received, thinking, effort, prepared.sampled, prepared.drafts);
     };
     if (result) |r| {
-        if (@import("compute_turns.zig").forced(srv)) try @import("compute_turns.zig").countExecuted(a, r.runtime);
+        if (@import("compute_turns.zig").forced(srv)) try @import("compute_turns.zig").countExecuted(a, r.runtime, r.compute_ran);
     } else |e| logEnded(input.id, e, cx.message, prepared.prompt_len, gen.collected.items.len, seconds(nowNs(io) - received));
     return result;
 }

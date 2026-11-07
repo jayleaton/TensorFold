@@ -29,6 +29,7 @@ const Merge = struct {
     inserted: usize = 0,
     owned: ?reply_text.Owned = null, // the segments' runner bytes in `content` (Generation.ownedOf)
     calls: std.ArrayList(Value) = .empty, // one report a call
+    ran: usize = 0, // the calls an executor ran (Reply.compute_ran)
     history: std.ArrayList(Value) = .empty, // the request's messages, then each segment's call turn and results
 };
 
@@ -50,7 +51,7 @@ pub fn rest(first: *Generation, cx: *Cx, p: chat.Prepared, filter: *turns.Filter
         var reports: []Value = &.{};
         if (calls.len > 0 and used + answer_room < p.request.max_tokens) {
             assistant = try assistantTurn(a, answer.prose, answer.reasoning, calls);
-            reports = try runAll(a, srv, cfg, calls, &run_calls, gone);
+            reports = try runAll(a, srv, cfg, calls, &run_calls, &m.ran, gone);
             plan = try suffix(srv, cx, p, &m.history, assistant, calls, reports);
             if (plan) |s| if (used + s.len + answer_room > p.request.max_tokens) {
                 plan = null;
@@ -125,8 +126,8 @@ fn segmentAnswer(g: *Generation) chat.Failure!Answer {
     return .{ .prose = parsed.content, .reasoning = reasoning, .calls = parsed.calls };
 }
 
-/// Runs each call in order (results stay in call order); past the reply's call cap a call gets that note instead.
-fn runAll(a: Allocator, srv: *Server, cfg: lane.Config, calls: []const Value, ran: *u32, gone: anytype) chat.Failure![]Value {
+/// Runs each call in order (results in call order); past the call cap, a note; `executed` counts calls an executor ran.
+fn runAll(a: Allocator, srv: *Server, cfg: lane.Config, calls: []const Value, ran: *u32, executed: *usize, gone: anytype) chat.Failure![]Value {
     const Watch = struct {
         gone: @TypeOf(gone),
         fn left(ctx: *anyopaque) bool {
@@ -154,11 +155,14 @@ fn runAll(a: Allocator, srv: *Server, cfg: lane.Config, calls: []const Value, ra
             if (s3) |r| if (r == .declined and r.declined == .cancelled) return error.Cancelled;
             const owned = ownedOf(s3);
             const shadow = owned != null and srv.compute_exec.?.cfg.verify;
+            var started = owned != null;
             if (owned == null or shadow) {
                 if (code) |src| o = try srv.compute.?.run(a, src, hook);
                 if (o.status == .cancelled) return error.Cancelled;
+                if (code != null and o.status != .unavailable) started = true;
                 body = try lane.runner.body(a, o, cfg.max_ms, cfg.max_output_bytes);
             }
+            if (started) executed.* += 1;
             if (owned) |w| if (shadow) {
                 verify = std.mem.eql(u8, w.body, body);
                 if (!verify.?) log.line("warning: compute lane verify: the circuit printed [{s}], the sandbox [{s}]", .{ w.body, body });
@@ -304,6 +308,7 @@ fn merge(a: Allocator, m: *Merge, last: chat.Reply, last_ids: []const u32) chat.
     if (m.reasoning.items.len > 0) r.reasoning = try std.mem.concat(a, u8, &.{ m.reasoning.items, last.reasoning orelse "" });
     r.completion_tokens += m.completion;
     r.reasoning_tokens += m.reasoning_tokens;
+    r.compute_ran = m.ran;
     if (m.calls.items.len == 0 and m.inserted == 0) return r;
     const rt = r.runtime.object;
     const tail = if (rt.get("token_ids")) |t| t.array else &[_]Value{};
