@@ -2,6 +2,15 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+/// Whether `word` ends in a TeX command (`\times`, `\bmod`, `\cdot`) or `times`: an operator before the expression.
+fn operatorWord(word: []const u8) bool {
+    var k = word.len;
+    while (k > 0 and std.ascii.isAlphabetic(word[k - 1])) k -= 1;
+    if (k == word.len) return false;
+    if (k > 0 and word[k - 1] == '\\') return true;
+    return std.ascii.eqlIgnoreCase(word[k..], "times");
+}
+
 /// A whole arithmetic expression ending the line at `=` or `= ` (no comparison, word, gap; chain only with `chain`).
 pub fn inlineExpr(line: []const u8, arith: bool, chain: bool) ?struct { expr: []const u8, space: bool, call: bool = false } {
     var t = line;
@@ -60,6 +69,8 @@ pub fn inlineExpr(line: []const u8, arith: bool, chain: bool) ?struct { expr: []
         // the modulus of `A mod M` or `A % M` is not the whole expression (live bn-011: `3^400 mod 10^18 =`)
         if (std.mem.endsWith(u8, word, "%") or (word.len >= 3 and std.ascii.eqlIgnoreCase(word[word.len - 3 ..], "mod") and
             (word.len == 3 or !std.ascii.isAlphanumeric(word[word.len - 4])))) return null;
+        // nor is the right operand of a TeX or worded operator (SparkDash: `\(4 \times 49 - 11 =` got 38, `\bmod` 9563)
+        if (operatorWord(word)) return null;
         // `1, 234 + 5 =`: the expression is the next item of a number list
         if (word.len >= 2 and word[word.len - 1] == ',' and std.ascii.isDigit(word[word.len - 2])) return null;
         // `Add 11,529,600 +1 =` adds to a running total the model holds; a lone operand (`subtract 3^67 =`) is fine

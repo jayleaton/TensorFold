@@ -98,6 +98,16 @@ const refused = [_][]const u8{
     "147,000+73) =",
     "((1,000+2) =",
     "1,000+2)) =",
+    // the right operand of a TeX or worded operator (SparkDash e89f8d1 reason-09 and arith-27 on the compute default)
+    "- Jamal: \\(4 \\times 49 - 11 =",
+    "1. \\(221 \\bmod 4331 + 1000 =",
+    "9. \\(15314 \\bmod 8563 + 1000 =",
+    "Target floor: \\(4 \\times 3 + 6 =",
+    "\\(68 \\div 2 + 10 =",
+    "\\(0.5^2 \\times 0.06^2 =",
+    "Surface area of cube with side 2: \\(6 \\cdot 2^2 =",
+    "x \\cdot 3 + 4 =",
+    "4 times 49 - 11 =",
     // a running total the model holds
     "Add 11,529,600 +1 =",
     "Minus 2,386,000 +25 =",
