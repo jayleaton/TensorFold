@@ -133,13 +133,6 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
     const logprobs = if (is_chat) try fields.probabilityOptions(cx, body, exact_bytes) else try fields.legacyLogprobs(cx, body, exact_bytes);
     if (srv.config.request_log) |path| request_log.append(cx.a, path, body);
     var input: chat.Input = .{ .fields = undefined };
-    if (is_chat) {
-        input.messages = try messages.normalizeWith(cx, body.get("messages"), "system", srv.needs_user_after_tool, .of(srv.info.vision));
-        input.tools = try @import("compute_turns.zig").tools(srv, cx, body.get("tools"), body.get("tool_choice"));
-    } else if (body.get("messages")) |m| if (m == .array and m.array.len > 0) {
-        input.messages = try messages.normalizeWith(cx, m, "system", srv.needs_user_after_tool, .of(srv.info.vision));
-    };
-    if (!is_chat and input.messages.array.len == 0) input.prompt = try legacyPrompt(srv, cx, body.get("prompt"));
     // ``body.get("max_tokens") or body.get("max_completion_tokens")``: both are ints or None by now
     const first = body.get("max_tokens");
     const max = if (first != null and first.?.truthy()) first else body.get("max_completion_tokens");
@@ -148,6 +141,13 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
         .null => null,
         else => 0,
     } else null;
+    if (is_chat) {
+        input.messages = try messages.normalizeWith(cx, body.get("messages"), "system", srv.needs_user_after_tool, .of(srv.info.vision));
+        try @import("compute_turns.zig").requestTools(srv, cx, body, &input, logprobs != null); // after max_tokens
+    } else if (body.get("messages")) |m| if (m == .array and m.array.len > 0) {
+        input.messages = try messages.normalizeWith(cx, m, "system", srv.needs_user_after_tool, .of(srv.info.vision));
+    };
+    if (!is_chat and input.messages.array.len == 0) input.prompt = try legacyPrompt(srv, cx, body.get("prompt"));
     if (body.get("temperature")) |t| if (t.truthy()) {
         input.temperature = if (t == .float) t.float else std.fmt.parseFloat(f64, t.int) catch 0;
     };
@@ -338,7 +338,7 @@ const Run = struct {
         // max_tokens cut a call the stream had begun: the whole reply returns it cut too, as the stream did (#1238)
         const cut = if (!r.plan.policy.single and std.mem.eql(u8, reply.finish_reason, "length")) try tool_stream.cutCalls(r.a, reply.content, tools) else null;
         if (cut != null) reply.content = try @import("reply_text.zig").cutProse(r.a, reply.content, reply.owned);
-        const found = cut orelse parsed.calls;
+        const found = try @import("compute_turns.zig").ownCalls(r.a, r.plan.input.lane_own, reply, cut orelse parsed.calls, if (cut != null) reply.content else parsed.content);
         const calls = (if (r.turn != null) cortheon.clientCalls(found) else found) orelse {
             if (r.plan.policy.single or parsed.calls != null) reply.content = try r.plan.policy.parsedContent(r.a, parsed.content);
             return null;

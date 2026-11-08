@@ -160,6 +160,7 @@ test {
     _ = @import("compute_segments.zig");
     _ = @import("compute_lane_http_test.zig");
     _ = @import("compute_default_test.zig");
+    _ = @import("compute_default_fit_test.zig");
     _ = @import("runner_owned_http_test.zig");
     _ = @import("runner_owned.zig");
     // the benchmark command's serve child runs under POSIX signals and waits; Windows refuses the command

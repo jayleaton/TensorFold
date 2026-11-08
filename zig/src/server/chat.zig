@@ -35,6 +35,8 @@ pub const Input = struct {
     logprobs: ?u8 = null,
     /// ``/v1/completions``' ``prompt_logprobs``: rows for the prompt with this many alternatives; null: not asked.
     prompt_logprobs: ?u8 = null,
+    /// `tools` holds the compute default's own built-in tool (compute_turns.ownedByServer): its calls stay unseen.
+    lane_own: bool = false,
 };
 
 /// A streamed piece: content text (a string) or a delta object (reasoning or tool calls).
@@ -104,7 +106,8 @@ pub fn prepare(srv: *Server, cx: *Cx, given: Input, gone: anytype) Failure!Prepa
     const a = cx.a;
     var input = given;
     // the runner guide (runner_guide.zig) with the runner on: the request's, or the boot's under the compute default
-    const asked_guide = @import("compute_turns.zig").guideAsked(srv, input.fields);
+    const thinks = input.prompt == null and (flag(input.fields, "enable_thinking") orelse srv.config.enable_thinking);
+    const asked_guide = @import("compute_turns.zig").guideAsked(srv, input.fields, thinks);
     const guided = @import("runner_guide.zig").apply(a, if (srv.info.runner != null and input.prompt == null) &srv.guides else null, asked_guide, input.messages) catch |e| switch (e) {
         error.BadGuide => return cx.refuse(try srv.guides.refusal(a)),
         error.OutOfMemory => return error.OutOfMemory,
@@ -245,7 +248,7 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
     preparing = false;
     var filter: @import("compute_turns.zig").Filter = .{ .a = a, .inner = if (sink) |s| s else undefined };
     const shown: ?Sink = if (request.hold_eos and sink != null) filter.sink() else sink; // built-in calls stay hidden
-    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .seed = if (request.sampling) |v| v.seed else null, .sink = shown, .hold = request.hold_eos, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .token_ids = prepared.token_ids, .guide = prepared.guide, .lp = if (request.logprobs != null) .{} else null, .loop_stop = request.loop_stop, .deadline_ns = prepared.deadline_ns };
+    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .seed = if (request.sampling) |v| v.seed else null, .sink = shown, .hold = request.hold_eos, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .token_ids = prepared.token_ids, .guide = prepared.guide, .lp = if (request.logprobs != null) .{} else null, .loop_stop = request.loop_stop, .deadline_ns = prepared.deadline_ns, .lane_own = input.lane_own };
     defer srv.noteRequest(prepared.prompt_len, box.cached orelse 0, gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
     const result: Failure!Reply = blk: {

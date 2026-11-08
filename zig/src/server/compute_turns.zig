@@ -45,13 +45,36 @@ pub fn forced(srv: *const Server) bool {
     return srv.compute != null and srv.info.compute.?.default;
 }
 
-/// The request's own "runner_guide", or null (the boot's guide) under the compute default, whatever the request sends.
-pub fn guideAsked(srv: *const Server, fields: Value) ?Value {
-    return if (forced(srv)) null else fields.get("runner_guide");
+/// The request's own "runner_guide"; under the default the boot's (null) for a thinking chat, else none (""), always.
+pub fn guideAsked(srv: *const Server, fields: Value, thinking: bool) ?Value {
+    // the boot's guide was measured inside thinking; in a visible answer it writes `<expr> =` cells at the client
+    return if (!forced(srv)) fields.get("runner_guide") else if (thinking) null else .{ .string = "" };
 }
 
-/// The request's tools with `{"type": "code_interpreter"}` as the built-in tool (in every chat under the default).
-pub fn tools(srv: *Server, cx: *Cx, raw: ?Value, choice: ?Value) errors.Refused![]Value {
+/// Under this max_tokens the default offers no built-in tool unasked: a call, its result and an answer do not fit.
+pub const default_min_tokens = 1024;
+
+/// What a request asks, known before it renders, that decides whether its reply can hold for the lane (`arms`).
+pub const Fit = struct { max_tokens: i64, stop: bool = false, logprobs: bool = false, structured: bool = false };
+
+/// Whether a reply that asked `f` holds at its EOS and has room for a call, its result and an answer.
+fn fits(f: Fit) bool {
+    return !f.stop and !f.logprobs and !f.structured and f.max_tokens >= default_min_tokens;
+}
+
+/// A chat body's tools (`tools`) and `lane_own` into `input`, whose max_tokens is read; `logprobs`: rows asked.
+pub fn requestTools(srv: *Server, cx: *Cx, body: Value, input: *chat.Input, logprobs: bool) errors.Refused!void {
+    var structured = false;
+    for (@import("grammar.zig").fields) |k| structured = structured or json.truthyField(body, k);
+    // chat.zig's limit: max_tokens, or the server's default for 0 and unset
+    const budget = if (input.max_tokens) |m| (if (m != 0) m else srv.config.default_max_tokens) else srv.config.default_max_tokens;
+    const fit: Fit = .{ .max_tokens = budget, .stop = json.truthyField(body, "stop"), .logprobs = logprobs or json.truthyField(body, "prompt_logprobs"), .structured = structured };
+    input.tools = try tools(srv, cx, body.get("tools"), body.get("tool_choice"), fit);
+    input.lane_own = ownedByServer(srv, body.get("tools"), input.tools);
+}
+
+/// The request's tools, `{"type": "code_interpreter"}` as the built-in tool (the default's: every chat that `fit`s).
+pub fn tools(srv: *Server, cx: *Cx, raw: ?Value, choice: ?Value, fit: Fit) errors.Refused![]Value {
     const always = forced(srv);
     const list = raw orelse Value{ .array = &.{} };
     if (list != .array and !always) return tool_specs.active(cx, raw, choice);
@@ -61,7 +84,7 @@ pub fn tools(srv: *Server, cx: *Cx, raw: ?Value, choice: ?Value) errors.Refused!
         const kind = if (t == .object) t.strField("type") orelse "" else "";
         if (std.mem.eql(u8, kind, opt_in)) listed = true else try rest.append(cx.a, t);
     };
-    if (!listed and !always) return tool_specs.active(cx, raw, choice);
+    if (!listed and (!always or !fits(fit))) return tool_specs.active(cx, raw, choice);
     if (srv.compute == null) return cx.other("code_interpreter is not enabled on this server");
     var specs = try tool_specs.active(cx, if (list == .array) .{ .array = rest.items } else raw, choice);
     // a client's own copy of the built-in definition is the same tool: one declaration, not a refusal (default only)
@@ -114,6 +137,31 @@ fn toolName(t: Value) []const u8 {
 pub fn isBuiltIn(t: Value) bool {
     const f = t.get("function") orelse return false;
     return std.mem.eql(u8, f.strField("name") orelse "", name) and std.mem.eql(u8, f.strField("description") orelse "", description);
+}
+
+/// Whether `specs` hold the default's own built-in tool (no code_interpreter listed): its calls never reach the client.
+pub fn ownedByServer(srv: *const Server, raw: ?Value, specs: []const Value) bool {
+    if (!forced(srv)) return false;
+    if (raw) |list| if (list == .array) for (list.array) |t| {
+        if (t == .object and std.mem.eql(u8, t.strField("type") orelse "", opt_in)) return false;
+    };
+    for (specs) |t| if (isBuiltIn(t)) return true;
+    return false;
+}
+
+/// A reply's calls for its client (`own`: the default's tool, whose unrun calls end the reply at length, unseen).
+pub fn ownCalls(a: Allocator, own: bool, reply: *chat.Reply, found: ?[]Value, prose: []const u8) Allocator.Error!?[]Value {
+    if (!own) return found;
+    const all: []const Value = found orelse &.{};
+    var kept: std.ArrayList(Value) = .empty;
+    for (all) |c| if (!isBuiltInCall(c)) try kept.append(a, c);
+    const dropped = kept.items.len < all.len;
+    // a call the lane could not run (no room left), or one max_tokens cut: the budget ended the reply
+    if (dropped or (found == null and std.mem.eql(u8, reply.finish_reason, "length"))) {
+        reply.content = try @import("reply_text.zig").cutProse(a, prose, reply.owned);
+        reply.finish_reason = "length";
+    }
+    return if (kept.items.len > 0) kept.items else null;
 }
 
 /// Whether a call names the built-in tool.

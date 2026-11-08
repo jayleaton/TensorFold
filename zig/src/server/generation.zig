@@ -63,6 +63,7 @@ pub const Generation = struct {
     deadline_ns: ?i96 = null, // "deadline_s": when the server ends the reply itself
     deadline_hit: bool = false, // it did: the engine was cancelled there; what it gave before its end still lands
     base: usize = 0, // the reply's tokens before this segment's (compute_segments.zig): the runner records count them
+    lane_own: bool = false, // Input.lane_own: a call max_tokens cut never shows as prose, as the reply's own call
 
     fn eos(g: *const Generation, t: u32) bool {
         return !g.ignore_eos and std.mem.indexOfScalar(u32, g.srv.eos, t) != null;
@@ -325,7 +326,8 @@ pub const Generation = struct {
             const thought = g.streamed_reasoning.text.items;
             if (reasoning) |r| if (std.mem.startsWith(u8, r, thought) and r.len > thought.len)
                 try g.emit(sink, try deltaOf(a, "reasoning_content", r[thought.len..]));
-            const shown = if (g.calls != null) try tool_stream.endProse(a, content, if (g.thinking) content else text, g.tools, reason, owned) else content;
+            const cut = g.lane_own and std.mem.eql(u8, reason, "length");
+            const shown = if (cut) try reply_text.cutProse(a, content, owned) else if (g.calls != null) try tool_stream.endProse(a, content, if (g.thinking) content else text, g.tools, reason, owned) else content;
             const sent = g.streamed.text.items;
             const rest = if (std.mem.startsWith(u8, shown, sent) and shown.len > sent.len) shown[sent.len..] else "";
             if (g.lp) |*l| (if (try l.delta(g.srv, a, g.thinking, g.ignore_eos, g.collected.items, rest, shown.len, true)) |d| try g.emit(sink, d)) else if (rest.len > 0) try g.emit(sink, .{ .string = rest });

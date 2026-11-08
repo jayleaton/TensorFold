@@ -68,7 +68,7 @@ fn chat(a: Allocator, ask: Ask) !Run {
     defer conn.deinit();
     const body = try json.newObject(a);
     try body.put(a, "model", .{ .string = "m" });
-    try body.put(a, "max_tokens", try json.intValue(a, 400));
+    try body.put(a, "max_tokens", try json.intValue(a, 2048)); // past turns.default_min_tokens
     try body.put(a, "messages", history);
     if (ask.tools) |tools| try body.put(a, "tools", try h.obj(a, tools));
     if (ask.choice) |c| try body.put(a, "tool_choice", try h.obj(a, c));
@@ -237,13 +237,18 @@ test "compute lane: the default takes the boot's guide over a request's runner_g
     const srv = try @import("server.zig").Server.init(a, t.io, script.engine(), hf.text(), .{ .served_name = "m", .model_ids = &.{"m"}, .enable_thinking = false, .use_drafts = false }, null);
     defer srv.deinit();
     const fields = try h.obj(a, "{\"runner_guide\":\"\"}");
-    try t.expectEqualStrings("", turns.guideAsked(srv, fields).?.string); // no lane: the request's own
-    try t.expect(turns.guideAsked(srv, try h.obj(a, "{}")) == null);
+    try t.expectEqualStrings("", turns.guideAsked(srv, fields, true).?.string); // no lane: the request's own
+    try t.expect(turns.guideAsked(srv, try h.obj(a, "{}"), true) == null);
     srv.info.compute = .{ .python = python, .default = false };
     srv.compute = lane.Pool.init(srv.info.compute.?, &.{"/nonexistent"});
-    try t.expectEqualStrings("", turns.guideAsked(srv, fields).?.string);
+    try t.expectEqualStrings("", turns.guideAsked(srv, fields, true).?.string);
     srv.info.compute.?.default = true;
-    try t.expect(turns.guideAsked(srv, fields) == null);
+    try t.expect(turns.guideAsked(srv, fields, true) == null);
+    // a chat with thinking off gets no guide under the default (it writes cells into the visible answer)
+    try t.expectEqualStrings("", turns.guideAsked(srv, fields, false).?.string);
+    srv.info.compute.?.default = false;
+    try t.expectEqualStrings("", turns.guideAsked(srv, fields, false).?.string); // off: the request's own, as before
+    try t.expect(turns.guideAsked(srv, try h.obj(a, "{}"), false) == null);
 }
 
 test "compute lane: the executed counter adds built-in calls run and the runner cells the engine wrote" {
