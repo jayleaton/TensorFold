@@ -36,11 +36,11 @@ pub fn open(srv: *Server, cfg: lane.Config) !lane.Pool {
         return error.ComputeLaneUnavailable;
     };
     std.log.info("compute lane: {s} in a sandbox, {d} at a time, {d} ms, {d} MiB, results up to {d} tokens, {d} calls a reply", .{ cfg.python, cfg.workers, cfg.max_ms, cfg.mem_mb, cfg.max_result_tokens, cfg.max_calls });
-    if (cfg.default) std.log.info("compute default: every chat gets the built-in tool and the runner's guide, whatever it sends", .{});
+    if (cfg.default) std.log.info("compute default: every thinking chat gets the built-in tool and the runner's guide, whatever it sends", .{});
     return pool;
 }
 
-/// Whether the server gives every chat the built-in tool and the runner's guide (TF_DSV41_COMPUTE_LANE_DEFAULT=1).
+/// Whether thinking chats get the built-in tool and the boot's guide, whatever they send (the compute default).
 pub fn forced(srv: *const Server) bool {
     return srv.compute != null and srv.info.compute.?.default;
 }
@@ -55,11 +55,12 @@ pub fn guideAsked(srv: *const Server, fields: Value, thinking: bool) ?Value {
 pub const default_min_tokens = 1024;
 
 /// What a request asks, known before it renders, that decides whether its reply can hold for the lane (`arms`).
-pub const Fit = struct { max_tokens: i64, stop: bool = false, logprobs: bool = false, structured: bool = false };
+pub const Fit = struct { max_tokens: i64, thinking: bool = true, stop: bool = false, logprobs: bool = false, structured: bool = false };
 
-/// Whether a reply that asked `f` holds at its EOS and has room for a call, its result and an answer.
+/// Whether a reply that asked `f` thinks, holds at its EOS and has room for a call, its result and an answer.
 fn fits(f: Fit) bool {
-    return !f.stop and !f.logprobs and !f.structured and f.max_tokens >= default_min_tokens;
+    // unthinking, the prose before a call is the visible answer and the result's answer runs on into it
+    return f.thinking and !f.stop and !f.logprobs and !f.structured and f.max_tokens >= default_min_tokens;
 }
 
 /// A chat body's tools (`tools`) and `lane_own` into `input`, whose max_tokens is read; `logprobs`: rows asked.
@@ -68,7 +69,8 @@ pub fn requestTools(srv: *Server, cx: *Cx, body: Value, input: *chat.Input, logp
     for (@import("grammar.zig").fields) |k| structured = structured or json.truthyField(body, k);
     // chat.zig's limit: max_tokens, or the server's default for 0 and unset
     const budget = if (input.max_tokens) |m| (if (m != 0) m else srv.config.default_max_tokens) else srv.config.default_max_tokens;
-    const fit: Fit = .{ .max_tokens = budget, .stop = json.truthyField(body, "stop"), .logprobs = logprobs or json.truthyField(body, "prompt_logprobs"), .structured = structured };
+    const thinking = (try @import("fields.zig").thinkingFields(cx, body, srv.effort_levels)).enable orelse srv.config.enable_thinking;
+    const fit: Fit = .{ .max_tokens = budget, .thinking = thinking, .stop = json.truthyField(body, "stop"), .logprobs = logprobs or json.truthyField(body, "prompt_logprobs"), .structured = structured };
     input.tools = try tools(srv, cx, body.get("tools"), body.get("tool_choice"), fit);
     input.lane_own = ownedByServer(srv, body.get("tools"), input.tools);
 }

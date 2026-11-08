@@ -1,4 +1,4 @@
-//! The compute default (TF_DSV41_COMPUTE_LANE_DEFAULT=1) through the chat route: every chat gets the built-in tool.
+//! The compute default (TF_DSV41_COMPUTE_LANE_DEFAULT=1) through the chat route: thinking chats get the built-in tool.
 const std = @import("std");
 const json = @import("json");
 const api = @import("engine_api");
@@ -21,7 +21,7 @@ const Run = struct { code: u16, body: json.Value, prompt: []const u32, held: boo
 /// The model's first segment: a python call, one with no code, a bash call, or a plain answer; then "It is 42.".
 const Model = enum { python_call, no_code, bash_call, answer };
 
-const Ask = struct { default: bool, tools: ?[]const u8 = null, choice: ?[]const u8 = null, model: Model = .answer, max_calls: u32 = 8, runner: bool = false };
+const Ask = struct { default: bool, tools: ?[]const u8 = null, choice: ?[]const u8 = null, model: Model = .answer, max_calls: u32 = 8, runner: bool = false, think: bool = true };
 
 fn chat(a: Allocator, ask: Ask) !Run {
     std.Io.Dir.accessAbsolute(t.io, python, .{}) catch return error.SkipZigTest;
@@ -32,7 +32,7 @@ fn chat(a: Allocator, ask: Ask) !Run {
     defer hf.deinit();
     const text = hf.text();
     const history = try tf.messages(a, "What is 6*7?");
-    const asked = try text.renderIds(a, history, .{ .add_generation_prompt = true }, &problem);
+    const asked = try text.renderIds(a, history, .{ .add_generation_prompt = true, .enable_thinking = ask.think }, &problem);
     const call_turn = try h.obj(a, switch (ask.model) {
         .python_call =>
         \\{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"python","arguments":"{\"code\":\"print(6*7)\"}"}}]}
@@ -47,9 +47,12 @@ fn chat(a: Allocator, ask: Ask) !Run {
         \\{"role":"assistant","content":"It is 42."}
         ,
     });
-    const called = try text.renderIds(a, try h.appendTo(a, history, &.{call_turn}), .{ .add_generation_prompt = false }, &problem);
+    const called = try text.renderIds(a, try h.appendTo(a, history, &.{call_turn}), .{ .add_generation_prompt = false, .enable_thinking = ask.think }, &problem);
     const eos = called[called.len - 1];
-    const answer = try std.mem.concat(a, u32, &.{ try text.encodePlain(a, "It is 42."), &.{eos} });
+    // thinking, the tool-result turn reopens <think>: the answer closes it first, as the call turn did
+    const close_id = [_]u32{text.tokenId("</think>").?};
+    const close: []const u32 = if (ask.think) &close_id else &.{};
+    const answer = try std.mem.concat(a, u32, &.{ close, try text.encodePlain(a, "It is 42."), &.{eos} });
     const script = try a.create(h.Script);
     script.* = .{ .a = a, .call = called[asked.len..], .answer = answer };
     const srv = try @import("server.zig").Server.init(a, t.io, script.engine(), text, .{ .served_name = "m", .model_ids = &.{"m"}, .enable_thinking = false, .use_drafts = false }, null);
@@ -72,6 +75,7 @@ fn chat(a: Allocator, ask: Ask) !Run {
     try body.put(a, "messages", history);
     if (ask.tools) |tools| try body.put(a, "tools", try h.obj(a, tools));
     if (ask.choice) |c| try body.put(a, "tool_choice", try h.obj(a, c));
+    if (ask.think) try body.put(a, "chat_template_kwargs", try h.obj(a, "{\"enable_thinking\":true}"));
     @import("openai.zig").run(srv, a, reply.out(), .{ .conn = &conn }, true, .{ .object = body });
     errdefer std.debug.print("COMPUTE_DEFAULT_REPLY {s}\n", .{json.stringify(a, reply.body, .{}) catch ""});
     return .{ .code = reply.code, .body = reply.body, .prompt = script.prompt, .held = script.held_asked, .resumes = script.resumes.items.len, .run_cells = script.run_cells };
@@ -100,6 +104,21 @@ test "compute lane: the default gives a chat with no tools the built-in tool, ru
     // the prompt is the one an explicit opt-in renders: the measured layout, declared once
     const opted = try chat(a, .{ .default = false, .tools = "[{\"type\":\"code_interpreter\"}]", .model = .python_call });
     try t.expectEqualSlices(u32, opted.prompt, r.prompt);
+}
+
+test "compute lane: the default offers no built-in tool to a chat with thinking off: its prompt is the default off's" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const r = try chat(a, .{ .default = true, .think = false });
+    const off = try chat(a, .{ .default = false, .think = false });
+    try t.expectEqual(@as(u16, 200), r.code);
+    try t.expectEqualSlices(u32, off.prompt, r.prompt);
+    try t.expect(!r.held);
+    try t.expectEqualStrings("It is 42.", r.body.get("choices").?.array[0].get("message").?.strField("content").?);
+    // a client's own tools stay as they are
+    const tools = "[" ++ bash_tool ++ "]";
+    try t.expectEqualSlices(u32, (try chat(a, .{ .default = false, .tools = tools, .think = false })).prompt, (try chat(a, .{ .default = true, .tools = tools, .think = false })).prompt);
 }
 
 test "compute lane: under the default a chat that runs nothing counts 0" {
@@ -213,7 +232,7 @@ test "compute lane: with the default off a chat is as before: no built-in tool, 
     const hf = try HfText.load(a, t.io, tmp.path, null, a, &problem);
     defer hf.deinit();
     const plain = try hf.text().renderIds(a, try tf.messages(a, "What is 6*7?"), .{ .add_generation_prompt = true }, &problem);
-    const r = try chat(a, .{ .default = false });
+    const r = try chat(a, .{ .default = false, .think = false });
     try t.expectEqual(@as(u16, 200), r.code);
     try t.expectEqualSlices(u32, plain, r.prompt);
     try t.expect(!r.held);
