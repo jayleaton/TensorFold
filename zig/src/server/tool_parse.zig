@@ -3,6 +3,7 @@ const std = @import("std");
 const json = @import("json");
 const ids = @import("ids.zig");
 const reply_text = @import("reply_text.zig");
+const reply_owned = @import("reply_owned.zig");
 const tool_closers = @import("tool_closers.zig");
 const tool_dsml = @import("tool_dsml.zig");
 const tool_params = @import("tool_params.zig");
@@ -20,7 +21,7 @@ const Error = tool_dsml.Error;
 const Call = tool_dsml.Call;
 const Envelope = struct { start: usize, end: usize, payload: []const u8, complete: bool = true };
 
-pub const Parsed = struct { content: []const u8, calls: ?[]Value, rejected_envelopes: usize = 0 };
+pub const Parsed = struct { content: []const u8, calls: ?[]Value, rejected_envelopes: usize = 0, owned: ?reply_owned.Owned = null };
 
 fn findCI(hay: []const u8, needle: []const u8, from: usize) ?usize {
     if (from > hay.len) return null;
@@ -97,9 +98,20 @@ fn envelopes(a: Allocator, text: []const u8) Allocator.Error![]Envelope {
     return kept.items;
 }
 
+/// Where the first tool-call block of `text` starts, as `parse` finds them; null: none.
+pub fn firstEnvelope(a: Allocator, text: []const u8) Allocator.Error!?usize {
+    const envs = try envelopes(a, text);
+    return if (envs.len > 0) envs[0].start else null;
+}
+
 /// ``parse_tool_calls_from_content``: the reply's content and its calls (null when it makes none).
 pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?usize) Allocator.Error!Parsed {
-    if (tools.len == 0) return .{ .content = text, .calls = null };
+    return parseOwned(a, text, tools, max_calls, null);
+}
+
+/// ``parse`` whose strip keeps the engine's `owned` bytes of `text` (reply_owned.zig), given in the content's offsets.
+pub fn parseOwned(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?usize, owned: ?reply_owned.Owned) Allocator.Error!Parsed {
+    if (tools.len == 0) return .{ .content = text, .calls = null, .owned = owned };
     var known: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
     for (tools) |tool| {
         const name = try tool_specs.toolName(a, tool);
@@ -108,7 +120,7 @@ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?u
     if (try bareCalls(a, text, &known, max_calls)) |calls| return .{ .content = "", .calls = calls };
     const schemas = try tool_params.schemas(a, tools);
     const envs = try envelopes(a, text);
-    if (envs.len == 0) return .{ .content = text, .calls = null };
+    if (envs.len == 0) return .{ .content = text, .calls = null, .owned = owned };
     var calls: std.ArrayList(Value) = .empty;
     var residue: std.ArrayList(u8) = .empty;
     var cursor: usize = 0;
@@ -152,7 +164,14 @@ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?u
         }
     }
     try residue.appendSlice(a, text[cursor..]);
-    return .{ .content = strip(residue.items), .calls = if (calls.items.len > 0) calls.items else null, .rejected_envelopes = rejected };
+    // owned bytes come before the first envelope, so the residue's offsets are the text's there
+    const content = reply_owned.strip(residue.items, owned);
+    var kept: ?reply_owned.Owned = null;
+    if (owned) |o| if (o.hi <= residue.items.len) {
+        const lead = @intFromPtr(content.ptr) -% @intFromPtr(residue.items.ptr);
+        if (o.lo >= lead and lead <= residue.items.len) kept = .{ .lo = o.lo - lead, .hi = o.hi - lead };
+    };
+    return .{ .content = content, .calls = if (calls.items.len > 0) calls.items else null, .rejected_envelopes = rejected, .owned = kept };
 }
 
 /// What closes the call ``text`` ends inside (the model's end token came before its ``
