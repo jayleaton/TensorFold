@@ -233,6 +233,7 @@ pub const Info = struct {
     /// A byte budget each request promises its caches from as it is admitted (null: none); never beside `admit`.
     ledger: ?Ledger = null,
     compute: ?hold.compute_lane.Config = null, // the family's built-in code execution: replies hold at EOS for results
+    compute_tool: hold.compute_lane.Tool = .{}, // the built-in tool its binding names (compute_binding.zig)
 
     pub const Capability = @import("engine_capabilities.zig").Capability;
 
