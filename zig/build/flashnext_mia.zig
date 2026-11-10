@@ -20,3 +20,14 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     const weights_exe = b.addExecutable(.{ .name = "tf-flashnext-mia-weights", .root_module = weights });
     b.step("flashnext-mia-weights", "tf-flashnext-mia-weights SNAPSHOT [WEIGHTS.json]: loaded weights' digests against the oracle's").dependOn(&b.addInstallArtifact(weights_exe, .{}).step);
 }
+
+/// Her module's host tests, roce_mia's, the lane opt-ins her family takes and its native contract; in test-cuda-host.
+pub fn hostTests(b: *std.Build, cuda: *std.Build.Module, mia: *std.Build.Module, lanes: *std.Build.Module, native: *std.Build.Module, all: *std.Build.Step) void {
+    const step = b.step("test-flashnext-mia-host", "MiaAI-Lab's Flash Next engine: its host tests and the lane opt-ins it takes, no GPU");
+    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mia })).step);
+    const roce = &.{ "the timeout reader compiles", "prefetch blocks:", "NCCL_IB_HCA lists", "the region layout:" };
+    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cuda, .filters = roce })).step);
+    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = lanes, .filters = &.{ "join batch:", "head stops:" } })).step);
+    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = native, .filters = &.{"flashnext_mia family:"} })).step);
+    all.dependOn(step);
+}
