@@ -67,6 +67,14 @@ pub fn batches(h: *LaneHost) bool {
     return h.queued.items.len >= 2 and lanes_now -| h.admitted.items.len >= 2;
 }
 
+/// Config.burst_split: an image prompt, or one at least burst_short long that resumes or keeps states, goes alone.
+fn splitsAlone(h: *const LaneHost, job: *const Job) bool {
+    if (!h.core.cfg.burst_split) return false;
+    const s = &job.stream;
+    if (s.images.len > 0) return true;
+    return (s.reuse.at > 0 or s.reuse.marks.len > 0) and s.prompt_len >= h.core.cfg.burst_short;
+}
+
 /// Every queued request a lane is free for, prompts in one pass (lone and warm ones as before); false: none taken.
 pub fn many(h: *LaneHost) bool {
     var jobs: [lanes.Engine.max_together]*Job = undefined;
@@ -84,6 +92,10 @@ pub fn many(h: *LaneHost) bool {
         };
         took = true;
         const at = h.setup(job) orelse continue;
+        if (splitsAlone(h, job)) { // Config.burst_split: resumed or marked, it prefills alone
+            _ = h.launch(job, at);
+            continue;
+        }
         // a prompt-only job ends through `launch`: after `addStreams` nothing would complete it
         if (h.startsAlone(job) or job.stream.promptOnly() or (h.core.fills() and !h.core.batchable(&job.stream))) { // long, image, resumed: filled
             _ = h.launch(job, at);
@@ -94,6 +106,9 @@ pub fn many(h: *LaneHost) bool {
         n += 1;
     }
     if (n == 1) return h.launch(jobs[0], began[0]);
+    if (h.core.cfg.burst_split) for (jobs[0..n]) |job| {
+        job.stream.reuse = .{}; // a short prompt's resume and marks dropped; Job.reported keeps its entry
+    };
     var streams: [lanes.Engine.max_together]*lanes.Stream = undefined;
     for (jobs[0..n], 0..) |job, i| streams[i] = &job.stream;
     var errs: [lanes.Engine.max_together]?anyerror = undefined;
