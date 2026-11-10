@@ -12,6 +12,10 @@ pub fn wanted(o: api.Open) bool {
     return std.mem.eql(u8, o.model_type, family.model_type) and mia.selected();
 }
 
+test {
+    _ = @import("cuda_flashnext_mia_lane_test.zig"); // the compute lane and runner under TF_FLASHNEXT_ENGINE=mia
+}
+
 test "flashnext_mia family: two ranks and fp8 caches through the options, no --vision or --slide" {
     const F = family;
     try std.testing.expect(refusals.family(F, .{ .dir = "d", .model_type = F.model_type, .tp = 2, .rank = 1, .master = "192.0.2.1", .kv8 = true }) == null);

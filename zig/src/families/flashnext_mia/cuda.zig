@@ -1,6 +1,7 @@
 //! Flash Next (qwen4_exp) on CUDA in Zig: the Python engine's kernels and layouts, bit-exact on one GPU and TP=2.
 
 pub const native = @import("cuda_native.zig");
+pub const lane_backend = @import("cuda_lanes.zig"); // her lanes (and Toy): native's compute hold test drives them
 pub const ngram = @import("cuda_ngram.zig");
 pub const rope = @import("cuda_rope.zig");
 pub const sampler = @import("cuda_sampler.zig");
