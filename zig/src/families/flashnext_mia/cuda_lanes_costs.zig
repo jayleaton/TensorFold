@@ -8,6 +8,36 @@ const max_drafts = cl.max_drafts;
 const max_streams = cl.max_streams;
 const shared_points = cl.shared_points;
 
+/// A shared width's timing: untimed rounds of the timed shape first, then the median of the timed ones.
+pub const shared_warm = 4;
+pub const shared_reps = 9;
+/// Passes over every width; each width keeps its least median (a pass slowed by boot noise does not price it).
+pub const shared_passes = 2;
+
+/// One pass at one width: `shared_warm` untimed rounds, then the median of `shared_reps` timed ones (`round.ms`).
+pub fn passMs(round: anytype) !f64 {
+    for (0..shared_warm) |_| _ = try round.ms(false);
+    var times: [shared_reps]f64 = undefined;
+    for (&times) |*x| x.* = try round.ms(true);
+    return median(&times);
+}
+
+/// A shared round of every stream's full window and the head's drafts, as `passMs` runs it.
+fn SharedRound(comptime E: type) type {
+    return struct {
+        c: *Costing(E),
+        top: usize,
+        text: []const u32,
+        io: std.Io,
+
+        fn ms(s: @This(), timed: bool) !f64 {
+            var out: f64 = 0;
+            try s.c.round(s.top, s.text, if (timed) .{ .io = s.io, .out = &out } else null, s.top - 1);
+            return out;
+        }
+    };
+}
+
 pub fn Measure(comptime E: type) type {
     return struct {
         const Self = lanes_core.Lanes(E);
@@ -49,18 +79,36 @@ pub fn Measure(comptime E: type) type {
                 self.cost_count += 1;
             }
             self.mtp_ms = k.level;
-            // shared rounds: n streams' full windows in one forward
+            // shared rounds: n streams' full windows in one forward; each pass times every width, the least median kept
             self.shared_count = 0;
-            var n: usize = 2;
-            while (n <= self.streams and self.shared_count < shared_points) : (n = if (n * 2 > self.streams and n < self.streams) self.streams else n * 2) {
-                var many = try Costing(E).init(self.gpa, e, @min(self.context, 2048), n, ids[0..lead]);
-                defer many.deinit();
-                try many.round(1, cont, null, 0);
-                // a whole shared round: forward, draws and the batched head's drafts (the allocator weighs rows)
-                for (&times) |*x| try many.round(top, cont, .{ .io = io, .out = x }, top - 1);
-                self.shared[self.shared_count] = .{ .width = @intCast(n * top), .ms = median(times[1..]) };
-                self.shared_count += 1;
+            for (0..shared_passes) |pass| {
+                var i: usize = 0;
+                var n: usize = 2;
+                while (n <= self.streams and i < shared_points) : (n = if (n * 2 > self.streams and n < self.streams) self.streams else n * 2) {
+                    var many = try Costing(E).init(self.gpa, e, @min(self.context, 2048), n, ids[0..lead]);
+                    defer many.deinit();
+                    // a whole shared round: forward, draws and the batched head's drafts (the allocator weighs rows)
+                    const got = try passMs(SharedRound(E){ .c = &many, .top = top, .text = cont, .io = io });
+                    if (pass == 0) self.shared[i] = .{ .width = @intCast(n * top), .ms = got } else self.shared[i].ms = @min(self.shared[i].ms, got);
+                    i += 1;
+                }
+                self.shared_count = i;
             }
+        }
+
+        /// The cost tables in one line (rank 0 logs it at boot): verify ms by rows, a head level, shared ms by rows.
+        pub fn logCosts(self: *const Self) void {
+            var buf: [1024]u8 = undefined;
+            var n: usize = 0;
+            n += (std.fmt.bufPrint(buf[n..], "lanes costs: verify ", .{}) catch return).len;
+            for (self.costs[0..self.cost_count], 0..) |c, i| {
+                n += (std.fmt.bufPrint(buf[n..], "{s}{d}:{d:.1}", .{ if (i == 0) "" else ",", c.width, c.ms }) catch return).len;
+            }
+            n += (std.fmt.bufPrint(buf[n..], "; level {d:.2} ms; shared ", .{self.mtp_ms}) catch return).len;
+            for (self.shared[0..self.shared_count], 0..) |c, i| {
+                n += (std.fmt.bufPrint(buf[n..], "{s}{d}:{d:.1}", .{ if (i == 0) "" else ",", c.width, c.ms }) catch return).len;
+            }
+            std.log.info("{s}", .{buf[0..n]});
         }
     };
 }
@@ -156,4 +204,18 @@ fn msSince(io: std.Io, t0: std.Io.Timestamp) f64 {
 fn median(xs: []f64) f64 {
     std.mem.sort(f64, xs, {}, std.sort.asc(f64));
     return if (xs.len % 2 == 1) xs[xs.len / 2] else (xs[xs.len / 2 - 1] + xs[xs.len / 2]) / 2;
+}
+
+test "shared round costs: a width's slow first rounds and one outlier rep leave its steady ms" {
+    // a fake clock: a width's first 5 rounds run slow (190 ms), its 10th is an outlier (500 ms), the rest take 125 ms
+    const Spiky = struct {
+        calls: *usize,
+        fn ms(f: @This(), _: bool) !f64 {
+            defer f.calls.* += 1;
+            return if (f.calls.* < 5) 190 else if (f.calls.* == 9) 500 else 125;
+        }
+    };
+    var calls: usize = 0;
+    try std.testing.expectEqual(@as(f64, 125), try passMs(Spiky{ .calls = &calls }));
+    try std.testing.expectEqual(@as(usize, shared_warm + shared_reps), calls);
 }

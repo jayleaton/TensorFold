@@ -175,6 +175,7 @@ pub fn openOn(comptime M: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const 
         const ids = try costText(gpa, io, dir);
         defer gpa.free(ids);
         try own.lanes.measure(io, ids);
+        if (o.rank == 0) own.lanes.logCosts();
     }
     own.lanes.cache_budget = if (o.rank == 0) cacheBudget(o, &own.lanes) else 0; // rank 1 follows rank 0's notes
     var backend = own.lanes.backend();
@@ -402,6 +403,7 @@ fn settingsText(gpa: std.mem.Allocator, base: []const u8, snapshot: [32]u8, kern
 test {
     _ = mirror;
     _ = lane_backend;
+    _ = @import("cuda_lanes_costs.zig");
 }
 
 test "open compiles over the engine" {

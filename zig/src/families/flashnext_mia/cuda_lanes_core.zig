@@ -157,6 +157,7 @@ pub fn Lanes(comptime E: type) type {
         pub const heldFn = rounds_part.Rounds(E).heldFn;
         pub const releaseFn = rounds_part.Rounds(E).releaseFn;
         pub const measure = costs_part.Measure(E).measure;
+        pub const logCosts = costs_part.Measure(E).logCosts;
 
         pub fn init(gpa: std.mem.Allocator, e: *E, drafting: bool, context: usize, window: usize) Self {
             const late = if (envs.get("TF_FLASHNEXT_KEEP_LATE")) |v| !std.mem.eql(u8, v, "0") else true;
