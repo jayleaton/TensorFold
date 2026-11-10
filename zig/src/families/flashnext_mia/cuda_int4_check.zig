@@ -5,6 +5,7 @@ const kern = @import("cuda_kernels.zig");
 const int4 = @import("cuda_int4.zig");
 
 const Allocator = std.mem.Allocator;
+const Dev = @import("cuda_int4_check_dev.zig").Dev;
 
 fn bf16ToF32(b: u16) f32 {
     return @bitCast(@as(u32, b) << 16);
@@ -72,37 +73,6 @@ fn ulps(a: f32, b: f32) u32 {
     const fb = if (ib < 0) -(ib & 0x7FFFFFFF) else ib;
     return @intCast(@min(@abs(fa - fb), std.math.maxInt(u32)));
 }
-
-const Dev = struct {
-    d: *const cuda.Driver,
-    bufs: std.ArrayList(cuda.DeviceBuffer) = .empty,
-    gpa: Allocator,
-
-    fn put(dv: *Dev, bytes: []const u8) !u64 {
-        const b = try cuda.DeviceBuffer.fromHost(dv.d, bytes);
-        try dv.bufs.append(dv.gpa, b);
-        return b.ptr;
-    }
-
-    fn zeros(dv: *Dev, n: usize) !u64 {
-        var b = try cuda.DeviceBuffer.alloc(dv.d, @max(n, 16));
-        try b.fill8(0, null);
-        // cuMemsetD8 runs on the legacy stream, which the checks' stream does not wait for: finish the fill first
-        try dv.d.check(dv.d.api.cuCtxSynchronize(), "cuCtxSynchronize");
-        try dv.bufs.append(dv.gpa, b);
-        return b.ptr;
-    }
-
-    fn get(dv: *Dev, ptr: u64, out: []u8) !void {
-        const b: cuda.DeviceBuffer = .{ .d = dv.d, .ptr = ptr, .len = out.len };
-        try b.download(0, out);
-    }
-
-    fn deinit(dv: *Dev) void {
-        for (dv.bufs.items) |*b| b.free();
-        dv.bufs.deinit(dv.gpa);
-    }
-};
 
 /// Packs `g`'s slice to the device: (words, scales) pointers.
 fn packDev(gpa: Allocator, dv: *Dev, g: Gen, sl: int4.Slice) ![2]u64 {
