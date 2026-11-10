@@ -76,6 +76,7 @@ pub const Engine = struct {
                 .confidence_floor = cfg.draft_confidence,
                 .batch_rows = cfg.batch_rows,
                 .batched_heads = cfg.draft_streams,
+                .pooled_budgets = cfg.pooled_budgets,
             },
         };
     }

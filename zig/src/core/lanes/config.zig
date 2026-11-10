@@ -48,6 +48,7 @@ pub const Model = struct {
     join_batch: bool = false, // opt-in: joiners' first drafts wait for the next round, in one batch (lanes/join_batch.zig)
     burst_split: bool = false, // opt-in: a burst's resumed or marked prompts prefill alone, the rest still together
     burst_short: u32 = 0, // with burst_split: a prompt shorter than this drops its resume and marks to join a burst
+    pooled_budgets: bool = false, // opt-in: shared budgets price head steps inside the measured overhead, no probe row
     copy_first: bool = false, // a copy ahead takes the round: the head holds no drafts for it (a drafter's own pass)
     hold_costs: []const @import("hold_price.zig").HoldCost = &.{}, // a drafter's own hold pass, timed at load
     head_trees: bool = false, // the head drafts trees of lanes (DraftRequest.lanes) and holds them
@@ -93,6 +94,7 @@ pub const Config = struct {
     join_batch: bool = false, // Model.join_batch
     burst_split: bool = false, // Model.burst_split (the lane host's burst admission reads it)
     burst_short: u32 = 0, // Model.burst_short
+    pooled_budgets: bool = false, // Model.pooled_budgets
     /// a prompt in pieces leaves its last token as the pending row of its first shared round's window
     join_tail: bool = false,
     /// a round's pieces of several streams in one backend call (Backend.pieces), which may run them as one forward
@@ -182,6 +184,7 @@ pub const Config = struct {
             .join_batch = m.join_batch,
             .burst_split = m.burst_split,
             .burst_short = m.burst_short,
+            .pooled_budgets = m.pooled_budgets,
             .join_tail = m.join_tail,
             .piece_runs = m.piece_runs,
             .join_drafts = m.join_drafts,

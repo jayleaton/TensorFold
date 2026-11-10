@@ -74,6 +74,7 @@ pub const Rule = struct {
     head_stops: bool = false, // opt-in: the head stops each chain itself, so every ask is the room's most drafts
     head_stops_most: u32 = std.math.maxInt(u32), // ... while at most this many streams are live (`live`)
     live: usize = 0, // the engine's live streams, set at each step when head_stops is on (lanes/join_batch.zig)
+    pooled_budgets: bool = false, // opt-in: budgets as db281878 made them (head steps in the overhead, no probe row)
     batch_rows: u32,
     batched_heads: bool = false, // one batch drafts every stream of a shared round (its steps: the deepest stream's)
     row_cost: @import("row_cost.zig").RowCost = .{}, // what a row costs past shared_costs here, under k.learn_rows
@@ -346,12 +347,14 @@ pub const Rule = struct {
         defer r.gpa.free(ones);
         @memset(ones, 1);
         const head: alloc.HeadCost = .{ .step_ms = r.mtp_step_ms, .batched = r.batched_heads, .row_ms = r.row_cost.extraMs(whos.len, sampled) };
-        const counts = if (r.draft_step_ms != 0)
+        const counts = if (r.pooled_budgets)
+            try alloc.allocate(r.gpa, ones, probs, r.shared_costs, r.overheadMs(whos.len, sampled), @max(whos.len, r.batch_rows))
+        else if (r.draft_step_ms != 0)
             try alloc.allocateDrafts(r.gpa, ones, probs, r.shared_costs, r.overheadMs(whos.len, sampled), r.row_cost.capRows(whos.len, sampled, @max(whos.len, r.batch_rows)), .{ .step_ms = r.draft_step_ms, .batched = r.batched_heads and pricedBatched(), .free_first = true, .row_ms = r.row_cost.extraMs(whos.len, sampled) })
         else
             try alloc.allocateDrafts(r.gpa, ones, probs, r.shared_costs, r.fixedMs(whos.len, sampled), r.row_cost.capRows(whos.len, sampled, @max(whos.len, r.batch_rows)), head);
         defer r.gpa.free(counts);
-        r.probeShared(whos, most, counts);
+        if (!r.pooled_budgets) r.probeShared(whos, most, counts);
         if (r.plain_guard) {
             // no draft where none pays; a probe after a growing run of plain rounds
             for (whos, counts) |w, *c| {
