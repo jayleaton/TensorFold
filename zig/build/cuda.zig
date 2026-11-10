@@ -392,6 +392,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     cli.addImport("flashnext_mia", native_modules.engines.import_table.get("flashnext_mia").?);
     cli.addOptions("build_options", build_options);
     cli.addImport("checkpoint_cli", checkpointCli(b, host, .debug, false, native_modules.engines, mods.core));
+    @import("flashnext_mia.zig").cliCheck(b, cli, native_modules.engines.import_table.get("dory").?, @import("cluster_cuda.zig").module(b, host, .debug, mods.lanes, mods.core, native_modules.canon, native_modules.verbs));
     const memory_cli = checkpointCli(b, host, .debug, false, native_modules.engines, mods.core);
     memory_cli.root_source_file = b.path("zig/src/cli/tests.zig");
     b.step("test-cli-memory-host", "Actual checkpoint info memory tests without device or shader producers").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = memory_cli, .filters = &.{ "info prints family", "issue 934:", "plan" } })).step);

@@ -31,3 +31,13 @@ pub fn hostTests(b: *std.Build, cuda: *std.Build.Module, mia: *std.Build.Module,
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = native, .filters = &.{"flashnext_mia family:"} })).step);
     all.dependOn(step);
 }
+
+/// check-flashnext-mia-cli: the tensorfold CLI with her commands compiled (no kernels); in test-flashnext-mia-host.
+pub fn cliCheck(b: *std.Build, cli: *std.Build.Module, dory: *std.Build.Module, cluster: *std.Build.Module) void {
+    cli.addImport("dory", dory); // what `main` reaches past the host tests' imports, as the installed CLI has them
+    cli.addImport("cluster", cluster);
+    const obj = b.addExecutable(.{ .name = "tensorfold-cli-check", .root_module = cli }); // an executable: `main` is analyzed
+    const step = b.step("check-flashnext-mia-cli", "Compile the tensorfold CUDA CLI with MiaAI-Lab's commands, no kernels");
+    step.dependOn(&obj.step);
+    b.top_level_steps.get("test-flashnext-mia-host").?.step.dependOn(step);
+}

@@ -386,7 +386,7 @@ pub fn generate(gpa: Allocator, io: std.Io, e: *Engine, prompt: []const u32, max
 }
 
 /// `generate` for a prompt with images or video frames (`media`: its rows, rotary positions and features).
-pub fn generateMedia(gpa: Allocator, io: std.Io, e: *Engine, prompt: []const u32, max_tokens: usize, sampling: ?lanes.Sampling, drafts: bool, stop_eos: bool, media: ?*const lanes.Media) !Generated {
+pub fn generateMedia(gpa: Allocator, io: std.Io, e: *Engine, prompt: []const u32, max_tokens: usize, sampling: ?lanes.Sampling, drafts: bool, stop_eos: bool, media: ?*const flashnext.media.Media) !Generated {
     const room = @as(i64, @intCast(e.max_len)) - @as(i64, @intCast(prompt.len)) - @as(i64, @intCast(e.depth)) - 1;
     if (room < 1) return error.PromptPastWindow;
     const count = @max(1, @min(max_tokens, @as(usize, @intCast(room))));
@@ -794,7 +794,7 @@ fn gate(gpa: Allocator, io: std.Io, e: *Engine, capture: []const u8, o: Options)
 const MediaCase = struct {
     name: []const u8,
     tokens: []u32,
-    media: lanes.Media,
+    media: flashnext.media.Media,
     blobs: [2][]align(16) u8,
     rows: []u32,
     expected: ?std.json.Value,
