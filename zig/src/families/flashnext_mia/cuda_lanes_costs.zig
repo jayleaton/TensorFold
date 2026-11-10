@@ -8,7 +8,7 @@ const max_drafts = cl.max_drafts;
 const max_streams = cl.max_streams;
 const shared_points = cl.shared_points;
 
-/// A shared width's timing: untimed rounds of the timed shape first, then the median of the timed ones.
+/// Every cost table width's timing: untimed rounds of the timed shape first, then the median of the timed ones.
 pub const shared_warm = 4;
 pub const shared_reps = 9;
 /// Passes over every width; each width keeps its least median (a pass slowed by boot noise does not price it).
@@ -22,18 +22,32 @@ pub fn passMs(round: anytype) !f64 {
     return median(&times);
 }
 
-/// A shared round of every stream's full window and the head's drafts, as `passMs` runs it.
-fn SharedRound(comptime E: type) type {
+/// Every stream's `w`-row window, then `levels` head drafts (a shared round: `w - 1`), as `passMs` runs it.
+fn WindowRound(comptime E: type) type {
     return struct {
         c: *Costing(E),
-        top: usize,
+        w: usize,
+        levels: usize,
         text: []const u32,
         io: std.Io,
 
         fn ms(s: @This(), timed: bool) !f64 {
             var out: f64 = 0;
-            try s.c.round(s.top, s.text, if (timed) .{ .io = s.io, .out = &out } else null, s.top - 1);
+            try s.c.round(s.w, s.text, if (timed) .{ .io = s.io, .out = &out } else null, s.levels);
             return out;
+        }
+    };
+}
+
+/// One stream's head chaining `levels` drafts, as `passMs` runs it (every chain is timed; warm-ups drop theirs).
+fn ChainRound(comptime E: type) type {
+    return struct {
+        c: *Costing(E),
+        levels: usize,
+        io: std.Io,
+
+        fn ms(s: @This(), _: bool) !f64 {
+            return s.c.chain(s.io, s.levels);
         }
     };
 }
@@ -47,7 +61,6 @@ pub fn Measure(comptime E: type) type {
         /// Times verify windows, head levels and shared rounds in ms on `ids` (ranks in step) for the cost tables.
         pub fn measure(self: *Self, io: std.Io, ids: []const u32) !void {
             if (!self.drafting) return;
-            const reps = 5;
             const e = self.e;
             if (ids.len < 3 * max_rows) return error.CostTextTooShort;
             try self.settle();
@@ -58,18 +71,20 @@ pub fn Measure(comptime E: type) type {
             var c = try Costing(E).init(self.gpa, e, @min(self.context, 4096), 1, ids[0..lead]);
             defer c.deinit();
             for (0..32) |_| try c.round(1, cont, null, 0); // the GPU at its working clocks before any window is timed
+            // each pass times every width and level; a width keeps its least median, as the shared rounds below
             var verify_all: [max_rows + 1]f64 = @splat(0);
             const verify = verify_all[0 .. top + 1];
-            var times: [reps + 1]f64 = undefined;
-            for (1..top + 1) |w| {
-                for (&times) |*x| try c.round(w, cont, .{ .io = io, .out = x }, 0);
-                verify[w] = median(times[1..]);
-            }
             var chain: [2]f64 = undefined;
             const deep = @max(2, @min(8, top - 1));
-            for ([_]usize{ 1, deep }, &chain) |levels, *out| {
-                for (&times) |*x| x.* = try c.chain(io, levels);
-                out.* = median(times[1..]);
+            for (0..shared_passes) |pass| {
+                for (1..top + 1) |w| {
+                    const got = try passMs(WindowRound(E){ .c = &c, .w = w, .levels = 0, .text = cont, .io = io });
+                    verify[w] = if (pass == 0) got else @min(verify[w], got);
+                }
+                for ([_]usize{ 1, deep }, &chain) |levels, *out| {
+                    const got = try passMs(ChainRound(E){ .c = &c, .levels = levels, .io = io });
+                    out.* = if (pass == 0) got else @min(out.*, got);
+                }
             }
             // one regime over every width: f212's pooling as hers at db281878 (no regime boundary)
             const k = @import("core").draft_depth.Costs.measured(verify, (chain[1] - chain[0]) / @as(f64, @floatFromInt(deep - 1)), std.math.maxInt(usize));
@@ -88,7 +103,7 @@ pub fn Measure(comptime E: type) type {
                     var many = try Costing(E).init(self.gpa, e, @min(self.context, 2048), n, ids[0..lead]);
                     defer many.deinit();
                     // a whole shared round: forward, draws and the batched head's drafts (the allocator weighs rows)
-                    const got = try passMs(SharedRound(E){ .c = &many, .top = top, .text = cont, .io = io });
+                    const got = try passMs(WindowRound(E){ .c = &many, .w = top, .levels = top - 1, .text = cont, .io = io });
                     if (pass == 0) self.shared[i] = .{ .width = @intCast(n * top), .ms = got } else self.shared[i].ms = @min(self.shared[i].ms, got);
                     i += 1;
                 }

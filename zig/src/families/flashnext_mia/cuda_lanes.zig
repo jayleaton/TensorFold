@@ -197,6 +197,23 @@ test "costs are measured by the same calls a decode makes" {
     for (b.costs[0..b.cost_count], 1..) |c, w| try std.testing.expectEqual(@as(u32, @intCast(w)), c.width);
 }
 
+test "every verify width, head level and shared width is warmed and timed in each pass" {
+    const gpa = std.testing.allocator;
+    const costs = @import("cuda_lanes_costs.zig");
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var t: Toy = .{ .gpa = gpa };
+    var b = Lanes(Toy).init(gpa, &t, true, 1 << 16, 7);
+    defer b.deinit();
+    var ids: [64]u32 = undefined;
+    for (&ids, 0..) |*x, i| x.* = @intCast(i % 50);
+    b.streams = 4;
+    try b.measure(threaded.io(), &ids);
+    // 32 clock-warming rounds, then per pass: 7 verify widths, 2 head levels and 2 shared widths, each a pass
+    const pass = costs.shared_warm + costs.shared_reps;
+    try std.testing.expectEqual(@as(usize, 32 + costs.shared_passes * (7 + 2 + 2) * pass), t.rounds);
+}
+
 test "a rank's failed prepare stops both ranks before a collective; an engine error after the agreement is fatal" {
     const gpa = std.testing.allocator;
     const G = struct {
