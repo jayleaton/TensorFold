@@ -1,20 +1,5 @@
 #!/usr/bin/env python3
-"""Flash Next's Triton kernel set without the checkpoint: every specialization in a spec list compiled with
-``triton.compile`` for sm_121 (no GPU, no weights), written as ``aot.json`` + ``cubins/`` (the form
-``zig/src/cuda/aot.zig`` loads and ``tools/zig/flashnext_mia/aot_pack.py`` writes from a capture).
-
-  extract: a capture (launches.json + its Triton cache) -> the spec list (zig/tests/cuda/flashnext_mia/kernels.json)
-  derive:  the captured TP=1 entries -> the same plus the TP=2 specializations (PLAN.md's TP=2 split, the Python
-           wrappers' own K-split and tile rules for the new shapes)
-  cover:   every launch in W5's replay fixtures must find a variant; missing ones are added from a template of the
-           same kernel (argument types, int forms, constexprs, warps as the fixture gives them)
-  build:   the spec list -> <out>/aot.json + <out>/cubins/<hash>.cubin; --check <manifest.json> compares the TP=1
-           entries' cubin sha256 (and Triton's kernel hash) with a capture's
-
-A spec entry is exactly what Triton's JIT hands ``compile``: the function (module + qualname), the signature by
-parameter name, the constexpr values by name (typed: int, bool, float64 bits, dtype, None, str, a JIT function), the
-divisibility attributes by name, and the compile options. TP=2 entries carry ``"tp": [2]`` and their own constexprs;
-the TP=1 ones ``"tp": [1]`` (or ``[1, 2]`` when both ranks launch the same specialization)."""
+"""Flash Next's Triton kernel set for sm_121 without checkpoint or GPU: extract, derive, cover, build -> aot.json."""
 
 from __future__ import annotations
 
@@ -93,9 +78,7 @@ def extract(launches: Path, cache: Path, mount: str, out: Path, roles: dict | No
 
 # ----------------------------------------------------------------------------------------------------------- derive
 
-# PLAN.md "TP=2 design": per rank GDN 8 key / 24 value heads, attention 12 q heads / 1 kv head (indexer replicated),
-# shared expert at half width (640 -> 320), out_proj / o_proj input columns halved with fp32 partial outputs, the
-# head split by vocabulary, n-gram rows by head (16 -> 8 a rank), write-backs of gathered partials (mode 3, WORLD 2)
+# PLAN.md "TP=2 design": per-rank head, expert, column and vocabulary splits with fp32 partial outputs
 B16_TP2 = {(16480, 2560): (8240, 2560, None, "GDN in_proj: qkv 2048+3072 | z 3072 | b 24 | a 24 a rank"),
            (13952, 2560): (7296, 2560, None, "attention proj: q|gate 6144, k 256, v 256 a rank; indexer q 512 + key 128 replicated"),
            (2560, 6144): (2560, 3072, True, "GDN out_proj / attention o_proj: K halves, fp32 partials (mode 3)"),
@@ -127,8 +110,7 @@ def _key(k: dict) -> str:
 
 
 
-# runtime ints whose value Triton specializes (1 -> a constexpr, a multiple of 16 -> divisibility), by kernel: a row
-# count or a size that follows it; strides of fixed buffers are left as captured
+# runtime ints Triton specializes (1 -> constexpr, multiple of 16 -> divisibility) by kernel; fixed strides as captured
 ROW_INTS = {"bf16._b16mm": ("M", True), "nvfp4._fp4mm": ("M", True), "moe._router": ("M", True),
             "bf16._reduce": ("total", False), "nvfp4._reduce": ("total", False), "attention._pool": ("R", True),
             "glue._ple_conv": ("R", True), "forward._shift_windows": ("keep", True),

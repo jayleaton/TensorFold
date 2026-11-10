@@ -1,6 +1,4 @@
-//! `tensorfold` for Flash Next (qwen4_exp) on CUDA: token-id runs and the exactness checks against the Python
-//! engine's capture (zig/tests/cuda/flashnext_mia/capture.py: weights.json, teacher.json, prefill/ and teacher/ dumps,
-//! prompts.json, results.json). cuda_main.zig hands a checkpoint whose config.json says qwen4_exp here.
+//! `tensorfold` for Flash Next (qwen4_exp) on CUDA: token runs and exactness checks against the Python capture.
 const std = @import("std");
 const cuda = @import("cuda");
 const core = @import("core");
@@ -379,8 +377,7 @@ pub const Generated = struct {
     accepted: usize,
 };
 
-/// Python Engine.generate on one GPU: `_serial` (draft false: a prefill without the MTP head, one token a round)
-/// or `_decode` (a prefill absorbing every chunk, then MTP-drafted rounds), the reply capped by the window.
+/// Python Engine.generate on one GPU: `_serial` (no MTP head) or `_decode` (MTP-drafted rounds), capped by the window.
 pub fn generate(gpa: Allocator, io: std.Io, e: *Engine, prompt: []const u32, max_tokens: usize, sampling: ?lanes.Sampling, drafts: bool, stop_eos: bool) !Generated {
     return generateMedia(gpa, io, e, prompt, max_tokens, sampling, drafts, stop_eos, null);
 }
@@ -437,9 +434,7 @@ fn run(gpa: Allocator, io: std.Io, e: *Engine, o: Options) !u8 {
     return 0;
 }
 
-/// agree: each prompt's greedy serial reply (written to --report); with --against, the reference's replies
-/// teacher-forced (prompt, then each reference token in turn) and this engine's greedy draw at each step compared with
-/// the reference's next token: top-1 agreement over the reply, and the first index where the free replies differ.
+/// agree: each prompt's greedy serial reply; with --against, top-1 agreement teacher-forced on the reference's replies.
 fn agree(gpa: Allocator, io: std.Io, e: *Engine, capture: []const u8, o: Options) !u8 {
     var pb: [512]u8 = undefined;
     const prompts = try readJson(gpa, io, try std.fmt.bufPrint(&pb, "{s}/prompts.json", .{capture}));
@@ -533,8 +528,7 @@ const StepDump = struct {
     }
 };
 
-/// The capture's teacher steps: from an empty state, step i forwards tokens[i] at pos i, draws greedily, then the
-/// MTP head absorbs (row i's streams, tokens[i + 1]) at mtp pos i, then commit(1, 1).
+/// The capture's teacher steps: step i forwards tokens[i] at pos i greedily, the MTP head absorbs, then commit(1, 1).
 fn teacher(gpa: Allocator, io: std.Io, e: *Engine, path: []const u8, dump_root: ?[]const u8, with_mtp: bool) !u8 {
     const t = try readJson(gpa, io, path);
     defer t.deinit();
@@ -592,8 +586,7 @@ fn bf16f(x: u16) f32 {
     return @bitCast(@as(u32, x) << 16);
 }
 
-/// `n` bf16 values at `ptr` against `dir`/`name`.bin's from element `offset` (absent: nothing printed): max |diff|,
-/// the reference's max |value|, values bit-equal, and whether the argmax agrees.
+/// `n` bf16 values at `ptr` against `dir`/`name`.bin from `offset`: max |diff|, max |ref|, bit-equal, argmax agrees.
 fn closeness(gpa: Allocator, io: std.Io, e: *Engine, dir: []const u8, name: []const u8, ptr: u64, offset: usize, n: usize) !void {
     var pb: [600]u8 = undefined;
     const path = try std.fmt.bufPrint(&pb, "{s}/{s}.bin", .{ dir, name });
@@ -630,8 +623,7 @@ fn idsOf(gpa: Allocator, v: std.json.Value) ![]u32 {
     return ids;
 }
 
-/// One captured prompt's prefill (the oracle's: chunks of 2048 absorbing into the MTP head): its first token, the
-/// last row's streams, pos and mtp_len against teacher.json's "prefill", every chunk's dumps against the digests.
+/// One captured prompt's prefill (chunks of 2048 into the MTP head) against teacher.json's "prefill" and the digests.
 fn prefillCheck(gpa: Allocator, io: std.Io, e: *Engine, prompts_path: []const u8, name: []const u8, dump: ?[]const u8, teacher_path: ?[]const u8) !u8 {
     const p = try readJson(gpa, io, prompts_path);
     defer p.deinit();
@@ -699,9 +691,7 @@ fn listed(only: ?[]const u8, name: []const u8) bool {
     return false;
 }
 
-/// The run gate (zig/tests/cuda/nemotron/gate.py's rule on one load): every captured prompt, serial and drafted,
-/// greedy and with the capture's sampling (seed 1234, temperature 1, top_k 20, top_p 0.95), token for token
-/// against the oracle's results.json; drafted must equal serial.
+/// The run gate: every captured prompt, serial and drafted, greedy and sampled, token for token against results.json.
 fn gate(gpa: Allocator, io: std.Io, e: *Engine, capture: []const u8, o: Options) !u8 {
     var pb: [512]u8 = undefined;
     const prompts = try readJson(gpa, io, try std.fmt.bufPrint(&pb, "{s}/prompts.json", .{capture}));
@@ -764,8 +754,7 @@ fn gate(gpa: Allocator, io: std.Io, e: *Engine, capture: []const u8, o: Options)
                     keep_tokens = true;
                 }
                 total += 1;
-                // two ranks have no oracle (Python's TP=2 refuses NVFP4), nor does a checkpoint Python never ran (an
-                // empty results.json: INT4-AutoRound): drafted == serial is the gate there
+                // no oracle at two ranks or for an empty results.json (INT4-AutoRound): drafted == serial is the gate
                 const no_oracle = e.world > 1 or res.object.count() == 0;
                 const ok = (equal or no_oracle) and same_serial;
                 const verdict = if (no_oracle) (if (!same_serial) "DIFFER" else if (equal) "TP1-SAME" else if (e.world > 1) "TP1-OTHER" else "SELF") else if (ok) "EQUAL" else "DIFFER";
@@ -787,9 +776,6 @@ fn gate(gpa: Allocator, io: std.Io, e: *Engine, capture: []const u8, o: Options)
     return if (bad == 0) 0 else 1;
 }
 
-/// The shared-round gate: N streams (the captured prompts in turn, greedy and sampled alternating) decoded
-/// together in shared rounds, three passes (every stream drafted, every stream serial, then mixed); each stream's
-/// tokens against the oracle's solo run (results.json); at two ranks, against this engine's own solo runs.
 /// One image or video case of zig/tests/cuda/flashnext_mia/vision_ref.py: the prompt, its media and Python's results.
 const MediaCase = struct {
     name: []const u8,
@@ -858,9 +844,7 @@ fn tokensEqual(want: std.json.Value, got: []const u32) bool {
     return true;
 }
 
-/// gate-media DIR: every case vision_ref.py wrote (DIR/<case>/bundle.json, positions.bin, features.bin): its prompt
-/// with the media through the engine, the prompt chunks' digests and the serial and drafted greedy tokens against
-/// Python's; then all cases together in shared rounds (concurrent == solo), at once and arriving in slices.
+/// gate-media DIR: every vision_ref.py case's digests and tokens against Python's, then all cases in shared rounds.
 fn gateMedia(gpa: Allocator, io: std.Io, e: *Engine, dir: []const u8, o: Options) !u8 {
     var names: std.ArrayList([]const u8) = .empty;
     defer {
@@ -968,11 +952,9 @@ fn gateMedia(gpa: Allocator, io: std.Io, e: *Engine, dir: []const u8, o: Options
             }
         }
     }
-    // shared rounds: every case's stream together (each must equal its solo drafted run), then arriving one a round
-    // and filling in layer slices between the others' rounds
+    // shared rounds: every case together (each equals its solo drafted run), then arriving one a round in layer slices
     if (o.drafts and solo_n == cases.len and cases.len > 1 and cases.len <= 64) {
-        // --burst: text prompts (a case's first tokens as a plain prompt, no media) stand before and between the media
-        // prompts, so a burst forms around them: the media prompts must prefill alone, every stream == its solo run
+        // --burst: text prompts around the media prompts, so media prompts prefill alone; every stream == its solo run
         const n_text: usize = if (o.burst) 4 else 0;
         const text_solo = try gpa.alloc([]u32, n_text);
         var text_n: usize = 0;
@@ -1032,6 +1014,7 @@ fn gateMedia(gpa: Allocator, io: std.Io, e: *Engine, dir: []const u8, o: Options
     return if (bad == 0) 0 else 1;
 }
 
+/// The shared-round gate: N streams decoded together, drafted, serial and mixed, each against its solo run.
 fn gateMany(gpa: Allocator, io: std.Io, e: *Engine, capture: []const u8, o: Options) !u8 {
     var pb: [512]u8 = undefined;
     const prompts = try readJson(gpa, io, try std.fmt.bufPrint(&pb, "{s}/prompts.json", .{capture}));
@@ -1119,10 +1102,7 @@ fn decodeBound(gpa: Allocator, e: *Engine, first: u32, count: usize) ![]u32 {
     return r.tokens.toOwnedSlice(gpa);
 }
 
-/// Prompt reuse against fresh prefills: P2 = P ++ (16 reply tokens). Fresh: P2 prefilled from empty. Resumed: P
-/// prefilled keeping its state at len - 1, a 32-token reply (rows past the point overwritten), then P2 resumed from
-/// the kept state. Forked: a second sequence takes the kept prefix (copyPrefix) and resumes P2. 48 drafted tokens
-/// each, greedy and sampled; all three must agree.
+/// Prompt reuse: P2 = P ++ 16 reply tokens, fresh vs resumed from kept state vs forked (copyPrefix); all must agree.
 fn reuse(gpa: Allocator, io: std.Io, e: *Engine, capture: []const u8, o: Options) !u8 {
     var pb: [512]u8 = undefined;
     const prompts = try readJson(gpa, io, try std.fmt.bufPrint(&pb, "{s}/prompts.json", .{capture}));
@@ -1176,8 +1156,7 @@ fn reuse(gpa: Allocator, io: std.Io, e: *Engine, capture: []const u8, o: Options
     return if (bad == 0) 0 else 1;
 }
 
-/// The tokens the sequences' budget holds at N streams: N sequences grown a step at a time in turn until every
-/// one is refused (error.NoRoom) or at its window.
+/// The tokens the sequences' budget holds at N streams: each grown a step in turn until refused (NoRoom) or full.
 fn pool(gpa: Allocator, e: *Engine, o: Options) !u8 {
     const N = o.streams;
     const seqs = try gpa.alloc(*flashnext.forward.Seq, N);
@@ -1341,8 +1320,7 @@ fn qsaCheck(gpa: Allocator, io: std.Io, ctx: *const cuda.Context, kernels: []con
     return if (ok) 0 else 1;
 }
 
-/// `fp4-check`: no checkpoint; fn_ops' K-serial NVFP4 kernel against Triton's `_fp4mm` at one K slice (the shared
-/// expert's gate/up), bytes compared at decode-sized rows, then both timed.
+/// `fp4-check`: no checkpoint; fn_ops' K-serial NVFP4 kernel against Triton's `_fp4mm` at one K slice, bytes and time.
 fn fp4Check(gpa: Allocator, io: std.Io, ctx: *const cuda.Context, kernels: []const u8, o: Options) !u8 {
     var set = try cuda.aot.Set.load(gpa, io, ctx.d, ctx.device, kernels);
     defer set.deinit();
@@ -1503,9 +1481,7 @@ const bench_structured = [_][]const u8{
     "Write a JSON list of 12 workouts with name, muscle group, sets, reps and rest seconds.",
 };
 
-/// The owner's sparkDash decode bench (its prompt catalog, src/shared/llmPrompts.js; greedy, thinking off): one
-/// prose prompt and one structured prompt, each stream's copy suffixed " (stream i/N)" past one stream, and one code
-/// task a stream.
+/// The owner's sparkDash decode bench (src/shared/llmPrompts.js; greedy, thinking off): prose, structured, code.
 const dash_prose = "Write a detailed step-by-step explanation of how a hash map works, including collision handling, resizing, and time complexity. Be thorough.";
 const dash_structured = "Count from 1 to 200. Output only the numbers, separated by spaces. No other text.";
 const dash_code_tail = "Output only Python source. No comments, no docstrings, no markdown fences. Then add tests and the helpers this needs. Keep writing code.";
@@ -1544,10 +1520,7 @@ const dash_code = [_][]const u8{
     "dependency_closure\ndef closure(root, deps) -> list: packages reachable from root, each name once, in visit order.\n" ++ dash_code_tail,
 };
 
-/// bench-many: for each kind (--kind code,prose,chat,structured,dash-prose,dash-code,dash-structured) and stream count (--rows N,N,...; default --streams), the
-/// kind's prompts decoded together in shared rounds, --reps times: aggregate tok/s and each round's parts
-/// (Engine.Times; TF_FLASHNEXT_PROFILE adds the GPU parts, eagerly). Code greedy; prose and chat sampled T 1,
-/// top_k 20, top_p 0.95 (dbench's rules), seeds 1000 + stream.
+/// bench-many: each --kind and --rows stream count decoded in shared rounds --reps times: tok/s and each round's parts.
 fn benchMany(gpa: Allocator, io: std.Io, e: *Engine, o: Options) !u8 {
     const path = try std.fs.path.join(gpa, &.{ o.model, "tokenizer.json" });
     defer gpa.free(path);
@@ -1626,7 +1599,7 @@ fn benchMany(gpa: Allocator, io: std.Io, e: *Engine, o: Options) !u8 {
     return 0;
 }
 
-/// `glue-check`: no checkpoint; the fused hyper-connection up projection + mix against _b16mm + _hc_mix, and the fused write-back + norm against _hc_writeback + _hc_normed.
+/// `glue-check`: no checkpoint; the fused hyper-connection up+mix and write-back+norm against their unfused kernels.
 fn glueCheck(gpa: Allocator, io: std.Io, ctx: *const cuda.Context, kernels: []const u8) !u8 {
     var set = try cuda.aot.Set.load(gpa, io, ctx.d, ctx.device, kernels);
     defer set.deinit();

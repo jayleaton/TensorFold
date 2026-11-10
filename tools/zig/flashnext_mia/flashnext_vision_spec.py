@@ -1,21 +1,5 @@
 #!/usr/bin/env python3
-"""The image and video prompts' rotary specializations (``MODE=2``) for Flash Next's kernel set.
-
-An image or video sequence rotates its queries, keys and pooled indexer keys at the prompt's three-axis positions
-(``glue._attn_prep`` and ``attention._pool`` with ``ROPE`` / ``DELTA`` / ``length``, image_rows.rope_axis); text
-keeps ``MODE=0``. For every ``MODE=0`` entry of the spec this adds the ``MODE=2`` entries Triton's JIT builds for
-such a launch, as a capture of Python TensorFold's image prompts records them (work/out/v1r1/launches.json):
-
-  _attn_prep  the same signature (ROPE and DELTA were already pointers, POS0 passed for them), MODE 2, ``length``
-              (the prompt's tokens, a runtime i32) a multiple of 16 or not
-  _pool       ROPE and DELTA become ``*i32`` arguments (16-byte aligned: device allocations) instead of the None
-              constexprs, MODE 2, ``length`` a multiple of 16 or not; every ``R`` form of the MODE 0 entry
-
-Entries this script made before (``"rule"`` starting with ``vision``) are replaced, so it can run again.
-
-    python3 -B tools/zig/flashnext_mia/flashnext_vision_spec.py --spec zig/tests/cuda/flashnext_mia/kernels.json \\
-        --out zig/tests/cuda/flashnext_mia/kernels.json
-"""
+"""The image and video prompts' rotary ``MODE=2`` specializations of ``_attn_prep`` and ``_pool`` for the kernel set."""
 
 from __future__ import annotations
 

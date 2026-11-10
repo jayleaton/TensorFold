@@ -1,13 +1,4 @@
-//! tf-flashnext-weights: Flash Next's weights loaded by flashnext.weights (on the GPU, or hashed on the host) and every
-//! buffer's sha256 against the Python oracle's weights.json (zig/tests/cuda/flashnext_mia/capture.py weight_digests).
-//!
-//!   tf-flashnext-weights SNAPSHOT [WEIGHTS.json] [--mode device|hash|count] [--rank R --world W] [--threads N]
-//!                        [--yarn FACTOR] [--gather TOKENS] [--out DIGESTS.json]
-//!
-//! device: loads onto GPU 0 and downloads each buffer to hash it; hash: no GPU, the bytes a load would upload; count:
-//! sizes only. Prints the device bytes the rank holds; with WEIGHTS.json, PASS when every oracle tensor is loaded with
-//! its digest and shape and nothing else is (our own buffers, oracle == false, are listed apart). --gather runs a
-//! window of n-gram ids through the GPU table's gather (fn_pack.cu) and the host gather and compares the rows.
+//! tf-flashnext-weights SNAPSHOT [WEIGHTS.json] [--mode device|hash|count]: weight sha256s vs the Python oracle's.
 const std = @import("std");
 const cuda = @import("cuda");
 const flashnext = @import("flashnext_mia");

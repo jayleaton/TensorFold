@@ -1,18 +1,4 @@
-// Flash Next's prompt indexer scores (ours; work/research/R2-prefill.md W-F (c)): attention._scores' bits from a
-// row-tiled kernel. `_scores` gives one Triton program a (row, 64-block tile) and reduces every dot over the 128 index
-// dims across lanes; here a CTA takes 32 rows x 64 blocks, stages the block tile's pooled keys and the rows' index
-// queries in shared memory once, and each thread computes 2 rows x 4 blocks of scores serially.
-//
-// The arithmetic is _scores' as compiled for sm_121 (its TTGIR layout: sizePerThread [1, 8], threadsPerWarp [2, 16],
-// so lane l of a row holds dims [8l, 8l + 8); PTX read from the compiled kernel, spec zig/tests/cuda/flashnext/
-// kernels.json):
-//   lane partial  p_l = fma(k7,q7, fma(k6,q6, ... fma(k2,q2, fma(k0,q0, k1*q1))))   (mul.f32 then fma.rn.f32.bf16)
-//   lane tree     shfl.bfly 8, 4, 2, 1 with add.f32: a_l = p_l + p_{l+8}, b_l = a_l + a_{l+4}, c_l = b_l + b_{l+2},
-//                 S = c_0 + c_1 (fp32 addition is commutative, so every lane's sum is this one)
-//   heads         total = max(S_0, 0) + 0, then total = total + max(S_h, 0) for h = 1..3 (max.f32, add.f32)
-//   store         div.full.f32 total / 0x413504F3 (sqrt 128 as Triton folds it)
-// Each step is the same PTX instruction on the same operands, so each score is the same fp32 word; rows and blocks
-// outside a row's complete blocks are not stored, as in _scores.
+// Prompt indexer scores, row-tiled: each step attention._scores' sm_121 PTX on the same operands, the same fp32 words.
 #include <cuda_bf16.h>
 #include <stdint.h>
 
@@ -73,8 +59,7 @@ __device__ __forceinline__ F8 widen(const uint4& w) {
   return f;
 }
 
-// lane partial over 8 dims: (k1 * q1) first, then k0 q0, k2 q2, ... k7 q7 fused (fma.rn: the products of bf16
-// values are exact in fp32, so fma.rn.f32 on the widened values is fma.rn.f32.bf16's result)
+// lane partial over 8 dims: k1*q1 first, then fma k0q0, k2q2 .. k7q7 (bf16 products exact in fp32, so fma.rn matches).
 __device__ __forceinline__ float lane(const F8& k, const F8& q) {
   float p = fma_rn(k.v[0], q.v[0], mul_rn(k.v[1], q.v[1]));
 #pragma unroll
@@ -84,8 +69,7 @@ __device__ __forceinline__ float lane(const F8& k, const F8& q) {
 
 }  // namespace
 
-// IQ [rows, HI, DI] bf16, POOLED [blocks, DI] bf16, POS0 the first row's position, SC [rows, NB] fp32. A CTA of 256
-// threads takes 16 TR rows x 16 TB blocks (a thread TR rows x TB blocks); keys then queries in dynamic shared memory.
+// IQ [rows, HI, DI] bf16, POOLED [blocks, DI] bf16, SC [rows, NB] fp32; 256 threads take 16 TR rows x 16 TB blocks.
 template <int TR, int TB, bool KF32>
 __device__ __forceinline__ void scores_body(const uint16_t* __restrict__ IQ, const uint16_t* __restrict__ POOLED,
                                             const int* __restrict__ POS0, float* __restrict__ SC, int NB, int rows,

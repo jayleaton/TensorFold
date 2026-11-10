@@ -1,8 +1,4 @@
-//! Flash Next's host draws (Python qwen4_exp/cuda/decode.py): the keyed rule of core/lanes/sampling.zig over the
-//! candidates the GPU hands back, with the draft head's temperature-1 probability for the chain's stop rule.
-//! One rank: each row's top_k + MARGIN values (any order), their columns (mapped to token ids for the draft head)
-//! and the row's log-sum-exp. Two ranks: every rank's top CAND values, global ids and log-sum-exp, gathered
-//! [world][rows][2 * CAND + 1] f32 words (`candidates` in forward.py), drawn the same on both ranks.
+//! Flash Next's host draws (Python qwen4_exp/cuda/decode.py): the keyed rule over GPU candidates, one or two ranks.
 const std = @import("std");
 const lanes = @import("lanes");
 const Allocator = std.mem.Allocator;
@@ -42,9 +38,7 @@ fn probOf(values: []const f32, ids: []const u64, token: u64, total: f64) f64 {
     return 0.0;
 }
 
-/// One row of one rank's candidates: `values` f32 (top_k + margin, any order) with token `ids`, at `position`.
-/// Greedy (null or temperature <= 0) takes the lowest-id maximum; `lse` (the row's f32 log-sum-exp) gives the
-/// temperature-1 probability of the drawn token (Python `sample_draft` and `sample_mapped`).
+/// One row's candidates at `position`: greedy takes the lowest-id max; `lse` gives the drawn token's T=1 probability.
 pub fn drawRow(gpa: Allocator, values: []const f32, ids: []const u64, position: u64, s: ?S.Sampling, lse: ?f32) !Draw {
     const token: u64 = if (s == null or s.?.temperature <= 0)
         ids[firstBest(values, ids)]
@@ -57,9 +51,7 @@ pub fn drawRow(gpa: Allocator, values: []const f32, ids: []const u64, position: 
     return .{ .token = token, .prob = if (lse) |l| probOf(values, ids, token, @as(f64, l)) else 0.0 };
 }
 
-/// Every rank's gathered candidates `got` [world][rows][2 * cand + 1] (values, ids as int32 bits, log-sum-exp) ->
-/// each row's draw at `positions[r]`, the same on every rank (Python `choose_gathered`; `with_prob` adds each
-/// token's temperature-1 probability from the ranks' log-sum-exps).
+/// Every rank's gathered candidates -> each row's draw at `positions[r]`, same on all ranks (Python `choose_gathered`).
 pub fn chooseGathered(gpa: Allocator, got: []const f32, world: usize, rows: usize, positions: []const u64, s: ?S.Sampling, with_prob: bool, out: []Draw) !void {
     const width = 2 * cand + 1;
     if (got.len < world * rows * width or positions.len != rows or out.len != rows) return error.GatheredShape;

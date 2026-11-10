@@ -1,19 +1,4 @@
-// GPTQ int4 (symmetric: zero point 8, fp16 scale per group of GS inputs and output column) W4A16 matmuls for the
-// INT4-AutoRound Flash Next checkpoint: the routed experts (grouped by the experts plan, gate/up with the SwiGLU
-// epilogue, down) and the lm_head (dense rows). Ours (TensorFold Zig engine, no Python counterpart).
-//
-// Weights are exact in bf16 MMAs: a code q (0..15) becomes the bf16 pair (128 + q) - 136 = q - 8. Per group of GS
-// inputs the products of one output column run in one fp32 MMA chain (k32 blocks in order, each block's two k16 steps
-// in order, the k permutation below fixed), then acc = fmaf(group sum, scale, acc) in group order. A row's result
-// therefore depends on its own inputs and the weights only: never on the other rows of the call, the row count, the
-// items the plan cuts, the column tiles a warp takes (NT) or the grid.
-//
-// Packed layout (cuda_int4.zig packs it from the checkpoint's qweight [K/8, N] int32): words uint32
-// [N/8][K/GS][32 lanes][GS/32]: lane l of an n8 tile holds column 8 tile + l/4 and, for each k32 block, the inputs
-// 8 (l%4) .. 8 (l%4) + 7 of the block (GPTQ's word for those 8 inputs) with its nibbles reordered so that nibble i
-// (i < 4) is input 2i and nibble i + 4 input 2i + 1: the pair at shift 4p is inputs (2p, 2p + 1). The k16 step s of
-// the block takes pairs 2s (as b0) and 2s + 1 (as b1), against the lane's activations at the same inputs (a uint4 of
-// 8 bf16 per row: a0/a1 = inputs 4s, 4s + 1, a2/a3 = 4s + 2, 4s + 3). Scales fp16 [N/8][K/GS][8].
+// GPTQ int4 W4A16 matmuls (experts, lm_head): codes exact in bf16 MMAs, fixed group order, so a row's bits are its own.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -94,8 +79,7 @@ __device__ __forceinline__ Words<GS> load_words(const uint32_t* p) {
   return w;
 }
 
-// One stage: a group's weights and scales of every (matrix, n8 tile) and the activations of rows gq and gq + 8 of
-// each of the MT row tiles (16 rows each) a pass takes.
+// One stage: a group's weights and scales of every (matrix, n8 tile), and rows gq, gq + 8 of each of the MT row tiles.
 template <int GS, int NT, int MATS, int MT>
 struct Stage {
   Words<GS> w[MATS][NT];
@@ -185,10 +169,7 @@ __device__ __forceinline__ void store(const float (&acc)[MATS][NT][4], void* out
   }
 }
 
-// A warp a unit: (item, NT n8 tiles of every matrix). Items (expert, first member, count) from the experts plan, or,
-// with `items` null, the dense rows [16 i, 16 i + 16) of `rows` (the head: one matrix, members the rows themselves).
-// `slots`: a member p reads input row p / slots (gate/up from token rows), 0: row p (down from pair rows). A pass
-// takes MT tiles of 16 rows: the weights a group are loaded once for them (prompt items of up to 64 pairs).
+// A warp a unit (item, NT n8 tiles a matrix): plan items, or dense rows if `items` is null; MT row tiles share weights.
 template <int GS, int NT, int MT, int MATS, int EPI, int WARPS>
 __global__ void __launch_bounds__(WARPS * 32)
     int4_kernel(const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint32_t* __restrict__ W,
@@ -268,16 +249,7 @@ __global__ void __launch_bounds__(WARPS * 32)
 }
 
 
-// ---- prompt calls: a block a (plan item of up to 64 pairs, column block), weights and rows staged in shared memory --
-//
-// The same per-output arithmetic as int4_kernel (so the same bits, int4-check): per group of GS inputs a fresh fp32
-// MMA chain over the k32 blocks in order and each block's two k16 steps in order, with the same k permutation (a lane
-// holds inputs 8 t .. 8 t + 7 of a block; nibble pair p of its word is inputs 2p, 2p + 1), then
-// acc = fmaf(group sum, scale, acc) in group order. What changes is where the operands come from: a block of WR x WC
-// warps copies one group of the item's rows (gathered by the plan's members, zero past the item's count) and of its
-// column block's packed words and scales into shared memory with cp.async, STAGES groups in flight; each warp then
-// applies every dequantized k16 weight step to RT row tiles of 16 (the int4 decode once for RT MMAs) and every row
-// fragment to WN n8 tiles of each matrix. A row's bits never depend on the other rows (an MMA's rows are independent).
+// ---- prompt calls: int4_kernel's per-output arithmetic, operands staged in shared memory by cp.async (same bits) --
 
 __device__ __forceinline__ void cp_async16(void* smem, const void* gmem, int bytes) {
   const unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(smem));
@@ -291,8 +263,7 @@ __device__ __forceinline__ uint4 lds128(const unsigned char* p) {
   return *reinterpret_cast<const uint4*>(p);
 }
 
-// The 16-byte chunk c of shared row r (GS * 2 bytes a row): odd rows' chunks moved by four (a quarter warp's two rows
-// gq, gq + 1 at the same chunks then hit all 32 banks).
+// Chunk c of shared row r, odd rows' chunks moved by four, so a quarter warp's rows gq, gq + 1 hit all 32 banks.
 __device__ __forceinline__ int swz(int r, int c) { return c ^ ((r & 1) << 2); }
 
 template <int GS, int MATS, int WR, int WC, int RT, int WN>
@@ -464,9 +435,7 @@ __global__ void __launch_bounds__(WR * WC * 32)
 
 }  // namespace tf_fn_int4
 
-// gate/up SwiGLU (2 matrices, groups of 128), down fp32 / bf16 (groups of 128 at one GPU, 64 at a TP=2 rank: its
-// half of the 640 inputs cuts a group of 128), the head (bf16); 1, 2 or 4 n8 tiles a warp, 1 or 2 row tiles a pass
-// (the same bits).
+// gate/up SwiGLU (groups of 128), down fp32 / bf16 (128 at one GPU, 64 a TP=2 rank), the head; 1-4 n8, 1-2 row tiles.
 #define TF_INT4(GS, NT, MT, MATS, EPI) template __global__ void tf_fn_int4::int4_kernel<GS, NT, MT, MATS, EPI, 4>( \
     const __nv_bfloat16*, int, int, const uint32_t*, const __half*, int, int, const int*, const int*, const int*, int, \
     void*, int, float, int);
@@ -478,8 +447,7 @@ TF_INT4_NT(128, 1, 3)
 TF_INT4_NT(64, 1, 0)
 TF_INT4_NT(64, 1, 3)
 
-// Prompt calls of the routed down (int4_prompt_kernel, 8 warps: 2 row x 4 column, 2 row tiles and 4 n8 tiles a warp,
-// items of up to 64 pairs): fp32 / bf16 out, groups of 64 (a TP=2 rank) in 3 stages, of 128 (one GPU) in 2.
+// Prompt routed down (8 warps of 2 row x 4 n8 tiles, items up to 64 pairs): groups of 64 in 3 stages, of 128 in 2.
 #define TF_INT4_PROMPT(GS, EPI, ST) template __global__ void tf_fn_int4::int4_prompt_kernel<GS, 1, EPI, 2, 4, 2, 4, ST>( \
     const __nv_bfloat16*, int, int, const uint32_t*, const __half*, int, int, const int*, const int*, const int*, void*, \
     int, float, int);

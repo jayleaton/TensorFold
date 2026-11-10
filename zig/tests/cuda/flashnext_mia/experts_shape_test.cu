@@ -1,15 +1,4 @@
-// Decode plan D3 (work/research/R1-decode.md 3.3): the routed NVFP4 experts' launch shapes (zig/kernels/cuda/
-// fn_nvfp4_shape.cu) against the engine's kernel (fn_nvfp4_experts.cu, <M, EPI, 4 warps, 2 stages>) on one GPU, no
-// checkpoint: random NVFP4 blocks for 512 experts at Flash Next's TP=1 and TP=2 shapes, random routings (10 of 512 a
-// row plus the shared slot the kernels skip, the plan's items of at most 16 pairs, and a skewed routing where most rows
-// share a few experts), every row count the decode windows and shared rounds use. For each shape it checks that the
-// output is byte-equal to the original kernel's (gate/up SwiGLU bf16, down fp32 and bf16) and times it: GPU time a call
-// over many calls with fresh routings (so the experts' weights come from DRAM, as in a forward), launch grid as
-// cuda_kernels.zig sizes it (ceil(max units / warps) capped at the resident blocks).
-//
-// Build (PyTorch image): nvcc -O3 -std=c++20 -arch=sm_121 -I zig/kernels/cuda -o experts_shape_test
-//   zig/tests/cuda/flashnext_mia/experts_shape_test.cu      Run: ./experts_shape_test [iters=200]
-// Lines: PASS / FAIL / RESULT; exit 1 on any byte difference.
+// D3: fn_nvfp4_shape.cu vs fn_nvfp4_experts.cu byte-equal, timed; build nvcc -O3 -std=c++20 -arch=sm_121
 
 #include <cuda_runtime.h>
 

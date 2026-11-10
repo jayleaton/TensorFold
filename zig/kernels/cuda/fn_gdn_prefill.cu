@@ -1,4 +1,4 @@
-// Device code of src/tensorfold/cuda/kernels/gdn_prefill.cu (lines 1-144, comments and ATen includes dropped), checked by zig/tests/cuda/copies.py.
+// Device code of src/tensorfold/cuda/kernels/gdn_prefill.cu (lines 1-144, no comments/ATen), checked by copies.py.
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -140,8 +140,7 @@ __global__ void __launch_bounds__(2 * ROWS) chain_kernel(
 }
 } // namespace tf_fn_gdn_prefill
 
-// The instantiations gdn_prefill_cuda launches (32 steps a stage): fp32 keys (Flash Next's front) and bf16,
-// 128 value rows a block when the value heads fill the SMs, else 64.
+// gdn_prefill_cuda's instantiations (32 steps a stage): fp32 or bf16 keys, 128 value rows a block if SMs fill, else 64.
 #define TF_PREFILL(QK, ROWS) template __global__ void tf_fn_gdn_prefill::chain_kernel<QK, ROWS, 32>(const QK*, \
     const QK*, const __nv_bfloat16*, const float*, const float*, const float*, float*, __nv_bfloat16*, int, int, int);
 TF_PREFILL(float, 128)

@@ -1,7 +1,4 @@
-//! Flash Next (qwen4_exp) on CUDA in Zig: the Python 0.6.5 engine's kernels and layouts for NVIDIA's ModelOpt NVFP4
-//! export, so tokens match it bit for bit on one GPU, and the same arithmetic split over two ranks (work/PLAN.md).
-//! The Metal family's host files (config.zig, affine.zig, ...) reach core by relative paths, so this module reads the
-//! checkpoint through its own cuda_*.zig files and the `core` module.
+//! Flash Next (qwen4_exp) on CUDA in Zig: the Python engine's kernels and layouts, bit-exact on one GPU and TP=2.
 
 pub const native = @import("cuda_native.zig");
 pub const ngram = @import("cuda_ngram.zig");

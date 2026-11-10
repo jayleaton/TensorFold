@@ -1,11 +1,4 @@
-//! Decode plan D5 (work/research/R1-decode.md 3.5): the MTP head's bf16 matrices in affine 4-bit, groups of 32 (the
-//! draft head's own format: cuda_layouts.quantize4 / packQ4 / majorQ4, qmm.Q4), for the drafts only. The target never
-//! reads them, so its output is unchanged; only the drafts (and so the rounds' acceptance) can move.
-//! TF_FLASHNEXT_MTP_Q4=1 builds the table at load from the loaded bf16 weights (this rank's slices at TP=2):
-//! fc_embedding, fc_hidden, the MTP layer's attention projection and o_proj, its two hyper-connections' down and up
-//! projections and the head's mixer. Forward.mmx then runs a matrix found here through qmm (K slices in a cluster).
-//! The value may name parts instead of all ("fc,hc,mixer", "attn"); TF_FLASHNEXT_MTP_Q4_MSE=1 picks each group's
-//! range by the least squared error over shrunken min/max ranges instead of min/max itself.
+//! MTP head bf16 matrices in affine 4-bit (groups of 32), drafts only (TF_FLASHNEXT_MTP_Q4); the target is unchanged.
 const std = @import("std");
 const cuda = @import("cuda");
 const W = @import("cuda_weights.zig");
@@ -35,8 +28,7 @@ pub const Table = struct {
         return null;
     }
 
-    /// Quantizes every MTP bf16 matrix of `w` (downloaded from the device) on `threads` host threads.
-    /// `parts`: "1" or "all", else a comma list of fc, attn, hc, mixer.
+    /// Quantizes every MTP bf16 matrix of `w` on `threads` host threads; `parts`: "1", "all" or fc, attn, hc, mixer.
     pub fn build(gpa: Allocator, d: *const cuda.Driver, w: *const W.Weights, parts: []const u8, mse: bool) !Table {
         var t: Table = .{};
         errdefer t.deinit();
@@ -109,8 +101,7 @@ pub const Table = struct {
     }
 };
 
-/// cuda_layouts.quantize4's format (scale and bias bf16, codes 0..15), each group's range chosen among the min/max range
-/// shrunk toward its centre by 0..30% (the bias and scale as stored, rounded to bf16) by the least squared error.
+/// quantize4's format with each group's range picked by least squared error among min/max shrunk by 0..30%.
 pub fn quantize4Mse(rows: []const u16, n: usize, k: usize, words: []u32, scales: []u16, biases: []u16) void {
     const kg = k / 32;
     for (0..n) |r| for (0..kg) |g| {

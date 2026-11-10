@@ -1,17 +1,4 @@
-//! Flash Next's device layouts made on the host, byte for byte as the Python engine makes them on the GPU:
-//!   packExpert   cuda/nvfp4/experts.py _pack: NVFP4 codes and e4m3 scales -> [N/32][K/32][144] int32 blocks
-//!   tileBits     qwen4_exp/cuda/nvfp4.py _tile_bits: a bf16 grid -> [N/64][K/64][64][64] (the shared expert's tables)
-//!   quantize4    qwen4_exp/cuda/bf16.py quantize4: bf16 rows -> MLX affine 4-bit in groups of 32 (the draft head)
-//!   packQ4       cuda/kernels/qmm.py pack: MLX words -> the lane matmul's [N/64][K/32][8][32] fragments
-//!   quantizeFp4  cuda/nvfp4/experts.py _quantize: bf16 experts -> NVFP4 by ModelOpt's recipe (the MTP experts)
-//!   dequantFp8   weights.weight_bf16 with Fp8BlockLinear.column_scales: FP8_PB_WO rows -> bf16
-//!   ngramLut     host_table.FP8Table: e4m3 code -> bf16_rne(e4m3 x scale), NaN codes 0x7FC0
-//!   invFreq      weights.load: theta ** (-i / half) in fp64, stored fp32
-//! The Python steps that run as CUDA torch ops keep CUDA torch's arithmetic: a tensor divided by a Python float is a
-//! multiply by the fp32 reciprocal (ATen div_true_kernel_cuda's CPU-scalar path), a tensor by a tensor a true division,
-//! fp32 -> bf16 and fp32 -> e4m3 round to nearest even, argmin keeps the first minimum, and nothing contracts to FMA.
-//! Python source: Ash Hart (ashhart) for every function above; weight_bf16 by Jürgen Schmied; FP8Table by tournierjc
-//! and ashhart (TensorFold). fixtures_cuda_weights.py records their outputs; the tests below compare.
+//! Host-made device layouts, bit-exact with CUDA torch; Python by Ash Hart, Jürgen Schmied, tournierjc (TensorFold).
 const std = @import("std");
 
 // ---- scalar formats ---------------------------------------------------------------------------------------------
@@ -75,8 +62,7 @@ pub fn f32ToE4m3(x: f32) u8 {
 pub const cols_a_block = 32;
 pub const words_a_block = 144;
 
-/// A matrix of NVFP4 codes and e4m3 scales as rows of a larger stored array: n rows from `row0`, `k` inputs from input
-/// `k0` (codes: byte k0 / 2 on, scales: byte k0 / 16 on; k0 a multiple of 16), each array's row pitch in bytes.
+/// NVFP4 codes and e4m3 scales as rows of a larger array: n rows from `row0`, k inputs from `k0` (a multiple of 16).
 pub const Fp4Rows = struct {
     words: []const u8,
     word_pitch: usize,
@@ -86,12 +72,7 @@ pub const Fp4Rows = struct {
     k0: usize = 0,
 };
 
-/// One expert matrix [n, k] -> `out[cb][g][m_count * 144]`, its 144 words at `m * 144` of each (cb, g) cell
-/// (Experts4.up holds gate at m 0 and up at m 1, down a single matrix).
-///
-/// `_pack` puts input 16h + 4t + q of a 32-input group at nibble slot 2h + q / 2 + 4 (q % 2) of word
-/// (lane gq * 4 + t, tile j): with the codes' bytes b0, b1 (h 0) and b2, b3 (h 1), low nibble first, the word is their
-/// four low nibbles in its low half and their four high nibbles in its high half.
+/// One expert matrix [n, k] -> `out[cb][g][m_count * 144]` in `_pack`'s nibble order, its words at `m * 144`.
 pub fn packExpert(src: Fp4Rows, n: usize, k: usize, out: []u32, m: usize, m_count: usize) void {
     const nb = n / cols_a_block;
     const kg = k / 32;
@@ -210,8 +191,7 @@ pub fn fp4Global(rows: []const u16) f32 {
     return @max(amax * inv, @as(f32, @floatCast(@as(f64, 1e-30))));
 }
 
-/// One expert's bf16 [n, k] (rows of `pitch` from column `k0`) -> codes [n, k/2] (low nibble the even input) and e4m3
-/// scales [n, k/16] with the expert's g (fp4Global over the same n x k values).
+/// One expert's bf16 [n, k] -> codes [n, k/2] (low nibble even input) and e4m3 scales [n, k/16] with the expert's g.
 pub fn quantizeFp4(rows: []const u16, pitch: usize, k0: usize, n: usize, k: usize, g: f32, words: []u8, scales: []u8) void {
     const inv6: f32 = @as(f32, 1.0) / @as(f32, 6.0);
     const tiny: f32 = @floatCast(@as(f64, 1e-30));

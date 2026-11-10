@@ -1,4 +1,4 @@
-// Device code of src/tensorfold/cuda/nvfp4/qmmf.cu (lines 1-298, comments and ATen includes dropped), checked by zig/tests/cuda/copies.py.
+// Device code of src/tensorfold/cuda/nvfp4/qmmf.cu (lines 1-298, no comments/ATen), checked by tests/cuda/copies.py.
 
 #include <algorithm>
 #include <cooperative_groups.h>
@@ -290,9 +290,7 @@ __global__ void reduce_kernel(const float* __restrict__ part, void* __restrict__
 }
 } // namespace tf_fn_qmmf
 
-// Block FP8 (FP8G, an fp32 scale per 64 inputs and column: Fp8BlockLinear) on sm_121: row tiles 16, 32, 64 with
-// one K slice (no cluster) or 2-8 slices in a cluster, and the fused prompt form (bm 0); bf16 or fp32 out. The
-// reduce never runs: split_k stays <= 8 and sm_90+ adds those slices in the cluster.
+// Block FP8 (FP8G, an fp32 scale per 64 inputs and column) on sm_121: tiles 16/32/64, 1-8 K slices, fused prompt form.
 #define TF_QMMF(BM, F32, CLUSTER, FUSE) template __global__ void tf_fn_qmmf::qmmf_kernel<3, BM, 64, 1, 4, 4, F32, \
     CLUSTER, FUSE>(const __nv_bfloat16*, const unsigned char*, const uint8_t*, float, void*, float*, int, int, int, \
     int, int, int, int);

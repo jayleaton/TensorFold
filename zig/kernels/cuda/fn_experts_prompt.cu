@@ -1,15 +1,4 @@
-// Flash Next's routed NVFP4 experts for prompt chunks (ours; work/research/R2-prefill.md W-B). nvfp4_expert_kernel
-// (fn_nvfp4_experts.cu, the copy of TensorFold's src/tensorfold/cuda/nvfp4/experts.cu) gives a warp one plan item of
-// at most 16 pairs and one 32-column block: per 16-row pass it streams that block's weights and decodes every weight
-// fragment and scale again. Here a warp's pass takes T row tiles of 16 (an item of any size, the plan's tile chosen
-// by the caller): each 32-input group's weight words are loaded, decoded and their e4m3 scales converted once and
-// applied to all T tiles, so weight reads and the decode's ALU work drop by T.
-//
-// The bits are nvfp4_expert_kernel's: a pair row's sums never depend on the other rows of its mma (each row of an
-// m16n8k16 is its own dot), and every output value goes through the same steps in the same order: for each 32-input
-// group g, for each 16-input half h: p = mma(a, b, 0) (a fresh zero accumulator), acc = fmaf(p, e4m3 scale, acc);
-// then acc *= the (expert, matrix) fp32 scale and the same epilogue (experts.cuh). The weight words, scale bytes and
-// decode are the same (the block layout of experts.py `pack`). Built with the same flags (-O3).
+// Routed NVFP4 experts for prompt chunks: nvfp4_expert_kernel's bits, each weight group decoded once for T row tiles.
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <stdint.h>
@@ -37,8 +26,7 @@ __device__ __forceinline__ uint4 ld_nc(const uint4* p) {
   return r;
 }
 
-// experts.cuh's mma with a fresh zero accumulator, its result in registers of its own: the same instruction (C = +0.0),
-// without the copy of the A fragment into the result registers the "+f" form costs when A is reused for 8 mmas
+// experts.cuh's mma with a fresh zero accumulator in its own registers (no A-fragment copy as in the "+f" form).
 __device__ __forceinline__ void mma0(float (&d)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
                                      uint32_t b1) {
   asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
@@ -51,8 +39,7 @@ __device__ __forceinline__ float e4m3f(uint32_t b) {
   return __half2float(__half(__nv_cvt_fp8_to_halfraw(static_cast<__nv_fp8_storage_t>(b), __NV_E4M3)));
 }
 
-// A warp's stage: the lane's weight words and scales for one 32-input group (as nvfp4_expert_kernel's Stage), and the
-// inputs of T row tiles (rows gq and gq + 8 of each).
+// A warp's stage: one 32-input group's weight words and scales, and the inputs of T row tiles (rows gq and gq + 8).
 template <int M, int T>
 struct Stage {
   uint4 w[M];
@@ -82,8 +69,7 @@ __device__ __forceinline__ void load_stage(Stage<M, T>& st, const uint4* blk, in
     }
 }
 
-// nvfp4_expert_kernel's compute_stage with each weight fragment decoded and each scale converted once for T row
-// tiles; every row tile's values take the same mma, fmaf and order as there.
+// nvfp4_expert_kernel's compute_stage, each fragment decoded once for T row tiles with the same mma, fmaf and order.
 template <int M, int T>
 __device__ __forceinline__ void compute_stage(float (&acc)[T][M][1][NTW][4], const Stage<M, T>& st,
                                               const bool (&hi)[T]) {
@@ -115,11 +101,7 @@ __device__ __forceinline__ void compute_stage(float (&acc)[T][M][1][NTW][4], con
     }
 }
 
-// X, x_stride, slots, W, scale, KG, NB, items, counts, members, out, N, limit, skip: nvfp4_expert_kernel's arguments
-// and loop; a warp's pass takes 16 * T pairs of its item instead of 16 (items of any size).
-// EPI 5: gate/up's SwiGLU from a gate pass: `gate` [pairs, N] holds bf16(gate sums x scale) (EPI 3 of the gate
-// matrix), this pass the up matrix: swiglu(gate, up) as epilogue<2> computes it (its first step is bf16(g), which the
-// stored gate already is), the same bf16 store.
+// nvfp4_expert_kernel's arguments and loop at 16 * T pairs a pass; EPI 5: SwiGLU of a stored bf16 gate and this up.
 __device__ __forceinline__ void epilogue_up(const float (&acc)[1][1][NTW][4], void* out, const __nv_bfloat16* gate,
                                             int N, int col0, int pr0, int pr1, bool v0, bool v1, float limit) {
 #pragma unroll
@@ -211,8 +193,7 @@ __device__ __forceinline__ void prompt_body(const __nv_bfloat16* __restrict__ X,
 
 }  // namespace tf_fn_experts_prompt
 
-// gate/up SwiGLU (M 2, epilogue 2), down fp32 (M 1, epilogue 0) and bf16 (3); 4 warps a CTA, each warp T row tiles
-// of 16 a pass. extern "C" names: fn_prompt4_<gu|f32|b16>_t<T>.
+// gate/up SwiGLU (M 2, EPI 2), down fp32 (M 1, EPI 0) and bf16 (3); 4 warps a CTA; names fn_prompt4_<gu|f32|b16>_t<T>.
 #define TF_PROMPT4(NAME, M, EPI, T) TF_PROMPT4B(NAME, M, EPI, T, )
 #define TF_PROMPT4B(NAME, M, EPI, T, MINB)                                                                         \
   extern "C" __global__ void __launch_bounds__(128 MINB)                                                         \
@@ -236,8 +217,7 @@ TF_PROMPT4B(fn_prompt4_gu_t2o, 2, 2, 2, COMMA4)
 TF_PROMPT4B(fn_prompt4_f32_t2o, 1, 0, 2, COMMA4)
 TF_PROMPT4B(fn_prompt4_b16_t2o, 1, 3, 2, COMMA4)
 
-// gate/up in two one-matrix passes at 4 CTAs an SM (half the accumulators): the gate's bf16(sums x scale) into `out`
-// of the first, then the up pass's SwiGLU reading them (`gate`), so the act bytes are epilogue<2>'s
+// gate/up as two one-matrix passes at 4 CTAs an SM: gate bf16(sums x scale) into `out`, then up's SwiGLU reads it.
 extern "C" __global__ void __launch_bounds__(128, 4)
     fn_prompt4_gate_t2o(const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,
                         const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items,

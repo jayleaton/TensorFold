@@ -1,10 +1,4 @@
-//! Flash Next's top_k-off draws (Python tensorfold/cuda/sampling.nucleus_rows): each token's share of the row's mass
-//! in fixed point (floor(exp(f64(logit) / t - top) * 2^40), int64, on the GPU with CUDA's fp64 exp as torch's
-//! elementwise kernels run it: cuda_torch_ops.nucleusMass), every rank's top candidates (value, global id, mass) with
-//! its shard's mass sum and width, and the keyed draw over the top_p nucleus then min_p on the host (`_draw`): the
-//! nucleus cut by exact integer mass sums, the same on every rank. A rank whose nucleus runs past its candidates
-//! sends its whole shard instead. tools/zig/flashnext_mia/check_flashnext_nucleus.py checks the mass kernel against torch and
-//! records fixtures of Python's own _shares / _draw, which the test here replays.
+//! Flash Next's top_k-off draws (Python sampling.nucleus_rows): fixed-point masses on GPU, exact nucleus cut on host.
 const std = @import("std");
 const cuda = @import("cuda");
 const lanes = @import("lanes");
@@ -60,8 +54,7 @@ fn before(_: void, a: Entry, b: Entry) bool {
     return a.id < b.id;
 }
 
-/// sampling._draw: each row's (token, share of the mass), or false when some rank's nucleus runs past its
-/// candidates (the caller then sends whole shards).
+/// sampling._draw: each row's (token, mass share), or false when a rank's nucleus runs past its candidates.
 pub fn drawShares(gpa: Allocator, sh: Shares, positions: []const u64, s: S.Sampling, out: []Drawn) !bool {
     const cut = 0.0 < s.top_p and s.top_p < 1.0;
     const min_log = s.minLog();
@@ -156,9 +149,7 @@ fn bf16(x: u16) f32 {
     return @bitCast(@as(u32, x) << 16);
 }
 
-/// nucleus_rows over `rows` rows of this rank's bf16 logits (`columns` wide at `logits`, ids = offset + column, or
-/// `id_map[column]` for the draft head), row r keyed at positions[r]; tokens into `out`, their shares into
-/// `shares` (the draw's temperature-1 probability for the draft chain). Every rank calls it alike.
+/// nucleus_rows over this rank's bf16 logits, row r keyed at positions[r]: tokens into `out`, shares into `shares`.
 pub fn sampleRows(f: *fwd.Forward, sc: Scratch, logits: u64, rows: usize, columns: usize, id_map: ?[]const u32, offset: i64, positions: []const u64, s: S.Sampling, out: []u32, shares: ?[]f64) !void {
     const gpa = f.gpa;
     const t = @max(s.temperature, 1e-6);
@@ -258,8 +249,7 @@ const Gathered = struct {
     }
 };
 
-/// _shares: this rank's top `count` (value, global id, mass), padded with (-inf, -1, 0), its mass sum and width,
-/// every rank's gathered (one rank: its own).
+/// _shares: this rank's top `count` (value, id, mass) padded (-inf, -1, 0), mass sum and width, all ranks gathered.
 fn exchange(f: *fwd.Forward, gpa: Allocator, world: usize, count: usize, order: []const u32, scaled: []const f64, mass: []const i64, sum: i64, columns: usize, id_map: ?[]const u32, offset: i64) !Gathered {
     const width = 3 * count + 2;
     const mine = try gpa.alloc(u64, width);

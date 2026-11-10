@@ -1,8 +1,4 @@
-// Flash Next's n-gram table on the GPU (ours, flashnext/cuda_weights.zig NgramTable.gpu): a rank holds the rows of
-// its n-gram heads [head0, head0 + heads) as stored (FP8 e4m3 codes, or bf16), global rows [base, base + count), and
-// gathers a window's rows into bf16 bits [tokens][heads * width], the values host_table.FP8Table.gather gives
-// (code -> lut[code] = bf16_rne(e4m3 x weight_scale), NaN codes 0x7FC0). Pure data movement: no arithmetic, so the
-// bits are the host gather's. An id outside the rank's rows writes 0x7FC0 (the host gather refuses it).
+// N-gram table rows gathered to bf16 as host_table.FP8Table.gather does; pure data movement, foreign ids write 0x7FC0.
 #include <cstdint>
 
 namespace {

@@ -1,12 +1,4 @@
-//! GPTQ int4 weights of the INT4-AutoRound checkpoint (azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound): the
-//! routed experts and the lm_head, symmetric 4-bit codes with an fp16 scale per 128 inputs and output column
-//! (AutoGPTQ's v1 layout: qweight int32 [K/8, N], eight codes a word low nibble first; qzeros all 7, the stored zero
-//! point minus one, so every zero point is 8; no g_idx). zig/kernels/cuda/fn_int4.cu runs them (ours, no Python
-//! counterpart): exact weights in bf16 MMAs, one fp32 MMA chain a group, groups added with fmaf in order, so a row's
-//! bits never depend on the other rows, the row count, the plan's items or the column tiles a warp takes.
-//!
-//! This file: the packed layouts (made on the host from the checkpoint's bytes, `packWords` / `packScales`), the
-//! kernels' launches (`gateUp`, `down`, `dense`) and the host reference the checks use.
+//! GPTQ int4 experts and lm_head (INT4-AutoRound, zero point 8, fp16 scale per 128): layouts, launches, reference.
 const std = @import("std");
 const cuda = @import("cuda");
 const kern = @import("cuda_kernels.zig");
@@ -40,8 +32,7 @@ pub fn scalesOf(n: usize, k: usize, gs: usize) usize {
     return n * (k / gs);
 }
 
-/// A GPTQ word's eight codes (input j at nibble j) reordered for the kernel: nibble i = input 2i, nibble i + 4 =
-/// input 2i + 1 (the pair at shift 4p is inputs 2p, 2p + 1).
+/// A GPTQ word's eight codes reordered for the kernel: nibble i = input 2i, nibble i + 4 = input 2i + 1.
 pub fn shuffle(w: u32) u32 {
     var out: u32 = 0;
     inline for (0..4) |i| {
@@ -51,14 +42,12 @@ pub fn shuffle(w: u32) u32 {
     return out;
 }
 
-/// The source of one checkpoint matrix: qweight int32 [k_full / 8, n_full] and scales fp16 [k_full / 128, n_full]
-/// as little-endian bytes.
+/// One checkpoint matrix's source: qweight int32 [k_full / 8, n_full] and scales fp16 [k_full / 128, n_full], LE bytes.
 pub const Source = struct { qweight: []const u8, scales: []const u8, n_full: usize, k_full: usize };
 
 pub const Slice = struct { n0: usize, n: usize, k0: usize, k: usize, gs: usize };
 
-/// A slice the kernels take: groups of 64 or 128 inside the source's groups of 128, whole n8 tiles, in bounds, and
-/// the source's byte lengths those of [k_full / 8, n_full] words and [k_full / 128, n_full] scales.
+/// A kernel slice: groups of 64 or 128 inside the source's 128-groups, whole n8 tiles, in bounds, lengths matching.
 fn checkSlice(src: Source, sl: Slice) !void {
     if (sl.gs != 64 and sl.gs != 128) return error.BadSlice;
     if (sl.n == 0 or sl.k == 0 or sl.n % 8 != 0 or sl.k % sl.gs != 0 or sl.k0 % sl.gs != 0) return error.BadSlice;
@@ -135,14 +124,11 @@ fn symbol(comptime gs: usize, comptime nt: usize, comptime mt: usize, comptime m
     return std.fmt.comptimePrint("_ZN10tf_fn_int411int4_kernelILi{d}ELi{d}ELi{d}ELi{d}ELi{d}ELi4EEEvPK13__nv_bfloat16iiPKjPK6__halfiiPKiSA_SA_iPvifi", .{ gs, nt, mt, mats, epi });
 }
 
-/// The plan tile of prompt calls (items of up to 64 pairs, two 16-row tiles a pass) and the pairs from which it is
-/// taken; smaller calls take kern.plan_tile (16) and one tile a pass.
+/// The plan tile of prompt calls (items of up to 64 pairs, two 16-row tiles a pass); smaller calls take plan_tile 16.
 pub const prompt_tile: usize = 64;
 pub const prompt_pairs: usize = 2048;
 
-/// Measured on GB10 (int4-check, 4096 rows, top 5 of 512): 64-pair items with two row tiles a pass are slower
-/// (gate/up 8.4 vs 6.0 ms, down 3.8 vs 3.2 ms: a third of the warps), so every call takes 16-pair items for now;
-/// TF_FLASHNEXT_INT4_TILE=64 takes the prompt tile (the same bits either way, int4-check).
+/// Every call takes 16-pair items (64-pair ones are slower); TF_FLASHNEXT_INT4_TILE=64 takes the prompt tile.
 pub fn tileFor(pairs: usize) usize {
     const want = if (std.c.getenv("TF_FLASHNEXT_INT4_TILE")) |v| std.fmt.parseInt(usize, std.mem.span(v), 10) catch kern.plan_tile else kern.plan_tile;
     return if (want == prompt_tile and pairs >= prompt_pairs) prompt_tile else kern.plan_tile;
@@ -161,11 +147,7 @@ pub const symbols = blk: {
     break :blk out;
 };
 
-/// The routed down of prompt calls (int4_prompt_kernel: a block a (item of up to 64 pairs, 128 columns), 8 warps,
-/// a group's rows, words and scales staged in shared memory, each decoded k16 weight step applied to two row tiles;
-/// the same per-output arithmetic, so the same bits: int4-check). Measured on GB10 at a TP=2 rank (width 320, groups
-/// of 64), 4096 rows top 5: 1.08-1.14x over int4_kernel on 16-pair items, 8192 rows 1.10-1.19x; gate/up gained
-/// nothing (the weights' DRAM reads bound it either way) and keeps int4_kernel.
+/// The routed down of prompt calls on int4_prompt_kernel (staged in shared memory, same per-output math so same bits).
 pub const prompt_down_tile: usize = 64;
 const prompt_threads = 256;
 /// [gs 128, 64][fp32, bf16 out]: stages 2 (128) and 3 (64)
@@ -267,8 +249,7 @@ fn launch(k: *const Kernels, s: cuda.Stream, kind: usize, max_items: usize, x: u
     try cuda.launch.launch(k.fns[kind][j][q], .{ .grid = .{ .x = @intCast(grid) }, .block = .{ .x = warps * 32 } }, s, &a);
 }
 
-/// The routed experts' gate/up with SwiGLU: x [R, D] token rows -> out [R * slots, width] bf16, a row per routed pair
-/// of the plan (items of expert `skip` untouched). `tile`: the plan's (tileFor: 64 makes two row tiles a pass).
+/// Routed experts' gate/up with SwiGLU: x [R, D] -> out [R * slots, width] bf16, a row a pair; expert `skip` untouched.
 pub fn gateUp(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, ex: Experts, p: kern.Plan, plan_slots: usize, plan_experts: usize, out: u64, rows: usize, skip: c_int, tile: usize) !void {
     const items = kern.maxItems(rows * plan_slots, plan_experts, tile);
     try launch(k, s, 0, items, x, x_stride, plan_slots, ex.up, ex.up_s, ex.dims, ex.width, p, 0, out, ex.width, skip, null, if (tile > 16) 2 else 1);
@@ -285,8 +266,7 @@ pub fn down(k: *const Kernels, s: cuda.Stream, act: u64, act_stride: usize, ex: 
     try launch(k, s, kind, items, act, act_stride, 0, ex.down, ex.down_s, ex.width, ex.dims, p, 0, out, ex.dims, skip, null, if (tile > 16) 2 else 1);
 }
 
-/// The routed experts' down of a prompt call on int4_prompt_kernel: `down`'s outputs, byte for byte, from a plan
-/// whose items hold at most `prompt_down_tile` pairs.
+/// The routed down of a prompt call on int4_prompt_kernel: `down`'s outputs byte for byte, items <= prompt_down_tile.
 pub fn downPrompt(k: *const Kernels, s: cuda.Stream, act: u64, act_stride: usize, ex: Experts, p: kern.Plan, plan_slots: usize, plan_experts: usize, out: u64, f32_out: bool, rows: usize, skip: c_int) !void {
     const gs: usize = ex.gs_down;
     const g: usize = switch (gs) {

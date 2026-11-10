@@ -1,23 +1,4 @@
-//! Flash Next's weights on the GPU in the Python engine's layouts (qwen4_exp/cuda/weights.py load(), its ModelOpt
-//! path): bf16 linears as stored, faces stacked by rows, the routed experts' NVFP4 blocks, the shared expert as
-//! identity-scaled FP4 tables, the router with the shared expert's gate, fp32 centred-norm scales, the MTP head
-//! (FP8_PB_WO experts dequantized and re-quantized by ModelOpt's recipe) and the draft head (the lm_head's rows of the
-//! draft vocabulary, MLX 4-bit). Every device buffer carries the Python dataclass path as its name, so digests compare
-//! with the oracle's weights.json. Each layout is made on the host (cuda_layouts.zig, checked against Python's
-//! outputs); nothing here launches a kernel.
-//!
-//! Rank `rank` of `world` takes Python's rank slices (work/PLAN.md "TP=2 design"): DeltaNet key/value heads and
-//! attention q/kv heads by rank, out_proj / o_proj input columns, every expert and the shared expert at the rank's half
-//! of the intermediate width, lm_head and the draft head by vocabulary, the rest replicated.
-//! The n-gram table stays memory-mapped on the host at one rank (47.7 GiB does not fit beside the experts) with an
-//! exact host gather; on the GPU (two ranks) a rank holds its n-gram heads' rows and fn_pack.cu gathers them.
-//!
-//! The loader writes each buffer through a sink: the device (cuMemcpyHtoD), a sha256 per buffer (no GPU: the digests
-//! and memory a load would give, from the checkpoint alone), or sizes only.
-//!
-//! Python source (TensorFold, https://github.com/ashhart/TensorFold): weights.py's ModelOpt path by tournierjc,
-//! Ash Hart (ashhart) and Jürgen Schmied, reader.py, nvfp4.py, nvfp4_moe.py, bf16.py, host_table.py and
-//! cuda/nvfp4/experts.py by Ash Hart, tournierjc and Patrick Meenan.
+//! Flash Next weights in Python's GPU layouts, TP rank-sliced; from weights.py et al. by Ash Hart, tournierjc et al.
 const std = @import("std");
 const cuda = @import("cuda");
 const core = @import("core");
@@ -49,8 +30,7 @@ pub const Options = struct {
     mode: Mode = .device,
     /// the CUDA driver (its context current) for `.device`
     driver: ?*const cuda.Driver = null,
-    /// a directory whose safetensors take precedence over the checkpoint's for the names they hold (INT4-AutoRound's
-    /// fast-fp8/: block-FP8 hyper-connections and MTP experts); the shadowed checkpoint tensors are read as nothing
+    /// a directory whose safetensors override the checkpoint's same-named tensors (INT4-AutoRound's fast-fp8/)
     overlay: ?[]const u8 = null,
     threads: u32 = 16,
     /// drop the checkpoint's pages once a layer's tensors are on the device (Python's reader.release)
@@ -62,8 +42,7 @@ pub const Rows = struct { weight: u64 = 0, n: u32 = 0, k: u32 = 0 };
 /// An FP4 table in the pattern form: bf16 bits [n/64][k/64][64][64], fp32 scales [k/16, n], fp32 scale2 [n].
 pub const Fp4 = struct { weight: u64 = 0, scale: u64 = 0, scale2: u64 = 0, n: u32 = 0, k: u32 = 0 };
 pub const Expert4 = struct { gu: Fp4 = .{}, down: Fp4 = .{} };
-/// cuda/nvfp4/experts.py Experts4: up [E, NI/32, D/32, 2, 144] int32 (gate, up), down [E, D/32, NI/32, 1, 144],
-/// up_scale [E, 2] fp32, down_scale [E, 1] fp32.
+/// Experts4: up [E, NI/32, D/32, 2, 144] int32, down [E, D/32, NI/32, 1, 144], fp32 up_scale [E, 2], down_scale [E, 1].
 pub const Experts4 = struct { up: u64 = 0, down: u64 = 0, up_scale: u64 = 0, down_scale: u64 = 0, count: u32 = 0, width: u32 = 0, dims: u32 = 0 };
 /// nvfp4_moe.MoE4 with MoEW's router: [E + 1, D] bf16, the shared expert's gate row last.
 pub const MoE = struct { router: u64 = 0, routed: Experts4 = .{}, shared: Expert4 = .{}, int4: ?int4.Experts = null, shared8: ?Shared8 = null };
@@ -81,9 +60,7 @@ pub const Hc = struct {
         return h.down.n + if (h.down8) |d| d.n else 0;
     }
 };
-/// INT4-AutoRound (block FP8 dense linears): `proj8` the projection's first columns (DeltaNet q, k, v, z; attention
-/// q|gate, k, v) on the block-FP8 lane matmul, `proj` the bf16 rows after them (DeltaNet b, a; the indexer);
-/// `out8` / `o8` replace `out` / `o`.
+/// INT4-AutoRound: `proj8` leading block-FP8 projection columns, `proj` the bf16 rows after; `out8`/`o8` replace out/o.
 pub const Gdn = struct { proj: Rows = .{}, conv: u64 = 0, a_log: u64 = 0, dt_bias: u64 = 0, norm: u64 = 0, out: Rows = .{}, proj8: ?fp8.Linear = null, out8: ?fp8.Linear = null };
 pub const Attn = struct { proj: Rows = .{}, q_scale: u64 = 0, k_scale: u64 = 0, iq_scale: u64 = 0, ik_scale: u64 = 0, o: Rows = .{}, proj8: ?fp8.Linear = null, o8: ?fp8.Linear = null };
 /// INT4-AutoRound's healed shared expert: block FP8 gate|up rows [2 w, D] and down [D, w] (w its rank's width).
@@ -114,8 +91,7 @@ pub const Named = struct {
     }
 };
 
-/// The FP8 (or bf16) n-gram table: the shards memory-mapped, a gather a lookup at a time (host_table.FP8Table), and
-/// on the GPU a rank's heads' rows with the LUT.
+/// The FP8 (or bf16) n-gram table: mapped shards with a host gather, or on the GPU a rank's heads' rows with the LUT.
 pub const NgramTable = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -164,9 +140,7 @@ pub const NgramTable = struct {
     }
 };
 
-/// The n-gram table's GPU gather (zig/kernels/cuda/fn_pack.cu): a window's global row ids (device int64
-/// [tokens][ids_stride], every head's) -> `out` bf16 bits [tokens][heads * width] for the rank's heads, the host
-/// gather's bits (data movement only).
+/// fn_pack.cu gather: global row ids int64 [tokens][ids_stride] -> bf16 [tokens][heads * width] for the rank's heads.
 pub const Gather = struct {
     module: cuda.Module,
     fp8: cuda.Function,
@@ -257,8 +231,7 @@ pub fn freeDigests(gpa: std.mem.Allocator, ds: []Digest) void {
     gpa.free(ds);
 }
 
-/// sha256 of every buffer: hashed at load (`.hash`), else downloaded from the device a chunk at a time. Names borrow
-/// the Weights' strings.
+/// sha256 of every buffer: hashed at load, else downloaded a chunk at a time; names borrow the Weights' strings.
 pub fn digests(gpa: std.mem.Allocator, w: *const Weights) ![]Digest {
     const out = try gpa.alloc(Digest, w.named.items.len);
     var done: usize = 0;
@@ -421,7 +394,7 @@ const Loader = struct {
         }
     }
 
-    /// `dir`/ple-table/*.safetensors, when present (the table's files: other tensors in them are never read).
+    /// The .safetensors files in `dir`/ple-table when present (only the table's tensors in them are read).
     fn openExtra(L: *Loader, dir: []const u8) !void {
         const sub = try std.fs.path.join(L.gpa, &.{ dir, "ple-table" });
         defer L.gpa.free(sub);
@@ -447,8 +420,7 @@ const Loader = struct {
         return L.extraIndex(key) != null;
     }
 
-    /// The INT4-AutoRound lm_head (GPTQ int4, groups of 128): this rank's vocabulary columns packed for fn_int4.cu.
-    /// Returns the checkpoint's bytes (the draft head dequantizes its rows from them).
+    /// The INT4-AutoRound lm_head (GPTQ int4, groups of 128) by vocab columns; returns the bytes for the draft head.
     fn int4Head(L: *Loader, w: *Weights, vl: usize) !int4.Source {
         const c = L.c;
         const d: usize = c.hidden;
@@ -509,8 +481,7 @@ const Loader = struct {
         return false;
     }
 
-    /// The tensor `name` (after the checkpoint's prefix), marked used; its pages are released after the layer. An
-    /// overlay's tensor wins (the checkpoint's of the same name is marked used).
+    /// The tensor `name` (after the prefix), marked used, pages released after the layer; an overlay's tensor wins.
     fn get(L: *Loader, name: []const u8) !Tensor {
         var buf: [256]u8 = undefined;
         const full = try std.fmt.bufPrint(&buf, "{s}{s}", .{ L.prefix, name });
@@ -569,8 +540,7 @@ const Loader = struct {
         }
     }
 
-    /// A checkpoint name in a ring of 16 buffers: valid for the next 15 calls, so a name made here may be an argument
-    /// of the next (hc's names are built from its caller's).
+    /// A checkpoint name in a ring of 16 buffers: valid for the next 15 calls, so it may be an argument of the next.
     fn nameOf(L: *Loader, comptime fmt: []const u8, args: anytype) ![]const u8 {
         L.ring_at = (L.ring_at + 1) % L.ring.len;
         return std.fmt.bufPrint(&L.ring[L.ring_at], fmt, args);
@@ -583,8 +553,7 @@ const Loader = struct {
         return L.cscaleRope(path, name, n, false);
     }
 
-    /// cscale, then with `rotated` YaRN's attention factor folded into the rotary dims (cuda_rope.foldGamma: the
-    /// patched Python's q_scale, k_scale, iq_scale and ik_scale; a no-op without YaRN).
+    /// cscale, with `rotated` folding YaRN's attention factor into rotary dims (cuda_rope.foldGamma).
     fn cscaleRope(L: *Loader, path: []const u8, name: []const u8, n: usize, rotated: bool) !u64 {
         const t = try L.expect(name, .bf16, &.{n});
         const host: []f32 = @alignCast(std.mem.bytesAsSlice(f32, try L.staging(n * 4)));
@@ -608,8 +577,7 @@ const Loader = struct {
 
     const Part = struct { t: Tensor, rows: []const [2]usize = &.{}, cols: ?[2]usize = null };
 
-    /// Rows of several linears of one input as one [n, k] bf16 matrix (`face` / `stack_b16`); `rows` row ranges of a
-    /// part (all its rows when empty), `cols` an input-column range (o_proj's and out_proj's TP split).
+    /// Several linears of one input as one [n, k] bf16 matrix (stack_b16); `rows` ranges per part, `cols` the TP split.
     fn face(L: *Loader, path: []const u8, parts: []const Part) !Rows {
         const k_all = parts[0].t.dim(1);
         const k = if (parts[0].cols) |c| c[1] - c[0] else k_all;
@@ -675,8 +643,7 @@ const Loader = struct {
         return h;
     }
 
-    /// gdn_nvfp4: the rank's q, k, v channels, z, b and a rows; conv taps at the same channels; A_log and dt_bias as
-    /// fp32; the gated norm as stored; out_proj's input columns of the rank's value heads.
+    /// gdn_nvfp4: the rank's q, k, v, z, b, a rows and conv taps; fp32 A_log, dt_bias; out_proj's rank head columns.
     fn gdn(L: *Loader, path: []const u8, name: []const u8) !Gdn {
         const c = L.c;
         const r: usize = L.o.rank;
@@ -736,8 +703,7 @@ const Loader = struct {
         return a;
     }
 
-    /// moe_nvfp4: the router with the shared expert's gate row, the shared expert's FP4 tables at the rank's half width,
-    /// and the routed experts: NVFP4 as shipped (the main layers) or FP8_PB_WO dequantized and re-quantized (MTP).
+    /// moe_nvfp4: router with shared gate row, shared FP4 expert at half width, NVFP4 or re-quantized (MTP) experts.
     fn moe(L: *Loader, path: []const u8, name: []const u8, mtp: bool) !MoE {
         const c = L.c;
         const r: usize = L.o.rank;
@@ -755,8 +721,7 @@ const Loader = struct {
         const sgate = try L.linear(try L.nameOf("{s}.shared_expert_gate", .{name}), 1, d);
         m.router = (try L.face(try std.fmt.bufPrint(&pb, "{s}.router", .{path}), &.{ .{ .t = router }, .{ .t = sgate } })).weight;
 
-        // the shared expert: bf16 rows [lo, hi) of gate and up (Python slices it by moe_width's bounds), down's columns
-        // (the MTP layer's own width: INT4-AutoRound's healed main shared experts are wider than its MTP one)
+        // shared expert: gate/up rows [lo, hi), down's columns; MTP uses its own width (INT4-AutoRound's main is wider)
         const sw = if (mtp and c.int4ar()) (try L.get(try L.nameOf("{s}.shared_expert.gate_proj.weight", .{name}))).dim(0) else c.shared_width;
         const sg = try L.linear(try L.nameOf("{s}.shared_expert.gate_proj", .{name}), sw, d);
         const su = try L.linear(try L.nameOf("{s}.shared_expert.up_proj", .{name}), sw, d);
@@ -809,8 +774,7 @@ const Loader = struct {
 
     // -- INT4-AutoRound: block-FP8 faces, GPTQ int4 experts --------------------------------------------------
 
-    /// One block-FP8 linear of a face: its checkpoint name (".weight" e4m3 [n, k], ".weight_scale_inv" fp32 128x128
-    /// blocks), row ranges (all when empty) and an input-column range (out_proj's and o_proj's TP split).
+    /// One block-FP8 linear of a face: name (e4m3 weight, fp32 128x128 scale_inv), row ranges and column range.
     const Part8 = struct { name: []const u8, rows: []const [2]usize = &.{}, cols: ?[2]usize = null };
 
     fn isFp8(L: *Loader, name: []const u8) !bool {
@@ -818,8 +782,7 @@ const Loader = struct {
         return L.has(try std.fmt.bufPrint(&b, "{s}{s}.weight_scale_inv", .{ L.prefix, name }));
     }
 
-    /// Fp8BlockLinear.from_rows of the parts' rows stacked (each row's fp32 scale per 64 inputs from its 128x128
-    /// block), in the FP8G lane matmul's fragment order: "<path>.w8" and "<path>.bs".
+    /// Fp8BlockLinear.from_rows of stacked rows (fp32 scale per 64 inputs) in FP8G fragment order: ".w8", ".bs".
     fn fp8Face(L: *Loader, path: []const u8, parts: []const Part8) !fp8.Linear {
         var n: usize = 0;
         var k: usize = 0;
@@ -888,8 +851,7 @@ const Loader = struct {
         return l;
     }
 
-    /// The DeltaNet block of the INT4-AutoRound checkpoint: q, k, v (the rank's channels) and z on block FP8, b and a
-    /// bf16 rows after them; out_proj's input columns of the rank's value heads on block FP8.
+    /// INT4-AutoRound DeltaNet: q, k, v, z block FP8 then bf16 b, a rows; out_proj's rank head columns block FP8.
     fn gdn8(L: *Loader, path: []const u8, name: []const u8) !Gdn {
         const c = L.c;
         const r: usize = L.o.rank;
@@ -926,8 +888,7 @@ const Loader = struct {
         return g;
     }
 
-    /// The attention block of the INT4-AutoRound checkpoint: the rank's q|gate, k, v rows on block FP8, the indexer's
-    /// rows bf16 after them; o_proj's columns on block FP8; fp32 norms.
+    /// INT4-AutoRound attention: rank's q|gate, k, v block FP8, bf16 indexer rows; o_proj block FP8; fp32 norms.
     fn attention8(L: *Loader, path: []const u8, name: []const u8) !Attn {
         const c = L.c;
         const r: usize = L.o.rank;
@@ -957,8 +918,7 @@ const Loader = struct {
         return a;
     }
 
-    /// The INT4-AutoRound MoE: the bf16 router with the shared expert's gate row, the healed shared expert on block FP8
-    /// (the rank's half of its width), the GPTQ int4 routed experts (the rank's half of the expert width).
+    /// INT4-AutoRound MoE: bf16 router with shared gate row, block-FP8 shared expert, GPTQ int4 experts; rank halves.
     fn moe8(L: *Loader, path: []const u8, name: []const u8) !MoE {
         const c = L.c;
         const r: usize = L.o.rank;
@@ -985,8 +945,7 @@ const Loader = struct {
         return m;
     }
 
-    /// GPTQ int4 routed experts in fn_int4.cu's layout: gate and up rows [lo, hi) of every expert ([E][2]), down's
-    /// input columns [lo, hi) (groups of 64 when the slice cuts a group of 128).
+    /// GPTQ int4 experts for fn_int4.cu: gate/up rows [lo, hi) per expert, down's columns [lo, hi) (64-groups if cut).
     fn int4Experts(L: *Loader, path: []const u8, name: []const u8, lo: usize, hi: usize) !int4.Experts {
         const c = L.c;
         const e = c.experts;
@@ -1054,8 +1013,7 @@ const Loader = struct {
 
     const Packed = struct { blocks: u64, scale2: []f32 };
 
-    /// The main layers' routed experts as shipped: per expert U8 codes [N, K/2], e4m3 scales [N, K/16] and an fp32
-    /// weight_scale_2, packed by `_pack` (rows [lo, lo + n) of gate and up, or down's input columns from `lo`).
+    /// Main-layer routed experts as shipped (U8 codes, e4m3 scales, fp32 scale_2) packed by `_pack` at the rank slice.
     fn packRouted(L: *Loader, path: []const u8, name: []const u8, projs: []const []const u8, n: usize, k: usize, lo: usize, down: bool) !Packed {
         const c = L.c;
         const e = c.experts;
@@ -1097,8 +1055,7 @@ const Loader = struct {
         return .{ .blocks = ptr, .scale2 = s2 };
     }
 
-    /// The MTP layer's FP8_PB_WO experts: each dequantized to bf16 (weight_bf16), its rank slice taken, quantized by
-    /// ModelOpt's recipe (one g per expert and matrix) and packed (moe4_from_bf16).
+    /// MTP FP8_PB_WO experts: dequantized to bf16, rank-sliced, ModelOpt-quantized and packed (moe4_from_bf16).
     fn mtpExperts(L: *Loader, path: []const u8, name: []const u8, x: *Experts4, lo: usize, hi: usize) !void {
         const c = L.c;
         const e = c.experts;
@@ -1209,8 +1166,7 @@ const Loader = struct {
         x.down_scale = try L.out.whole(try std.fmt.bufPrint(&pb, "{s}.experts.routed_experts.down_scale", .{path}), "float32", &.{ e, 1 }, std.mem.sliceAsBytes(ds));
     }
 
-    /// The PLE layer: the n-gram constants checked, the table opened (host map, or the rank's heads on the GPU), the
-    /// key and value projections, three fp32 norm scales and the conv taps.
+    /// The PLE layer: n-gram constants checked, table opened (host or GPU), k/v projections, fp32 norms, conv taps.
     fn ple(L: *Loader, path: []const u8, name: []const u8, ple_index: u32, w: *Weights) !Ple {
         const c = L.c;
         const g = try ngram.NGram.init(c.ngramOptions(ple_index));
@@ -1242,8 +1198,7 @@ const Loader = struct {
         return p;
     }
 
-    /// open_table: the shards (".shard_i" or ".shards.i") mapped from their files again, FP8 with its table scale
-    /// (bf16_rne(e4m3 x scale) through a 256-entry LUT) or bf16 as stored.
+    /// open_table: shards mapped again, FP8 with its table scale through a 256-entry bf16 LUT, or bf16 as stored.
     fn openTable(L: *Loader, base: []const u8, g: ngram.NGram) !NgramTable {
         var t: NgramTable = .{ .gpa = L.gpa, .io = L.io };
         errdefer t.deinit();
@@ -1255,8 +1210,7 @@ const Loader = struct {
             var b: [256]u8 = undefined;
             var key = try std.fmt.bufPrint(&b, "{s}{s}ngram_embedding.shard_{d}.weight", .{ L.prefix, base, i });
             if (!L.has(key) and !L.hasExtra(key)) key = try std.fmt.bufPrint(&b, "{s}{s}ngram_embedding.shards.{d}.weight", .{ L.prefix, base, i });
-            // the shard's file, mapped once more for the table's lifetime: a checkpoint file, else one of the table's
-            // own files beside it (INT4-AutoRound's ple-table/, outside the index)
+            // the shard's file, mapped again for the table's lifetime: a checkpoint file or a ple-table file
             var file_i: ?usize = null;
             for (L.ck.files.items, 0..) |*f, fi| if (f.names.contains(key)) {
                 file_i = fi;
@@ -1398,8 +1352,7 @@ fn parallel(threads: u32, n: usize, ctx: anytype, comptime f: fn (@TypeOf(ctx), 
     for (pool[0..extra]) |t| if (t) |th| th.join();
 }
 
-/// Python's norms_around_one over the layers' attn_hyper_connection.hc_norm means: true when stored as scales (around
-/// one), false when centred (around zero: one is added); anything else is refused.
+/// Python's norms_around_one over hc_norm means: true when scales (around one), false when centred; else refused.
 pub fn aroundOne(means: []const f64) !bool {
     if (means.len == 0) return true;
     var above: usize = 0;
@@ -1415,8 +1368,7 @@ pub fn aroundOne(means: []const f64) !bool {
     return error.NormsUnclear;
 }
 
-/// The draft vocabulary's ids below `vocab`, sorted and unique (np.unique of draft_vocab.txt), then rank `rank`'s
-/// share of `world` (np.array_split: the first len % world shares one longer).
+/// Draft vocabulary ids below `vocab`, sorted unique (np.unique), then rank's share of `world` (np.array_split).
 pub fn draftIds(gpa: std.mem.Allocator, text: []const u8, vocab: u32, rank: u32, world: u32) ![]u32 {
     var all: std.ArrayList(u32) = .empty;
     defer all.deinit(gpa);
@@ -1448,12 +1400,7 @@ fn skip(ck: *core.Checkpoint, gpa: std.mem.Allocator, prefix: []const u8) !usize
     return n;
 }
 
-/// weights.load for the ModelOpt NVFP4 checkpoint in `dir`: rank `o.rank` of `o.world`'s buffers, leftovers refused
-/// (the vision tower, skipped for now, and the experts' activation input_scale excepted).
-/// The checkpoint's shards out of the page cache (POSIX_FADV_DONTNEED over each whole file; clean pages, no root):
-/// the loader drops what this rank read, but the other rank's reads over NFS from this box fill its page cache
-/// again, and a GPU allocation under a full page cache waits for reclaim (a 32k prompt's kept state took 1.4-1.7 s
-/// to allocate on spark1 with ~40 GiB cached, 38 ms after this; P1 out/p1-gapC, out/p1-gapD).
+/// Drops the checkpoint's shards from the page cache (POSIX_FADV_DONTNEED) so GPU allocation does not wait for reclaim.
 pub fn dropPages(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) void {
     const paths = core.checkpoint.shardFiles(gpa, io, dir) catch return;
     defer core.checkpoint.freeShardFiles(gpa, paths);
@@ -1464,6 +1411,7 @@ pub fn dropPages(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) void {
     }
 }
 
+/// weights.load of the ModelOpt NVFP4 checkpoint: this rank's buffers, leftovers refused (vision, input_scale aside).
 pub fn load(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, c: *const Config, o: Options) !Weights {
     var why: cfgs.Why = .{};
     c.check(&why) catch |e| {

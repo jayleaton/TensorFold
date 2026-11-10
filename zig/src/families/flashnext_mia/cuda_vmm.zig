@@ -1,9 +1,4 @@
-//! CUDA virtual memory for Flash Next's caches (work/research/R3-concurrency-kv.md's KV items): a sequence reserves
-//! address space for its whole window once and maps physical memory into it as it grows, so a cache never moves (no
-//! copy, no old-plus-new peak, pointers that captured graphs keep), and its indexer keys live in a ring: one
-//! physical chunk mapped again and again over the window's rows, since only the rows from the last incomplete
-//! block on are ever read (attention.py `_pool_block` reads rows [p0 - 3, p0 + R) of the keys attn_prep wrote).
-//! The driver's VMM entry points are looked up from libcuda here (the shared driver binding does not carry them).
+//! CUDA VMM for Flash Next's caches: reserve the window once, map as it grows (never moves), indexer keys in a ring.
 const std = @import("std");
 const cuda = @import("cuda");
 
@@ -116,8 +111,7 @@ pub const Region = struct {
         return size;
     }
 
-    /// The whole region as a ring over one chunk of `chunk` bytes (a multiple of the granularity): address
-    /// base + x reaches physical byte x mod chunk. Returns the physical bytes.
+    /// The whole region as a ring over one chunk of `chunk` bytes: address base + x reaches physical byte x mod chunk.
     pub fn mapRing(r: *Region, gpa: Allocator, chunk: usize) !usize {
         const size = r.v.up(chunk);
         if (r.reserved % size != 0) return error.RingDoesNotTile;

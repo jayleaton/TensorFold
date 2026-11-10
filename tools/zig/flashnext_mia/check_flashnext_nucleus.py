@@ -1,14 +1,4 @@
-"""Flash Next's top_k-off draws (cuda/sampling.nucleus_rows) against the deployed torch, and fixtures for the Zig port.
-
-1. fn_ops.cu's tf_fn_nucleus_mass against torch's fixed-point mass (floor(exp(f64(f32(logit)) / t - top) * 2**40),
-   int64) and its row sums, raw bytes, at the checkpoint's vocabulary, a TP=2 rank's half and the draft head's.
-2. Fixtures of Python's own _shares / _draw on one rank and on two (each rank's shard, the global top), with the
-   whole-shard fallback when a nucleus runs past the candidates: zig/src/families/flashnext_mia/fixtures_cuda_nucleus.json,
-   which cuda_nucleus.zig's test replays on the host.
-Run on the GPU in nvcr.io/nvidia/pytorch:26.07-py3 from tools/zig with TensorFold's src on PYTHONPATH:
-
-    python check_flashnext_nucleus.py --source ../../zig/kernels/cuda/torch_ops --out <dir> --fixture <json>
-"""
+"""fn_ops.cu's nucleus mass vs torch by raw bytes, and _shares/_draw fixtures for cuda_nucleus.zig (GPU)."""
 
 import argparse
 import json
@@ -71,8 +61,7 @@ def main():
     cases = []
     samplings = [Sampling(7, 1.0, 0, 0.95, 0.0), Sampling(11, 0.7, 0, 0.5, 0.0), Sampling(13, 1.0, 0, 1.0, 0.05),
                  Sampling(17, 1.3, 0, 0.9, 0.02), Sampling(19, 2.5, 0, 0.99, 0.0), Sampling(23, 4.0, 0, 1.0, 0.001)]
-    # small shapes (48 candidates of 256-token shards) so the fixture stays small; _draw's rules do not depend on
-    # NUCLEUS, the count _shares is handed
+    # small shapes keep the fixture small; _draw's rules do not depend on NUCLEUS
     vocab, count0 = 512, 48
     for world in (1, 2):
         for spread in (1.0, 8.0):

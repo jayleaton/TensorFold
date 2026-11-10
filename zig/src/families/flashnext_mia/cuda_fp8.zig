@@ -1,13 +1,4 @@
-//! 128x128-block FP8 linears (ModelOpt FP8_PB_WO: e4m3 `weight` + fp32 `weight_scale_inv`) on CUDA, as the Python
-//! engine runs them (cuda/nvfp4/linear.py Fp8BlockLinear): e4m3 bytes in the FP8 GEMM's fragment order, an fp32
-//! scale per (64 inputs, output column), and the lane matmul in mode FP8G (qmmf.cu) for decode and prompt rows
-//! alike: each 64 inputs' bf16 MMA products scaled into an fp32 sum in block order, K slices fixed by the shape, a
-//! row's bits independent of every other row and of M. zig/kernels/cuda/fn_qmmf.cu is the device code copied by
-//! zig/tests/cuda/copies.py (SASS-equal to the Python extension tensorfold_nvfp4_v3); `matmul` is linear._matmul and
-//! qmmf_cuda's host logic. The host layout helpers make the loader's buffers byte for byte as from_checkpoint does.
-//!
-//! Python source (TensorFold, https://github.com/ashhart/TensorFold, cuda/nvfp4/linear.py and qmmf.cu, authored by
-//! Ash Hart (ashhart)).
+//! 128x128-block FP8 linears as Fp8BlockLinear (TensorFold linear.py, qmmf.cu by Ash Hart (ashhart)), bit-exact.
 const std = @import("std");
 const cuda = @import("cuda");
 
@@ -61,7 +52,7 @@ pub const sym = struct {
         break :blk out;
     };
     pub const fused = [2][:0]const u8{ name(64, false, false, true), name(64, true, false, true) };
-    /// fn_qmmf_ld.cu's (tools/zig/flashnext_mia/flashnext_qmmf_ld.py): bf16 out with a row stride, [cluster][bm 16, 32, 64] and fused
+    /// fn_qmmf_ld.cu's: bf16 out with a row stride, [cluster][bm 16, 32, 64] and fused
     fn ldName(comptime bm: u32, comptime cluster: bool, comptime fuse: bool) [:0]const u8 {
         return std.fmt.comptimePrint("_ZN13tf_fn_qmmf_ld11qmmf_kernelILi3ELi{d}ELi64ELi1ELi4ELi4ELb0ELb{d}ELb{d}EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiiii", .{ bm, @intFromBool(cluster), @intFromBool(fuse) });
     }
@@ -124,15 +115,12 @@ fn bucketIndex(bm: usize) usize {
     };
 }
 
-/// linear._matmul(FP8G, ...) and qmmf_cuda: x (m, K) bf16 rows `x_stride` elements apart -> out (m, n) bf16 (fp32
-/// with `f32_out`), contiguous. K slices from the shape alone (split_k), added in a cluster (sm_90 on) or, from
-/// FUSED_ROWS rows, by each block in slice order: the same bits either way, a row's bits never depend on m.
+/// linear._matmul(FP8G) and qmmf_cuda: x (m, K) bf16 -> out (m, n); K slices from the shape, row bits independent of m.
 pub fn matmul(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, l: Linear, out: u64, f32_out: bool, m: usize) !void {
     return matmulAt(k, s, x, x_stride, l, out, f32_out, m, null);
 }
 
-/// `matmul`, bf16 out, the rows `ldo` elements apart (fn_qmmf_ld: the same kernels and values, only the store
-/// address differs; a projection's block-FP8 columns written straight into its wider rows).
+/// `matmul`, bf16 out, rows `ldo` elements apart (fn_qmmf_ld: same kernels and values, only the store address differs).
 pub fn matmulLd(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, l: Linear, out: u64, ldo: usize, m: usize) !void {
     if (ldo < l.n or ldo % 2 != 0 or out % 4 != 0) return error.Invalid;
     return matmulAt(k, s, x, x_stride, l, out, false, m, ldo);
@@ -172,8 +160,7 @@ fn matmulAt(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, l: Linea
 
 // ---- host layouts (Fp8BlockLinear.from_checkpoint) ------------------------------------------------------------------
 
-/// Fp8BlockLinear.column_scales: fp32 `scale_inv` [ceil(n/128), k/128] -> `out` [n, k/64], each (row, 64 inputs)'s
-/// block scale.
+/// Fp8BlockLinear.column_scales: fp32 `scale_inv` [ceil(n/128), k/128] -> `out` [n, k/64] block scales.
 pub fn columnScales(scale_inv: []const f32, n: usize, k: usize, out: []f32) !void {
     if (k % 128 != 0 or scale_inv.len != ((n + 127) / 128) * (k / 128) or out.len != n * (k / 64)) return error.BadScaleShape;
     const kb = k / 128;
@@ -232,7 +219,7 @@ test "split_k, buckets and shared memory follow qmm.py and qmmf.cu" {
 }
 
 test "fragment order is fragment_index's (k, n) of every byte" {
-    // fragment_index: p = 16 (byte / 4) + 4 (lane % 4) + byte % 4; kin = 16 (p / 16) + 2 ((p % 16) / 4) + p % 2 + 8 ((p % 4) / 2)
+    // fragment_index: p = 16(byte/4) + 4(lane%4) + byte%4; kin = 16(p/16) + 2((p%16)/4) + p%2 + 8((p%4)/2)
     for (0..32) |lane| for (0..8) |byte| {
         const p = 16 * (byte / 4) + 4 * (lane % 4) + (byte % 4);
         try std.testing.expectEqual(16 * (p / 16) + 2 * ((p % 16) / 4) + (p % 2) + 8 * ((p % 4) / 2), kin(lane, byte));
@@ -303,7 +290,7 @@ test "column scales repeat 128 rows and two 64-input groups" {
     try std.testing.expectEqual(@as(f32, 6), cols[199 * 6 + 4]);
 }
 
-// ---- fp8-check: the port against Python's Fp8BlockLinear (tools/zig/flashnext_mia/check_fp8block.py's cases) ---------------------
+// ---- fp8-check: the port against Python's Fp8BlockLinear (check_fp8block.py's cases) ----
 
 fn readFile(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, name: []const u8, suffix: []const u8) ![]u8 {
     const path = try std.fmt.allocPrint(gpa, "{s}/{s}{s}", .{ dir, name, suffix });
@@ -317,9 +304,7 @@ fn hex(bytes: []const u8) [64]u8 {
     return std.fmt.bytesToHex(sum, .lower);
 }
 
-/// Every case of `dir` (cases.json + each case's codes, scale_inv and input rows): the host layouts' sha256 against
-/// Python's, then `matmul` at every row count (bf16, and fp32 where Python wrote it) against Python's outputs, a
-/// row's bits against its one-row call, and the time at 1 and 4096 rows. True when every byte agrees.
+/// Every case of `dir`: layouts' sha256 and `matmul` outputs vs Python's, row invariance, timing; true if equal.
 pub fn check(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8) !bool {
     const d = ctx.d;
     var k = try Kernels.load(ctx);
@@ -411,8 +396,7 @@ pub fn check(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
             }
         }
         ok = ok and inv_ok;
-        // matmulLd (fn_qmmf_ld): every bf16 row count's rows written `ldo` apart hold the contiguous call's bytes,
-        // and the gaps between them stay untouched
+        // matmulLd: every bf16 row count's rows written `ldo` apart hold the contiguous call's bytes, gaps untouched
         {
             const ldo = n + 72;
             var dl = try cuda.DeviceBuffer.alloc(d, max_m * ldo * 2);

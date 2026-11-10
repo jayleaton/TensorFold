@@ -1,8 +1,4 @@
-//! Device buffers of Flash Next on CUDA (Python qwen4_exp/cuda/state.py): a window's or prompt chunk's scratch
-//! (`Buffers`, static so a step can be graph-captured) and one sequence's committed caches (`State`: the GDN conv and
-//! recurrent state, the attention layers' KV, indexer keys and pooled blocks, the PLE tail, the MTP head's own
-//! attention cache). Sizes follow Python's shapes field by field, per rank: `Geometry` holds the rank's share
-//! (heads, value heads, expert width, head rows) as the weight loader's `(rank, world)` split gives it.
+//! Device buffers of Flash Next on CUDA (Python qwen4_exp/cuda/state.py): graph-capturable scratch and sequence caches.
 const std = @import("std");
 const cuda = @import("cuda");
 
@@ -16,9 +12,7 @@ pub const gdn_dk = 128;
 pub const gdn_dv = 128;
 pub const grow_step = 8192; // caches grow this many rows at a time (State.ensure)
 
-/// The attention caches' format (--kv-dtype): bf16, or FP8 (Python kv8.py, the owner's GLM recipe format adapted to
-/// per-head rows): a key row is head_dim e4m3 codes then s_k, s_v (fp32) and 8 zero bytes, a value row head_dim
-/// codes; one power-of-two scale a (position, KV head) row. Every sequence of an engine uses the same format.
+/// Attention cache format (--kv-dtype): bf16 or FP8 (Python kv8.py), power-of-two scale per row; one format an engine.
 pub const KvDtype = enum {
     bf16,
     fp8,
@@ -61,8 +55,7 @@ pub const Geometry = struct {
     shared_width: usize = 0,
     /// INT4-AutoRound: block-FP8 mixers and shared expert, GPTQ int4 experts and head (cuda_forward's scratch for them)
     int4ar: bool = false,
-    /// the MTP layer's routed experts a row (0: top_k); drafts only (TF_FLASHNEXT_MTP_TOPK: INT4-AutoRound's MTP layer
-    /// was trained at top-10 while its main layers route 5)
+    /// the MTP layer's routed experts a row for drafts (0: top_k; TF_FLASHNEXT_MTP_TOPK)
     mtp_top_k: usize = 0,
     kv: KvDtype = .bf16,
 
@@ -353,8 +346,7 @@ pub const State = struct {
         return g.attention_layers + @intFromBool(g.mtp);
     }
 
-    /// Bytes one attention layer's caches take at `rows` rows (keys and values in the geometry's format, indexer
-    /// keys, pooled blocks).
+    /// Bytes one attention layer's caches take at `rows` rows (keys, values, indexer keys, pooled blocks).
     pub fn layerBytes(g: Geometry, rows: usize) usize {
         return rows * (g.kRow() + g.vRow() + g.index_dim * 2) + g.blocks(rows) * g.index_dim * 2;
     }
@@ -372,8 +364,7 @@ pub const State = struct {
     fn fixedSizes(g: Geometry) [10]usize {
         const n = g.linear_layers;
         return .{
-            // one DeltaNet state a layer (the engine folds kept rows in place: cuda_forward.zig Round); the
-            // replay inputs live in the engine's round scratch, not per sequence
+            // one DeltaNet state a layer (folded in place); replay inputs live in the engine's round scratch
             n * (g.conv_kernel - 1) * g.gdnConv() * 2,        n * g.nv * gdn_dv * gdn_dk * 4,
             0,                                                0,
             0,                                                0,
@@ -426,8 +417,7 @@ pub const State = struct {
         return cacheBytes(s.g, s.capacity) - before;
     }
 
-    /// Reallocate the context caches at `rows` rows, keeping every committed row (the layers' `pos`, the MTP head's
-    /// `mtp_len`). Python reallocates a layer at a time; here one allocation holds all, so a resize briefly holds both.
+    /// Reallocate the caches at `rows` rows, keeping committed rows; one allocation, so a resize briefly holds both.
     pub fn resize(s: *State, rows: usize) !void {
         const keep = @max(s.pos, s.mtp_len);
         if (rows < keep) return error.CacheTooSmall;

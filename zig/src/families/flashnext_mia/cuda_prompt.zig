@@ -1,10 +1,4 @@
-//! The prompt path's matmuls without split-K partials (work/research/R2-prefill.md W-A): `_b16mm_ks` and
-//! `_fp4mm_ks` (src/tensorfold/families/qwen4_exp/cuda/prompt_mm.py, in the kernel set through
-//! tools/zig/flashnext_mia/flashnext_prompt_spec.py) run all K slices of a tile in one program and add the slice totals in slice
-//! order, the fp32 adds `_reduce` makes, so they give `_b16mm` + `_reduce`'s (and `_fp4mm` + `_reduce`'s) bits with
-//! no [SK, M, N] fp32 buffer written and read back. Decode windows (<= 128 rows) keep the split kernels.
-//! `TF_FLASHNEXT_PROMPT_MM=0` keeps Python's two launches for prompts too (the A/B and the fallback when a kernel
-//! set has no `_ks` entries). `check` replays both on random, cancelling and edge-case inputs and compares bytes.
+//! Prompt matmuls without split-K partials (`_b16mm_ks`, `_fp4mm_ks`): slice totals in order, `_reduce`'s bits.
 const std = @import("std");
 const cuda = @import("cuda");
 const aot = cuda.aot;
@@ -128,8 +122,7 @@ fn sample(r: std.Random, fill: Fill, i: usize) u16 {
             break :blk bf16Bits(if (r.boolean()) -v else v);
         },
         .cancel => blk: {
-            // pairs +a, -a (with a few bits off; the other operand's signs are random) so sums cancel and the low
-            // bits decide
+            // pairs +a, -a (a few bits off) so sums cancel and the low bits decide
             const a = std.math.ldexp(1.0 + r.float(f32), r.intRangeAtMost(i32, -4, 8));
             const off: f32 = if (r.uintLessThan(u32, 8) == 0) std.math.ldexp(@as(f32, 1.0), r.intRangeAtMost(i32, -12, -2)) else 0;
             break :blk bf16Bits(if (i % 2 == 0) a else -a + off);
@@ -162,9 +155,7 @@ fn fillBuf(gpa: std.mem.Allocator, buf: cuda.DeviceBuffer, count: usize, r: std.
     try buf.upload(0, std.mem.sliceAsBytes(h));
 }
 
-/// Directed slice totals (Codex review P1-codex-1 #2): each x row holds 2^24, 1 and -2^24 in K slices 0, 1, 2 (with
-/// SK 2: 2^24 in slice 0, 1 and -2^24 in slice 1; one more pattern inside a K block), the rest zero; w is +-1, 2 or
-/// 0.5. In slice order the fp32 total is (2^24 + 1) - 2^24 = 0; any other association gives 1.
+/// Directed slice totals: rows of 2^24, 1, -2^24 across K slices, so only slice-order fp32 association gives 0.
 fn slicesFill(gpa: std.mem.Allocator, x: cuda.DeviceBuffer, w: cuda.DeviceBuffer, rows: usize, stride: usize, n: usize, k: usize, sk: usize, r: std.Random) !void {
     const hx = try gpa.alloc(u16, rows * stride);
     defer gpa.free(hx);
@@ -200,8 +191,7 @@ fn slicesFill(gpa: std.mem.Allocator, x: cuda.DeviceBuffer, w: cuda.DeviceBuffer
     try w.upload(0, std.mem.sliceAsBytes(hw));
 }
 
-/// Both paths of every case at TP `tp` (1, 2 or 3 for both) over `rows`, each input kind; true when every output
-/// byte is equal. Prints one line a case and row count.
+/// Both paths of every case at TP `tp` over `rows`, each input kind; true when every output byte is equal.
 pub fn check(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri, tp: u32, rows: []const usize) !bool {
     var prng = std.Random.DefaultPrng.init(0x5eed_9f1);
     const r = prng.random();
@@ -331,8 +321,7 @@ pub fn bench(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri, c: Case,
 
 // -- the indexer's scoring and selection of a prompt block, by rows ---------------------------------------------
 
-/// attention.qsa_rows' `_scores` alone (Tri.qsaRows' first launch): rows [0, rows) of the block whose first row's
-/// position is at `pos0`, scores into `sc.scores`.
+/// attention.qsa_rows' `_scores` alone: rows [0, rows) of the block starting at `pos0`, scores into `sc.scores`.
 pub fn qsaScores(t: tri.Tri, iq: u64, pooled: u64, pos0: u64, sc: tri.AttnScratch, rows: usize, g: tri.AttnGeometry, context: ?usize, d: tri.Dims) !void {
     const blocks = g.blocks(context);
     try run(t, "_scores", .{ rows, cdiv(blocks, 64), 1 }, &.{ aot.ptr("IQ", bf16, iq), aot.ptr("POOLED", bf16, pooled), aot.ptr("POS0", "*i32", pos0), aot.ptr("SC", f32p, sc.scores), int("NB", g.nb) }, &.{ ci("HI", d.index_heads), ci("DI", d.index_dim), ci("RATIO", g.ratio), ci("TOP", g.budget / g.ratio), ci("BB", 64) });
@@ -415,8 +404,7 @@ pub fn qsaSelectTiles(t: tri.Tri, pos0: u64, sc: tri.AttnScratch, rows: usize, g
     try run(t, "_select_tiles", .{ rows, 1, 1 }, &lists, &.{ ci("RATIO", g.ratio), ci("TOP", g.budget / g.ratio), ci("IDW", g.idw), ci("TB", if (rows >= 64) 4096 else 8192) });
 }
 
-/// `qsa-check`: `_scores_rows` against `_scores` (score bytes) and `_select_tiles` against `_select` (key lists,
-/// lengths, flags) on random and tie-heavy indexer keys, rows past several positions. True when all equal.
+/// `qsa-check`: `_scores_rows` vs `_scores`, `_select_tiles` vs `_select` on random and tie-heavy keys; true if equal.
 pub fn qsaCheck(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri, fast: ?*const QsaScores) !bool {
     const capacity: usize = 262144 + 8;
     const g = tri.AttnGeometry.init(capacity, 2048, 4);
@@ -557,8 +545,7 @@ pub fn wbNormAvailable(set: *const aot.Set) bool {
     return set.smallestConst("_hc_wb_norm", "MODE", 0) != null;
 }
 
-/// `_hc_up_mix`: mixed [M, D] = hc_mix(b16mm(act [M, K], up [S D, K]), normed [M, S D]) without the up rows (and
-/// without the 32-group sums of mixed).
+/// `_hc_up_mix`: mixed [M, D] = hc_mix(b16mm(act, up), normed) without writing the up rows or 32-group sums.
 pub fn upMix(t: tri.Tri, act: u64, w: u64, normed: u64, mixed: u64, m: usize, d: usize, streams: usize, k: usize, bm: usize) !void {
     try run(t, "_hc_up_mix", .{ cdiv(m, bm), d / 64, 1 }, &.{ aot.ptr("ACT", bf16, act), aot.ptr("W", bf16, w), aot.ptr("NORMED", bf16, normed), aot.ptr("MIXED", bf16, mixed), int("M", m) }, &.{ ci("D", d), ci("S", streams), ci("K", k), ci("BM", bm), ci("BD", 64), ci("BK", 64) });
 }
@@ -642,8 +629,7 @@ fn fillF32(gpa: std.mem.Allocator, buf: cuda.DeviceBuffer, count: usize, r: std.
     try buf.upload(0, std.mem.sliceAsBytes(h));
 }
 
-/// `glue-check`'s second part: `_hc_wb_norm` against `_hc_writeback` + `_hc_normed` (the streams, the squared sums
-/// and the normed rows, bytes) for every branch kind, on random and edge inputs.
+/// `glue-check`'s second part: `_hc_wb_norm` against `_hc_writeback` + `_hc_normed`, bytes, every branch kind.
 pub fn wbNormCheck(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri) !bool {
     const D: usize = 2560;
     const S: usize = 4;

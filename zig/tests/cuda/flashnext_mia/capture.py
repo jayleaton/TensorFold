@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Flash Next's Python CUDA engine (qwen4_exp, one GPU) as the Zig engine's oracle: every Triton launch and extension
-call by phase, weight digests, per-layer dumps, teacher-forced logits, MTP draws, tokens."""
+"""Flash Next's Python CUDA engine as the Zig oracle: launches, weight digests, layer dumps, logits, MTP draws."""
 
 from __future__ import annotations
 

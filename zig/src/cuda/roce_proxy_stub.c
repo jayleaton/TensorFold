@@ -1,5 +1,4 @@
-// roce_proxy.c's interface where libibverbs' headers are missing at build time (decode D1): the layout as there, and
-// every open refused, so cuda_comm.zig keeps NCCL for every gather.
+// roce_proxy.c's interface without libibverbs headers: the same layout, every open refused (NCCL does every gather).
 #include <stdint.h>
 #include <stdio.h>
 

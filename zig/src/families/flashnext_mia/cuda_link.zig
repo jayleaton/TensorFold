@@ -1,7 +1,4 @@
-//! The two ranks' control link: one TCP connection from rank 1 to rank 0's `--master` address and port. It carries what
-//! the collectives do not: the NCCL id, an agreement on the settings both ranks load with, and rank 0's decisions
-//! (each request, each round's plan, the stop). Frames are a u32 tag, a u64 length and the bytes, in little endian.
-//! The activations never pass here; they go over NCCL (cuda_comm.zig).
+//! The two ranks' control link (TCP, rank 1 to rank 0): NCCL id, settings agreement, rank 0's decisions; LE frames.
 const std = @import("std");
 const posix = std.posix;
 const net = std.Io.net;
@@ -166,9 +163,7 @@ pub const Link = struct {
         return f.bytes;
     }
 
-    /// Both ranks must load with the same settings (checkpoint, window, streams, drafts, kernels, rope): each sends
-    /// the sha256 of its canonical settings text and compares it with the peer's. Rank 0 sends first; both ranks get
-    /// error.RanksDisagree on a mismatch.
+    /// Both ranks compare the sha256 of their canonical settings; rank 0 sends first; mismatch: error.RanksDisagree.
     pub fn agree(l: Link, gpa: Allocator, rank: u32, settings: []const u8) !void {
         var mine: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(settings, &mine, .{});

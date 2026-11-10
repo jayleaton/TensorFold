@@ -1,30 +1,4 @@
-// torch.logsumexp(x, dim=-1, keepdim=True) on contiguous fp32 rows [R, N], with torch's bits (torch 2.13 CUDA).
-//
-// torch composes it (ReduceOps.cpp logsumexp_out_impl): m = amax(x) with |m| == inf set to 0, e = exp(x - m) into a
-// fresh contiguous tensor, s = sum(e) over the row, out = log(s) + m. Only the sum depends on an order; it follows
-// ATen's reduce kernel for a reduction along the contiguous last dimension with vectorized input (4 floats a load):
-//
-//   config(R, N, num_mp, max_threads_mp), N >= 128:
-//     d0 = N / 4 < 512 ? last_pow2(N / 4) : 512;  d1 = R < 512 ? last_pow2(R) : 512   (last_pow2: floor pow2, >= 1)
-//     bw = min(d0, 32); bh = min(d1, 512 / bw); bw = min(d0, 512 / bh)               block (bw, bh)
-//     step = bw; vpt = ceil(N / step); split = vpt >= min(16 bh, 256)
-//     split: rows a block 1, step *= bh                else: rows a block bh (row = y + bh blockIdx.x)
-//     grid_x = ceil(R / rows a block); target = num_mp * (max_threads_mp / (bw bh)); ctas = 1
-//     split and ceil(N / step) >= 256 and grid_x <= target:
-//       v = ceil(N / step); ctas = max(min(ceil(target / grid_x), ceil(v / 16)), ceil(v / 256))
-//
-// A thread (x, y) of block (bx, by) reads its row's elements as e's storage holds them: the row starts
-// (row * N) % 4 floats past a 16-byte boundary (e is a fresh allocation, so its base is aligned whatever x's is).
-// The unaligned head goes to lanes x in [shift, 4) of the tail-owning threads, then 4-float vectors at index
-// i = x + bw (split ? y + bh by : 0) stepping by bw (split ? bh ctas : 1) into 4 accumulators, then the < 4 float
-// tail to lanes x, accumulators folded 0+1+2+3; then the lane tree (shared memory down to 32, then shuffles),
-// then (split) the warp tree; ctas > 1: partials per CTA, folded by the global-reduce tree (thread t sums partials
-// t, t + bw bh, ...; the warp tree; the lane tree). Ours writes partials and folds them in a second launch with the
-// same tree instead of a semaphore; the bits are the same.
-//
-// Launches: tf_fn_lse_max_kernel<<<R, 256>>>(x, maxes, R, N); tf_fn_lse_sum_kernel<<<(grid_x, ctas), (bw, bh)>>>(x,
-// maxes, partial, R, N, ctas, split); tf_fn_lse_finish_kernel<<<R, (bw, bh)>>>(partial, maxes, out, R, ctas).
-// Scratch: maxes R floats, partial R * ctas floats. No dynamic shared memory. Compile with --fmad=false --ftz=false.
+// torch.logsumexp(x, -1, keepdim=True) on fp32 rows [R, N] with torch 2.13's bits: ATen's reduce config and order.
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include <math.h>

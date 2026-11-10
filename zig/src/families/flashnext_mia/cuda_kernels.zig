@@ -1,17 +1,4 @@
-//! Flash Next's CUDA extension kernels: the fn_* fatbins (copies of the Python extensions' device code, SASS-equal,
-//! zig/tests/cuda/copies.py) with each Python wrapper's launch: grid, block, dynamic shared memory, stream, arguments.
-//!
-//! Sources (all authored by ashhart in TensorFold, see each fatbin's copy header):
-//!   fn_gdn           families/qwen4_exp/cuda/gdn.cu      gdn_chain_cuda, gdn_replay_cuda   (tensorfold_qwen4_exp_gdn)
-//!   fn_gdn_io        families/qwen4_exp/cuda/gdn_io.cu   gdn_front_cuda, gdn_back_cuda     (tensorfold_qwen4_exp_gdn_io)
-//!   fn_gdn_prefill   cuda/kernels/gdn_prefill.cu         gdn_prefill_cuda                  (tensorfold_gdn_v2)
-//!   fn_gdn_tree      cuda/kernels/gdn.cu                 gdn_tree_cuda, gdn_replay_cuda (fp32 keys)
-//!   fn_nvfp4_experts cuda/nvfp4/experts.cu               nvfp4_experts_cuda                (tensorfold_nvfp4_v3)
-//!   fn_qmm           cuda/kernels/qmm.cu                 qmm_cuda, groups of 32            (tensorfold_qmm_v5)
-//!   fn_qmm_prefill   cuda/kernels/qmm_prefill.cu         qmm_prefill_cuda, groups of 32, tile 0
-//!   experts          cuda/experts.cu                     experts_plan_cuda (Nemotron's copy) (tensorfold_experts_v7)
-//!   fn_nvfp4_shape   ours (decode D3): fn_nvfp4_experts' kernel in another launch shape, each unit's arithmetic the
-//!                    original's (zig/tests/cuda/flashnext_mia/experts_shape_test.cu checks the bytes)
+//! Flash Next's CUDA extension kernels: fn_* fatbins (SASS-equal copies by ashhart, TensorFold) with Python's launches.
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -186,8 +173,7 @@ pub fn maxItems(pairs: usize, experts: usize, tile: usize) usize {
     return @min(pairs, experts) + pairs / tile;
 }
 
-/// Plan tiles: Flash Next's NVFP4 routed experts take items of 16 pairs, decode and prompt alike
-/// (cuda/experts.py TILE and cuda/nvfp4/experts.py PREFILL_TILE).
+/// Plan tiles: NVFP4 routed experts take items of 16 pairs, decode and prompt alike (TILE and PREFILL_TILE).
 pub const plan_tile: usize = 16;
 pub const plan_max_experts: usize = 1024; // experts.cu EMAX
 pub const plan_small: usize = 1024; // experts.cu PSMALL: pairs the one-block plan takes
@@ -215,8 +201,7 @@ pub const Kernels = struct {
     tree_replay: cuda.Function,
     nvfp4: [3]cuda.Function, // epilogue 2, 0, 3
     nvfp4_blocks: [3]usize, // resident blocks the grid caps at: per SM (at least 1) times SMs
-    /// decode D3: gate/up calls of at most `nt_units` units run nvfp4_nt (one warp a block, one n8 tile a warp: 4
-    /// warps a unit), same bits; 0 (TF_FLASHNEXT_EXPERT_SHAPE=0) keeps the original launch everywhere
+    /// gate/up calls of at most `nt_units` units run nvfp4_nt (one n8 tile a warp), same bits; 0 keeps the original
     nvfp4_nt: cuda.Function,
     nvfp4_nt_blocks: usize,
     nt_units: usize,
@@ -284,10 +269,7 @@ pub const Kernels = struct {
     }
 };
 
-/// The largest gate/up launch (plan units) that takes the one-tile-a-warp shape: 230 = one row at TP=1 (20 column
-/// blocks x 11 items), one or two rows at TP=2 (10 x 11, 10 x 23), where experts_shape_test.cu measured it faster
-/// (TP=2 1.22x and 1.08x, TP=1 1.12x); at more units the original is as fast or faster. TF_FLASHNEXT_EXPERT_SHAPE=0
-/// turns it off, =N sets the bound.
+/// The largest gate/up launch (plan units) taking the one-tile-a-warp shape; TF_FLASHNEXT_EXPERT_SHAPE=0 off, =N bound.
 pub fn ntUnits(env: ?[]const u8) usize {
     const v = env orelse return 230;
     return std.fmt.parseInt(usize, v, 10) catch 230;
@@ -319,8 +301,7 @@ pub const Ops = struct {
         try cuda.launch.launch(f, .{ .grid = .{ .x = u(grid[0]), .y = u(grid[1]), .z = u(grid[2]) }, .block = .{ .x = u(block) }, .shared = u(shared) }, o.s, args);
     }
 
-    /// qwen4_exp gdn.chain (gdn_chain_cuda): `rows` rows of one stream through conv, norms, gates, the delta rule and
-    /// the gated RMSNorm; `nv` value heads (48, or 24 a TP=2 rank). Zero addresses are the wrapper's empty tensors.
+    /// gdn.chain: `rows` of one stream through conv, norms, gates, delta rule, gated RMSNorm; `nv` value heads.
     pub fn gdnChain(o: Ops, nv: usize, p: u64, conv_state: u64, conv_w: u64, state_in: u64, a_log: u64, dt_bias: u64, norm_w: u64, eps: f32, rows: usize, out: u64, xs: u64, state_out: u64, k_save: u64, v_save: u64, g_save: u64, b_save: u64) !void {
         const h = try heads(nv);
         var a: cuda.Args = .{};
@@ -341,8 +322,7 @@ pub const Ops = struct {
         try o.go(o.k.replay[h], .{ nv, 1, 1 }, 1024, 0, &a);
     }
 
-    /// gdn_io.front (gdn_front_cuda): per (row, head) block, conv + SiLU and the q/k L2 norms (fp32 q, k), v (bf16),
-    /// g and beta; `windows` (rows, 4) int32 taps, `sid` a stream id a row into `conv_ptrs` (int64 addresses).
+    /// gdn_io.front: per (row, head) conv + SiLU, q/k L2 norms (fp32), v (bf16), g and beta; `sid` indexes `conv_ptrs`.
     pub fn gdnFront(o: Ops, nv: usize, p: u64, conv_ptrs: u64, sid: u64, windows: u64, rows: usize, conv_w: u64, a_log: u64, dt_bias: u64, q: u64, k: u64, v: u64, g: u64, beta: u64) !void {
         const h = try heads(nv);
         if (rows == 0) return;
@@ -363,8 +343,7 @@ pub const Ops = struct {
         try o.go(o.k.back[h], .{ rows, nv, 1 }, 128, 0, &a);
     }
 
-    /// cuda/kernels/gdn.chain (prefill, gdn_prefill_cuda): `w` rows from `state` (read only) to `last`, y (w, hv, 128)
-    /// bf16 (the caller's buffer; the wrapper allocates it). 128 value rows a block when hv >= SMs, else 64.
+    /// gdn.chain prefill: `w` rows from read-only `state` to `last`, y (w, hv, 128) bf16 in the caller's buffer.
     pub fn gdnPrefill(o: Ops, fp32_keys: bool, q: u64, k: u64, v: u64, g: u64, beta: u64, state: u64, last: u64, y: u64, w: usize, hk: usize, hv: usize) !void {
         if (w == 0) return;
         const wide = hv >= @as(usize, @intCast(o.k.sms));
@@ -375,8 +354,7 @@ pub const Ops = struct {
         try o.go(o.k.prefill[@intFromBool(!fp32_keys)][@intFromBool(!wide)], .{ hv, 128 / rows, 1 }, 2 * rows, 0, &a);
     }
 
-    /// cuda/kernels/gdn.tree with fp32 keys (gdn_tree_cuda -> dispatch_tree<float>): a window's chains or trees from
-    /// one `state` (streams 1) or a `table` of every stream's states with `starts`; `tree_plan` (nodes, 3) int32.
+    /// gdn.tree fp32 keys (gdn_tree_cuda): a window's chains or trees from one `state` or a `table` with `starts`.
     pub fn gdnTree(o: Ops, q: u64, k: u64, v: u64, g: u64, beta: u64, state: u64, table: u64, starts: u64, tree_plan: u64, nodes: usize, slots: u32, streams: usize, max_rows: usize, y: u64, hk: usize, hv: usize, dv: usize, pending: Pending, final_state: u64, final_table: u64) !void {
         if (slots > 32 or max_rows < 1 or (slots != 0 and max_rows > 1024)) return error.Invalid;
         const i = treeIndex(slots, u(streams), o.k.major, o.k.minor, o.k.sms);
@@ -397,8 +375,7 @@ pub const Ops = struct {
         try o.go(o.k.tree[i], .{ (dv + step - 1) / step, hv, streams }, 32 * t.warps, shared, &a);
     }
 
-    /// cuda/kernels/gdn.replay with fp32 keys (gdn_replay_cuda): each (stream, layer) replays its accepted rows; `out`
-    /// 0 writes over the table's states (in place). Rows and counts strides in elements.
+    /// gdn.replay fp32 keys: each (stream, layer) replays accepted rows; `out` 0 writes in place; strides in elements.
     pub fn gdnTreeReplay(o: Ops, table: u64, layers: usize, streams: usize, rows: u64, row_stride: usize, counts: u64, count_stride: usize, out: u64, hk: usize, hv: usize, dv: usize) !void {
         var a: cuda.Args = .{};
         a.add(table);
@@ -442,8 +419,7 @@ pub const Ops = struct {
         try o.go(o.k.plan_scatter, .{ (pairs + 255) / 256, 1, 1 }, 256, 0, &c);
     }
 
-    /// nvfp4 experts (nvfp4_experts_cuda): epilogue 2 (gate/up SwiGLU, bf16), 0 (down, fp32) or 3 (down, bf16);
-    /// items of expert `skip` untouched; the grid is ceil(max_units / 4) capped at the resident blocks.
+    /// nvfp4_experts_cuda: epilogue 2 (gate/up SwiGLU bf16), 0 (down fp32) or 3 (down bf16); expert `skip` untouched.
     pub fn nvfp4Experts(o: Ops, epi: u8, x: u64, x_stride: usize, slots: usize, w: u64, scale: u64, kg: usize, nb: usize, p: Plan, out: u64, n: usize, limit: f32, skip: c_int, max_units: usize) !void {
         const i: usize = switch (epi) {
             2 => 0,
@@ -476,8 +452,7 @@ pub const Ops = struct {
         try o.nvfp4Experts(2, x, x_stride, plan_slots, ex.up, ex.up_scale, ex.dims / 32, nb, p, out, ex.width, ex.limit, skip, units);
     }
 
-    /// nvfp4GateUp in fn_nvfp4_shape's one-tile-a-warp shape: each unit's four n8 tiles in four one-warp blocks
-    /// (grid: 4 units' worth capped at the resident blocks), every output element the original kernel's bits.
+    /// nvfp4GateUp in fn_nvfp4_shape's one-tile-a-warp shape: four one-warp blocks a unit, the original kernel's bits.
     fn nvfp4GateUpNt(o: Ops, x: u64, x_stride: usize, ex: Experts4, p: Plan, plan_slots: usize, out: u64, skip: c_int, units: usize) !void {
         const grid = @min(units * 4, o.k.nvfp4_nt_blocks);
         if (grid < 1) return;
@@ -503,8 +478,7 @@ pub const Ops = struct {
         try o.nvfp4Experts(if (f32_out) 0 else 3, act, act_stride, 0, ex.down, ex.down_scale, ex.width / 32, nb, p, out, ex.dims, 0, skip, units);
     }
 
-    /// qmm.matmul for groups of 32 (qmm_cuda, one K slice): x (m, k) bf16 rows `x_stride` apart with group sums xs
-    /// (m, k/32) -> out (m, n) bf16 or fp32. The draft head's shapes take one slice; more are refused.
+    /// qmm.matmul groups of 32, one K slice: x (m, k) bf16 with group sums -> out (m, n) bf16 or fp32.
     pub fn qmm32(o: Ops, x: u64, x_stride: usize, xs: u64, q: Q4, out: u64, m: usize, f32_out: bool) !void {
         if (m < 1) return error.Invalid;
         if (splitK32(q.n, q.k) != 1) return error.SplitKUnsupported;
@@ -516,8 +490,7 @@ pub const Ops = struct {
         try o.go(o.k.qmm[@intFromBool(f32_out)][bucketIndex(bm)], .{ rows_t * ((q.n + 63) / 64), 1, 1 }, 128, qmmShared(bm), &a);
     }
 
-    /// qmm.matmul for groups of 32 at any K-slice count qmm.split_k gives (decode D5, the MTP head's matrices):
-    /// one slice as qmm32, else up to 8 slices summed in slice order inside a cluster (qmm_cuda on sm_90+).
+    /// qmm.matmul groups of 32 at any split_k: one slice as qmm32, else up to 8 summed in order in a cluster.
     pub fn qmm32Split(o: Ops, x: u64, x_stride: usize, xs: u64, q: Q4, out: u64, m: usize, f32_out: bool) !void {
         if (m < 1) return error.Invalid;
         const sk = splitK32(q.n, q.k);
@@ -535,8 +508,7 @@ pub const Ops = struct {
         }, o.s, &a);
     }
 
-    /// qmm.prefill_matmul for groups of 32 (qmm_prefill_cuda, tile 0): weights rounded once to bf16, one fp32 chain
-    /// over K; any chunking gives the same bits.
+    /// qmm.prefill_matmul groups of 32: weights rounded once to bf16, one fp32 chain over K; chunking-invariant.
     pub fn qmmPrefill32(o: Ops, x: u64, x_stride: usize, q: Q4, out: u64, m: usize, f32_out: bool) !void {
         if (m < 1) return error.Invalid;
         const rows_t = (m + 127) / 128;

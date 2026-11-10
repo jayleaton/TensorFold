@@ -1,18 +1,5 @@
 #!/usr/bin/env python3
-"""Python TensorFold's Flash Next image and video path as the Zig engine's oracle (TP=1, one GPU).
-
-Each case is a chat request with image or video parts, run the way ``tensorfold.cuda.server`` runs it:
-``prepare_images`` (``split_images``, the chat template with image parts, Pillow / PyAV loads, the processor) and
-``QwenCudaVision.encode`` (the tower), then the serial engine's ``prefill(..., vision=...)`` with per-chunk digests
-(the chunk's final streams and the last row's logits, as the Zig engine's TF_FLASHNEXT_PREFILL_DIGEST prints them),
-greedy serial decoding (``serial_decode``) and MTP-drafted decoding (``mtp_decode``) of ``--tokens`` tokens, eager.
-
-Writes ``<out>/<case>/``: ``request.json`` (the OpenAI messages, media as data URLs), ``bundle.json`` (token ids,
-feature rows, rope delta, digests, expected tokens) and ``positions.bin`` (i32 [n, 3]) + ``features.bin`` (bf16
-[rows, 2560]) for ``tensorfold-native flashnext gate-media``; ``<out>/media/`` the generated images and video.
-
-Needs transformers (5.17.0 as the recipes pin it) and PyAV on the path beside TensorFold's ``src``.
-"""
+"""Python TensorFold's Flash Next image and video path (TP=1) as the Zig engine's oracle: per-case bundles and media."""
 
 from __future__ import annotations
 

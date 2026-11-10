@@ -1,16 +1,4 @@
-//! Flash Next's forward on CUDA (Python qwen4_exp/cuda/forward.py, its NVFP4 checkpoint path): the host staging
-//! (token ids, the n-gram rows gathered on the host), the embedding, each decoder layer (the n-gram branch, the
-//! attention hyper-connection's write-back and read-out, the DeltaNet or attention mixer, the MLP hyper-connection,
-//! the routed NVFP4 experts with the shared expert), the last write-back, the mixer and the head, and `commit`
-//! (DeltaNet replays, the conv windows' and n-gram tail's shifts, the n-gram history). Every launch is the Python
-//! wrapper's own (cuda_triton.zig for the Triton cubins, cuda_kernels.zig for the extensions, cuda_torch_ops.zig
-//! for torch's ops), in Python's order, on the same buffers (cuda_state.zig), so one GPU gives Python's bits.
-//!
-//! Two ranks (work/PLAN.md "TP=2 design"): the bf16 out_proj / o_proj and the MoE leave fp32 partials that are
-//! all-gathered in rank order and summed by `_hc_writeback` mode 3; the head's candidates are gathered.
-//!
-//! Python source (TensorFold, https://github.com/ashhart/TensorFold, qwen4_exp/cuda/forward.py and mtp.py, authored
-//! by Ash Hart (ashhart) with commits by vcruz305 inside TensorFold, which the owner allows for this port).
+//! Flash Next CUDA forward, Python forward.py/mtp.py by Ash Hart (ashhart) and vcruz305 (TensorFold), same launches.
 const std = @import("std");
 const cuda = @import("cuda");
 const kern = @import("cuda_kernels.zig");
@@ -30,12 +18,10 @@ const int4 = @import("cuda_int4.zig");
 const Allocator = std.mem.Allocator;
 const W = weights;
 
-/// A pending write-back: the branch `_hc_writeback` adds next and the inject gates it reads (Python's
-/// (mode, branch, weights, inject) tuple).
+/// A pending write-back: the branch `_hc_writeback` adds next and its inject gates (Python's (mode, ...) tuple).
 pub const Pending = struct { branch: tri.Branch, inject: u64 };
 
-/// One window's buffers with what Python's Buffers holds beside the pointers: the experts' slot dtype (fp32 in the
-/// MTP head's decode buffers, bf16 in the main ones and the prompt's) and the attention scratch's geometry.
+/// One window's buffers plus Python Buffers' extras: the experts' slot dtype and the attention scratch's geometry.
 pub const Bufs = struct {
     b: state.Buffers,
     y_f32: bool,
@@ -46,9 +32,7 @@ pub const Bufs = struct {
     }
 };
 
-/// A sequence's images and video frames (Python image_rows.attach): the whole prompt's rotary table [len, 3] i32
-/// on the device (kept until the sequence resets: decode and the MTP layer read it past the prompt too), the
-/// features [rows, width] bf16 on the device and their prompt rows (ascending; until the prompt is in).
+/// A sequence's images and video frames (Python image_rows.attach): device rotary table [len, 3] i32 and features.
 pub const SeqMedia = struct {
     table: cuda.DeviceBuffer,
     len: usize,
@@ -89,13 +73,11 @@ pub const Seq = struct {
     last_streams: ?cuda.DeviceBuffer = null,
     /// bytes this sequence holds of the engine's Budget
     charged: usize = 0,
-    /// its caches in reserved address space (cuda_vmm.zig): per cache layer keys, values, the indexer-key ring,
-    /// pooled blocks; empty: State's own allocation (grown by copying)
+    /// its caches in reserved address space (cuda_vmm.zig); empty: State's own allocation (grown by copying)
     regions: std.ArrayList(vmm.Region) = .empty,
     /// rows the indexer-key ring holds (0: no ring)
     ring_rows: usize = 0,
-    /// the last round's kept rows not yet folded into its DeltaNet states: rows [held_a0, held_a0 + held) of the
-    /// round scratch of parity held_par (the next round's tree folds them in first, or `flush`)
+    /// last round's kept rows not yet folded into DeltaNet states: [held_a0, held_a0 + held) of parity held_par
     held: usize = 0,
     held_a0: usize = 0,
     held_par: u1 = 0,
@@ -119,14 +101,11 @@ pub const Seq = struct {
     }
 };
 
-/// The rank's memory for sequences' caches (Python's MemoryGate): a sequence takes its fixed state and its
-/// context caches from it, grows in steps while the budget holds the grown caches beside the old ones (a resize
-/// holds both), and gives everything back when freed. A step past the budget is refused (error.NoRoom).
+/// The rank's cache memory (Python MemoryGate): fixed state plus caches grown in steps; past budget, error.NoRoom.
 pub const Budget = struct {
     limit: usize,
     used: usize = 0,
-    /// MemAvailable a growth step must leave (the owner's 10 GiB floor), checked against the kernel's own count
-    /// at each step whatever else took memory since load; 0: unchecked
+    /// MemAvailable a growth step must leave, checked against the kernel's count at each step; 0: unchecked
     floor: usize = 0,
 
     /// Whether `bytes` more leave MemAvailable at or above the floor (true when it cannot be read).
@@ -172,8 +151,7 @@ pub const Seg = struct { seq: *Seq, a0: usize, a1: usize };
 /// One stream's window of a shared round: its tokens at its own seq.st.pos.
 pub const Window = struct { seq: *Seq, tokens: []const u32 };
 
-/// Scratch Python's wrappers allocate per call from torch's caching allocator (split-K partials, the fp32 down
-/// projection of a read-out, the DeltaNet prompt front's outputs, the shared expert's), sized for the widest window.
+/// Scratch Python's wrappers allocate per call from torch's caching allocator, sized for the widest window.
 pub const Scratch = struct {
     arena: state.Arena,
     part: u64,
@@ -190,15 +168,13 @@ pub const Scratch = struct {
     invalid: u64, // gatherRows' bad-index flag
     vote: u64, // two ranks' growth agreement (this rank's word, then both)
     gdn_t: u64, // a prompt chunk's DeltaNet state of one layer, copied back over the sequence's
-    // two ranks, the n-gram table on the GPU: every head's row ids, this rank's heads' embedding and group sums,
-    // and both ranks' gathered
+    // two ranks, n-gram table on the GPU: head row ids, this rank's embedding and group sums, both ranks' gathered
     ngram_ids: u64, // [rows, heads] int64
     ple_half: u64, // [rows, heads / world * dh] bf16
     xs_half: u64, // [rows, heads / world * dh / 32] fp32
     ple_all: u64, // [world, rows, heads / world * dh] bf16
     xs_all: u64,
-    // INT4-AutoRound: a projection's block-FP8 columns and its bf16 rows' columns before they are copied into place,
-    // the healed shared expert's gate|up and its SwiGLU
+    // INT4-AutoRound: a projection's block-FP8 and bf16 columns before copying, the shared expert's gate|up and SwiGLU
     p8: u64, // [rows, the widest block-FP8 face] bf16
     pb: u64, // [rows, the widest bf16 part] bf16
     sh_g: u64, // [rows, 2 shared width] bf16
@@ -236,12 +212,7 @@ pub const Scratch = struct {
     }
 };
 
-/// A round's DeltaNet scratch and tables (Python gdn_multi.Scratch and Tables): the window rows' queries, and their
-/// keys, values, gates and betas kept a round per parity (the next round's trees fold a stream's kept rows from
-/// them); every row's stream and conv taps, every stream's row range, kept rows to fold, conv and state pointers.
-/// The most rows the K-serial NVFP4 kernel takes for `n` columns: where it beat `_fp4mm` on GB10 (fp4-check's timing,
-/// out/w6-i-fp4: N 640 2.1x at 36-64 rows, 1.2x at 113-128, slower past; N 1280 1.7x at 36-48, slower from 113; both
-/// slower at 1-8 rows, which keep `_fp4mm`).
+/// The most rows the K-serial NVFP4 kernel takes for `n` columns (where it beats `_fp4mm` on GB10).
 pub fn fp4SerialRows(n: usize) usize {
     return if (n <= 640) 128 else if (n <= 1280) 64 else 0;
 }
@@ -271,8 +242,7 @@ pub const Round = struct {
     rrows: u64,
     rcount: u64,
     host_bytes: usize,
-    /// attn_multi.Step's tables (the batched attention): each row's position, each stream's first position and
-    /// rows, and every attention layer's cache pointers [layer][6][streams] int64; their own pinned buffer
+    /// attn_multi.Step's tables: row positions, stream first positions and rows, attention cache pointers (pinned)
     att: usize,
     posr: u64,
     first: u64,
@@ -363,8 +333,7 @@ pub fn partBytes(g: state.Geometry, rows: usize) usize {
     return @max(most, 256);
 }
 
-/// Per-layer tensors as Python's capture names them (zig/tests/cuda/flashnext_mia/capture.py Dumps): each one's sha256,
-/// compared with the oracle's digests.json when given, written raw into `dir` when given.
+/// Per-layer tensors named as capture.py Dumps: each one's sha256, checked against digests.json, or dumped to `dir`.
 pub const Dump = struct {
     gpa: Allocator,
     io: std.Io,
@@ -437,13 +406,7 @@ pub const Dump = struct {
     }
 };
 
-/// Two ranks' prompt glue split by rows (work/research/R2-prefill.md W-C, the GLM recipe's split): rank r runs the
-/// write-backs and read-outs of rows [o, o + rh), rh = ceil(R / 2) rounded up to 16 (rank 1's rows past R are pad), and
-/// the read-out rows are all-gathered for the mixers and experts, which run on every row as before. A mixer's or
-/// the MoE's fp32 partial is made in two halves: this rank's rows into its slot of the [2, rh, D] block the
-/// write-back adds (mode 3, rank 0 then rank 1, one rounding: unchanged), the peer's rows sent to the peer while the
-/// peer's partial of this rank's rows arrives in the other slot. Every row's values are the unsplit path's bits:
-/// each kernel is row-independent and runs the same arithmetic on the same inputs.
+/// Two ranks' prompt glue split by rows (rh = ceil(R/2) to 16), partials exchanged; bits equal the unsplit path's.
 pub const Split = struct {
     rank: usize,
     /// rows a rank runs: ceil(R / 2) rounded up to 16 (the second rank's last ones pad rows past R)
@@ -485,8 +448,7 @@ pub const Forward = struct {
     contexts: ?[]const usize = null,
     /// the sequences' memory (null: unbounded)
     budget: ?*Budget = null,
-    /// decode rounds' DeltaNet scratch (initRound), the parity the last decode stage wrote, and every live
-    /// sequence (those holding rows of a round that a later one overwrites are folded first)
+    /// decode rounds' DeltaNet scratch, the parity the last decode stage wrote, and every live sequence
     round: ?Round = null,
     cur_par: u1 = 1,
     seqs: std.ArrayList(*Seq) = .empty,
@@ -498,33 +460,28 @@ pub const Forward = struct {
     sample: ?tops.Torch.Sample = null,
     /// TF_FLASHNEXT_PROFILE: the prompt chunk's parts timed (cuda_prof.zig); null: no events
     prof: ?*profs.Prof = null,
-    /// TF_FLASHNEXT_COUNT_EXPERTS=1 (with the profile): every decode MoE layer's distinct routed experts and rows
-    /// counted on the host (a wait a layer); the main model's and the MTP head's, since the last report
+    /// TF_FLASHNEXT_COUNT_EXPERTS=1: decode MoE layers' distinct routed experts and rows, counted since last report
     count_experts: bool = false,
     /// the shared expert's stream (initSide): it runs beside the routed experts, joined before their sum
     side: ?Side = null,
     /// `_fp4mm` SK 1 launches of 9 to fp4SerialRows(n) rows on fn_ops' K-serial kernel (fp4Serial)
     fp4_serial: bool = false,
-    /// a shared round of at least this many streams runs its attention in one launch a kernel (attn_multi; 0 off,
-    /// or a kernel set without it); `round_multi` says whether the staged round does
+    /// a shared round of at least this many streams runs attention in one launch a kernel (attn_multi; 0 off)
     attn_multi: usize = 0,
     round_multi: bool = false,
     experts_seen: [2]struct { layers: usize = 0, distinct: usize = 0, rows: usize = 0 } = .{ .{}, .{} },
-    /// prompt matmuls with split K run their slices in one program (cuda_prompt.zig, the same bits); false:
-    /// Python's split kernels and `_reduce` for every row count
+    /// prompt split-K matmuls run their slices in one program (cuda_prompt.zig, same bits); false: Python's kernels
     prompt_mm: bool = false,
     /// prompt chunks' routed experts read each expert's weights once a call (cuda_moe_prompt.zig, the same bits)
     px: ?*const moep.Prompt4 = null,
-    /// two ranks, prompt chunks: the hyper-connection glue split by rows (`Split`); false: every rank runs it on
-    /// every row (the same bits either way)
+    /// two ranks, prompt chunks: the hyper-connection glue split by rows (`Split`; same bits either way)
     glue_split: bool = false,
     /// INT4-AutoRound: the block-FP8 lane matmul and the GPTQ int4 kernels (cuda_engine loads them)
     k8: ?*const fp8.Kernels = null,
     k4: ?*const int4.Kernels = null,
     /// INT4-AutoRound: a projection's block-FP8 columns stored straight into its rows (fn_qmmf_ld), not copied
     fp8_ld: bool = true,
-    /// decode D2 (TF_FLASHNEXT_L2PF=1, cuda_comm.zig): the weights the kernels after the token mixer's gather and
-    /// after the MoE's gather read first (the MLP read-out's down projection; the next layer's or the mixer's)
+    /// TF_FLASHNEXT_L2PF=1 (cuda_comm.zig): weights read first by the kernels after the mixer's and MoE's gathers
     pf_mixer: comms.Prefetch = .{},
     pf_moe: comms.Prefetch = .{},
     /// decode D5 (TF_FLASHNEXT_MTP_Q4=1): the MTP head's matrices in 4-bit, run by `mmx` (drafts only)
@@ -537,14 +494,11 @@ pub const Forward = struct {
     cs: ?cuda.Stream = null,
     cs_ev: [4]cuda.Event = undefined,
     cs_i: usize = 0,
-    /// what the comm stream overlaps (TF_FLASHNEXT_OVERLAP bits): 1 the mixers' out_proj (attention: the peer's
-    /// rows first), 2 the MoE in two row halves (the peer's first)
+    /// comm stream overlap (TF_FLASHNEXT_OVERLAP bits): 1 the mixers' out_proj, 2 the MoE in two row halves
     overlap: u8 = 1,
-    /// two ranks, prompt chunks: an attention block's indexer rows scored and selected half on each rank, the key
-    /// lists exchanged, from this many keys (TF_FLASHNEXT_QSA_SPLIT_KEYS; 0: never)
+    /// two ranks, prompt chunks: indexer rows split per rank from this many keys (TF_FLASHNEXT_QSA_SPLIT_KEYS; 0 never)
     qsa_split_keys: usize = 65536,
-    /// prompt indexer kernels: `_scores_rows` with this many rows a program (0: Python's `_scores`), and
-    /// `_select_tiles` from this many blocks (Python's from past `_select`'s registers); the same bits either way
+    /// prompt indexer kernels: `_scores_rows` rows a program (0: Python's), `_select_tiles` from this many blocks
     qsa_rt: usize = 0,
     qsa_tiles_from: usize = 8192,
     /// fn_qsa_scores.cu for the prompt indexer's scores (`_scores`' bits); null: Python's `_scores`
@@ -624,10 +578,7 @@ pub const Forward = struct {
         seq.held = 0;
     }
 
-    /// A decode round's DeltaNet tables (Python gdn_multi.Tables) for `segs`, writing parity `p`: rows' streams and
-    /// conv taps (< 3 the stream's conv state row, else window row a0 + tap - 3), row ranges, the kept rows to fold
-    /// (last round's, parity 1 - p), conv and state pointers a layer. Streams whose kept rows sit in parity p are
-    /// folded first, since this round overwrites them.
+    /// A decode round's DeltaNet tables (Python gdn_multi.Tables) writing parity `p`; kept rows in p fold first.
     fn roundTables(f: *Forward, segs: []const Seg, p: u1) !void {
         const r = &(f.round orelse return error.NoRoundScratch);
         const n = segs.len;
@@ -686,8 +637,7 @@ pub const Forward = struct {
         try f.uploadRound(r.counts, o_counts, n * 4);
         try f.uploadRound(r.conv, o_conv, r.lin * n * 8);
         try f.uploadRound(r.state, o_state, r.lin * n * 8);
-        // a round with an image or video stream takes the per-stream launches (its MODE 2 rotary table: Python's
-        // attn_multi VISION variant has the same bits as the per-stream path, which is what runs here)
+        // image or video streams take the per-stream launches (same bits as attn_multi's VISION variant)
         const media = for (segs) |sg| {
             if (sg.seq.media != null) break true;
         } else false;
@@ -699,8 +649,7 @@ pub const Forward = struct {
         try f.staged.record(f.s);
     }
 
-    /// A second stream for the shared expert: its matmuls are a few programs each, latency-bound over K, and run
-    /// beside the routed experts' bandwidth-bound kernels (the same kernels and inputs: the same bits).
+    /// A second stream for the latency-bound shared expert beside the routed experts (same kernels, same bits).
     pub fn initSide(f: *Forward) !void {
         var s = try cuda.Stream.init(f.d, true);
         errdefer s.deinit();
@@ -710,8 +659,7 @@ pub const Forward = struct {
         f.side = .{ .s = s, .fork = fork, .join = join };
     }
 
-    /// attn_multi.Step for `segs` (positions before the round commits): rows' positions, streams' first positions
-    /// and rows, every attention layer's cache pointers; uploaded from the round's own pinned buffer.
+    /// attn_multi.Step for `segs` (positions before commit), uploaded from the round's own pinned buffer.
     fn multiTables(f: *Forward, r: *Round, segs: []const Seg) !void {
         const n = segs.len;
         const R = segs[n - 1].a1;
@@ -783,8 +731,7 @@ pub const Forward = struct {
         return f.cs_ev[f.cs_i];
     }
 
-    /// The exchange of `count` elements: `send` to the peer, the peer's into `recv`; on the comm stream after the
-    /// work queued so far (`exchangeWait` joins it), or in line without one.
+    /// Exchange `count` elements with the peer on the comm stream (`exchangeWait` joins it), or in line without one.
     fn exchangeAsync(f: *Forward, send: u64, recv: u64, count: usize, dtype: cuda.nccl.DataType) !void {
         const cm = f.comm.?;
         const cs = f.cs orelse return cm.exchange(send, recv, count, dtype, f.s.handle);
@@ -847,12 +794,10 @@ pub const Forward = struct {
         return f.mmxAt(part, x, x_stride, xs, r, out, fp32, m);
     }
 
-    /// INT4-AutoRound's projections: the first columns block FP8 (`l8`), the rest bf16 rows (`rb`), each on its kernel
-    /// into a scratch and copied into `out`'s columns (rows `out_w` wide; Python's Concat); without `l8`, `rb` alone.
+    /// INT4-AutoRound projections: block-FP8 columns (`l8`) and bf16 rows (`rb`) into `out`'s columns (Python Concat).
     fn projFace(f: *Forward, part: profs.Part, x: u64, x_stride: usize, l8: ?fp8.Linear, rb: W.Rows, out: u64, out_w: usize, m: usize) !void {
         const l = l8 orelse return f.mmAt(part, x, x_stride, rb, out, false, m);
-        // the block-FP8 columns stored straight into `out`'s rows (fn_qmmf_ld; TF_FLASHNEXT_FP8_LD=0: through the
-        // scratch and a copy, the same bytes)
+        // block-FP8 columns stored straight into `out` (fn_qmmf_ld; TF_FLASHNEXT_FP8_LD=0: via scratch, same bytes)
         if (f.fp8_ld) {
             try fp8.matmulLd(f.k8 orelse return error.NoFp8Kernels, f.s, x, x_stride, l, out, out_w, m);
         } else {
@@ -871,7 +816,6 @@ pub const Forward = struct {
         return f.mm(x, x_stride, f.w.head, out, false, m);
     }
 
-    /// The shared expert's NVFP4-table matmul (nvfp4.matmul), marked as `part` when profiling.
     /// `fp4At`'s matmul on `t`'s stream, unmarked (the side stream's).
     fn fp4On(f: *Forward, t: tri.Tri, th: tops.Torch, x: u64, x_stride: usize, fp: tri.Fp4, out: u64, fp32: bool, m: usize, n: usize, k: usize) !void {
         if (f.fp4Serial(fp, x_stride, m, n, k)) {
@@ -886,14 +830,12 @@ pub const Forward = struct {
         try f.mark(part);
     }
 
-    /// Whether `_fp4mm`'s single-slice launch (SK 1: the shared expert's gate/up) runs as fn_ops' K-serial kernel
-    /// (TF_FLASHNEXT_FP4_SERIAL=1; its bits are `_fp4mm`'s): bf16-pattern tables, decode-sized rows.
+    /// Whether `_fp4mm`'s single-slice launch runs fn_ops' K-serial kernel (TF_FLASHNEXT_FP4_SERIAL=1, same bits).
     fn fp4Serial(f: *const Forward, fp: tri.Fp4, x_stride: usize, m: usize, n: usize, k: usize) bool {
         return f.fp4_serial and !fp.codes and m > 8 and m <= fp4SerialRows(n) and tri.fp4SplitK(n, k) == 1 and tops.fp4SerialFits(x_stride, n, k);
     }
 
-    /// mm with the input's group sums `xs` known: a matrix with a 4-bit copy in mtp_q4 (the MTP head's, D5) runs qmm
-    /// on it; every other matrix (and xs 0) the bf16 matmul as `mm`.
+    /// mm with group sums `xs` known: a matrix with a 4-bit mtp_q4 copy runs qmm, every other the bf16 `mm`.
     pub fn mmx(f: *Forward, x: u64, x_stride: usize, xs: u64, r: W.Rows, out: u64, fp32: bool, m: usize) !void {
         if (xs != 0) if (f.mtp_q4) |t| if (t.find(r.weight)) |q| return f.ops.qmm32Split(x, x_stride, xs, q, out, m, fp32);
         try f.mm(x, x_stride, r, out, fp32, m);
@@ -960,8 +902,7 @@ pub const Forward = struct {
         f.dropMedia(seq);
     }
 
-    /// The sequence's images and video frames released (State.reset clears image_positions), their bytes given
-    /// back to the budget. The stream drains first: launches in flight may read the table.
+    /// Release the sequence's images and video frames to the budget, draining the stream first.
     pub fn dropMedia(f: *Forward, seq: *Seq) void {
         const m = &(seq.media orelse return);
         f.s.synchronize() catch {};
@@ -971,11 +912,7 @@ pub const Forward = struct {
         seq.media = null;
     }
 
-    /// Python image_rows.attach: the prompt's rotary table and features onto the device, the decode offset set.
-    /// Two ranks: rank 0 holds the media; rank 1's copy carries only the rows' count (`follower_rows`), and the
-    /// table, the rows and the features reach it by NCCL broadcasts from rank 0 here (nothing large rides the
-    /// control link). Validity, budget and the device allocations are agreed first, so either both ranks refuse
-    /// (error.MediaRefused, before any collective of the prompt) or both run the same broadcasts.
+    /// Python image_rows.attach; two ranks agree validity and budget first, then rank 0 broadcasts the media by NCCL.
     pub fn attachMedia(f: *Forward, seq: *Seq, media: *const @import("cuda_media.zig").Media, prompt_len: usize) !void {
         const lead = if (f.comm) |cm| cm.rank == 0 else true;
         var valid = true;
@@ -1048,8 +985,7 @@ pub const Forward = struct {
         m.charged -|= freed;
     }
 
-    /// Python image_rows.embed: the prompt chunk's rows [pos, pos + R) that are image or video placeholders get
-    /// their feature row in each of the S residual streams (index_copy_ of features.repeat(1, S): data movement).
+    /// Python image_rows.embed: placeholder rows of the chunk get their feature row in each of the S residual streams.
     pub fn injectMedia(f: *Forward, seq: *Seq, x: *const Bufs, R: usize) !void {
         const m = &(seq.media orelse return);
         const feats = m.feats orelse return;
@@ -1077,9 +1013,7 @@ pub const Forward = struct {
 
     // -- staging ----------------------------------------------------------------------------------------------
 
-    /// A sequence's caches grown to hold `rows` rows (a growth step at a time, State.ensure) within the budget: the
-    /// grown caches must fit beside the old ones while the copy runs. The stream drains first (the resize copies on
-    /// the legacy stream and frees the old caches).
+    /// Grow a sequence's caches to `rows` rows within the budget (old and new fit together); drains the stream first.
     pub fn grow(f: *Forward, seq: *Seq, rows: usize) !void {
         const st = &seq.st;
         if (rows <= st.capacity) return;
@@ -1098,8 +1032,7 @@ pub const Forward = struct {
         }
     }
 
-    /// Two ranks: a growth goes ahead only when both may take it (each rank's MemAvailable is its own), so both
-    /// refuse together and stay in step; one rank: its own answer.
+    /// Two ranks: a growth goes ahead only when both may take it, so both refuse together and stay in step.
     pub fn agree(f: *Forward, ok: bool) !bool {
         const cm = f.comm orelse return ok;
         const mine: u64 = @intFromBool(ok);
@@ -1114,8 +1047,7 @@ pub const Forward = struct {
         return both[0] != 0 and both[1] != 0;
     }
 
-    /// grow in place: more physical memory under each cache's reserved range (zeroed, as Python's caches are),
-    /// nothing copied, no pointer moves (State.version stays: captured graphs stay valid).
+    /// grow in place: more zeroed physical memory under each reserved range, no copy, no pointer moves.
     fn growMapped(f: *Forward, seq: *Seq, target: usize) !void {
         const st = &seq.st;
         const g = f.g;
@@ -1154,8 +1086,7 @@ pub const Forward = struct {
         try f.staged.record(f.s);
     }
 
-    /// forward.stage: every window's token ids and n-gram rows (each stream's own history) into one buffer, the
-    /// windows' rows one after another; `segs` gets each stream's rows. Returns the rows.
+    /// forward.stage: every window's token ids and n-gram rows into one buffer; `segs` gets each stream's rows.
     pub fn stageMany(f: *Forward, windows: []const Window, x: *const Bufs, segs: []Seg) !usize {
         var R: usize = 0;
         if (segs.len < windows.len) return error.SegsTooFew;
@@ -1213,8 +1144,7 @@ pub const Forward = struct {
 
     // -- the forward ------------------------------------------------------------------------------------------
 
-    /// forward.compute on staged rows: the embedding, every layer, then `finish`; the head's logits (`logits`) of
-    /// every row (a window) or the last (a prompt chunk), or null. `segs` are the streams' rows (one for a prompt).
+    /// forward.compute on staged rows: embedding, every layer, then `finish`; returns the head's logits or null.
     pub fn computeSegs(f: *Forward, segs: []const Seg, x: *const Bufs, logits: bool) !?u64 {
         const b = &x.b;
         const R = segs[segs.len - 1].a1;
@@ -1318,9 +1248,7 @@ pub const Forward = struct {
         return (g.hidden / 256) * g.streams * 4;
     }
 
-    /// hc_block: the pending branch written back into the streams h, then the hyper-connection's read-out into
-    /// b.mixed (and its inject gates into `inject_out` when it has them). Split: this rank's rows, then the read-out
-    /// rows of both ranks gathered into b.mixed.
+    /// hc_block: pending branch written back into h, then the read-out into b.mixed (split: both ranks' rows gathered).
     fn hcBlock(f: *Forward, hc: *const W.Hc, x: *const Bufs, R: usize, h: u64, pending: ?Pending, inject_out: u64, sp: ?Split) !void {
         const g = f.g;
         const b = &x.b;
@@ -1348,8 +1276,7 @@ pub const Forward = struct {
         try f.readoutAt(hc, x, h, x.b.pss, R, if (hc.inject) inject_out else null, x.b.mixed, x.b.xs_mixed, fuse);
     }
 
-    /// Whether this write-back also makes the read-out's normed rows (`_hc_wb_norm`): prompt chunks, no 4-bit MTP
-    /// matrices (the only readers of normed's 32-group sums), and a branch the kernel set has an entry for.
+    /// Whether this write-back also makes the read-out's normed rows (`_hc_wb_norm`): prompt chunks, no 4-bit MTP.
     fn fusesNorm(f: *const Forward, hc: *const W.Hc, b: *const state.Buffers, pending: ?Pending) bool {
         _ = hc;
         if (!f.wb_norm or !b.prefill or f.mtp_q4 != null) return false;
@@ -1387,8 +1314,7 @@ pub const Forward = struct {
         } else try f.mmxAt(.hc_down, b.normed, Wd, b.xs_normed, hc.down, f.sc.dn, true, R);
         try f.t.hcAct(f.sc.dn, b.act, b.xs_act, inject, R, dn_n, g.streams, g.low);
         try f.mark(.hc_act);
-        // prompt chunks: the up projection and the mix in one pass (cuda_prompt.zig upMix, the same mixed bytes; no
-        // 32-group sums of mixed, which only the 4-bit MTP draft matrices read)
+        // prompt chunks: up projection and mix in one pass (cuda_prompt.zig upMix, same bytes; no 32-group sums)
         if (f.up_mix and b.prefill and R >= 16 and hc.up8 == null and f.mtp_q4 == null and hc.up.n == g.wide() and hc.up.k == g.low and g.low % 64 == 0) {
             try prompt.upMix(f.t, b.act, hc.up.weight, b.normed, mixed, R, g.hidden, g.streams, g.low, 64);
             try f.mark(.hc_mix);
@@ -1436,8 +1362,7 @@ pub const Forward = struct {
         const scale: f32 = if (f.w.table) |t| (if (t.fp8) 1.0 else t.scale) else 1.0;
         const table = f.w.table.?;
         if (table.gpu) |gp| {
-            // two ranks: this rank's heads embedded (each head alone, so the split is exact), both ranks' halves
-            // gathered in rank (head) order, then interleaved into the [R, heads * dh] rows and their group sums
+            // two ranks: this rank's heads embedded, both halves gathered in head order, then interleaved
             const cm = f.comm orelse return error.TwoRanksNeedComm;
             const half = gp.heads * p.ngram.dims;
             try f.t.pleEmbedBf16(b.ple_v, f.sc.ple_half, f.sc.xs_half, R, gp.heads, p.ngram.dims, scale);
@@ -1458,8 +1383,7 @@ pub const Forward = struct {
         }
     }
 
-    /// gdn_block: the projection, then the decode chain (rows saved for the replay at commit) or, in a prompt chunk,
-    /// the front, the chunk-invariant chain and the back, the layer committed at once.
+    /// gdn_block: the projection, then the decode chain, or in a prompt chunk front, chain and back committed at once.
     fn gdnBlock(f: *Forward, layer: *const W.Layer, segs: []const Seg, x: *const Bufs, R: usize) !tri.Branch {
         const b = &x.b;
         const g = f.g;
@@ -1468,9 +1392,7 @@ pub const Forward = struct {
         const pw = g.gdnWidth();
         const nv = g.nv;
         if (b.prefill) {
-            // the projection over every row, then each prompt's own chain: its conv taps and state, as alone (the
-            // front and back are row-wise, the chain runs over one sequence's rows; the segment's rows start the
-            // windows table over again, so a prompt's taps never read the rows before it)
+            // projection over every row, then each prompt's own chain with its own conv taps and state, as alone
             try f.projFace(.gdn_proj, b.mixed, g.hidden, gd.proj8, gd.proj, b.proj, pw, R);
             const C = g.gdnConv();
             for (segs) |sg| {
@@ -1501,8 +1423,7 @@ pub const Forward = struct {
             try f.mm(b.mixed, g.hidden, gd.proj, proj, false, R);
             try f.mark(.gdn_proj);
         }
-        // every stream's rows in one launch a step (gdn_multi.block): conv taps and states found by table, each
-        // tree first folding in its stream's last kept rows (in place), the window's inputs kept for the next fold
+        // every stream's rows in one launch a step (gdn_multi.block), each tree folding its last kept rows first
         const r = &(f.round orelse return error.NoRoundScratch);
         const n = segs.len;
         const p: usize = f.cur_par;
@@ -1519,8 +1440,7 @@ pub const Forward = struct {
         return f.outProj(x, b.gout, gd.out, gd.out8, R);
     }
 
-    /// attn_block: the projection, attn_prep (norms, rope, cache writes), the indexer's pool/select when the
-    /// capacity passes its budget, the chunked attention and merge (prompt chunks in 256-row blocks), the gate.
+    /// attn_block: projection, attn_prep, indexer pool/select past budget, chunked attention and merge, the gate.
     fn attnBlock(f: *Forward, layer: *const W.Layer, segs: []const Seg, x: *const Bufs, R: usize, mtp: bool) !tri.Branch {
         const b = &x.b;
         const g = f.g;
@@ -1559,8 +1479,7 @@ pub const Forward = struct {
                 if (ag.qsa) try f.t.qsaPoolRope(ikc, pooled, pos, a.ik_scale, f.w.inv_freq, n, ag, d, rope);
                 try f.mark(.qsa_pool);
                 if (f.splitOf(x, R)) |sp| if (segs.len == 1 and f.cs != null and f.overlap & 1 != 0) {
-                    // the peer's rows first (their 256-row blocks, the same blocks as below), their gate and
-                    // out_proj, sent while this rank's own blocks run
+                    // the peer's rows first (their 256-row blocks), their gate and out_proj sent while ours run
                     const D = g.hidden;
                     const pa = sp.po;
                     const pb = @min(sp.po + sp.rh, n);
@@ -1573,8 +1492,7 @@ pub const Forward = struct {
                             if (peer != (phase == 0)) continue;
                             try f.th.fill32(b.pos_blk, @intCast(host_pos + r1), 1);
                             const ends = host_pos + r1 + m;
-                            // the blocks run in a rank's own order here: the indexer rows are not split (their exchange
-                            // pairs the same block on both ranks)
+                            // blocks in a rank's own order: indexer rows are not split (exchanges pair blocks)
                             if (ag.qsa) try f.qsaBlockOpt(iq + r1 * irow, pooled, b.pos_blk, host_pos + r1, sc, m, ag, ends, false);
                             try f.t.attention(q + r1 * qrow, cache, b.pos_blk, sc, b.attn_o + r1 * qrow, m, ag, ends, d);
                             try f.mark(.attention);
@@ -1617,9 +1535,7 @@ pub const Forward = struct {
         return f.outProjX(x, b.gated, b.xs_gated, a.o, a.o8, R);
     }
 
-    /// The indexer's scores and key lists of a prompt block's `m` rows (first row at `pos`, its device copy `pos0`).
-    /// Two ranks past `qsa_split_keys`: each rank scores and selects its half of the rows (rank 0 the first) and the
-    /// lists, lengths and flags are exchanged: the same kernels on the same rows, so the same lists.
+    /// The indexer's scores and key lists of a prompt block's `m` rows; two ranks split rows and exchange the lists.
     fn qsaBlock(f: *Forward, iq: u64, pooled: u64, pos0: u64, pos: usize, sc: tri.AttnScratch, m: usize, ag: tri.AttnGeometry, ends: usize) !void {
         return f.qsaBlockOpt(iq, pooled, pos0, pos, sc, m, ag, ends, true);
     }
@@ -1662,8 +1578,7 @@ pub const Forward = struct {
         try f.mark(.qsa_select);
     }
 
-    /// attn_multi.layer: every stream's rows of a decode round in one launch a kernel (prep, pool, the sparse
-    /// streams' own selects, chunks, merge) into b.attn_o; the round's tables from multiTables.
+    /// attn_multi.layer: every stream's decode-round rows in one launch a kernel into b.attn_o (multiTables).
     fn attnMulti(f: *Forward, layer: *const W.Layer, segs: []const Seg, x: *const Bufs, R: usize) !void {
         const b = &x.b;
         const g = f.g;
@@ -1704,10 +1619,7 @@ pub const Forward = struct {
         try f.mark(.attention);
     }
 
-    /// moe_block (nvfp4_moe.moe): the router with the shared expert's gate, each row's top_k and the shared slot,
-    /// the plan, the routed gate/up SwiGLU, the shared expert's SwiGLU into its slot, the routed down, the shared
-    /// down into its slot. One GPU: the pending (mode 2, slots y, weights); two ranks: the gathered partials. `mtp`:
-    /// the MTP layer (its own top-k with TF_FLASHNEXT_MTP_TOPK; every stride follows the call's slots).
+    /// moe_block (nvfp4_moe.moe): router, routed and shared SwiGLU and down; one GPU pending, two ranks gathered.
     fn moeBlock(f: *Forward, m: *const W.MoE, x: *const Bufs, R: usize, mtp: bool) !tri.Branch {
         const b = &x.b;
         const g = f.g;
@@ -1772,8 +1684,7 @@ pub const Forward = struct {
         c.rows += R;
     }
 
-    /// The experts, the shared expert and the slots of rows [a0, a0 + n) (the router's picks made for every row), `top`
-    /// routed experts a row.
+    /// The experts, shared expert and slots of rows [a0, a0 + n), `top` routed experts a row.
     fn moeRows(f: *Forward, m: *const W.MoE, x: *const Bufs, a0: usize, n: usize, top: usize) !void {
         if (m.int4) |ex4| return f.moeRowsInt4(m, ex4, x, a0, n, top);
         const b = &x.b;
@@ -1836,9 +1747,7 @@ pub const Forward = struct {
         }
     }
 
-    /// INT4-AutoRound's experts of rows [a0, a0 + n): the GPTQ int4 gate/up SwiGLU, the block-FP8 shared expert's
-    /// gate|up and SwiGLU (its own scratch: the healed shared expert is wider than the routed ones), the int4 down,
-    /// the shared down into its slot.
+    /// INT4-AutoRound experts of rows [a0, a0 + n): int4 gate/up and down, block-FP8 shared expert into its slot.
     fn moeRowsInt4(f: *Forward, m: *const W.MoE, ex4: int4.Experts, x: *const Bufs, a0: usize, n: usize, top: usize) !void {
         const b = &x.b;
         const g = f.g;
@@ -1863,8 +1772,7 @@ pub const Forward = struct {
         try f.mark(.topk_plan);
         const sh = m.shared8 orelse return error.NoSharedExpert;
         if (f.side) |sd| {
-            // the block-FP8 shared expert on the side stream (its own scratch and its slot of moe_y, which the routed
-            // kernels skip): the same kernels on the same inputs, so the same bits, beside the routed experts
+            // block-FP8 shared expert on the side stream (own scratch and moe_y slot): same bits, beside routed
             try sd.fork.record(f.s);
             try sd.s.wait(sd.fork);
             var th2 = f.th;
@@ -1895,8 +1803,7 @@ pub const Forward = struct {
         try f.mark(.slot_copy);
     }
 
-    /// The routed int4 down of rows' pairs: prompt calls on int4_prompt_kernel from a plan of 64-pair items (made
-    /// again after gate/up read the 16-pair one; the same bytes as int4_kernel's, int4-check), else int4_kernel.
+    /// The routed int4 down: prompt calls on int4_prompt_kernel from a 64-pair plan (same bytes), else int4_kernel.
     fn int4Down(f: *Forward, k4: *const int4.Kernels, pick: u64, act: u64, ex4: int4.Experts, plan: kern.Plan, slots: usize, E: usize, y: u64, y_f32: bool, R: usize, skip: c_int, tile: usize) !void {
         if (int4.promptDown(R * slots)) {
             try f.ops.plan(pick, R * slots, E + 1, int4.prompt_down_tile, plan);
@@ -1905,14 +1812,12 @@ pub const Forward = struct {
         return int4.down(k4, f.s, act, ex4.width, ex4, plan, slots, E + 1, y, y_f32, R, skip, tile);
     }
 
-    /// finish: the last write-back into a copy of the streams (b.streams), the mixer's read-out (a prompt chunk's
-    /// last row only), the head (`logits`), the candidates gathered across ranks.
+    /// finish: last write-back into b.streams, the mixer's read-out, the head (`logits`), candidates gathered.
     pub fn finish(f: *Forward, mixer: *const W.Hc, x: *const Bufs, R: usize, pending: Pending, logits: bool) !?u64 {
         return f.finishSegs(mixer, x, R, pending, logits, &.{});
     }
 
-    /// `finish` of a prompt chunk that carries several prompts (`segs`, each ending its own prompt): the read-out
-    /// and the head on each prompt's last row, one row a prompt (b.logits and the candidates hold `segs.len` rows).
+    /// `finish` of a multi-prompt chunk: read-out and head on each prompt's last row (`segs.len` rows).
     pub fn finishSegs(f: *Forward, mixer: *const W.Hc, x: *const Bufs, R: usize, pending: Pending, logits: bool, segs: []const Seg) !?u64 {
         const b = &x.b;
         const g = f.g;
@@ -1935,8 +1840,7 @@ pub const Forward = struct {
             const prow = (g.hidden / 256) * g.streams * 4;
             if (segs.len > 1) {
                 if (segs.len > state.max_rows) return error.TooManyPrompts;
-                // the last rows gathered into rows 0.. of h (free once the streams hold its rows) and of the sums
-                // (a row's source is never before its slot, so the copies in order do not overwrite one to come)
+                // last rows gathered into rows 0.. of h and sums (a source never precedes its slot, so in order)
                 for (segs, 0..) |sg, i| {
                     try f.th.copy(b.h + i * Wd * 2, b.streams + (sg.a1 - 1) * Wd * 2, Wd * 2);
                     if (sg.a1 - 1 != i) try f.th.copy(b.pss + i * prow, b.pss + (sg.a1 - 1) * prow, prow);
@@ -1964,8 +1868,7 @@ pub const Forward = struct {
         return b.logits;
     }
 
-    /// forward.candidates: each rank's top CAND values, global ids and log-sum-exp of `rows` rows, gathered into
-    /// b.cand_all [world, rows, 2 CAND + 1].
+    /// forward.candidates: each rank's top CAND values, ids and log-sum-exp gathered into b.cand_all.
     pub fn candidates(f: *Forward, x: *const Bufs, logits: u64, rows: usize, columns: usize, id_map: ?u64, offset: i64, cm: *const comms.Comm) !void {
         const b = &x.b;
         const s = f.sample orelse return error.NoSampleScratch;
@@ -1975,8 +1878,7 @@ pub const Forward = struct {
 
     // -- commit -----------------------------------------------------------------------------------------------
 
-    /// forward.commit: keep the first `keep` of the window's R rows (a prompt chunk keeps all, its DeltaNet layers
-    /// committed during the forward): the replays, the conv windows' shift, the n-gram history and tail, pos.
+    /// forward.commit: keep the first `keep` rows: replays, conv shift, n-gram history and tail, pos.
     pub fn commit(f: *Forward, seq: *Seq, x: *const Bufs, R: usize, keep: usize) !void {
         return f.commitAt(seq, x, R, keep, 0);
     }
@@ -2009,8 +1911,7 @@ pub const Forward = struct {
 
 test "the partial scratch covers the widest split-K matmul of a prompt chunk" {
     const g: state.Geometry = .{ .hidden = 2560, .streams = 4, .low = 320, .heads = 24, .kv_heads = 2, .head_dim = 256, .index_heads = 4, .index_dim = 128, .index_budget = 2048, .index_ratio = 4, .nk = 16, .nv = 48, .conv_kernel = 4, .experts = 512, .top_k = 10, .moe_width = 640, .ple_dim = 2560, .heads_per_ngram = 8, .ngram_size = 3, .ple_kernel = 4, .head_n = 248320, .linear_layers = 36, .attention_layers = 12, .mtp = true, .world = 1 };
-    // the MTP head's fc_h over a chunk's 4 streams a row: 4 K slices of [4 * 2048, 2560] fp32 (past the shared
-    // expert's down, 8 slices of [2048, 2560])
+    // the MTP head's fc_h over a chunk's 4 streams a row: 4 K slices of [4 * 2048, 2560] fp32
     try std.testing.expectEqual(@as(usize, 4 * 4 * 2048 * 2560 * 4), partBytes(g, 2048));
     // the MTP head's fc_h at 8 rows takes 32 stream rows of [2560, 2560]
     try std.testing.expect(partBytes(g, 8) >= tri.b16PartBytes(32, 2560, 2560));

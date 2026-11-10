@@ -1,14 +1,4 @@
-//! Flash Next's Triton kernels from the captured cubins: one function a Python wrapper of the qwen4_exp CUDA engine
-//! (TensorFold 0.6.5: qwen4_exp/cuda/{glue,bf16,nvfp4,attention,forward,exl3_mm}.py and cuda/moe.py) with that
-//! wrapper's grid, runtime arguments (names, Triton pointer types, ints) and constexprs, so `aot.Set.find` picks the
-//! variant Python launched. Shapes are the NVIDIA ModelOpt NVFP4 checkpoint's: at TP=1 Python's own, at TP=2 a rank's
-//! (work/PLAN.md "TP=2 design": half the heads, half the expert width, fp32 partials gathered for `_hc_writeback`
-//! mode 3). The tests replay fixtures_cuda_triton.json, which tools/zig/flashnext_mia/flashnext_triton_fixtures.py records by
-//! calling the Python wrappers themselves with recorders in place of their kernels.
-//!
-//! Kernel names are Triton's function names as the pack writes them (`fn`). Three are shared by name with different
-//! sources: `_reduce` (bf16.py and nvfp4.py, the same arguments and bits) and `_embed` (exl3_mm.py, the one the NVFP4
-//! checkpoint's bf16 table takes; glue.py's 4-bit `_embed` has other argument names, so `find` keeps them apart).
+//! Triton kernels from captured cubins: one fn per qwen4_exp CUDA wrapper, same args and constexprs so find picks it.
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -169,10 +159,7 @@ pub const AttnGeometry = struct {
 /// AttnScratch's device buffers: chunk partials, each row's key list, its length and whether it is sparse, scores.
 pub const AttnScratch = struct { po: u64, pm: u64, pl: u64, ids: u64, nk: u64, sparse: u64, scores: u64 };
 
-/// The attention caches of one layer: keys and values (bf16, or int8 / int4 codes) and their fp16 scales (a bf16
-/// cache keeps one-element scales, kvcache.KVCache, so the kernels take one argument list). `fp8`: kv8.py's rows
-/// (key rows head_dim + 16 bytes holding both scales, value rows head_dim bytes; `ks`/`vs` unused), written by
-/// `_attn_prep8` and read by `_chunks8`; `bits` stays 0 (no H32 rotation: the merge is bf16's).
+/// One layer's attention caches: k/v (bf16, int8/int4 codes) and fp16 scales; `fp8` holds kv8.py rows, `bits` stays 0.
 pub const Cache = struct {
     k: u64,
     v: u64,
@@ -190,8 +177,7 @@ pub const Cache = struct {
     }
 };
 
-/// An NVFP4 matmul's table (nvfp4.FP4): bf16 patterns and fp32 scales (the shared expert, `packed` false) or the
-/// checkpoint's codes and e4m3 scales (`codes`, Python's `packed`).
+/// An NVFP4 matmul's table (nvfp4.FP4): bf16 patterns and fp32 scales, or the checkpoint's codes and e4m3 scales.
 pub const Fp4 = struct { weight: u64, scale: u64, scale2: u64, codes: bool = false };
 
 /// bf16.split_k: K slices by the weight's shape alone, a power of two of whole 64-blocks.
@@ -245,9 +231,7 @@ fn gpiFor(per: usize, want: usize) usize {
     return 1;
 }
 
-/// The variant `aot.Set.find` picked for each (function, constexprs, arguments' specialization) seen, so a repeated
-/// launch skips the scan over every captured variant: a decode round enqueues thousands of launches, and the scan
-/// was most of their host time. The pick is the one `find` makes (the key holds everything `find` matches on).
+/// Memo of `aot.Set.find`'s pick per (function, constexprs, specialization), so repeated launches skip the scan.
 pub const Memo = struct {
     gpa: std.mem.Allocator,
     map: std.AutoHashMapUnmanaged(u64, usize) = .empty,
@@ -327,8 +311,7 @@ pub const Tri = struct {
         try t.run("_embed", .{ rows, d / 256, 1 }, &.{ p("IDS", i32p, ids), p("T", bf16, table), p("OUT", bf16, out) }, &.{ ci("D", d), ci("S", copies), ci("BLOCK", 256) });
     }
 
-    /// glue.hc_writeback: the pending branch into the streams h [R, S*D] (in place when hout == h), each stream's
-    /// squared sums per 256 dims into pss [R, D/256, S]; `inject` [R, S] bf16 gates (unused in mode 0).
+    /// glue.hc_writeback: branch into streams h [R, S*D], squared sums per 256 dims into pss; `inject` [R, S] gates.
     pub fn hcWriteback(t: Tri, h: u64, hout: u64, pss: u64, inject: ?u64, branch: Branch, rows: usize, d: usize, streams: usize) !void {
         return t.hcWritebackNorm(h, hout, pss, inject, branch, rows, d, streams, null);
     }
@@ -336,8 +319,7 @@ pub const Tri = struct {
     /// The scale (fp32 [S*D]), the normed rows [R, S*D] bf16 and eps of `_hc_wb_norm`.
     pub const NormOut = struct { scale: u64, normed: u64, eps: f32 };
 
-    /// hcWriteback and, with `norm`, hcNormed's rows (no 32-group sums) in the same launch, a row a program
-    /// (prompt_mm._hc_wb_norm: the same bits as the two kernels).
+    /// hcWriteback plus, with `norm`, hcNormed's rows in one launch, a row a program (prompt_mm._hc_wb_norm).
     pub fn hcWritebackNorm(t: Tri, h: u64, hout: u64, pss: u64, inject: ?u64, branch: Branch, rows: usize, d: usize, streams: usize, norm: ?NormOut) !void {
         const block = 256;
         var br = p("BR", bf16, h);
@@ -387,8 +369,7 @@ pub const Tri = struct {
         try t.run("_hc_normed", .{ rows, streams * d / block, 1 }, &.{ p("H", bf16, h), p("PSS", f32p, pss), p("SCALE", f32p, scale), p("NORMED", bf16, normed), p("XS", f32p, xs), aot.float("eps", eps) }, &.{ ci("D", d), ci("S", streams), ci("NC", d / 256), ci("BLOCK", block) });
     }
 
-    /// glue.hc_act: the down projection's fp32 rows dn [R, ndn] -> act [R, low] bf16 (SiLU), its group sums, and
-    /// with `inject` (ndn = low + S) the inject gates [R, S].
+    /// glue.hc_act: fp32 dn [R, ndn] -> act [R, low] bf16 (SiLU) and group sums; `inject` gates when ndn = low + S.
     pub fn hcAct(t: Tri, dn: u64, act: u64, xs: u64, inject: ?u64, rows: usize, ndn: usize, streams: usize, low: usize) !void {
         try t.run("_hc_act", .{ rows, 1, 1 }, &.{ p("DN", f32p, dn), p("ACT", bf16, act), p("XS", f32p, xs), p("INJ", bf16, inject orelse act) }, &.{ ci("S", streams), ci("LOW", low), ci("LOWP", pow2(low)), cb("HAS_INJ", inject != null), ci("NDN", ndn) });
     }
@@ -398,8 +379,7 @@ pub const Tri = struct {
         try t.run("_hc_mix", .{ rows, d / 256, 1 }, &.{ p("UP", bf16, up), p("NORMED", bf16, normed), p("MIXED", bf16, mixed), p("XS", f32p, xs) }, &.{ ci("D", d), ci("S", streams), ci("BLOCK", 256) });
     }
 
-    /// glue.rmsnorm: each run of `group` features (null: the whole row) normalized, times w (fp32), bf16 out [R, d]
-    /// and its 32-group sums; x rows `x_stride` elements apart.
+    /// glue.rmsnorm: each `group` run (null: whole row) normalized times fp32 w, bf16 out [R, d] and its 32-group sums.
     pub fn rmsnorm(t: Tri, x: u64, x_stride: usize, w: u64, out: u64, xs: u64, rows: usize, d: usize, group: ?usize, eps: f32) !void {
         const g = group orelse d;
         try t.run("_rmsnorm", .{ rows, d / g, 1 }, &.{ p("X", bf16, x), p("W", f32p, w), p("OUT", bf16, out), p("XS", f32p, xs), aot.float("eps", eps), int("x_stride", x_stride) }, &.{ ci("D", d), ci("G", g), ci("BLOCK", pow2(g)) });
@@ -414,18 +394,14 @@ pub const Tri = struct {
 
     pub const Prep = struct { p: u64, pos0: u64, qw: u64, kw: u64, iw: u64, inv: u64, q: u64, cache: Cache, iq: u64, ikc: u64 };
 
-    /// An image or video prompt's rotary table (image_rows.attach): rows at positions below `length` rotate at
-    /// the table's (t, h, w) [length, 3] i32 by the interleaved section map, later ones at pos + delta (Python
-    /// rope_axis, MODE 2). Every attention launch of such a sequence takes it: prompt chunks, decode windows, the
-    /// MTP layer.
+    /// Image/video rotary table (image_rows.attach): rows below `length` use the (t, h, w) table, later pos + delta.
     pub const Rope = struct { table: u64, delta: u64, length: usize };
 
     /// The multimodal rotary sections' h and w counts (rope_parameters.mrope_section [11, 11, 10]).
     pub const rope_s1 = 11;
     pub const rope_s2 = 10;
 
-    /// glue.attn_prep on text positions (MODE 0: ROPE and DELTA are POS0, as Python passes them without images):
-    /// q, k, indexer heads normalized and rotated, keys and values stored at POS0 + r, raw indexer keys.
+    /// glue.attn_prep on text positions (MODE 0): q, k, indexer heads normed and rotated, k/v stored at POS0 + r.
     pub fn attnPrep(t: Tri, a: Prep, rows: usize, d: Dims) !void {
         return t.attnPrepRope(a, rows, d, null);
     }
@@ -445,8 +421,7 @@ pub const Tri = struct {
         try t.run("_attn_prep", .{ rows, d.heads + d.kv_heads + d.index_heads + 1, 1 }, &.{ p("P", bf16, a.p), p("POS0", i32p, a.pos0), p("QW", f32p, a.qw), p("KW", f32p, a.kw), p("IW", f32p, a.iw), p("INV", f32p, a.inv), p("Q", bf16, a.q), p("KC", a.cache.codes(), a.cache.k), p("VC", a.cache.codes(), a.cache.v), p("KS", f16p, a.cache.ks), p("VS", f16p, a.cache.vs), p("IQ", bf16, a.iq), p("IKC", bf16, a.ikc), p("ROPE", i32p, table), p("DELTA", i32p, delta), int("length", length), aot.float("eps", d.eps) }, &.{ ci("PW", pw), ci("NQ", d.heads), ci("NKV", d.kv_heads), ci("HD", d.head_dim), ci("NI", d.index_heads), ci("IHD", d.index_dim), ci("HALF", d.rotary_half), ci("BITS", a.cache.bits), ci("MODE", mode), ci("S1", rope_s1), ci("S2", rope_s2) });
     }
 
-    /// attention.attention: rows' queries [R, H, D] over their 512-key chunks (sparse rows through the scratch's
-    /// key lists), merged in chunk order into out [R, H, D]; `context` bounds the chunks (null: the scratch's).
+    /// attention.attention: queries [R, H, D] over 512-key chunks merged in chunk order; `context` bounds chunks.
     pub fn attention(t: Tri, q: u64, cache: Cache, pos0: u64, sc: AttnScratch, out: u64, rows: usize, g: AttnGeometry, context: ?usize, d: Dims) !void {
         const h = d.heads;
         const hk = d.kv_heads;
@@ -461,14 +436,12 @@ pub const Tri = struct {
         try t.run("_merge", .{ rows, hk, 1 }, &.{ p("PO", f32p, sc.po), p("PM", f32p, sc.pm), p("PL", f32p, sc.pl), p("POS0", i32p, pos0), p("OUT", bf16, out), p("NKR", i32p, sc.nk), p("SPR", i32p, sc.sparse) }, &.{ ci("H", h), ci("HK", hk), ci("D", d.head_dim), ci("G", grp), ci("CH", AttnGeometry.chunk), ci("NCH", g.nch), cb("QSA", g.qsa), ci("BITS", cache.bits) });
     }
 
-    /// attention.qsa_pool on text positions: the RATIO-key blocks rows [P0, P0 + R) complete, pooled, normalized
-    /// (w = the indexer's k_layernorm, fp32) and rotated (ROPE and DELTA None, as Python passes them).
+    /// attention.qsa_pool on text positions: complete RATIO-key blocks pooled, normed (k_layernorm) and rotated.
     pub fn qsaPool(t: Tri, ikc: u64, pooled: u64, pos0: u64, w: u64, inv: u64, rows: usize, g: AttnGeometry, d: Dims) !void {
         return t.qsaPoolRope(ikc, pooled, pos0, w, inv, rows, g, d, null);
     }
 
-    /// attention.qsa_pool: text positions without `rope` (ROPE and DELTA None, MODE 0), else the image prompt's
-    /// table (ROPE and DELTA pointers, MODE 2), a block crossing the prompt's end included.
+    /// attention.qsa_pool: text positions without `rope` (MODE 0), else the image prompt's table (MODE 2).
     pub fn qsaPoolRope(t: Tri, ikc: u64, pooled: u64, pos0: u64, w: u64, inv: u64, rows: usize, g: AttnGeometry, d: Dims, rope: ?Rope) !void {
         const grid: [3]usize = .{ rows / g.ratio + 2, 1, 1 };
         const consts = [_]aot.Const{ ci("DI", d.index_dim), ci("HALF", d.rotary_half), ci("RATIO", g.ratio), ci("MODE", if (rope != null) 2 else 0), ci("S1", rope_s1), ci("S2", rope_s2) };
@@ -476,8 +449,7 @@ pub const Tri = struct {
         try t.run("_pool", grid, &.{ p("IKC", bf16, ikc), p("POOLED", bf16, pooled), p("POS0", i32p, pos0), p("W", f32p, w), p("INV", f32p, inv), aot.float("eps", d.eps), int("R", rows), int("length", 0) }, &consts);
     }
 
-    /// attention.qsa_rows: each sparse row's block scores, then its TOP blocks and tail (_select while the blocks
-    /// fit its registers, _select_tiles past them) into the scratch's key lists.
+    /// attention.qsa_rows: each sparse row's block scores, then its TOP blocks and tail into the scratch's key lists.
     pub fn qsaRows(t: Tri, iq: u64, pooled: u64, pos0: u64, sc: AttnScratch, rows: usize, g: AttnGeometry, context: ?usize, d: Dims) !void {
         const top = g.budget / g.ratio;
         const blocks = g.blocks(context);
@@ -504,8 +476,7 @@ pub const Tri = struct {
 
     // -- a shared round's attention in one launch a kernel (attn_multi.py) ------------------------------------
 
-    /// attn_multi.Step's tables: each row's position and stream, each stream's first position and row count, and
-    /// a layer's pointer table [6][N] int64 (keys, values, key scales, value scales, index keys, pooled).
+    /// attn_multi.Step's tables: row position and stream, stream first position and count, a layer's [6][N] pointers.
     pub const Multi = struct { posr: u64, sid: u64, first: u64, counts: u64, n: usize };
 
     /// Whether the kernel set holds attn_multi's kernels (aot/w6-ks1 and later).
@@ -524,8 +495,7 @@ pub const Tri = struct {
         try t.run("_pool_multi", .{ m.n, most / g.ratio + 2, 1 }, &.{ p("CP", "*i64", cp), p("VP", "*i64", cp), p("P0", i32p, m.first), p("RS", i32p, m.counts), p("W", f32p, w), p("INV", f32p, inv), aot.float("eps", d.eps), int("N", m.n) }, &.{ ci("DI", d.index_dim), ci("HALF", d.rotary_half), ci("RATIO", g.ratio), cb("VISION", false), ci("S1", 11), ci("S2", 10) });
     }
 
-    /// attn_multi._chunks_multi + _merge_multi: every row over its stream's caches (a row is sparse when its end
-    /// passes TOP blocks: its key list from qsaRows), merged into out [R, H, D]; `keys` the most a row has.
+    /// attn_multi._chunks_multi + _merge_multi: every row over its stream's caches merged into out; `keys` the row max.
     pub fn attentionMulti(t: Tri, m: Multi, cp: u64, q: u64, sc: AttnScratch, out: u64, rows: usize, g: AttnGeometry, keys: usize, d: Dims) !void {
         const h = d.heads;
         const hk = d.kv_heads;
@@ -544,28 +514,24 @@ pub const Tri = struct {
 
     // -- the n-gram embedding (PLE) ------------------------------------------------------------------------
 
-    /// glue.ple_embed_bf16: the gathered rows (row r * heads + h, dh bf16 values) -> out [R, heads * dh] and group
-    /// sums; `scale` the table's weight_scale (1.0 for the checkpoint's FP8 table: its LUT holds the scale).
+    /// glue.ple_embed_bf16: gathered rows -> out [R, heads * dh] and group sums; `scale` 1.0 for the FP8 table (LUT).
     pub fn pleEmbedBf16(t: Tri, v: u64, out: u64, xs: u64, rows: usize, heads: usize, dh: usize, scale: f32) !void {
         try t.run("_ple_embed_bf16", .{ rows, heads, 1 }, &.{ p("V", bf16, v), p("OUT", bf16, out), p("XS", f32p, xs) }, &.{ ci("HEADS", heads), ci("DH", dh), aot.cf("SCALE", scale) });
     }
 
-    /// glue.ple_gate: each stream's gate from its normalized key and query, gated values [R, S*D] and their
-    /// squared sums [R, S].
+    /// glue.ple_gate: each stream's gate from its normed key and query, gated values [R, S*D] and squared sums [R, S].
     pub fn pleGate(t: Tri, keys: u64, vals: u64, h: u64, norm_key: u64, norm_query: u64, gated: u64, pss: u64, rows: usize, d: usize, streams: usize, eps: f32) !void {
         try t.run("_ple_gate", .{ rows, 1, 1 }, &.{ p("KEYS", bf16, keys), p("VALS", bf16, vals), p("H", bf16, h), p("NK", f32p, norm_key), p("NQ", f32p, norm_query), p("GATED", bf16, gated), p("PSS", f32p, pss), aot.float("eps", eps) }, &.{ ci("D", d), ci("S", streams), ci("BLOCK", 512) });
     }
 
-    /// glue.ple_conv (one stream's rows): the dilated conv over [tail; rows], SiLU, both residual adds into hout,
-    /// and the normed rows kept in nrow for the next tail; conv_w [S*D, taps] bf16.
+    /// glue.ple_conv (one stream): dilated conv over [tail; rows], SiLU, residual adds into hout, normed rows to nrow.
     pub fn pleConv(t: Tri, gated: u64, pss: u64, norm_conv: u64, tail: u64, conv_w: u64, h: u64, hout: u64, nrow: u64, rows: usize, d: usize, streams: usize, taps: usize, dilation: usize, eps: f32) !void {
         try t.run("_ple_conv", .{ rows, streams * d / 512, 1 }, &.{ p("GATED", bf16, gated), p("PSS", f32p, pss), p("NC", f32p, norm_conv), p("TAIL", bf16, tail), p("CW", bf16, conv_w), p("H", bf16, h), p("HOUT", bf16, hout), p("NROW", bf16, nrow), aot.float("eps", eps), int("R", rows) }, &.{ ci("D", d), ci("S", streams), ci("TAPS", taps), ci("DIL", dilation), ci("BLOCK", 512) });
     }
 
     // -- matmuls -------------------------------------------------------------------------------------------
 
-    /// bf16.matmul: x [M, K] bf16 (rows `x_stride` apart) @ w [N, K].T -> out [M, N] (bf16, or fp32 sums with
-    /// `f32`); K slices (b16SplitK) into `part` (b16PartBytes) are summed in slice order by `_reduce`.
+    /// bf16.matmul: x [M, K] @ w [N, K].T -> out [M, N] (bf16 or fp32); K slices summed in order by `_reduce`.
     pub fn b16mm(t: Tri, x: u64, x_stride: usize, w: u64, out: u64, fp32: bool, part: u64, m: usize, n: usize, k: usize) !void {
         if (k % 64 != 0) return error.KNotBlocked;
         const sk = b16SplitK(n, k);
@@ -581,8 +547,7 @@ pub const Tri = struct {
         try t.run("_reduce", .{ cdiv(total, 1024), 1, 1 }, &.{ p("PART", f32p, part), p("OUT", if (fp32) f32p else bf16, out), int("total", total) }, &.{ ci("SK", sk), ci("BLOCK", 1024), cb("F32", fp32) });
     }
 
-    /// nvfp4.matmul at its defaults (the shared expert: gate|up [2NI, D], down [D, NI] from rows `x_stride` apart):
-    /// x [M, K] bf16 @ fp.T -> out [M, N] bf16 (fp32 with `f32`), K slices (fp4SplitK) summed in order.
+    /// nvfp4.matmul at defaults (shared expert): x [M, K] bf16 @ fp.T -> out [M, N], K slices summed in order.
     pub fn fp4mm(t: Tri, x: u64, x_stride: usize, fp: Fp4, out: u64, fp32: bool, part: u64, m: usize, n: usize, k: usize) !void {
         if (n % 64 != 0) return error.NNotTiled;
         const bm = bucket(m);
@@ -611,8 +576,7 @@ pub const Tri = struct {
         try t.run("_router", .{ cdiv(m, bm), cdiv(ne, be), 1 }, &.{ p("X", bf16, x), p("W", bf16, rows_w), p("OUT", f32p, out), int("M", m), int("x_stride", x_stride) }, &.{ ci("D", d), ci("NE", ne), ci("BM", bm), ci("BLOCK_E", be), ci("BK", bk) });
     }
 
-    /// moe.select_rows: each row's top_k experts and weights, then the shared expert as slot top_k (pick, wts
-    /// [R, top_k + 1]); the grouping into a plan is the experts extension's.
+    /// moe.select_rows: each row's top_k experts and weights, then the shared expert as slot top_k (pick, wts).
     pub fn topkRows(t: Tri, logits: u64, pick: u64, wts: u64, rows: usize, experts: usize, top_k: usize) !void {
         try t.run("_topk_rows", .{ rows, 1, 1 }, &.{ p("L", f32p, logits), p("PICK", i32p, pick), p("WTS", f32p, wts) }, &.{ ci("NE", experts), ci("NL", experts + 1), ci("TOPK", top_k), ci("SLOTS", top_k + 1), ci("BLOCK", pow2(experts + 1)), ci("SLOTP", pow2(top_k + 1)) });
     }
@@ -624,8 +588,7 @@ pub const Tri = struct {
 
     // -- commit --------------------------------------------------------------------------------------------
 
-    /// forward.shift_windows: old [L, T, C] (in place, layers `old_l` elements apart) takes rows keep .. keep + T
-    /// of [old; new rows], new rows `new_row` apart within a layer and `new_l` across layers (the first C columns).
+    /// forward.shift_windows: old [L, T, C] in place takes rows keep .. keep + T of [old; new rows].
     pub fn shiftWindows(t: Tri, old: u64, new: u64, keep: usize, old_l: usize, new_l: usize, new_row: usize, layers: usize, channels: usize, taps: usize) !void {
         try t.run("_shift_windows", .{ layers, cdiv(channels, 256), 1 }, &.{ p("OLD", bf16, old), p("NEW", bf16, new), int("keep", keep), int("OLD_L", old_l), int("NEW_L", new_l), int("NEW_ROW", new_row) }, &.{ ci("C", channels), ci("T", taps), ci("TP", pow2(taps)), ci("BLOCK", 256) });
     }
@@ -659,8 +622,7 @@ fn jsonInt(v: std.json.Value) i64 {
     return v.integer;
 }
 
-/// The recorded launches equal the fixture's: kernel, grid, each runtime argument's type and value by name, and
-/// every non-None constexpr (None ones are not runtime arguments and Zig passes nothing for them).
+/// The recorded launches equal the fixture's: kernel, grid, runtime args by name and every non-None constexpr.
 fn expectLaunches(f: *const Fixture, id: []const u8, rec: *const Recorder) !void {
     const want = try f.case(id);
     errdefer std.debug.print("case {s}\n", .{id});
@@ -731,7 +693,7 @@ fn check(f: *const Fixture, comptime fmt: []const u8, args: anytype, run: anytyp
     try expectLaunches(f, id, &rec);
 }
 
-/// tools/zig/flashnext_mia/flashnext_triton_fixtures.py ROWS: decode windows, the capture's prompt pieces and full chunks
+/// flashnext_triton_fixtures.py ROWS: decode windows, the capture's prompt pieces and full chunks
 const rows_cases = [_]usize{ 1, 2, 3, 4, 5, 6, 7, 16, 18, 19, 29, 30, 116, 973, 974, 2048 };
 const prompts = [_][2]usize{ .{ 0, 2048 }, .{ 4096, 19 }, .{ 139264, 2048 }, .{ 2048, 974 }, .{ 2048, 973 }, .{ 0, 30 }, .{ 0, 29 }, .{ 0, 18 }, .{ 2048, 206 }, .{ 2048, 205 } };
 

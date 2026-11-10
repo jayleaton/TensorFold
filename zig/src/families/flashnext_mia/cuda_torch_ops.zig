@@ -1,20 +1,4 @@
-//! Flash Next's torch ops on the CUDA hot path, replaced with the same bits: our fn_ops.cu and fn_logsumexp.cu
-//! (zig/kernels/cuda/torch_ops) and the Nemotron operators that already cover an op (bf16 -> fp32, argmax, the
-//! unsorted top-k, strided copies and row gathers), each launched with the geometry of the C launcher that
-//! tools/zig/flashnext_mia/check_flashnext_ops.py qualifies against torch; plain copies, fills and zeroing are driver calls.
-//!
-//! What each Python op becomes (TensorFold 0.6.5 qwen4_exp/cuda):
-//!   nvfp4_moe.MoE4.shared_act + `buf.act[:R, top_k] = ...`   sharedSwiglu (one kernel, torch's rounding points)
-//!   `buf.y[:R, top_k] = shared down`                         slotCopy (movement.cu strided copy)
-//!   `b.streams[:R].copy_(b.h[:R])`, clones, `pss[0].copy_`  copy (cuMemcpyDtoDAsync)
-//!   `pos_blk.fill_`, `pos_dev.fill_` (int32)                 fill32 (cuMemsetD32Async); `conv_ptr.fill_` fill64
-//!   State.reset's `zero_()`                                  zero (cuMemsetD8Async)
-//!   `b.pss.index_select`, `b.streams.index_select` (ends)    gatherRows (movement.cu)
-//!   `logits.float()`                                         toF32 (pointwise.cu)
-//!   `logits.argmax(dim=-1)` / `row.max(dim=-1)`              argmax (argmax.cu, int32 ids, the first maximum)
-//!   `torch.topk(x, k, sorted=False)`                          topk (topk.cu)
-//!   `torch.logsumexp(row, dim=-1)`                            logsumexp (fn_logsumexp.cu)
-//!   sample_draft's `torch.cat([...])`, candidates' packing    draftPick, draftPack, candidates (fn_ops.cu)
+//! Flash Next's torch ops on the CUDA hot path as same-bit kernels (fn_ops.cu, fn_logsumexp.cu, Nemotron's) or copies.
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -92,9 +76,7 @@ pub const Functions = struct {
     }
 };
 
-/// fn_logsumexp.cu: torch.logsumexp(x, dim=-1, keepdim=True) on contiguous fp32 rows in ATen's reduction order:
-/// the row maxima (|max| == inf -> 0), the exp(x - max) sum by ATen's reduce config for (rows, n) on this device,
-/// its per-CTA partials folded, then log(sum) + max. The config needs n >= 128 and rows <= 65535.
+/// fn_logsumexp.cu: torch.logsumexp(x, -1) on fp32 rows in ATen's reduction order; needs n >= 128, rows <= 65535.
 pub const Lse = struct {
     max: cuda.Function,
     sum: cuda.Function,
@@ -163,8 +145,7 @@ pub const Lse = struct {
     }
 };
 
-/// Threads a multiprocessor by compute capability (the driver attribute this runtime does not list): 1536 on
-/// sm_86/89 and sm_12x, 2048 on sm_80/90/100.
+/// Threads a multiprocessor by compute capability: 1536 on sm_86/89 and sm_12x, 2048 on sm_80/90/100.
 pub fn threadsPerMultiprocessor(cc: u32) usize {
     return switch (cc) {
         86, 87, 89, 120, 121 => 1536,
@@ -253,8 +234,7 @@ pub const Torch = struct {
         try t.check(t.s.d.api.cuMemsetD8Async(dst, 0, bytes, t.s.handle), "cuMemsetD8Async");
     }
 
-    /// A slot assignment `dst[:rows, slot] = src` (or any `.copy_` between row-strided views): `rows` rows of
-    /// `row_bytes`, `src_ld` and `dst_ld` bytes apart, one block a row.
+    /// A slot assignment `dst[:rows, slot] = src` (any row-strided `.copy_`): `rows` of `row_bytes`, one block a row.
     pub fn slotCopy(t: Torch, src: u64, src_ld: usize, dst: u64, dst_ld: usize, row_bytes: usize, rows: usize) !void {
         if (rows == 0) return;
         var a: cuda.Args = .{};
@@ -278,8 +258,7 @@ pub const Torch = struct {
 
     // -- the shared expert ---------------------------------------------------------------------------------
 
-    /// MoE4.shared_act into its slot: g [rows, 2 ni] bf16 (gate | up) -> out rows `out_stride` elements apart
-    /// (buf.act[:, top_k]: (top_k + 1) * ni).
+    /// MoE4.shared_act into its slot: g [rows, 2 ni] bf16 (gate | up) -> out rows `out_stride` elements apart.
     pub fn sharedSwiglu(t: Torch, g: u64, out: u64, rows: usize, ni: usize, out_stride: usize) !void {
         if (rows * ni == 0) return;
         var a: cuda.Args = .{};
@@ -301,8 +280,7 @@ pub const Torch = struct {
         try t.go(t.f.to_f32, .{ blocks(count, 256), 1 }, 256, &a);
     }
 
-    /// torch.argmax / max(dim=-1)'s index over rows of bf16 logits `ld` apart, as int32: the first maximum, a NaN
-    /// first.
+    /// torch.argmax over rows of bf16 logits `ld` apart, as int32: the first maximum, a NaN first.
     pub fn argmax(t: Torch, logits: u64, vocab: usize, ld: usize, out: u64, rows: usize) !void {
         if (rows == 0) return;
         var a: cuda.Args = .{};
@@ -313,8 +291,7 @@ pub const Torch = struct {
         try t.go(t.f.argmax, .{ rows, 1 }, 256, &a);
     }
 
-    /// torch.topk(rows of fp32 `columns` wide, k, sorted=False): values [rows, k] fp32 and int64 columns, in
-    /// torch's order; `scratch` is topkScratchBytes(rows, columns).
+    /// torch.topk(fp32 rows, k, sorted=False): fp32 values, int64 columns in torch's order; topkScratchBytes scratch.
     pub fn topk(t: Torch, in: u64, columns: usize, rows: usize, k: usize, values: u64, indices: u64, scratch: u64) !void {
         const n = tiles(columns);
         const row_bytes: u64 = columns * 4;
@@ -370,10 +347,7 @@ pub const Torch = struct {
         try t.go(t.f.draft_pack, .{ blocks(k + 1, 256), 1 }, 256, &a);
     }
 
-    /// forward.candidates' row packing (two ranks): out [rows, 2 cand + 1] = [values | ids as int32 bits | lse],
-    /// ids = id_map[idx] (the draft head; `id_map` int64) or idx + offset (the main head's rank shard).
-    /// sampling.nucleus_rows' fixed-point mass of `rows` rows of bf16 logits (`ld` apart): mass [rows, cols] int64 =
-    /// floor(exp(f64(logit) / t - top[r]) * 2^40) and each row's sum into `sums` (zeroed here first).
+    /// nucleus_rows' fixed-point mass: floor(exp(f64(logit) / t - top[r]) * 2^40) int64, row sums into zeroed `sums`.
     pub fn nucleusMass(t: Torch, logits: u64, ld: usize, rows: usize, cols: usize, temp: f64, top: u64, mass: u64, sums: u64) !void {
         if (rows == 0 or cols == 0) return;
         try t.zero(sums, rows * 8);
@@ -388,9 +362,7 @@ pub const Torch = struct {
         try t.go(t.f.nucleus_mass, .{ (cols + 255) / 256, rows }, 256, &a);
     }
 
-    /// nvfp4.matmul with one K slice and bf16-pattern tables (`_fp4mm` SK 1, PACKED 0) in the same bits: each
-    /// 16-input block's HMMA (C 0) then fma by its scale, in block order (fn_ops.cu tf_fn_fp4_serial_kernel), a warp
-    /// 16 rows x 8 columns, the blocks streamed through a cp.async ring. x [m, k] bf16 rows `x_stride` apart.
+    /// nvfp4.matmul one K slice, bf16-pattern tables, same bits: each 16-input block's HMMA then fma by its scale.
     pub fn fp4Serial(t: Torch, x: u64, x_stride: usize, w: u64, scale: u64, out: u64, fp32: bool, m: usize, n: usize, k: usize) !void {
         if (m == 0) return;
         if (!fp4SerialFits(x_stride, n, k)) return error.Invalid;
@@ -400,6 +372,7 @@ pub const Torch = struct {
         try t.go(t.f.fp4_serial, .{ (m + 15) / 16, n / 32 }, 128, &a);
     }
 
+    /// forward.candidates packing: out [rows, 2 cand + 1] = [values | int32 ids | lse]; ids id_map[idx] or idx + offset
     pub fn candidates(t: Torch, vals: u64, idx: u64, id_map: ?u64, offset: i64, lse: u64, out: u64, rows: usize, cand: usize) !void {
         if (rows == 0) return;
         var a: cuda.Args = .{};
@@ -431,8 +404,7 @@ pub const Torch = struct {
         }
     };
 
-    /// cuda/sampling.sample_rows with top_k > 0 (and decode.sample_mapped): `logits.float()` then the unsorted
-    /// top_k + MARGIN; the host reads s.vals and s.idx (columns; the draft head's map to ids on the host).
+    /// sampling.sample_rows with top_k > 0: `logits.float()` then unsorted top_k + MARGIN; host reads s.vals and s.idx.
     pub fn sampleTopk(t: Torch, logits: u64, rows: usize, columns: usize, k: usize, s: Sample) !void {
         try t.toF32(logits, s.f32, rows * columns);
         try t.topk(s.f32, columns, rows, k, s.vals, s.idx, s.topk);
@@ -454,8 +426,7 @@ pub const Torch = struct {
         try t.draftPack(s.vals, s.idx, s.lse, out, k);
     }
 
-    /// forward.candidates (two ranks): `rows` rows of this rank's bf16 logits `columns` wide -> out [rows, 2 cand + 1]
-    /// (before the all-gather into cand_all).
+    /// forward.candidates (two ranks): this rank's bf16 logits -> out [rows, 2 cand + 1] before the all-gather.
     pub fn rankCandidates(t: Torch, logits: u64, rows: usize, columns: usize, cand: usize, id_map: ?u64, offset: i64, s: Sample, out: u64) !void {
         try t.toF32(logits, s.f32, rows * columns);
         try t.topk(s.f32, columns, rows, cand, s.vals, s.idx, s.topk);

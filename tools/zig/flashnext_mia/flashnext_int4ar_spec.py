@@ -1,17 +1,5 @@
 #!/usr/bin/env python3
-"""The Triton specializations the INT4-AutoRound checkpoint (azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound)
-needs beyond the NVFP4 kernel set (zig/tests/cuda/flashnext_mia/kernels.json, aot/p1-ks1), and the merge of both sets.
-
-  spec:  kernels.json -> kernels_int4ar.json, only the new entries, each cloned from an entry of the same function:
-         top-5 routing (``_topk_rows``, ``_hc_writeback`` mode 2, ``_moe_partial`` at TOPK 5 / SLOTS 6) and the bf16
-         parts of the block-FP8 projection stacks that stay on ``bf16.matmul`` (GDN in_proj_b|in_proj_a: 96 rows at
-         one GPU, 48 a TP=2 rank; the indexer's index_qk_proj: 640 rows, replicated), K 2560, in every row bucket and
-         int form the wrappers launch (``_b16mm`` and the prompt path's ``_b16mm_ks``). Their K-slice sums take
-         ``_reduce`` SK 8 F32 False, already in the set (nvfp4._reduce: the same source as bf16._reduce, same name).
-  merge: <base>/aot.json + cubins and <new>/aot.json + cubins -> <out> (copies; a hash in both is kept once)
-
-Build the new entries with ``flashnext_aot.py build --spec zig/tests/cuda/flashnext_mia/kernels_int4ar.json`` in the
-PyTorch image with this tree at /tensorfold (the spec's source_root), as kernels.json is built."""
+"""INT4-AutoRound's Triton specializations beyond the NVFP4 set (spec: entries cloned per function) and set merge."""
 
 from __future__ import annotations
 

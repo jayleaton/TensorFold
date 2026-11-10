@@ -1,12 +1,4 @@
-//! The one-shot RoCE all-gather between two ranks (decode plan D1, work/research/R1-decode.md 3.1): b12x's
-//! "RoCEnante" protocol (https://github.com/local-inference-lab/b12x, b12x/comm/roce, by the b12x contributors at
-//! Local Inference Lab, Apache License 2.0) in a new implementation: the host proxy in roce_proxy.c (libibverbs opened
-//! at run time), the GPU kernel in zig/kernels/cuda/fn_roce.cu. A gather of up to `slot_bytes` a rank costs one kernel
-//! launch, with no host work on the receive side; the byte layout is ncclAllGather's (rank 0's shard first), so it is
-//! a drop-in for small gathers and graph-capturable (the sequence lives in device memory).
-//!
-//! Setup: `open` (region, ports, queue pairs), the two ranks swap `blob`s (the caller's control link), `connect`,
-//! `start` (the proxy thread). Both ranks must make the same gathers in the same order, as for NCCL.
+//! Two-rank one-shot RoCE all-gather: b12x's RoCEnante (b12x contributors, Apache-2.0), new code; ncclAllGather layout.
 const std = @import("std");
 const abi = @import("abi.zig");
 const Driver = @import("driver.zig").Driver;
@@ -42,8 +34,7 @@ fn prefetchBlocks(bytes: usize) usize {
 
 pub const prefetch_symbol: [:0]const u8 = "_ZN10tf_fn_roce8prefetchEPKcy";
 
-/// The prefetch alone, for gathers NCCL makes: one launch on the gather's stream just before it; the lines it asks
-/// for keep arriving while NCCL waits on the network.
+/// The prefetch alone, for gathers NCCL makes: one launch on the gather's stream just before it.
 pub const L2 = struct {
     mod: module.Module,
     f: module.Function,
@@ -190,18 +181,14 @@ pub const Roce = struct {
         return bytes > 0 and bytes <= r.slot_bytes and bytes % 4 == 0;
     }
 
-    /// fits, with both pointers 4-byte aligned and the send buffer either apart from the receive one or exactly this
-    /// rank's block of it (NCCL's in-place form: the kernel then rewrites each word of that block with itself, after
-    /// staging it, and never reads the peer's block from `send`).
+    /// fits, both pointers 4-aligned, send apart from recv or exactly this rank's block of it (NCCL's in-place form).
     pub fn takes(r: *const Roce, send: abi.DevicePtr, recv: abi.DevicePtr, bytes: usize) bool {
         if (!r.fits(bytes) or send % 4 != 0 or recv % 4 != 0) return false;
         if (send == recv + r.rank * bytes) return true;
         return send + bytes <= recv or recv + 2 * bytes <= send;
     }
 
-    /// `bytes` from `send` on each rank into `recv` [2][bytes], rank 0's first, on `stream` (capturable); `pf`'s lines
-    /// prefetched into the L2 by extra blocks of the same launch. Gathers must run one after another (one stream, or
-    /// streams ordered by events): every launch shares the device sequence and counters.
+    /// `bytes` from `send` per rank into `recv` [2][bytes] on `stream` (capturable), `pf` prefetched; gathers in order.
     pub fn allGather(r: *const Roce, send: abi.DevicePtr, recv: abi.DevicePtr, bytes: usize, stream: abi.Stream, pf: Prefetch) !void {
         if (!r.takes(send, recv, bytes)) return error.Invalid;
         const wide = bytes % 16 == 0 and send % 16 == 0 and recv % 16 == 0;
@@ -234,8 +221,7 @@ pub const Roce = struct {
     }
 };
 
-/// NCCL_IB_HCA's device names ("rocep1s0f1,roceP2p1s0f1", an optional leading = and :1 suffixes; the proxy uses port
-/// 1, so another port is refused), at most `max_ports`; `out` holds slices of `text`.
+/// NCCL_IB_HCA's device names (optional =, :1 suffixes; other ports refused), at most `max_ports`, slices of `text`.
 pub fn parseHcas(text: []const u8, out: *[max_ports][]const u8) ![]const []const u8 {
     var t = text;
     if (t.len > 0 and t[0] == '^') return error.ExcludeListUnsupported;

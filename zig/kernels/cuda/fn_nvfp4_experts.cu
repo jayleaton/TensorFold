@@ -1,4 +1,4 @@
-// Device code of src/tensorfold/cuda/nvfp4/experts.cu (lines 1-148, comments and ATen includes dropped), checked by zig/tests/cuda/copies.py.
+// Device code of src/tensorfold/cuda/nvfp4/experts.cu (lines 1-148, no comments/ATen), checked by copies.py.
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>

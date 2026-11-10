@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""Any capture's Triton manifest (or flashnext_aot.py's) as a Zig kernel set: aot.json (launch facts and keys) plus the
-cubins. The family-neutral form of zig/tests/cuda/nemotron/aot_pack.py: the same aot.json fields the Zig loader reads
-(zig/src/cuda/aot.zig), plus the Python function and source of each kernel, constexprs of any type (ints and bools as
-integers, floats by fp32 bits, others named), and every problem listed before it fails."""
+"""A Triton manifest as a Zig kernel set: aot.json (launch facts, keys, function, constexprs) plus the cubins."""
 
 from __future__ import annotations
 

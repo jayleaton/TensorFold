@@ -1,18 +1,4 @@
-// The GPU half of the one-shot RoCE all-gather between two DGX Sparks (decode plan D1, work/research/R1-decode.md 3.1):
-// b12x's "RoCEnante" protocol (https://github.com/local-inference-lab/b12x, b12x/comm/roce, by the b12x contributors
-// at Local Inference Lab, Apache License 2.0), written anew in CUDA C++ for TensorFold's Zig runtime (the host half is
-// zig/src/cuda/roce_proxy.c, the driver zig/src/cuda/roce_mia.zig; the region layout is described there).
-//
-// One launch is one all-gather of `n` units (16 or 4 bytes) a rank into out[world][n], rank 0's first, as
-// ncclAllGather lays it out: stage this rank's shard into the pinned send slot, ring the proxy (the last block, after
-// a system fence), wait for the peer's flag on every port, copy the local shard and the peer's from its receive slot
-// into place, and the last block publishes the sequence as the new epoch. The sequence lives on the device, so a CUDA
-// graph replays the launch as often as it likes. The bytes are moved, never computed on: exact by construction.
-// Every block waits for the peer, so the grid must be resident at once (the driver keeps it at 16 blocks or fewer).
-//
-// Decode plan D2 (L2 prefetch during the gather): blocks past the first `gblocks` do no gathering; they issue L2
-// prefetches over [pf, pf + pf_bytes) (the next kernels' weights, read-only) and exit, so DRAM fills the L2 while the
-// gather waits on the network. `prefetch` below is the same for a gather that NCCL makes.
+// GPU half of the two-Spark RoCE all-gather: b12x's RoCEnante protocol (b12x contributors, Apache-2.0), new CUDA code.
 #include <stdint.h>
 
 namespace tf_fn_roce {
@@ -33,8 +19,7 @@ __device__ __forceinline__ void st_relaxed_sys(unsigned* p, unsigned v) {
 }
 __device__ __forceinline__ uint4 ld_sys(const uint4* p) {
   uint4 r;
-  // no "memory" clobber: the loads of one copy loop may be in flight together (the flag's acquire and the block
-  // barrier already order them after the peer's write)
+  // no "memory" clobber: one copy loop's loads may overlap (the flag's acquire and block barrier order them)
   asm volatile("ld.relaxed.sys.global.v4.u32 {%0, %1, %2, %3}, [%4];"
                : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w)
                : "l"(p));
@@ -51,8 +36,7 @@ __device__ __forceinline__ unsigned long long globaltimer() {
   return t;
 }
 
-// T: uint4 (16-byte units, both pointers 16-aligned) or unsigned (4-byte units). `bytes` is the shard rounded up to
-// 16 (what the proxy writes); region pointers are device addresses of the mapped host region.
+// T: uint4 (16-byte units, 16-aligned) or unsigned (4-byte); `bytes` the shard rounded up to 16; regions mapped host.
 __device__ __forceinline__ void prefetch_lines(const char* pf, unsigned long long bytes, unsigned long long first,
                                                unsigned long long step) {
   for (unsigned long long off = first * 128; off < bytes; off += step * 128)
@@ -100,8 +84,7 @@ __global__ void __launch_bounds__(512) gather(const T* in, T* out, int n, unsign
     const unsigned long long t0 = globaltimer();
     while (ld_acquire_sys(f) != seq) {
       if (globaltimer() - t0 > timeout_ns) {
-        // the peer is gone or its proxy failed: say which, then trap rather than read a stale slot (a fatal error for
-        // the context: the process restarts; roce_mia.zig timedOut reads the sequence and the peer)
+        // peer gone or its proxy failed: record which, then trap rather than read a stale slot (context fatal)
         st_relaxed_sys(ctrl + 3, (unsigned)peer);
         st_relaxed_sys(ctrl + 2, seq);
         __threadfence_system();

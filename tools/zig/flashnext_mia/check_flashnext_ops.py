@@ -1,13 +1,4 @@
-"""Flash Next's torch ops against the deployed torch kernels by raw bytes, at the NVFP4 checkpoint's shapes.
-
-Compiles zig/kernels/cuda/torch_ops' fn_*.cu (ours for Flash Next) and the Nemotron operators Flash Next reuses
-(pointwise, movement, argmax, topk) with ops_build's pinned nvcc and flags, then runs each op beside the torch code
-the Python engine runs (TensorFold 0.6.5 qwen4_exp/cuda: nvfp4_moe.MoE4.shared_act and its slot copies,
-decode.Engine.sample_draft, decode.sample_mapped, cuda/sampling.sample_rows, forward.candidates) and compares bytes.
-Run on the GPU in nvcr.io/nvidia/pytorch:26.07-py3 from tools/zig:
-
-    PYTHONPATH=. python flashnext_mia/check_flashnext_ops.py --source ../../zig/kernels/cuda/torch_ops --out <dir> --config <snapshot>/config.json
-"""
+"""Flash Next's torch ops (torch_ops fn_*.cu and reused Nemotron ops) vs the deployed torch kernels by raw bytes."""
 
 import argparse
 import ctypes

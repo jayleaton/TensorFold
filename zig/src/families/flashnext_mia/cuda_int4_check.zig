@@ -1,14 +1,4 @@
-//! `int4-check` (no checkpoint): fn_int4.cu on random GPTQ int4 weights at the INT4-AutoRound shapes, against a
-//! host reference read straight from the GPTQ bytes (not from the packed layout):
-//!  - the kernel's bits: every output against the documented order emulated on the host (each group's products
-//!    summed exactly in fp64, rounded to fp32, then acc = fmaf(sum, scale, acc) in group order): the MMA chain's own
-//!    rounding is the only difference allowed (reported in fp32 ulps), and the error against the full fp64 dot
-//!    product relative to the sum of |products| is bounded;
-//!  - row invariance: each row of an m-row call is byte-equal to the 1-row call of that row, at every m;
-//!  - the n8 tiles a warp takes (1, 2, 4) never change a byte;
-//!  - the routed experts on the plan (gate/up SwiGLU, down fp32 and bf16, groups of 128 and of 64) byte-equal to the
-//!    dense kernel on each pair's expert, the skipped (shared) slot untouched;
-//!  - timings: the head GEMV, decode experts, a prompt chunk's experts.
+//! `int4-check`: fn_int4.cu vs a host reference from GPTQ bytes: group-order bits, row/tile invariance, plan, time.
 const std = @import("std");
 const cuda = @import("cuda");
 const kern = @import("cuda_kernels.zig");
@@ -97,8 +87,7 @@ const Dev = struct {
     fn zeros(dv: *Dev, n: usize) !u64 {
         var b = try cuda.DeviceBuffer.alloc(dv.d, @max(n, 16));
         try b.fill8(0, null);
-        // cuMemsetD8 runs on the legacy stream and may still be running when it returns; the checks' stream does
-        // not wait for that stream, so finish the fill before the buffer is handed out
+        // cuMemsetD8 runs on the legacy stream, which the checks' stream does not wait for: finish the fill first
         try dv.d.check(dv.d.api.cuCtxSynchronize(), "cuCtxSynchronize");
         try dv.bufs.append(dv.gpa, b);
         return b.ptr;
@@ -204,10 +193,7 @@ fn checkDense(gpa: Allocator, k: *const int4.Kernels, s: cuda.Stream, dv: *Dev, 
     std.debug.print("  dense n {d} k {d} (from {d}) gs {d}: rows {any} NT 1/2/4 byte-equal to 1-row calls; vs host order max {d} ulps, max |err|/sum|x w| {e:.2}\n", .{ n, kk, k0, gs, rows_list, rep.max_ulps, rep.max_rel });
 }
 
-/// The group order, enforced: weights and inputs whose every group sum is exact in fp32 (one nonzero code a column
-/// and group, inputs that are small powers of two), so the MMA chain's own rounding cannot hide anything, and scales
-/// that make the groups cancel (2^25 s, -2^25 s, s, ...): the kernel must equal acc = fmaf(sum_g, scale_g, acc) in
-/// group order bit for bit (any other order or a sum of products first gives other bits).
+/// The group order, enforced: exact group sums, cancelling scales; only fmaf(sum_g, scale_g, acc) in order matches.
 fn checkOrder(gpa: Allocator, k: *const int4.Kernels, s: cuda.Stream, dv: *Dev, r: std.Random, gs: usize, rep: *Report) !void {
     const n: usize = 64;
     const kk: usize = 1024;
@@ -385,8 +371,7 @@ fn checkExperts(gpa: Allocator, k: *const int4.Kernels, ops: kern.Ops, dv: *Dev,
             rep.ok = false;
             break;
         };
-        // the prompt down (int4_prompt_kernel, staged) on the same 64-pair items: fp32 and bf16 bytes, the shared
-        // slot's sentinel kept
+        // the prompt down on the same 64-pair items: fp32 and bf16 bytes, the shared slot's sentinel kept
         const ydp = try dv.zeros(pairs * D * 4);
         const ydb = try dv.zeros(pairs * D * 2);
         try (cuda.DeviceBuffer{ .d = dv.d, .ptr = ydp, .len = pairs * D * 4 }).upload(0, sentinel);

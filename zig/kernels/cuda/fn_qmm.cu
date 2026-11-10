@@ -1,4 +1,4 @@
-// Device code of src/tensorfold/cuda/kernels/qmm.cu (lines 1-230, comments and ATen includes dropped), checked by zig/tests/cuda/copies.py.
+// Device code of src/tensorfold/cuda/kernels/qmm.cu (lines 1-230, no comments/ATen), checked by tests/cuda/copies.py.
 
 #include <algorithm>
 #include <cooperative_groups.h>
@@ -224,8 +224,7 @@ __global__ void reduce_kernel(const float* __restrict__ part, void* __restrict__
 }
 } // namespace tf_fn_qmm
 
-// Groups of 32 (the MTP draft head's 4-bit copy of lm_head rows): row tiles 16, 32, 64, bf16 or fp32 out, one K
-// slice (no cluster); the launches qmm_cuda's dispatch<32, F32, false> makes.
+// Groups of 32 (MTP head's 4-bit lm_head rows): row tiles 16, 32, 64, bf16 or fp32 out, one K slice (no cluster).
 #define TF_QMM(BM, F32) template __global__ void tf_fn_qmm::qmm_kernel<32, BM, 64, 1, 4, 4, F32, false, false>( \
     const __nv_bfloat16*, const float*, const uint32_t*, const __nv_bfloat16*, const __nv_bfloat16*, void*, float*, \
     int, int, int, int, int, int, int);

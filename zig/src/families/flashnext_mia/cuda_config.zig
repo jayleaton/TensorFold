@@ -1,8 +1,4 @@
-//! Flash Next's dimensions for the CUDA engine: config.json (the root and its text_config) read into every field the
-//! Python CUDA engine's Config.read takes (qwen4_exp/cuda/weight_types.py), its derived sizes, ModelOpt's
-//! quantization_config, the MTP block, the end-of-reply ids (config.json's, then generation_config.json's), and the rope
-//! options with a caller's YaRN override (cuda_rope.zig does the rope math). std only: the Metal family's config.zig
-//! lives outside this module's import path.
+//! Flash Next's dimensions for the CUDA engine: config.json read as Python's Config.read (weight_types.py) does.
 const std = @import("std");
 const ngram = @import("cuda_ngram.zig");
 
@@ -126,8 +122,7 @@ pub fn glob(pattern: []const u8, name: []const u8) bool {
     return p == pattern.len;
 }
 
-/// One `dynamic` rule of a GPTQModel / AutoRound quantization_config: "-:regex" leaves the modules it matches
-/// unquantized, "+:regex" overrides their settings (re.match: anchored at the start).
+/// One `dynamic` GPTQ/AutoRound rule: "-:regex" leaves matches unquantized, "+:regex" overrides them (re.match).
 pub const Rule = struct { skip: bool, pattern: []const u8, bits: ?u32 = null };
 
 /// quantization_config of a GPTQ export (quant_method "gptq": AutoRound's and GPTQModel's).
@@ -150,8 +145,7 @@ pub const Gptq = struct {
         return bits;
     }
 
-    /// Whether `module` (e.g. "model.language_model.layers.3.mlp.experts.7.gate_proj") is quantized: no "-" rule
-    /// matches it (the lm_head only when `lm_head`).
+    /// Whether `module` is quantized: no "-" rule matches it (the lm_head only when `lm_head`).
     pub fn quantized(self: Gptq, module: []const u8) bool {
         for (self.dynamic) |r| if (r.skip and regexMatch(r.pattern, module)) return false;
         if (std.mem.eql(u8, module, "lm_head") and !self.lm_head) {
@@ -162,8 +156,7 @@ pub const Gptq = struct {
     }
 };
 
-/// Python's re.match for the subset GPTQ dynamic rules use: literals, '.', '\x' escapes, '*' and '+' after an
-/// atom, a final '$'. Anchored at the start; without '$' a prefix match is enough.
+/// Python's re.match for GPTQ rules' subset: literals, '.', '\x', '*' and '+', final '$'; prefix match without '$'.
 pub fn regexMatch(pattern: []const u8, text: []const u8) bool {
     return reAt(pattern, 0, text, 0);
 }
@@ -335,8 +328,7 @@ pub const Config = struct {
         return (self.ngram_size - 1) * self.heads_per_ngram;
     }
 
-    /// Rank `rank` of `world`: every split dimension divided (refused unless it divides, and the NVFP4 groups and the
-    /// 32-column pack blocks of the half expert width stay whole).
+    /// Rank shares of `world`: split dims divided; refused unless they divide with NVFP4 groups, 32-col blocks whole.
     pub fn shares(self: Config, world: u32) !Shares {
         if (world == 0) return error.BadWorld;
         for ([_]u32{ self.heads, self.kv_heads, self.nk, self.nv, self.moe_width, self.shared_width }) |d| if (d % world != 0) return error.WorldDoesNotDivide;
@@ -356,8 +348,7 @@ pub const Config = struct {
         return self.quant == .gptq;
     }
 
-    /// What the engine serves: the ModelOpt NVFP4 export (routed experts NVFP4 in groups of 16, the MTP experts
-    /// FP8_PB_WO in 128 blocks, the n-gram table FP8, every other linear bf16); anything else is refused with a reason.
+    /// Served: the ModelOpt NVFP4 export (NVFP4 experts, FP8_PB_WO MTP, FP8 n-gram, bf16 rest); else refused with why.
     pub fn check(self: Config, why: *Why) !void {
         var known = false;
         for (model_types) |m| known = known or std.mem.eql(u8, m, self.model_type);
@@ -407,8 +398,7 @@ pub const Config = struct {
 
 pub const int4ar_group = 128;
 
-/// The INT4-AutoRound checkpoint (GPTQ int4 g128 sym routed experts and lm_head, block-FP8 attention, DeltaNet and
-/// shared expert, bf16 rest, a bf16 MTP layer): what the engine serves of a GPTQ export.
+/// The INT4-AutoRound checkpoint (GPTQ int4 experts and lm_head, block-FP8 dense, bf16 MTP): what we serve of GPTQ.
 fn checkGptqImpl(self: Config, why: *Why) !void {
     const g = self.gptq.?;
     if (self.layers == 0 or self.layers > max_layers) {
@@ -758,7 +748,7 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8, generation: ?[]const u8, 
         std.mem.sort(u32, c.ple_layers[0..c.ple_count], {}, std.sort.asc(u32));
     }
 
-    // end-of-reply ids: config.json's own (its root's, else text_config's), then generation_config.json's not yet listed
+    // end-of-reply ids: config.json's own (root, else text_config), then generation_config.json's not yet listed
     var stop: std.ArrayList(i64) = .empty;
     const teos = field(t, "eos_token_id");
     if (teos) |v| c.ple_eos = switch (v) {

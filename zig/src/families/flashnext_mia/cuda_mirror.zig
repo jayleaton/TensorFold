@@ -1,38 +1,4 @@
-//! Two ranks behind one lane backend (work/PLAN.md, "Two ranks in serving"): rank 0's `Leader` wraps its lane
-//! backend so every call that moves an engine (prefill, first, queue, verify, keep, draft, unspeculate, release) is
-//! first sent to rank 1 as one call record, then made; rank 1's `Follower` reads the records and makes the same
-//! calls, with the same arguments and in the same order, on its own backend. The collectives inside the engines
-//! keep the two in step; nothing else passes per round. Reads (read, probabilities, tree, alternatives) stay local:
-//! both ranks hold the same bits. A stop ends rank 1.
-//!
-//! Transport (`Channel`): on GPUs `Records`, a fixed 16 KiB record broadcast from rank 0 over NCCL on the engine's
-//! stream (a small broadcast is a steady ~15-20 us where a TCP frame over the CX7 netdev is 70-700 us, W8a's
-//! out/w8a-comm5): u32 length, u8 kind (0 the batch inline, 1 the batch is the next `round` frame on the control
-//! link: a request's long prompt, once per request; 2 stop; 3 idle: no stream is open, rank 1 waits on the link for
-//! a `request` frame), 3 zero bytes, then the batch. A batch is a u16 count, then each call as a u32 length and its
-//! bytes: calls without collectives (first, keep, release) ride with the next call that has some, so a round is one
-//! record for its verify (with the last round's keeps) and one for its draft. `Frames` carries every batch as a
-//! `round` frame over the control link (cuda_link.zig): the host tests' transport. `Watch` ends a rank whose peer is
-//! lost; `Agreement` is the lane backend's prepare / agree / commit gate (cuda_lanes.Gate).
-//!
-//! A call is, little endian, no padding:
-//!   op u8 (Op), then the call's fields in this order:
-//!   prefill      key u64, max_new u32, drafts u8, sampling opt, prompt u32s, eos u32s, chunks u32s,
-//!                resume_key u64 (rank 0's key of the kept state it resumes; 0 none), resume_at u32, marks u32s
-//!   first        key u64, position u64
-//!   queue        key u64, feed, position u64
-//!   verify       windows
-//!   keep         windows, then one u32s path a window
-//!   draft        u32 count, then each: key u64, follow u32s, first opt feed, rows opt u32s, start u64,
-//!                position u64, depth u32, early u8, ranks u8
-//!   unspeculate  key u64
-//!   release      key u64
-//!   note         bytes (a u32 count and the bytes): the lane backend's prompt-cache decision for rank 1
-//! where `u32s` is a u32 count and the values, `opt X` a u8 (0 none, 1 present) then X, `feed` a u8 (0 handle,
-//! 1 value) and a u64, `sampling` seed u64, temperature f64, top_k u32, top_p f64, min_p f64 (f64 as their bits),
-//! `windows` a u32 count then each: key u64, pending u32, held u32, tokens u32s, parents opt i32s, positions u64s
-//! (a u32 count and u64s), early u8. A stream's key is rank 0's Stream address; rank 1 keeps its own Stream per key
-//! from the prefill frame to the release frame (prompt, budget, sampling, eos and chunks are all a backend reads).
+//! Two ranks behind one lane backend: rank 0's Leader records each engine call, rank 1's Follower replays it.
 const std = @import("std");
 const lanes = @import("lanes");
 const media_mod = @import("cuda_media.zig");
@@ -58,13 +24,11 @@ pub const StreamSpec = struct {
     resume_key: u64 = 0,
     resume_at: u32 = 0,
     marks: []const u32 = &.{},
-    /// the prompt's images and video frames: rows, rotary positions and offset (the features follow by NCCL
-    /// broadcast inside the engine's attach, not in the record)
+    /// the prompt's images and video frames: rows, rotary positions and offset (features follow by NCCL broadcast)
     media: ?MediaSpec = null,
 };
 
-/// The media's shape for rank 1: the feature rows' count, the decode offset and the width (the rows, rotary table
-/// and features follow by NCCL broadcast in the engine's attach: a long prompt's table never rides the link).
+/// The media's shape for rank 1: feature row count, decode offset and width (the data follows by NCCL broadcast).
 pub const MediaSpec = struct { rows: u32, delta: i64, width: u32 };
 
 pub const WindowCall = struct {
@@ -542,8 +506,7 @@ pub const Frames = struct {
 pub const record_bytes = 16384;
 const record_head = 8;
 
-/// inline_call: the batch follows the head; on_link: the batch is the next `round` frame on the link (a long
-/// prompt); stop: rank 1 leaves; idle: rank 0 has no stream open, the next record waits for a `request` frame.
+/// inline_call: batch follows; on_link: batch is the next link `round` frame; stop: rank 1 leaves; idle: wait request.
 pub const Kind = enum(u8) { inline_call = 0, on_link = 1, stop = 2, idle = 3, _ };
 
 /// `bytes` as a record into `out` (record_bytes); a batch too long for it goes on the link (`on_link`).
@@ -632,9 +595,7 @@ pub const Broadcast = struct {
     }
 };
 
-/// Batches as records on a wire; a batch longer than a record follows on the control link. While rank 0 has no
-/// stream open both ranks leave the wire: rank 1 waits on the link (a `request` frame wakes it, a closed link ends
-/// it), so an idle rank 1 neither spins in a collective nor misses rank 0's death.
+/// Batches as records on a wire, long ones on the control link; while idle rank 1 waits on the link, not a collective.
 pub const Records = struct {
     gpa: Allocator,
     wire: Wire,
@@ -661,8 +622,7 @@ pub const Records = struct {
         if (r.idle) try r.link.send(.request, &.{}); // rank 1 back on the wire
         r.idle = false;
         const k = packRecord(&r.rec, kind, bytes);
-        // the record first, then the long batch: rank 1 reads the batch only after the record wakes it, so a batch
-        // larger than the link's buffers needs rank 1 draining the link while this write is still going
+        // record first, then the long batch: rank 1 must be draining the link while a large write is still going
         try r.wire.put(r.wire.ptr, &r.rec);
         if (k == .on_link) try r.link.send(.round, bytes);
     }
@@ -738,9 +698,7 @@ pub const Records = struct {
 
 // -- peer loss ----------------------------------------------------------------------------------------------------
 
-/// Each rank's watchdog: the other rank is lost when the control link closes or errs (a dead process, and with
-/// keepalive a dead link within ~11 s), or when one call (or rank 1's wait for rank 0's next record) passes its
-/// deadline. Then the process exits at once (code 3): neither rank stays behind in NCCL.
+/// Each rank's watchdog: a closed link or a missed call deadline means the peer is lost; the process exits (code 3).
 pub const Watch = struct {
     io: std.Io,
     fd: std.posix.socket_t,
@@ -816,17 +774,14 @@ pub const Watch = struct {
         }
     }
 
-    /// Log and leave at once. Not ncclCommAbort first: it frees the communicator while this rank's other thread
-    /// may be entering a collective on it (a segfault, out/w7k6); _exit runs no atexit handler that could wait on
-    /// a kernel spinning for the lost peer, and the driver frees the GPU with the process.
+    /// Log and _exit at once; no ncclCommAbort, which can free the communicator under another thread's collective.
     fn abortAndExit(w: *Watch, why: []const u8) void {
         std.log.err("rank {d}: {s}; exiting", .{ w.rank, why });
         std.c._exit(3);
     }
 };
 
-/// The lane backend's gate at two ranks (cuda_lanes.Gate): each rank's prepare outcome in one 1-int all-gather on
-/// the engine's stream before the call's first collective; a failure after it goes to the watchdog (exit).
+/// The lane backend's gate at two ranks: prepare outcomes in one 1-int all-gather before the call's first collective.
 pub const Agreement = struct {
     comm: *const Comm,
     stream: cuda.abi.Stream,
@@ -886,10 +841,7 @@ fn keepalive(fd: std.posix.socket_t) void {
 
 // -- rank 0 -------------------------------------------------------------------------------------------------------
 
-/// Rank 0's backend: each engine call goes to rank 1 first, then to `inner`. A call that runs no collective
-/// (first, keep, release) waits in the batch for the next one that does (prefill, queue, verify, draft,
-/// unspeculate): a round is then one record (the last round's keep with this verify) plus its draft. Calls come
-/// from one thread (the lane host's), so the batch needs no lock.
+/// Rank 0's backend: each call goes to rank 1 first, then `inner`; non-collective calls batch with the next one.
 pub const Leader = struct {
     gpa: Allocator,
     inner: be.Backend,
@@ -1201,8 +1153,7 @@ pub const Follower = struct {
         }
     }
 
-    /// One call's bytes. A call that fails here is logged and the loop goes on: rank 0 made the same call
-    /// with the same arguments, so it failed there too and the round loop handles it.
+    /// One call's bytes; a failure is logged and the loop goes on (rank 0 failed the same call too).
     pub fn apply(self: *Follower, bytes: []const u8) !void {
         _ = self.arena.reset(.retain_capacity);
         const call = try decode(self.arena.allocator(), bytes);
@@ -1234,8 +1185,7 @@ pub const Follower = struct {
         return out;
     }
 
-    /// Rank 1's own stream for rank 0's prefill (prompt, budget, sampling, eos, chunks, its resume and marks); a
-    /// stream prefilled again keeps its backend lane, as on rank 0 (the backend replaces its caches).
+    /// Rank 1's own stream for rank 0's prefill; a stream prefilled again keeps its backend lane, as on rank 0.
     fn mirror(self: *Follower, p: StreamSpec) !*Stream {
         const m = try self.gpa.create(Mirrored);
         errdefer self.gpa.destroy(m);
@@ -1676,8 +1626,7 @@ test "the mirror over records: batched rounds, idle waits on the link, long prom
     try std.testing.expectEqual(@as(u32, 0), rank1.target.lanes.count());
 }
 
-/// Both ends of a socket pair kept small, with a deadline: a write larger than they hold blocks until the reader drains
-/// it, and a stuck one ends in an error instead of a hung test.
+/// Both ends of a small socket pair with a deadline: an undrained large write blocks, then errors instead of hanging.
 fn smallBuffers(links: []const Link) !void {
     const room: c_int = 4096;
     const deadline: std.posix.timeval = .{ .sec = 3, .usec = 0 };

@@ -1,19 +1,5 @@
 #!/usr/bin/env python3
-"""The batched decode attention's specializations (src/tensorfold/families/qwen4_exp/cuda/attn_multi.py) for the
-kernel set: every stream's rows of a shared round in one launch a kernel, the caches found by pointer table.
-
-From each decode-shaped ``_attn_prep`` / ``_pool`` / ``_chunks`` / ``_merge`` entry (the one-stream kernels the
-multi ones call row for row), an entry of ``_prep_multi`` / ``_pool_multi`` / ``_chunks_multi`` / ``_merge_multi``
-with the same shape constexprs, attn_multi.layer's launch options, text positions only (VISION False), bf16 caches
-(KT bf16), and the stream count N in both of Triton's int forms (a multiple of 16 or not; N is never 1: one stream
-takes the one-stream kernels). Entries this script made before (``"rule"`` starting with ``attn_multi``) are
-replaced, so it can run again.
-
-    python3 -B tools/zig/flashnext_mia/flashnext_multi_spec.py --spec zig/tests/cuda/flashnext_mia/kernels.json \
-        --out zig/tests/cuda/flashnext_mia/kernels.json
-    # then (PyTorch image, this tree at /tensorfold):
-    python -B tools/zig/flashnext_mia/flashnext_aot.py build --spec zig/tests/cuda/flashnext_mia/kernels.json --out <dir> --only attn_multi
-"""
+"""The batched decode attention's (attn_multi.py) ``*_multi`` entries, cloned from the decode one-stream entries."""
 
 from __future__ import annotations
 
@@ -114,10 +100,7 @@ def entries(kernels: list[dict]) -> list[dict]:
 
 
 def offset_entries(kernels: list[dict]) -> list[dict]:
-    """A shared round's sparse stream selects its keys with the one-stream kernels on its own rows, the scratch seen
-    from its first row a0 (attn_multi._rows_from): the row counts and flags (NKR, SPR) sit 4 * a0 bytes in, the
-    scores (SC) 4 * a0 * NB. The kernels are the same; Triton specializes those pointers' 16-byte alignment, so the
-    reachable forms are added: NKR / SPR unaligned with SC aligned or not (a0 a multiple of 4 aligns all three)."""
+    """A shared round's sparse stream's scratch pointers offset by row a0: adds the NKR / SPR / SC alignment forms."""
 
     out = []
     for k in kernels:

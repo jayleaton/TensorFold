@@ -1,18 +1,4 @@
-//! One sequence's decode loops (Python qwen4_exp/cuda/decode.py serial_decode, mtp_decode, draft): verify the
-//! pending token and the MTP head's drafts in one window, keep the rows up to the first draft the target did not
-//! draw, chain the next drafts from the kept rows. Drafts only propose: every kept token is the target's own keyed
-//! draw at its position, so drafted output equals serial output token for token.
-//!
-//! Generic over the engine `E`, which supplies (all on one sequence, Python Engine's methods):
-//!   pos(e) u64                                     committed rows
-//!   forward(e, tokens) !void                        a window's rows at pos .. pos + tokens.len - 1
-//!   sample(e, rows, first_position, out) !void      the target's draws of the window's rows
-//!   commit(e, rows, keep) !void                     keep the window's first `keep` rows
-//!   absorb(e, source, next_tokens) !void            the MTP cache takes kept rows (it drops last chain's drafts)
-//!   chain(e, token, from_row) !void                 one more MTP step on a draft, from the head's output row
-//!   sampleDraft(e, position) !Draw                  the head's draw at `position` and its temperature-1 probability
-//!   drawDraft(e, position) !u32                     the head's draw without a probability (confidence 0)
-//!   isEos(e, token) bool
+//! One sequence's decode loops (Python decode.py serial_decode, mtp_decode, draft); drafted output equals serial's.
 const std = @import("std");
 
 pub const Draw = struct { token: u32, prob: f64 };
@@ -58,10 +44,7 @@ fn last(r: Result) u32 {
     return r.tokens.items[r.tokens.items.len - 1];
 }
 
-/// The chain's stop rule from a `confidence` value: c > 0, each later draft only at or above c (Python's); c < 0, a
-/// later draft j only while p1 * ... * pj >= -c (the running product: decode D4 after X1's measurements,
-/// research/X1-drafts.md 3.4); 0, every draft to the depth. The first draft is always proposed. Drafts only: the
-/// kept tokens are the target's whatever the rule.
+/// The chain's stop rule: c > 0 each draft at or above c, c < 0 while p1*...*pj >= -c, 0 every draft; first always.
 pub const Stop = struct {
     c: f64,
     product: f64 = 1.0,
@@ -82,8 +65,7 @@ pub const Stop = struct {
     }
 };
 
-/// Absorb kept rows, then chain up to `count` drafts under the stop rule (`Stop`; Python `draft` for c > 0). Writes
-/// the drafts into `out`; returns how many.
+/// Absorb kept rows, then chain up to `count` drafts under the stop rule into `out` (Python `draft`); returns how many.
 pub fn draft(comptime E: type, e: *E, source: Source, next_tokens: []const u32, position: u64, count: usize, confidence: f64, out: []u32) !usize {
     try e.absorb(source, next_tokens);
     var n: usize = 0;
@@ -110,8 +92,7 @@ pub fn draft(comptime E: type, e: *E, source: Source, next_tokens: []const u32, 
     return n;
 }
 
-/// Verify the pending token and its drafts each round, commit the rows before the first mismatch, chain the next
-/// drafts from them (Python `mtp_decode`). `max_rows` bounds a window (depth + 1).
+/// Verify pending token and drafts, commit rows before the first mismatch, chain the next (Python `mtp_decode`).
 pub fn drafted(comptime E: type, e: *E, gpa: std.mem.Allocator, pending: u32, o: Options) !Result {
     var r: Result = .{};
     errdefer r.deinit(gpa);
@@ -119,8 +100,7 @@ pub fn drafted(comptime E: type, e: *E, gpa: std.mem.Allocator, pending: u32, o:
     var window: [16]u32 = undefined;
     var sampled: [16]u32 = undefined;
     const depth = @min(o.depth, window.len - 1);
-    // a round of d drafts adds up to d + 1 tokens: at most `left - 1` drafts when `left` tokens remain (a reply's last
-    // round verifies no row past its end)
+    // a round of d drafts adds up to d + 1 tokens, so at most `left - 1` drafts when `left` tokens remain
     var drafts_n = try draft(E, e, .prefill_last, &.{pending}, e.pos() + 1, @min(depth, (o.count -| r.tokens.items.len) -| 1), o.confidence, window[1..]);
     var unabsorbed: ?usize = null; // the last round's kept rows, not yet in the MTP cache
     while (r.tokens.items.len < o.count and !(o.stop_eos and e.isEos(last(r)))) {
@@ -140,8 +120,7 @@ pub fn drafted(comptime E: type, e: *E, gpa: std.mem.Allocator, pending: u32, o:
         r.accepted += keep - 1;
         try r.tokens.appendSlice(gpa, sampled[0..keep]);
         if (r.tokens.items.len >= o.count or (o.stop_eos and e.isEos(last(r)))) break;
-        // the kept rows absorbed every round (n 0: the head takes them and drafts nothing), so the MTP cache never
-        // skips a block before the last
+        // kept rows are absorbed every round (n 0 drafts nothing), so the MTP cache never skips a block
         const n = @min(depth, (o.count - r.tokens.items.len) -| 1);
         drafts_n = try draft(E, e, .window, sampled[0..keep], e.pos() + 1, n, o.confidence, window[1..]);
         unabsorbed = null;
@@ -152,8 +131,7 @@ pub fn drafted(comptime E: type, e: *E, gpa: std.mem.Allocator, pending: u32, o:
     return r;
 }
 
-/// A toy engine for the loops' tests: the "target" draws a token from a hash of the committed sequence and the row's
-/// position (keyed by position, as the real sampler), the "head" guesses it right unless a hash says otherwise.
+/// Toy engine for the tests: target draws from a hash of sequence and position, head guesses right unless hashed off.
 const Toy = struct {
     gpa: std.mem.Allocator,
     seq: std.ArrayList(u32) = .empty, // committed tokens (the cache)

@@ -1,4 +1,4 @@
-// Device code of src/tensorfold/families/qwen4_exp/cuda/gdn_io.cu (lines 1-103, comments and ATen includes dropped), checked by zig/tests/cuda/copies.py.
+// Device code of src/tensorfold/families/qwen4_exp/cuda/gdn_io.cu (lines 1-103, no comments/ATen), copies.py checks.
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>

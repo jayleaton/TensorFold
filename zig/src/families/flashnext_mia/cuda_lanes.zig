@@ -1,16 +1,4 @@
-//! The lane core's backend for Flash Next on CUDA (work/PLAN.md, W7): each stream has its own sequence on the
-//! engine; a round runs up to `streams` (--parallel) streams' windows in one forward, each row's bits as alone
-//! (the engine's shared rounds). The decode semantics are cuda_decode.zig's, made call by call: verify forwards
-//! each stream's pending token and held drafts and draws every row keyed at its position with its stream's
-//! sampling, keep commits the rows before the first miss, draft absorbs the kept rows into the MTP head and chains
-//! up to `depth` drafts with the confidence rule (the first always, a later one only at or above `confidence`),
-//! every stream in shared head steps. Only the target's own draws are ever kept, so the tokens equal serial
-//! decoding's. Two ranks: `Gate` (prepare / agree / commit); admission reserves each stream's whole window.
-//!
-//! Generic over the engine `E` (cuda_engine.zig's Engine; a toy one in the tests): newSeq(limit_rows) / freeSeq /
-//! bind, prefill(prompt, ?Sampling) !u32 (the first draw at the prompt's length), pos, the shared-round calls
-//! verifyMany(Window), sampleWindow, commitWindow, draftMany(DraftReq), and optionally setSampling, seqBytes and
-//! budget (admission).
+//! Flash Next CUDA lane backend: stream windows share one forward; tokens equal serial decoding's; generic over `E`.
 const std = @import("std");
 const lanes = @import("lanes");
 const media_mod = @import("cuda_media.zig");
@@ -24,8 +12,7 @@ pub const max_drafts = max_rows - 1;
 /// The MTP head's chain stops before a later draft under this temperature-1 probability (Python CONFIDENCE).
 pub const default_confidence = 0.70;
 
-/// The head's acceptance at depth 1, 2, ... given the ones before it, until a stream has its own: a start the
-/// depth rule moves from each stream's rounds (Flash Next's MTP keeps ~0.8 of first drafts on chat and code).
+/// Head acceptance prior at depth 1, 2, ... given the ones before, until a stream has its own rounds.
 pub const draft_prior = [_]f64{ 0.82, 0.76, 0.72, 0.68, 0.65, 0.62, 0.6, 0.58, 0.56, 0.54, 0.52, 0.5, 0.5, 0.5, 0.5 };
 
 /// First tokens a handle names (the prompt's draw is on the host once prefill returns).
@@ -33,11 +20,7 @@ const ring = 1024;
 /// a pass keeps its state late only this close to the prompt's end (the indexer key ring holds 4096+ rows)
 const late_keep_rows = 1024;
 
-/// Two ranks' prepare / agree / commit (work/research/R3): each call's fallible local steps (admission, sequences,
-/// commits of the last window, checks) run first, then `agree` hands this rank's outcome to one small gather that
-/// precedes the call's first collective; when any rank failed, every rank returns an error before a collective.
-/// An engine error after the agreement may leave the ranks apart: `fatal` ends this one (NCCL abort, exit), so
-/// neither waits in a collective for the other. One rank has no gate.
+/// Two ranks' prepare / agree / commit: local fallible steps, one gather, then collectives; `fatal` ends a split rank.
 pub const Gate = struct {
     ptr: *anyopaque,
     agree: *const fn (ptr: *anyopaque, ok: bool) anyerror!bool,
@@ -52,8 +35,7 @@ pub const Note = enum(u8) { pass = 1, drop = 2, _ };
 /// A filling stream's state after a step of her layer-sliced fill (her lanes core's FillState; f212 has none).
 pub const FillState = enum { filling, done, cancelled };
 
-/// The prompt cache's family calls (core/prompt_cache.zig Snapshots.VTable, same signatures) and its budget:
-/// native/cuda.zig makes the Store from them (this module cannot import the engine API's types).
+/// The prompt cache's family calls (core/prompt_cache.zig Snapshots.VTable) and budget for native/cuda.zig.
 pub const CacheHooks = struct {
     ptr: *anyopaque,
     bytes: *const fn (ptr: *anyopaque, at: u32) u64,
@@ -75,12 +57,7 @@ pub fn Lanes(comptime E: type) type {
         /// the engine's prompt fill (fillBegin / fillStep / fillFree), when it has one
         const FillPtr = if (@hasDecl(E, "fillBegin")) @typeInfo(@typeInfo(@TypeOf(E.fillBegin)).@"fn".return_type.?).error_union.payload else *anyopaque;
 
-        /// A kept prompt state (the prompt cache's saved state): the engine's snapshot at `at` and a keeper
-        /// sequence holding the prompt's first `at` cache rows, so any later stream resumes it (copyPrefix, then
-        /// prefillWith from the snapshot). `key` names it to the other rank: rank 0's address of it.
-        /// A late Kept (`late_keep`) has no keeper yet: `src`, the lane that made it, still holds its rows, and
-        /// fillLate copies them at the next call both ranks make after the first token went out; a keeper that
-        /// could not be made leaves it `broken` (never resumed).
+        /// A kept prompt state: engine snapshot at `at` plus a keeper sequence; `key` is rank 0's address of it.
         pub const Kept = struct {
             snap: SnapPtr,
             keeper: ?SeqPtr,
@@ -95,8 +72,7 @@ pub fn Lanes(comptime E: type) type {
 
         const Lane = struct {
             seq: SeqPtr,
-            /// the last verify's rows of this stream, not yet committed (the round loop keeps only on drops, and
-            /// a shared round drafts before it keeps)
+            /// the last verify's uncommitted rows of this stream (kept only on drops; a shared round drafts first)
             pending_rows: ?usize = null,
             /// this stream's window in the round `round` (the engine's sampleWindow / commitWindow index)
             index: usize = 0,
@@ -111,8 +87,7 @@ pub fn Lanes(comptime E: type) type {
             first: ?u64 = null,
         };
 
-        /// A prompt filling in slices: the engine's fill of the segment in progress (up to the next mark, or to
-        /// the end), the state the segment resumed from, and where the pass stands.
+        /// A prompt filling in slices: the engine fill of the current segment, its resume state and the pass position.
         const Filling = struct {
             fl: FillPtr,
             cur: ?SnapPtr = null,
@@ -130,14 +105,11 @@ pub fn Lanes(comptime E: type) type {
         /// streams a shared forward holds (--parallel; the engine's Options.streams)
         streams: usize = 1,
         confidence: f64 = default_confidence,
-        /// a running product (confidence < 0) applies while at most this many streams are drafting; above it the
-        /// per-draft rule at `wide_confidence` (cuda_engine's served hybrid; maxInt: the product always)
+        /// running product (confidence < 0) while at most this many streams draft, per-draft `wide_confidence` above
         product_streams: usize = std.math.maxInt(usize),
         wide_confidence: f64 = 0.5,
         gate: ?Gate = null,
-        /// admission (R3 c): a stream is admitted only when its whole window's caches fit the engine's sequence
-        /// budget beside every admitted stream's, so no stream fails to grow mid-reply; `overcommit`
-        /// (TF_FLASHNEXT_OVERCOMMIT=1) admits on what is free now instead
+        /// admit only if the window's caches fit the budget; `overcommit` (TF_FLASHNEXT_OVERCOMMIT=1) uses free now
         overcommit: bool = false,
         reserved: usize = 0,
         /// kept prompt states: every live one (the store's), the last pass's not yet adopted ones, their bytes
@@ -146,8 +118,7 @@ pub fn Lanes(comptime E: type) type {
         kept_bytes: u64 = 0,
         /// the prompt cache's budget on this rank (cuda_native.cacheBudget; snap_ready hands f212's store this much)
         cache_budget: u64 = 0,
-        /// keep a pass's last state late (TF_FLASHNEXT_KEEP_LATE=0 off): its keeper sequence is made and filled at
-        /// the next call after the first token, not in the prompt's time to first token (the copy is the same)
+        /// keep a pass's last state late, after the first token (TF_FLASHNEXT_KEEP_LATE=0 off; the copy is the same)
         late_keep: bool = true,
         late: std.ArrayList(*Kept) = .empty,
         /// rank 1 at two ranks: the last pass's kept states wait for rank 0's note of which the store took
@@ -281,8 +252,7 @@ pub fn Lanes(comptime E: type) type {
             }
         }
 
-        /// `fill_layers` more layers of every filling prompt; a segment that ends keeps its mark's state and
-        /// starts the next; a prompt that is in draws its first token (`first` returns it).
+        /// `fill_layers` more layers of every filling prompt; segments keep their marks, a done prompt draws `first`.
         fn prefillStepFn(ptr: *anyopaque, streams: []const *lanes.Stream, states: []FillState) anyerror!void {
             const self = of(ptr);
             self.fillLate();
@@ -326,8 +296,7 @@ pub fn Lanes(comptime E: type) type {
             l.fill = null;
         }
 
-        /// The facts the round loop reads at setup: windows up to `window` rows (16 at most), up to `streams`
-        /// streams' windows in one forward (each row's bits as alone), this GPU's costs.
+        /// Round loop setup facts: windows up to `window` rows (16 max), `streams` per forward, this GPU's costs.
         pub fn facts(self: *const Self) lanes.Model {
             const many = self.streams > 1;
             return .{
@@ -362,8 +331,7 @@ pub fn Lanes(comptime E: type) type {
             return l;
         }
 
-        /// Every window of the last verify still uncommitted, committed whole (the round kept all of its rows,
-        /// or keep would have cut it): before the next forward overwrites the round's rows.
+        /// Commits every still-uncommitted window of the last verify whole before the next forward overwrites its rows.
         fn settle(self: *Self) !void {
             defer self.opened.clearRetainingCapacity();
             for (self.opened.items) |o| {
@@ -411,8 +379,7 @@ pub fn Lanes(comptime E: type) type {
 
         // -- the vtable -----------------------------------------------------------------------------------------
 
-        /// A new sequence for the stream, then its prompt (chunks and the head's absorb inside the engine) and the
-        /// first draw at the prompt's length, keyed with the stream's sampling.
+        /// A new sequence for the stream, its prompt, and the first draw at the prompt's length with its sampling.
         fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
             const self = of(ptr);
             self.fillLate();
@@ -438,10 +405,7 @@ pub fn Lanes(comptime E: type) type {
             _ = self.take(first);
         }
 
-        /// A burst of prompts admitted together (no resumes, no marks): their admissions and sequences made first
-        /// (a refusal anywhere refuses the burst, nothing run: false, the host prefills them singly), then
-        /// the prompts that fit one pass together share it (Engine.prefillMany), the rest prefill alone. Each stream's
-        /// first token is kept for its own `first`.
+        /// A prompt burst: admit all first (a refusal: false, prefill singly), then share prefillMany passes.
         fn prefillManyFn(ptr: *anyopaque, ss: []const *lanes.Stream) anyerror!bool {
             const self = of(ptr);
             if (comptime !@hasDecl(E, "prefillMany")) return false;
@@ -503,8 +467,7 @@ pub fn Lanes(comptime E: type) type {
             return self.lost("a burst's prefill", err);
         }
 
-        /// The prompt pass: from a kept state (its rows copied in) or from 0, cut at each mark, where the state
-        /// is kept (a tentative Kept the prompt cache adopts through the stream's hook), then to the end.
+        /// The prompt pass from a kept state or 0, cut at each mark to keep a tentative state, then to the end.
         fn pass(self: *Self, s: *lanes.Stream, l: *Lane, from: ?*Kept) !u32 {
             const e = self.e;
             const ids = s.prompt();
@@ -532,8 +495,7 @@ pub fn Lanes(comptime E: type) type {
                 if (owned) e.freeSnapshot(cur.?);
                 cur = r.kept.?;
                 owned = true;
-                // late only the pass's last mark, near the end: the source's rows (its indexer key ring included)
-                // stay as they are until the next call
+                // late only the pass's last mark: the source's rows and key ring stay until the next call
                 const last = for (s.reuse.marks) |n| {
                     if (n > m and n < ids.len) break false;
                 } else true;
@@ -591,10 +553,7 @@ pub fn Lanes(comptime E: type) type {
             return k;
         }
 
-        /// The late Kepts' keepers, made and filled from their lanes, at the start of the calls with collectives
-        /// (prefill, prefill_begin, prefill_step, verify, draft: rank 1 runs them in the same order, after rank 0's
-        /// note of what the store adopted; first, keep and release ride in cuda_mirror's batch, so none of them
-        /// copies: a lane released first hands its sequence over as the keeper).
+        /// Fills late Kepts' keepers at the start of collective calls; rank 1 follows rank 0's order and adopt note.
         fn fillLate(self: *Self) void {
             if (self.late.items.len == 0) return;
             const e = self.e;
@@ -629,8 +588,7 @@ pub fn Lanes(comptime E: type) type {
             self.gpa.destroy(k);
         }
 
-        /// The pass ended: rank 0 (or one rank) frees what the store did not adopt and tells rank 1 which it did;
-        /// rank 1 keeps them all until that note.
+        /// Pass end: rank 0 frees what the store did not adopt and tells rank 1, which keeps them all until that note.
         fn endPass(self: *Self) void {
             if (self.follower) return;
             if (self.notes) |n| if (self.tentative.items.len > 0) {
@@ -701,10 +659,7 @@ pub fn Lanes(comptime E: type) type {
         pub fn dropFn(ptr: *anyopaque, saved: *anyopaque) void {
             const self = of(ptr);
             const k = self.keptOf(saved) orelse return;
-            // Store.keep evicts to fit the pass's next mark, and once older states are gone it takes one this same
-            // pass kept: the pass's tentative entry still points at it and rank 1 has not adopted its copy yet.
-            // Freeing it here left endPass reading a freed Kept (and its stale key adopted on rank 1, never
-            // dropped). It goes back to unadopted: endPass leaves it out of the note and frees it, as rank 1 does.
+            // Store.keep may evict a Kept this pass made before rank 1 adopted it: unadopt it so endPass frees it
             for (self.tentative.items) |*t| if (t.kept == k and t.adopted) {
                 t.adopted = false;
                 if (std.mem.indexOfScalar(*Kept, self.kept.items, k)) |i| _ = self.kept.swapRemove(i);
@@ -764,10 +719,7 @@ pub fn Lanes(comptime E: type) type {
         /// An admitted prompt's window and reservation (admit), for its lane (makeLane).
         const Admission = struct { limit: usize, need: usize, before: usize };
 
-        /// The prefill's admission, local and with no collective: the window and its reservation beside the admitted
-        /// streams', `ahead` bytes more for a burst's earlier streams. The ranks agree on it before makeLane, whose
-        /// new sequence runs a collective (growMapped's vote): a rank refusing alone while the other made its sequence
-        /// left that one in a collective the refusing rank never joined (MiaAI-Lab dual-Spark issue #6).
+        /// Local prefill admission (no collective); ranks agree before makeLane so none waits alone in a collective.
         fn admit(self: *Self, s: *lanes.Stream, ahead: usize) !Admission {
             const ids = s.prompt();
             const limit = ids.len + s.max_new + self.window;
@@ -859,10 +811,7 @@ pub fn Lanes(comptime E: type) type {
             return self.drawn[handle % ring];
         }
 
-        /// Every stream's window in one forward: its pending token, then its held drafts or the host's, each row
-        /// drawn at its position with its stream's sampling. Held drafts past the head's chain (the prompt's first
-        /// chain stopped early on confidence) repeat its last draft: a row is kept only when it equals the
-        /// target's draw, so they cost rows, not bits.
+        /// Every stream's window in one forward, each row drawn at its position; extra held drafts cost rows, not bits.
         fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
             const self = of(ptr);
             self.fillLate();
@@ -926,9 +875,7 @@ pub fn Lanes(comptime E: type) type {
             }
         }
 
-        /// Every request's head absorbs its kept rows with the token after each (after a prompt: its last row and
-        /// first token), then chains up to `depth` drafts, all streams in shared head steps (the engine's
-        /// draftMany: cuda_decode.draft's rule a stream); `tree` hands the round loop each one's count.
+        /// Heads absorb each request's kept rows, then chain up to `depth` drafts in shared steps; `tree` gets counts.
         fn draftFn(ptr: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
             const self = of(ptr);
             self.fillLate();
@@ -967,8 +914,7 @@ pub fn Lanes(comptime E: type) type {
             for (reqs[0..requests.len], ls[0..requests.len]) |q, l| l.held_n = q.drafted;
         }
 
-        /// The stop rule for this step's drafts: the running product while few streams draft (the lanes not filling a
-        /// prompt; the round loop's live count), the per-draft rule above (both ranks hold the same lanes).
+        /// Draft stop rule now: running product while few streams draft, per-draft rule above (same on both ranks).
         fn confidenceNow(self: *const Self) f64 {
             if (self.confidence >= 0) return self.confidence;
             var live: usize = 0;
@@ -1009,8 +955,7 @@ pub fn Lanes(comptime E: type) type {
         fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
             const self = of(ptr);
             const kv = self.lanes.fetchRemove(s) orelse return;
-            // a late Kept of this lane takes the lane's sequence as its keeper (its first `at` rows are the
-            // prompt's): release runs no collective (cuda_mirror batches it), so no keeper is made here
+            // a late Kept of this lane takes its sequence as keeper: release runs no collective, so none is made here
             var kept_seq = false;
             var i: usize = 0;
             while (i < self.late.items.len) {
@@ -1050,12 +995,7 @@ pub fn Lanes(comptime E: type) type {
 
         // -- costs ----------------------------------------------------------------------------------------------
 
-        /// What a verify window of 1..`window` rows and one head level cost on this engine, in ms (median of 5
-        /// after a warm one), and with several streams a whole shared round of 2, 4, ... `streams` full windows,
-        /// the batched head's drafts included (the lanes core's shared-costs table, to streams x window rows; C3):
-        /// each timed on sequences of their own over
-        /// `ids` (real text, at least 48 tokens). Every call is the same on both ranks, so a two-rank engine's
-        /// collectives stay in step while each rank times itself.
+        /// Times verify windows, head levels and shared rounds in ms on `ids` (ranks in step) for the cost tables.
         pub fn measure(self: *Self, io: std.Io, ids: []const u32) !void {
             if (!self.drafting) return;
             const reps = 5;
@@ -1063,8 +1003,7 @@ pub fn Lanes(comptime E: type) type {
             if (ids.len < 3 * max_rows) return error.CostTextTooShort;
             try self.settle();
             const top = self.window;
-            // 19 prompt rows (the head absorbs 18): a multiple of 16 rows asks the kernel set for a variant
-            // (Triton's M % 16 specialization) a capture may not hold
+            // 19 prompt rows: a multiple of 16 asks Triton for an M % 16 variant a capture may not hold
             const lead = max_rows + 3;
             const cont = ids[lead..];
             var c = try Costing(E).init(self.gpa, e, @min(self.context, 4096), 1, ids[0..lead]);
@@ -1098,8 +1037,7 @@ pub fn Lanes(comptime E: type) type {
                 var many = try Costing(E).init(self.gpa, e, @min(self.context, 2048), n, ids[0..lead]);
                 defer many.deinit();
                 try many.round(1, cont, null, 0);
-                // a whole shared round: the forward, the draws and the batched head drafting every stream's next
-                // window (C3: the allocator weighs rows against what the round costs, the head included)
+                // a whole shared round: forward, draws and the batched head's drafts (the allocator weighs rows)
                 for (&times) |*x| try many.round(top, cont, .{ .io = io, .out = x }, top - 1);
                 self.shared[self.shared_count] = .{ .width = @intCast(n * top), .ms = median(times[1..]) };
                 self.shared_count += 1;
@@ -1152,9 +1090,7 @@ fn Costing(comptime E: type) type {
 
         const Timing = struct { io: std.Io, out: *f64 };
 
-        /// One round of every stream's `w`-row window (its pending token, then text), its first row kept and
-        /// absorbed by the head, which then drafts `levels` (confidence 0: every level runs); `timing` times the
-        /// forward and the draws, and the head when it drafts.
+        /// One round of every stream's `w`-row window, first row kept and absorbed, then `levels` drafts, timed.
         fn round(c: *Self, w: usize, text: []const u32, timing: ?Timing, levels: usize) !void {
             const e = c.e;
             var ids: [max_streams][max_rows]u32 = undefined;
@@ -1223,8 +1159,7 @@ fn median(xs: []f64) f64 {
 
 // -- tests: a toy engine with several sequences -------------------------------------------------------------------
 
-/// The target draws from a hash of the committed sequence, the window's rows so far and the keyed position; the
-/// head guesses it right most of the time, with probabilities that cross the confidence threshold now and then.
+/// Toy target: draws from a hash of the sequence, window rows and position; the head guesses it right mostly.
 pub const Toy = struct {
     pub const Seq = struct {
         tokens: std.ArrayList(u32) = .empty,
@@ -1322,8 +1257,7 @@ pub const Toy = struct {
     pub const PrefillOptions = struct { keep_at: ?usize = null, resume_from: ?*const Snapshot = null, media: ?*const media_mod.Media = null };
     pub const Prefilled = struct { first: u32, kept: ?*Snapshot = null };
 
-    /// The prompt from 0, or from a kept state of this sequence (its first pos rows the prompt's), keeping the
-    /// state at keep_at; the first draw. The head then holds every prompt row but the last, as a fresh pass.
+    /// The prompt from 0 or a kept state, keeping keep_at's state; first draw; the head holds all but the last row.
     pub fn prefillWith(t: *Toy, prompt: []const u32, s: ?lanes.Sampling, o: PrefillOptions) !Prefilled {
         const q = t.seq();
         if (prompt.len == 0 or prompt.len > q.limit) return error.ToyMisuse;
@@ -1763,8 +1697,7 @@ test "admission reserves each stream's whole window: a prompt that would not fit
     try std.testing.expectEqual(@as(usize, 0), b.reserved);
 }
 
-/// The prompt cache's part a test plays: a store that keeps every mark the pass offers (LaneHost's hook ->
-/// Store.keep -> the family's save).
+/// The prompt cache part a test plays: keeps every mark the pass offers (LaneHost hook -> Store.keep -> family save).
 const KeepAll = struct {
     hooks: CacheHooks,
     saved: std.ArrayList(*anyopaque) = .empty,
@@ -1954,8 +1887,7 @@ test "a state the store evicts during the pass that kept it is left out of rank 
             self.notes.appendSlice(std.testing.allocator, bytes) catch unreachable;
         }
     };
-    // Store.keep with room for one state: once older states are gone it evicts the pass's own earlier mark
-    // before it saves the next one (four 175K-token marks past a ~4.4 GiB budget in production)
+    // Store.keep with room for one state: evicts the pass's own earlier mark before saving the next one
     const KeepOne = struct {
         hooks: CacheHooks,
         saved: std.ArrayList(*anyopaque) = .empty,

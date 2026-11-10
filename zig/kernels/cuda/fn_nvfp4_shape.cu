@@ -1,13 +1,4 @@
-// Flash Next's routed NVFP4 experts in other launch shapes (decode plan D3, work/research/R1-decode.md 3.3): the same
-// per-unit arithmetic as fn_nvfp4_experts.cu (TensorFold's cuda/nvfp4/experts.cu by Ash Hart, copied SASS-equal by
-// zig/tests/cuda/copies.py), with WARPS warps a block and D k-groups of loads in flight a warp instead of 4 and 2.
-//
-// A unit (one plan item's rows x 32 output columns) is one warp's work in both kernels, with no shared memory and no
-// cross-warp exchange: the unit loop below is the original's, and it runs the original's load_stage, compute_stage
-// (the k-groups in increasing order, each mma and fmaf as there), the fp32 scale and the epilogue. WARPS moves only
-// which block a unit runs in; D moves only how far ahead load_stage issues, never the order of compute_stage calls.
-// So every output element keeps its bits (checked byte for byte by zig/tests/cuda/flashnext_mia/experts_shape_test.cu
-// against the original on every row count and epilogue, and by the engine's gates).
+// NVFP4 experts in other launch shapes (WARPS, D in flight): fn_nvfp4_experts.cu's (Ash Hart) per-unit math, same bits.
 
 #include "fn_nvfp4_experts.cu"
 
@@ -75,10 +66,7 @@ __global__ void __launch_bounds__(WARPS * 32)
   }
 }
 
-// Fewer n8 tiles a warp: a unit's 32 columns split into 4 / NT parts, each a warp's (units x 4 / NT warps). Every
-// output element is still one n8 tile's mma over the same fragments, scaled and summed over the k-groups in the same
-// order with the same fmaf, and the epilogue's per-element code is the original's: only which warp computes a tile
-// changes. compute_stage and epilogue restricted to tiles [j0, j0 + NT):
+// NT n8 tiles a warp, each tile's mma, fmaf order and epilogue as the original's; compute_stage, epilogue on [j0, +NT):
 template <int M, int NT>
 __device__ __forceinline__ void compute_stage_nt(float (&acc)[M][1][NTW][4], const Stage<M>& st, bool hi, int j0) {
 #pragma unroll
@@ -198,8 +186,6 @@ __global__ void __launch_bounds__(WARPS * 32)
 }
 }  // namespace tf_fn_nvfp4_shape
 
-// The shape cuda_kernels.zig launches for small gate/up calls (at most 230 units: one row at TP=1, one or two at TP=2):
-// one warp a block, two stages, one n8 tile a warp (zig/tests/cuda/flashnext_mia/experts_shape_test.cu: TP=2 one row
-// 80.8 -> 66.3 us, two rows 100.8 -> 93.4; TP=1 one row 103.1 -> 92.0). The test instantiates every other shape itself.
+// The shape cuda_kernels.zig launches for small gate/up calls (<= 230 units): a warp a block, two stages, one n8 tile.
 template __global__ void tf_fn_nvfp4_shape::expert_nt_kernel<2, 2, 1, 2, 1>(const __nv_bfloat16*, int, int,
     const uint4*, const float*, int, int, const int*, const int*, const int*, void*, int, float, int);

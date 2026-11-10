@@ -1,13 +1,4 @@
-"""Digests of the Python engine's weight layouts on small deterministic inputs, for cuda_weights.zig's host tests.
-
-Run in the pytorch image with the TensorFold source (src/tensorfold) and a GPU (the float steps run where Python runs
-them, on CUDA):  python -I fixtures_cuda_weights.py <src/tensorfold> <out.json> [<checkpoint dir>]
-
-Only the layout modules are loaded, by path, under stub parent packages (no package __init__ runs): bf16.py, nvfp4.py,
-qmm.py (qwen4_exp/cuda), cuda/kernels/qmm.py, cuda/nvfp4/{experts,linear,format}.py, cuda/experts.py, all authored by
-Ash Hart (ashhart). The FP8 n-gram LUT and the FP8_PB_WO dequantization below restate host_table.FP8Table (tournierjc,
-ashhart) and weights.weight_bf16 (Jürgen Schmied) line for line, so the digests are those functions' outputs.
-"""
+"""Python weight-layout digests for cuda_weights.zig; restates code by Ash Hart, tournierjc and Jürgen Schmied."""
 
 from __future__ import annotations
 

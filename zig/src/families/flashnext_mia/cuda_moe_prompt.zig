@@ -1,10 +1,4 @@
-//! The routed NVFP4 experts of a prompt chunk (work/research/R2-prefill.md W-B; zig/kernels/cuda/fn_experts_prompt.cu):
-//! a warp applies each loaded and decoded weight block to T row tiles of 16 pairs instead of one, on a plan whose items
-//! hold `tile` pairs (32 by default) instead of 16. The bits are nvfp4_expert_kernel's (the same per-pair math in the
-//! same order; `check` compares bytes for several tiles and T). Measured on GB10 (experts-check, 320-wide TP=2 rank):
-//! gate/up 1.11x at 4096 rows but 0.87x at 2048, down 1.11-1.18x from 2048 rows, so gate/up takes it from 4096 rows
-//! (`gu_rows`), down from 2048 (`down_rows`); decode windows and short chunks keep Python's kernel.
-//! `TF_FLASHNEXT_PROMPT_EXPERTS=0` keeps Python's kernel for every chunk.
+//! Routed NVFP4 experts of a prompt chunk: T row tiles a warp, nvfp4_expert_kernel's bits; PROMPT_EXPERTS=0 off.
 const std = @import("std");
 const cuda = @import("cuda");
 const kern = @import("cuda_kernels.zig");
@@ -23,26 +17,22 @@ pub const Prompt4 = struct {
     gu: [3]Fn, // row tiles a warp T = 2, 3, 4
     f32: [2]Fn, // T = 2, 4
     b16: [2]Fn,
-    /// T = 2 at 4 CTAs an SM: the down's default (experts-check at 2048/4096 rows: bf16 1.25-1.35x, fp32 1.08-1.16x
-    /// over T = 2 at 3 CTAs); gate/up spills there (0.55-0.75x), so only with TF_FLASHNEXT_PROMPT_EXPERTS_OCC=1
+    /// T = 2 at 4 CTAs an SM: the down's default; gate/up spills there, so only with TF_FLASHNEXT_PROMPT_EXPERTS_OCC=1
     occ: [3]Fn = undefined, // gate/up, down fp32, down bf16
     use_occ: bool = false,
     occ_down: bool = true,
-    /// gate/up in two one-matrix passes at 4 CTAs (TF_FLASHNEXT_PROMPT_EXPERTS_GU2=1): the gate's bf16 values in
-    /// `gate_buf` [pairs, NI] between them (reserveGate)
+    /// gate/up in two one-matrix passes at 4 CTAs (TF_FLASHNEXT_PROMPT_EXPERTS_GU2=1), gate values in `gate_buf`
     gu2: bool = false,
     gate2: Fn = undefined,
     up2: Fn = undefined,
     gate_buf: ?cuda.DeviceBuffer = null,
-    /// SMs a grid may cover (each function's grid caps at its own resident CTAs an SM times this;
-    /// TF_FLASHNEXT_EXPERT_SMS_FREE lowers it, the grids loop over units: same bits)
+    /// SMs a grid may cover (TF_FLASHNEXT_EXPERT_SMS_FREE lowers it; the grids loop over units: same bits)
     sms: usize = 0,
     /// the plan's item size and the row tiles a warp (TF_FLASHNEXT_PROMPT_EXPERTS_CFG=tile,Tgu,Tdown; same bits)
     tile: usize = default_tile,
     t_gu: usize = 2,
     t_down: usize = 2,
-    /// rows from which gate/up and down take this kernel (below: Python's on 16-pair items, faster there;
-    /// TF_FLASHNEXT_PROMPT_EXPERTS_ROWS=gu,down)
+    /// rows from which gate/up and down take this kernel (TF_FLASHNEXT_PROMPT_EXPERTS_ROWS=gu,down)
     gu_rows: usize = 4096,
     down_rows: usize = 2048,
 
@@ -214,15 +204,12 @@ fn upload(d: *const cuda.Driver, bytes: []const u8) !cuda.DeviceBuffer {
     return b;
 }
 
-/// Random packed experts (code words any bits, e4m3 scale bytes finite), skewed routing (a few experts take
-/// hundreds of pairs), every chunk size in `rows`, width `ni` (320 at TP=2, 640 at TP=1): gate/up and both down
-/// faces of both kernels compared byte for byte, then timed. True when all equal.
+/// Random packed experts, skewed routing, every chunk size: both kernels' gate/up and down compared bytewise, timed.
 pub fn check(gpa: std.mem.Allocator, ctx: *const cuda.Context, ops: kern.Ops, p: *const Prompt4, ni: usize, rows: []const usize, skew: bool) !bool {
     return checkWith(gpa, ctx, ops, p, ni, rows, skew, false);
 }
 
-/// `check`; `special`: every e4m3 scale byte (zero, subnormal, NaN codes), extreme (expert, matrix) scales (signed
-/// zero, subnormal, 2^100, NaN) and a SwiGLU limit of 7 (Codex review P1-codex-1 #4).
+/// `check`; `special`: every e4m3 scale byte, extreme expert/matrix scales (0, subnormal, 2^100, NaN), limit 7.
 pub fn checkWith(gpa: std.mem.Allocator, ctx: *const cuda.Context, ops: kern.Ops, p: *const Prompt4, ni: usize, rows: []const usize, skew: bool, special: bool) !bool {
     const d = ctx.d;
     const E: usize = 512;

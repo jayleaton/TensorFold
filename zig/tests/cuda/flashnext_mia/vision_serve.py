@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
-"""The served image and video path against Python TensorFold's: each vision_ref.py case (``<dir>/<case>/request.json``,
-its ``bundle.json`` expected tokens) sent to a running ``tensorfold-native serve --vision`` as an OpenAI chat request
-(temperature 0, thinking off, ``ignore_eos``, as many tokens as the oracle decoded), drafted and with ``"draft":
-false``; the reply's ``runtime.token_sha`` must be the sha of Python's tokens. Then every case at once (concurrent ==
-solo). ``--text``: capture.py's text prompts as well, against a capture's serial greedy tokens (the text path
-byte-identical with vision on). Standard library only.
-
-    python3 vision_serve.py --url http://127.0.0.1:8888 --cases out/v1r1 [--text out/fncap1] [--report out.json]
-"""
+"""The served image and video path vs Python TensorFold's: vision_ref cases' token sha via a running native server."""
 
 from __future__ import annotations
 
@@ -59,8 +51,7 @@ def data_url(path: Path, media: str) -> str:
 
 
 def bench(url: str, media: Path, reps: int) -> dict:
-    """TTFT (the server's time_to_first_token: helper decode + preprocess + tower + prefill + first draw) of one
-    1280x960 image, ten 640x480 images and a 30 s video (vision_ref.py's media), one reply token, ``reps`` times."""
+    """TTFT of one 1280x960 image, ten 640x480 images and a 30 s video, one reply token, ``reps`` times."""
 
     one = {"type": "image_url", "image_url": {"url": data_url(media / "big.jpg", "image/jpeg")}}
     small = {"type": "image_url", "image_url": {"url": data_url(media / "one.jpg", "image/jpeg")}}

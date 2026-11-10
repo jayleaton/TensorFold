@@ -1,9 +1,4 @@
-//! A prompt chunk's GPU time by part (work/research/R2-prefill.md W-0): timing events recorded on the engine's
-//! stream between the parts of a forward, read back after the chunk. Off unless `TF_FLASHNEXT_PROFILE=1`; when on,
-//! `Forward.prof` points here and each `mark` closes the interval since the previous mark under that part's name.
-//! The MTP head's absorb is counted apart (`mtp`). The events add a few microseconds a mark and change no bits.
-//! Decode rounds (Engine.generateManyWith, run eagerly while profiling) mark their host gaps too: the interval
-//! before a phase's first launch is the GPU waiting on the host (`gap_*`), and the MTP head's time by draft level.
+//! A prompt chunk's and decode rounds' GPU time by part (TF_FLASHNEXT_PROFILE=1); events change no bits.
 const std = @import("std");
 const cuda = @import("cuda");
 
@@ -127,8 +122,7 @@ pub const Prof = struct {
         p.n = 1;
     }
 
-    /// Decode rounds since the last report: ms a round by part (main model, then the MTP head and its levels), the
-    /// whole of it against the rounds' wall time; then cleared.
+    /// Decode rounds since the last report: ms a round by part against the rounds' wall time; then cleared.
     pub fn rounds(p: *Prof, rank: u32, label: []const u8, n_rounds: usize, wall_ms: f64) !void {
         try p.drain();
         p.n = 0;

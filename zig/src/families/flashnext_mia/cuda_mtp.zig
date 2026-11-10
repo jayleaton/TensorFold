@@ -1,12 +1,4 @@
-//! Flash Next's MTP head on CUDA (Python qwen4_exp/cuda/mtp.py and decode.py's draft draws): the next tokens'
-//! embeddings and the main model's final streams, normalized and projected (fc_e, fc_h per stream), added into the
-//! head's streams, its own attention layer over its own cache (State's last attention cache, `mtp_len` rows, the
-//! last `mtp_drafted` of them chained drafts), the mixer, and the draft head over the draft vocabulary (the lm_head's
-//! draft rows, 4-bit in groups of 32) on the last row. The draws (`sample_draft`, `sample_mapped`) read the head's
-//! row on the GPU and draw on the host with the keyed rule (cuda_sampler.zig), so a draft equals Python's.
-//!
-//! Python source (TensorFold, https://github.com/ashhart/TensorFold, qwen4_exp/cuda/mtp.py and decode.py, authored
-//! by Ash Hart (ashhart) with commits by vcruz305 inside TensorFold, which the owner allows for this port).
+//! Flash Next's MTP head on CUDA (TensorFold qwen4_exp/cuda/mtp.py by Ash Hart (ashhart), vcruz305; owner allows).
 const std = @import("std");
 const cuda = @import("cuda");
 const lanes = @import("lanes");
@@ -29,10 +21,7 @@ extern "c" fn log(x: f64) f64;
 /// Two ranks' scratch for tp_sample_rows: a pass's device scratch, this rank's packed rows and every rank's.
 pub const TpScratch = struct { s: tops.Torch.Sample, pack: u64, all: u64, max_rows: usize, max_k: usize };
 
-/// decode.tp_sample_rows (two ranks, a sampler past the gathered candidates): every rank's top_k + MARGIN of each
-/// of `rows` rows (`columns` wide at `logits`, this rank's shard) with global ids (offset, or `id_map` for the
-/// draft head) and its log-sum-exp, all-gathered in rank order; each row's keyed draw at first_position + r on
-/// the host, the same on both ranks, with the temperature-1 probability in `probs` when given.
+/// decode.tp_sample_rows: each rank's top_k + MARGIN and lse all-gathered; each row's keyed draw on the host.
 pub fn tpSampleRows(f: *Forward, t: TpScratch, logits: u64, rows: usize, columns: usize, id_map: ?u64, first_position: u64, smp: lanes.Sampling, out: []u32, probs: ?[]f64) !void {
     const cm = f.comm orelse return error.NoComm;
     const k = topK(columns, smp);
@@ -81,8 +70,7 @@ pub fn tpSampleRows(f: *Forward, t: TpScratch, logits: u64, rows: usize, columns
 /// One stream's MTP step input: its next tokens and the main model's streams [n, S*D] they follow (device).
 pub const Input = struct { seq: *Seq, next: []const u32, streams: u64 };
 
-/// mtp_stage + mtp_compute (last_only), one stream: the draft head's logits of the last row (b.logits [1, ids]),
-/// appending n entries to the head's cache at st.mtp_len; the caller advances mtp_len (Python mtp_forward).
+/// mtp_stage + mtp_compute (last_only), one stream: the last row's draft logits, n cache entries at st.mtp_len.
 pub fn forward(f: *Forward, seq: *Seq, x: *const Bufs, next: []const u32, streams: u64) !u64 {
     try stage(f, seq, x, next, streams);
     return compute(f, seq, x, next.len);
@@ -94,8 +82,7 @@ pub fn stage(f: *Forward, seq: *Seq, x: *const Bufs, next: []const u32, streams:
     _ = try stageMany(f, &.{.{ .seq = seq, .next = next, .streams = streams }}, x, &one);
 }
 
-/// mtp_stage: every stream's next tokens' ids and input streams into the head's buffers, one after another;
-/// `segs` gets each stream's rows. Returns the rows.
+/// mtp_stage: every stream's next tokens' ids and input streams into the head's buffers; `segs` gets each's rows.
 pub fn stageMany(f: *Forward, inputs: []const Input, x: *const Bufs, segs: []fwd.Seg) !usize {
     if (f.w.mtp == null) return error.NoMtpHead;
     if (segs.len < inputs.len) return error.SegsTooFew;
@@ -125,8 +112,7 @@ pub fn compute(f: *Forward, seq: *Seq, x: *const Bufs, n: usize) !u64 {
     return computeSegs(f, &.{.{ .seq = seq, .a0 = 0, .a1 = n }}, x);
 }
 
-/// mtp_compute (last_only) over every stream's rows: the draft head's logits of each stream's last row
-/// (b.logits [segs, ids], contiguous); each stream's attention on its own head cache.
+/// mtp_compute (last_only) over every stream: each last row's draft logits (b.logits [segs, ids]), own head cache each.
 pub fn computeSegs(f: *Forward, segs: []const fwd.Seg, x: *const Bufs) !u64 {
     const b = &x.b;
     const g = f.g;
@@ -151,12 +137,10 @@ pub fn computeSegs(f: *Forward, segs: []const fwd.Seg, x: *const Bufs) !u64 {
     try f.mark(.mtp_in);
     f.pf_moe = Forward.prefetchOf(m.mixer.down);
     const pending = try f.layerForward(&m.layer, segs, x, n, null, true);
-    // several prompts in one pass: the head's cache is written by the layer above and nothing reads the draft
-    // head's logits of a prompt pass (the drafts come later, from the prompts' last rows), so stop here
+    // several prompts in one pass: nothing reads a prompt pass's draft logits, so stop after the head's cache write
     if (b.prefill and k > 1) return b.logits;
     _ = try f.finish(&m.mixer, x, n, pending, false);
-    // prompt buffers mix the last row into row 0; a window's last row is row n - 1; several streams' last rows
-    // gathered into one block (mtp_e and mtp_xe are free by now: Python's index_select)
+    // a window's last row is row n - 1, a prompt's is in row 0; several streams' last rows gathered into one block
     var rows = b.mixed + (n - 1) * D * 2;
     var xs = b.xs_mixed + (n - 1) * (D / 32) * 4;
     if (b.prefill) {
@@ -189,8 +173,7 @@ pub fn computeSegs(f: *Forward, segs: []const fwd.Seg, x: *const Bufs) !u64 {
     return b.logits;
 }
 
-/// The draft head's draws on the host: its row's candidates (one rank) or the gathered ones (two ranks), the keyed
-/// rule at the draft's position, and the drawn token's temperature-1 probability for the chain's stop rule.
+/// The draft head's host draws: candidates (one or two ranks), the keyed rule, the token's temperature-1 probability.
 pub const Draws = struct {
     gpa: Allocator,
     /// column -> token id (this rank's share at two ranks; the whole draft vocabulary at one), null: columns are ids

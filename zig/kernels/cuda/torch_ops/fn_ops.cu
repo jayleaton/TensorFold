@@ -1,16 +1,11 @@
-// Flash Next (qwen4_exp) torch ops on the CUDA engine's hot path, with torch's rounding points kept one for one.
-// TensorFold 0.6.5 sources: nvfp4_moe.MoE4.shared_act, decode.Engine.sample_draft and forward.candidates; the fills
-// replace Tensor.fill_ on 64-bit device scalars (gdn_io's conv pointer). Compile with -O3 --fmad=false --ftz=false
-// (torch_ops/README.md); tools/zig/flashnext_mia/check_flashnext_ops.py compares raw bytes with torch.
+// Flash Next torch ops (TensorFold 0.6.5 sources) with torch's rounding points; build -O3 --fmad=false --ftz=false.
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <stdint.h>
 #include "launch_shape.h"
 
-// MoE4.shared_act, then `buf.act[:rows, top_k] = ...`: g [rows, 2 ni] bf16 (gate columns, then up) ->
-// bf16(f32(bf16(gate / (1 + exp(-gate)))) * up), row r at out + r * out_stride. torch runs neg (exact), exp, add,
-// div, the bf16 round trip and mul as separate fp32 kernels; each is one IEEE operation here.
+// MoE4.shared_act: bf16(f32(bf16(silu(gate))) * up) for g [rows, 2 ni], each torch fp32 kernel one IEEE op here.
 extern "C" __global__ void tf_fn_shared_swiglu_kernel(const __nv_bfloat16* g, __nv_bfloat16* out, uint64_t rows,
                                                       uint64_t ni, uint64_t out_stride) {
     const uint64_t count = rows * ni;
@@ -33,8 +28,7 @@ extern "C" __global__ void tf_fn_fill_u64_kernel(uint64_t* out, uint64_t value, 
          i += uint64_t(gridDim.x) * blockDim.x) out[i] = value;
 }
 
-// Engine.sample_draft, greedy: torch.cat([top, lse, col.float()]) of row = logits[:1].float(), where top, col =
-// row.max(dim=-1) (the first maximum: `col` from the argmax of the same bf16 row, whose fp32 widening is exact).
+// Engine.sample_draft greedy: [top, lse, col] of logits[:1].float(), col the first argmax of the same bf16 row.
 extern "C" __global__ void tf_fn_draft_pick_kernel(const __nv_bfloat16* logits, const int32_t* col, const float* lse,
                                                    float* out) {
     if (blockIdx.x != 0 || threadIdx.x != 0) return;
@@ -44,8 +38,7 @@ extern "C" __global__ void tf_fn_draft_pick_kernel(const __nv_bfloat16* logits, 
     out[2] = __ll2float_rn((long long)c);
 }
 
-// Engine.sample_draft, sampled: torch.cat([vals, lse, idx.float()], dim=1) of one row's top-k (k values, int64
-// columns) and its fp32 log-sum-exp -> out [2k + 1].
+// Engine.sample_draft sampled: torch.cat([vals, lse, idx.float()]) of one row's top-k and fp32 lse -> out [2k + 1].
 extern "C" __global__ void tf_fn_draft_pack_kernel(const float* vals, const int64_t* idx, const float* lse, float* out,
                                                    uint64_t k) {
     for (uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; i <= k;
@@ -59,8 +52,7 @@ extern "C" __global__ void tf_fn_draft_pack_kernel(const float* vals, const int6
     }
 }
 
-// forward.candidates (two ranks): row r of c [rows, 2 cand + 1] = [vals | ids as int32 bits | lse], ids =
-// (id_map[idx] if id_map else idx + offset).to(int32) (the low word, as torch narrows int64).
+// forward.candidates (two ranks): row r = [vals | ids as int32 bits | lse], ids = id_map[idx] or idx + offset.
 extern "C" __global__ void tf_fn_candidates_kernel(const float* vals, const int64_t* idx, const int64_t* id_map,
                                                    int64_t offset, const float* lse, float* out, uint64_t rows,
                                                    uint64_t cand) {
@@ -79,10 +71,7 @@ extern "C" __global__ void tf_fn_candidates_kernel(const float* vals, const int6
     }
 }
 
-// sampling.nucleus_rows' fixed-point mass (top_k off): scaled = f64(f32(logit)) / t (torch: logits.float().double() /
-// max(temperature, 1e-6)), mass = int64(floor(exp(scaled - top[r]) * 2^40)) (MASS), and each row's sum (an exact
-// int64 sum in any order). torch runs the division, the subtraction, exp, the multiply and floor as separate fp64
-// kernels: each is one IEEE operation here (exp is CUDA's fp64 exp, which torch's elementwise exp calls).
+// nucleus_rows' fixed-point mass: int64(floor(exp(f64(f32(logit)) / t - top[r]) * 2^40)) and its exact row sum.
 extern "C" __global__ void tf_fn_nucleus_mass_kernel(const __nv_bfloat16* logits, uint64_t ld, uint64_t cols, double t,
                                                      const double* top, int64_t* mass, unsigned long long* sums) {
     const uint64_t r = blockIdx.y;
@@ -95,13 +84,7 @@ extern "C" __global__ void tf_fn_nucleus_mass_kernel(const __nv_bfloat16* logits
     atomicAdd(&sums[r], (unsigned long long)m);
 }
 
-// nvfp4.matmul with one K slice (SK 1: the shared expert's gate/up, K 2560) and bf16-pattern tables (PACKED 0), the
-// same bits as Triton's `_fp4mm` there: for each 16-input block b in order, p = HMMA.16816.F32.BF16(x rows, the
-// block's 16 x 8 weights, C = 0) and acc = fma(p, S[b, n], acc) (the cubins' HMMA with RZ, then FFMA), the bf16 store
-// rounding to nearest. `_fp4mm` runs a 64-column tile a program walking all of K, so 10 programs cover N 640 and the
-// chain waits on each block's loads; here a warp owns 16 rows x 8 columns, a CTA 16 x 32, and the blocks stream
-// through a STAGES-deep cp.async ring. X [M, K] bf16 rows x_stride apart; W the 64-column tiles of 16 x 64 blocks
-// (tile t at t * (K / 64) * 64 * 64 elements, block b at b * 16 * 64, row k, column n % 64); S [K / 16, N] fp32.
+// nvfp4.matmul (SK 1, PACKED 0) with `_fp4mm`'s bits: per 16-input block HMMA (C = 0) then fma by S, cp.async ring.
 #define TF_FP4S_STAGES 16
 __device__ __forceinline__ void tf_cp16(void* smem, const void* g, bool ok) {
     const unsigned s = (unsigned)__cvta_generic_to_shared(smem);

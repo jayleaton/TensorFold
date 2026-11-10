@@ -1,16 +1,4 @@
-//! The two ranks' NCCL communicator (Python tensorfold.cuda.comm's role): rank 0 makes the NCCL id and hands it to
-//! rank 1 over the control link (cuda_link.zig), both join, and every exchange is an all-gather on the engine's
-//! stream, so CUDA graphs can capture it. Partials are gathered in fp32 and added by the reading kernel in rank
-//! order (rank 0, then rank 1) with one rounding, so both ranks hold the same bits (work/PLAN.md, TP=2 design).
-//! One GPU (world 1) opens no communicator: the gathers are copies the caller skips.
-//!
-//! TF_FLASHNEXT_ROCE (default on; 0 off) (decode plan D1) adds the one-shot RoCE all-gather (cuda/roce_mia.zig, b12x's RoCEnante protocol)
-//! for every all-gather of up to 512 KiB a rank, on the ports NCCL_IB_HCA names with NCCL_IB_GID_INDEX; larger
-//! gathers and the broadcasts stay on NCCL. Both ranks use it only when both opened it (they say so over the link),
-//! a rank that cannot open it (no NCCL_IB_HCA, no RDMA device) leaves both on NCCL. TF_FLASHNEXT_L2PF (default on; 0
-//! off) (decode plan D2) prefetches the weights a gather's
-//! caller names (`allGatherThen`) into the L2 while the gather waits: extra blocks of the RoCE launch, or one small
-//! launch before an NCCL gather. Neither changes a byte of any result.
+//! The two ranks' NCCL communicator: fp32 partials added in rank order, same bits on both; opt RoCE, L2 prefetch.
 const std = @import("std");
 const cuda = @import("cuda");
 const link_mod = @import("cuda_link.zig");
@@ -92,8 +80,7 @@ pub const Comm = struct {
         return c;
     }
 
-    /// Opens the RoCE side (none without a driver), tells the peer whether it did, and connects when both did; null
-    /// when either did not.
+    /// Opens the RoCE side, tells the peer whether it did, connects when both did; null when either did not.
     fn handshake(gpa: Allocator, link: Link, rank: u32, d: ?*const cuda.Driver) !?roce.Roce {
         var r: ?roce.Roce = if (d) |dd| openRoce(dd, rank) else null;
         var keep = false;
@@ -168,7 +155,7 @@ pub const Comm = struct {
         return if (c.extra) |x| x.r != null else false;
     }
 
-    /// The RoCE side's proxy failure or a kernel's timed-out wait, if any, as text in `buf` (the stream traps on its own).
+    /// The RoCE proxy failure or a kernel's timed-out wait, if any, as text in `buf` (the stream traps on its own).
     pub fn roceFailure(c: *const Comm, buf: []u8) ?[]const u8 {
         const x = c.extra orelse return null;
         const r = &(x.r orelse return null);
@@ -192,17 +179,14 @@ pub const Comm = struct {
         if (c.extra) |x| {
             const pf: Prefetch = if (x.prefetch) next else .{};
             const bytes = count * size(dtype);
-            // RoCE takes every size it fits whose layout it can (aligned; out of place or NCCL's in-place form), else
-            // NCCL. Both ranks run the same calls on buffers carved the same way (the same allocation sequence,
-            // offsets and in-place choices), so the layout test answers alike on both: no rank picks the other path.
+            // RoCE when it fits and the layout allows, else NCCL; buffers carved alike, so both ranks pick one path
             if (x.r) |*r| if (r.takes(send, recv, bytes)) return r.allGather(send, recv, bytes, stream, pf);
             if (x.l2) |*l| if (pf.bytes > 0) try l.run(pf, stream);
         }
         try c.lib.check(c.lib.api.ncclAllGather(send, recv, count, dtype, c.comm, stream), "ncclAllGather");
     }
 
-    /// NCCL's in-place all-gather (`send` = `recv` + rank * count elements): the prompt glue's row halves. Never RoCE,
-    /// which takes no overlapping buffers; NCCL on both ranks whatever the size (the same choice on both).
+    /// NCCL's in-place all-gather (`send` = `recv` + rank * count): never RoCE (overlap), same choice on both ranks.
     pub fn allGatherInPlace(c: *const Comm, send: cuda.abi.DevicePtr, recv: cuda.abi.DevicePtr, count: usize, dtype: nccl.DataType, stream: cuda.abi.Stream) !void {
         try c.lib.check(c.lib.api.ncclAllGather(send, recv, count, dtype, c.comm, stream), "ncclAllGather");
     }
@@ -212,8 +196,7 @@ pub const Comm = struct {
         try c.lib.check(c.lib.api.ncclBroadcast(buf, buf, bytes, .u8, @intCast(root), c.comm, stream), "ncclBroadcast");
     }
 
-    /// Two ranks swap `count` elements: `send` goes to the peer while the peer's arrive in `recv` (one NCCL group:
-    /// a send and a receive, the same order on both ranks). The buffers must not overlap.
+    /// Two ranks swap `count` elements via one NCCL send/recv group, same order on both; buffers must not overlap.
     pub fn exchange(c: *const Comm, send: cuda.abi.DevicePtr, recv: cuda.abi.DevicePtr, count: usize, dtype: nccl.DataType, stream: cuda.abi.Stream) !void {
         const peer: c_int = @intCast(1 - c.rank);
         try c.lib.check(c.lib.api.ncclGroupStart(), "ncclGroupStart");
@@ -228,8 +211,7 @@ pub const Comm = struct {
         try c.lib.check(c.lib.api.ncclGroupEnd(), "ncclGroupEnd");
     }
 
-    /// One NCCL group of point-to-point pairs with the peer: each `sends[i]` (bytes) goes out, each `recvs[i]`
-    /// (bytes) comes in, in this order on both ranks (the peer's sends match this rank's receives).
+    /// One NCCL group of point-to-point pairs: `sends[i]` out, `recvs[i]` in, the same order on both ranks.
     pub fn exchangeBytes(c: *const Comm, sends: []const [2]u64, recvs: []const [2]u64, stream: cuda.abi.Stream) !void {
         const peer: c_int = @intCast(1 - c.rank);
         try c.lib.check(c.lib.api.ncclGroupStart(), "ncclGroupStart");

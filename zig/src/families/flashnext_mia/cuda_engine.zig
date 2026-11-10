@@ -1,14 +1,4 @@
-//! The Flash Next CUDA engine (Python qwen4_exp/cuda/decode.py Engine and engine.py's setup), the contract of
-//! work/PLAN.md "Engine API contract": the config, the extension kernels (cuda_kernels.zig), the torch-op kernels
-//! (cuda_torch_ops.zig), the captured Triton set (`kernels_dir`: aot.json + cubins), the weights (cuda_weights.zig),
-//! the decode window's, the MTP head's and the prompt chunk's buffers, and sequences (cuda_state.State each). A
-//! prompt prefills in 2048-row chunks with the MTP head absorbing each chunk's next tokens, and the bound sequence
-//! offers cuda_decode.zig's `E` interface, so cuda_decode.serial and cuda_decode.drafted run on it unchanged.
-//!
-//! Every call that runs collectives (two ranks) must be made in the same order with the same arguments on both.
-//!
-//! Python source (TensorFold, https://github.com/ashhart/TensorFold, qwen4_exp/cuda/decode.py and engine.py,
-//! authored by Ash Hart (ashhart) with commits by vcruz305 inside TensorFold, which the owner allows for this port).
+//! Flash Next CUDA engine from TensorFold qwen4_exp/cuda decode.py + engine.py (Ash Hart, vcruz305); ranks in step.
 const std = @import("std");
 const cuda = @import("cuda");
 const lanes = @import("lanes");
@@ -39,17 +29,10 @@ const Allocator = std.mem.Allocator;
 pub const default_depth = 6;
 pub const default_confidence = 0.70;
 
-/// The chains' stop rule as served (cuda_decode.Stop): the running product p1 * ... * pj >= 0.4 (encoded -0.4; decode
-/// D4 after X1, research/X1-drafts.md 3.4: TP=2 code +13-19%, sampled hash map +7.5% over depth 6 / 0.70; a fixed 0.5
-/// at depth 15 cost hash-map prose 10% served), or TF_FLASHNEXT_CONFIDENCE (-1..1: c > 0 Python's per-draft rule, c < 0
-/// the running product at -c, 0 every draft). The oracle runs keep `default_confidence`. Drafts only: the kept tokens
-/// are the target's either way.
+/// Served draft stop rule: running product >= 0.4 (encoded -0.4); TF_FLASHNEXT_CONFIDENCE overrides; drafts only.
 pub const served_confidence = -0.4;
 
-/// The served hybrid: the running product (served_confidence) while at most this many streams are live, Python's
-/// per-draft rule at `wide_confidence` above that (TF_FLASHNEXT_PRODUCT_STREAMS; 2 by default). W6's served A/B: the
-/// product with the longest asks wins at one or two streams (code +10%) and loses prose at four and eight, where
-/// deeper chains cost rows (STATUS 2026-10-07).
+/// Served hybrid: running product while at most this many streams are live, per-draft wide_confidence above.
 pub const product_streams_default = 2;
 pub const wide_confidence = 0.5;
 
@@ -82,12 +65,10 @@ pub const Options = struct {
     streams: usize = 1,
     /// bytes the sequences' caches may take on this rank; null: what is free once loaded, less `reserve_gib`
     kv_budget: ?usize = null,
-    /// memory kept free beside the caches (the owner's floor is 10 GiB MemAvailable); env
-    /// TENSORFOLD_MEMORY_RESERVE_GIB overrides it in the CLI and the server
+    /// memory kept free beside the caches in GiB; TENSORFOLD_MEMORY_RESERVE_GIB overrides it in the CLI and the server
     reserve_gib: f64 = 12,
     prefill_rows: usize = state.prefill_rows,
-    /// sequences' caches in reserved address space, grown in place, indexer keys in a ring (cuda_vmm.zig);
-    /// false: State's allocations, grown by copying
+    /// caches in reserved address space grown in place, indexer keys in a ring (cuda_vmm.zig); false: copy growth
     vmm: bool = true,
     /// bytes kept free beside the reserve for the vision helper's workspace (rank 0 with --vision)
     vision_reserve: usize = 0,
@@ -100,24 +81,18 @@ pub const ring_min_rows = 4096;
 
 pub const Seq = fwd.Seq;
 
-/// A captured decode window (or MTP step): its sequence's buffers, the window's rows, the DeltaNet buffers' parity
-/// and the attention context bucket (Python Graphs.main / Graphs.mtp keys).
-/// `media`: the sequence's image/video attachment (SeqMedia.epoch; 0: text): an image sequence's launches bake in its
-/// rotary table and prompt length, so its graphs are its own.
+/// A captured decode window or MTP step (Python Graphs.main/mtp keys); `media` separates image/video sequences' graphs.
 const GraphKey = struct { seq: usize, version: u32, mtp: bool, rows: u32, parity: u32, ctx: usize, media: u64 = 0 };
 
 /// A shared round's (or shared MTP step's) graph and the sequences whose buffers it bakes in.
 const MultiGraph = struct { exec: cuda.graph.Exec, seqs: []usize };
 
-/// Shared-round graphs kept at most (drafted rounds vary their windows' lengths; a composition is captured
-/// the second time it is seen).
+/// Shared-round graphs kept at most; a composition is captured the second time it is seen.
 const max_multi_graphs = 192;
 
 /// The state of a class of captures after failures: rounds left to run eagerly, and the failures in a row.
 const CaptureFault = struct { pause: u32 = 0, streak: u32 = 0, total: u64 = 0 };
-/// TF_FLASHNEXT_MULTI_GRAPHS: the most streams a shared step is captured for. Wider steps rarely repeat their
-/// composition, are GPU-bound (the launches hide behind the kernels), and a capture costs a second enqueue plus the
-/// instantiation: measured at TP=2, x8/x16/x32 run 2-27% faster eagerly (work/research/W6-rounds-profile.md).
+/// TF_FLASHNEXT_MULTI_GRAPHS: most streams a shared step is captured for; wider steps rarely repeat and run eagerly.
 const multi_graphs_default = 4;
 
 /// Graphs._bucket: the attention bound a captured window replays at, a power of two from 8192 up to the capacity.
@@ -263,10 +238,7 @@ fn envOff(name: [:0]const u8) bool {
     return std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "off");
 }
 
-/// TF_FLASHNEXT_PREFILL_ROWS: the prompt chunk's rows (both ranks the same; any chunking gives the same bits), else
-/// the caller's.
-/// Two ranks' prompt chunk rows: with the in-program K slices and the prompt expert kernel 4096 rows a call are
-/// faster than 2048 (TP=2 A/B, work/research/R2-measured.md); one GPU keeps Python's 2048.
+/// Two ranks' prompt chunk rows (TF_FLASHNEXT_PREFILL_ROWS overrides; any chunking gives the same bits); one GPU: 2048.
 pub const tp2_prefill_rows: usize = 4096;
 
 fn promptRows(default: usize) !usize {
@@ -311,8 +283,7 @@ pub const Engine = struct {
     cand_have: u64 = std.math.maxInt(u64),
     /// TF_FLASHNEXT_DRAW_ONCE=0: each window's and draft's draws read the candidates again (the old way)
     draw_once: bool = true,
-    /// generateMany's served hybrid (gate-many --served): a running product applies while at most this many streams
-    /// are live, `wide_confidence` above (maxInt: the request's rule always)
+    /// generateMany's served hybrid: running product while at most this many streams are live, `wide_confidence` above
     product_streams: usize = std.math.maxInt(usize),
     /// shared steps of at most this many streams are captured (TF_FLASHNEXT_MULTI_GRAPHS)
     multi_graphs: usize = multi_graphs_default,
@@ -324,9 +295,7 @@ pub const Engine = struct {
     rank: u32,
     world: u32,
     prefill_rows: usize,
-    /// a prompt's last chunk takes up to this many rows past `prefill_rows` rather than leave them to a chunk of
-    /// their own (prompt chunks are chunk-invariant: same bits); the prompt buffers hold prefill_rows + this.
-    /// TF_FLASHNEXT_PREFILL_TAIL (rows, a multiple of 16)
+    /// a last chunk takes up to this many extra rows, not a chunk of its own (same bits); TF_FLASHNEXT_PREFILL_TAIL
     prefill_tail: usize = 0,
     sampling: ?lanes.Sampling = null,
     /// prompt chunks absorb into the MTP head (Python prefill's `mtp`; the serial reference prefills without)
@@ -348,9 +317,7 @@ pub const Engine = struct {
     pfill: ?*const Fill = null,
     graphs: std.AutoHashMapUnmanaged(GraphKey, cuda.graph.Exec) = .empty,
     captures: usize = 0,
-    /// a failed capture, instantiate or upload is not fatal: that round runs eagerly (the same bits) and captures
-    /// pause for a while (solo windows and shared rounds apart); TF_FLASHNEXT_GRAPH_LOG=1 logs the graph counts,
-    /// TF_FLASHNEXT_GRAPH_FAIL=N fails every N-th instantiate (a test of the fallback)
+    /// a failed capture runs that round eagerly (same bits) and pauses captures; TF_FLASHNEXT_GRAPH_LOG/_FAIL test
     solo_fault: CaptureFault = .{},
     multi_fault: CaptureFault = .{},
     instantiated: u64 = 0,
@@ -370,8 +337,7 @@ pub const Engine = struct {
     k4: ?int4.Kernels = null,
     /// with `digest`: each chunk's (streams, logits) sha256 prefixes kept here too (the CLI's media gate)
     digests: ?*std.ArrayList([2][16]u8) = null,
-    /// TF_FLASHNEXT_POISON_PADS: rows past a chunk's end in the row-indexed prompt buffers overwritten with
-    /// rank-dependent bytes before each chunk (a test: no live row may read them)
+    /// TF_FLASHNEXT_POISON_PADS: prompt-buffer rows past a chunk's end get rank-dependent bytes (none may be read)
     poison: bool = false,
     /// TF_FLASHNEXT_PASS_TIMES=1: prefillWith logs its parts' wall times (the stream drained at each edge)
     pass_times: bool = false,
@@ -397,8 +363,7 @@ pub const Engine = struct {
         errdefer e.torch.deinit();
         e.set = try cuda.aot.Set.load(gpa, io, d, ctx.device, kernels_dir);
         errdefer e.set.deinit();
-        // TF_FLASHNEXT_INT4AR_FAST=1: INT4-AutoRound's fast-fp8/ variant over the checkpoint (block-FP8 hyper-connections
-        // and MTP experts; lossy against the bf16 ones, opt-in)
+        // TF_FLASHNEXT_INT4AR_FAST=1: INT4-AutoRound's lossy fast-fp8/ variant over the checkpoint (opt-in)
         var overlay_buf: [1024]u8 = undefined;
         const overlay: ?[]const u8 = if (e.c.int4ar() and envGet("TF_FLASHNEXT_INT4AR_FAST") != null and !envOff("TF_FLASHNEXT_INT4AR_FAST")) try std.fmt.bufPrint(&overlay_buf, "{s}/fast-fp8", .{dir}) else null;
         e.w = try weights.load(gpa, io, dir, &e.c, .{ .rank = o.rank, .world = o.world, .mtp = o.mtp, .draft_head = o.mtp, .mode = .device, .driver = d, .overlay = overlay });
@@ -417,7 +382,7 @@ pub const Engine = struct {
         errdefer e.buf.deinit();
         if (e.w.mtp != null) e.mbuf = .{ .b = try state.Buffers.init(d, e.g, rows, .{ .capacity = e.max_len }), .y_f32 = true, .attn = ag };
         errdefer if (e.mbuf) |*m| m.deinit();
-        // default 512: a prompt's last chunk takes up to 512 more rows instead of a chunk of its own (exact: chunk invariance)
+        // default 512: a last chunk takes up to 512 more rows instead of its own chunk (exact: chunk invariance)
         if (e.prefill_rows + 512 <= 16384) e.prefill_tail = 512;
         if (envGet("TF_FLASHNEXT_PREFILL_TAIL")) |v| {
             e.prefill_tail = std.fmt.parseInt(usize, v, 10) catch return error.BadPrefillTail;
@@ -449,15 +414,12 @@ pub const Engine = struct {
         if (!envOff("TF_FLASHNEXT_SHARED_SIDE")) try e.f.initSide();
         // INT4-AutoRound's projections: block-FP8 columns stored in place (TF_FLASHNEXT_FP8_LD=0: scratch + copy)
         e.f.fp8_ld = !envOff("TF_FLASHNEXT_FP8_LD");
-        // the shared expert's single-slice gate/up on fn_ops' K-serial kernel where it is faster (the same bits,
-        // fp4-check; TF_FLASHNEXT_FP4_SERIAL=0 off)
+        // shared expert's single-slice gate/up on the K-serial kernel (same bits); TF_FLASHNEXT_FP4_SERIAL=0 off
         e.f.fp4_serial = !envOff("TF_FLASHNEXT_FP4_SERIAL");
         e.graph_log = envGet("TF_FLASHNEXT_GRAPH_LOG") != null;
         if (envGet("TF_FLASHNEXT_GRAPH_FAIL")) |v| e.inject_every = std.fmt.parseInt(u64, v, 10) catch 0;
         if (envGet("TF_FLASHNEXT_MULTI_GRAPHS")) |v| e.multi_graphs = std.fmt.parseInt(usize, v, 10) catch multi_graphs_default;
-        // shared rounds past the captured widths run their attention in one launch a kernel (attn_multi.py's
-        // kernels, aot/w6-ks1 and later; without them, a stream at a time): TF_FLASHNEXT_ATTN_MULTI=N from N
-        // streams (never at a captured width), 0 off
+        // shared rounds past captured widths run attention in one launch: TF_FLASHNEXT_ATTN_MULTI=N from N streams
         if (tri.Tri.multiAvailable(&e.set)) {
             const want: usize = if (envGet("TF_FLASHNEXT_ATTN_MULTI")) |v| (std.fmt.parseInt(usize, v, 10) catch 0) else e.multi_graphs + 1;
             if (want > 0) e.f.attn_multi = @max(want, e.multi_graphs + 1, 2);
@@ -475,16 +437,14 @@ pub const Engine = struct {
         // two ranks: prompt glue split by rows (TF_FLASHNEXT_GLUE_SPLIT=0: every rank runs every row)
         e.f.glue_split = o.world == 2 and !envOff("TF_FLASHNEXT_GLUE_SPLIT");
         e.digest = envGet("TF_FLASHNEXT_PREFILL_DIGEST") != null;
-        // NCCL connects point-to-point channels on their first use: the split glue's first prompt would pay it (tens of
-        // ms a layer at 1k rows), so one exchange of a prompt-sized block runs now (pure data movement, both ranks)
+        // NCCL connects point-to-point channels on first use, so one prompt-sized exchange runs now on both ranks
         if (e.f.glue_split) if (o.comm) |cm| {
             const n = @min(e.prefill_rows / 2, 2048) * e.g.hidden;
             try cm.exchange(e.pbuf.b.part_branch, e.pbuf.b.g_branch, n, .f32, e.stream.handle);
             try cm.exchange(e.pbuf.b.part_moe, e.pbuf.b.g_moe, n, .f32, e.stream.handle);
             try e.stream.synchronize();
         };
-        // both ranks have loaded (the exchange above met them): the checkpoint's pages out of this box's page cache,
-        // where the other rank's NFS reads left them (TF_FLASHNEXT_DROP_PAGES=0 keeps them)
+        // both ranks loaded: drop the checkpoint's pages from the page cache (TF_FLASHNEXT_DROP_PAGES=0 keeps them)
         if (!envOff("TF_FLASHNEXT_DROP_PAGES")) weights.dropPages(gpa, io, dir);
         e.poison = envGet("TF_FLASHNEXT_POISON_PADS") != null;
         e.pass_times = envGet("TF_FLASHNEXT_PASS_TIMES") != null;
@@ -570,8 +530,7 @@ pub const Engine = struct {
         var reserve_gib = o.reserve_gib;
         if (std.c.getenv("TENSORFOLD_MEMORY_RESERVE_GIB")) |v| reserve_gib = std.fmt.parseFloat(f64, std.mem.span(v)) catch return error.BadMemoryReserve;
         const reserve: usize = @intFromFloat(reserve_gib * (1 << 30));
-        // MemAvailable counts the mapped n-gram table's reclaimable pages (they then page from disk, as Python's
-        // admission accepts); the device's own count of free memory leaves them out
+        // MemAvailable counts the mapped n-gram table's reclaimable pages; the device's free count leaves them out
         const free = memAvailable(io) orelse (try ctx.memInfo()).free;
         e.budget = .{ .limit = o.kv_budget orelse (free -| reserve -| o.vision_reserve) };
         if (o.vision_reserve > 0) std.log.info("vision: {d:.2} GiB kept free for the image tower's workspace", .{@as(f64, @floatFromInt(o.vision_reserve)) / (1 << 30)});
@@ -596,8 +555,7 @@ pub const Engine = struct {
         return e;
     }
 
-    /// The prompt buffers' DeltaNet taps: row r reads [conv state (3) | rows] at r .. r + 3, stream 0 (Python
-    /// Buffers.windows and sid).
+    /// The prompt buffers' DeltaNet taps: row r reads [conv state (3) | rows] at r .. r + 3 (Python Buffers.windows).
     fn initWindows(e: *Engine) !void {
         const b = &e.pbuf.b;
         const taps = e.g.conv_kernel;
@@ -677,9 +635,7 @@ pub const Engine = struct {
         return s;
     }
 
-    /// A sequence's caches in reserved address space: State's own (one row) given back, then per cache layer the
-    /// keys', values' and pooled blocks' ranges for the whole window, mapped up to `first` rows, and the indexer
-    /// keys' range over one ring chunk.
+    /// A sequence's caches in reserved address space: per layer KV and pooled ranges mapped to `first`, a key ring.
     fn mapSeq(e: *Engine, s: *Seq, v: *const vmm.Vmm, first: usize) !void {
         const g = e.g;
         const st = &s.st;
@@ -724,17 +680,13 @@ pub const Engine = struct {
         e.gpa.destroy(s);
     }
 
-    /// One cache layer's indexer-key ring (physical bytes): a prompt chunk's rows and the 3 before them that a pool
-    /// reads, at least `ring_min_rows`, a power of two of rows (mapSeq aligns the reservation to it) in whole granules.
+    /// One cache layer's indexer-key ring bytes: chunk rows plus 3, at least ring_min_rows, a power of two.
     fn ringBytes(e: *const Engine, v: *const vmm.Vmm) usize {
         const rows = std.math.ceilPowerOfTwo(usize, @max(ring_min_rows, e.prefill_rows + e.g.index_ratio)) catch unreachable;
         return v.up(@max(rows * e.g.index_dim * 2, v.granularity));
     }
 
-    /// Bytes a new sequence holding `rows` context rows would take: its fixed state and its caches at the growth
-    /// step that holds them, as newSeq, mapSeq and the growth charge them (in reserved address space: per cache
-    /// layer the indexer-key ring and the keys, values and pooled blocks mapped in whole granules; else State's
-    /// one allocation with full-length indexer keys). The keys' and values' bytes follow the KV format.
+    /// Bytes a new sequence of `rows` context rows takes (fixed state plus caches at that growth step), as newSeq does.
     pub fn seqBytes(e: *const Engine, rows: usize) usize {
         const g = e.g;
         const cap = @min(e.max_len, std.mem.alignForward(usize, @max(rows, 1), state.grow_step));
@@ -764,16 +716,12 @@ pub const Engine = struct {
 
     // -- the prompt -------------------------------------------------------------------------------------------
 
-    /// decode.prefill (fresh, no kept states): the prompt's chunks committed in order, each one's next tokens
-    /// absorbed by the MTP head (`absorbing`), then the first draw at the prompt's length.
+    /// decode.prefill (fresh): the prompt's chunks committed in order, each absorbed by the MTP head; the first draw.
     pub fn prefill(e: *Engine, prompt: []const u32, sampling: ?lanes.Sampling) !u32 {
         return (try e.prefillWith(prompt, sampling, .{})).first;
     }
 
-    /// A kept prompt state (Python State.snapshot with its MTP tail): the DeltaNet states, conv windows, n-gram
-    /// tail and history at `pos`, the MTP head's length one short of it and the streams of row pos - 1, so a prompt
-    /// that extends tokens[0..pos] resumes there (its caches' first pos rows must still be in the sequence: the
-    /// one it was kept from, or one copyPrefix filled). The rows past pos may have been overwritten since.
+    /// A kept prompt state (Python State.snapshot + MTP tail) at `pos`; a resume needs those cache rows in place.
     pub const Snapshot = struct {
         pos: usize,
         mtp_len: usize,
@@ -804,8 +752,7 @@ pub const Engine = struct {
         return .{ g.linear_layers * g.nv * state.gdn_dv * state.gdn_dk * 4, g.linear_layers * (g.conv_kernel - 1) * g.gdnConv() * 2, (g.ple_kernel - 1) * g.ngram_size * g.wide() * 2, g.wide() * 2, (g.attention_layers + 1) * g.index_ratio * g.index_dim * 2 };
     }
 
-    /// Cache layer i's incomplete-block rows [first, end) at the sequence's committed rows (pos, or the MTP
-    /// head's `mtp_len` for its layer).
+    /// Cache layer i's incomplete-block rows [first, end) at the committed rows (pos, or mtp_len for the MTP layer).
     fn ikcTail(e: *const Engine, i: usize, pos_rows: usize, mtp_rows: usize) [2]usize {
         const end = if (e.g.mtp and i == e.g.attention_layers) mtp_rows else pos_rows;
         return .{ end / e.g.index_ratio * e.g.index_ratio, end };
@@ -868,8 +815,7 @@ pub const Engine = struct {
         try e.f.setMtpLen(st, snap.mtp_len);
     }
 
-    /// State.copy_prefix: `src`'s first `pos` cache rows (and complete indexer blocks) and its MTP head's first
-    /// `mtp_len` into `dst` (grown to hold them), so `dst` can resume from a snapshot kept on `src`.
+    /// State.copy_prefix: `src`'s first `rows` cache rows and `mtp_rows` MTP rows into `dst`, to resume src's snapshot.
     pub fn copyPrefix(e: *Engine, dst: *Seq, src: *Seq, rows: usize, mtp_rows: usize) !void {
         if (dst == src) return error.SameSequence;
         if (rows > src.st.pos or mtp_rows > src.st.mtp_len) return error.PrefixPastSource;
@@ -887,9 +833,7 @@ pub const Engine = struct {
         }
     }
 
-    /// decode.prefill with kept states: the prompt's chunks (one ends at `keep_at`, whose state is kept; prompt
-    /// chunks are chunk-invariant, so a chunk ending there leaves the bits of a cut inside one), or a resume from a
-    /// kept state of this sequence (its MTP tail absorbed with the prompt's next token first). The first draw.
+    /// decode.prefill with kept states: chunks (one ends at kept `keep_at`; same bits) or a kept-state resume; draw.
     pub fn prefillWith(e: *Engine, prompt: []const u32, sampling: ?lanes.Sampling, o: PrefillOptions) !Prefilled {
         if (prompt.len == 0) return error.EmptyPrompt;
         if (e.pfill != null) return error.PromptBuffersBusy; // a sliced fill holds the prompt buffers mid-chunk
@@ -995,8 +939,7 @@ pub const Engine = struct {
         return .{ .first = first[0], .kept = kept };
     }
 
-    /// Where a prompt chunk from `start` ends: prefill_rows on, or the prompt's end when that is at most
-    /// prefill_tail rows further.
+    /// Where a prompt chunk from `start` ends: prefill_rows on, or the prompt's end if at most prefill_tail further.
     fn chunkEnd(e: *const Engine, start: usize, len: usize) usize {
         const end = @min(start + e.prefill_rows, len);
         return if (len - end <= e.prefill_tail) len else end;
@@ -1014,8 +957,7 @@ pub const Engine = struct {
     /// One prompt of a burst (prefillMany).
     pub const ManyPrompt = struct { seq: *Seq, prompt: []const u32, sampling: ?lanes.Sampling };
 
-    /// Whether `prefillMany` can take these prompts as one pass: two to `state.max_rows` prompts whose rows fit the
-    /// prompt buffers together (each a whole prompt, from reset).
+    /// Whether prefillMany takes these prompts in one pass: 2..state.max_rows whole prompts that fit the buffers.
     pub fn manyFit(e: *const Engine, prompts: []const ManyPrompt) bool {
         if (prompts.len < 2 or prompts.len > state.max_rows or e.pfill != null) return false;
         var rows: usize = 0;
@@ -1026,10 +968,7 @@ pub const Engine = struct {
         return rows <= e.prefill_rows;
     }
 
-    /// Several prompts in ONE prompt pass (a burst): their rows stage one after another, every row-wise step runs once
-    /// over all of them, each prompt's attention, DeltaNet chain, n-gram tail and MTP cache run over its own rows from
-    /// its own state (the prompt chunks are chunk-invariant), so each prompt's states and its first token equal its
-    /// own prefillWith's. `firsts[i]` is prompt i's draw at its length. No prompt-cache marks or resumes here.
+    /// Several prompts in one pass: row-wise steps once, state per prompt; each one equals its own prefillWith.
     pub fn prefillMany(e: *Engine, prompts: []const ManyPrompt, firsts: []u32) !void {
         if (!e.manyFit(prompts)) return error.BadBurst;
         if (firsts.len < prompts.len) return error.BadBurst;
@@ -1052,7 +991,7 @@ pub const Engine = struct {
         const lg = (try e.f.computeSegs(segs[0..n], pb, true)).?;
         for (prompts, segs[0..n]) |p, sg| try e.f.th.copy(p.seq.last_streams.?.ptr, pb.b.streams + (sg.a1 - 1) * Wd * 2, Wd * 2);
         if (use_mtp) {
-            // each prompt's MTP rows: its next tokens over the main model's streams of its rows (a prompt of one row has none)
+            // each prompt's MTP rows: its next tokens over its rows' streams (a one-row prompt has none)
             var inputs: [state.max_rows]mtp.Input = undefined;
             var m: usize = 0;
             for (prompts, segs[0..n]) |p, sg| {
@@ -1074,8 +1013,7 @@ pub const Engine = struct {
         }
     }
 
-    /// A prompt filling in slices between decode rounds (fillBegin, fillStep): the chunk in progress, its next
-    /// layer and the pending write-back it carries (all in the prompt buffers, which rounds never touch).
+    /// A prompt filling in slices between decode rounds: the chunk in progress, its next layer, its pending write-back.
     pub const Fill = struct {
         seq: *Seq,
         prompt: []u32,
@@ -1124,9 +1062,7 @@ pub const Engine = struct {
         e.gpa.destroy(fl);
     }
 
-    /// Up to `layers` more layer passes of the filling prompt (a chunk's embedding and finish ride with its first
-    /// and last layer); true once the prompt is committed and `first` holds its draw. The same calls in the same
-    /// order as prefillWith, so the same bits, with decode rounds of other sequences run between the slices.
+    /// Up to `layers` more layer passes of the filling prompt, as prefillWith calls them; true once `first` is drawn.
     pub fn fillStep(e: *Engine, fl: *Fill, layers: usize) !bool {
         if (fl.done) return true;
         const pb = &e.pbuf;
@@ -1247,15 +1183,12 @@ pub const Engine = struct {
         try buf.download(0, host);
     }
 
-    /// Engine.sample over `rows` rows of the main head's `logits` (one rank) or gathered candidates `cand_all`
-    /// (two ranks), keyed at first_position + r.
+    /// Engine.sample over `rows` rows of the main head's `logits` (one rank) or gathered `cand_all` (two ranks).
     fn draw(e: *Engine, logits: u64, cand_all: u64, rows: usize, first_position: u64, out: []u32) !void {
         return e.drawRows(logits, cand_all, rows, 0, rows, first_position, e.sampling, out);
     }
 
-    /// The draws of rows [row0, row0 + rows) of a forward's `total` rows (one stream's window of a shared round)
-    /// with that stream's sampling.
-    /// choose_gathered over rows [row0, row0 + rows) of the host copy `all` [world][total][2 CAND + 1].
+    /// choose_gathered over one stream's rows [row0, row0 + rows) of the host copy `all` [world][total][2 CAND + 1].
     fn chooseFrom(e: *Engine, all: []const f32, total: usize, row0: usize, rows: usize, first_position: u64, s: ?lanes.Sampling, out: []u32) !void {
         const width = 2 * state.cand + 1;
         // this window's rows of every rank's block
@@ -1321,10 +1254,7 @@ pub const Engine = struct {
 
     pub const Window = fwd.Window;
 
-    /// One forward over every stream's window, each at its own position on its own caches; the dense layers,
-    /// hyper-connections and experts once over all rows (each row's bits as alone), the DeltaNet chain, attention
-    /// and n-gram tail per stream. Then sampleWindow / commitWindow each window, and draftMany. One window runs
-    /// as `forward` does (graphs).
+    /// One forward over every stream's window (row-wise layers once, state per stream), then sample, commit, draftMany.
     pub fn verifyMany(e: *Engine, windows: []const Window) !void {
         if (windows.len == 0) return error.EmptyRound;
         try e.f.mark(.gap_verify);
@@ -1370,12 +1300,10 @@ pub const Engine = struct {
         try e.f.commitAt(sg.seq, &e.buf, sg.a1 - sg.a0, keep, sg.a0);
     }
 
-    /// Where a stream's absorb reads the main model's final streams: its prompt's last row, or its window's
-    /// first rows in the last shared round.
+    /// Where a stream's absorb reads the main model's final streams: the prompt's last row or the window's first rows.
     pub const DraftSource = union(enum) { prefill_last, window: usize };
 
-    /// One stream's MTP drafting: absorb `next` (the kept tokens) with their streams, then chain up to `count`
-    /// drafts with `sampling` and `confidence` into `out`; `drafted` is set to how many (Python _draft_all).
+    /// One stream's MTP drafting (Python _draft_all): absorb `next`, chain up to `count` drafts into `out`, `drafted`.
     pub const DraftReq = struct {
         seq: *Seq,
         source: DraftSource,
@@ -1387,9 +1315,7 @@ pub const Engine = struct {
         drafted: usize = 0,
     };
 
-    /// MultiDecoder._draft_all: every stream absorbs its kept rows in one MTP step, then a step a depth over the
-    /// streams still drafting (the first draft always kept, a later one only at or above the confidence), each
-    /// draw with its stream's rule at its own position. Each stream's drafts equal its solo chain's.
+    /// MultiDecoder._draft_all: one absorb step for all streams, then a step a depth; drafts equal each solo chain's.
     pub fn draftMany(e: *Engine, reqs: []DraftReq) !void {
         const mb = &(e.mbuf orelse return error.NoMtpHead);
         const d = &(e.draws orelse return error.NoMtpHead);
@@ -1496,8 +1422,7 @@ pub const Engine = struct {
         }
     }
 
-    /// One request of a reference multi-stream run (generateMany): its prompt, reply cap, rule and drafting, and
-    /// the round it arrives at (0: before the first; later ones fill in slices between rounds).
+    /// One request of a reference multi-stream run (generateMany) and the round it arrives at (later ones fill slices).
     pub const Request = struct {
         prompt: []const u32,
         max_tokens: usize,
@@ -1536,10 +1461,7 @@ pub const Engine = struct {
         return e.generateManyWith(gpa, reqs, .{});
     }
 
-    /// Every request decoded together in shared rounds (Python MultiDecoder.round's order: verify every window,
-    /// draw each stream's rows, keep each up to its first miss, every drafting stream's next drafts in shared MTP
-    /// steps). Requests arriving later fill their prompts in layer slices between rounds while the others decode.
-    /// Each request's tokens must equal its solo run's.
+    /// Requests decoded in shared rounds (Python MultiDecoder.round order); each one's tokens equal its solo run's.
     pub fn generateManyWith(e: *Engine, gpa: Allocator, reqs: []Request, mo: ManyOptions) !void {
         e.times = .{};
         var t = std.Io.Clock.awake.now(e.io);
@@ -1754,8 +1676,7 @@ pub const Engine = struct {
 
     // -- CUDA graphs ------------------------------------------------------------------------------------------
 
-    /// Graphs of sequence `seq` (all, or those of other buffer versions than `keep` or of another media
-    /// attachment than `media`) released.
+    /// Graphs of sequence `seq` released: all, or those of a buffer version other than `keep`.
     fn dropGraphs(e: *Engine, seq: usize, keep: ?u32) void {
         return e.dropGraphsOf(seq, keep, null);
     }
@@ -1772,8 +1693,7 @@ pub const Engine = struct {
         }
     }
 
-    /// An image or video sequence's graphs are keyed by its attachment (GraphKey.media); TF_FLASHNEXT_MEDIA_GRAPHS=0
-    /// runs such sequences eagerly (the same bits).
+    /// Image/video graphs are keyed by attachment (GraphKey.media); TF_FLASHNEXT_MEDIA_GRAPHS=0 runs them eagerly.
     fn graphable(e: *Engine, rows: usize) bool {
         return e.graphs_on and e.f.dump == null and e.f.prof == null and rows <= e.buf.b.rows and (e.media_graphs or e.bound.media == null);
     }
@@ -1793,8 +1713,7 @@ pub const Engine = struct {
         } else _ = try e.f.compute(e.bound, &e.buf, rows, true);
     }
 
-    /// Replays the staged window's graph, capturing it first: an eager run at the bucket (this call's result),
-    /// then the capture of the same launches (Graphs.forward / mtp_forward).
+    /// Replays the staged window's graph, capturing it first after an eager run (Graphs.forward / mtp_forward).
     fn graphed(e: *Engine, comptime head: bool, rows: usize, ctx: usize, par: u32) !void {
         const seq = e.bound;
         const key: GraphKey = .{ .seq = @intFromPtr(seq), .version = seq.st.version, .mtp = head, .rows = @intCast(rows), .parity = par, .ctx = ctx, .media = mediaKey(seq) };
@@ -1827,8 +1746,7 @@ pub const Engine = struct {
         return true;
     }
 
-    /// Ends the capture (always) and, when `ok`, instantiates and uploads it; null (noted) on any failure, with the
-    /// stream no longer capturing and nothing left allocated.
+    /// Ends the capture and, when `ok`, instantiates and uploads it; null on any failure with nothing left allocated.
     fn capEnd(e: *Engine, f: *CaptureFault, comptime class: []const u8, ok: bool) ?cuda.graph.Exec {
         var g = cuda.graph.endCapture(e.stream) catch |err| {
             if (ok) _ = e.capNote(f, class, "end capture", err);
@@ -1860,8 +1778,7 @@ pub const Engine = struct {
         return exec;
     }
 
-    /// A capture failed: warn, run eagerly, and pause this class of captures for 64 rounds, doubling with each
-    /// failure in a row up to 4096. Returns false (the capture body's `ok`).
+    /// A failed capture: warn, run eagerly, pause the class 64 rounds (doubling per failure up to 4096); returns false.
     fn capNote(e: *Engine, f: *CaptureFault, comptime class: []const u8, what: []const u8, err: anyerror) bool {
         f.total += 1;
         f.streak +|= 1;
@@ -1877,9 +1794,7 @@ pub const Engine = struct {
         std.log.info("graphs after {d} captures ({s}): {d} solo, {d} shared live; {d} instantiated; {d} MiB device memory free", .{ e.captures, class, e.graphs.count(), e.multi.count(), e.instantiated, free >> 20 });
     }
 
-    /// Graphs.warm: every decode window (1 .. depth + 1 rows) at both DeltaNet parities and every MTP step size
-    /// captured on the engine's own sequence before serving, so no request waits on a capture; the sequence is
-    /// emptied after. Returns the graphs captured. (A sequence from newSeq captures its own on first use.)
+    /// Graphs.warm: every decode window and MTP step size captured on the engine's sequence before serving; the count.
     pub fn warmGraphs(e: *Engine) !usize {
         if (!e.graphs_on) return 0;
         const before = e.captures;
@@ -1912,8 +1827,7 @@ pub const Engine = struct {
         }
     }
 
-    /// A shared step's composition: every segment's sequence, buffer version, rows, DeltaNet parity and context
-    /// bucket (written to `ctxs`), and which buffers; null when a sequence's DeltaNet layers are out of step.
+    /// A shared step's composition key (sequences, versions, rows, parities, `ctxs` buckets); null if DeltaNet apart.
     fn multiKey(e: *Engine, comptime head: bool, segs: []const fwd.Seg, ctxs: []usize) ?u64 {
         var h = std.hash.Wyhash.init(if (head) 0x6d7470 else 0x6d61696e);
         for (segs, ctxs) |sg, *c| {
@@ -1928,8 +1842,7 @@ pub const Engine = struct {
         return h.final();
     }
 
-    /// A shared step through its graph (captured on the composition's second sight: an eager run at the
-    /// buckets, which is this call's result, then the capture), else eagerly. Staging stays outside.
+    /// A shared step through its graph (captured on the composition's second sight), else eagerly; staging outside.
     fn runMulti(e: *Engine, comptime head: bool, segs: []const fwd.Seg, x: *const fwd.Bufs) !void {
         var ctxs: [64]usize = undefined;
         if (segs.len > ctxs.len) return error.TooManyStreams;
@@ -2005,8 +1918,7 @@ pub const Engine = struct {
         try e.f.commit(e.bound, &e.buf, rows, keep);
     }
 
-    /// decode.absorb: the MTP cache drops the last chain's drafts and takes the kept rows' streams with the next
-    /// tokens (the prompt's last row, or the last window's first next_tokens.len rows).
+    /// decode.absorb: the MTP cache drops the last chain's drafts and takes the kept rows' streams and next tokens.
     pub fn absorb(e: *Engine, source: decode.Source, next_tokens: []const u32) !void {
         const mb = &(e.mbuf orelse return error.NoMtpHead);
         const st = &e.bound.st;
@@ -2049,8 +1961,7 @@ pub const Engine = struct {
 
     // -- the oracle checks' entry points ----------------------------------------------------------------------
 
-    /// The teacher's MTP step: mtp_forward([next], buf.streams[:1]) at mtp_len, then mtp_len + 1; the draft head's
-    /// row (device).
+    /// The teacher's MTP step: mtp_forward([next], buf.streams[:1]) at mtp_len, then mtp_len + 1; the draft head's row.
     pub fn teacherMtp(e: *Engine, next: u32) !u64 {
         const mb = &(e.mbuf orelse return error.NoMtpHead);
         const st = &e.bound.st;

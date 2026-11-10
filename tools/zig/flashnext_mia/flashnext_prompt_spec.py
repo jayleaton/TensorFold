@@ -1,16 +1,5 @@
 #!/usr/bin/env python3
-"""The prompt-path matmul specializations (src/tensorfold/families/qwen4_exp/cuda/prompt_mm.py) for the kernel set.
-
-For every ``_b16mm`` / ``_fp4mm`` entry of the spec that a prompt chunk launches with split K (the 128-row bucket,
-``SK > 1``, ``M`` a runtime int), an entry of ``_b16mm_ks`` / ``_fp4mm_ks`` with the same shape constexprs, the same
-attributes and options, and no ``PART`` argument. Entries this script made before (``"rule"`` starting with
-``prompt_mm``) are replaced, so it can run again after a ``derive`` / ``cover``.
-
-    python3 -B tools/zig/flashnext_mia/flashnext_prompt_spec.py --spec zig/tests/cuda/flashnext_mia/kernels.json \
-        --out zig/tests/cuda/flashnext_mia/kernels.json
-    # then (PyTorch image, this tree at /tensorfold):
-    python -B tools/zig/flashnext_mia/flashnext_aot.py build --spec zig/tests/cuda/flashnext_mia/kernels.json --out <dir> --only _ks
-"""
+"""The prompt-path split-K matmuls (prompt_mm.py): ``_b16mm_ks`` / ``_fp4mm_ks`` entries cloned from split-K entries."""
 
 from __future__ import annotations
 
@@ -130,8 +119,7 @@ def glue_entries(kernels: list[dict]) -> list[dict]:
 
 
 def wbnorm_entries(kernels: list[dict]) -> list[dict]:
-    """``_hc_wb_norm`` (``_hc_writeback`` + ``_hc_normed`` a row a program) for every ``_hc_writeback`` entry: its
-    arguments, constexprs, attributes and options, then SCALE, NORMED and eps."""
+    """``_hc_wb_norm`` for every ``_hc_writeback`` entry: its arguments, constexprs, options, SCALE, NORMED, eps."""
 
     out = []
     for k in kernels:

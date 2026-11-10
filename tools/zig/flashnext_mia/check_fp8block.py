@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""Python's block-FP8 linear (cuda/nvfp4/linear.py Fp8BlockLinear, qmmf FP8G) on synthetic tensors at the
-INT4-AutoRound checkpoint's shapes: writes each case's e4m3 codes, fp32 weight_scale_inv and bf16 input rows, and the
-sha256 of Python's layouts (w8, bs) and of its outputs for every row count, for ``tensorfold fp8-check DIR`` (the Zig
-engine's port, cuda_fp8.zig) to compare byte for byte.
-
-Run on a GPU in nvcr.io/nvidia/pytorch:26.07-py3 with the tree at /tensorfold (PYTHONPATH=/tensorfold/src):
-    python -B tools/zig/flashnext_mia/check_fp8block.py OUT_DIR
-"""
+"""Python's block-FP8 linear on synthetic INT4-AutoRound shapes: inputs and digests for ``tensorfold fp8-check``."""
 
 from __future__ import annotations
 

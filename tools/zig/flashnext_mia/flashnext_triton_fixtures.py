@@ -1,14 +1,5 @@
 #!/usr/bin/env python3
-"""Flash Next's Triton launches as its Python wrappers make them, for the Zig wrappers' host tests.
-
-Each Python wrapper (qwen4_exp/cuda/{glue,bf16,nvfp4,attention,forward,exl3_mm}.py, cuda/moe.py) runs on CPU tensors
-of the NVFP4 checkpoint's shapes (TP=1 and the TP=2 rank shapes of work/PLAN.md) with its Triton kernels replaced by
-recorders: nothing launches, and each launch's kernel, grid, runtime arguments (name, Triton type, int and float
-values) and constexprs are written to zig/src/families/flashnext_mia/fixtures_cuda_triton.json. cuda_triton.zig's tests
-make the same calls and compare. Run from the repo root with the source on PYTHONPATH (CPU only):
-
-    PYTHONPATH=src python tools/zig/flashnext_mia/flashnext_triton_fixtures.py --out zig/src/families/flashnext_mia/fixtures_cuda_triton.json
-"""
+"""Flash Next's Triton launches as its Python wrappers make them (CPU, recorders), for the Zig wrappers' host tests."""
 
 from __future__ import annotations
 

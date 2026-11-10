@@ -1,12 +1,4 @@
-//! Flash Next for the native server on CUDA: the engine, its MTP head and the lane backend. native/cuda.zig drives
-//! what `open` returns; nothing here knows the server.
-//!
-//! Two ranks (`tp` 2, work/PLAN.md "Two ranks in serving"): before either loads, rank 0 listens on
-//! `master`:`master_port` and rank 1 joins it (cuda_link.zig); both agree on their settings (checkpoint, snapshot,
-//! window, drafts, YaRN, kernel set), join the NCCL communicator (cuda_comm.zig) and load their halves. Rank 0's
-//! backend is then the mirror (cuda_mirror.zig): each lane call goes to rank 1 before it runs, as a record
-//! broadcast over NCCL on the engine's stream (a long prompt on the link); rank 1 runs `follow` instead of serving
-//! and makes the same calls on its own engine until rank 0 stops.
+//! Flash Next for the native server on CUDA: engine, MTP head, lane backend; at TP=2 rank 0 mirrors calls to rank 1.
 const std = @import("std");
 const cuda = @import("cuda");
 const lanes = @import("lanes");
@@ -18,10 +10,7 @@ const mirror = @import("cuda_mirror.zig");
 const lane_backend = @import("cuda_lanes.zig");
 
 pub const model_type = "qwen4_exp";
-/// Weight formats as tensorfold.native.contract.weight_format names them: NVIDIA's ModelOpt NVFP4 export (top-10;
-/// its quant_algo MIXED_PRECISION, NVFP4 experts) and
-/// INT4-AutoRound's GPTQ int4 (azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound, top-5); the engine reads either
-/// from the checkpoint's quantization_config (cuda_config.zig: quant_method "modelopt" or "gptq").
+/// Weight formats: ModelOpt NVFP4 (top-10) or INT4-AutoRound GPTQ int4 (top-5), read from quantization_config.
 pub const formats: []const []const u8 = &.{ "modelopt-nvfp4", "modelopt-mixed-precision", "gptq-b4" };
 /// The checkpoint's native window; 1,048,576 with YaRN (work/PLAN.md, "1M context").
 pub const default_context: i64 = 262144;
@@ -124,13 +113,11 @@ pub fn openOn(comptime M: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const 
     own.* = .{ .gpa = gpa, .rank = o.rank, .world = o.tp };
     errdefer own.closeLink();
     const yarn = try yarnFor(gpa, io, dir, o.context);
-    // the window: 15 drafts (16 rows: deeper MTP chains and copy windows; decode D4, TP=2 served edits +37%, code and
-    // prose unchanged at confidence 0.5; aot/fnaot3 holds every width to 16) unless TF_FLASHNEXT_DEPTH says (Python's 6)
+    // the window: 15 drafts (16 rows) unless TF_FLASHNEXT_DEPTH says (Python's 6)
     const depth: usize = if (getenv("TF_FLASHNEXT_DEPTH")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadDepth else 15;
     if (depth < 1 or depth > lane_backend.max_drafts) return error.BadDepth;
     if (o.tp == 2) {
-        // a rank stops on SIGTERM / SIGINT while it loads and, rank 1, while it follows (in a container it is PID 1,
-        // where a signal's default action is ignored); rank 0's server takes them over once it serves
+        // a rank stops on SIGTERM / SIGINT while loading or following (PID 1 ignores them); then rank 0's server does
         installStop();
         const address = std.Io.net.IpAddress.parse(o.master orelse "", o.master_port) catch {
             std.log.err("--master {s}: not an IP address", .{o.master orelse ""});
@@ -175,8 +162,7 @@ pub fn openOn(comptime M: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const 
     own.lanes.product_streams = @import("cuda_engine.zig").productStreams();
     own.lanes.wide_confidence = @import("cuda_engine.zig").wide_confidence;
     own.lanes.overcommit = if (getenv("TF_FLASHNEXT_OVERCOMMIT")) |v| std.mem.eql(u8, v, "1") else false;
-    // prompts fill in layer slices between rounds (the engine's fillBegin / fillStep): opt-in until the sliced
-    // fill is verified exact on GPUs; both ranks agree on it
+    // prompts fill in layer slices between rounds: opt-in until verified exact on GPUs; both ranks agree on it
     own.lanes.sliced = if (getenv("TF_FLASHNEXT_FILL")) |v| std.mem.eql(u8, v, "1") else false;
     if (getenv("TF_FLASHNEXT_FILL_LAYERS")) |v| own.lanes.fill_layers = @max(1, std.fmt.parseInt(usize, v, 10) catch 8);
     errdefer own.lanes.deinit();
@@ -286,8 +272,7 @@ fn Owned(comptime M: type) type {
     };
 }
 
-/// SIGTERM / SIGINT end the process at once (exit 0): the other rank sees the link close and exits too. Only
-/// async-signal-safe calls (write, _exit): the main thread may be waiting in a collective or on the link.
+/// SIGTERM / SIGINT exit 0 at once (the peer sees the link close); async-signal-safe calls only (write, _exit).
 fn installStop() void {
     const posix = std.posix;
     const stop: posix.Sigaction = .{ .handler = .{ .handler = onStop }, .mask = posix.sigemptyset(), .flags = 0 };
@@ -329,8 +314,7 @@ fn costText(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) ![]u32 {
     return tok.encode(gpa, cost_text);
 }
 
-/// The window this checkpoint serves (native/cuda.zig's admission): YaRN's factor x original when the config or
-/// TF_FLASHNEXT_YARN turns it on, else max_position_embeddings; 0 when config.json cannot be read.
+/// The window served: YaRN's factor x original when on, else max_position_embeddings; 0 if config.json is unreadable.
 pub fn modelWindow(a: std.mem.Allocator, io: std.Io, dir: []const u8) i64 {
     const path = std.fs.path.join(a, &.{ dir, "config.json" }) catch return 0;
     defer a.free(path);
@@ -349,8 +333,7 @@ fn windowOf(a: std.mem.Allocator, config_text: []const u8, factor_env: ?[]const 
     return if (v == .integer and v.integer > 0) v.integer else 0;
 }
 
-/// YaRN for this run: the checkpoint's rope_parameters or TF_FLASHNEXT_YARN (cuda_rope.fromConfig), else past the
-/// native window the factor that reaches `context`; null below it.
+/// YaRN for this run: the checkpoint's or TF_FLASHNEXT_YARN, else the factor reaching `context` past the native window.
 fn yarnFor(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, context: usize) !?rope.Yarn {
     const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
     defer gpa.free(path);

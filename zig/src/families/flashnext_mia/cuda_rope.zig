@@ -1,16 +1,4 @@
-//! Flash Next's rotary frequencies on the host: the default ones and YaRN past the native 262,144 tokens (Qwen's
-//! recipe: rope_type yarn, factor 4, original_max_position_embeddings 262144 -> a 1,048,576-token window), with the
-//! bits of the Python engine (qwen4_exp/cuda/weights.py's inv_freq, patched by qwen4_exp/cuda/yarn.py; work/YARN.md).
-//!
-//! The rotary dims are the first `rotary_dim` (64) of each head, rotate-half pairs (i, i + 32). Frequencies are
-//! computed in fp64 and rounded to fp32 once. YaRN follows Transformers' `_compute_yarn_parameters`: pair i keeps the
-//! native frequency theta^(-i/32) below the ramp, takes it over `factor` above it, and blends linearly between the
-//! correction dims of beta_fast (32) and beta_slow (1) rotations in `original_max_position_embeddings` positions
-//! (floor and ceil: pairs 14..22 at theta 1e7). The attention factor (0.1 ln(factor) + 1 = 1.13862943649292 in fp32
-//! at factor 4) multiplies cos and sin of the rotary dims in Transformers and vLLM; this engine folds it, rounded to
-//! fp32, into the fp32 gammas of the four RMSNorms whose outputs are rotated (q_norm, k_norm, indexer q_layernorm and
-//! k_layernorm of every attention layer and the MTP layer): the normalized head is multiplied by its gamma before
-//! the rotation, and the rotation is linear, so no kernel changes. Dims past `rotary_dim` keep their gammas.
+//! Flash Next rotary frequencies on the host (Python weights.py inv_freq + yarn.py); YaRN gain folded into fp32 gammas.
 const std = @import("std");
 
 /// The most rotary pairs a head may have here (Flash Next: 32).
@@ -30,8 +18,7 @@ pub const Yarn = struct {
     /// the config's attention_factor (or mscale / mscale_all_dim ratio); 0 derives it from `factor`
     attention_factor: f64 = 0,
     truncate: bool = true,
-    /// the positions the correction dims count rotations in; 0 is `original` (Transformers). vLLM's
-    /// MRotaryEmbedding hands its YaRN code 4x `original`, which moves the ramp to pairs 16..24.
+    /// positions the correction dims count rotations in; 0 is `original` (Transformers; vLLM passes 4x `original`)
     ramp_positions: u64 = 0,
 
     /// The prompt-plus-reply window YaRN serves: factor x original.
@@ -62,8 +49,7 @@ fn mscale(scale: f64, m: f64) f64 {
     return if (scale <= 1) 1.0 else 0.1 * m * @log(scale) + 1.0;
 }
 
-/// The rotary dim at which a frequency makes `rotations` turns in `positions` positions (Transformers'
-/// find_correction_dim, same operation order).
+/// The rotary dim where a frequency makes `rotations` turns in `positions` (Transformers' find_correction_dim).
 fn correctionDim(rotations: f64, dim: f64, theta: f64, positions: f64) f64 {
     return dim * @log(positions / (rotations * 2 * std.math.pi)) / (2 * @log(theta));
 }
@@ -77,9 +63,7 @@ pub const Rope = struct {
         return self.rotary_dim / 2;
     }
 
-    /// out[i] = the fp32 frequency of rotary pair i (out.len == rotary_dim / 2), computed in fp64 with the Python
-    /// engine's operations: theta ** (-i / half); under YaRN (native / factor) * (1 - keep) + native * keep with
-    /// keep = 1 - clamp((i - low) / (high - low), 0, 1).
+    /// out[i] = fp32 frequency of rotary pair i, computed in fp64 with the Python engine's operations (YaRN blend).
     pub fn invFreq(self: Rope, out: []f32) Error!void {
         const h = self.half();
         if (h == 0 or h > max_half or self.rotary_dim % 2 != 0 or out.len != h or !(self.theta > 1)) return error.InvalidRope;
@@ -114,9 +98,7 @@ pub const Rope = struct {
     }
 };
 
-/// gamma[0 .. rotary_dim] *= scale, one IEEE fp32 multiply each (the Python fold's bits); the rest is untouched.
-/// Apply once per loaded gamma: q_norm, k_norm, indexer q_layernorm and k_layernorm (fp32, as the engine stores
-/// them: 1 + w for centered checkpoints), in every attention layer and the MTP layer. A no-op at scale 1.
+/// gamma[0 .. rotary_dim] *= scale, one fp32 multiply each (Python fold's bits); apply once per rotated-norm gamma.
 pub fn foldGamma(gamma: []f32, rotary_dim: u32, scale: f32) Error!void {
     if (gamma.len < rotary_dim) return error.InvalidRope;
     if (scale == 1.0) return;
@@ -126,10 +108,7 @@ pub fn foldGamma(gamma: []f32, rotary_dim: u32, scale: f32) Error!void {
 pub const env_factor = "TF_FLASHNEXT_YARN";
 pub const env_ramp = "TF_FLASHNEXT_YARN_RAMP_POSITIONS";
 
-/// The YaRN settings of a text config, as qwen4_exp/cuda/yarn.py's `read`: `rope` is text_config.rope_parameters
-/// (empty when absent), `native` max_position_embeddings; `factor_env` is TF_FLASHNEXT_YARN (a factor above 1 forces
-/// yarn with that factor; 0/off/no/false/none/default forces the default rope) and `ramp_env` is
-/// TF_FLASHNEXT_YARN_RAMP_POSITIONS. Null: the default rope.
+/// YaRN settings of a text config as yarn.py's `read`, with TF_FLASHNEXT_YARN(_RAMP_POSITIONS) overrides; null: off.
 pub fn fromConfig(rope: std.json.ObjectMap, native: u64, factor_env: ?[]const u8, ramp_env: ?[]const u8) Error!?Yarn {
     var forced: ?f64 = null;
     if (factor_env) |raw| {
@@ -198,7 +177,6 @@ fn number(v: std.json.Value) Error!?f64 {
     };
 }
 
-// ---------------------------------------------------------------------------------------------------------------
 // tests
 
 const testing = std.testing;
@@ -209,8 +187,7 @@ fn bitsOf(v: []const f32, out: []u32) void {
     for (v, out) |x, *o| o.* = @bitCast(x);
 }
 
-// fp32 bits the Python engine stores (tensorfold-upstream:609ca41, torch 2.13 on aarch64 CPU, work/patches-python/
-// check_yarn.py): the stock weights.py inv_freq and yarn.inv_freq at factor 4, 2, and 4 with vLLM's 4x ramp window.
+// fp32 bits the Python engine stores: stock inv_freq, yarn at factor 4 and 2, and factor 4 with vLLM's 4x ramp window.
 const py_default = [32]u32{ 0x3f800000, 0x3f1ab32b, 0x3ebaf81a, 0x3e61f836, 0x3e088d77, 0x3da50957, 0x3d47763f, 0x3cf11176, 0x3c91ad39, 0x3c301052, 0x3bd4ca14, 0x3b80967d, 0x3b1b690d, 0x3abbd3ec, 0x3a6301e2, 0x3a092e02, 0x39a5cb5f, 0x394860c1, 0x38f22ce3, 0x3892587f, 0x3830df51, 0x37d5c442, 0x37812dac, 0x371c1fc4, 0x36bcb0c1, 0x36640cc6, 0x3609cf4b, 0x35a68e4c, 0x35494c56, 0x34f3499c, 0x3493048e, 0x3431af44 };
 const py_yarn4 = [32]u32{ 0x3f800000, 0x3f1ab32b, 0x3ebaf81a, 0x3e61f836, 0x3e088d77, 0x3da50957, 0x3d47763f, 0x3cf11176, 0x3c91ad39, 0x3c301052, 0x3bd4ca14, 0x3b80967d, 0x3b1b690d, 0x3abbd3ec, 0x3a6301e2, 0x39f8a364, 0x3986b53d, 0x3910058b, 0x38975c0e, 0x381b7e06, 0x379ac367, 0x3712f6ed, 0x36812dac, 0x361c1fc4, 0x35bcb0c1, 0x35640cc6, 0x3509cf4b, 0x34a68e4c, 0x34494c56, 0x33f3499c, 0x3393048e, 0x3331af44 };
 const py_yarn2 = [32]u32{ 0x3f800000, 0x3f1ab32b, 0x3ebaf81a, 0x3e61f836, 0x3e088d77, 0x3da50957, 0x3d47763f, 0x3cf11176, 0x3c91ad39, 0x3c301052, 0x3bd4ca14, 0x3b80967d, 0x3b1b690d, 0x3abbd3ec, 0x3a6301e2, 0x3a009b22, 0x399111f3, 0x3922ce9d, 0x38b5a1aa, 0x384939ae, 0x37dd1726, 0x37707cca, 0x37012dac, 0x369c1fc4, 0x363cb0c1, 0x35e40cc6, 0x3589cf4b, 0x35268e4c, 0x34c94c56, 0x3473499c, 0x3413048e, 0x33b1af44 };
@@ -238,8 +215,7 @@ test "YaRN inv_freq is the patched Python engine's bits" {
     try expectBits(r, py_yarn4_vllm);
 }
 
-/// Transformers' _compute_yarn_parameters written out independently in fp64: pos_freqs = theta^(2i/d),
-/// interpolation 1/(factor pos), extrapolation 1/pos, mask = 1 - ramp, inter (1 - mask) + extra mask.
+/// Transformers' _compute_yarn_parameters written out independently in fp64.
 fn hfYarn64(theta: f64, d: f64, factor: f64, positions: f64, out: []f64) void {
     const lo = @max(@floor(d * @log(positions / (32.0 * 2.0 * std.math.pi)) / (2.0 * @log(theta))), 0);
     var hi = @min(@ceil(d * @log(positions / (1.0 * 2.0 * std.math.pi)) / (2.0 * @log(theta))), d - 1);
@@ -377,8 +353,7 @@ test "folding the attention factor into the gammas equals scaling cos and sin" {
             for (q_ref) |v| top = @max(top, @abs(v));
             for (q_ref, q_fold) |a, b| try testing.expect(@abs(a - b) <= top * 0x1p-22); // gamma*m's fp32 rounding
             for (q_ref[64..], q_fold[64..]) |a, b| try testing.expectEqual(a, b);
-            // logits: m^2 on the rotary part, the rest unchanged; the indexer's relu(q . k) is positively
-            // homogeneous, so its scores agree the same way
+            // logits scale by m^2 on the rotary part; the indexer's relu(q . k) is homogeneous, so scores agree
             var dot_ref: f64 = 0;
             var dot_fold: f64 = 0;
             var rot_ref: f64 = 0;

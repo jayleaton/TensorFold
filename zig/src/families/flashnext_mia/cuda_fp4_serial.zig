@@ -1,6 +1,4 @@
-//! `fp4-check` (no checkpoint): fn_ops' K-serial NVFP4 kernel (cuda_torch_ops.Torch.fp4Serial) against Triton's
-//! `_fp4mm` at one K slice (the shared expert's gate/up: N 640 a TP=2 rank, 1280 at TP=1, K 2560), bytes compared over
-//! decode-sized rows, both row strides, several value ranges and scales; then both timed.
+//! `fp4-check` (no checkpoint): fn_ops' K-serial NVFP4 kernel against Triton's `_fp4mm` at one K slice, bytes and time.
 const std = @import("std");
 const cuda = @import("cuda");
 const tri = @import("cuda_triton.zig");

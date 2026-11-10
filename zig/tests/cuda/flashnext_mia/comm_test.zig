@@ -1,15 +1,4 @@
-//! Flash Next's two-rank transport on two GPUs, before the engine needs it (work/PLAN.md, TP=2 design):
-//! `tf-flashnext-comm RANK MASTER PORT [ITERS] [WARMUP]`, one process per box, rank 0 listening on MASTER:PORT.
-//!
-//! It opens the CUDA context, the control link (cuda_link.zig) and the NCCL communicator over it (cuda_comm.zig), then
-//! for every gather the engine makes per layer and per round — the fp32 partials of decode windows [1..16, 2560], a
-//! prompt chunk's [2048, 2560], and the head's gathered candidates [16, 65] — checks that the all-gather is bit-exact
-//! (each rank's words, NaN payloads, signed zeros and denormals included, land in rank order, and both ranks hold the
-//! same bytes: their sha256 is compared over the link) and times it: per call on the host (enqueue to stream done)
-//! and on the GPU (events around the call), p50/p90 over ITERS calls after WARMUP, and the pipelined rate (ITERS calls
-//! back to back, one synchronize). busbw is the bytes each rank sends (and receives) per call over the time, which is
-//! nccl-tests' bus bandwidth for an all-gather on two ranks. It also times one control-link frame round trip.
-//! Lines: PASS / FAIL / RESULT / INFO; exit 1 on any failure.
+//! Two-rank transport: engine gathers bit-exact and timed. tf-flashnext-comm RANK MASTER PORT [ITERS] [WARMUP]
 const std = @import("std");
 const cuda = @import("cuda");
 const flashnext = @import("flashnext_mia");
@@ -178,8 +167,7 @@ fn linkRoundTrip(gpa: Allocator, io: std.Io, link: link_mod.Link, rank: u32, whe
     }
 }
 
-/// Reads `buf` full with non-blocking reads in a loop: the reader never sleeps in the kernel, so the trip shows the
-/// link without the wake-up (what a busy-polling rank 1 would see between rounds).
+/// Reads `buf` full with non-blocking reads in a loop, so the trip shows the link without the wake-up.
 fn spinRead(fd: std.posix.socket_t, buf: []u8) !void {
     const posix = std.posix;
     var done: usize = 0;
@@ -244,23 +232,19 @@ fn splitmix(x: u64) u64 {
     return z ^ (z >> 31);
 }
 
-/// Rank `r`'s partial for one seed: arbitrary 32-bit words, the first ones the fp32 values a careless copy would
-/// change (quiet and signalling NaNs with payloads, both zeros, denormals, infinities, the largest finite).
+/// Rank `r`'s partial for one seed: arbitrary words led by fp32 specials (NaN payloads, zeros, denormals, infinities).
 fn fill(words: []u32, seed: u64, r: u32) void {
     const special = [_]u32{ 0x7fc0_0001, 0xffc1_2345, 0x7f80_0001, 0x8000_0000, 0x0000_0000, 0x0000_0001, 0x807f_ffff, 0x7f80_0000, 0xff80_0000, 0x7f7f_ffff };
     for (words, 0..) |*w, i| {
         w.* = if (i < special.len) special[i] else @truncate(splitmix(seed ^ (@as(u64, r) << 56) ^ @as(u64, i)));
     }
-    // the two ranks' blocks differ everywhere, so a swap or a duplicated block shows: past the specials each rank
-    // draws its own stream, and rank 1 holds the specials in reverse order
+    // the ranks' blocks differ everywhere (own streams, rank 1's specials reversed) so a swap or duplicate shows
     if (r == 1) std.mem.reverse(u32, words[0..@min(special.len, words.len)]);
 }
 
 const Failed = error{TestFailed};
 
-/// 300 gathers in a row (every third in NCCL's in-place form), sizes cycling 1 / 7 / 16 / 2 rows (and 3 x 65 words), each call's payload drawn from
-/// its index: every output checked against both ranks' expected words. RoCE's two slots and sequence numbers are
-/// exercised with fresh data each time; nothing waits between calls but the download that checks them.
+/// 300 gathers in a row (every third in place), sizes cycling, payloads from the index, every output checked.
 fn sequenceCheck(gpa: Allocator, d: *const cuda.Driver, comm: *const Comm, stream: cuda.Stream, rank: u32) !void {
     const shapes = [_][2]usize{ .{ 1, hidden }, .{ 7, hidden }, .{ 16, hidden }, .{ 2, hidden }, .{ 3, 65 } };
     const most = 16 * hidden;

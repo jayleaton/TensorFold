@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-"""A capture's kernel inventory as kernels.md: every Triton kernel (function, constexpr variants, grids, sites, launches
-per phase) and every extension call (function, scalar/template arguments, shapes), grouped by role; graph replays and
-the torch ops the profiler saw."""
+"""A capture's kernel inventory as kernels.md: Triton kernels and extension calls by role, graph replays, torch ops."""
 
 from __future__ import annotations
 

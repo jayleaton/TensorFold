@@ -1,22 +1,4 @@
-// The host half of the one-shot RoCE all-gather between two DGX Sparks (decode plan D1, work/research/R1-decode.md 3.1).
-//
-// The protocol is b12x's "RoCEnante" (https://github.com/local-inference-lab/b12x, b12x/comm/roce, by the b12x
-// contributors at Local Inference Lab, Apache License 2.0): each rank stages its shard into a pinned host send slot,
-// rings a doorbell, and this proxy thread RDMA-writes the shard into the peer's receive slot over every RoCE port,
-// each port's stripe followed on the same reliable queue pair by a 4-byte sequence number into the peer's flag for
-// that port; the peer's kernel waits for every flag, then reads the shard. This file is a new implementation of that
-// protocol for TensorFold's Zig CUDA runtime (zig/src/cuda/roce_mia.zig drives it, zig/kernels/cuda/fn_roce.cu is the GPU
-// half); the GLM-5.3 recipe's TensorFold patch 0006 did the same for the Python engine.
-//
-// Region (pinned host memory mapped into the GPU, registered with every port), offsets from roce_layout:
-//   recv[src][slot]          ROCE_SLOTS x world x slot_bytes   written by the peers' NICs
-//   flag[src][slot][port]    128 B each, u32 sequence           written by the peers' NICs after each stripe
-//   send[slot]               ROCE_SLOTS x slot_bytes             written by this rank's kernel
-//   ctrl                     128 B: u32 seq (doorbell), u32 pad, u32 error seq, u32 missing peer,
-//                            u32 bytes[ROCE_SLOTS]               written by this rank's kernel
-// libibverbs is opened at run time (dlopen), so the binary runs without it until RoCE is turned on; only the
-// queue-pair fast paths (post_send, poll_cq) go through the header's inline wrappers, which call the provider's
-// function table and need no symbol.
+// Host half of the two-Spark RoCE all-gather: b12x's RoCEnante protocol (b12x contributors, Apache-2.0), new C code.
 
 #define _GNU_SOURCE
 #include <dlfcn.h>
@@ -235,8 +217,7 @@ static int open_port(tf_roce *r, int i, const char *name) {
 
 void tf_roce_close(tf_roce *r);
 
-// Opens `ports` RDMA devices (names[i]) on port 1 with GID `gid_index`, registers `region`, makes one RC queue pair a
-// port toward the one peer. Returns NULL with the reason in `err`.
+// Opens `ports` RDMA devices on port 1 (GID `gid_index`), registers `region`, one RC queue pair a port; NULL + `err`.
 tf_roce *tf_roce_open(int world, int rank, const char *const *names, int ports, int gid_index, void *region,
                       uint64_t region_bytes, uint64_t slot_bytes, char *err, uint64_t err_len) {
   uint64_t lay[5];
@@ -363,8 +344,7 @@ static int reap(tf_roce *r, int i) {
   return 0;
 }
 
-// Sequence `seq`'s shard (`bytes`, a multiple of 16) from send[seq % SLOTS] into the peer's recv[rank][seq % SLOTS],
-// split over the ports in 16-byte units, each port's stripe then its flag (same queue pair, so in order).
+// Posts seq's shard (`bytes`, 16-multiple) into the peer's recv slot, striped over ports, each stripe then its flag.
 static int post(tf_roce *r, uint32_t seq, uint32_t bytes) {
   if (bytes == 0 || bytes % 16 != 0 || bytes > r->slot_bytes) {
     snprintf(r->err, sizeof(r->err), "RoCE shard of %u bytes (a positive multiple of 16 up to %llu)", bytes,
@@ -437,10 +417,7 @@ static uint64_t now_ns(void) {
   return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
 }
 
-// The proxy: poll the doorbell; post every sequence it has not posted, in order. A kernel finishes on the peer's
-// shard alone, so the next one can ring before this thread saw the last: at most ROCE_SLOTS are ever pending (a rank
-// cannot get two gathers ahead of its peer), each with its slot's byte count. Hot while gathers flow; after a second
-// without one it naps 50 us between polls, so an idle server does not hold a core.
+// The proxy: polls the doorbell, posts every new sequence in order (<= ROCE_SLOTS pending); naps 50 us after 1 s idle.
 static void *proxy(void *arg) {
   tf_roce *r = arg;
   volatile uint32_t *ctrl = (volatile uint32_t *)(r->region + r->ctrl_off);

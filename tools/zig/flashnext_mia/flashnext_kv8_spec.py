@@ -1,17 +1,5 @@
 #!/usr/bin/env python3
-"""The FP8 KV cache's specializations (src/tensorfold/families/qwen4_exp/cuda/kv8.py, --kv-dtype fp8) for the kernel set.
-
-For every ``_attn_prep`` and ``_chunks`` entry of the spec (TP=1 and TP=2 shapes, QSA on and off), an entry of
-``_attn_prep8`` / ``_chunks8`` with the same shape constexprs, attributes and options: the key and value codes as
-``*fp8e4nv``, the key rows' fp32 view (both scales in their trailer) as ``KS``, no int8/int4 scale tensors and no
-``BITS``. The merge stays ``_merge`` with BITS 0 (bf16's entries). Entries this script made before (``"rule"``
-starting with ``kv8``) are replaced, so it can run again after a ``derive`` / ``cover``.
-
-    python3 -B tools/zig/flashnext_mia/flashnext_kv8_spec.py --spec zig/tests/cuda/flashnext_mia/kernels.json \\
-        --out zig/tests/cuda/flashnext_mia/kernels.json
-    # then (PyTorch image, this tree at /tensorfold):
-    python -B tools/zig/flashnext_mia/flashnext_aot.py build --spec zig/tests/cuda/flashnext_mia/kernels.json --out <dir> --only kv8
-"""
+"""The FP8 KV cache's (kv8.py) ``_attn_prep8`` / ``_chunks8`` entries, cloned from each ``_attn_prep`` / ``_chunks``."""
 
 from __future__ import annotations
 

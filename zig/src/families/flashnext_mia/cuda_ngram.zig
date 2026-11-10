@@ -1,6 +1,4 @@
-//! The n-gram embedding's row ids on the host (Python qwen4_exp/cuda/ngram.py): each head's table size is a prime past
-//! the vocabulary base, the multipliers come from splitmix64, and a row id is numpy's signed int64 product-xor of the
-//! last n tokens (EOS resets the n-grams), floor-mod the head's size, plus its offset. Same values as numpy.
+//! n-gram embedding row ids on the host (Python qwen4_exp/cuda/ngram.py): numpy's int64 values exactly.
 const std = @import("std");
 
 const golden: u64 = 0x9E3779B97F4A7C15;
@@ -93,8 +91,7 @@ pub const NGram = struct {
         if (!std.mem.eql(i64, sizes, g.sizes[0..g.heads])) return error.NgramSizesDiffer;
     }
 
-    /// Row ids for `tokens` after `history` (n - 1 earlier tokens, EOS-filled at a sequence's start) into
-    /// `out[tokens.len * heads]`, row-major [token][head] (Python `ids`).
+    /// Row ids for `tokens` after `history` (n - 1 tokens, EOS-filled) into `out` [token][head] (Python `ids`).
     pub fn ids(g: NGram, history: []const i64, tokens: []const i64, out: []i64) !void {
         if (history.len != g.n - 1) return error.NgramHistoryLength;
         if (out.len != tokens.len * g.heads) return error.NgramOutLength;
@@ -147,8 +144,7 @@ pub const NGram = struct {
     }
 };
 
-// Values from Python's NGram with the nvidia/Qwen3.8-Flash-Next-NVFP4 config (vocab 248320, n 3, 8 heads per n-gram,
-// base 20,000,000, divisor 128, seed 1234, eos 248044, 2560 dims, PLE index 0).
+// Values from Python's NGram with the nvidia/Qwen3.8-Flash-Next-NVFP4 config.
 const test_options: Options = .{ .vocab = 248320, .ngram_size = 3, .heads_per_ngram = 8, .vocab_base = 20000000, .divisor = 128, .seed = 1234, .eos = 248044, .embed_dim = 2560 };
 
 test "derived constants equal Python's" {
