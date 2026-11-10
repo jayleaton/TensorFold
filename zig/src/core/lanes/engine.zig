@@ -89,12 +89,7 @@ pub const Engine = struct {
         e.arena.deinit();
     }
 
-    /// Streams holding or about to hold a row (paused ones included).
-    pub fn activeCount(e: *const Engine) usize {
-        var n: usize = 0;
-        for (e.live.items) |s| n += @intFromBool(!s.finished);
-        return n;
-    }
+    pub const activeCount = handover.activeCount;
     pub const addStream = open.add;
     pub const addStreamCommitted = open.addCommitted;
     pub const addStreams = open.addStreams;
@@ -116,6 +111,7 @@ pub const Engine = struct {
 
     /// One round for every live stream (Python `_family_step`).
     pub fn step(e: *Engine) !void {
+        try @import("join_batch.zig").step(e); // opt-in: joiners' first drafts in one batch; head stops' live count
         _ = e.arena.reset(.retain_capacity);
         const a = e.arena.allocator();
         try trail.event(e, &.{ f("ev", str("step")), f("index", int(e.steps)) });

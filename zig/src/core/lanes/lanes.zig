@@ -78,6 +78,8 @@ test {
     _ = @import("grammar_parallel_test.zig");
     _ = @import("pricing_test.zig");
     _ = @import("depth_probe_test.zig");
+    _ = @import("head_stops_test.zig");
+    _ = @import("join_batch_test.zig");
     _ = @import("proposal_external_test.zig");
     _ = @import("lone_costs_test.zig");
     _ = @import("lone_backoff_test.zig");

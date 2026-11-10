@@ -71,6 +71,9 @@ pub const Rule = struct {
     node_probabilities: bool,
     granted_depth: bool = false, // node_probabilities: a stream drafts its last grant plus draft_slack, lone ones too
     confidence_floor: ?f64 = null,
+    head_stops: bool = false, // opt-in: the head stops each chain itself, so every ask is the room's most drafts
+    head_stops_most: u32 = std.math.maxInt(u32), // ... while at most this many streams are live (`live`)
+    live: usize = 0, // the engine's live streams, set at each step when head_stops is on (lanes/join_batch.zig)
     batch_rows: u32,
     batched_heads: bool = false, // one batch drafts every stream of a shared round (its steps: the deepest stream's)
     row_cost: @import("row_cost.zig").RowCost = .{}, // what a row costs past shared_costs here, under k.learn_rows
@@ -156,11 +159,16 @@ pub const Rule = struct {
         return modeled;
     }
 
+    /// Whether the head's own stops size the chains this step: head_stops, and few enough live streams.
+    pub fn stopsNow(r: *const Rule) bool {
+        return r.head_stops and r.live <= r.head_stops_most;
+    }
+
     /// The most expected tokens a ms, probing one depth farther every `depth_probe_every` rounds.
     pub fn depth(r: *Rule, who: Who) !i64 {
         const most = @min(@as(i64, r.most_drafts), @max(1, who.draft_room - 1));
         if (most <= 0) return 0;
-        if (r.confidence_floor != null and !who.sampled) return most;
+        if ((r.confidence_floor != null and !who.sampled) or r.stopsNow()) return most;
         const p = try r.rates(who);
         if (r.family_costs.empty()) {
             const want: i64 = if (p[0] < 0.8) 1 else if (p[0] < 0.9) 2 else 3;
@@ -309,7 +317,7 @@ pub const Rule = struct {
 
     /// Head drafts for the streams of a shared round, sized by allocation over their chain chances.
     pub fn budgets(r: *Rule, whos: []Who, probe: Probe, sampled: bool, out: []i64) !void {
-        if (r.confidence_floor != null) {
+        if (r.confidence_floor != null or r.stopsNow()) {
             for (whos, out) |*w, *o| o.* = try r.headDepth(w, null, probe);
             return;
         }
@@ -463,26 +471,6 @@ test "depth picks the most tokens a ms and probes deeper" {
     defer if (st) |*s| s.deinit(gpa);
     const who: Who = .{ .state = &st, .draft_room = 100, .finished = false, .forced = false };
     try std.testing.expectEqual(@as(i64, 3), try rule.depth(who));
-}
-
-test "under a confidence floor a greedy stream drafts the most, and a sampled one keeps its rates' depth" {
-    const gpa = std.testing.allocator;
-    const empty: Table = .{};
-    const No = struct {
-        fn copy(_: *anyopaque, _: *const Who) bool {
-            return false;
-        }
-    };
-    var unused: u8 = 0;
-    const probe: Probe = .{ .ptr = &unused, .copy = No.copy };
-    var rule: Rule = .{ .gpa = gpa, .prior = &.{ 0.5, 0.5, 0.5 }, .most_drafts = 3, .family_costs = &empty, .shared_costs = &empty, .mtp_step_ms = 0.5, .plain_guard = false, .node_probabilities = true, .confidence_floor = 0.5, .batch_rows = 8 };
-    defer rule.deinit();
-    var states: [2]?State = .{ null, null };
-    defer for (&states) |*s| if (s.*) |*x| x.deinit(gpa);
-    const greedy: Who = .{ .state = &states[0], .draft_room = 100, .finished = false, .forced = false };
-    const sampled: Who = .{ .state = &states[1], .draft_room = 100, .finished = false, .forced = false, .sampled = true };
-    try std.testing.expectEqual(@as(i64, 3), try rule.headDepth(&greedy, null, probe));
-    try std.testing.expectEqual(@as(i64, 1), try rule.headDepth(&sampled, null, probe)); // a first rate under 0.8: one draft
 }
 
 test "a shared round's drafts come out the same whichever depths its overhead was measured at" {

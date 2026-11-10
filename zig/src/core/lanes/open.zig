@@ -91,6 +91,7 @@ fn openedCommitted(e: *Engine, s: *Stream, reach: Reach, hook: ?be.Committed) !v
         s.pending = null;
         return;
     }
+    if (@import("join_batch.zig").joins(e, s)) return @import("join_batch.zig").opened(e, s, hook);
     if (e.backend.first_before_draft and e.cfg.family_mtp and s.drafts) return @import("open_first.zig").opened(e, s, reach, hook);
     if (s.isCancelled()) { // cancelled in its last chunk: no first token
         e.backend.release(s);

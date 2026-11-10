@@ -42,6 +42,9 @@ pub const Model = struct {
     granted_depth: bool = false, // with draft_probabilities: every stream drafts its last grant plus a slack
     draft_slack: u32 = 0, // drafts past a stream's last grant, short or not (0: the Constants' own)
     draft_streams: bool = false, // the head drafts every stream of a shared round in one batch
+    draft_stops: bool = false, // opt-in: the head stops each chain itself (a running product): ask the most drafts
+    draft_stops_most: u32 = std.math.maxInt(u32), // ... while at most this many streams are live
+    join_batch: bool = false, // opt-in: joiners' first drafts wait for the next round, in one batch (lanes/join_batch.zig)
     copy_first: bool = false, // a copy ahead takes the round: the head holds no drafts for it (a drafter's own pass)
     hold_costs: []const @import("hold_price.zig").HoldCost = &.{}, // a drafter's own hold pass, timed at load
     head_trees: bool = false, // the head drafts trees of lanes (DraftRequest.lanes) and holds them
@@ -81,6 +84,9 @@ pub const Config = struct {
     fill_floor: f64 = 0.35, // the share of grafted rows a stream must keep to go on reading its chain back every round
     draft_streams: bool,
     head_trees: bool,
+    head_stops: bool = false, // Model.draft_stops
+    head_stops_most: u32 = std.math.maxInt(u32), // Model.draft_stops_most
+    join_batch: bool = false, // Model.join_batch
     /// a prompt in pieces leaves its last token as the pending row of its first shared round's window
     join_tail: bool = false,
     /// a round's pieces of several streams in one backend call (Backend.pieces), which may run them as one forward
@@ -164,6 +170,9 @@ pub const Config = struct {
             .granted_depth = m.granted_depth and m.draft_probabilities,
             .draft_streams = m.draft_streams,
             .head_trees = m.head_trees,
+            .head_stops = m.draft_stops,
+            .head_stops_most = m.draft_stops_most,
+            .join_batch = m.join_batch,
             .join_tail = m.join_tail,
             .piece_runs = m.piece_runs,
             .join_drafts = m.join_drafts,

@@ -56,3 +56,10 @@ pub fn sweep(e: *Engine) !void {
     }
     if (failure) |err| return err;
 }
+
+/// Streams holding or about to hold a row (paused ones included).
+pub fn activeCount(e: *const Engine) usize {
+    var n: usize = 0;
+    for (e.live.items) |s| n += @intFromBool(!s.finished);
+    return n;
+}
