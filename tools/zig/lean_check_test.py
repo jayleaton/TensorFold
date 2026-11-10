@@ -96,5 +96,14 @@ class DirectGetenv(unittest.TestCase):
         self.assertNotIn("TENSORFOLD_NO_UPDATE_CHECK", lean_check.lenient())
 
 
+class PinnedSources(unittest.TestCase):
+    def test_a_pinned_source_keeps_its_comments_but_not_its_length(self):
+        pinned = lean_check.PINNED_SOURCES[0]
+        text = '"""Two-line\ndocstring."""\n# a\n# b\n'
+        self.assertEqual(lean_check.problems(Text(pinned, text)), [])
+        self.assertEqual(len(lean_check.problems(Text("tools/zig/other.py", text))), 2)
+        with patch.object(lean_check, "MAX_LINES", 2):
+            self.assertEqual(lean_check.problems(Text(pinned, text)), [f"{Path(pinned)}: 4 lines (split past 2)"])
+
 if __name__ == "__main__":
     unittest.main()

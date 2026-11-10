@@ -21,6 +21,11 @@ GENERATOR_OUTPUT = (
     "zig/src/families/flashnext/roles_gen.zig",
     "zig/kernels/metal/flashnext/sources_gen.zig",
 )
+# Kernel sources pinned to captured kernels' hashes (Triton hashes docstrings): comments as written; length checked.
+PINNED_SOURCES = (
+    "tools/zig/flashnext_mia/triton/kv8.py",
+    "tools/zig/flashnext_mia/triton/prompt_mm.py",
+)
 # A setting read by name instead of through platform/environment.zig, which refuses malformed text.
 DIRECT_GETENV = re.compile(r'\bgetenv\(\s*"((?:TF|TENSORFOLD)_[A-Za-z0-9_]*)"')
 # A getenv of a name that is not a literal: a new wrapper or a held name would hide its setting from DIRECT_GETENV.
@@ -68,6 +73,8 @@ def problems(path: Path) -> list[str]:
     rel, found = path.relative_to(ROOT), []
     if len(lines) > MAX_LINES and path.name not in GENERATED:
         found.append(f"{rel}: {len(lines)} lines (split past {MAX_LINES})")
+    if rel.as_posix() in PINNED_SOURCES:
+        return found
     comment = COMMENT[path.suffix]
     settings = path.suffix == ".zig" and not test_only(rel.as_posix())
     names_given = rel.as_posix() in NAME_READERS

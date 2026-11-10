@@ -435,7 +435,7 @@ test "the settings text names everything both ranks must share" {
     const a = try settingsText(gpa, "fc694b54", @splat(1), @splat(2), .{ .context = 32768, .drafts = true, .tp = 2, .rank = 0 }, 6, null);
     defer gpa.free(a);
     // rank 1's text differs only where its settings do: the rank itself is not part of it
-    const b = try settingsText(gpa, "fc694b54", @splat(1), @splat(2), .{ .context = 32768, .drafts = true, .tp = 2, .rank = 1, .master = "10.0.34.1" }, 6, null);
+    const b = try settingsText(gpa, "fc694b54", @splat(1), @splat(2), .{ .context = 32768, .drafts = true, .tp = 2, .rank = 1, .master = "192.0.2.1" }, 6, null);
     defer gpa.free(b);
     try std.testing.expectEqualStrings(a, b);
     const c = try settingsText(gpa, "fc694b54", @splat(1), @splat(2), .{ .context = 65536, .drafts = true, .tp = 2 }, 6, .{ .factor = 4, .original = 262144 });
