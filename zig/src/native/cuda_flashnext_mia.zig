@@ -14,6 +14,7 @@ pub fn wanted(o: api.Open) bool {
 
 test {
     _ = @import("cuda_flashnext_mia_lane_test.zig"); // the compute lane and runner under TF_FLASHNEXT_ENGINE=mia
+    _ = @import("cuda_flashnext_mia_sched_test.zig"); // her bursts and shared budgets
 }
 
 test "flashnext_mia family: two ranks and fp8 caches through the options, no --vision or --slide" {

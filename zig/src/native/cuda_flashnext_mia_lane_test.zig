@@ -80,11 +80,11 @@ test "flashnext_mia family: the ML and MR arms' knobs parse into the lane, the r
 }
 
 /// A reply's events as the server's mailbox keeps them.
-const Box = struct {
+pub const Box = struct {
     mutex: std.Io.Mutex = .init,
     tokens: std.ArrayList(u32) = .empty,
     done: ?api.Reason = null,
-    fn event(ctx: *anyopaque, _: api.Id, e: *const api.Event) void {
+    pub fn event(ctx: *anyopaque, _: api.Id, e: *const api.Event) void {
         const b: *@This() = @ptrCast(@alignCast(ctx));
         b.mutex.lockUncancelable(t.io);
         defer b.mutex.unlock(t.io);
@@ -108,7 +108,7 @@ const Box = struct {
         }
         return error.Timeout;
     }
-    fn wait(b: *@This()) !api.Reason {
+    pub fn wait(b: *@This()) !api.Reason {
         for (0..10_000) |_| {
             if (b.count().done) |r| return r;
             std.Io.sleep(t.io, .fromMilliseconds(1), .awake) catch {};
@@ -118,7 +118,7 @@ const Box = struct {
 };
 
 /// Her toy target's greedy draw after `history` (it hashes the whole history; its vocabulary is 50 tokens).
-fn greedy(history: []const u32) u32 {
+pub fn greedy(history: []const u32) u32 {
     return Toy.next(history, &.{}, null, 0);
 }
 

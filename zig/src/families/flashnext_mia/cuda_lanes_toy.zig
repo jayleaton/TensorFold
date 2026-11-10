@@ -50,6 +50,9 @@ pub const Toy = struct {
     seqs: usize = 0,
     forwards: usize = 0,
     head_err: u64 = 1,
+    prefill_rows: usize = 4096, // a burst's rows in one pass at most (cuda_engine's prefill_rows)
+    many: usize = 0, // prefillMany calls
+    many_prompts: usize = 0, // the prompts they took
 
     pub fn next(done: []const u32, extra: []const u32, s: ?lanes.Sampling, position: u64) u32 {
         var h = std.hash.Wyhash.init(11);
@@ -134,6 +137,33 @@ pub const Toy = struct {
         }
         t.passes += 1;
         return .{ .first = next(q.tokens.items, &.{}, s, prompt.len), .kept = kept };
+    }
+
+    /// One prompt of a burst (cuda_engine's ManyPrompt).
+    pub const ManyPrompt = struct { seq: *Seq, prompt: []const u32, sampling: ?lanes.Sampling };
+
+    /// cuda_engine's manyFit: 2..max_rows whole prompts within prefill_rows.
+    pub fn manyFit(t: *const Toy, prompts: []const ManyPrompt) bool {
+        if (prompts.len < 2 or prompts.len > max_rows) return false;
+        var rows: usize = 0;
+        for (prompts) |p| {
+            if (p.prompt.len == 0 or p.prompt.len > p.seq.limit) return false;
+            rows += p.prompt.len;
+        }
+        return rows <= t.prefill_rows;
+    }
+
+    /// cuda_engine's prefillMany: one pass, each prompt as its own prefillWith from 0.
+    pub fn prefillMany(t: *Toy, prompts: []const ManyPrompt, firsts: []u32) !void {
+        if (!t.manyFit(prompts) or firsts.len < prompts.len) return error.ToyMisuse;
+        const keep = t.bound;
+        defer t.bound = keep;
+        for (prompts, firsts[0..prompts.len]) |p, *f| {
+            t.bound = p.seq;
+            f.* = (try t.prefillWith(p.prompt, p.sampling, .{})).first;
+        }
+        t.many += 1;
+        t.many_prompts += prompts.len;
     }
 
     /// cuda_engine's Fill: a prompt filling in layer slices; here `left` layers, then prefillWith's effect.

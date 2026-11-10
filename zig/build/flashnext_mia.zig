@@ -28,7 +28,7 @@ pub fn hostTests(b: *std.Build, cuda: *std.Build.Module, mia: *std.Build.Module,
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mia })).step);
     const roce = &.{ "the timeout reader compiles", "prefetch blocks:", "NCCL_IB_HCA lists", "the region layout:" };
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cuda, .filters = roce })).step);
-    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = lanes, .filters = &.{ "join batch:", "head stops:" } })).step);
+    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = lanes, .filters = &.{ "join batch:", "head stops:", "pooled budgets:" } })).step);
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = native, .filters = &.{"flashnext_mia family:"} })).step);
     all.dependOn(step);
 }

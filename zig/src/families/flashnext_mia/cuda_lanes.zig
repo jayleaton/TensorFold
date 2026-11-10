@@ -18,6 +18,9 @@ pub const default_confidence = 0.70;
 /// Head acceptance prior at depth 1, 2, ... given the ones before, until a stream has its own rounds.
 pub const draft_prior = [_]f64{ 0.82, 0.76, 0.72, 0.68, 0.65, 0.62, 0.6, 0.58, 0.56, 0.54, 0.52, 0.5, 0.5, 0.5, 0.5 };
 
+/// Her store kept and resumed nothing for shorter prompts (db281878 Rules.min_prompt), so her host burst them all.
+pub const burst_short = 4096;
+
 /// First tokens a handle names (the prompt's draw is on the host once prefill returns).
 pub const ring = 1024;
 /// a pass keeps its state late only this close to the prompt's end (the indexer key ring holds 4096+ rows)

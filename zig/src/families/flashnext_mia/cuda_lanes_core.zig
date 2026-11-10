@@ -230,6 +230,10 @@ pub fn Lanes(comptime E: type) type {
                 .draft_stops_most = @intCast(@min(self.product_streams, std.math.maxInt(u32))),
                 // each sequence keeps its prompt's last streams until its first drafts: joiners draft together
                 .join_batch = self.drafting,
+                // her host's bursts (0007 admitAll) and her round budgets (db281878 Rule.budgets)
+                .burst_split = true,
+                .burst_short = cl.burst_short,
+                .pooled_budgets = true,
             };
         }
 
