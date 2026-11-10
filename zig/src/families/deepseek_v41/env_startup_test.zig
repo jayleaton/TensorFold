@@ -7,8 +7,10 @@ const rules = sys.environment.rules;
 const model = @import("cuda_model.zig");
 const t = std.testing;
 
-fn refused(name: [:0]const u8) !void {
-    try t.expectEqual(@as(c_int, 0), env.setenv(name, "mistyped value", 1));
+fn refused(r: sys.environment.Rule) !void {
+    const name = r.name;
+    // any text is a presence row's value; a control character is malformed for every kind
+    try t.expectEqual(@as(c_int, 0), env.setenv(name, if (r.kind == .present) "mistyped\nvalue" else "mistyped value", 1));
     defer _ = env.unsetenv(name);
     try t.expectError(error.InvalidEnvironment, model.Model.open(t.failing_allocator, t.io, "missing-checkpoint", "missing-assets", .{}));
     try t.expectError(error.InvalidEnvironment, @import("aot_needs.zig").Served.fromEnv());
@@ -23,7 +25,7 @@ fn blank(name: [:0]const u8) !void {
 
 test "DeepSeek strict env: every malformed setting stops the real loader before resources" {
     _ = env.unsetenv("TENSORFOLD_TOOL_GRAMMAR");
-    for (rules) |r| if (r.scope == .dsv41) try refused(r.name);
+    for (rules) |r| if (r.scope == .dsv41) try refused(r);
 }
 
 test "DeepSeek strict env: a blank setting is unset, so the loader and planner pass the check" {
@@ -107,7 +109,7 @@ test "DeepSeek strict env: shared floor, graph room and reader counts retain the
     _ = env.setenv("TF_DSV41_FLOOR_HARD_GIB", "", 1);
     try t.expectEqual(@as(f64, 4), try b.hardFloorGiB());
     try t.expect(!try v.imageBiasEnv());
-    for ([_][:0]const u8{ "0", "1", " 0 " }) |raw| {
+    for ([_][:0]const u8{ "0", "1", " 0 ", "/model", "on" }) |raw| {
         _ = env.setenv("TF_DSV41_BIAS_VL", raw, 1);
         try t.expect(try v.imageBiasEnv());
     }
@@ -115,7 +117,7 @@ test "DeepSeek strict env: shared floor, graph room and reader counts retain the
         _ = env.setenv("TF_DSV41_BIAS_VL", raw, 1);
         try t.expect(!try v.imageBiasEnv());
     }
-    _ = env.setenv("TF_DSV41_BIAS_VL", "on", 1);
+    _ = env.setenv("TF_DSV41_BIAS_VL", "/model\n", 1);
     try t.expectError(error.InvalidEnvironment, v.imageBiasEnv());
 }
 

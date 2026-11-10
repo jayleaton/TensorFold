@@ -13,10 +13,11 @@ const Fixture = struct {
     }
 };
 
-const Group = enum { switches, integers, reals, structured };
+const Group = enum { switches, integers, reals, structured, present };
 
 fn group(r: e.Rule) Group {
     if (r.kind == .flag or r.kind == .toggle) return .switches;
+    if (r.kind == .present) return .present;
     if (e.isReal(r.kind)) return .reals;
     return if (r.kind == .word or r.kind == .range or r.only.len > 0) .structured else .integers;
 }
@@ -35,20 +36,20 @@ fn check(name: []const u8, raw: []const u8, valid: bool) !void {
     try t.expect(std.mem.endsWith(u8, why.?, e.rule(name).forms));
 }
 
-test "DeepSeek strict env: the shared table holds all 81 settings: 48 switches, 14 integers, 16 reals and 3 structured" {
-    var counts: [4]usize = @splat(0);
+test "DeepSeek strict env: the shared table holds all 81 settings: 47 switches, 14 integers, 16 reals, 3 structured, 1 presence" {
+    var counts: [5]usize = @splat(0);
     for (e.rules) |r| if (r.scope == .dsv41) {
         try t.expect(std.mem.startsWith(u8, r.name, "TF_DSV41_"));
         counts[@backingInt(group(r))] += 1;
     };
-    try t.expectEqual([4]usize{ 48, 14, 16, 3 }, counts);
+    try t.expectEqual([5]usize{ 47, 14, 16, 3, 1 }, counts);
 }
 
 test "DeepSeek strict env: unset and blank settings both read as the caller's default" {
     for (e.rules) |r| if (r.scope == .dsv41) for ([_]?[]const u8{ null, "", " ", "\t", " \t\r\n" }) |raw| {
         if (raw) |v| try check(r.name, v, true);
         switch (group(r)) {
-            .switches => for ([_]bool{ false, true }) |d| try t.expectEqual(d, try e.value(bool, r.name, raw, d)),
+            .switches, .present => for ([_]bool{ false, true }) |d| try t.expectEqual(d, try e.value(bool, r.name, raw, d)),
             .reals => try t.expectEqual(@as(f64, 2), try e.value(f64, r.name, raw, 2)),
             else => if (r.kind == .range) try t.expect(try e.range(r.name, raw) == null) else try t.expectEqual(@as(u64, 2), try e.value(u64, r.name, raw, 2)),
         }
@@ -115,6 +116,14 @@ test "DeepSeek strict env: layer ranges, row buckets and image modes refuse igno
     for ([_][]const u8{ "0", "9", "11", "17", "25", "49", "65", "bad" }) |raw| try check("TF_DSV41_ROWS_CAP", raw, false);
     for ([_][]const u8{ "native", " native ", "0" }) |raw| try check("TF_DSV41_IMAGES", raw, true);
     for ([_][]const u8{ "nativee", "1" }) |raw| try check("TF_DSV41_IMAGES", raw, false);
+}
+
+test "DeepSeek strict env: the vision bias is on whenever set, as its reader and the shipped profile's directory use it" {
+    for ([_][]const u8{ "/model", "1", "0", "on", " /model " }) |raw| {
+        try check("TF_DSV41_BIAS_VL", raw, true);
+        try t.expect(try e.value(bool, "TF_DSV41_BIAS_VL", raw, false));
+    }
+    for ([_][]const u8{ "/model\n", "/mo\x1bdel" }) |raw| try t.expectError(error.InvalidEnvironment, e.parse("TF_DSV41_BIAS_VL", raw));
 }
 
 test "DeepSeek strict env: the row-cap list is exactly the batch's buckets" {

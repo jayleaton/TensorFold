@@ -4,7 +4,7 @@ const sys = @import("sys.zig");
 
 pub const Error = error{InvalidEnvironment};
 pub const Scope = enum { common, cuda, metal, xpu, slide, hooks, dsv41, gemma4, drama3, glm };
-pub const Kind = enum { u32, u64, size, percent, positive, device, segments, mib, bit_width, word, prompt, flag, toggle, real, positive_real, signed_real, range, path };
+pub const Kind = enum { u32, u64, size, percent, positive, device, segments, mib, bit_width, word, prompt, flag, toggle, real, positive_real, signed_real, range, path, present };
 pub const Rule = struct {
     name: [:0]const u8,
     scope: Scope,
@@ -82,7 +82,7 @@ pub const rules = [_]Rule{
     .{ .name = "TF_DSV41_GRAPHS", .scope = .dsv41, .kind = .flag, .forms = "0 or 1" },
     .{ .name = "TF_DSV41_AOT_GUARD", .scope = .dsv41, .kind = .flag, .forms = "0 or 1" },
     .{ .name = "TF_DSV41_ENGRAM_PREFETCH", .scope = .dsv41, .kind = .flag, .forms = "0 or 1" },
-    .{ .name = "TF_DSV41_BIAS_VL", .scope = .dsv41, .kind = .flag, .trim = " ", .forms = "0 or 1 (either selects the vision bias; unset or blank does not)" },
+    .{ .name = "TF_DSV41_BIAS_VL", .scope = .dsv41, .kind = .present, .trim = " ", .forms = "any text without control characters, such as 1 or the checkpoint directory (any of them selects the vision bias; unset or blank does not)" },
     .{ .name = "TF_DSV41_FLOOR_PRICE", .scope = .dsv41, .kind = .flag, .trim = " ", .forms = "0 or 1" },
     .{ .name = "TF_DSV41_SESSIONS", .scope = .dsv41, .kind = .flag, .trim = " ", .forms = "0 or 1" },
     .{ .name = "TF_DSV41_SAMPLING", .scope = .dsv41, .kind = .flag, .forms = "0 or 1" },
@@ -178,10 +178,10 @@ pub fn parse(name: []const u8, raw: ?[]const u8) Error!?u64 {
         return error.InvalidEnvironment;
     }
     if (r.kind == .toggle) return toggle(r, text) orelse error.InvalidEnvironment;
-    // a path travels as 0, its text read by `path`; the file itself is its reader's to check
-    if (r.kind == .path) return if (for (text) |ch| {
+    // a path travels as 0 (`path` reads its text; the file is its reader's to check), a set `.present` row as 1
+    if (r.kind == .path or r.kind == .present) return if (for (text) |ch| {
         if (ch < 0x20 or ch == 0x7f) break true;
-    } else false) error.InvalidEnvironment else 0;
+    } else false) error.InvalidEnvironment else @as(u64, @intFromBool(r.kind == .present));
     // a real travels as its f64 bits and a range as lo above hi; `value` and `range` decode them
     if (isReal(r.kind)) return @bitCast(try real(r, text));
     if (r.kind == .range) {

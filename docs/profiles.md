@@ -198,8 +198,9 @@ The table row, the batch reader and the planner use that list, and a host test k
 Every floor reader shares its row's space trim and named refusal. The hard floor has one reader in the KV budget,
 used by the pool, graph room, scheduler and prefill path; its unset value remains 4 GiB.
 
-`BIAS_VL` retains its accepted presence forms: unset/blank off, while both `0` and `1` select vision bias.
-Other text refuses. Engram queue depth remains 64 by default and permits 0 for serial reads. Reader threads
+`BIAS_VL` keeps its presence meaning: unset/blank is off, and any other text selects vision bias, including `0`,
+`1` and the checkpoint directory that shipped profiles name (`TF_DSV41_BIAS_VL=/model`); only control characters
+refuse. Engram queue depth remains 64 by default and permits 0 for serial reads. Reader threads
 remain 16 by default and accept 0 through 32; larger values refuse instead of clamping. Generation streams
 remain 1 by default.
 
