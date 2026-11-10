@@ -977,7 +977,7 @@ const Loader = struct {
             const sc = try L.expect(try std.fmt.bufPrint(&b[1], "{s}.experts.{d}.{s}.scales", .{ name, x, proj }), .f16, &.{ kf / int4.checkpoint_group, nf });
             const qz = try L.expect(try std.fmt.bufPrint(&b[2], "{s}.experts.{d}.{s}.qzeros", .{ name, x, proj }), .i32, &.{ kf / int4.checkpoint_group, nf / 8 });
             if (!int4.zerosAreSymmetric(qz.bytes)) {
-                std.log.err("{s}{s}: zero points other than 8 (AutoGPTQ v1 qzeros 7); the engine reads symmetric GPTQ", .{ L.prefix, b[2][0..std.mem.indexOfScalar(u8, &b[2], 0) orelse 0] });
+                std.log.err("{s}{s}: zero points other than 8 (AutoGPTQ v1 qzeros 7); the engine reads symmetric GPTQ", .{ L.prefix, b[2][0 .. std.mem.indexOfScalar(u8, &b[2], 0) orelse 0] });
                 return error.UnsupportedQuantization;
             }
             const src: int4.Source = .{ .qweight = qw.bytes, .scales = sc.bytes, .n_full = nf, .k_full = kf };

@@ -1011,7 +1011,6 @@ pub const Forward = struct {
         }
     }
 
-
     // -- staging ----------------------------------------------------------------------------------------------
 
     /// Grow a sequence's caches to `rows` rows within the budget (old and new fit together); drains the stream first.

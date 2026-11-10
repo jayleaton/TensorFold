@@ -288,8 +288,8 @@ test "environment: MiaAI-Lab's engine's rows take 0 and her readers' own forms, 
         .{ .name = "TENSORFOLD_MEMORY_RESERVE_GIB", .raw = "10", .n = @bitCast(@as(f64, 10)) },
     }) |c| try t.expectEqual(@as(?u64, c.n), try e.parse(c.name, c.raw));
     for ([_][2][]const u8{
-        .{ "TF_FLASHNEXT_ROCE", "off" },         .{ "TF_FLASHNEXT_DROP_PAGES", "false" },
-        .{ "TF_FLASHNEXT_YARN", "1x" },          .{ "TF_FLASHNEXT_MTP_Q4", "fc,typo" },
+        .{ "TF_FLASHNEXT_ROCE", "off" },                   .{ "TF_FLASHNEXT_DROP_PAGES", "false" },
+        .{ "TF_FLASHNEXT_YARN", "1x" },                    .{ "TF_FLASHNEXT_MTP_Q4", "fc,typo" },
         .{ "TF_FLASHNEXT_PROMPT_EXPERTS_ROWS", "4096,x" }, .{ "TF_FLASHNEXT_OVERLAP", "256" },
     }) |c| try t.expectError(error.InvalidEnvironment, e.parse(c[0], c[1]));
 }

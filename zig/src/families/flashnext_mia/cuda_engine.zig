@@ -1130,10 +1130,10 @@ pub const Engine = struct {
         const v: u8 = if (e.rank == 0) 0xFF else 0x7F;
         const qrow = g.heads * g.head_dim * 2;
         const list = [_][2]u64{
-            .{ b.h, g.wide() * 2 },                   .{ b.streams, g.wide() * 2 },          .{ b.mixed, g.hidden * 2 },
-            .{ b.gout, g.nv * state.gdn_dv * 2 },     .{ b.gated, qrow },                     .{ b.attn_o, qrow },
-            .{ b.moe_y, g.slots() * g.hidden * 2 },   .{ b.moe_wts, g.slots() * 4 },          .{ b.moe_act, g.slots() * g.moe_width * 2 },
-            .{ b.inj_a, g.streams * 2 },              .{ b.inj_m, g.streams * 2 },            .{ b.pss, (g.hidden / 256) * g.streams * 4 },
+            .{ b.h, g.wide() * 2 },                 .{ b.streams, g.wide() * 2 },  .{ b.mixed, g.hidden * 2 },
+            .{ b.gout, g.nv * state.gdn_dv * 2 },   .{ b.gated, qrow },            .{ b.attn_o, qrow },
+            .{ b.moe_y, g.slots() * g.hidden * 2 }, .{ b.moe_wts, g.slots() * 4 }, .{ b.moe_act, g.slots() * g.moe_width * 2 },
+            .{ b.inj_a, g.streams * 2 },            .{ b.inj_m, g.streams * 2 },   .{ b.pss, (g.hidden / 256) * g.streams * 4 },
         };
         if (R >= b.rows) return;
         for (list) |it| {

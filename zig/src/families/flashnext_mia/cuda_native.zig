@@ -344,7 +344,6 @@ fn yarnFor(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, context: usize) 
     return yarnOf(gpa, text, context, envs.get(rope.env_factor), envs.get(rope.env_ramp));
 }
 
-
 fn yarnOf(gpa: std.mem.Allocator, config_text: []const u8, context: usize, factor_env: ?[]const u8, ramp_env: ?[]const u8) !?rope.Yarn {
     const doc = try std.json.parseFromSlice(std.json.Value, gpa, config_text, .{});
     defer doc.deinit();

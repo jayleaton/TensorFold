@@ -1301,7 +1301,7 @@ fn expertsCheck(gpa: Allocator, ctx: *const cuda.Context, o: Options) !u8 {
     ok = (try flashnext.moe_prompt.checkWith(gpa, ctx, ops, &p, 320, rows.items, true, true)) and ok;
     ok = (try flashnext.moe_prompt.check(gpa, ctx, ops, &p, 640, rows.items, false)) and ok;
     p.gu2 = false;
-        std.debug.print("{s} experts-check: the prompt expert kernel {s} Python's on 16-pair items\n", .{ if (ok) "PASS" else "FAIL", if (ok) "byte-equal to" else "DIFFER from" });
+    std.debug.print("{s} experts-check: the prompt expert kernel {s} Python's on 16-pair items\n", .{ if (ok) "PASS" else "FAIL", if (ok) "byte-equal to" else "DIFFER from" });
     return if (ok) 0 else 1;
 }
 
