@@ -165,7 +165,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     if (std.mem.eql(u8, o.model_type, "fish_omni")) return openDrama(a, gpa, io, o, problem);
     if (std.mem.eql(u8, o.model_type, "qwen4") or std.mem.eql(u8, o.model_type, "qwen4_text")) return @import("qwen4_cuda.zig").open(a, gpa, io, o, problem);
     // MiaAI-Lab's Flash Next engine also reads qwen4_exp: TF_FLASHNEXT_ENGINE=mia picks it over upstream's flashnext
-    if (flashnext_mia.wanted(o)) return flashnext_mia.open(a, gpa, io, o, problem);
+    if (flashnext_mia.wanted(o)) return openWith(flashnext_mia.family, a, gpa, io, o, problem);
     inline for (registry) |F| if (std.mem.eql(u8, o.model_type, F.model_type)) return openWith(F, a, gpa, io, o, problem);
     if (std.mem.eql(u8, o.model_type, lfm2.family.model_type)) {
         if (refusals.lfm2(o)) |why| {
@@ -527,6 +527,7 @@ test {
     _ = @import("cuda_ledger.zig");
     _ = kv_pages;
     _ = drafted;
+    _ = flashnext_mia; // MiaAI-Lab's family against the contract
     _ = cuda_disk; // its tests run under test-cuda-disk-open-host's filter
     _ = @import("cuda_disk_identity_test.zig");
 }
