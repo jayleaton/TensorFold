@@ -27,6 +27,52 @@ fn served(toy: *Toy, streams: usize) L.Lanes(Toy) {
     return b;
 }
 
+/// f212's store rules with her lookahead: a short prompt keeps its history's state (her own rules keep none).
+const F212Store = struct {
+    pub const snap_lookahead: u32 = 0;
+};
+
+/// One request through a lane host over `store`, served to its end.
+fn serveOne(core: *lanes.Engine, store: *api.prompt_cache.Store, id: api.Id, prompt: []const u32, history_len: u32) !void {
+    var host = api.LaneHost.init(gpa, t.io, core, .{ .lanes = 16 });
+    host.cache = store;
+    var req: api.Request = .{ .prompt = prompt, .max_tokens = 4, .history_len = history_len };
+    var box: Box = .{};
+    defer box.tokens.deinit(gpa);
+    try host.engine().submit(id, &req, .{ .ctx = &box, .event = Box.event });
+    try host.start();
+    defer host.stop();
+    _ = try box.wait();
+}
+
+test "flashnext_mia family: her cache rules keep no state for 47- or 3000-token prompts and one at 4200 tokens" {
+    var toy: Toy = .{ .gpa = gpa };
+    var b = served(&toy, 16);
+    defer b.deinit();
+    var cfg = try lanes.Config.init(gpa, b.facts(), L.max_rows, L.max_rows - 1);
+    defer cfg.deinit(gpa);
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, b.backend(), clock.clock());
+    defer core.deinit();
+    // the server's store over her lanes with her family's own pass rules (native/cuda.zig)
+    const pc = api.prompt_cache;
+    const vt: pc.Snapshots.VTable = .{ .bytes = L.Lanes(Toy).bytesFn, .save = L.Lanes(Toy).saveFn, .restore = L.Lanes(Toy).restoreFn, .drop = L.Lanes(Toy).dropFn };
+    var store = pc.Store.init(gpa, .{ .ptr = &b, .vtable = &vt }, @import("cuda_snaps.zig").passRules(family, family.prompt_rows), 1 << 30);
+    defer store.deinit();
+    const text = try gpa.alloc(u32, 4200);
+    defer gpa.free(text);
+    for (text, 0..) |*x, i| x.* = @intCast(i % 50);
+    // a chat prompt (its 3-token opening is the history), then one whose history passes a 2048-row chunk end
+    try serveOne(&core, &store, 1, text[0..47], 3);
+    try t.expectEqual(@as(usize, 0), store.entries.items.len);
+    try serveOne(&core, &store, 2, text[0..3000], 2900);
+    try t.expectEqual(@as(usize, 0), store.entries.items.len);
+    // at her min_prompt (4096) and past it: the history's state is kept
+    try serveOne(&core, &store, 3, text, 4150);
+    try t.expectEqual(@as(usize, 1), store.entries.items.len);
+    try t.expectEqual(@as(u32, 4150), store.entries.items[0].at);
+}
+
 test "flashnext_mia family: sixteen queued prompts with a 3-token cache hit prefill in one burst" {
     var toy: Toy = .{ .gpa = gpa };
     var b = served(&toy, 16);
@@ -36,10 +82,10 @@ test "flashnext_mia family: sixteen queued prompts with a 3-token cache hit pref
     var clock: lanes.fake.FixedClock = .{};
     var core = lanes.Engine.init(gpa, &cfg, b.backend(), clock.clock());
     defer core.deinit();
-    // the server's store over her lanes (native/cuda.zig: her snap_* calls, f212's pass rules)
+    // the server's store over her lanes (native/cuda.zig: her snap_* calls) under f212's rules, where short states keep
     const pc = api.prompt_cache;
     const vt: pc.Snapshots.VTable = .{ .bytes = L.Lanes(Toy).bytesFn, .save = L.Lanes(Toy).saveFn, .restore = L.Lanes(Toy).restoreFn, .drop = L.Lanes(Toy).dropFn };
-    var store = pc.Store.init(gpa, .{ .ptr = &b, .vtable = &vt }, @import("cuda_snaps.zig").passRules(family, family.prompt_rows), 1 << 30);
+    var store = pc.Store.init(gpa, .{ .ptr = &b, .vtable = &vt }, @import("cuda_snaps.zig").passRules(F212Store, family.prompt_rows), 1 << 30);
     defer store.deinit();
 
     // one request keeps the state at its 3-token history (the chat template's opening, as in the c16 wave)

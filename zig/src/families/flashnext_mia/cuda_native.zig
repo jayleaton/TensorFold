@@ -28,6 +28,8 @@ pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, 
 /// The prompt cache's copies over `Loaded.target` (her lanes); a kept state depends on its tokens alone: lookahead 0.
 const Served = lane_backend.Lanes(@import("cuda_engine.zig").Engine);
 pub const snap_lookahead: u32 = 0;
+/// Her store's rule (db281878 Rules.min_prompt): a shorter prompt keeps no state; burst_short is the same length.
+pub const snap_min_prompt: u32 = lane_backend.burst_short;
 pub const snap_bytes = Served.bytesFn;
 pub const snap_save = Served.saveFn;
 pub const snap_restore = Served.restoreFn;
