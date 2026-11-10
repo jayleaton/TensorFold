@@ -99,3 +99,13 @@ third-party notices that go with it (TensorFold's MIT and Apache-2.0 notices, Zi
   128 GB unified memory), two of them linked by their ConnectX-7 ports.
 
 If you believe something here is missing or credited wrongly, please open an issue.
+
+---
+
+## Port note (added by the TensorFold port of this recipe; not part of MiaAI-Lab's file)
+
+This tree carries MiaAI-Lab's patches 0001-0008 and 0010-0012 from
+`MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold` at `dc05c912342e` as her own commits. **Patch 0009 (vision) is
+left out.** It changes only TensorFold's Python vision helper and Python call gates, and that Python engine was removed
+upstream (394d566cb), so the patch has nothing to apply to. The port serves text only: `--vision` is refused, and image
+and video input stay with her original image until the vision path is rebuilt in Zig.
