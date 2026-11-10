@@ -111,3 +111,34 @@ test "flashnext_mia family: four live streams' budgets are db281878's allocation
     // her prior's chains 0.82, 0.6232, 0.4487, 0.3051 at 8 ms overhead: (4 + 4 * 1.8919) / 34 = 0.3402 is the best
     try t.expectEqualSlices(i64, &.{ 3, 3, 3, 3 }, &out); // f212 priced: two each (9.7728 / 42 > 11.5676 / 52)
 }
+
+test "flashnext_mia family: at one or two live streams her engine's rule asks the room's most, her head stops it" {
+    var toy: Toy = .{ .gpa = gpa };
+    var b = served(&toy, 4);
+    defer b.deinit();
+    var cfg = try lanes.Config.init(gpa, b.facts(), L.max_rows, L.max_rows - 1);
+    defer cfg.deinit(gpa);
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, b.backend(), clock.clock());
+    defer core.deinit();
+    var states: [2]?lanes.depth.State = @splat(null);
+    defer for (&states) |*s| if (s.*) |*x| x.deinit(gpa);
+    var whos: [2]lanes.depth.Who = undefined;
+    for (&whos, &states) |*w, *s| w.* = .{ .state = s, .draft_room = 400, .finished = false, .forced = false };
+    const No = struct {
+        fn copy(_: *anyopaque, _: *const lanes.depth.Who) bool {
+            return false;
+        }
+    };
+    var unused: u8 = 0;
+    const most: i64 = cfg.most_drafts;
+    core.rule.live = 1; // a lone stream (c1): her 0007 Engine.init gave the rule cfg.head_stops
+    try t.expect(core.rule.stopsNow());
+    try t.expectEqual(most, try core.rule.depth(whos[0]));
+    core.rule.live = 2; // her product_streams: a shared round still asks the most of each
+    var out: [2]i64 = undefined;
+    try core.rule.budgets(&whos, .{ .ptr = &unused, .copy = No.copy }, false, &out);
+    try t.expectEqualSlices(i64, &.{ most, most }, &out);
+    core.rule.live = 3; // past it: allocation (the test above)
+    try t.expect(!core.rule.stopsNow());
+}
