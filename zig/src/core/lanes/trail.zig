@@ -22,6 +22,20 @@ pub fn event(e: *Engine, fields: []const ev.Field) !void {
     if (e.log) |log| _ = try log.add(fields);
 }
 
+/// A shared round's `budgets` event; under TF_LANES_BUDGET_LOG its budgets are kept for the round's line.
+pub fn budgets(e: *Engine, plans: []const @import("windows.zig").Plan, heads: []const usize, depths: []i64) !void {
+    const ids = try e.arena.allocator().alloc(Value, heads.len);
+    for (ids, heads) |*id, i| id.* = str(plans[i].stream.id);
+    try event(e, &.{ f("ev", str("budgets")), f("streams", .{ .list = ids }), f("depths", .{ .i64s = depths }) });
+    if (e.blog.on) try @import("budget_log.zig").budgets(e, plans, heads, depths);
+}
+
+/// A round's `overhead` event (`one`: a lone round's stream); under TF_LANES_BUDGET_LOG also its budget line.
+pub fn roundOverhead(e: *Engine, one: ?*Stream, streams: usize, rows: u64, ms: f64) !void {
+    try event(e, &.{ f("ev", str("overhead")), f("streams", int(streams)), f("rows", int(rows)), f("ms", ev.bits(ms)) });
+    if (e.blog.on) @import("budget_log.zig").round(e, one, streams, rows, ms);
+}
+
 pub fn pipe(e: *Engine, s: *Stream, before: ?sm.Mode, got: []const u32) !void {
     try event(e, &.{ f("ev", str("pipe")), f("stream", str(s.id)), f("mode", modeName(before)), f("after", modeName(s.mode)), f("got", .{ .u32s = got }) });
 }

@@ -39,6 +39,7 @@ pub const Engine = struct {
     backend: be.Backend,
     clock: be.Clock,
     log: ?*ev.Log = null,
+    blog: @import("budget_log.zig").Log = .{}, // TF_LANES_BUDGET_LOG, read at init
     trim: ?trim.Trim = null, // a family's row policy in place of the built-in allocation (lanes/trim.zig)
     rule: depth.Rule,
     live: std.ArrayList(*Stream) = .empty, // admitted streams in admission order (Python `_live`)
@@ -61,6 +62,7 @@ pub const Engine = struct {
             .backend = backend,
             .clock = clock,
             .arena = std.heap.ArenaAllocator.init(gpa),
+            .blog = .init(),
             .rule = .{
                 .gpa = gpa,
                 .k = cfg.k,
@@ -248,7 +250,7 @@ pub const Engine = struct {
         }
         if (e.cfg.timed and plan.kind == .head) {
             const ms = e.clock.elapsedMs(.overhead);
-            try trail.event(e, &.{ f("ev", str("overhead")), f("streams", int(1)), f("rows", int(rows)), f("ms", ev.bits(ms)) });
+            try trail.roundOverhead(e, s, 1, rows, ms);
             try e.rule.observeOverhead(1, rows, ms, s.sampling != null, 0.0);
         }
         if (e.backend.round_observer != null) e.backend.observed(&.{o.path});
@@ -294,9 +296,7 @@ pub const Engine = struct {
             try @import("shared_drafts.zig").budgets(e, plans, heads.items, budgets)
         else
             try e.rule.budgets(whos, win.probe(e), sampled, budgets);
-        const ids = try a.alloc(ev.Value, heads.items.len);
-        for (ids, heads.items) |*id, i| id.* = str(plans[i].stream.id);
-        try trail.event(e, &.{ f("ev", str("budgets")), f("streams", .{ .list = ids }), f("depths", .{ .i64s = budgets }) });
+        try trail.budgets(e, plans, heads.items, budgets);
         if (heads.items.len > 0 and e.cfg.draft_streams) {
             // every stream's head in one batch (the backend drafts a depth for all of them at once)
             const requests = try a.alloc(be.DraftRequest, heads.items.len);
@@ -319,7 +319,7 @@ pub const Engine = struct {
             var steps: i64 = 0;
             for (budgets) |d| steps = if (e.cfg.draft_streams and depth.pricedBatched()) @max(steps, d - 1) else steps + @max(0, d - 1);
             const ms = e.clock.elapsedMs(.overhead) - e.cfg.draft_step_ms * @as(f64, @floatFromInt(steps));
-            try trail.event(e, &.{ f("ev", str("overhead")), f("streams", int(plans.len)), f("rows", int(total)), f("ms", ev.bits(ms)) });
+            try trail.roundOverhead(e, null, plans.len, total, ms);
             try e.rule.observeOverhead(@intCast(plans.len), total, ms, sampled, e.rule.headMs(budgets));
         }
         if (e.backend.round_observer != null) e.backend.observed(paths);

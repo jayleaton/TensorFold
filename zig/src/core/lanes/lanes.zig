@@ -34,6 +34,7 @@ pub const windows = @import("windows.zig");
 pub const shared_drafts = @import("shared_drafts.zig");
 pub const row_cost = @import("row_cost.zig");
 pub const trail = @import("trail.zig");
+pub const budget_log = @import("budget_log.zig");
 pub const engine = @import("engine.zig");
 pub const hold = @import("hold.zig");
 pub const round_trace = @import("round_trace.zig");

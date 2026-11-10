@@ -46,6 +46,8 @@ const valid = [_]Case{
     .{ .name = "TENSORFOLD_RESTORE_PREFETCH", .raw = "65537", .n = 65537 },
     .{ .name = "TENSORFOLD_RESTORE_PREFETCH_GIB", .raw = "16777217", .n = 16777217 },
     .{ .name = "TENSORFOLD_RESTORE_PREFETCH_MS", .raw = "1099511627777", .n = 1099511627777 },
+    .{ .name = "TF_LANES_BUDGET_LOG", .raw = "0", .n = 0 },
+    .{ .name = "TF_LANES_BUDGET_LOG", .raw = "1", .n = 1 },
     .{ .name = "TENSORFOLD_TOOL_ID_KEY_FILE", .raw = "/etc/tensorfold/tool id.key", .n = 0 },
     .{ .name = "TF_CUDA_DEVICE", .raw = " 3 ", .n = 3 },
     .{ .name = "TF_CUDA_DEVICE", .raw = "4294967295", .n = std.math.maxInt(u32) },
