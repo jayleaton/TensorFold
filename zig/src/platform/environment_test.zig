@@ -3,7 +3,7 @@ const std = @import("std");
 const e = @import("environment.zig");
 const t = std.testing;
 const a = t.allocator;
-const all: e.Flags = .{ .cuda = true, .metal = true, .xpu = true, .slide = true, .hooks = true, .dsv41 = true, .gemma4 = true, .drama3 = true };
+const all: e.Flags = .{ .cuda = true, .metal = true, .xpu = true, .slide = true, .hooks = true, .dsv41 = true, .gemma4 = true, .drama3 = true, .flashnext_mia = true };
 const Env = struct {
     name: []const u8,
     raw: ?[]const u8,
@@ -62,6 +62,7 @@ const valid = [_]Case{
     .{ .name = "TENSORFOLD_PROMPT_CACHE_KEEP_OTHERS", .raw = "0", .n = 0 },
     .{ .name = "TENSORFOLD_PROMPT_CACHE_KEEP_OTHERS", .raw = "1", .n = 1 },
     .{ .name = "TF_ROCE_GID_INDEX", .raw = "2147483647", .n = 2147483647 },
+    .{ .name = "TF_FLASHNEXT_ENGINE", .raw = "mia", .n = 1 },
     .{ .name = "TF_DRAMA_PREFILL_ROWS", .raw = " 128 ", .n = 128 },
     .{ .name = "TF_DRAMA_REFERENCE_CACHE", .raw = "0", .n = 0 },
     .{ .name = "TF_GEMMA4_CHUNK_SOLO", .raw = "2048", .n = 2048 },
@@ -99,6 +100,8 @@ test "environment: valid forms remain raw numbers before existing consumer clamp
         for ([_][]const u8{ "", " ", "\t \n" }) |raw| try t.expectEqual(@as(?u64, null), try e.parse(r.name, raw));
         // the DeepSeek rows are each covered, with every kept form, by deepseek_v41/env_validate_test.zig
         if (r.scope == .dsv41) continue;
+        // MiaAI-Lab's engine's rows are covered by the flashnext_mia test below
+        if (r.scope == .flashnext_mia) continue;
         var covered = false;
         for (valid) |c| if (std.mem.eql(u8, r.name, c.name)) {
             covered = true;
@@ -264,4 +267,29 @@ test "environment: a legacy alias is checked only while its canonical name is un
     try t.expectEqualStrings("TF_DSV41_TOOL_GRAMMAR=\"bad\": expected 0 or 1 (ignored while TENSORFOLD_TOOL_GRAMMAR is set)", why);
     for ([_][]const u8{ "", "0", "1" }) |canonical| try t.expect((try e.refusal(a, Alias{ .canonical = canonical }, .{ .dsv41 = true })) == null);
     try t.expect((try e.refusal(a, Alias{ .canonical = null }, .{})) == null);
+}
+
+test "environment: MiaAI-Lab's engine's rows take 0 and her readers' own forms, and refuse what they misread" {
+    for (e.rules) |r| if (r.scope == .flashnext_mia) {
+        try t.expectEqual(@as(?u64, 0), try e.parse(r.name, "0"));
+        const why = try e.refusal(a, Env{ .name = r.name, .raw = "0" }, all);
+        try t.expect(why == null);
+    };
+    for ([_]Case{
+        .{ .name = "TF_FLASHNEXT_DEPTH", .raw = "15", .n = 15 },
+        .{ .name = "TF_FLASHNEXT_DROP_PAGES", .raw = "off", .n = 1 },
+        .{ .name = "TF_FLASHNEXT_DROP_PAGES", .raw = "on", .n = 3 },
+        .{ .name = "TF_FLASHNEXT_YARN", .raw = " 4 ", .n = @bitCast(@as(f64, 4)) },
+        .{ .name = "TF_FLASHNEXT_YARN", .raw = "OFF", .n = 0 },
+        .{ .name = "TF_FLASHNEXT_CONFIDENCE", .raw = "-0.4", .n = @bitCast(@as(f64, -0.4)) },
+        .{ .name = "TF_FLASHNEXT_MTP_Q4", .raw = "fc,attn", .n = 0 },
+        .{ .name = "TF_FLASHNEXT_PROMPT_EXPERTS_CFG", .raw = "64,2,2", .n = 0 },
+        .{ .name = "TF_FLASHNEXT_OVERLAP", .raw = "255", .n = 255 },
+        .{ .name = "TENSORFOLD_MEMORY_RESERVE_GIB", .raw = "10", .n = @bitCast(@as(f64, 10)) },
+    }) |c| try t.expectEqual(@as(?u64, c.n), try e.parse(c.name, c.raw));
+    for ([_][2][]const u8{
+        .{ "TF_FLASHNEXT_ROCE", "off" },         .{ "TF_FLASHNEXT_DROP_PAGES", "false" },
+        .{ "TF_FLASHNEXT_YARN", "1x" },          .{ "TF_FLASHNEXT_MTP_Q4", "fc,typo" },
+        .{ "TF_FLASHNEXT_PROMPT_EXPERTS_ROWS", "4096,x" }, .{ "TF_FLASHNEXT_OVERLAP", "256" },
+    }) |c| try t.expectError(error.InvalidEnvironment, e.parse(c[0], c[1]));
 }

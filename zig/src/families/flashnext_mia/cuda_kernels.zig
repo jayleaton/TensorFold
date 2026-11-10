@@ -1,6 +1,7 @@
 //! Flash Next's CUDA extension kernels: fn_* fatbins (SASS-equal copies by ashhart, TensorFold) with Python's launches.
 
 const std = @import("std");
+const envs = @import("cuda_env.zig");
 const cuda = @import("cuda");
 
 /// Mangled names of every entry point resolved here (cuobjdump -symbols of each fatbin).
@@ -260,7 +261,7 @@ pub const Kernels = struct {
         // nvfp4/experts.cu launch: cudaOccupancyMaxActiveBlocksPerMultiprocessor(128 threads, 0 bytes), at least 1
         for (k.nvfp4, &k.nvfp4_blocks) |f, *n| n.* = @as(usize, @max(1, try f.occupancy(128, 0))) * @as(usize, @intCast(k.sms));
         k.nvfp4_nt_blocks = @as(usize, @max(1, try k.nvfp4_nt.occupancy(32, 0))) * @as(usize, @intCast(k.sms));
-        k.nt_units = ntUnits(if (std.c.getenv("TF_FLASHNEXT_EXPERT_SHAPE")) |v| std.mem.span(v) else null);
+        k.nt_units = ntUnits(envs.get("TF_FLASHNEXT_EXPERT_SHAPE"));
         return k;
     }
 

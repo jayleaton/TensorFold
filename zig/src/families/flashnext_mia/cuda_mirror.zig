@@ -1,5 +1,6 @@
 //! Two ranks behind one lane backend: rank 0's Leader records each engine call, rank 1's Follower replays it.
 const std = @import("std");
+const envs = @import("cuda_env.zig");
 const lanes = @import("lanes");
 const media_mod = @import("cuda_media.zig");
 const cuda = @import("cuda");
@@ -716,7 +717,7 @@ pub const Watch = struct {
 
     pub fn start(w: *Watch) !void {
         keepalive(w.fd);
-        if (std.c.getenv("TF_TP_TIMEOUT_S")) |v| w.base_s = std.fmt.parseInt(u64, std.mem.span(v), 10) catch w.base_s;
+        if (envs.get("TF_TP_TIMEOUT_S")) |v| w.base_s = std.fmt.parseInt(u64, v, 10) catch w.base_s;
         w.thread = try std.Thread.spawn(.{}, run, .{w});
     }
 

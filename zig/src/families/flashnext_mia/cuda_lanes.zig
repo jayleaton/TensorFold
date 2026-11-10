@@ -1,5 +1,6 @@
 //! Flash Next CUDA lane backend: stream windows share one forward; tokens equal serial decoding's; generic over `E`.
 const std = @import("std");
+const envs = @import("cuda_env.zig");
 const lanes = @import("lanes");
 const media_mod = @import("cuda_media.zig");
 const decode = @import("cuda_decode.zig");
@@ -141,7 +142,7 @@ pub fn Lanes(comptime E: type) type {
         mtp_ms: f64 = 0,
 
         pub fn init(gpa: std.mem.Allocator, e: *E, drafting: bool, context: usize, window: usize) Self {
-            const late = if (std.c.getenv("TF_FLASHNEXT_KEEP_LATE")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+            const late = if (envs.get("TF_FLASHNEXT_KEEP_LATE")) |v| !std.mem.eql(u8, v, "0") else true;
             return .{ .gpa = gpa, .e = e, .drafting = drafting, .context = context, .window = @max(1, @min(window, max_rows)), .late_keep = late };
         }
 
@@ -485,7 +486,7 @@ pub fn Lanes(comptime E: type) type {
             self.dropTentative();
             // TF_FLASHNEXT_PASS_TIMES=1: each part's wall time (the stream drained at each edge), in the log
             const timed = comptime @hasField(E, "io") and @hasField(E, "stream");
-            const times = timed and std.c.getenv("TF_FLASHNEXT_PASS_TIMES") != null;
+            const times = timed and envs.get("TF_FLASHNEXT_PASS_TIMES") != null;
             var t_last: std.Io.Timestamp = if (times) passNow(e) else undefined;
             var parts: [3]f64 = @splat(0); // to the marks, keeping, the rest
             for (s.reuse.marks) |m| {
@@ -534,7 +535,7 @@ pub fn Lanes(comptime E: type) type {
                 return k;
             }
             const timed = comptime @hasField(E, "io") and @hasField(E, "stream");
-            const times = timed and std.c.getenv("TF_FLASHNEXT_PASS_TIMES") != null;
+            const times = timed and envs.get("TF_FLASHNEXT_PASS_TIMES") != null;
             var t_last: std.Io.Timestamp = if (times) passNow(e) else undefined;
             const keeper = try e.newSeq(at + 1);
             errdefer e.freeSeq(keeper);

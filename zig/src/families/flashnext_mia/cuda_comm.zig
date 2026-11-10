@@ -1,5 +1,6 @@
 //! The two ranks' NCCL communicator: fp32 partials added in rank order, same bits on both; opt RoCE, L2 prefetch.
 const std = @import("std");
+const envs = @import("cuda_env.zig");
 const cuda = @import("cuda");
 const link_mod = @import("cuda_link.zig");
 const Link = link_mod.Link;
@@ -14,10 +15,6 @@ const roce_tag: link_mod.Tag = @enumFromInt(0x524f4345);
 
 /// The RoCE all-gather, the L2 prefetch and the driver they were opened with (heap: Comm is copied by value).
 const Extra = struct { driver: cuda.Driver, r: ?roce.Roce = null, l2: ?roce.L2 = null, prefetch: bool = false };
-
-fn envIs(name: [:0]const u8, value: []const u8) bool {
-    return if (std.c.getenv(name)) |v| std.mem.eql(u8, std.mem.span(v), value) else false;
-}
 
 pub const Comm = struct {
     lib: nccl.Library,
@@ -50,8 +47,8 @@ pub const Comm = struct {
         errdefer _ = lib.api.ncclCommDestroy(comm);
         errdefer if (c.extra) |x| freeExtra(x);
         // on by default (decode D1, D2); "0" turns either off
-        const want_roce = !envIs("TF_FLASHNEXT_ROCE", "0");
-        const want_pf = !envIs("TF_FLASHNEXT_L2PF", "0");
+        const want_roce = !envs.is("TF_FLASHNEXT_ROCE", "0");
+        const want_pf = !envs.is("TF_FLASHNEXT_L2PF", "0");
         var driver: ?cuda.Driver = null;
         if (want_roce or want_pf) driver = cuda.Driver.open() catch |e| blk: {
             std.log.warn("RoCE / L2 prefetch: no CUDA driver handle ({t}); NCCL alone", .{e});
@@ -129,7 +126,7 @@ pub const Comm = struct {
         };
         const gid: c_int = if (std.c.getenv("NCCL_IB_GID_INDEX")) |g| std.fmt.parseInt(c_int, std.mem.span(g), 10) catch 3 else 3;
         // TF_FLASHNEXT_ROCE_MAX: the largest shard a rank RoCE takes (default 512 KiB; a multiple of 4096)
-        const max: u64 = if (std.c.getenv("TF_FLASHNEXT_ROCE_MAX")) |m| std.fmt.parseInt(u64, std.mem.span(m), 10) catch (512 << 10) else (512 << 10);
+        const max: u64 = if (envs.get("TF_FLASHNEXT_ROCE_MAX")) |m| std.fmt.parseInt(u64, m, 10) catch (512 << 10) else (512 << 10);
         return roce.Roce.open(d, rank, .{ .ports = ports, .gid_index = gid, .slot_bytes = max }) catch |e| {
             std.log.warn("RoCE: {t}", .{e});
             return null;

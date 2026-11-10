@@ -1,5 +1,6 @@
 //! GPTQ int4 experts and lm_head (INT4-AutoRound, zero point 8, fp16 scale per 128): layouts, launches, reference.
 const std = @import("std");
+const envs = @import("cuda_env.zig");
 const cuda = @import("cuda");
 const kern = @import("cuda_kernels.zig");
 
@@ -130,7 +131,7 @@ pub const prompt_pairs: usize = 2048;
 
 /// Every call takes 16-pair items (64-pair ones are slower); TF_FLASHNEXT_INT4_TILE=64 takes the prompt tile.
 pub fn tileFor(pairs: usize) usize {
-    const want = if (std.c.getenv("TF_FLASHNEXT_INT4_TILE")) |v| std.fmt.parseInt(usize, std.mem.span(v), 10) catch kern.plan_tile else kern.plan_tile;
+    const want = if (envs.get("TF_FLASHNEXT_INT4_TILE")) |v| std.fmt.parseInt(usize, v, 10) catch kern.plan_tile else kern.plan_tile;
     return if (want == prompt_tile and pairs >= prompt_pairs) prompt_tile else kern.plan_tile;
 }
 
@@ -302,7 +303,7 @@ pub fn downPrompt(k: *const Kernels, s: cuda.Stream, act: u64, act_stride: usize
 
 /// Whether a prompt call of `pairs` routed pairs takes `downPrompt` (TF_FLASHNEXT_INT4_PROMPT_DOWN=0: never).
 pub fn promptDown(pairs: usize) bool {
-    if (std.c.getenv("TF_FLASHNEXT_INT4_PROMPT_DOWN")) |v| if (std.mem.eql(u8, std.mem.span(v), "0")) return false;
+    if (envs.is("TF_FLASHNEXT_INT4_PROMPT_DOWN", "0")) return false;
     return pairs >= prompt_pairs;
 }
 

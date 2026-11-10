@@ -1,5 +1,6 @@
 //! Routed NVFP4 experts of a prompt chunk: T row tiles a warp, nvfp4_expert_kernel's bits; PROMPT_EXPERTS=0 off.
 const std = @import("std");
+const envs = @import("cuda_env.zig");
 const cuda = @import("cuda");
 const kern = @import("cuda_kernels.zig");
 
@@ -45,20 +46,20 @@ pub const Prompt4 = struct {
         p.f32 = .{ try p.fnOf("fn_prompt4_f32_t2"), try p.fnOf("fn_prompt4_f32_t4") };
         p.b16 = .{ try p.fnOf("fn_prompt4_b16_t2"), try p.fnOf("fn_prompt4_b16_t4") };
         p.occ = .{ try p.fnOf("fn_prompt4_gu_t2o"), try p.fnOf("fn_prompt4_f32_t2o"), try p.fnOf("fn_prompt4_b16_t2o") };
-        p.use_occ = if (std.c.getenv("TF_FLASHNEXT_PROMPT_EXPERTS_OCC")) |v| v[0] == '1' else false;
-        if (std.c.getenv("TF_FLASHNEXT_PROMPT_EXPERTS_OCC")) |v| p.occ_down = v[0] != '0';
+        p.use_occ = if (envs.get("TF_FLASHNEXT_PROMPT_EXPERTS_OCC")) |v| v.len > 0 and v[0] == '1' else false;
+        if (envs.get("TF_FLASHNEXT_PROMPT_EXPERTS_OCC")) |v| p.occ_down = v.len == 0 or v[0] != '0';
         p.gate2 = try p.fnOf("fn_prompt4_gate_t2o");
         p.up2 = try p.fnOf("fn_prompt4_up_t2o");
-        p.gu2 = if (std.c.getenv("TF_FLASHNEXT_PROMPT_EXPERTS_GU2")) |v| v[0] == '1' else false;
+        p.gu2 = if (envs.get("TF_FLASHNEXT_PROMPT_EXPERTS_GU2")) |v| v.len > 0 and v[0] == '1' else false;
         p.sms = @intCast(try ctx.attribute(.multiprocessor_count));
-        if (std.c.getenv("TF_FLASHNEXT_PROMPT_EXPERTS_CFG")) |v| {
-            var it = std.mem.tokenizeScalar(u8, std.mem.span(v), ',');
+        if (envs.get("TF_FLASHNEXT_PROMPT_EXPERTS_CFG")) |v| {
+            var it = std.mem.tokenizeScalar(u8, v, ',');
             if (it.next()) |x| p.tile = std.fmt.parseInt(usize, x, 10) catch default_tile;
             if (it.next()) |x| p.t_gu = std.fmt.parseInt(usize, x, 10) catch 2;
             if (it.next()) |x| p.t_down = std.fmt.parseInt(usize, x, 10) catch 2;
         }
-        if (std.c.getenv("TF_FLASHNEXT_PROMPT_EXPERTS_ROWS")) |v| {
-            var it = std.mem.tokenizeScalar(u8, std.mem.span(v), ',');
+        if (envs.get("TF_FLASHNEXT_PROMPT_EXPERTS_ROWS")) |v| {
+            var it = std.mem.tokenizeScalar(u8, v, ',');
             if (it.next()) |x| p.gu_rows = std.fmt.parseInt(usize, x, 10) catch 4096;
             if (it.next()) |x| p.down_rows = std.fmt.parseInt(usize, x, 10) catch 2048;
         }

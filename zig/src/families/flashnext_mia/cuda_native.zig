@@ -1,5 +1,6 @@
 //! Flash Next for the native server on CUDA: engine, MTP head, lane backend; at TP=2 rank 0 mirrors calls to rank 1.
 const std = @import("std");
+const envs = @import("cuda_env.zig");
 const cuda = @import("cuda");
 const lanes = @import("lanes");
 const core = @import("core");
@@ -106,6 +107,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
 /// `open` over the engine module `M` (cuda_engine.zig: M.Engine, M.Options as PLAN.md's Engine API contract).
 pub fn openOn(comptime M: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: []const u8, o: Options) !Loaded {
     const Own = Owned(M);
+    try envs.startup();
     if (o.tp != 1 and o.tp != 2) return error.UnsupportedTp;
     if (o.rank >= o.tp) return error.BadRank;
     const own = try gpa.create(Own);
@@ -114,7 +116,7 @@ pub fn openOn(comptime M: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const 
     errdefer own.closeLink();
     const yarn = try yarnFor(gpa, io, dir, o.context);
     // the window: 15 drafts (16 rows) unless TF_FLASHNEXT_DEPTH says (Python's 6)
-    const depth: usize = if (getenv("TF_FLASHNEXT_DEPTH")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadDepth else 15;
+    const depth: usize = if (envs.get("TF_FLASHNEXT_DEPTH")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadDepth else 15;
     if (depth < 1 or depth > lane_backend.max_drafts) return error.BadDepth;
     if (o.tp == 2) {
         // a rank stops on SIGTERM / SIGINT while loading or following (PID 1 ignores them); then rank 0's server does
@@ -161,10 +163,10 @@ pub fn openOn(comptime M: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const 
     own.lanes.confidence = @import("cuda_engine.zig").confidenceSetting();
     own.lanes.product_streams = @import("cuda_engine.zig").productStreams();
     own.lanes.wide_confidence = @import("cuda_engine.zig").wide_confidence;
-    own.lanes.overcommit = if (getenv("TF_FLASHNEXT_OVERCOMMIT")) |v| std.mem.eql(u8, v, "1") else false;
+    own.lanes.overcommit = if (envs.get("TF_FLASHNEXT_OVERCOMMIT")) |v| std.mem.eql(u8, v, "1") else false;
     // prompts fill in layer slices between rounds: opt-in until verified exact on GPUs; both ranks agree on it
-    own.lanes.sliced = if (getenv("TF_FLASHNEXT_FILL")) |v| std.mem.eql(u8, v, "1") else false;
-    if (getenv("TF_FLASHNEXT_FILL_LAYERS")) |v| own.lanes.fill_layers = @max(1, std.fmt.parseInt(usize, v, 10) catch 8);
+    own.lanes.sliced = if (envs.get("TF_FLASHNEXT_FILL")) |v| std.mem.eql(u8, v, "1") else false;
+    if (envs.get("TF_FLASHNEXT_FILL_LAYERS")) |v| own.lanes.fill_layers = @max(1, std.fmt.parseInt(usize, v, 10) catch 8);
     errdefer own.lanes.deinit();
     if (o.drafts) {
         const ids = try costText(gpa, io, dir);
@@ -320,7 +322,7 @@ pub fn modelWindow(a: std.mem.Allocator, io: std.Io, dir: []const u8) i64 {
     defer a.free(path);
     const text = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 24)) catch return 0;
     defer a.free(text);
-    return windowOf(a, text, getenv(rope.env_factor), getenv(rope.env_ramp)) catch 0;
+    return windowOf(a, text, envs.get(rope.env_factor), envs.get(rope.env_ramp)) catch 0;
 }
 
 fn windowOf(a: std.mem.Allocator, config_text: []const u8, factor_env: ?[]const u8, ramp_env: ?[]const u8) !i64 {
@@ -339,12 +341,9 @@ fn yarnFor(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, context: usize) 
     defer gpa.free(path);
     const text = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 24));
     defer gpa.free(text);
-    return yarnOf(gpa, text, context, getenv(rope.env_factor), getenv(rope.env_ramp));
+    return yarnOf(gpa, text, context, envs.get(rope.env_factor), envs.get(rope.env_ramp));
 }
 
-fn getenv(name: [:0]const u8) ?[]const u8 {
-    return if (std.c.getenv(name)) |v| std.mem.span(v) else null;
-}
 
 fn yarnOf(gpa: std.mem.Allocator, config_text: []const u8, context: usize, factor_env: ?[]const u8, ramp_env: ?[]const u8) !?rope.Yarn {
     const doc = try std.json.parseFromSlice(std.json.Value, gpa, config_text, .{});
@@ -391,8 +390,8 @@ fn hashFile(gpa: std.mem.Allocator, io: std.Io, h: *std.crypto.hash.sha2.Sha256,
 fn settingsText(gpa: std.mem.Allocator, base: []const u8, snapshot: [32]u8, kernel_set: [32]u8, o: Options, depth: usize, yarn: ?rope.Yarn) ![]u8 {
     var y: [96]u8 = undefined;
     const yt = if (yarn) |v| try std.fmt.bufPrint(&y, "{d}x{d}/ramp{d}/att{d}", .{ v.factor, v.original, v.ramp_positions, v.attention() }) else "off";
-    const fill = getenv("TF_FLASHNEXT_FILL") orelse "0";
-    const fill_layers = getenv("TF_FLASHNEXT_FILL_LAYERS") orelse "8";
+    const fill = envs.get("TF_FLASHNEXT_FILL") orelse "0";
+    const fill_layers = envs.get("TF_FLASHNEXT_FILL_LAYERS") orelse "8";
     return std.fmt.allocPrint(gpa, "flashnext tp={d} checkpoint={s} snapshot={x} context={d} parallel={d} drafts={} depth={d} confidence={d}/{d} yarn={s} fill={s}/{s} kv={s} kernels={x}", .{
         o.tp, base, snapshot, o.context, o.lanes, o.drafts, depth, @import("cuda_engine.zig").confidenceSetting(), @import("cuda_engine.zig").productStreams(), yt, fill, fill_layers, if (o.kv8) "fp8" else "bf16", kernel_set,
     });

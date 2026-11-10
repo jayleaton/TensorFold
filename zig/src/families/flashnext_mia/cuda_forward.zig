@@ -1,5 +1,6 @@
 //! Flash Next CUDA forward, Python forward.py/mtp.py by Ash Hart (ashhart) and vcruz305 (TensorFold), same launches.
 const std = @import("std");
+const envs = @import("cuda_env.zig");
 const cuda = @import("cuda");
 const kern = @import("cuda_kernels.zig");
 const tri = @import("cuda_triton.zig");
@@ -1162,14 +1163,14 @@ pub const Forward = struct {
 
     /// A weight's first bytes to prefetch: all of it up to TF_FLASHNEXT_L2PF_BYTES (default 8 MiB).
     pub fn prefetchOf(r: W.Rows) comms.Prefetch {
-        const cap: usize = if (std.c.getenv("TF_FLASHNEXT_L2PF_BYTES")) |v| std.fmt.parseInt(usize, std.mem.span(v), 10) catch (8 << 20) else (8 << 20);
+        const cap: usize = if (envs.get("TF_FLASHNEXT_L2PF_BYTES")) |v| std.fmt.parseInt(usize, v, 10) catch (8 << 20) else (8 << 20);
         return .{ .ptr = r.weight, .bytes = @min(@as(usize, r.n) * r.k * 2, cap) };
     }
 
     /// A read-out's down projection to prefetch: its block-FP8 bytes (fast-fp8), else its bf16 rows.
     pub fn prefetchHc(h: *const W.Hc) comms.Prefetch {
         const d8 = h.down8 orelse return prefetchOf(h.down);
-        const cap: usize = if (std.c.getenv("TF_FLASHNEXT_L2PF_BYTES")) |v| std.fmt.parseInt(usize, std.mem.span(v), 10) catch (8 << 20) else (8 << 20);
+        const cap: usize = if (envs.get("TF_FLASHNEXT_L2PF_BYTES")) |v| std.fmt.parseInt(usize, v, 10) catch (8 << 20) else (8 << 20);
         return .{ .ptr = d8.w8, .bytes = @min(@as(usize, d8.npad) * d8.k, cap) };
     }
 

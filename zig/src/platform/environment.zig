@@ -3,8 +3,8 @@ const std = @import("std");
 const sys = @import("sys.zig");
 
 pub const Error = error{InvalidEnvironment};
-pub const Scope = enum { common, cuda, metal, xpu, slide, hooks, dsv41, gemma4, drama3 };
-pub const Kind = enum { u32, u64, size, percent, positive, device, segments, mib, bit_width, word, prompt, flag, toggle, real, positive_real, signed_real, range, path };
+pub const Scope = enum { common, cuda, metal, xpu, slide, hooks, dsv41, gemma4, drama3, flashnext_mia };
+pub const Kind = enum { u32, u64, size, percent, positive, device, segments, mib, bit_width, word, prompt, flag, toggle, real, positive_real, signed_real, range, path, list };
 pub const Rule = struct {
     name: [:0]const u8,
     scope: Scope,
@@ -17,7 +17,7 @@ pub const Rule = struct {
     max: u64 = std.math.maxInt(u64),
     /// When nonempty, the only whole numbers accepted.
     only: []const u64 = &.{},
-    /// A `.word` setting's accepted texts; the parsed value is the matching index.
+    /// A `.word` row's texts (value: the index), a `.list` row's tokens, or a real row's off forms (any case, value 0).
     words: []const []const u8 = &.{},
     /// A legacy name that is ignored, and so never refused, while its canonical name is set.
     alias_of: ?[:0]const u8 = null,
@@ -48,6 +48,63 @@ pub const rules = [_]Rule{
     .{ .name = "TENSORFOLD_PROMPT_CACHE_KEEP_OTHERS", .scope = .cuda, .kind = .flag, .forms = "0 or 1" },
     .{ .name = "TF_ROCE_GID_INDEX", .scope = .cuda, .kind = .u32, .forms = "a whole GID index from 0 to 2147483647" },
     .{ .name = "TF_FLASHNEXT_ENGINE", .scope = .cuda, .kind = .word, .trim = " ", .words = &.{ "upstream", "mia" }, .forms = "upstream or mia" },
+    .{ .name = "TF_FLASHNEXT_DEPTH", .scope = .flashnext_mia, .kind = .size, .forms = "a whole draft count from 1 to the lane core's most (default 15)" },
+    .{ .name = "TF_FLASHNEXT_FILL", .scope = .flashnext_mia, .kind = .flag, .forms = "0 or 1" },
+    .{ .name = "TF_FLASHNEXT_FILL_LAYERS", .scope = .flashnext_mia, .kind = .size, .forms = "a whole layer count a fill step (default 8; 0 reads as 1)" },
+    .{ .name = "TF_FLASHNEXT_OVERCOMMIT", .scope = .flashnext_mia, .kind = .flag, .forms = "0 or 1" },
+    .{ .name = "TF_FLASHNEXT_PRODUCT_STREAMS", .scope = .flashnext_mia, .kind = .size, .forms = "a whole stream count (default 2)" },
+    .{ .name = "TF_FLASHNEXT_CONFIDENCE", .scope = .flashnext_mia, .kind = .signed_real, .forms = "a finite number; -1 to 1 sets the draft stop rule, others keep -0.4" },
+    .{ .name = "TF_FLASHNEXT_KEEP_LATE", .scope = .flashnext_mia, .kind = .flag, .forms = "0 or 1" },
+    .{ .name = "TF_FLASHNEXT_YARN", .scope = .flashnext_mia, .kind = .positive_real, .trim = " \t\r\n", .words = &.{ "0", "off", "no", "false", "none", "default" }, .forms = "a YaRN factor above 1, or 0, off, no, false, none or default (any case) for none" },
+    .{ .name = "TF_FLASHNEXT_YARN_RAMP_POSITIONS", .scope = .flashnext_mia, .kind = .u64, .trim = " \t\r\n", .forms = "a whole position count" },
+    .{ .name = "TF_FLASHNEXT_ROCE", .scope = .flashnext_mia, .kind = .flag, .forms = "0 or 1" },
+    .{ .name = "TF_FLASHNEXT_L2PF", .scope = .flashnext_mia, .kind = .flag, .forms = "0 or 1" },
+    .{ .name = "TF_FLASHNEXT_ROCE_MAX", .scope = .flashnext_mia, .kind = .u64, .forms = "a whole byte count (default 524288)" },
+    .{ .name = "TF_FLASHNEXT_L2PF_BYTES", .scope = .flashnext_mia, .kind = .size, .forms = "a whole byte count (default 8388608)" },
+    .{ .name = "TF_FLASHNEXT_MTP_TOPK", .scope = .flashnext_mia, .kind = .size, .forms = "a whole routed-expert count (0: the checkpoint's; 10 is the other routed one)" },
+    .{ .name = "TF_FLASHNEXT_MTP_Q4", .scope = .flashnext_mia, .kind = .list, .words = &.{ "0", "1", "all", "fc", "attn", "hc", "mixer" }, .forms = "0 (off), 1 or all, or a comma list of fc, attn, hc and mixer" },
+    .{ .name = "TF_FLASHNEXT_MTP_Q4_MSE", .scope = .flashnext_mia, .kind = .flag, .forms = "0 or 1" },
+    .{ .name = "TF_FLASHNEXT_PREFILL_ROWS", .scope = .flashnext_mia, .kind = .size, .forms = "whole prompt chunk rows from 16 to 16384" },
+    .{ .name = "TF_FLASHNEXT_PREFILL_TAIL", .scope = .flashnext_mia, .kind = .size, .forms = "whole rows, a multiple of 16, with the chunk at most 16384" },
+    .{ .name = "TF_FLASHNEXT_INT4AR_FAST", .scope = .flashnext_mia, .kind = .word, .words = &.{ "0", "off", "1", "on" }, .forms = "0 or off, 1 or on" },
+    .{ .name = "TF_FLASHNEXT_PROMPT_MM", .scope = .flashnext_mia, .kind = .word, .words = &.{ "0", "off", "1", "on" }, .forms = "0 or off, 1 or on" },
+    .{ .name = "TF_FLASHNEXT_DRAW_ONCE", .scope = .flashnext_mia, .kind = .word, .words = &.{ "0", "off", "1", "on" }, .forms = "0 or off, 1 or on" },
+    .{ .name = "TF_FLASHNEXT_SHARED_SIDE", .scope = .flashnext_mia, .kind = .word, .words = &.{ "0", "off", "1", "on" }, .forms = "0 or off, 1 or on" },
+    .{ .name = "TF_FLASHNEXT_FP8_LD", .scope = .flashnext_mia, .kind = .word, .words = &.{ "0", "off", "1", "on" }, .forms = "0 or off, 1 or on" },
+    .{ .name = "TF_FLASHNEXT_FP4_SERIAL", .scope = .flashnext_mia, .kind = .word, .words = &.{ "0", "off", "1", "on" }, .forms = "0 or off, 1 or on" },
+    .{ .name = "TF_FLASHNEXT_PROMPT_EXPERTS", .scope = .flashnext_mia, .kind = .word, .words = &.{ "0", "off", "1", "on" }, .forms = "0 or off, 1 or on" },
+    .{ .name = "TF_FLASHNEXT_GLUE_SPLIT", .scope = .flashnext_mia, .kind = .word, .words = &.{ "0", "off", "1", "on" }, .forms = "0 or off, 1 or on" },
+    .{ .name = "TF_FLASHNEXT_DROP_PAGES", .scope = .flashnext_mia, .kind = .word, .words = &.{ "0", "off", "1", "on" }, .forms = "0 or off, 1 or on" },
+    .{ .name = "TF_FLASHNEXT_GLUE_FUSE", .scope = .flashnext_mia, .kind = .word, .words = &.{ "0", "off", "1", "on" }, .forms = "0 or off, 1 or on" },
+    .{ .name = "TF_FLASHNEXT_WB_NORM", .scope = .flashnext_mia, .kind = .word, .words = &.{ "0", "off", "1", "on" }, .forms = "0 or off, 1 or on" },
+    .{ .name = "TF_FLASHNEXT_QSA_FAST", .scope = .flashnext_mia, .kind = .word, .words = &.{ "0", "off", "1", "on" }, .forms = "0 or off, 1 or on" },
+    .{ .name = "TF_FLASHNEXT_GRAPH_LOG", .scope = .flashnext_mia, .kind = .flag, .forms = "0 or 1 (set at all, it is on)" },
+    .{ .name = "TF_FLASHNEXT_PREFILL_DIGEST", .scope = .flashnext_mia, .kind = .flag, .forms = "0 or 1 (set at all, it is on)" },
+    .{ .name = "TF_FLASHNEXT_POISON_PADS", .scope = .flashnext_mia, .kind = .flag, .forms = "0 or 1 (set at all, it is on)" },
+    .{ .name = "TF_FLASHNEXT_PASS_TIMES", .scope = .flashnext_mia, .kind = .flag, .forms = "0 or 1 (set at all, it is on)" },
+    .{ .name = "TF_FLASHNEXT_BURST_LOG", .scope = .flashnext_mia, .kind = .flag, .forms = "0 or 1 (set at all, it is on)" },
+    .{ .name = "TF_FLASHNEXT_GRAPH_FAIL", .scope = .flashnext_mia, .kind = .u64, .forms = "a whole graph-launch count between injected failures (0: none)" },
+    .{ .name = "TF_FLASHNEXT_MULTI_GRAPHS", .scope = .flashnext_mia, .kind = .size, .forms = "a whole stream count of captured shared-round widths" },
+    .{ .name = "TF_FLASHNEXT_ATTN_MULTI", .scope = .flashnext_mia, .kind = .size, .forms = "a whole stream count from which attention runs in one launch (0: never)" },
+    .{ .name = "TF_FLASHNEXT_MEDIA_GRAPHS", .scope = .flashnext_mia, .kind = .flag, .forms = "0 or 1" },
+    .{ .name = "TF_FLASHNEXT_COUNT_EXPERTS", .scope = .flashnext_mia, .kind = .flag, .forms = "0 or 1" },
+    .{ .name = "TF_FLASHNEXT_PROFILE", .scope = .flashnext_mia, .kind = .flag, .forms = "0 or 1" },
+    .{ .name = "TF_FLASHNEXT_QSA_RT", .scope = .flashnext_mia, .kind = .size, .forms = "a whole row-tile count (0: the kernel's own)" },
+    .{ .name = "TF_FLASHNEXT_QSA_TILES_FROM", .scope = .flashnext_mia, .kind = .size, .forms = "a whole key count from which scores run in tiles" },
+    .{ .name = "TF_FLASHNEXT_QSA_SPLIT_KEYS", .scope = .flashnext_mia, .kind = .size, .forms = "a whole key count a split (0: none)" },
+    .{ .name = "TF_FLASHNEXT_QSA_TILE", .scope = .flashnext_mia, .kind = .size, .forms = "a whole tile choice (above 3 reads as 3)" },
+    .{ .name = "TF_FLASHNEXT_OVERLAP", .scope = .flashnext_mia, .kind = .u32, .max = 255, .forms = "a whole overlap mode from 0 (off) to 255" },
+    .{ .name = "TF_FLASHNEXT_COMM_PRIORITY", .scope = .flashnext_mia, .kind = .signed_real, .forms = "a whole CUDA stream priority, negative for higher (other numbers read as 0)" },
+    .{ .name = "TF_FLASHNEXT_EXPERT_SMS_FREE", .scope = .flashnext_mia, .kind = .size, .forms = "a whole SM count the expert kernels leave free" },
+    .{ .name = "TF_FLASHNEXT_EXPERT_SHAPE", .scope = .flashnext_mia, .kind = .size, .forms = "a whole expert unit count (default 230)" },
+    .{ .name = "TF_FLASHNEXT_INT4_TILE", .scope = .flashnext_mia, .kind = .size, .forms = "a whole INT4 tile choice (default: the planned one)" },
+    .{ .name = "TF_FLASHNEXT_INT4_PROMPT_DOWN", .scope = .flashnext_mia, .kind = .flag, .forms = "0 or 1" },
+    .{ .name = "TF_FLASHNEXT_PROMPT_EXPERTS_OCC", .scope = .flashnext_mia, .kind = .flag, .forms = "0 or 1" },
+    .{ .name = "TF_FLASHNEXT_PROMPT_EXPERTS_GU2", .scope = .flashnext_mia, .kind = .flag, .forms = "0 or 1" },
+    .{ .name = "TF_FLASHNEXT_PROMPT_EXPERTS_CFG", .scope = .flashnext_mia, .kind = .list, .forms = "comma-separated whole numbers: tile, gate/up threads, down threads" },
+    .{ .name = "TF_FLASHNEXT_PROMPT_EXPERTS_ROWS", .scope = .flashnext_mia, .kind = .list, .forms = "comma-separated whole numbers: gate/up rows, down rows" },
+    .{ .name = "TF_TP_TIMEOUT_S", .scope = .flashnext_mia, .kind = .u64, .forms = "whole seconds a rank waits for the other" },
+    .{ .name = "TENSORFOLD_MEMORY_RESERVE_GIB", .scope = .flashnext_mia, .kind = .real, .forms = "a finite GiB amount of at least 0" },
     .{ .name = "TF_GEMMA4_CHUNK_SOLO", .scope = .gemma4, .kind = .size, .forms = "a solo prompt pass's rows, a multiple of 512 up to 4096" },
     .{ .name = "TF_DRAMA_PREFILL_ROWS", .scope = .drama3, .kind = .u32, .trim = " ", .forms = "whole prompt rows a chunk, 1 through 1024 (checked when a Drama 3 checkpoint opens)" },
     .{ .name = "TF_DRAMA_REFERENCE_CACHE", .scope = .drama3, .kind = .u32, .trim = " ", .forms = "kept reference states, 0 (off) through 16 (checked when a Drama 3 checkpoint opens)" },
@@ -172,7 +229,23 @@ pub fn parse(name: []const u8, raw: ?[]const u8) Error!?u64 {
         if (ch < 0x20 or ch == 0x7f) break true;
     } else false) error.InvalidEnvironment else 0;
     // a real travels as its f64 bits and a range as lo above hi; `value` and `range` decode them
-    if (isReal(r.kind)) return @bitCast(try real(r, text));
+    if (isReal(r.kind)) {
+        // a real row's words (any case) are its off forms, which travel as 0
+        for (r.words) |w| if (std.ascii.eqlIgnoreCase(text, w)) return 0;
+        return @bitCast(try real(r, text));
+    }
+    // a list travels as 0, its text read by its reader: the row's words, or whole numbers, between commas
+    if (r.kind == .list) {
+        var it = std.mem.tokenizeScalar(u8, text, ',');
+        while (it.next()) |x| {
+            if (r.words.len == 0) {
+                _ = std.fmt.parseInt(u64, x, 10) catch return error.InvalidEnvironment;
+            } else if (for (r.words) |w| {
+                if (std.mem.eql(u8, x, w)) break false;
+            } else true) return error.InvalidEnvironment;
+        }
+        return 0;
+    }
     if (r.kind == .range) {
         var it = std.mem.splitScalar(u8, text, '-');
         const lo = std.fmt.parseInt(u32, it.next().?, 10) catch return error.InvalidEnvironment;
@@ -243,7 +316,7 @@ pub fn check(name: [:0]const u8, raw: ?[]const u8) Error!void {
 
 /// One setting in its reader's type: a switch as bool, a real as a float, any other kind as its whole number.
 pub fn value(comptime T: type, name: [:0]const u8, raw: ?[]const u8, default: T) Error!T {
-    std.debug.assert(isReal(rule(name).kind) == (@typeInfo(Plain(T)) == .float) and rule(name).kind != .range and rule(name).kind != .path);
+    std.debug.assert(isReal(rule(name).kind) == (@typeInfo(Plain(T)) == .float) and rule(name).kind != .range and rule(name).kind != .path and rule(name).kind != .list);
     return decode(T, (try checked(name, raw)) orelse return default);
 }
 
@@ -303,6 +376,7 @@ pub const Flags = struct {
     dsv41: bool = false,
     gemma4: bool = false,
     drama3: bool = false,
+    flashnext_mia: bool = false,
     device: ?u32 = null,
     segments: ?u32 = null,
     carveout: bool = false,
@@ -318,6 +392,7 @@ pub const Flags = struct {
             .dsv41 => f.dsv41,
             .gemma4 => f.gemma4,
             .drama3 => f.drama3,
+            .flashnext_mia => f.flashnext_mia,
         };
     }
 };

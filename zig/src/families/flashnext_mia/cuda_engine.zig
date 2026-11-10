@@ -1,5 +1,6 @@
 //! Flash Next CUDA engine from TensorFold qwen4_exp/cuda decode.py + engine.py (Ash Hart, vcruz305); ranks in step.
 const std = @import("std");
+const envs = @import("cuda_env.zig");
 const cuda = @import("cuda");
 const lanes = @import("lanes");
 const media_mod = @import("cuda_media.zig");
@@ -37,13 +38,13 @@ pub const product_streams_default = 2;
 pub const wide_confidence = 0.5;
 
 pub fn productStreams() usize {
-    const v = std.c.getenv("TF_FLASHNEXT_PRODUCT_STREAMS") orelse return product_streams_default;
-    return std.fmt.parseInt(usize, std.mem.span(v), 10) catch product_streams_default;
+    const v = envs.get("TF_FLASHNEXT_PRODUCT_STREAMS") orelse return product_streams_default;
+    return std.fmt.parseInt(usize, v, 10) catch product_streams_default;
 }
 
 pub fn confidenceSetting() f64 {
-    const v = std.c.getenv("TF_FLASHNEXT_CONFIDENCE") orelse return served_confidence;
-    const x = std.fmt.parseFloat(f64, std.mem.span(v)) catch return served_confidence;
+    const v = envs.get("TF_FLASHNEXT_CONFIDENCE") orelse return served_confidence;
+    const x = std.fmt.parseFloat(f64, v) catch return served_confidence;
     return if (x >= -1 and x <= 1) x else served_confidence;
 }
 /// The most candidates a main-head draw reads back (top_k + MARGIN); larger top_k values are refused.
@@ -126,7 +127,7 @@ fn yarnConfig(y: rope.Yarn) cfgs.Yarn {
 
 /// TF_FLASHNEXT_MTP_TOPK: the MTP layer's routed experts a row (drafts only; 0 or unset: the config's top_k).
 fn mtpTopK(top_k: u32) usize {
-    const v = envGet("TF_FLASHNEXT_MTP_TOPK") orelse return 0;
+    const v = envs.get("TF_FLASHNEXT_MTP_TOPK") orelse return 0;
     const n = std.fmt.parseInt(usize, v, 10) catch return 0;
     // the kernel set routes the checkpoints' own values (10, INT4-AutoRound's 5); 10 is the only other one accepted
     if (n != 10 or n == top_k) {
@@ -229,20 +230,11 @@ fn streamWithPriority(d: *const cuda.Driver, priority: c_int) !cuda.Stream {
     return .{ .d = d, .handle = s };
 }
 
-fn envGet(name: [:0]const u8) ?[]const u8 {
-    return if (std.c.getenv(name)) |v| std.mem.span(v) else null;
-}
-
-fn envOff(name: [:0]const u8) bool {
-    const v = envGet(name) orelse return false;
-    return std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "off");
-}
-
 /// Two ranks' prompt chunk rows (TF_FLASHNEXT_PREFILL_ROWS overrides; any chunking gives the same bits); one GPU: 2048.
 pub const tp2_prefill_rows: usize = 4096;
 
 fn promptRows(default: usize) !usize {
-    const v = envGet("TF_FLASHNEXT_PREFILL_ROWS") orelse return default;
+    const v = envs.get("TF_FLASHNEXT_PREFILL_ROWS") orelse return default;
     const n = std.fmt.parseInt(usize, v, 10) catch return error.BadPrefillRows;
     if (n < 16 or n > 16384) return error.BadPrefillRows;
     return n;
@@ -345,6 +337,7 @@ pub const Engine = struct {
     qsa_fast: ?prompt_mm.QsaScores = null,
 
     pub fn init(gpa: Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels_dir: []const u8, o: Options) !*Engine {
+        try envs.startup();
         const t0 = std.Io.Clock.awake.now(io);
         if (o.world < 1 or o.world > 2 or o.rank >= o.world) return error.BadRank;
         if (o.world > 1 and o.comm == null) return error.TwoRanksNeedComm;
@@ -365,7 +358,7 @@ pub const Engine = struct {
         errdefer e.set.deinit();
         // TF_FLASHNEXT_INT4AR_FAST=1: INT4-AutoRound's lossy fast-fp8/ variant over the checkpoint (opt-in)
         var overlay_buf: [1024]u8 = undefined;
-        const overlay: ?[]const u8 = if (e.c.int4ar() and envGet("TF_FLASHNEXT_INT4AR_FAST") != null and !envOff("TF_FLASHNEXT_INT4AR_FAST")) try std.fmt.bufPrint(&overlay_buf, "{s}/fast-fp8", .{dir}) else null;
+        const overlay: ?[]const u8 = if (e.c.int4ar() and envs.get("TF_FLASHNEXT_INT4AR_FAST") != null and !envs.off("TF_FLASHNEXT_INT4AR_FAST")) try std.fmt.bufPrint(&overlay_buf, "{s}/fast-fp8", .{dir}) else null;
         e.w = try weights.load(gpa, io, dir, &e.c, .{ .rank = o.rank, .world = o.world, .mtp = o.mtp, .draft_head = o.mtp, .mode = .device, .driver = d, .overlay = overlay });
         errdefer e.w.deinit();
         if (o.mtp and e.w.mtp == null) return error.NoMtpHead;
@@ -384,7 +377,7 @@ pub const Engine = struct {
         errdefer if (e.mbuf) |*m| m.deinit();
         // default 512: a last chunk takes up to 512 more rows instead of its own chunk (exact: chunk invariance)
         if (e.prefill_rows + 512 <= 16384) e.prefill_tail = 512;
-        if (envGet("TF_FLASHNEXT_PREFILL_TAIL")) |v| {
+        if (envs.get("TF_FLASHNEXT_PREFILL_TAIL")) |v| {
             e.prefill_tail = std.fmt.parseInt(usize, v, 10) catch return error.BadPrefillTail;
             if (e.prefill_tail % 16 != 0 or e.prefill_rows + e.prefill_tail > 16384) return error.BadPrefillTail;
         }
@@ -408,35 +401,35 @@ pub const Engine = struct {
         errdefer if (e.k8) |*q| q.deinit();
         errdefer if (e.k4) |*q| q.deinit();
         // prompt matmuls without split-K partials when the kernel set has them (TF_FLASHNEXT_PROMPT_MM=0: off)
-        e.f.prompt_mm = !envOff(prompt_mm.env) and prompt_mm.available(&e.set);
-        e.draw_once = !envOff("TF_FLASHNEXT_DRAW_ONCE");
+        e.f.prompt_mm = !envs.off(prompt_mm.env) and prompt_mm.available(&e.set);
+        e.draw_once = !envs.off("TF_FLASHNEXT_DRAW_ONCE");
         // the shared expert beside the routed experts on a second stream (TF_FLASHNEXT_SHARED_SIDE=0: in line)
-        if (!envOff("TF_FLASHNEXT_SHARED_SIDE")) try e.f.initSide();
+        if (!envs.off("TF_FLASHNEXT_SHARED_SIDE")) try e.f.initSide();
         // INT4-AutoRound's projections: block-FP8 columns stored in place (TF_FLASHNEXT_FP8_LD=0: scratch + copy)
-        e.f.fp8_ld = !envOff("TF_FLASHNEXT_FP8_LD");
+        e.f.fp8_ld = !envs.off("TF_FLASHNEXT_FP8_LD");
         // shared expert's single-slice gate/up on the K-serial kernel (same bits); TF_FLASHNEXT_FP4_SERIAL=0 off
-        e.f.fp4_serial = !envOff("TF_FLASHNEXT_FP4_SERIAL");
-        e.graph_log = envGet("TF_FLASHNEXT_GRAPH_LOG") != null;
-        if (envGet("TF_FLASHNEXT_GRAPH_FAIL")) |v| e.inject_every = std.fmt.parseInt(u64, v, 10) catch 0;
-        if (envGet("TF_FLASHNEXT_MULTI_GRAPHS")) |v| e.multi_graphs = std.fmt.parseInt(usize, v, 10) catch multi_graphs_default;
+        e.f.fp4_serial = !envs.off("TF_FLASHNEXT_FP4_SERIAL");
+        e.graph_log = envs.get("TF_FLASHNEXT_GRAPH_LOG") != null;
+        if (envs.get("TF_FLASHNEXT_GRAPH_FAIL")) |v| e.inject_every = std.fmt.parseInt(u64, v, 10) catch 0;
+        if (envs.get("TF_FLASHNEXT_MULTI_GRAPHS")) |v| e.multi_graphs = std.fmt.parseInt(usize, v, 10) catch multi_graphs_default;
         // shared rounds past captured widths run attention in one launch: TF_FLASHNEXT_ATTN_MULTI=N from N streams
         if (tri.Tri.multiAvailable(&e.set)) {
-            const want: usize = if (envGet("TF_FLASHNEXT_ATTN_MULTI")) |v| (std.fmt.parseInt(usize, v, 10) catch 0) else e.multi_graphs + 1;
+            const want: usize = if (envs.get("TF_FLASHNEXT_ATTN_MULTI")) |v| (std.fmt.parseInt(usize, v, 10) catch 0) else e.multi_graphs + 1;
             if (want > 0) e.f.attn_multi = @max(want, e.multi_graphs + 1, 2);
             // the kernel set's attn_multi kernels read bf16 caches: an FP8 cache keeps the one-stream kernels
             if (e.g.kv != .bf16) e.f.attn_multi = 0;
         }
-        if (envGet("TF_FLASHNEXT_MEDIA_GRAPHS")) |v| e.media_graphs = !std.mem.eql(u8, v, "0");
-        e.f.count_experts = if (envGet("TF_FLASHNEXT_COUNT_EXPERTS")) |v| std.mem.eql(u8, v, "1") else false;
-        if (!envOff(moep.env)) {
+        if (envs.get("TF_FLASHNEXT_MEDIA_GRAPHS")) |v| e.media_graphs = !std.mem.eql(u8, v, "0");
+        e.f.count_experts = if (envs.get("TF_FLASHNEXT_COUNT_EXPERTS")) |v| std.mem.eql(u8, v, "1") else false;
+        if (!envs.off(moep.env)) {
             e.px = try moep.Prompt4.init(ctx);
             if (e.px.?.gu2) try e.px.?.reserveGate(d, (e.prefill_rows + e.prefill_tail) * e.g.slots(), e.g.moe_width);
             e.f.px = &e.px.?;
         }
         errdefer if (e.px) |*q| q.deinit();
         // two ranks: prompt glue split by rows (TF_FLASHNEXT_GLUE_SPLIT=0: every rank runs every row)
-        e.f.glue_split = o.world == 2 and !envOff("TF_FLASHNEXT_GLUE_SPLIT");
-        e.digest = envGet("TF_FLASHNEXT_PREFILL_DIGEST") != null;
+        e.f.glue_split = o.world == 2 and !envs.off("TF_FLASHNEXT_GLUE_SPLIT");
+        e.digest = envs.get("TF_FLASHNEXT_PREFILL_DIGEST") != null;
         // NCCL connects point-to-point channels on first use, so one prompt-sized exchange runs now on both ranks
         if (e.f.glue_split) if (o.comm) |cm| {
             const n = @min(e.prefill_rows / 2, 2048) * e.g.hidden;
@@ -445,34 +438,34 @@ pub const Engine = struct {
             try e.stream.synchronize();
         };
         // both ranks loaded: drop the checkpoint's pages from the page cache (TF_FLASHNEXT_DROP_PAGES=0 keeps them)
-        if (!envOff("TF_FLASHNEXT_DROP_PAGES")) weights.dropPages(gpa, io, dir);
-        e.poison = envGet("TF_FLASHNEXT_POISON_PADS") != null;
-        e.pass_times = envGet("TF_FLASHNEXT_PASS_TIMES") != null;
-        e.f.up_mix = !envOff("TF_FLASHNEXT_GLUE_FUSE") and prompt_mm.upMixAvailable(&e.set);
-        e.f.wb_norm = !envOff("TF_FLASHNEXT_WB_NORM") and prompt_mm.wbNormAvailable(&e.set);
+        if (!envs.off("TF_FLASHNEXT_DROP_PAGES")) weights.dropPages(gpa, io, dir);
+        e.poison = envs.get("TF_FLASHNEXT_POISON_PADS") != null;
+        e.pass_times = envs.get("TF_FLASHNEXT_PASS_TIMES") != null;
+        e.f.up_mix = !envs.off("TF_FLASHNEXT_GLUE_FUSE") and prompt_mm.upMixAvailable(&e.set);
+        e.f.wb_norm = !envs.off("TF_FLASHNEXT_WB_NORM") and prompt_mm.wbNormAvailable(&e.set);
         // the split glue's exchanges on their own stream beside the other rows' work (TF_FLASHNEXT_OVERLAP=0: in line)
-        if (!envOff("TF_FLASHNEXT_QSA_FAST")) {
+        if (!envs.off("TF_FLASHNEXT_QSA_FAST")) {
             e.qsa_fast = try prompt_mm.QsaScores.init(d);
             e.f.qsa_fast = &e.qsa_fast.?;
         }
         errdefer if (e.qsa_fast) |*q| q.deinit();
-        if (envGet("TF_FLASHNEXT_QSA_RT")) |v| {
+        if (envs.get("TF_FLASHNEXT_QSA_RT")) |v| {
             e.f.qsa_rt = std.fmt.parseInt(usize, v, 10) catch 0;
         }
-        if (envGet("TF_FLASHNEXT_QSA_TILES_FROM")) |v| {
+        if (envs.get("TF_FLASHNEXT_QSA_TILES_FROM")) |v| {
             e.f.qsa_tiles_from = std.fmt.parseInt(usize, v, 10) catch std.math.maxInt(usize);
         }
-        if (envGet("TF_FLASHNEXT_QSA_SPLIT_KEYS")) |v| {
+        if (envs.get("TF_FLASHNEXT_QSA_SPLIT_KEYS")) |v| {
             e.f.qsa_split_keys = std.fmt.parseInt(usize, v, 10) catch 0;
         }
         // measured ~1% (research/R2-measured.md): off unless asked
-        if (e.f.glue_split and envGet("TF_FLASHNEXT_OVERLAP") != null and !envOff("TF_FLASHNEXT_OVERLAP")) {
-            if (envGet("TF_FLASHNEXT_OVERLAP")) |v| e.f.overlap = std.fmt.parseInt(u8, v, 10) catch 1;
-            const prio: c_int = if (envGet("TF_FLASHNEXT_COMM_PRIORITY")) |v| (std.fmt.parseInt(c_int, v, 10) catch 0) else 0;
+        if (e.f.glue_split and envs.get("TF_FLASHNEXT_OVERLAP") != null and !envs.off("TF_FLASHNEXT_OVERLAP")) {
+            if (envs.get("TF_FLASHNEXT_OVERLAP")) |v| e.f.overlap = std.fmt.parseInt(u8, v, 10) catch 1;
+            const prio: c_int = if (envs.get("TF_FLASHNEXT_COMM_PRIORITY")) |v| (std.fmt.parseInt(c_int, v, 10) catch 0) else 0;
             e.f.cs = try streamWithPriority(d, prio);
             for (&e.f.cs_ev) |*ev| ev.* = try cuda.Event.init(d, false);
             // CTAs the persistent expert kernels leave free for NCCL's (the grids loop over units: same bits)
-            if (envGet("TF_FLASHNEXT_EXPERT_SMS_FREE")) |v| {
+            if (envs.get("TF_FLASHNEXT_EXPERT_SMS_FREE")) |v| {
                 const free = std.fmt.parseInt(usize, v, 10) catch 0;
                 const sms: usize = @intCast(e.k.sms);
                 for (&e.k.nvfp4_blocks) |*n| n.* = n.* / sms * (sms - @min(free, sms - 1));
@@ -483,14 +476,14 @@ pub const Engine = struct {
             cs.deinit();
             for (&e.f.cs_ev) |*ev| ev.deinit();
         };
-        if (profs.wanted(envGet(profs.env))) {
+        if (profs.wanted(envs.get(profs.env))) {
             e.prof = try profs.Prof.init(gpa, d, 16384);
         }
         errdefer if (e.prof) |p| p.deinit(gpa);
         if (o.rank == 0) std.debug.print("prompt path: {d}-row chunks (the last up to {d} more), glue {s}{s}, matmul K slices {s}, experts {s}{s}\n", .{ e.prefill_rows, e.prefill_tail, if (e.f.glue_split) "split by rows" else "on every row", if (e.f.cs != null) " (exchanges overlapped)" else "", if (e.f.prompt_mm) "in one program (_b16mm_ks/_fp4mm_ks)" else "split with _reduce", if (e.px != null) "on 128-pair items (fn_experts_prompt)" else "on 16-pair items", if (e.prof != null) ", profiled" else "" });
-        if (e.w.mtp != null) if (std.c.getenv("TF_FLASHNEXT_MTP_Q4")) |v| if (!std.mem.eql(u8, std.mem.span(v), "0")) {
-            const mse = if (std.c.getenv("TF_FLASHNEXT_MTP_Q4_MSE")) |x| std.mem.eql(u8, std.mem.span(x), "1") else false;
-            e.mtpq = try @import("cuda_mtp_q4.zig").Table.build(gpa, d, &e.w, std.mem.span(v), mse);
+        if (e.w.mtp != null) if (envs.get("TF_FLASHNEXT_MTP_Q4")) |v| if (!std.mem.eql(u8, v, "0")) {
+            const mse = envs.is("TF_FLASHNEXT_MTP_Q4_MSE", "1");
+            e.mtpq = try @import("cuda_mtp_q4.zig").Table.build(gpa, d, &e.w, v, mse);
             e.f.mtp_q4 = &e.mtpq.?;
             std.log.info("MTP head in 4-bit for the drafts: {d} matrices, {d:.1} -> {d:.1} MB", .{ e.mtpq.?.n, @as(f64, @floatFromInt(e.mtpq.?.bytes_bf16)) / 1e6, @as(f64, @floatFromInt(e.mtpq.?.bytes_q4)) / 1e6 });
         };
@@ -528,7 +521,7 @@ pub const Engine = struct {
         try e.stream.synchronize();
         // the floor the server and the recipe set (TENSORFOLD_MEMORY_RESERVE_GIB) wins over the option
         var reserve_gib = o.reserve_gib;
-        if (std.c.getenv("TENSORFOLD_MEMORY_RESERVE_GIB")) |v| reserve_gib = std.fmt.parseFloat(f64, std.mem.span(v)) catch return error.BadMemoryReserve;
+        if (envs.get("TENSORFOLD_MEMORY_RESERVE_GIB")) |v| reserve_gib = std.fmt.parseFloat(f64, v) catch return error.BadMemoryReserve;
         const reserve: usize = @intFromFloat(reserve_gib * (1 << 30));
         // MemAvailable counts the mapped n-gram table's reclaimable pages; the device's free count leaves them out
         const free = memAvailable(io) orelse (try ctx.memInfo()).free;
@@ -976,7 +969,7 @@ pub const Engine = struct {
         const pb = &e.pbuf;
         const Wd = e.g.wide();
         const use_mtp = e.absorbing and e.w.mtp != null;
-        if (e.rank == 0 and envGet("TF_FLASHNEXT_BURST_LOG") != null) {
+        if (e.rank == 0 and envs.get("TF_FLASHNEXT_BURST_LOG") != null) {
             var rows: usize = 0;
             for (prompts) |p| rows += p.prompt.len;
             std.debug.print("burst prefill: {d} prompts, {d} rows in one pass\n", .{ n, rows });

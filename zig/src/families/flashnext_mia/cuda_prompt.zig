@@ -1,5 +1,6 @@
 //! Prompt matmuls without split-K partials (`_b16mm_ks`, `_fp4mm_ks`): slice totals in order, `_reduce`'s bits.
 const std = @import("std");
+const envs = @import("cuda_env.zig");
 const cuda = @import("cuda");
 const aot = cuda.aot;
 const tri = @import("cuda_triton.zig");
@@ -380,7 +381,7 @@ pub const QsaScores = struct {
             f.* = try m.function(n);
             try f.allowDynamicShared(@intCast(shared(i)));
         }
-        if (std.c.getenv("TF_FLASHNEXT_QSA_TILE")) |v| q.pick = @min(3, std.fmt.parseInt(usize, std.mem.span(v), 10) catch 0);
+        if (envs.get("TF_FLASHNEXT_QSA_TILE")) |v| q.pick = @min(3, std.fmt.parseInt(usize, v, 10) catch 0);
         return q;
     }
 

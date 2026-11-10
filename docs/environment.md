@@ -60,6 +60,69 @@ Backend-specific settings are checked when that backend starts; slide settings r
 Common server settings are checked before checkpoint resolution, including when no request would use them yet.
 Direct family readers also refuse malformed values when called without the server.
 
+## MiaAI-Lab's Flash Next engine
+
+These settings are read only with `TF_FLASHNEXT_ENGINE=mia`. Each has a `flashnext_mia` row in `platform/environment.zig`.
+Every row is checked when her engine opens, before it loads anything; a malformed value is refused with the usual message.
+An accepted value keeps her engine's meaning: her readers still interpret the text, so the table only refuses text they would misread.
+`TF_FLASHNEXT_CONFIDENCE` and `TF_FLASHNEXT_KEEP_LATE` are also read by the upstream Flash Next engine, with its own meaning.
+
+| Variable | Accepted explicit value | Meaning (default) |
+| --- | --- | --- |
+| `TF_FLASHNEXT_DEPTH` | Whole count | Drafts a window, 1 through the lane core's most (15: 16-row windows) |
+| `TF_FLASHNEXT_YARN` | Factor above 1, or `0`, `off`, `no`, `false`, `none`, `default` (any case) | YaRN factor; `4` gives a 1,048,576 window (the checkpoint's rope scaling) |
+| `TF_FLASHNEXT_YARN_RAMP_POSITIONS` | Whole count | YaRN ramp positions (0) |
+| `TF_FLASHNEXT_ROCE` | `0` or `1` | `0` turns off the one-shot RoCE all-gather between two ranks (on) |
+| `TF_FLASHNEXT_L2PF` | `0` or `1` | `0` turns off the L2 weight prefetch (on) |
+| `TF_FLASHNEXT_ROCE_MAX` | Whole byte count | Largest all-gather sent over RoCE (524288) |
+| `TF_FLASHNEXT_L2PF_BYTES` | Whole byte count | Bytes of a weight to prefetch (8388608) |
+| `TF_FLASHNEXT_FILL` | `0` or `1` | `1` fills prompts in layer slices between rounds (off) |
+| `TF_FLASHNEXT_FILL_LAYERS` | Whole count | Layers a fill step, at least 1 (8) |
+| `TF_FLASHNEXT_OVERCOMMIT` | `0` or `1` | `1` admits a stream against memory free now instead of its window's reserved caches (off) |
+| `TF_FLASHNEXT_CONFIDENCE` | Finite number | Draft stop rule from -1 through 1: c > 0 per draft, c < 0 running product (-0.4); others keep the default |
+| `TF_FLASHNEXT_PRODUCT_STREAMS` | Whole count | Live streams up to which the running-product rule applies (2) |
+| `TF_FLASHNEXT_KEEP_LATE` | `0` or `1` | `0` turns off pending DeltaNet rows for partly kept windows (on) |
+| `TF_FLASHNEXT_MTP_TOPK` | Whole count | MTP layer's routed experts a row; only 10 is used besides the checkpoint's (0: the checkpoint's) |
+| `TF_FLASHNEXT_MTP_Q4` | `0`, `1`, `all`, or a comma list of `fc`, `attn`, `hc`, `mixer` | MTP head matrices quantized to 4 bits for drafts (off) |
+| `TF_FLASHNEXT_MTP_Q4_MSE` | `0` or `1` | `1` picks the 4-bit scales by least squared error (off) |
+| `TF_FLASHNEXT_PREFILL_ROWS` | Whole count, 16 through 16384 | Prompt chunk rows (4096 on two ranks, 2048 on one) |
+| `TF_FLASHNEXT_PREFILL_TAIL` | Whole count, a multiple of 16 | Rows a last chunk may take instead of its own chunk (512) |
+| `TF_FLASHNEXT_INT4AR_FAST` | `0`, `off`, `1` or `on` | `1` loads INT4-AutoRound's lossy `fast-fp8/` overlay (off) |
+| `TF_FLASHNEXT_PROMPT_MM` | `0`, `off`, `1` or `on` | Prompt matmuls without split-K partials when the kernel set has them (on) |
+| `TF_FLASHNEXT_DRAW_ONCE` | `0`, `off`, `1` or `on` | Two ranks draw a round's tokens once from gathered candidates when they fit (on) |
+| `TF_FLASHNEXT_SHARED_SIDE` | `0`, `off`, `1` or `on` | Shared expert on a second stream beside the routed experts (on) |
+| `TF_FLASHNEXT_FP8_LD` | `0`, `off`, `1` or `on` | INT4-AutoRound block-FP8 columns stored in place (on) |
+| `TF_FLASHNEXT_FP4_SERIAL` | `0`, `off`, `1` or `on` | Shared expert's single-slice gate/up on the K-serial kernel (on) |
+| `TF_FLASHNEXT_PROMPT_EXPERTS` | `0`, `off`, `1` or `on` | Prompt experts on 128-pair items (on) |
+| `TF_FLASHNEXT_GLUE_SPLIT` | `0`, `off`, `1` or `on` | Two ranks split the prompt glue by rows (on) |
+| `TF_FLASHNEXT_DROP_PAGES` | `0`, `off`, `1` or `on` | Drop the checkpoint's pages from the page cache once loaded (on) |
+| `TF_FLASHNEXT_GLUE_FUSE` | `0`, `off`, `1` or `on` | Fused up-mix glue when the kernel set has it (on) |
+| `TF_FLASHNEXT_WB_NORM` | `0`, `off`, `1` or `on` | Fused write-back norm when the kernel set has it (on) |
+| `TF_FLASHNEXT_QSA_FAST` | `0`, `off`, `1` or `on` | Fast indexer score kernel (on) |
+| `TF_FLASHNEXT_QSA_RT` | Whole count | Indexer score row tile (0: the default path) |
+| `TF_FLASHNEXT_QSA_TILES_FROM` | Whole count | Key blocks from which indexer scores run in tiles (8192) |
+| `TF_FLASHNEXT_QSA_SPLIT_KEYS` | Whole count | Keys a split of the indexer scores (65536) |
+| `TF_FLASHNEXT_QSA_TILE` | Whole count | Indexer score tile choice, above 3 read as 3 (0) |
+| `TF_FLASHNEXT_OVERLAP` | Whole number 0 through 255 | With split glue, its exchanges on their own stream in this mode (0: in line) |
+| `TF_FLASHNEXT_COMM_PRIORITY` | Whole number | That exchange stream's CUDA priority (0) |
+| `TF_FLASHNEXT_EXPERT_SMS_FREE` | Whole count | SMs the persistent expert kernels leave free for NCCL with overlap (0) |
+| `TF_FLASHNEXT_EXPERT_SHAPE` | Whole count | Expert units up to which gate/up takes the NT shape (230) |
+| `TF_FLASHNEXT_INT4_TILE` | Whole count | INT4 expert tile (the planned tile) |
+| `TF_FLASHNEXT_INT4_PROMPT_DOWN` | `0` or `1` | `0` turns off the INT4 prompt down-projection kernel (on) |
+| `TF_FLASHNEXT_PROMPT_EXPERTS_OCC` | `0` or `1` | `1` runs gate/up on the occupancy prompt-expert kernels; `0` also takes the down projection off them (gate/up off, down on) |
+| `TF_FLASHNEXT_PROMPT_EXPERTS_GU2` | `0` or `1` | `1` splits the prompt experts' gate and up (off) |
+| `TF_FLASHNEXT_PROMPT_EXPERTS_CFG` | Comma-separated whole numbers | Prompt-expert tile, gate/up and down threads (32,2,2) |
+| `TF_FLASHNEXT_PROMPT_EXPERTS_ROWS` | Comma-separated whole numbers | Prompt-expert gate/up and down rows (4096,2048) |
+| `TF_FLASHNEXT_MULTI_GRAPHS` | Whole count | Shared-round widths captured as graphs (4) |
+| `TF_FLASHNEXT_ATTN_MULTI` | Whole count | Streams from which attention runs in one launch (graph widths + 1; 0: never) |
+| `TF_FLASHNEXT_MEDIA_GRAPHS` | `0` or `1` | `0` runs media prompts without graphs (on) |
+| `TF_FLASHNEXT_COUNT_EXPERTS` | `0` or `1` | `1` counts routed experts while profiling (off) |
+| `TF_FLASHNEXT_PROFILE` | `0` or `1` | `1` profiles the forward (off) |
+| `TF_FLASHNEXT_GRAPH_FAIL` | Whole count | Test hook: a graph launch fails every this many (0: never) |
+| `TF_FLASHNEXT_GRAPH_LOG`, `TF_FLASHNEXT_PREFILL_DIGEST`, `TF_FLASHNEXT_POISON_PADS`, `TF_FLASHNEXT_PASS_TIMES`, `TF_FLASHNEXT_BURST_LOG` | `0` or `1` | Diagnostics, on whenever set, `0` included (off) |
+| `TF_TP_TIMEOUT_S` | Whole seconds | How long a rank waits for the other (300) |
+| `TENSORFOLD_MEMORY_RESERVE_GIB` | Finite GiB amount of at least 0 | GiB her engine keeps free, as in the server's admission |
+
 ## Existing lenient switches
 
 These settings retain their existing boolean policies rather than gaining new aliases or refusals:
