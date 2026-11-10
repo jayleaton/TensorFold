@@ -28,6 +28,7 @@ pub const fp4_serial = @import("cuda_fp4_serial.zig");
 pub const prof = @import("cuda_prof.zig");
 pub const moe_prompt = @import("cuda_moe_prompt.zig");
 pub const fp8 = @import("cuda_fp8.zig");
+pub const media = @import("cuda_media.zig");
 pub const int4 = @import("cuda_int4.zig");
 pub const int4_check = @import("cuda_int4_check.zig");
 pub const Engine = engine.Engine;
@@ -62,6 +63,7 @@ test {
     _ = prof;
     _ = moe_prompt;
     _ = fp8;
+    _ = media;
     _ = int4;
     _ = int4_check;
 }

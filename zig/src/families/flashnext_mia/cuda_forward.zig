@@ -976,7 +976,7 @@ pub const Forward = struct {
     /// table, the rows and the features reach it by NCCL broadcasts from rank 0 here (nothing large rides the
     /// control link). Validity, budget and the device allocations are agreed first, so either both ranks refuse
     /// (error.MediaRefused, before any collective of the prompt) or both run the same broadcasts.
-    pub fn attachMedia(f: *Forward, seq: *Seq, media: *const @import("lanes").Media, prompt_len: usize) !void {
+    pub fn attachMedia(f: *Forward, seq: *Seq, media: *const @import("cuda_media.zig").Media, prompt_len: usize) !void {
         const lead = if (f.comm) |cm| cm.rank == 0 else true;
         var valid = true;
         media.check(prompt_len) catch {

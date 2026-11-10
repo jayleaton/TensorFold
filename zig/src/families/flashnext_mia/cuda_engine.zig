@@ -12,6 +12,7 @@
 const std = @import("std");
 const cuda = @import("cuda");
 const lanes = @import("lanes");
+const media_mod = @import("cuda_media.zig");
 const kern = @import("cuda_kernels.zig");
 const tri = @import("cuda_triton.zig");
 const tops = @import("cuda_torch_ops.zig");
@@ -793,7 +794,7 @@ pub const Engine = struct {
         /// resume from a kept state of this sequence (the prompt extends its tokens)
         resume_from: ?*const Snapshot = null,
         /// the prompt's images and video frames (Python prefill(..., vision=)): fresh prompts only, nothing kept
-        media: ?*const lanes.Media = null,
+        media: ?*const media_mod.Media = null,
     };
 
     pub const Prefilled = struct { first: u32, kept: ?*Snapshot = null };
@@ -1507,7 +1508,7 @@ pub const Engine = struct {
         stop_eos: bool = true,
         arrive: usize = 0,
         /// the prompt's images and video frames (null: text)
-        media: ?*const lanes.Media = null,
+        media: ?*const media_mod.Media = null,
         tokens: std.ArrayList(u32) = .empty,
         rounds: usize = 0,
         accepted: usize = 0,

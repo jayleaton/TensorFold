@@ -35,6 +35,7 @@
 //! from the prefill frame to the release frame (prompt, budget, sampling, eos and chunks are all a backend reads).
 const std = @import("std");
 const lanes = @import("lanes");
+const media_mod = @import("cuda_media.zig");
 const cuda = @import("cuda");
 const Link = @import("cuda_link.zig").Link;
 const Comm = @import("cuda_comm.zig").Comm;
@@ -980,12 +981,12 @@ pub const Leader = struct {
             .probabilities = if (v.probabilities != null) probabilitiesFn else null,
             .tree = if (v.tree != null) treeFn else null,
             .alternatives = if (v.alternatives != null) alternativesFn else null,
-            .prefill_begin = if (v.prefill_begin != null and v.prefill_step != null) prefillBeginFn else null,
-            .prefill_step = if (v.prefill_begin != null and v.prefill_step != null) prefillStepFn else null,
+            .prefill_step = if (v.prefill_step != null) prefillStepFn else null,
             .prefill_many = if (v.prefill_many != null) prefillManyFn else null,
             .release = releaseFn,
         };
-        return .{ .ptr = self, .vtable = &self.vtable };
+        const i = self.inner; // f212's backend flags: the leader serves what its lanes do
+        return .{ .ptr = self, .vtable = &self.vtable, .first_before_draft = i.first_before_draft, .penalties = i.penalties, .chunk_invariant = i.chunk_invariant };
     }
 
     fn of(p: *anyopaque) *Leader {
@@ -1004,33 +1005,29 @@ pub const Leader = struct {
             .resume_key = if (s.reuse.saved) |saved| @intFromPtr(saved) else 0,
             .resume_at = s.reuse.at,
             .marks = s.reuse.marks,
-            .media = if (s.media) |m| .{ .rows = @intCast(m.rowCount()), .delta = m.delta, .width = m.width } else null,
+            .media = if (media_mod.of(s)) |m| .{ .rows = @intCast(m.rowCount()), .delta = m.delta, .width = m.width } else null,
         };
     }
 
-    fn prefillBeginFn(p: *anyopaque, s: *Stream) anyerror!void {
+    /// f212's prefill_step: the first step sends the spec (rank 1 mirrors it), each step its key, then both step.
+    fn prefillStepFn(p: *anyopaque, s: *Stream, max_rows: u32) anyerror!bool {
         const self = of(p);
-        try self.open.put(self.gpa, keyOf(s), {});
-        try self.send(.{ .prefill_begin = specOf(s) }, true);
-        self.arm(0);
-        defer self.disarm();
-        return self.inner.vtable.prefill_begin.?(self.inner.ptr, s);
-    }
-
-    fn prefillStepFn(p: *anyopaque, streams: []const *Stream, states: []be.FillState) anyerror!void {
-        const self = of(p);
-        const keys = try self.scratch().alloc(u64, streams.len);
-        for (keys, streams) |*k, s| k.* = keyOf(s);
+        if (!self.open.contains(keyOf(s))) {
+            try self.open.put(self.gpa, keyOf(s), {});
+            try self.send(.{ .prefill_begin = specOf(s) }, false);
+        }
+        const keys = try self.scratch().alloc(u64, 1);
+        keys[0] = keyOf(s);
         try self.send(.{ .prefill_step = keys }, true);
         self.arm(0);
         defer self.disarm();
-        return self.inner.vtable.prefill_step.?(self.inner.ptr, streams, states);
+        return self.inner.vtable.prefill_step.?(self.inner.ptr, s, max_rows);
     }
 
-    fn prefillManyFn(p: *anyopaque, ss: []const *Stream) anyerror!void {
+    fn prefillManyFn(p: *anyopaque, ss: []const *Stream) anyerror!bool {
         const self = of(p);
         // an image or video prompt prefills alone: its table and features go by broadcast inside its own prefill
-        for (ss) |s| if (s.media != null) return error.BurstRefused;
+        for (ss) |s| if (media_mod.of(s) != null) return false;
         const specs = try self.scratch().alloc(StreamSpec, ss.len);
         var seconds: usize = 0;
         for (specs, ss) |*sp, s| {
@@ -1149,7 +1146,7 @@ const Mirrored = struct {
     chunks: []u32,
     marks: []u32,
     /// rank 0's media shape (its rows, rotary table and features reach this rank by broadcast)
-    media: ?*lanes.Media = null,
+    media: ?*media_mod.Media = null,
 };
 
 /// Rank 1's loop: rank 0's calls on `inner`, until a `stop` frame.
@@ -1253,11 +1250,11 @@ pub const Follower = struct {
         m.media = null;
         errdefer if (m.media) |md| self.gpa.destroy(md);
         if (p.media) |pm| {
-            const md = try self.gpa.create(lanes.Media);
+            const md = try self.gpa.create(media_mod.Media);
             md.* = .{ .rows = &.{}, .positions = &.{}, .delta = pm.delta, .features = &.{}, .width = pm.width, .follower_rows = pm.rows };
             m.media = md;
         }
-        m.stream = try Stream.init(self.gpa, .{ .id = "rank0", .prompt = p.prompt, .max_new = p.max_new, .eos = m.eos, .sampling = p.sampling, .drafts = p.drafts, .chunks = m.chunks, .reuse = .{ .saved = saved, .at = p.resume_at, .marks = m.marks }, .media = m.media });
+        m.stream = try Stream.init(self.gpa, .{ .id = "rank0", .prompt = p.prompt, .max_new = p.max_new, .eos = m.eos, .sampling = p.sampling, .drafts = p.drafts, .chunks = m.chunks, .reuse = .{ .saved = saved, .at = p.resume_at, .marks = m.marks } });
         const gop = try self.streams.getOrPut(self.gpa, p.key);
         if (gop.found_existing) {
             const old = gop.value_ptr.*;
@@ -1277,19 +1274,12 @@ pub const Follower = struct {
                 const f = b.vtable.prefill_many orelse return error.NoBursts;
                 const ss = try a.alloc(*Stream, ps.len);
                 for (ss, ps) |*x, p| x.* = try self.mirror(p);
-                try f(b.ptr, ss);
+                _ = try f(b.ptr, ss); // refused on rank 0 too (the same specs): rank 0 then prefills each alone
             },
-            .prefill_begin => |p| {
-                const f = b.vtable.prefill_begin orelse return error.NoFills;
-                try f(b.ptr, try self.mirror(p));
-            },
+            .prefill_begin => |p| _ = try self.mirror(p), // its fill begins with its first prefill_step
             .prefill_step => |keys| {
                 const f = b.vtable.prefill_step orelse return error.NoFills;
-                const ss = try a.alloc(*Stream, keys.len);
-                for (ss, keys) |*x, k| x.* = try self.stream(k);
-                const states = try a.alloc(be.FillState, keys.len);
-                @memset(states, .filling);
-                try f(b.ptr, ss, states);
+                for (keys) |k| _ = try f(b.ptr, try self.stream(k), 0);
             },
             .first => |f| _ = try b.first(try self.stream(f.key), f.position),
             .queue => |q| _ = try b.queue(try self.stream(q.key), q.feed, q.position),
@@ -1521,7 +1511,7 @@ const Rank1 = struct {
         defer l.close();
         var frames: Frames = .{ .gpa = gpa, .link = l };
         defer frames.deinit();
-        var f = Follower.init(gpa, if (r.sliced) r.target.backendSliced() else r.target.backend(), frames.channel());
+        var f = Follower.init(gpa, if (r.sliced) r.target.stepped() else r.target.backend(), frames.channel());
         defer f.deinit();
         f.run() catch |e| {
             r.err = e;
@@ -1900,38 +1890,45 @@ test "prompts filling between rounds are mirrored: rank 1 fills the same slices 
             var streams: [3]Stream = undefined;
             for (&streams, prompts, 0..) |*s, p, i| s.* = try Stream.init(gpa, .{ .id = "s", .prompt = p, .max_new = 20 + 5 * @as(u32, @intCast(i)), .eos = &.{96} });
             defer for (&streams) |*s| s.deinit(gpa);
-            // one fills alone, then the others arrive two steps apart while it decodes
-            _ = try engine.beginStream(&streams[0]);
+            // one fills alone, then the others arrive two steps apart while it decodes (f212's host steps fills)
+            var filling: [3]bool = .{ true, false, false };
+            var fresh: [3]bool = @splat(true);
             var next: usize = 1;
             var steps: usize = 0;
-            while (engine.activeCount() > 0 or engine.fillingCount() > 0 or next < 3) : (steps += 1) {
+            while (steps < 10_000) : (steps += 1) {
                 if (next < 3 and steps % 2 == 1) {
-                    _ = try engine.beginStream(&streams[next]);
+                    filling[next] = true;
                     next += 1;
                 }
-                try engine.step();
+                var any = false;
+                for (&streams, &filling, &fresh) |*s, *fl, *fr| if (fl.*) {
+                    any = true;
+                    if (try engine.fillStream(s, fr.*)) fl.* = false;
+                    fr.* = false;
+                };
+                if (engine.activeCount() > 0) try engine.step() else if (!any and next >= 3) break;
             }
             var out: [3][]u32 = undefined;
             for (&out, &streams) |*o, *s| o.* = try gpa.dupe(u32, s.emitted());
             return out;
         }
     };
-    var alone: fake.Fake = .{ .gpa = gpa, .slice = 3 };
+    var alone: fake.Fake = .{ .gpa = gpa, .prefill_chunks = 3 };
     defer alone.deinit();
-    const want = try Drive.run(alone.backend());
+    const want = try Drive.run(alone.stepped());
     defer for (want) |w| gpa.free(w);
 
     const server = try link_mod.Server.open(try net.IpAddress.parse("127.0.0.1", 0));
     defer server.close();
-    var rank1: Rank1 = .{ .target = .{ .gpa = gpa, .slice = 3 }, .sliced = true };
+    var rank1: Rank1 = .{ .target = .{ .gpa = gpa, .prefill_chunks = 3 }, .sliced = true };
     defer rank1.target.deinit();
     const t = try std.Thread.spawn(.{}, Rank1.run, .{ &rank1, io, server.port() });
-    var rank0: fake.Fake = .{ .gpa = gpa, .slice = 3 };
+    var rank0: fake.Fake = .{ .gpa = gpa, .prefill_chunks = 3 };
     defer rank0.deinit();
     const l = try server.accept(5000);
     defer l.close();
     var frames: Frames = .{ .gpa = gpa, .link = l };
-    var leader = Leader.init(gpa, rank0.backendSliced(), frames.channel());
+    var leader = Leader.init(gpa, rank0.stepped(), frames.channel());
     const got = Drive.run(leader.backend()) catch |e| {
         leader.deinit();
         t.join();
@@ -1942,8 +1939,8 @@ test "prompts filling between rounds are mirrored: rank 1 fills the same slices 
     t.join();
     if (rank1.err) |e| return e;
     for (want, got) |a, b| try std.testing.expectEqualSlices(u32, a, b);
-    try std.testing.expect(rank0.fill_steps > 0);
-    try std.testing.expectEqual(rank0.fill_steps, rank1.target.fill_steps);
+    try std.testing.expect(rank0.prefill_count > 3); // every prompt in 3 steps
+    try std.testing.expectEqual(rank0.prefill_count, rank1.target.prefill_count);
     try std.testing.expectEqualSlices(u32, rank0.drawn.items, rank1.target.drawn.items);
     try std.testing.expectEqual(@as(u64, 0), rank1.failed);
 }
