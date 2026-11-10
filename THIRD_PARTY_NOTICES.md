@@ -459,6 +459,19 @@ recipe commit e1f564eb915bb5272474b6c1c527aec3b9ed3de6. It credits TensorFold Co
 arithmetic and staging design. Copyright (c) 2026 MiaAI-Lab and Copyright (c) 2026 TensorFold contributors.
 The complete original MIT notices and permission text are retained in [Mia-FlashNext-MIT.txt](LICENSES/Mia-FlashNext-MIT.txt).
 
+## MiaAI-Lab dual-Spark Flash Next engine
+
+`zig/src/families/flashnext_mia/`, `zig/src/cuda/roce_mia.zig`, `zig/src/cuda/roce_proxy.c`, `zig/src/cuda/roce_proxy_stub.c`,
+the `zig/kernels/cuda/fn_*.cu` kernels she added, `zig/src/cli/flashnext_cuda.zig`, `tools/zig/flashnext_mia/` and her
+edits to the server, native host and core lanes are ported from
+[MiaAI-Lab's dual-Spark recipe](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold), commit
+dc05c912342ec19467b3b7b686888de763f2ada1, patches 0001-0008 and 0010-0012, Apache-2.0, Copyright 2026 MiaAI-Lab.
+Her commits keep her authorship. Changed in the port: her files moved to the paths above, her edits merged onto
+upstream f212eeabd, Python engine edits dropped (that engine was removed), and patch 0009 (vision, Python only) left out.
+Her LICENSE, NOTICE (with TensorFold's MIT notice for pre-0.6.0 code) and CREDITS are in
+`LICENSES/MiaAI-Lab-DualTF-LICENSE.txt`, `LICENSES/MiaAI-Lab-DualTF-NOTICE.txt` and `LICENSES/MiaAI-Lab-DualTF-CREDITS.md`;
+the RoCE one-shot all-gather follows b12x's RoCEnante protocol by local-inference-lab (Apache-2.0), as her CREDITS state.
+
 ## Ling-3.0-tiny and Ling-3.1-flash
 
 Ling-3.0-tiny and Ling-3.1-flash are MIT licensed by inclusionAI. The host family package
