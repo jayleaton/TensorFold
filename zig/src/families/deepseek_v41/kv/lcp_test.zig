@@ -93,6 +93,32 @@ test "LCP resume: the planner snapshots at each checkpoint, then at the replay p
     }
 }
 
+test "LCP resume: spacings below the snapshot minimum start at their first multiple at or past it" {
+    for ([_]u64{ 16, 32, 48 }) |every| {
+        var p = sched.Planner.init(t.allocator, .{ .rows = 128, .sessions = true, .lcp_every = every });
+        defer p.deinit();
+        var round = p.beginAdmit();
+        defer round.deinit(t.allocator);
+        _ = try p.admit(&round, .{ .key = 1, .n = 1000, .max_new = 8, .submitted = 0 }, null, 0, null);
+        var pieces: std.ArrayList(sched.Piece) = .empty;
+        defer pieces.deinit(t.allocator);
+        var finals: std.ArrayList(usize) = .empty;
+        defer finals.deinit(t.allocator);
+        var saves: std.ArrayList(u64) = .empty;
+        defer saves.deinit(t.allocator);
+        while (finals.items.len == 0) {
+            try p.plan(null, &pieces, &finals);
+            for (pieces.items) |pc| if (pc.save) try saves.append(t.allocator, pc.end);
+        }
+        var want: std.ArrayList(u64) = .empty;
+        defer want.deinit(t.allocator);
+        var c = (p.s.session_min + every - 1) / every * every;
+        while (c < 992) : (c += every) try want.append(t.allocator, c);
+        try want.append(t.allocator, 992);
+        try t.expectEqualSlices(u64, want.items, saves.items);
+    }
+}
+
 fn findStore(st: *sessions.Store, prompt: []const u32) !?sessions.store.Hit {
     var ids: [1024]i32 = undefined;
     for (ids[0..prompt.len], prompt) |*d, x| d.* = @intCast(x);

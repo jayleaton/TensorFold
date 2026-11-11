@@ -416,11 +416,11 @@ pub const Planner = struct {
         return .{ .admit = .{ .need = pp.need, .hit = hit } };
     }
 
-    /// The next snapshot past `from`: a checkpoint (a multiple of lcp_every) before the replay point, else that point.
+    /// The next snapshot past `from`: a checkpoint (an lcp_every multiple >= session_min) before replay, else replay.
     fn savePoint(p: *const Planner, n: u64, from: u64) ?u64 {
         if (!p.s.sessions) return null;
         const s = snapshotPoint(n);
-        const c = if (p.s.lcp_every > 0) (from / p.s.lcp_every + 1) * p.s.lcp_every else s;
+        const c = if (p.s.lcp_every > 0) (@max(from, p.s.session_min - 1) / p.s.lcp_every + 1) * p.s.lcp_every else s;
         return if (c < s and c >= p.s.session_min) c else if (s > from and s >= p.s.session_min) s else null;
     }
 
