@@ -38,6 +38,8 @@ pub const Options = struct {
     delta: bool = false,
     /// TF_DSV41_SESSION_SLOTS=1: the store with several live slots too (default off)
     several: bool = false,
+    /// TF_DSV41_SESSION_LCP_RESUME=1: prompt checkpoints every this many tokens (kv/lcp.zig; null: off)
+    lcp_every: ?u64 = null,
 };
 
 fn flag(name: [*:0]const u8) bool {
@@ -47,7 +49,8 @@ fn flag(name: [*:0]const u8) bool {
 
 /// The store's policy from the family's options: an unset residency stays unlimited, as sessions.Policy reads null.
 fn policy(o: Options) sessions.store.Policy {
-    return .{ .ram_bytes = o.ram_bytes, .chats = o.resident, .resident_bytes = o.resident_bytes, .skip_covered = o.skip_covered, .delta = o.delta };
+    const anchors: ?u32 = if (o.lcp_every != null) kv.lcp.checkpoint_kind else null;
+    return .{ .ram_bytes = o.ram_bytes, .chats = o.resident, .resident_bytes = o.resident_bytes, .skip_covered = o.skip_covered, .delta = o.delta, .anchor_kind = anchors };
 }
 
 test "the default session options keep idle chats unlimited; an explicit 0 keeps none" {
@@ -57,6 +60,8 @@ test "the default session options keep idle chats unlimited; an explicit 0 keeps
     const zero = policy(.{ .resident = 0, .resident_bytes = 0 });
     try std.testing.expectEqual(@as(?u32, 0), zero.chats);
     try std.testing.expectEqual(@as(?u64, 0), zero.resident_bytes);
+    try std.testing.expectEqual(@as(?u32, null), unset.anchor_kind);
+    try std.testing.expectEqual(@as(?u32, kv.lcp.checkpoint_kind), policy(.{ .lcp_every = 272 }).anchor_kind);
 }
 
 pub fn optionsFromEnv() !Options {
@@ -80,6 +85,7 @@ pub fn optionsFromEnv() !Options {
     o.skip_covered = flag("TF_DSV41_SESSION_SKIP_COVERED");
     o.delta = flag("TF_DSV41_SESSION_DELTA");
     o.several = flag("TF_DSV41_SESSION_SLOTS");
+    o.lcp_every = try kv.lcp.fromEnv();
     return o;
 }
 
@@ -112,6 +118,8 @@ pub const Sessions = struct {
     /// full mode: the drafter's rings ride in the snapshot; a restore sets the pass's context start through `ds_set`
     ds_rings: bool = false,
     ds_set: ?DsSet = null,
+    /// TF_DSV41_SESSION_LCP_RESUME: the checkpoint spacing (null: off)
+    lcp_every: ?u64 = null,
 
     pub const DsSet = struct { ctx: *anyopaque, set: *const fn (ctx: *anyopaque, slot: u32, valid: u64) void, get: ?*const fn (*anyopaque, u32) u64 = null };
 
@@ -121,7 +129,7 @@ pub const Sessions = struct {
         if (kx.slots.len != shape.slots) return error.SlotRange;
         const s = try gpa.create(Sessions);
         errdefer gpa.destroy(s);
-        s.* = .{ .gpa = gpa, .io = io, .f = f, .kx = kx, .store = undefined, .pieces = &.{}, .bounded_bytes = 0, .hist = &.{}, .ds_valid = &.{}, .measure = undefined, .names = std.heap.ArenaAllocator.init(gpa) };
+        s.* = .{ .gpa = gpa, .io = io, .f = f, .kx = kx, .store = undefined, .pieces = &.{}, .bounded_bytes = 0, .hist = &.{}, .ds_valid = &.{}, .measure = undefined, .names = std.heap.ArenaAllocator.init(gpa), .lcp_every = o.lcp_every };
         errdefer s.names.deinit();
         const na = s.names.allocator();
         s.hist = try na.alloc(std.ArrayList(i32), shape.slots);
@@ -396,7 +404,7 @@ pub const Sessions = struct {
         const snap = try s.snapshot();
         var bounded = snap.bounded();
         bounded.logical_bytes = snap.measure;
-        const id = s.store.save(s.kx.slot, bounded, h.items, s.tag(), prompt_kind) catch |e| {
+        const id = s.store.save(s.kx.slot, bounded, h.items, s.tag(), kv.lcp.kindAt(s.lcp_every, h.items.len, prompt_kind)) catch |e| {
             Snap.release(snap);
             return e;
         };
@@ -426,8 +434,13 @@ pub const Sessions = struct {
         return (try @import("request_admission.zig").resumeRequest(s, prompt, max_new orelse 0)).at;
     }
 
-    /// The longest saved entry that strictly prefixes `prompt` (a row must remain to prefill), null: none.
+    /// The longest saved entry strictly prefixing `prompt` (null: none); LCP resume: never inside an image's positions.
     pub fn find(s: *Sessions, prompt: []const u32) !?sessions.store.Hit {
+        if (s.lcp_every == null) return s.findAny(prompt);
+        return kv.lcp.outsideImages(prompt, s, findAny, &@import("image_opts.zig").isVid);
+    }
+
+    fn findAny(s: *Sessions, prompt: []const u32) !?sessions.store.Hit {
         const ids = try s.gpa.alloc(i32, prompt.len);
         defer s.gpa.free(ids);
         for (ids, prompt) |*d, t| d.* = @intCast(t);
@@ -449,8 +462,23 @@ pub const Sessions = struct {
         try s.f.sendSessAdmit(need, spills);
         try s.applyAdmit(need, spills);
         s.ds_valid[s.cur()] = 0;
+        s.logDivergence(prompt, if (hit) |h| h.pos else 0) catch {};
         return s.resumeHit(prompt, hit);
     }
+
+    /// A miss's line: the prompt left every stored entry at least `miss_log_min` tokens past where it resumes.
+    fn logDivergence(s: *Sessions, prompt: []const u32, at: u64) !void {
+        if (quiet) return;
+        const ids = try s.gpa.alloc(i32, prompt.len);
+        defer s.gpa.free(ids);
+        for (ids, prompt) |*d, t| d.* = @intCast(t);
+        const d = try s.store.diverge(s.tag(), ids);
+        if (d.stored == 0 or d.at < at + miss_log_min) return;
+        std.log.scoped(.dsv41).info("sessions: slot {d}: a {d}-token prompt diverged at token {d} (stored {d}); it prefills from {d}", .{ s.cur(), prompt.len, d.at, d.stored, at });
+    }
+
+    /// The reuse a miss line reports at least (tokens): shorter losses (a regenerated reply) stay quiet.
+    const miss_log_min: u64 = 1024;
 
     fn resumeHit(s: *Sessions, prompt: []const u32, hit: ?sessions.store.Hit) !Resumed {
         const h = hit orelse return .{};

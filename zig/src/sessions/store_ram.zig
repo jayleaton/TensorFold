@@ -78,6 +78,7 @@ pub fn restoreRam(s: *Store, id: u32, slot: *Slot) !Bounded {
         try slot.push(dst);
     }
     if (e.extra.origin) |o| slot.origin = .{ .key = o.key, .pages = @min(o.pages, full) };
+    try s.touchAnchors(id);
     s.touch(id);
     s.stats.hits_ram += 1;
     return e.extra.bounded.?;

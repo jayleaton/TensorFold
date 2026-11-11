@@ -42,6 +42,7 @@ pub fn entryKey(node: Digest, pos: u64, tail: []const i32) Digest {
 }
 
 pub const Tier = enum { ram, any };
+pub const Divergence = @import("diverge.zig").Divergence;
 
 pub fn Index(comptime Extra: type) type {
     return struct {
@@ -347,6 +348,8 @@ pub fn Index(comptime Extra: type) type {
             }
             return null;
         }
+
+        pub const diverge = @import("diverge.zig").diverge;
 
         /// A newer entry of id's chain holds every position it does (tier .ram: in RAM), so id need not be written.
         pub fn covered(x: *Self, id: u32, tier: Tier) bool {

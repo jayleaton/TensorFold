@@ -44,6 +44,8 @@ pub const Policy = struct {
     delta: bool = true,
     /// parks and restores on the tier thread (settled by the plan)
     async_io: bool = false,
+    /// entries of this kind (a family's prompt checkpoints) share their chat's recency and are dropped, never parked
+    anchor_kind: ?u32 = null,
 };
 
 pub const Extra = struct {
@@ -150,6 +152,21 @@ pub const Store = struct {
         const id = s.index.find(tag, prompt, d, .any) orelse return null;
         const e = s.index.get(id);
         return .{ .id = id, .ram = e.ram, .pos = e.pos };
+    }
+
+    /// Where prompt leaves everything stored under tag, and the longest entry sharing that much.
+    pub fn diverge(s: *Store, tag: u32, prompt: []const i32) !prefix.Divergence {
+        const d = try s.digests(tag, prompt);
+        return s.index.diverge(tag, prompt, d);
+    }
+
+    /// A RAM entry's older checkpoints (policy.anchor_kind) take its recency, before it does.
+    pub fn touchAnchors(s: *Store, id: u32) !void {
+        const k = s.policy.anchor_kind orelse return;
+        var m: std.ArrayList(u32) = .empty;
+        defer m.deinit(s.gpa);
+        _ = try s.index.members(id, &m, usedOf);
+        for (m.items) |o| if (s.index.get(o).extra.kind == k) s.touch(o);
     }
 
     pub fn link(s: *Store, id: u32) void {
@@ -400,6 +417,10 @@ pub const Store = struct {
             s.stats.covered_drops += 1;
             return null;
         }
+        if (s.policy.anchor_kind) |k| if (e.extra.kind == k) {
+            try s.drop(id);
+            return null;
+        };
         if (s.disk) |d| if (d.accepts(e.pos)) {
             const j = try s.beginPark(id) orelse return null;
             if (!s.policy.async_io) _ = try s.settle(j);

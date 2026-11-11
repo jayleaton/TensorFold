@@ -22,6 +22,7 @@ pub const Store = store.Store;
 test {
     _ = @import("restore.zig");
     _ = @import("prefix_fail_test.zig");
+    _ = @import("diverge.zig");
     _ = @import("store_residency_linux_test.zig");
     _ = @import("store_residency_test.zig");
     _ = @import("store_failure_test.zig");

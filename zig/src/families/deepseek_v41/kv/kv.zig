@@ -10,6 +10,7 @@ pub const device = @import("device.zig");
 pub const DevicePool = device.DevicePool;
 pub const sess = @import("sess.zig");
 pub const sched = @import("sched.zig");
+pub const lcp = @import("lcp.zig");
 pub const progress = @import("progress.zig");
 
 test {
@@ -26,5 +27,7 @@ test {
     _ = @import("session_slots_test.zig");
     _ = @import("resend_test.zig");
     _ = sched;
+    _ = @import("lcp_test.zig");
+    _ = @import("lcp_resume_host_test.zig");
     _ = progress;
 }

@@ -174,6 +174,7 @@ pub const Settings = struct {
     concurrent: u64 = 1,
     session_min: u64 = 64, // shorter prompts are not snapshotted
     sessions: bool = true, // a session store is open (prompt snapshots at the replay point)
+    lcp_every: u64 = 0, // TF_DSV41_SESSION_LCP_RESUME (lcp.zig): prompt checkpoints at multiples of this (0: none)
     adapt: ?Adapt = null, // adaptive rows (on whenever the floor is): null = the fixed rows
     floor: ?Floor = null, // the memory floor (null: no memory source)
     price: PriceKnobs = .{},
@@ -192,6 +193,7 @@ pub const Settings = struct {
         if (envFloat("TF_DSV41_FLOOR_PF_HOST_GIB")) |v| s.price.host_gib = v;
         if (envFloat("TF_DSV41_FLOOR_PF_OTHER_GIB")) |v| s.price.other_gib = v;
         if (std.c.getenv("TF_DSV41_FLOOR_PRICE")) |v| s.price.on = !std.mem.eql(u8, std.mem.trim(u8, std.mem.span(v), " "), "0");
+        s.lcp_every = (try @import("lcp.zig").fromEnv()) orelse 0;
         return s;
     }
 
@@ -267,7 +269,7 @@ pub const Seq = struct {
     submitted: f64,
     done: u64, // prompt tokens in the slot's state (prefill progress)
     cached: u64 = 0, // the tokens its saved prefix gave it at admission
-    save_at: ?u64, // the replay point still to snapshot at
+    save_at: ?u64, // the next checkpoint or the replay point still to snapshot at
     decoding: bool = false,
     long: bool = false,
     price: ?Price = null,
@@ -414,10 +416,12 @@ pub const Planner = struct {
         return .{ .admit = .{ .need = pp.need, .hit = hit } };
     }
 
-    fn savePoint(p: *const Planner, n: u64, cached: u64) ?u64 {
+    /// The next snapshot past `from`: a checkpoint (a multiple of lcp_every) before the replay point, else that point.
+    fn savePoint(p: *const Planner, n: u64, from: u64) ?u64 {
         if (!p.s.sessions) return null;
         const s = snapshotPoint(n);
-        return if (s > cached and s >= p.s.session_min) s else null;
+        const c = if (p.s.lcp_every > 0) (from / p.s.lcp_every + 1) * p.s.lcp_every else s;
+        return if (c < s and c >= p.s.session_min) c else if (s > from and s >= p.s.session_min) s else null;
     }
 
     /// Refused only when nothing is live and it waited `refuse_s` with its price still past usable less the hard floor.
@@ -479,7 +483,7 @@ pub const Planner = struct {
             // a piece is at least one grid step and may overrun the budget: saturating to 0 ends the round
             budget -|= end - x.done;
             x.done = end;
-            if (save) x.save_at = null;
+            if (save) x.save_at = p.savePoint(x.n, end);
         }
         for (p.seqs.items) |*x| if (!x.decoding and x.done == x.n - 1) {
             if (!x.damaged) try finals.append(p.gpa, x.key);
@@ -526,7 +530,7 @@ pub const Planner = struct {
             x.done = 0;
             x.decoding = false;
             x.long = x.n > p.s.long_prompt;
-            x.save_at = if (p.s.sessions) snapshotPoint(x.n) else null;
+            x.save_at = if (p.s.sessions) p.savePoint(x.n, 0) orelse snapshotPoint(x.n) else null;
         };
         var prefilling = false;
         for (p.seqs.items) |x| prefilling = prefilling or !x.decoding;

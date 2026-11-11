@@ -9,5 +9,6 @@ test {
     _ = @import("pool.zig");
     _ = @import("pagestore.zig");
     _ = @import("prefix.zig");
+    _ = @import("diverge.zig");
     _ = @import("format.zig");
 }
