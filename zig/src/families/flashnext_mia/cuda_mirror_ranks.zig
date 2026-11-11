@@ -130,7 +130,7 @@ pub const Leader = struct {
             .release = releaseFn,
         };
         const i = self.inner; // f212's backend flags: the leader serves what its lanes do
-        return .{ .ptr = self, .vtable = &self.vtable, .first_before_draft = i.first_before_draft, .penalties = i.penalties, .chunk_invariant = i.chunk_invariant };
+        return .{ .ptr = self, .vtable = &self.vtable, .first_before_draft = i.first_before_draft, .penalties = i.penalties, .chunk_invariant = i.chunk_invariant, .open_fills = i.open_fills };
     }
 
     fn of(p: *anyopaque) *Leader {

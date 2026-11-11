@@ -192,7 +192,7 @@ pub fn Lanes(comptime E: type) type {
                 .tree = heldFn,
                 .release = releaseFn,
                 .prefill_step = fillStepFn,
-            } };
+            }, .open_fills = 1 }; // the engine holds one prompt's buffers mid-chunk (fillStep: PromptBuffersBusy)
             return .{ .ptr = self, .vtable = &.{
                 .prefill = prefillFn,
                 .first = firstFn,

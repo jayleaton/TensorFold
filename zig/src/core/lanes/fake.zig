@@ -67,6 +67,8 @@ pub const Fake = struct {
     answer_cycles: bool = false,
     prefill_chunks: usize = 0,
     prefill_count: usize = 0,
+    open_fills: u32 = 0, // stepped(): a pass is one chunk; past this many open ones a step fails PromptBuffersBusy
+    busy: usize = 0, // prefill_step calls refused for open_fills
     fail_pieces: usize = 0, // the next this many `piece` calls fail with error.Unbound
     many_passes: usize = 0, // prefill_many calls that took their streams (batched())
     many_streams: usize = 0, // streams those calls prefilled
@@ -137,7 +139,7 @@ pub const Fake = struct {
 
     /// The same target filling its prompt a chunk a call (`prefill_chunks`), as a backend with `prefill_step`.
     pub fn stepped(x: *Fake) be.Backend {
-        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .prefill_step = prefillStep, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .features = features, .release = release, .first_row = firstRow, .reports_fill = true }, .chunk_invariant = true };
+        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .prefill_step = prefillStep, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .features = features, .release = release, .first_row = firstRow, .reports_fill = true }, .chunk_invariant = true, .open_fills = x.open_fills };
     }
 
     pub fn batchedSteps(x: *Fake) be.Backend {
@@ -304,6 +306,10 @@ pub const Fake = struct {
     fn prefillStep(ptr: *anyopaque, s: *Stream, max_rows: u32) anyerror!bool {
         const x = self(ptr);
         if (x.refuse_sampled and s.sampling != null) return error.SamplingRefused;
+        if (x.open_fills > 0 and !s.fill_open and x.openFills() >= x.open_fills) {
+            x.busy += 1; // as an engine with one set of prompt buffers refuses a second prompt mid-chunk
+            return error.PromptBuffersBusy;
+        }
         if (x.memory_lanes) |n| if (!x.lanes.contains(s) and x.lanes.count() >= n) return error.LaneMemory;
         const got = try x.newLane(s);
         if (got.found_existing and !got.value_ptr.filling) freeLane(x.gpa, got.value_ptr);
@@ -314,6 +320,7 @@ pub const Fake = struct {
         if (s.isCancelled()) return error.Cancelled;
         l.filled += 1;
         const chunks: usize = @intCast(chunksFor(s.prompt_len, x.prefill_chunks, max_rows));
+        s.fill_open = x.open_fills > 0 and l.filled < chunks;
         const at = @min(@as(u64, @intCast(s.prompt_len)), s.prompt_len * l.filled / @as(u64, @intCast(chunks)));
         s.fill_at.store(@intCast(at), .monotonic);
         try x.seed(l, s); // the kept rows are held from the first step, as the steps' features are asked for them
@@ -322,6 +329,14 @@ pub const Fake = struct {
         l.filling = false;
         try x.fillPrompt(l, s);
         return true;
+    }
+
+    /// Streams whose pass is mid-chunk (a stepped pass is one chunk here).
+    fn openFills(x: *Fake) u32 {
+        var n: u32 = 0;
+        var it = x.lanes.keyIterator();
+        while (it.next()) |k| n += @intFromBool(k.*.fill_open);
+        return n;
     }
 
     /// The pass's chunk count: the configured one, more when the caller caps each chunk's rows.

@@ -171,6 +171,7 @@ pub const Stream = struct {
     key: []const u32 = &.{},
     cached: u32 = 0, // prompt tokens the backend restored from `reuse` (its prompt pass started there)
     fill_at: std.atomic.Value(u32) = .init(0), // prompt tokens the pass has prefilled; the engine thread writes
+    fill_open: bool = false, // a prefill_step chunk begun and not ended, as a backend with open_fills sets it
     reuse_failed: bool = false, // the backend's restore of `reuse` failed: it prefilled from 0
     reuse_error: ?anyerror = null, // the rejected restore's reason, logged once when its cache borrow is reported
     context: std.ArrayList(u32) = .empty,

@@ -93,6 +93,7 @@ pub fn Fill(comptime E: type) type {
                 const l = self.lanes.get(s) orelse return error.UnknownStream;
                 const f = &(l.fill orelse return error.NotFilling);
                 const done = self.e.fillStep(f.fl, self.fill_layers) catch |err| return self.lost("a prompt's fill", err);
+                s.fill_open = !done and chunkOpen(self.e, f.fl); // the host steps no other prompt until it ends
                 if (!done) continue;
                 if (!f.final) {
                     const m: u32 = @intCast(f.fl.prompt.len);
@@ -268,6 +269,12 @@ pub fn Fill(comptime E: type) type {
             return r.first;
         }
     };
+}
+
+/// Whether fill `fl` holds the engine's prompt buffers mid-chunk; an engine without them holds none open.
+fn chunkOpen(e: anytype, fl: anytype) bool {
+    if (comptime !@hasField(@TypeOf(e.*), "pfill")) return false;
+    return if (e.pfill) |p| p == fl else false;
 }
 
 pub fn passNow(e: anytype) std.Io.Timestamp {

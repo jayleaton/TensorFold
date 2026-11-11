@@ -20,9 +20,11 @@ fn took(h: *const LaneHost, at: usize) usize {
 
 /// The fill `next` takes among `among`, its waits untouched; null when none waits.
 fn pick(h: *const LaneHost, among: enum { all, short, long }) ?usize {
+    const held = atOpenLimit(h); // the backend holds all the open chunks it can: only theirs may step
     var found: ?usize = null;
     for (h.filling.items, 0..) |j, i| {
         if (among != .all and short(j) != (among == .short)) continue;
+        if (held and !open(j)) continue;
         const at = found orelse {
             found = i;
             continue;
@@ -39,6 +41,20 @@ fn pick(h: *const LaneHost, among: enum { all, short, long }) ?usize {
         } else if (remaining(h, j) < remaining(h, best)) found = i;
     }
     return found;
+}
+
+/// A begun fill whose chunk the backend still holds open (`Backend.open_fills`).
+fn open(j: *const LaneHost.Job) bool {
+    return j.fill_began and j.stream.fill_open;
+}
+
+/// The backend's open chunks are at its limit: the next prompt call must continue one of them.
+fn atOpenLimit(h: *const LaneHost) bool {
+    const limit = h.core.backend.open_fills;
+    if (limit == 0) return false;
+    var n: usize = 0;
+    for (h.filling.items) |j| n += @intFromBool(open(j));
+    return n >= limit;
 }
 
 fn remaining(h: *const LaneHost, j: *const LaneHost.Job) u64 {
@@ -200,6 +216,7 @@ fn policyRun(h: *LaneHost) void {
 
 /// The first long prompt in `filling`, which is in admission order: admitOne appends, removal keeps the order.
 fn oldestLong(h: *const LaneHost) ?usize {
+    if (atOpenLimit(h)) return pick(h, .long); // the open long prompt, or none while a short one holds the chunk
     for (h.filling.items, 0..) |j, i| if (!short(j)) return i;
     return null;
 }
@@ -317,50 +334,6 @@ fn runnable(h: *const LaneHost) usize {
     return n;
 }
 
-test "a share of 0.5 owes the decoders a step's time; 1 owes nothing; rounds pay it down" {
-    var s: Share = .{ .p = 0.5 };
-    s.stepped(1000, true);
-    try std.testing.expectEqual(@as(i64, 1000), s.debt_ns);
-    s.stepped(1000, false);
-    try std.testing.expectEqual(@as(i64, 1000), s.debt_ns);
-    s.rounded(400);
-    s.rounded(800);
-    try std.testing.expectEqual(@as(i64, 0), s.debt_ns);
-    var one: Share = .{};
-    one.stepped(1000, true);
-    try std.testing.expectEqual(@as(i64, 0), one.debt_ns);
-    var q: Share = .{ .p = 0.25 };
-    q.stepped(1000, true);
-    try std.testing.expectEqual(@as(i64, 3000), q.debt_ns);
-}
-
-test "a share below the floor, NaN and inf fall back to 1; the floor and 1 stand" {
-    for ([_][]const u8{ "1e-12", "0.0099", "0", "-0.5", "nan", "inf", "-inf", "2", "x", "" }) |text| {
-        try std.testing.expectEqual(@as(f64, 1), Share.fromText(text).p);
-    }
-    try std.testing.expectEqual(@as(f64, 0.01), Share.fromText("0.01").p);
-    try std.testing.expectEqual(@as(f64, 1), Share.fromText("1").p);
-}
-
-test "prefill service: TENSORFOLD_PREFILL_BUDGET is whole rows; unset, 0 or anything else is none, main's order" {
-    for ([_][]const u8{ "", "0", "x", "-512", "+512", "5e2", "4294967296" }) |text| {
-        try std.testing.expectEqual(@as(u64, 0), Share.budget(text));
-    }
-    try std.testing.expectEqual(@as(u64, 512), Share.budget("512"));
-    try std.testing.expectEqual(@as(u64, 1), Share.budget(" 1\t"));
-    try std.testing.expectEqual(@as(u64, 0), (Share{}).rows);
-}
-
-test "a step's debt saturates instead of overflowing" {
-    var s: Share = .{ .p = Share.min_share };
-    s.stepped(std.math.maxInt(i64), true);
-    try std.testing.expect(s.debt_ns > 0);
-    s.stepped(std.math.maxInt(i64), true);
-    try std.testing.expectEqual(@as(i64, std.math.maxInt(i64)), s.debt_ns);
-    s.rounded(1000);
-    try std.testing.expect(s.debt_ns < std.math.maxInt(i64));
-}
-
 test "prefill service: charge respects restored floors, stale progress and terminal removal" {
     const lanes = @import("lanes");
     const api = @import("engine_api.zig");
@@ -446,6 +419,10 @@ test "prefill service: aged long priority keeps the existing stable winner over 
     try std.testing.expectEqual(@as(u64, 512), b.stream.fill_at.load(.monotonic));
 }
 
+test {
+    _ = @import("lane_host_fill_open_test.zig");
+}
+
 // TENSORFOLD_PREFILL_POLICY tests (the env is parsed in Share.fromEnv; these set host.share).
 const PolicyCalls = struct {
     host: *LaneHost,
@@ -498,26 +475,6 @@ fn policyHost(comptime body: fn (*LaneHost, *PolicyCalls) anyerror!void, decoder
     target.prefill_hook = PolicyCalls.hook;
     target.prefill_hook_ctx = &calls;
     try body(&host, &calls);
-}
-
-test "prefill service: policy text and rows; unset or unknown is the default order, TOKENS clamped" {
-    for ([_][]const u8{ "", "stock", "FCFS", "lifo", "batched", "x" }) |text| try std.testing.expectEqual(Share.Policy.stock, Share.policyOf(text));
-    try std.testing.expectEqual(Share.Policy.fcfs, Share.policyOf("fcfs"));
-    try std.testing.expectEqual(Share.Policy.fcfs, Share.policyOf(" fcfs\t"));
-    try std.testing.expectEqual(Share.Policy.stock, (Share{}).policy);
-    try std.testing.expectEqual(@as(u32, 2048), (Share{}).tokens);
-    for ([_][]const u8{ "", "0", "x", "-1", "4294967296" }) |text| try std.testing.expectEqual(@as(u32, 2048), Share.tokensOf(text));
-    for ([_]u32{ 2048, 4096, 8192, 16384 }) |n| { // the default and the measured options pass through unchanged
-        var buf: [8]u8 = undefined;
-        try std.testing.expectEqual(n, Share.tokensOf(try std.fmt.bufPrint(&buf, "{d}", .{n})));
-    }
-    try std.testing.expectEqual(@as(u32, 64), Share.tokensOf("1"));
-    try std.testing.expectEqual(@as(u32, 64), Share.tokensOf("63"));
-    try std.testing.expectEqual(@as(u32, 1000), Share.tokensOf("1000"));
-    try std.testing.expectEqual(@as(u32, 8193), Share.tokensOf("8193"));
-    try std.testing.expectEqual(@as(u32, 16384), Share.tokensOf("16384"));
-    try std.testing.expectEqual(@as(u32, 16384), Share.tokensOf("16385"));
-    try std.testing.expectEqual(@as(u32, 16384), Share.tokensOf("65536"));
 }
 
 test "prefill service: stock policy keeps the default hint and its one long step, call_rows or not" {

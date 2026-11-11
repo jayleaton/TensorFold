@@ -83,6 +83,8 @@ pub const Backend = struct {
     penalties: bool = false,
     /// Prompt fill gives the same tokens at any chunk cut, so --decode-share may cap its chunk rows; wrappers copy it.
     chunk_invariant: bool = false,
+    /// Prompts prefill_step may hold mid-chunk at once (`Stream.fill_open`; 0: any); wrappers copy it.
+    open_fills: u32 = 0,
     ptr: *anyopaque,
     vtable: *const VTable,
 
