@@ -276,14 +276,16 @@ remain strings for the client to validate. Union types and schema references are
 
 A reply that is not a call returns as content, never an error: prose, JSON that names no offered tool
 (a structured answer), and malformed tool blocks, which keep their text. A GLM argument key written without its
-`<arg_key>` gets that tag back, and the call parses. A well-formed call to a tool the
-request did not offer is returned as a tool call under its valid name, so the client can report the unknown
-tool and the model can correct itself.
+`<arg_key>` gets that tag back, and the call parses. A whole, well-formed call to a tool the request did not offer
+is returned as a tool call under its own name, as vLLM returns it, when that name is 1 to 64 letters, digits, `_` or
+`-` and its arguments are a JSON object, so the client can report the unknown tool and the model can correct itself.
+Any other undeclared name, such as one with spaces or dots, keeps the block as text. With no tools in the request,
+no reply is a tool call.
 
 When a model end token arrives inside a whole tool call before its closing markup, the server closes the
 markup and returns the call. A GLM value the end token cut off is closed with `</arg_value>` first, and the call
-returns when it then parses strictly. Any other partial value, a missing key value, an empty block, or an unoffered
-call that cannot parse as one complete call remains content.
+returns when it then parses strictly. Any other partial value, a missing key value, an empty block, or a call to a
+tool the request did not offer remains content.
 
 With `parallel_tool_calls: false`, the server buffers tool deltas until it can return the first valid
 completed call. Prose and reasoning can still stream. Usage counts the entire decoded reply, including

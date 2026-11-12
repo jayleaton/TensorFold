@@ -1,4 +1,4 @@
-//! Frozen parity answers and native security goldens, with the thirteen inherited differences.
+//! Frozen parity answers and native security goldens, with the seventeen inherited differences.
 const std = @import("std");
 const builtin = @import("builtin");
 const platform = @import("sys");
@@ -25,6 +25,11 @@ const known_diffs = [_]Known{
     .{ .group = "tools", .name = "choice-\"required\"" },
     .{ .group = "tools", .name = "choice-{\"type\": \"function\", \"function\": {\"name\": \"lookup\"}}" },
     .{ .group = "anthropic", .name = "tool-result" },
+    // Python kept a whole call to an undeclared function name as text; the native server returns it as vLLM does
+    .{ .group = "tools", .name = "bad_tool" },
+    .{ .group = "tools", .name = "bad_tool-stream" },
+    .{ .group = "tools", .name = "bad_tool-single" },
+    .{ .group = "tools", .name = "bad_tool-single-stream" },
 };
 
 /// Why two request logs differ: their line counts and the first line that does, each cut to 100 bytes.

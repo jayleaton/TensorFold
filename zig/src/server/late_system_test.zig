@@ -494,7 +494,7 @@ test "GET and DELETE /v1/recall: 404 without a record, its state, emptied, and 4
 }
 
 fn unofferedVisible(streaming: bool) !void {
-    const raw_call = "<tool_call>{\"name\":\"not_offered\",\"arguments\":{}}</tool_call>";
+    const raw_call = "<tool_call>{\"name\":\"not.offered\",\"arguments\":{}}</tool_call>"; // no function name
     var text: DropLate = .{};
     var backend: Capture = .{ .reply = raw_call };
     defer std.testing.allocator.free(backend.prompt);
@@ -542,10 +542,10 @@ fn unofferedVisible(streaming: bool) !void {
     try std.testing.expect(finished);
 }
 
-test "tool visibility HTTP: whole replies retain an unoffered call" {
+test "tool visibility HTTP: whole replies retain an unoffered call that names no function" {
     try unofferedVisible(false);
 }
 
-test "tool visibility HTTP: streamed replies retain an unoffered call" {
+test "tool visibility HTTP: streamed replies retain an unoffered call that names no function" {
     try unofferedVisible(true);
 }

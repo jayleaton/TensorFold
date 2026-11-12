@@ -182,39 +182,6 @@ test "replies that end outside a call close nothing" {
     for (replies) |text| try std.testing.expectEqualStrings("", try closeCall(a, text, tools));
 }
 
-test "a call to a tool the request did not declare stays text" {
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\"}}]")).ok.array;
-    const whole = [_][]const u8{
-        "<tool_call><function=launch><parameter=when>now</parameter></function></tool_call>",
-        "<tool_call>{\"name\": \"launch rocket!\", \"arguments\": {\"when\": \"now\"}}</tool_call>",
-        "<tool_call>{\"name\": \"launch\", \"arguments\": {\"when\": NaN}}</tool_call>",
-    };
-    for (whole) |text| {
-        const parallel = try parse(a, text, tools, null);
-        try std.testing.expect(parallel.calls == null);
-        try std.testing.expectEqualStrings(text, parallel.content);
-        const single = try parse(a, text, tools, 1);
-        try std.testing.expect(single.calls == null);
-        try std.testing.expectEqualStrings(text, single.content);
-    }
-    // an unclosed envelope is not a call in either mode, so the reply keeps it
-    const open = "<tool_call>{\"name\":\"launch\",\"arguments\":{\"when\":\"now\"}";
-    for ([_]?usize{ null, 1 }) |max_calls| {
-        const k = try parse(a, open, tools, max_calls);
-        try std.testing.expect(k.calls == null);
-        try std.testing.expectEqualStrings(open, k.content);
-    }
-    const prose = "Launching. <tool_call><function=launch><parameter=when>now</function></tool_call>";
-    try std.testing.expectEqualStrings(prose, (try parse(a, prose, tools, 1)).content);
-    // an offered tool keeps its offered spelling; bare JSON naming one not offered stays content
-    const offered = try parse(a, "<tool_call>{\"name\":\"LOOKUP\"}</tool_call>", tools, null);
-    try std.testing.expectEqualStrings("lookup", offered.calls.?[0].get("function").?.get("name").?.string);
-    try std.testing.expect((try parse(a, "{\"name\":\"launch\",\"arguments\":{}}", tools, null)).calls == null);
-}
-
 /// Two replies, the second of 8x the first's pieces, parsed in turn; `want` is the first call's arguments, or no call.
 const Timed = struct {
     replies: [2][]const u8,

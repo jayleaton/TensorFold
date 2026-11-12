@@ -195,8 +195,8 @@ test "closed rejected calls and literal less-than prose preserve later consumer 
     for (spellings) |sp| {
         const outer = try std.mem.concat(a, u8, &.{ sp.prefix, "outer", sp.suffix });
         const cases = [_][2][]const u8{
-            .{ try std.mem.concat(a, u8, &.{ outer, "<tool_call>{\"name\":\"other\",\"arguments\":{}}</tool_call>", adjacent }), "{\"q\":\"outer\"}{\"q\":\"adjacent\"}" },
-            .{ try std.mem.concat(a, u8, &.{ outer, "<tool_call><function=other></function></tool_call>", adjacent }), "{\"q\":\"outer\"}{\"q\":\"adjacent\"}" },
+            .{ try std.mem.concat(a, u8, &.{ outer, "<tool_call>{\"name\":\"other.tool\",\"arguments\":{}}</tool_call>", adjacent }), "{\"q\":\"outer\"}{\"q\":\"adjacent\"}" },
+            .{ try std.mem.concat(a, u8, &.{ outer, "<tool_call><function=other.tool></function></tool_call>", adjacent }), "{\"q\":\"outer\"}{\"q\":\"adjacent\"}" },
             .{ try std.mem.concat(a, u8, &.{ outer, "<tool_call></tool_call>", adjacent }), "{\"q\":\"outer\"}{\"q\":\"adjacent\"}" },
             .{ try std.mem.concat(a, u8, &.{ outer, "<tool_call><not_a_function></not_a_function></tool_call>", adjacent }), "{\"q\":\"outer\"}{\"q\":\"adjacent\"}" },
             .{ adjacent ++ "1 < 2 " ++ adjacent, "{\"q\":\"adjacent\"}{\"q\":\"adjacent\"}" },
@@ -283,4 +283,45 @@ test "a DSML call max_tokens cuts gives the same reply whole and streamed in eit
             try std.testing.expectEqual(.length, streamed.finish.?);
         }
     }
+}
+
+/// `raw` as the reply to a request declaring only `shell`: a call to `name` with `arguments`, or text when null.
+fn expectShellReply(a: std.mem.Allocator, raw: []const u8, name: ?[]const u8, arguments: []const u8) !void {
+    const shell_body = "{\"model\":\"test-model\",\"max_tokens\":2000,\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]," ++
+        "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"shell\",\"parameters\":{\"type\":\"object\"}}}]";
+    const tokens = try TestText.encode(undefined, a, raw, false);
+    for ([_]bool{ false, true }) |single| for ([_]bool{ false, true }) |batched| {
+        const body = try std.mem.concat(a, u8, &.{ shell_body, if (single) ",\"parallel_tool_calls\":false" else "" });
+        var backend: CallEngine = .{ .tokens = tokens, .batched = batched };
+        const whole = try sendWith(backend.engine(), .chat, try std.mem.concat(a, u8, &.{ body, ",\"stream\":false}" }), .{});
+        const streamed = try sendWith(backend.engine(), .chat, try std.mem.concat(a, u8, &.{ body, ",\"stream\":true}" }), .{});
+        try std.testing.expectEqual(@as(?u16, 200), whole.status);
+        try std.testing.expect(streamed.opened and streamed.status == null);
+        for ([_]*const @TypeOf(whole){ &whole, &streamed }) |seen| {
+            try std.testing.expectEqual(@as(usize, @intFromBool(name != null)), seen.calls);
+            const finish: @TypeOf(seen.finish.?) = if (name != null) .tool_calls else .stop;
+            try std.testing.expectEqual(finish, seen.finish.?);
+            try std.testing.expectEqualStrings(name orelse "", seen.callName());
+            try std.testing.expectEqualStrings(if (name != null) arguments else "", seen.arguments[0..seen.arguments_len]);
+            try std.testing.expectEqualStrings(if (name != null) "" else raw[0..@min(raw.len, seen.text.len)], seen.content());
+        }
+        try std.testing.expectEqual(@as(i64, 0), streamed.preparing);
+    };
+}
+
+test "tool visibility HTTP: a DSML call to an undeclared function name is a tool call in whole and streamed replies" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // OpenCode 2 declares `shell`; a call to `bash` goes back for the client to refuse, as vLLM returns it
+    for (spellings) |sp| for ([_][]const u8{ "bash", "shell", "run it" }) |name| {
+        const prefix = try std.mem.replaceOwned(u8, a, sp.prefix, "\"lookup\"", try std.mem.concat(a, u8, &.{ "\"", name, "\"" }));
+        const raw = try std.mem.concat(a, u8, &.{ prefix, "ls", sp.suffix });
+        // a name no function has stays the reply's text
+        try expectShellReply(a, raw, if (std.mem.eql(u8, name, "run it")) null else name, "{\"q\":\"ls\"}");
+    };
+    // DeepSeek-V4.1's own reply on the Sparks to `shell` alone, after a history whose calls named `bash`
+    const live = "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"bash\">\n<｜DSML｜ parameter name=\"command\" string=\"true\">" ++
+        "ls /tmp</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+    try expectShellReply(a, live, "bash", "{\"command\":\"ls /tmp\"}");
 }

@@ -8,10 +8,10 @@ const exchange = fixtures.exchange;
 const textOf = fixtures.textOf;
 const prose_chat = fixtures.prose_chat;
 
-test "a stream ends with a call to a tool the request did not offer as text, as the whole reply keeps it" {
+test "a stream ends with a call to an unoffered name that is no function name as text, as the whole reply keeps it" {
     var text: DropLate = .{};
-    // prose, then a call to a tool the request does not offer: the parser leaves the block as text
-    var backend: Capture = .{ .reply = "Checking the vault.\n<tool_call>\n<function=vault_list>\n<parameter=path>\nimported/\n</parameter>\n</function>\n</tool_call>" };
+    // prose, then a call to an unoffered name no function has: the parser leaves the block as text
+    var backend: Capture = .{ .reply = "Checking the vault.\n<tool_call>\n<function=vault.list>\n<parameter=path>\nimported/\n</parameter>\n</function>\n</tool_call>" };
     defer std.testing.allocator.free(backend.prompt);
     const srv = try server.Server.init(std.testing.allocator, std.testing.io, backend.engine(), text.text(), .{
         .served_name = "m",
@@ -52,7 +52,7 @@ test "a stream ends with a call to a tool the request did not offer as text, as 
 }
 
 const lookup_reply = "<tool_call>{\"name\":\"lookup\",\"arguments\":{}}</tool_call>";
-const vault_reply = "<tool_call>{\"name\":\"vault_list\",\"arguments\":{}}</tool_call>";
+const vault_reply = "<tool_call>{\"name\":\"vault.list\",\"arguments\":{}}</tool_call>"; // unoffered, no function name
 
 fn expectStreamMatchesWhole(reply: []const u8) !void {
     try expectStreamMatchesWholeCalls(reply, null);
@@ -158,7 +158,7 @@ test "stream without accepted calls preserves a space after streamed reasoning" 
 }
 
 test "stream retains an unoffered closed envelope promoted from unclosed reasoning" {
-    const content = "<tool_call>{\"name\": \"other\", \"arguments\": {}}</tool_call> done";
+    const content = "<tool_call>{\"name\": \"other.tool\", \"arguments\": {}}</tool_call> done";
     try expectStreamMatchesWholeOptions("Plan." ++ content, 0, true, content);
 }
 

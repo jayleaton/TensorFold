@@ -132,6 +132,8 @@ const Seen = struct {
     calls: usize = 0, // the tool calls the stream started, or the whole reply's tool calls
     arguments: [2048]u8 = undefined,
     arguments_len: usize = 0,
+    name: [64]u8 = undefined, // the first call's name
+    name_len: usize = 0,
     finish: ?enum { stop, length, tool_calls } = null, // the reply's or the stream's last finish_reason
     refusal: [160]u8 = undefined, // a whole reply's error message
     refusal_len: usize = 0,
@@ -143,6 +145,10 @@ const Seen = struct {
 
     fn keepArguments(c: *Seen, call: json.Value) void {
         const f = call.get("function") orelse return;
+        if (f.strField("name")) |n| if (c.name_len == 0) {
+            c.name_len = @min(n.len, c.name.len);
+            @memcpy(c.name[0..c.name_len], n[0..c.name_len]);
+        };
         const args = f.strField("arguments") orelse return;
         const n = @min(args.len, c.arguments.len - c.arguments_len);
         @memcpy(c.arguments[c.arguments_len..][0..n], args[0..n]);
@@ -151,6 +157,10 @@ const Seen = struct {
 
     pub fn content(c: *const Seen) []const u8 {
         return c.text[0..c.text_len];
+    }
+
+    pub fn callName(c: *const Seen) []const u8 {
+        return c.name[0..c.name_len];
     }
 
     fn keep(c: *Seen, part: json.Value) void {

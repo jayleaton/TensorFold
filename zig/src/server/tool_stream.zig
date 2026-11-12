@@ -199,7 +199,8 @@ pub const Streamer = struct {
                     };
                     const lower = try std.ascii.allocLowerString(s.a, reply_text.pyStrip(m.name));
                     const name = s.known.get(lower) orelse {
-                        if (!s.dsml_seen) {
+                        // an undeclared function name goes out whole at its closer, as the final parse returns it
+                        if (!s.dsml_seen and !tool_parse.functionName(reply_text.pyStrip(m.name))) {
                             s.state = .abort;
                             return;
                         }

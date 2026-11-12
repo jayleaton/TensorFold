@@ -174,7 +174,8 @@ pub fn closeCall(a: Allocator, text: []const u8, tools: []const Value) Allocator
     const tail = try argumentsClose(a, strip(block));
     const closed = try std.mem.concat(a, u8, &.{ "<tool_call>", block, tail, "</tool_call>" });
     // the strict reading: one whole call to an offered tool, nothing but its markup
-    if ((try parse(a, closed, tools, 1)).calls == null) return "";
+    const calls = (try parse(a, closed, tools, 1)).calls orelse return "";
+    if (!try declared(a, tools, calls[0].get("function").?.get("name").?.string)) return "";
     return std.mem.concat(a, u8, &.{ tail, "</tool_call>" });
 }
 
@@ -205,10 +206,25 @@ fn argumentsClose(a: Allocator, body: []const u8) Allocator.Error![]const u8 {
     return closed[body.len..];
 }
 
-/// The offered tool's spelling, or null when the request did not declare that name.
+/// The offered tool's spelling; else, as vLLM, an undeclared function name with finite object arguments; else null.
 fn callName(a: Allocator, c: Call, known: *const std.StringArrayHashMapUnmanaged([]const u8)) Allocator.Error!?[]const u8 {
     const name = strip(c.name);
-    return if (known.get(try std.ascii.allocLowerString(a, name))) |offered| offered else null;
+    if (known.get(try std.ascii.allocLowerString(a, name))) |offered| return offered;
+    // the client refuses the unknown tool and the model can retry; kept as text, the call ended the client's turn
+    return if (functionName(name) and c.arguments == .object and tool_params.finite(c.arguments)) name else null;
+}
+
+/// 1 to 64 of ``[A-Za-z0-9_-]``: a name OpenAI's API accepts for a function.
+pub fn functionName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 64) return false;
+    for (name) |ch| if (!(std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '-')) return false;
+    return true;
+}
+
+/// Whether the request declared ``name`` (any case).
+fn declared(a: Allocator, tools: []const Value, name: []const u8) Allocator.Error!bool {
+    for (tools) |tool| if (std.ascii.eqlIgnoreCase(try tool_specs.toolName(a, tool), name)) return true;
+    return false;
 }
 
 /// ``_openai_tool_call``: the call under ``name`` (``callName``), arguments as compact JSON.
@@ -431,7 +447,7 @@ fn glmCall(a: Allocator, written: []const u8, schemas: ?*const tool_params.Schem
     const cut = std.mem.indexOf(u8, block, "<arg_key>") orelse block.len;
     const name = strip(block[0..cut]);
     if (name.len == 0) return null;
-    // any one-line name, spaces included: parse keeps a name the request did not declare as text
+    // any one-line name, spaces included: callName keeps an undeclared one that is no function name as text
     for (name) |ch| if (ch == '<' or ch == '>' or ch == '\n' or ch == '\r') return null;
     const rest = block[cut..];
     var pairs: std.ArrayList(Param) = .empty;

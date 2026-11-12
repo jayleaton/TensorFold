@@ -230,3 +230,47 @@ test "malformed closed DSML masks its nested XML and resumes the next legitimate
         try std.testing.expectEqualStrings("{}", try sentArguments(a, out.items));
     }
 }
+
+test "a stream sends a call to an undeclared function name after an offered call, as the final parse returns both" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\"}}]")).ok.array;
+    const offered = "<tool_call>\n<function=lookup>\n<parameter=q>\nx\n</parameter>\n</function>\n</tool_call>\n";
+    const undeclared = "<tool_call>\n<function=launch>\n<parameter=when>\nnow\n</parameter>\n</function>\n</tool_call>";
+    const text = offered ++ undeclared;
+    for (0..text.len + 1) |boundary| {
+        var names: std.ArrayList(u8) = .empty;
+        const deltas = try streamed(a, tools, &.{ text[0..boundary], text });
+        for (deltas) |d| for (d.get("tool_calls").?.array) |one| {
+            if (one.get("function").?.strField("name")) |n| try names.appendSlice(a, try std.mem.concat(a, u8, &.{ n, ";" }));
+        };
+        try std.testing.expectEqualStrings("lookup;launch;", names.items);
+        try std.testing.expectEqualStrings("{\"q\":\"x\"}{\"when\":\"now\"}", try sentArguments(a, deltas));
+    }
+    const whole = try tool_parse.parse(a, text, tools, null);
+    try std.testing.expectEqual(@as(usize, 2), whole.calls.?.len);
+}
+
+test "a DSML block streams an offered call and an undeclared function name's call once each" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\"}}]")).ok.array;
+    const blocks = [_][]const u8{
+        "<｜DSML｜tool_calls><｜DSML｜invoke name=\"lookup\"><｜DSML｜parameter name=\"q\" string=\"true\">x</｜DSML｜parameter></｜DSML｜invoke>" ++
+            "<｜DSML｜invoke name=\"bash\"><｜DSML｜parameter name=\"q\" string=\"true\">ls</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>",
+        "<｜DSML｜ calls><｜DSML｜ invoke name=\"lookup\"><｜DSML｜ parameter name=\"q\" string=\"true\">x</｜DSML｜ parameter></｜DSML｜ invoke>" ++
+            "<｜DSML｜ invoke name=\"bash\"><｜DSML｜ parameter name=\"q\" string=\"true\">ls</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>",
+    };
+    for (blocks) |text| for (0..text.len + 1) |boundary| {
+        var names: std.ArrayList(u8) = .empty;
+        const deltas = try streamed(a, tools, &.{ text[0..boundary], text });
+        for (deltas) |d| for (d.get("tool_calls").?.array) |one| {
+            if (one.get("function").?.strField("name")) |n| try names.appendSlice(a, try std.mem.concat(a, u8, &.{ n, ";" }));
+        };
+        try std.testing.expectEqualStrings("lookup;bash;", names.items);
+        try std.testing.expectEqualStrings("{\"q\":\"x\"}{\"q\":\"ls\"}", try sentArguments(a, deltas));
+        try std.testing.expectEqual(@as(usize, 2), (try tool_parse.parse(a, text, tools, null)).calls.?.len);
+    };
+}
