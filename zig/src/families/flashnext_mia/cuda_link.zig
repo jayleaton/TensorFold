@@ -12,6 +12,7 @@ pub const Tag = enum(u32) {
     round = 4,
     stop = 5,
     ack = 6,
+    both = 7,
     _,
 };
 
@@ -174,6 +175,17 @@ pub const Link = struct {
         // the caller says which settings differ: it holds the text, this only compares digests
         if (!std.mem.eql(u8, &mine, theirs)) return error.RanksDisagree;
     }
+
+    /// A yes-no question: yes on both ranks only when both say yes, so both take the same path (rank 0 sends first).
+    pub fn both(l: Link, gpa: Allocator, rank: u32, mine: bool) !bool {
+        const said = [1]u8{@intFromBool(mine)};
+        if (rank == 0) try l.send(.both, &said);
+        const theirs = try l.expect(gpa, .both);
+        defer gpa.free(theirs);
+        if (rank != 0) try l.send(.both, &said);
+        if (theirs.len != 1 or theirs[0] > 1) return error.UnexpectedFrame;
+        return mine and theirs[0] == 1;
+    }
 };
 
 test "a frame and a settings agreement over a local link" {
@@ -227,4 +239,31 @@ test "different settings are refused on both ranks" {
     try std.testing.expectError(error.RanksDisagree, l.agree(gpa, 0, "context=8"));
     t.join();
     try std.testing.expect(refused);
+}
+
+test "a yes-no question is yes on both ranks only when both say yes" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const server = try Server.open(try net.IpAddress.parse("127.0.0.1", 0));
+    defer server.close();
+    const Peer = struct {
+        fn run(io2: std.Io, p: u16, says: [3]bool, got: *[3]?bool) void {
+            const l = Link.join(io2, net.IpAddress.parse("127.0.0.1", p) catch return, 5000) catch return;
+            defer l.close();
+            for (says, got) |s, *g| g.* = l.both(std.testing.allocator, 1, s) catch null;
+        }
+    };
+    const rank1 = [3]bool{ true, false, true };
+    const rank0 = [3]bool{ true, true, false };
+    var got1: [3]?bool = @splat(null);
+    const t = try std.Thread.spawn(.{}, Peer.run, .{ io, server.port(), rank1, &got1 });
+    const l = try server.accept(5000);
+    defer l.close();
+    var got0: [3]?bool = undefined;
+    for (rank0, &got0) |s, *g| g.* = try l.both(gpa, 0, s);
+    t.join();
+    try std.testing.expectEqual([3]?bool{ true, false, false }, got0);
+    try std.testing.expectEqual(got0, got1);
 }

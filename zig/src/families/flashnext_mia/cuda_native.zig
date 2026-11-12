@@ -9,6 +9,7 @@ const comm = @import("cuda_comm.zig");
 const rope = @import("cuda_rope.zig");
 const mirror = @import("cuda_mirror.zig");
 const lane_backend = @import("cuda_lanes.zig");
+const kept = @import("cuda_lanes_kept.zig");
 
 pub const model_type = "qwen4_exp";
 /// Weight formats: ModelOpt NVFP4 (top-10) or INT4-AutoRound GPTQ int4 (top-5), read from quantization_config.
@@ -123,6 +124,9 @@ pub fn openOn(comptime M: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const 
     // the window: 15 drafts (16 rows) unless TF_FLASHNEXT_DEPTH says (Python's 6)
     const depth: usize = if (envs.get("TF_FLASHNEXT_DEPTH")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadDepth else 15;
     if (depth < 1 or depth > lane_backend.max_drafts) return error.BadDepth;
+    // the settings both ranks agree on; they also key the kept lane cost tables
+    const text = try settings(gpa, io, dir, kernels, o, depth, yarn);
+    defer gpa.free(text);
     if (o.tp == 2) {
         // a rank stops on SIGTERM / SIGINT while loading or following (PID 1 ignores them); then rank 0's server does
         installStop();
@@ -138,8 +142,6 @@ pub fn openOn(comptime M: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const 
             std.log.info("rank 1: joining rank 0 at {s}:{d}", .{ o.master orelse "", o.master_port });
             own.link = try link.Link.join(io, address, link_timeout_ms);
         }
-        const text = try settings(gpa, io, dir, kernels, o, depth, yarn);
-        defer gpa.free(text);
         own.link.?.agree(gpa, o.rank, text) catch |e| {
             if (e == error.RanksDisagree) std.log.err("rank {d} loads with \"{s}\"; the other rank's settings differ (see its log)", .{ o.rank, text });
             return e;
@@ -173,12 +175,7 @@ pub fn openOn(comptime M: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const 
     own.lanes.sliced = if (envs.get("TF_FLASHNEXT_FILL")) |v| std.mem.eql(u8, v, "1") else false;
     if (envs.get("TF_FLASHNEXT_FILL_LAYERS")) |v| own.lanes.fill_layers = @max(1, std.fmt.parseInt(usize, v, 10) catch 8);
     errdefer own.lanes.deinit();
-    if (o.drafts) {
-        const ids = try costText(gpa, io, dir);
-        defer gpa.free(ids);
-        try own.lanes.measure(io, ids);
-        if (o.rank == 0) own.lanes.logCosts();
-    }
+    if (o.drafts) try laneCosts(gpa, io, ctx, dir, text, o, own.link, &own.lanes);
     own.lanes.cache_budget = if (o.rank == 0) cacheBudget(o, &own.lanes) else 0; // rank 1 follows rank 0's notes
     var backend = own.lanes.backend();
     own.lanes.follower = o.tp == 2 and o.rank == 1;
@@ -278,6 +275,23 @@ fn Owned(comptime M: type) type {
             std.log.info("rank 1: rank 0 stopped after {d} calls", .{f.calls});
         }
     };
+}
+
+/// The lane cost tables: kept ones when both ranks hold one that fits, else timed on both in step and kept.
+fn laneCosts(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, text: []const u8, o: Options, l: ?link.Link, set: anytype) !void {
+    const k = kept.key(gpa, io, ctx, text, o.rank, o.tp);
+    const found = if (k) |key| lanes.cost_cache.load(kept.Kept, gpa, io, key) else null;
+    const mine = if (found) |t| kept.fits(t, set.window) else false;
+    const both = if (o.tp == 2) try l.?.both(gpa, o.rank, mine) else mine;
+    if (both) {
+        kept.apply(found.?, set);
+    } else {
+        const ids = try costText(gpa, io, dir);
+        defer gpa.free(ids);
+        try set.measure(io, ids);
+        if (k) |key| lanes.cost_cache.save(kept.Kept, gpa, io, key, kept.of(set));
+    }
+    if (o.rank == 0) set.logCosts(if (both) "kept" else "measured");
 }
 
 /// SIGTERM / SIGINT exit 0 at once (the peer sees the link close); async-signal-safe calls only (write, _exit).
@@ -406,6 +420,7 @@ test {
     _ = mirror;
     _ = lane_backend;
     _ = @import("cuda_lanes_costs.zig");
+    _ = kept;
 }
 
 test "open compiles over the engine" {

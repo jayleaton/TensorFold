@@ -111,11 +111,11 @@ pub fn Measure(comptime E: type) type {
             }
         }
 
-        /// The cost tables in one line (rank 0 logs it at boot): verify ms by rows, a head level, shared ms by rows.
-        pub fn logCosts(self: *const Self) void {
+        /// The cost tables in one line (rank 0 logs it at boot), `source` measured or kept.
+        pub fn logCosts(self: *const Self, source: []const u8) void {
             var buf: [1024]u8 = undefined;
             var n: usize = 0;
-            n += (std.fmt.bufPrint(buf[n..], "lanes costs: verify ", .{}) catch return).len;
+            n += (std.fmt.bufPrint(buf[n..], "lanes costs ({s}): verify ", .{source}) catch return).len;
             for (self.costs[0..self.cost_count], 0..) |c, i| {
                 n += (std.fmt.bufPrint(buf[n..], "{s}{d}:{d:.1}", .{ if (i == 0) "" else ",", c.width, c.ms }) catch return).len;
             }
