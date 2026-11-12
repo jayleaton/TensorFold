@@ -515,4 +515,5 @@ test "geometry and dims follow the config's split" {
 test {
     std.testing.refAllDecls(@This());
     std.testing.refAllDecls(Engine);
+    _ = eng_init;
 }
