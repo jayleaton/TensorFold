@@ -106,3 +106,44 @@ test "a call whose undeclared name is no function name, or whose arguments are n
     try std.testing.expectEqualStrings("lookup", offered.calls.?[0].get("function").?.get("name").?.string);
     try std.testing.expect((try parse(a, "{\"name\":\"launch\",\"arguments\":{}}", tools, null)).calls == null);
 }
+
+/// Calls to `bash` (undeclared: only `shell` is offered) whose markup holds stray text; each stays the reply's text.
+pub const malformed_undeclared = [_][]const u8{
+    "<tool_call><function=bash>junk</function></tool_call>",
+    "<tool_call><function=bash><parameter=command>ls</parameter>junk</function></tool_call>",
+    "<tool_call><function=bash>junk<parameter=command>ls</parameter></function></tool_call>",
+    "<tool_call><function=bash><parameter=command>ls</function></tool_call>",
+    "<tool_call>bash<arg_key>command</arg_key><arg_value>ls</arg_value>junk</tool_call>",
+    "<tool_call>bash<arg_key>command</arg_key><arg_value>ls</arg_value><arg_key>cwd</arg_key></tool_call>",
+};
+
+/// Near misses: whole calls to `bash` whose only extra bytes are whitespace; each is a call, with these arguments.
+pub const whole_undeclared = [_][2][]const u8{
+    .{ "<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>\n</tool_call>", "{\"command\":\"ls\"}" },
+    .{ "<tool_call><function=bash> \n </function></tool_call>", "{}" },
+    .{ "<tool_call>bash\n<arg_key>command</arg_key>\n<arg_value>ls</arg_value>\n</tool_call>", "{\"command\":\"ls\"}" },
+};
+
+test "a call to an undeclared name whose XML or GLM markup holds stray text stays text in both call modes" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"shell\"}}]")).ok.array;
+    for (malformed_undeclared) |text| for ([_]?usize{ null, 1 }) |max_calls| {
+        const r = try parse(a, text, tools, max_calls);
+        try std.testing.expect(r.calls == null);
+        try std.testing.expectEqualStrings(text, r.content);
+        try std.testing.expectEqual(@as(usize, 1), r.rejected_envelopes);
+    };
+    for (whole_undeclared) |c| for ([_]?usize{ null, 1 }) |max_calls| {
+        const r = try parse(a, c[0], tools, max_calls);
+        try std.testing.expectEqualStrings("bash", r.calls.?[0].get("function").?.get("name").?.string);
+        try std.testing.expectEqualStrings(c[1], r.calls.?[0].get("function").?.get("arguments").?.string);
+        try std.testing.expectEqualStrings("", r.content);
+    };
+    // a declared call keeps the parallel parse's leniency (stray text dropped), and single-call mode still rejects it
+    for ([_][]const u8{ "<tool_call><function=shell>junk</function></tool_call>", "<tool_call>shell<arg_key>c</arg_key><arg_value>ls</arg_value>junk</tool_call>" }) |text| {
+        try std.testing.expectEqualStrings("shell", (try parse(a, text, tools, null)).calls.?[0].get("function").?.get("name").?.string);
+        try std.testing.expect((try parse(a, text, tools, 1)).calls == null);
+    }
+}

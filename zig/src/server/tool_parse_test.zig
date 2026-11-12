@@ -505,6 +505,8 @@ test "GLM pairs from the cached key and value ends are the pairs each key's own 
         const block = try repairGlmKeys(a, std.mem.trim(u8, body.items, " \n"));
         const cut = std.mem.indexOf(u8, block, "<arg_key>") orelse block.len;
         if (std.mem.indexOfScalar(u8, block[0..cut], '<') != null) continue; // no name: both stay text
+        // an undeclared name (`lookupk`): its stray text keeps it as text, which the visibility tests check
+        if (!std.mem.eql(u8, std.mem.trim(u8, block[0..cut], " \t\r\n"), "lookup")) continue;
         const rest = block[cut..];
         var canon: std.ArrayList(u8) = .empty; // the reference's pairs written plainly, nothing between them
         try canon.appendSlice(a, "<tool_call>");

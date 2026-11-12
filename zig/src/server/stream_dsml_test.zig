@@ -325,3 +325,12 @@ test "tool visibility HTTP: a DSML call to an undeclared function name is a tool
         "ls /tmp</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
     try expectShellReply(a, live, "bash", "{\"command\":\"ls /tmp\"}");
 }
+
+test "tool visibility HTTP: an undeclared call with stray text in its XML or GLM markup stays text, whole and streamed" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cases = @import("tool_parse_visibility_test.zig");
+    for (cases.malformed_undeclared) |raw| try expectShellReply(a, raw, null, "");
+    for (cases.whole_undeclared) |c| try expectShellReply(a, c[0], "bash", c[1]);
+}

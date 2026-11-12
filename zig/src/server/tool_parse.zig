@@ -206,12 +206,12 @@ fn argumentsClose(a: Allocator, body: []const u8) Allocator.Error![]const u8 {
     return closed[body.len..];
 }
 
-/// The offered tool's spelling; else, as vLLM, an undeclared function name with finite object arguments; else null.
+/// The offered spelling; else, as vLLM, an undeclared function name of a whole call with finite object arguments.
 fn callName(a: Allocator, c: Call, known: *const std.StringArrayHashMapUnmanaged([]const u8)) Allocator.Error!?[]const u8 {
     const name = strip(c.name);
     if (known.get(try std.ascii.allocLowerString(a, name))) |offered| return offered;
     // the client refuses the unknown tool and the model can retry; kept as text, the call ended the client's turn
-    return if (functionName(name) and c.arguments == .object and tool_params.finite(c.arguments)) name else null;
+    return if (c.whole and functionName(name) and c.arguments == .object and tool_params.finite(c.arguments)) name else null;
 }
 
 /// 1 to 64 of ``[A-Za-z0-9_-]``: a name OpenAI's API accepts for a function.
@@ -362,14 +362,15 @@ fn functionBlock(a: Allocator, block: []const u8, schemas: ?*const tool_params.S
     } else return null;
     const body = strip(block[body_start..close]);
     const params = try parameterBlocks(a, body);
-    if (complete and !allSpace(params.residue)) return null;
+    const whole = allSpace(params.residue);
+    if (complete and !whole) return null;
     const arguments = try json.newObject(a);
     for (params.items) |p| {
         const key = strip(p.key);
         const schema: tool_params.Schema = if (schemas) |s| try tool_params.schemaOf(s, name, key, a) else try tool_params.emptySchema(a);
         try arguments.put(a, key, try tool_params.decode(a, p.value, schema, true));
     }
-    return .{ .name = name, .arguments = .{ .object = arguments } };
+    return .{ .name = name, .arguments = .{ .object = arguments }, .whole = whole };
 }
 
 const Param = struct { key: []const u8, value: []const u8 };
@@ -468,14 +469,15 @@ fn glmCall(a: Allocator, written: []const u8, schemas: ?*const tool_params.Schem
         pos = kept;
     }
     try residue.appendSlice(a, rest[kept..]);
-    if (complete and !allSpace(residue.items)) return null;
+    const whole = allSpace(residue.items);
+    if (complete and !whole) return null;
     const arguments = try json.newObject(a);
     for (pairs.items) |p| {
         const key = strip(p.key);
         const schema: tool_params.Schema = if (schemas) |s| try tool_params.schemaOf(s, name, key, a) else try tool_params.emptySchema(a);
         try arguments.put(a, key, try tool_params.decode(a, p.value, schema, false));
     }
-    return .{ .name = name, .arguments = .{ .object = arguments } };
+    return .{ .name = name, .arguments = .{ .object = arguments }, .whole = whole };
 }
 
 /// The first ``</arg_key>`` at or after `from` that an ``<arg_value>`` follows, and where that value starts.

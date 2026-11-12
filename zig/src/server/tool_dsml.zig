@@ -6,7 +6,8 @@ const Value = json.Value;
 const Allocator = std.mem.Allocator;
 
 pub const Error = error{ Invalid, OutOfMemory };
-pub const Call = struct { name: []const u8, arguments: Value };
+/// `whole`: nothing but the call's markup (the lenient parallel parse may keep stray text inside a declared call).
+pub const Call = struct { name: []const u8, arguments: Value, whole: bool = true };
 
 /// One spelling's tags: every one ``<｜DSML｜``, its separator, then its name.
 pub const Spelling = struct {
