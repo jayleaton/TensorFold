@@ -1,4 +1,4 @@
-//! A round's committed tokens cut where the loop guard, the thinking budget or a tool_choice call gate takes over.
+//! A round's tokens cut where the loop guard, the thinking budget, the runner's digit stop or a call gate takes over.
 const std = @import("std");
 const sm = @import("stream.zig");
 const call_gate = @import("call_gate.zig");
@@ -10,6 +10,13 @@ pub fn apply(e: anytype, s: *Stream, committed: *std.ArrayList(u32), path: *[]u3
     const budget_cut = s.thinkCut(committed.items);
     const loop_cut = sm.loopCut(s, committed.items);
     const never = std.math.maxInt(usize);
+    // the digit stop (reasoning rows only, never the gate's) wins ties with the loop guard and yields to the budget
+    if (@import("runner_stop.zig").cut(s, committed.items)) |hit| if (hit.at <= (loop_cut orelse never) and hit.at < (budget_cut orelse never)) {
+        path.* = path.*[0 .. hit.at + 1];
+        committed.shrinkRetainingCapacity(hit.at);
+        try committed.append(a, hit.token);
+        return hit.at;
+    };
     // the gate wins ties with the loop guard and yields to the budget (patch 0007's order)
     if (s.gate) |*g| if (try g.cut(a, committed.items)) |hit| if (hit.at <= (loop_cut orelse never) and hit.at < (budget_cut orelse never)) {
         path.* = path.*[0 .. hit.at + 1];

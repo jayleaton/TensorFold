@@ -47,6 +47,7 @@ pub const recorder = @import("recorder.zig");
 pub const logprob = @import("logprob.zig");
 pub const grammar = @import("grammar.zig");
 pub const call_gate = @import("call_gate.zig"); // tool_choice required or named without a grammar (patch 0007)
+pub const runner_stop = @import("runner_stop.zig"); // the runner's digit stop after owned values (reasoning only)
 pub const grammar_time = @import("grammar_time.zig");
 pub const grammar_fake = @import("grammar_fake.zig"); // a stand-in libtfgrammar for tests
 
@@ -71,6 +72,7 @@ test {
     _ = @import("hold_test.zig");
     _ = @import("fire_replay_test.zig");
     _ = @import("settle_fire_test.zig");
+    _ = @import("runner_stop.zig");
     _ = @import("forced_rows_hold_test.zig");
     _ = @import("budget_hold_test.zig");
     _ = @import("round_trace_test.zig");

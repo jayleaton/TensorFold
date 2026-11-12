@@ -509,6 +509,7 @@ pub const Engine = struct {
         var current: Feed = .{ .handle = s.inflight.? };
         s.inflight = null;
         if (try e.forcedNext(s)) |t| current = .{ .value = t };
+        try @import("runner_stop.zig").pipelined(e, s, &current); // the runner's digit stop reads a watched draw
         var token: u32 = undefined;
         if (mode == .drain) {
             token = try e.readFeed(current); // the last queued step: no new one
@@ -535,6 +536,7 @@ pub const Engine = struct {
         var current: Feed = .{ .handle = s.inflight.? };
         s.inflight = null;
         if (try e.forcedNext(s)) |t| current = .{ .value = t };
+        try @import("runner_stop.zig").pipelined(e, s, &current); // the runner's digit stop reads a watched draw
         const token = try e.readFeed(current);
         s.rounds += 1;
         const landed = try s.commit(e.gpa, &.{token}, &.{});
