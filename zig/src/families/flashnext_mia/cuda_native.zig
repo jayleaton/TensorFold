@@ -22,6 +22,8 @@ pub const prompt_rows: u32 = 2048;
 /// The compute lane and in-model runner as upstream's flashnext binds them: one checkpoint, so one ChatML markup.
 pub const compute = @import("flashnext").native.compute; // TF_COMPUTE_LANE*: native/cuda.zig's openWith boots it
 pub const runner = @import("flashnext").native.runner; // TF_RUNNER*: openWith opens it for the lane host
+/// tool_choice required, a named function and Anthropic any: the lane core's call gate (her 0007), no grammar hook.
+pub const call_gates = true;
 
 /// f212's contract (cuda_options.zig): lanes is --parallel, kv8 --kv-cache fp8 (her --kv-dtype fp8); segments ignored.
 pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, lanes: u32 = 1, prompt_cache_gib: ?f64 = null, tp: u32 = 1, rank: u32 = 0, master: ?[]const u8 = null, master_port: u16 = 29551, kv8: bool = false };

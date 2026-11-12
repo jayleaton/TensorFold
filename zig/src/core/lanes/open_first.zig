@@ -24,10 +24,11 @@ pub fn opened(e: *Engine, s: *Stream, reach: open.Reach, hook: ?be.Committed) !v
     const drawn = try e.drawFirst(s, position);
     var feed: be.Feed = .{ .handle = drawn };
     if (try e.forcedNext(s)) |t| feed = .{ .value = t };
+    const drew = try @import("call_gate.zig").first(e, s, &feed); // a call gate reads and fixes the draw first
     const depth = try open.firstDepth(e, s, reach);
     const value = try e.readFeed(feed);
     if (e.log != null) {
-        const actual = if (feed == .handle) value else try e.backend.read(drawn);
+        const actual = if (feed == .handle) value else drew orelse try e.backend.read(drawn);
         try trail.event(e, &.{ f("ev", str("first")), f("stream", str(s.id)), f("position", int(position)), f("drawn", int(actual)), f("token", int(value)) });
     }
     var row: [1]LogRow = undefined;

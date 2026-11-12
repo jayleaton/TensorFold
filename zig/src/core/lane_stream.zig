@@ -37,8 +37,8 @@ pub fn open(h: *LaneHost, job: *Job) bool {
         job.custom = ps.make(ps.ctx, h.gpa, r.prompt, r.eos) catch return !h.drop(job, "the drafter could not start");
     } else job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch return !h.drop(job, "the drafter could not start");
     const recall = recalls.reader(h, job);
-    // forced result rows would leave a grammar, and logprob rows would rank tokens the model never drew
-    if (h.runner) |rn| if (r.run_cells and r.structure == null and r.logprobs == null) {
+    // forced result rows would leave a grammar or a call gate, and logprob rows would rank tokens never drawn
+    if (h.runner) |rn| if (r.run_cells and r.structure == null and r.call == null and r.logprobs == null) {
         job.runner = rn.session(r.run_trace) catch return !h.drop(job, "out of memory");
         if (job.runner) |s| s.commit.ask = r.run_commit;
     };
@@ -79,7 +79,8 @@ pub fn open(h: *LaneHost, job: *Job) bool {
         .untaught = r.untaught,
         .images = r.images,
         .key = r.cache_key,
-        .hold_eos = r.hold_eos and r.structure == null and r.logprobs == null, // forced rows would leave the grammar
+        .hold_eos = r.hold_eos and r.structure == null and r.call == null and r.logprobs == null, // forced rows would leave them
+        .call = r.call,
         .runner = if (job.runner) |s| s.hook() else null,
     }) catch {
         freeProposer(h, job);

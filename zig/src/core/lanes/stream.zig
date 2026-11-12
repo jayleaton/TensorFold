@@ -1,6 +1,7 @@
 //! One stream (Python LaneStream) and the round loop's state for it (Python's dicts keyed by stream id).
 const std = @import("std");
 const grammar = @import("grammar.zig");
+const call_gate = @import("call_gate.zig");
 const shape = @import("shape.zig");
 const plan_lanes = @import("plan_lanes.zig");
 const Allocator = std.mem.Allocator;
@@ -125,6 +126,7 @@ pub const Spec = struct {
     key: []const u32 = &.{}, // the prompt as the cache matches it (image rows by their image); empty: the prompt
     hold_eos: bool = false, // an EOS holds the stream for a server tool's result (hold.zig) instead of ending it
     runner: ?RunnerHook = null, // committed tokens go to the in-model runner, which may hold the stream at a token
+    call: ?call_gate.Spec = null, // tool_choice required or named: the answer opens an offered call (call_gate.zig)
 };
 
 pub const Stream = struct {
@@ -234,6 +236,7 @@ pub const Stream = struct {
     grant_gain: ?f64 = null, // the drafts its last grant expected to keep (the chances it was priced by)
     draft_chances: std.ArrayList(f64) = .empty, // last full head prices, retained through zero-row rounds
     copy_width: ?u32 = null,
+    gate: ?call_gate.Gate = null, // Spec.call's gate, moved on by each committed token
 
     pub fn init(gpa: Allocator, spec: Spec) !Stream {
         var s: Stream = .{
@@ -282,11 +285,13 @@ pub const Stream = struct {
         if (spec.grammar) |g| if (g.budget) |*b| {
             b.* = .{ .max_new = spec.max_new, .answer_max = spec.answer_max, .think_end = spec.think_end };
         };
+        if (spec.call) |c| s.gate = call_gate.Gate.afterPrompt(c, spec.prompt);
         try s.context.appendSlice(gpa, spec.prompt);
         return s;
     }
 
     pub fn deinit(s: *Stream, gpa: Allocator) void {
+        if (s.gate) |*g| g.deinit(gpa);
         s.context.deinit(gpa);
         s.rows.deinit(gpa);
         s.prompt_rows.deinit(gpa);
@@ -471,6 +476,7 @@ pub const Stream = struct {
             s.context.appendAssumeCapacity(t);
             if (rows.len > 0) s.rows.appendAssumeCapacity(rows[i]);
             landed += 1;
+            if (s.gate) |*g| try g.observe(gpa, t);
             s.forced_out -|= 1;
             const ended_think = s.think_open and @as(i64, t) == s.think_end;
             if (@as(i64, t) == s.think_end) {

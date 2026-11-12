@@ -105,6 +105,7 @@ fn openedCommitted(e: *Engine, s: *Stream, reach: Reach, hook: ?be.Committed) !v
     const drawn = try e.drawFirst(s, position);
     var feed: Feed = .{ .handle = drawn };
     if (try e.forcedNext(s)) |t| feed = .{ .value = t };
+    const drew = try @import("call_gate.zig").first(e, s, &feed); // a call gate reads and fixes the draw first
     var asked: ?u32 = null;
     if (e.cfg.family_mtp and s.drafts) {
         // the head reads the prompt's last row and the first token, and drafts the one after it
@@ -119,13 +120,13 @@ fn openedCommitted(e: *Engine, s: *Stream, reach: Reach, hook: ?be.Committed) !v
         if (d > 0) if (e.backend.vtable.tree) |tree| if (try tree(e.backend.ptr, s, e.gpa)) |held| {
             s.next = held; // a tree head's first drafts as host tokens, as every later round's
         };
-    } else if (e.cfg.pipelined and s.logprobs == null and s.grammar == null) {
+    } else if (e.cfg.pipelined and s.logprobs == null and s.grammar == null and s.gate == null) {
         try e.queueNext(s, feed);
     }
     const value = try e.readFeed(feed);
     if (asked) |d| try trail.event(e, &.{ f("ev", str("draft")), f("stream", str(s.id)), f("depth", int(d)), f("position", int(position + 1)), f("follow", .{ .u32s = &.{value} }), f("rows", .null) });
     if (e.log != null) {
-        const first = if (feed == .handle) value else try e.backend.read(drawn);
+        const first = if (feed == .handle) value else drew orelse try e.backend.read(drawn);
         try trail.event(e, &.{ f("ev", str("first")), f("stream", str(s.id)), f("position", int(position)), f("drawn", int(first)), f("token", int(value)) });
     }
     var first_row: [1]LogRow = undefined;

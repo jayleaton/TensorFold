@@ -150,8 +150,8 @@ pub const Engine = struct {
             try e.roundStreams(chosen);
         } else {
             for (live.items) |s| {
-                // logprobs and grammars take verify windows: rows' logits are read, or bits made, before a forward
-                const windowed = (e.cfg.family_mtp and s.drafts) or !e.cfg.pipelined or s.logprobs != null or s.grammar != null;
+                // logprobs, grammars and call gates take verify windows: rows read, bits made, tokens fixed first
+                const windowed = (e.cfg.family_mtp and s.drafts) or !e.cfg.pipelined or s.logprobs != null or s.grammar != null or s.gate != null;
                 const r = if (windowed) try e.familyRound(s, null) else try e.pipelinedRound(s);
                 s.min_rows = if (s.min_rows == 0) r.rows else @min(s.min_rows, r.rows);
             }
@@ -399,20 +399,7 @@ pub const Engine = struct {
             try t.commit(.{ .stream = s, .drafted = p.kind == .head, .rows = @intCast(rows), .parents = if (chain) null else parents, .path = path, .bonus = sampled[path[path.len - 1]] });
         };
         if (e.cfg.root_copies) s.root_copy_miss = p.kind == .copy and path.len < rows;
-        const budget_cut = s.thinkCut(committed.items);
-        const loop_cut = sm.loopCut(s, committed.items);
-        const loop_wins = if (loop_cut) |c| budget_cut == null or c < budget_cut.? else false;
-        var cut: ?usize = null;
-        if (loop_wins) {
-            cut = loop_cut;
-            path = path[0 .. loop_cut.? + 1];
-            committed.shrinkRetainingCapacity(loop_cut.? + 1);
-        } else if (budget_cut) |c| {
-            cut = c;
-            path = path[0 .. c + 1];
-            committed.shrinkRetainingCapacity(c);
-            try committed.append(a, try s.startClose(e.gpa));
-        }
+        const cut = try @import("round_cut.zig").apply(e, s, &committed, &path); // loop guard, budget or call gate
         s.rounds += 1;
         var committed_rows: []LogRow = &.{};
         if (rows_lp.len > 0) {

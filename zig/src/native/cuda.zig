@@ -465,6 +465,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         .prompt_logprobs = served.backend.vtable.prompt_rows,
         .penalties = served.backend.penalties,
         .structures = served.backend.vtable.first_masked != null,
+        .call_gates = @hasDecl(F, "call_gates") and F.call_gates, // the lane core forces the call (lanes/call_gate.zig)
         .vision = if (@hasField(@TypeOf(loaded), "vision")) vision_offer.offer(loaded.vision, o.vision) else null,
         .admit = admit,
         .ledger = @import("cuda_ledger.zig").info(if (h.kv_plan) |*p| p else null),
