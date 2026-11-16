@@ -45,8 +45,8 @@ pub fn site(s: *Seg, L: u32, which: []const u8, mode: moe.Mode) !void {
     const e = s.e;
     const pend = s.pend;
     s.pend = 0;
-    // the decoder replay's boundaries write the streams in place (replay.finish's Streams has no `alt`)
-    if (s.short) return moe.mhcInto(e, L, which, mode, s.part == .decoder);
+    // the decoder replay's boundaries too into the spare streams: mhc_cuda's CTAs race in place (#2715)
+    if (s.short) return moe.mhcInto(e, L, which, mode, false);
     const n = e.n;
     if (pend > 1 and mode == .boundary and n >= pend * pf_rows and n > split_rows) return s.sitePieces(L, which, pend, true);
     // TF_DSV41_MHC_SITE_ROWS: the boundary in row pieces, each piece's inputs still in L2 for its `_finish_k`

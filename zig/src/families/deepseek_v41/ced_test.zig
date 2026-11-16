@@ -122,22 +122,57 @@ test "CED: the encoder pass + the decoder pass are the whole segment's calls, la
             try testing.expectEqual(n, x.arg.t.shape[0]);
             try testing.expectEqual(n, y.arg.t.shape[0]);
         }
-        // no comp_wkv in the decoder (the encoder stored layer 20's rows); every boundary in place
-        var in_place: usize = 0;
+        // no comp_wkv in the decoder (the encoder stored layer 20's rows); Triton site boundaries in place
+        var boundaries: usize = 0;
         for (dec) |c| {
             for (c.args) |x| if (x.arg == .t and x.arg.t.role == .weight) try testing.expect(std.mem.indexOf(u8, x.arg.t.role.weight, "comp_wkv") == null);
             if (std.mem.eql(u8, c.name, "_site") and named(c, "POST_ON").?.b) {
                 try testing.expectEqualStrings(roleOf(named(c, "X").?), roleOf(named(c, "XOUT").?));
                 try testing.expect(!named(c, "SPLIT").?.b);
-                in_place += 1;
+                boundaries += 1;
             }
-            if (std.mem.eql(u8, c.name, "tf_dsv41_mhc_cuda_v1.run") and c.args[2].arg.t.role != .empty) {
-                try testing.expectEqualStrings(roleOf(c.args[0].arg), roleOf(c.args[1].arg));
-                in_place += 1;
-            }
+            if (std.mem.eql(u8, c.name, "tf_dsv41_mhc_cuda_v1.run") and c.args[19].arg.i == 0) boundaries += 1;
             if (std.mem.eql(u8, c.name, "_fused")) try testing.expectEqualStrings("w.lo", roleOf(named(c, "LO").?));
         }
-        try testing.expect(in_place >= 2 * dec_layers.len - 1);
+        try testing.expect(boundaries >= 2 * dec_layers.len - 2);
+    };
+}
+
+/// A short decoder pass's mhc_cuda boundaries: each writes the streams the next reads, never its own input.
+fn decoderSpare(dec: []const calls.Call) !usize {
+    var seen: usize = 0;
+    var prev: ?[]const u8 = null;
+    for (dec) |c| {
+        if (!std.mem.eql(u8, c.name, "tf_dsv41_mhc_cuda_v1.run")) continue;
+        const x = roleOf(c.args[0].arg);
+        if (prev) |p| try testing.expectEqualStrings(p, x);
+        if (c.args[19].arg.i != 0) continue; // a mixing site or the final norm
+        const xout = roleOf(c.args[1].arg);
+        if (std.mem.eql(u8, x, xout)) {
+            std.debug.print("boundary {d} writes its input {s}\n", .{ seen, x });
+            return error.TestBoundaryInPlace;
+        }
+        prev = xout;
+        seen += 1;
+    }
+    return seen;
+}
+
+test "CED: a short decoder pass's mhc_cuda boundaries write the spare streams, not their input (#2715)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cfg: Config = .{};
+    var w = try widths(a);
+    var layers: [25]u32 = undefined;
+    for (&layers, 0..) |*l, i| l.* = @intCast(i);
+    const dec_layers = layers[try ced.decoderStart(&cfg)..];
+    // mhc_cuda's boundary CTAs each read all four streams of their columns and write one: in place they race
+    for ([_]?block.Pool{ null, poolOf(true) }) |pool| for ([_]i64{ 1, 9, 13, 16 }) |m| for ([_]i64{ 0, 1000 }) |start| {
+        var o: block.Options = .{ .limit = limit, .rope_rows = limit + 2048 };
+        o.pool = pool;
+        const dec = try bp.emitReplay(a, &cfg, &w, o, dec_layers, m, start, .decoder);
+        try testing.expect(try decoderSpare(dec) >= 2 * dec_layers.len - 2);
     };
 }
 
