@@ -57,8 +57,8 @@ pub const records = [_]reg.CudaRecord{
         .{ .regs = 255, .static = 0, .bound = 256 },
         .{ .regs = 255, .static = 0, .bound = 256 },
         .{ .regs = 255, .static = 0, .bound = 256 },
-        .{ .regs = 255, .static = 0, .bound = 256 },
-        .{ .regs = 255, .static = 0, .bound = 256 },
+        .{ .regs = 254, .static = 0, .bound = 256 },
+        .{ .regs = 254, .static = 0, .bound = 256 },
     }, .later_pending = true },
     .{ .launch = .{ .name = "_ZN20tf_prefill_attention13hpattn_kernelILi256ELi8ELi2ELi2EEEvPK13__nv_bfloat16S3_S3_PS1_iiiiifiPKixi", .symbol = "_ZN20tf_prefill_attention13hpattn_kernelILi256ELi8ELi2ELi2EEEvPK13__nv_bfloat16S3_S3_PS1_iiiiifiPKixi", .image = "prefill_attention", .threads = 256, .dynamic = 98304, .opt_in = true, .min_sm = 80 }, .usage = .{
         .{ .regs = 251, .static = 0, .bound = 256 },
@@ -85,8 +85,8 @@ pub const records = [_]reg.CudaRecord{
         .{ .regs = 255, .static = 0, .bound = 256 },
         .{ .regs = 255, .static = 0, .bound = 256 },
         .{ .regs = 255, .static = 0, .bound = 256 },
-        .{ .regs = 255, .static = 0, .bound = 256 },
-        .{ .regs = 255, .static = 0, .bound = 256 },
+        .{ .regs = 254, .static = 0, .bound = 256 },
+        .{ .regs = 254, .static = 0, .bound = 256 },
     }, .later_pending = true },
 };
 

@@ -150,7 +150,7 @@
     const int pos0 = causal ? p0 + wrow + g : limit - 1, pos1 = causal ? pos0 + 8 : pos0;
     auto take = [&](int it) -> const uint4* {           // item it's slot, once every thread's copy has landed
         cp_wait<NS - 1>();
-        __syncthreads();
+        if (!F8 || it == 0) __syncthreads();  // fp8 slots are plain stores that done's barrier already ordered
         return slots + (it % NS) * HALF * CS;
     };
     auto done = [&](int it) {                            // the slot is free: stage the item NS ahead into it
