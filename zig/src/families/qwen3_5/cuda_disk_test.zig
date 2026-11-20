@@ -284,3 +284,25 @@ test "the probe releases its stream once whether its prompt pass, its wait or it
         try std.testing.expectEqual(@as(usize, 1), target.releases);
     }
 }
+
+test "the disk tier's staging permit takes one whole state at the served window, as native attachKept reads it" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(root);
+    var f: Fixture = .{ .d = undefined, .e = undefined };
+    f.init(false);
+    defer f.t.spares.deinit();
+    f.t.context = 1 << 24; // a state at this window is past the 1 GiB default permit
+    // read as native cuda_disk.attachKept reads it
+    const longest: u32 = if (comptime @hasDecl(disk, "longest")) disk.longest(&f.t) else 0;
+    var s = pc.Store.init(gpa, f.snapshots(), .{ .lookahead = 0, .min_prompt = 0, .min_gap = 1 }, 1 << 40);
+    const r = try rows.attach(gpa, &s, .{ .root = root, .identity = 3, .cap = 1 << 40, .floor = 0, .daily = 1 << 40, .longest = longest });
+    defer r.deinit();
+    defer s.deinit();
+    const whole = try rows.write.coldCharge(r, 1 << 24);
+    try std.testing.expect(whole > 1 << 30);
+    try std.testing.expectEqual(whole, r.staging_bytes);
+}

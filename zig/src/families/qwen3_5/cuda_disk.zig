@@ -150,6 +150,11 @@ pub fn probe(a: Allocator, io: std.Io, backend: lanes.backend.Backend, t: *Targe
     return .{ .hash = h.final(), .rate = @as(f64, @floatFromInt(toks.len)) / (@as(f64, @floatFromInt(@max(ns, 1))) / 1e9) };
 }
 
+/// The served window, a state the store's permit takes whole (rows.Options.longest); 0: the default permit.
+pub fn longest(t: *const Target) u32 {
+    return std.math.cast(u32, t.context) orelse std.math.maxInt(u32);
+}
+
 /// What else the states depend on: the cache format, target taps, int8 projections and rotary inputs.
 pub fn facts(t: *const Target) [4]u64 {
     var rope = std.hash.Wyhash.init(0x726f7065);

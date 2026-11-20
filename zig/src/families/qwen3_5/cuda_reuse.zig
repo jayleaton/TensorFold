@@ -48,6 +48,7 @@ pub const Target = struct {
     caches: *std.AutoHashMapUnmanaged(*lanes.Stream, *Cache),
     seen: *std.AutoHashMapUnmanaged(*lanes.Stream, []Seen),
     ctx: ?*const cuda.Context = null, // --learn-conversations: made current where the disk tier allocates copies
+    context: usize = 0, // the served window: a whole kept state the disk tier's staging permit takes (cuda_disk.longest)
     device: bool = false, // an integrated GPU: saves go to device memory, unless the disk tier reads them (ctx)
     spares: spares.Spares = .{}, // freed host copies, for the next save or recall of their size
 
