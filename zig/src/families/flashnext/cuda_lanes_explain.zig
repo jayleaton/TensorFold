@@ -8,6 +8,7 @@ pub fn open(err: anyerror) ?[]const u8 {
         error.FlashNextRanksOnCapturedGlue => "--tp 2 runs Flash Next's own glue, not a captured set: set TENSORFOLD_CUDA_KERNELS=native, or serve on one GPU",
         error.BadFlashNextKvPages, error.BadFlashNextPageTest, error.FlashNextPagesUnsupported, error.UnsupportedCheckpoint => explain(err),
         error.UnsupportedLearningFormat, error.TrainingOnCapturedGlue => explain(err),
+        error.CheckpointMathNeedsBlackwell, error.PrecisionNotBuilt, error.CheckpointMathOneRank => explain(err),
         else => null,
     };
 }
@@ -23,6 +24,9 @@ pub fn explain(err: anyerror) ?[]const u8 {
         error.BadDenseSplit => "TF_FLASHNEXT_SPLIT_DENSE takes 1 (split the BF16 dense projections at --tp 2, the default) or 0",
         error.DecodeGraphWithDenseSplit => "TF_FLASHNEXT_DECODE_GRAPH is not qualified with the dense split: unset it or set TF_FLASHNEXT_SPLIT_DENSE=0",
         error.RankDisconnected, error.RankTimeout, error.RemoteRank, error.BadRankFrame => "a tensor-parallel rank failed; restart both ranks from the same checkpoint before retrying",
+        error.CheckpointMathNeedsBlackwell => "--precision checkpoint: NVIDIA's FP4 math runs on Blackwell (compute capability 12.x); serve with --precision full",
+        error.CheckpointMathOneRank => "--precision checkpoint runs Flash Next on one GPU so far: serve without --tp or with --precision full",
+        error.PrecisionNotBuilt => "--precision checkpoint needs NVFP4 routed experts with input scales; serve this checkpoint with --precision full",
         else => @import("cuda_images.zig").Vision.explain(err),
         error.PocketOfAnotherSize => "a lesson's pocket is wider than the layer's loaded one: restart the server on the folder",
         error.UnsupportedLearningFormat => "--slide requires the affine 4-bit group-32 single-rank Flash Next checkpoint",

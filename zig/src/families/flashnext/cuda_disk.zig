@@ -115,6 +115,11 @@ pub fn policyOf(c: anytype) [13]u64 {
     grids.update(std.mem.asBytes(&k.nvfp4.resident));
     grids.update(std.mem.asBytes(&k.fp8.resident));
     if (k.expert_tile) |x| grids.update(std.mem.asBytes(&x.resident));
+    if (k.ck) |x| { // --precision checkpoint's math and its grids (full leaves the key as it was)
+        grids.update("checkpoint");
+        grids.update(std.mem.asBytes(&x.swiglu_resident));
+        grids.update(std.mem.asBytes(&x.swiglu_prompt_resident));
+    }
     grids.update(std.mem.asBytes(&k.native_lane.prompt_sms)); // a BF16 prompt tile runs over half these SMs' worth
     return .{
         // TF_FLASHNEXT_CHUNK_SOLO and _CHUNK as resolved: a pass's rows alone, and beside a decoding stream

@@ -165,7 +165,7 @@ pub fn run(gpu: check.Gpu) !void {
     defer owned.free();
     const layer = owned.view();
     try check.expect(layer.format == .fp8g and layer.width == NI and layer.dims == D and layer.experts == experts, "the head's experts load as block FP8, {d} x {d}, {d} experts", .{ NI, D, experts });
-    var k = try flash.batch_state.Kernels.load(gpu.d);
+    var k = try flash.batch_state.Kernels.load(gpu.d, false);
     defer k.deinit();
     const x = r.bfs(most * D, 1.0);
     const dx = try r.dev(std.mem.sliceAsBytes(x));

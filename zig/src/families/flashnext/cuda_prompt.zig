@@ -134,9 +134,9 @@ pub const Engine = struct {
     /// During a round of taught and untaught streams: its rows' pocket scales (0 on an untaught row); 0: none.
     taught_rows: u64 = 0,
     pub fn init(gpa: std.mem.Allocator, io: std.Io, driver: *cuda.Driver, stream: *cuda.Stream, model_dir: []const u8) !*Engine {
-        return initRank(gpa, io, driver, stream, model_dir, 1, 0);
+        return initRank(gpa, io, driver, stream, model_dir, 1, 0, false);
     }
-    pub fn initRank(gpa: std.mem.Allocator, io: std.Io, driver: *cuda.Driver, stream: *cuda.Stream, model_dir: []const u8, world: usize, rank: usize) !*Engine {
+    pub fn initRank(gpa: std.mem.Allocator, io: std.Io, driver: *cuda.Driver, stream: *cuda.Stream, model_dir: []const u8, world: usize, rank: usize, checkpoint: bool) !*Engine {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
         if ((world != 1 and world != 2) or rank >= world) return error.BadRank;
         // refused before anything loads: a bad TF_FLASHNEXT_CHUNK leaves no module or buffer behind
@@ -199,7 +199,7 @@ pub const Engine = struct {
         for (0..layers_n) |i| {
             const cap = fb.max_pocket * dims;
             var pk: load.Pocket = .{ .gate = rows[0..cap], .up = rows[cap..][0..cap], .down = rows[2 * cap ..][0..cap] };
-            e.layers[i] = try load.loadLayerRank(gpa, driver, stream, &e.store, pack_fn, i, world, rank, &pk);
+            e.layers[i] = try load.loadLayerRank(gpa, driver, stream, &e.store, pack_fn, i, world, rank, &pk, checkpoint);
             e.n_layers += 1;
             std.log.info("flashnext: rank {d}/{d} loaded layer {d}/{d}", .{ rank + 1, world, i + 1, layers_n });
             if (pk.n == 0) continue;
@@ -213,7 +213,7 @@ pub const Engine = struct {
         e.store.loaded(); // every layer is on the device: no pinned staging, borrowed plane or open shard while serving
         e.ngram = try ple.Ngram.init(gpa, io, e.model_dir);
         errdefer e.ngram.deinit();
-        e.batch_k = try batch.Kernels.load(driver);
+        e.batch_k = try batch.Kernels.load(driver, checkpoint);
         e.batch_k.native_lane.fuse_split_n = fuse_split_n;
         e.batch_s = null;
         e.scores = null;

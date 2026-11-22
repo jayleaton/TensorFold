@@ -261,21 +261,21 @@ fn keepDown(gpa: std.mem.Allocator, store: *Store, buf: []u8, prefix: []const u8
 }
 
 pub fn loadLayer(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.Stream, store: *Store, pack_fn: cuda.Function, layer: usize) !Layer {
-    return loadLayerRank(gpa, driver, stream, store, pack_fn, layer, 1, 0, null);
+    return loadLayerRank(gpa, driver, stream, store, pack_fn, layer, 1, 0, null, false);
 }
 
-pub fn loadLayerRank(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.Stream, store: *Store, pack_fn: cuda.Function, layer: usize, world: usize, rank: usize, pocket: ?*Pocket) !Layer {
+pub fn loadLayerRank(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.Stream, store: *Store, pack_fn: cuda.Function, layer: usize, world: usize, rank: usize, pocket: ?*Pocket, checkpoint: bool) !Layer {
     var buf: [80]u8 = undefined;
     const base = try std.fmt.bufPrint(&buf, "language_model.model.layers.{d}", .{layer});
-    return loadLayerAtRank(gpa, driver, stream, store, pack_fn, base, linearLayer(layer), layer == ple_layer, world, rank, pocket);
+    return loadLayerAtRank(gpa, driver, stream, store, pack_fn, base, linearLayer(layer), layer == ple_layer, world, rank, pocket, checkpoint);
 }
 
 /// The decoder layer under `base` (the MTP head's "language_model.mtp.layers.0": full attention, no n-gram branch).
 pub fn loadLayerAt(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.Stream, store: *Store, pack_fn: cuda.Function, base: []const u8, linear: bool, with_ple: bool) !Layer {
-    return loadLayerAtRank(gpa, driver, stream, store, pack_fn, base, linear, with_ple, 1, 0, null);
+    return loadLayerAtRank(gpa, driver, stream, store, pack_fn, base, linear, with_ple, 1, 0, null, false);
 }
 
-fn loadLayerAtRank(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.Stream, store: *Store, pack_fn: cuda.Function, base: []const u8, linear: bool, with_ple: bool, world: usize, rank: usize, pocket: ?*Pocket) !Layer {
+fn loadLayerAtRank(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.Stream, store: *Store, pack_fn: cuda.Function, base: []const u8, linear: bool, with_ple: bool, world: usize, rank: usize, pocket: ?*Pocket, checkpoint: bool) !Layer {
     // decided before any view is held: deciding maps layer 0's shard; the split halves the heads and cuts the outs
     const heads = try dense_split.heads(store, world);
     const cut: ?Cut = if (!heads.eql(.full)) try Cut.init(dims, world, rank) else null;
@@ -429,9 +429,10 @@ fn loadLayerAtRank(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.S
     var experts_down = deadBuf(driver);
     errdefer experts_down.free();
     if (store.has(try std.fmt.bufPrint(&buf, "{s}.experts.0.gate_proj.weight", .{mlp_root}))) {
-        native_experts = try mixed.load(gpa, driver, store, mlp_root, world, rank, cut != null);
+        native_experts = try mixed.load(gpa, driver, store, mlp_root, world, rank, cut != null, checkpoint);
     } else {
         if (world != 1 or rank != 0) return error.UnsupportedQuantization;
+        if (checkpoint) return error.PrecisionNotBuilt;
         const legacy = legacy_block: {
             var shared: [3]OwnedFace = .{ blankFace(), blankFace(), blankFace() };
             errdefer for (&shared) |*f| f.free(gpa);

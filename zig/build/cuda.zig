@@ -517,6 +517,11 @@ fn flashnextChecks(b: *std.Build, target: std.Build.ResolvedTarget, optimize: st
     const compare_run = b.addRunArtifact(b.addExecutable(.{ .name = "flashnext-compare", .root_module = compare_check }));
     if (embed_model != null and embed_kernels != null and prompt_ids != null) compare_run.addArgs(&.{ embed_model.?, embed_kernels.?, prompt_ids.? });
     b.step("flashnext-compare", "Our Flash Next glue against a captured set: every prompt row's scores, perplexity, greedy replies").dependOn(&compare_run.step);
+    // installed by its own step: one precision's teacher-forced prompt rows, then another's against them
+    const kl_check = b.createModule(.{ .root_source_file = b.path("zig/src/families/flashnext/cuda_ck_kl_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    kl_check.addImport("cuda", cuda);
+    kl_check.addImport("flashnext", flashnext);
+    b.step("flashnext-kl", "Flash Next's prompt rows at one --precision against another's: KL, top-1, perplexity").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "flashnext-kl", .root_module = kl_check }), .{}).step);
     // not installed: the native block selection against Triton's lists (capture_sparse.sh's fixtures)
     const select_check = b.createModule(.{ .root_source_file = b.path("zig/src/families/flashnext/cuda_select_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     select_check.addImport("cuda", cuda);

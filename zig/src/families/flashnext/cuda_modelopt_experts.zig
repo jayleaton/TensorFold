@@ -47,8 +47,11 @@ pub const Owned = struct {
     first: usize = 0,
     /// .nvfp4 (global scales a projection) or .fp8g (f32 128x128 block scales, cuda_fp8_experts_load.zig).
     format: cuda.experts.Format = .nvfp4,
+    /// --precision checkpoint: up/down hold ck.zig's words, up_scale/down_scale its scale tiles, and these its factors.
+    ck: ?@import("cuda_ck_experts.zig").Factors = null,
 
     pub fn free(self: *Owned) void {
+        if (self.ck) |*f| f.free();
         self.up.free();
         self.down.free();
         self.up_scale.free();

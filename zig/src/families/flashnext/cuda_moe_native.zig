@@ -24,7 +24,7 @@ pub fn run(self: anytype, native: *const mixed.Owned, n: usize, pairs: usize, pl
     if (zs.clearsY(native.world, native.rank)) try self.stream.d.check(self.stream.d.api.cuMemsetD8Async(s.y, 0, y_bytes, self.stream.handle), "cuMemsetD8Async");
     const side = try shared.fork(self, native, n);
     switch (owned.format) {
-        .nvfp4 => {
+        .nvfp4 => if (owned.ck) |*f| try @import("cuda_ck_experts.zig").run(self, owned, f, picks, n, pairs, plan) else {
             const pt = nvfp4_tile.size(self.k, n);
             try self.k.router.route(self.stream, picks, pairs, e, pt, plan);
             const items = cuda.grouped.maxItems(pairs, e, pt);

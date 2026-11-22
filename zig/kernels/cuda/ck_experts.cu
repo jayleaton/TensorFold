@@ -18,6 +18,35 @@ __device__ __forceinline__ float relu(float v) { return v < 0.0f ? 0.0f : v; }
 // The larger, or a NaN when either is (fmaxf drops it): a block holding a NaN gets a NaN scale.
 __device__ __forceinline__ float max_nan(float a, float b) { return (a > b || a != a) ? a : b; }
 
+// experts.cuh's SwiGLU on the two sums: bf16 gate and up, the optional limit, silu to bf16, times up.
+__device__ __forceinline__ float swiglu(float g, float u, float limit) {
+    float gv = bf(g), uv = bf(u);
+    if (limit > 0.f) {
+        gv = fminf(gv, limit);
+        uv = fminf(fmaxf(uv, -limit), limit);
+    }
+    return bf(gv / (1.f + expf(-gv))) * uv;
+}
+
+// A quad's 16-input block (four values a lane, inputs 2t, 2t + 1 then 8 + 2t, 9 + 2t) as tf_ck_quant4 makes it.
+__device__ __forceinline__ uint2 quant_quad(const float (&f)[4], float g, int t, uint32_t& sf8) {
+    float amax = 0.0f;
+#pragma unroll
+    for (int c = 0; c < 4; ++c) amax = max_nan(amax, fabsf(f[c]));
+    amax = max_nan(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+    amax = max_nan(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+    const nvfp4q::Scale sc = nvfp4q::block_scale(amax, g);
+    uint32_t lo = (nvfp4q::e2m1(f[0] * sc.mul) | nvfp4q::e2m1(f[1] * sc.mul) << 4) << (8 * t);
+    uint32_t hi = (nvfp4q::e2m1(f[2] * sc.mul) | nvfp4q::e2m1(f[3] * sc.mul) << 4) << (8 * t);
+#pragma unroll
+    for (int o = 1; o < 4; o <<= 1) {
+        lo |= __shfl_xor_sync(0xffffffffu, lo, o);
+        hi |= __shfl_xor_sync(0xffffffffu, hi, o);
+    }
+    sf8 = sc.sf8;
+    return make_uint2(lo, hi);
+}
+
 #include "common/unpack8_value.cuh"
 
 }  // namespace tf_ck4
@@ -78,18 +107,20 @@ struct Step {
     uint32_t s[TJ];
 };
 
-// A warp: a plan item's pairs (16 at most) by TJ n8 tiles, U steps read ahead; EPI 1 relu^2 to bf16, EPI 0 fp32 sums.
-template <int EPI, int TJ, int U>
+// A warp: an item's pairs (16 at most) by TJ n8 tiles, U steps ahead; EPI 0 fp32, 1 relu^2 bf16, 2 SwiGLU NVFP4.
+template <int EPI, int TJ, int U, bool SKIP = false>
 __device__ __forceinline__ void grouped(const uint8_t* __restrict__ codes, const uint8_t* __restrict__ xs, int slots,
                                         const uint32_t* __restrict__ w, const uint8_t* __restrict__ ws,
                                         const float* __restrict__ alpha, int K, int N, const int* __restrict__ items,
                                         const int* __restrict__ counts, const int* __restrict__ members,
-                                        void* __restrict__ out) {
+                                        void* __restrict__ out, uint8_t* __restrict__ out_scales = nullptr,
+                                        const float* __restrict__ g_e = nullptr, float limit = 0.0f, int skip = -1) {
     const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3, NG = N / (8 * TJ), KG = K / 64;
     const int units = __ldg(counts) * NG;
     for (int unit = blockIdx.x * 4 + (threadIdx.x >> 5); unit < units; unit += gridDim.x * 4) {
         const int it = unit / NG, n0 = (unit - it * NG) * 8 * TJ;
         const int e = __ldg(items + 3 * it), first = __ldg(items + 3 * it + 1), cnt = __ldg(items + 3 * it + 2);
+        if (SKIP && e == skip) continue;
         const bool v0 = g < cnt, v1 = g + 8 < cnt;
         const int p0 = v0 ? __ldg(members + first + g) : 0, p1 = v1 ? __ldg(members + first + g + 8) : 0;
         const int x0 = slots ? p0 / slots : p0, x1 = slots ? p1 / slots : p1;
@@ -132,6 +163,27 @@ __device__ __forceinline__ void grouped(const uint8_t* __restrict__ codes, const
                         mma4::mma_fp4(acc[j], st[u].a, st[u].b[j].x, st[u].b[j].y, st[u].sa, st[u].s[j]);
             }
         }
+        if constexpr (EPI == 2) {  // tile 2q gate, 2q + 1 up of outputs n0 / 2 + 8q: TJ / 4 blocks of 16 a row
+            const float ag = __ldg(alpha + 2 * e), au = __ldg(alpha + 2 * e + 1), ge = __ldg(g_e + e);
+#pragma unroll
+            for (int h = 0; h < 2; ++h)
+#pragma unroll
+                for (int bk = 0; bk < TJ / 4; ++bk) {
+                    float f[4];
+#pragma unroll
+                    for (int c = 0; c < 4; ++c) {
+                        const int j = 4 * bk + 2 * (c / 2);
+                        f[c] = tf_ck4::bf(tf_ck4::swiglu(acc[j][2 * h + c % 2] * ag, acc[j + 1][2 * h + c % 2] * au, limit));
+                    }
+                    uint32_t sf8;
+                    const uint2 q = tf_ck4::quant_quad(f, ge, t, sf8);
+                    if (t != 0 || !(h ? v1 : v0)) continue;
+                    const size_t row = static_cast<size_t>(h ? p1 : p0), blk = n0 / 32 + bk, NO = N / 2;
+                    *reinterpret_cast<uint2*>(static_cast<uint8_t*>(out) + row * (NO / 2) + blk * 8) = q;
+                    out_scales[row * (NO / 16) + blk] = static_cast<uint8_t>(sf8);
+                }
+            continue;
+        }
         const float al = __ldg(alpha + e);
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
@@ -167,6 +219,22 @@ TF_CK4(tf_ck4_down_f32, 0, 8, 1)
 TF_CK4(tf_ck4_up_relu2_few, 1, 4, 4)
 TF_CK4(tf_ck4_down_f32_few, 0, 4, 4)
 
+#define TF_CK4S(NAME, EPI, TJ, U)                                                                                      \
+    extern "C" __global__ void __launch_bounds__(128)                                                                  \
+        NAME(const uint8_t* __restrict__ codes, const uint8_t* __restrict__ xs, int slots,                            \
+             const uint32_t* __restrict__ w, const uint8_t* __restrict__ ws, const float* __restrict__ alpha, int K,  \
+             int N, const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members,   \
+             void* __restrict__ out, uint8_t* __restrict__ out_scales, const float* __restrict__ g_e, float limit,    \
+             int skip) {                                                                                               \
+        grouped<EPI, TJ, U, true>(codes, xs, slots, w, ws, alpha, K, N, items, counts, members, out, out_scales, g_e, \
+                                  limit, skip);                                                                        \
+    }
+// SwiGLU experts (gate and up n8 tiles paired) to down's NVFP4 rows, and fp32 down, dropping the skipped expert.
+TF_CK4S(tf_ck4_swiglu_nvfp4, 2, 8, 1)
+TF_CK4S(tf_ck4_down_f32_skip, 0, 8, 1)
+TF_CK4S(tf_ck4_swiglu_nvfp4_few, 2, 4, 4)
+TF_CK4S(tf_ck4_down_f32_skip_few, 0, 4, 4)
+
 namespace tf_ck4 {
 
 constexpr int PM = 128, PN = 128, PSTAGES = 4;  // a prompt CTA's rows (one plan item), columns, staged K steps
@@ -179,19 +247,21 @@ struct PromptStage {
     uint32_t sb[2][64];
 };
 
-// fp32 sums; relu^2 rows quantized as tf_ck_quant4 does; or an item's shares summed as tf_super_combine sums them.
-enum PromptEpi : int { F32 = 0, RELU2_NVFP4 = 1, SHARE_SUM = 2 };
+// fp32 sums; relu^2 or paired-tile SwiGLU rows quantized as tf_ck_quant4 does; or shares summed in order.
+enum PromptEpi : int { F32 = 0, RELU2_NVFP4 = 1, SHARE_SUM = 2, SWIGLU_NVFP4 = 3 };
 
 }  // namespace tf_ck4
 
 // A block: a plan item (up to 128 pairs of one expert) by 128 columns; each output keeps the decode warp's MMA chain.
-template <int EPI>
+template <int EPI, bool SKIP = false>
 __device__ __forceinline__ void grouped_prompt(const uint8_t* __restrict__ codes, const uint8_t* __restrict__ xs,
                                                int slots, const uint32_t* __restrict__ w,
                                                const uint8_t* __restrict__ ws, const float* __restrict__ alpha, int K,
                                                int N, const int* __restrict__ items, const int* __restrict__ counts,
                                                const int* __restrict__ members, void* __restrict__ out,
-                                               uint8_t* __restrict__ out_scales, float g_out, int shares, int experts) {
+                                               uint8_t* __restrict__ out_scales, float g_out, int shares, int experts,
+                                               const float* __restrict__ g_e = nullptr, float limit = 0.0f,
+                                               int skip = -1) {
     using namespace tf_ck4;
     __shared__ __align__(128) PromptStage st[PSTAGES];
     __shared__ __align__(16) uint2 row_codes[PM][PN / 16];  // RELU2_NVFP4: the tile's rows, written out whole
@@ -234,20 +304,28 @@ __device__ __forceinline__ void grouped_prompt(const uint8_t* __restrict__ codes
             qmm_frag::commit();
         }
     };
-    if (blockIdx.x < units) stage_unit(blockIdx.x);
-    for (int unit = blockIdx.x; unit < units; unit += gridDim.x) {
+    auto next = [&](int unit) {  // the first unit from `unit`, a grid stride apart, whose item is not the skipped expert
+        if (SKIP)
+            while (unit < units && __ldg(items + 3 * (unit / NT)) == skip) unit += gridDim.x;
+        return unit;
+    };
+    int after = next(blockIdx.x);
+    if (after < units) stage_unit(after);
+    for (int unit = after; unit < units; unit = after) {
         const int e = u_e, first = u_first, cnt = u_cnt, ct = u_ct;
         const bool cols = ct * PN + wn * 32 < N;  // a warp's 32 columns are all in or all past N
         float acc[4][4][4] = {}, sum[4][4][4];
         auto fold = [&](int s) {  // share s's sums times its expert's alpha, added in share order
             const float al = __ldg(alpha + s * experts + e);
+            const float al2[2] = {EPI == SWIGLU_NVFP4 ? __ldg(alpha + 2 * e) : al,
+                                  EPI == SWIGLU_NVFP4 ? __ldg(alpha + 2 * e + 1) : al};
 #pragma unroll
             for (int i = 0; i < 4; ++i)
 #pragma unroll
                 for (int j = 0; j < 4; ++j)
 #pragma unroll
                     for (int c = 0; c < 4; ++c) {
-                        const float v = acc[i][j][c] * al;
+                        const float v = acc[i][j][c] * al2[j & 1];
                         sum[i][j][c] = s ? __fadd_rn(sum[i][j][c], v) : v;
                         acc[i][j][c] = 0.0f;
                     }
@@ -282,8 +360,41 @@ __device__ __forceinline__ void grouped_prompt(const uint8_t* __restrict__ codes
         }
         fold(shares - 1);
         __syncthreads();  // every warp is past the last stage: the next unit's first steps load under this epilogue
-        if (unit + gridDim.x < units) stage_unit(unit + gridDim.x);
-        if constexpr (EPI == RELU2_NVFP4) {
+        after = next(unit + gridDim.x);
+        if (after < units) stage_unit(after);
+        if constexpr (EPI == SWIGLU_NVFP4) {
+            if (cols) {  // a warp's 32 columns: tiles 0, 1 and 2, 3 pair gate and up of one block of 16 outputs
+                const float ge = __ldg(g_e + e);
+#pragma unroll
+                for (int i = 0; i < 4; ++i)
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        float f[4];
+#pragma unroll
+                        for (int c = 0; c < 4; ++c) {
+                            const int j = 2 * (c / 2);
+                            f[c] = tf_ck4::bf(tf_ck4::swiglu(sum[i][j][2 * h + c % 2], sum[i][j + 1][2 * h + c % 2], limit));
+                        }
+                        uint32_t sf8;
+                        const uint2 q = tf_ck4::quant_quad(f, ge, t, sf8);
+                        const int r = wm * 64 + i * 16 + g + h * 8;
+                        if (t == 0) {
+                            row_codes[r][wn] = q;
+                            row_scales[r][wn] = static_cast<uint8_t>(sf8);
+                        }
+                    }
+            }
+            __syncthreads();
+            const int r = tid >> 1, part = tid & 1, NO = N / 2, PO = PN / 2;  // two threads a row: 16 bytes each
+            if (r >= cnt) continue;
+            const size_t row = __ldg(members + first + r);
+            if (part * 32 < NO - ct * PO)
+                reinterpret_cast<uint4*>(static_cast<uint8_t*>(out) + row * (NO / 2) + ct * (PO / 2))[part] =
+                    reinterpret_cast<const uint4*>(row_codes[r])[part];
+            if (part)
+                for (int b = 0; b < min(PO, NO - ct * PO) / 16; ++b)
+                    out_scales[row * (NO / 16) + ct * (PO / 16) + b] = row_scales[r][b];
+        } else if constexpr (EPI == RELU2_NVFP4) {
             if (cols) {  // tf_ck_quant4's blocks of 16 inputs: two n8 tiles across a quad, four values a lane
 #pragma unroll
                 for (int i = 0; i < 4; ++i)
@@ -372,6 +483,29 @@ extern "C" __global__ void __launch_bounds__(256)
                            const int* __restrict__ counts, const int* __restrict__ members, void* __restrict__ out) {
     grouped_prompt<tf_ck4::F32>(codes, xs, slots, w, ws, alpha, K, N, items, counts, members, out, nullptr, 0.0f, 1,
                                 0);
+}
+
+// Prompt SwiGLU gate-up to down's NVFP4 rows under g_e[e], and fp32 down; both drop expert `skip`.
+extern "C" __global__ void __launch_bounds__(256)
+    tf_ck4_swiglu_nvfp4_prompt(const uint8_t* __restrict__ codes, const uint8_t* __restrict__ xs, int slots,
+                               const uint32_t* __restrict__ w, const uint8_t* __restrict__ ws,
+                               const float* __restrict__ alpha, int K, int N, const int* __restrict__ items,
+                               const int* __restrict__ counts, const int* __restrict__ members,
+                               uint8_t* __restrict__ out, uint8_t* __restrict__ out_scales,
+                               const float* __restrict__ g_e, float limit, int skip) {
+    grouped_prompt<tf_ck4::SWIGLU_NVFP4, true>(codes, xs, slots, w, ws, alpha, K, N, items, counts, members, out,
+                                               out_scales, 0.0f, 1, 0, g_e, limit, skip);
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+    tf_ck4_down_f32_skip_prompt(const uint8_t* __restrict__ codes, const uint8_t* __restrict__ xs, int slots,
+                                const uint32_t* __restrict__ w, const uint8_t* __restrict__ ws,
+                                const float* __restrict__ alpha, int K, int N, const int* __restrict__ items,
+                                const int* __restrict__ counts, const int* __restrict__ members,
+                                void* __restrict__ out, uint8_t* __restrict__ out_scales,
+                                const float* __restrict__ g_e, float limit, int skip) {
+    grouped_prompt<tf_ck4::F32, true>(codes, xs, slots, w, ws, alpha, K, N, items, counts, members, out, nullptr,
+                                      0.0f, 1, 0, nullptr, 0.0f, skip);
 }
 
 // Prompt down over `shares` x `experts` share experts: each first-share item's pairs summed over shares, bf16 a row.

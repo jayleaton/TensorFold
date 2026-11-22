@@ -53,6 +53,23 @@ pub const Layer = struct {
     dims: usize,
 };
 
+/// SwiGLU experts in the FP4 mma's layout: gate and up n8 tiles paired over 2 * width columns, a skipped expert id.
+pub const Swiglu = struct {
+    up: u64, // [E][2 width/64][dims/64][8][32][2] u32: packed column 16q + c is gate c (c < 8) or up c - 8 of 8q
+    up_s: u64,
+    down: u64, // [E][dims/64][width/64][8][32][2]
+    down_s: u64,
+    up_alpha: u64, // fp32 [E][2]: the input scale times gate's and up's weight scales
+    down_alpha: u64, // fp32 [E]
+    down_g: u64, // fp32 [E]: 1 / each expert's down input scale, the quantizer's global scale
+    up_act: f32, // the layer's gate and up input scale (every expert's the same)
+    limit: f32,
+    experts: usize,
+    width: usize,
+    dims: usize,
+    skip: i32,
+};
+
 pub const Ck = struct {
     lane_mod: Module,
     experts_mod: Module,
@@ -67,6 +84,10 @@ pub const Ck = struct {
     resident: [2][2]usize, // blocks the up and down kernels fill, by up_fns' order: per SM times SMs
     prompt_fns: [3]Function, // over prompt plans: relu^2 up to NVFP4 rows, fp32 down, share-summed down (256 threads)
     prompt_resident: [3]usize,
+    swiglu_fns: [2][2]Function, // SwiGLU up then skipping fp32 down, by up_fns' order
+    swiglu_resident: [2][2]usize,
+    swiglu_prompt: [2]Function,
+    swiglu_prompt_resident: [2]usize,
     clusters: bool,
 
     pub fn load(d: *const Driver, capability_major: u32, sms: usize) !Ck {
@@ -91,6 +112,16 @@ pub const Ck = struct {
             c.resident[i] = .{ @max(1, try c.up_fns[i].occupancy(128, 0)) * sms, @max(1, try c.down_fns[i].occupancy(128, 0)) * sms };
         }
         for ([_][:0]const u8{ "tf_ck4_up_nvfp4_prompt", "tf_ck4_down_f32_prompt", "tf_ck4_down_sum_prompt" }, &c.prompt_fns, &c.prompt_resident) |name, *f, *n| {
+            f.* = try experts_mod.function(name);
+            n.* = @max(1, try f.occupancy(256, 0)) * sms;
+        }
+        for ([_][2][:0]const u8{ .{ "tf_ck4_swiglu_nvfp4", "tf_ck4_down_f32_skip" }, .{ "tf_ck4_swiglu_nvfp4_few", "tf_ck4_down_f32_skip_few" } }, 0..) |names, i| {
+            for (names, 0..) |name, j| {
+                c.swiglu_fns[i][j] = try experts_mod.function(name);
+                c.swiglu_resident[i][j] = @max(1, try c.swiglu_fns[i][j].occupancy(128, 0)) * sms;
+            }
+        }
+        for ([_][:0]const u8{ "tf_ck4_swiglu_nvfp4_prompt", "tf_ck4_down_f32_skip_prompt" }, &c.swiglu_prompt, &c.swiglu_prompt_resident) |name, *f, *n| {
             f.* = try experts_mod.function(name);
             n.* = @max(1, try f.occupancy(256, 0)) * sms;
         }
@@ -236,6 +267,37 @@ pub const Ck = struct {
         a.add(@as(i32, @intCast(l.experts / shares)));
         // the first share's items alone: pair p + s mirrors pair p, so every share's experts plan the same items
         try runPrompt(s, c.prompt_fns[2], c.prompt_resident[2], l.dims, items / shares, &a);
+    }
+
+    /// SwiGLU up over a plan to down's NVFP4 pair rows at `out`, each under its expert's down input scale.
+    pub fn swigluUp(c: *const Ck, s: Stream, l: Swiglu, rows: u64, nrows: usize, slots: usize, p: Plan, pairs: usize, out: u64, items: usize, prompt: bool) !void {
+        var a = args(rows, nrows, slots, l.up, l.up_s, l.up_alpha, l.dims, 2 * l.width, p, out);
+        swigluTail(&a, out + pairs * l.width / 2, l.down_g, l.limit, l.skip);
+        if (prompt) return runPrompt(s, c.swiglu_prompt[0], c.swiglu_prompt_resident[0], 2 * l.width, items, &a);
+        const few = @intFromBool(nrows <= few_tokens);
+        return runArgs(s, c.swiglu_fns[few][0], c.swiglu_resident[few][0], warp_columns[few], 2 * l.width, items, &a);
+    }
+
+    /// down over a plan from swigluUp's rows (`pairs` of them) to fp32 [pairs][dims], the skipped expert's untouched.
+    pub fn swigluDown(c: *const Ck, s: Stream, l: Swiglu, rows: u64, pairs: usize, tokens: usize, p: Plan, out: u64, items: usize, prompt: bool) !void {
+        var a = args(rows, pairs, 0, l.down, l.down_s, l.down_alpha, l.width, l.dims, p, out);
+        swigluTail(&a, 0, 0, 0, l.skip);
+        if (prompt) return runPrompt(s, c.swiglu_prompt[1], c.swiglu_prompt_resident[1], l.dims, items, &a);
+        const few = @intFromBool(tokens <= few_tokens);
+        return runArgs(s, c.swiglu_fns[few][1], c.swiglu_resident[few][1], warp_columns[few], l.dims, items, &a);
+    }
+
+    fn swigluTail(a: *launch_.Args, scales: u64, g: u64, limit: f32, skip: i32) void {
+        a.add(scales);
+        a.add(g);
+        a.add(limit);
+        a.add(skip);
+    }
+
+    fn runArgs(s: Stream, f: Function, resident: usize, columns: usize, n: usize, items: usize, a: *launch_.Args) !void {
+        const grid = @min((items * (n / columns) + 3) / 4, resident);
+        if (grid < 1) return;
+        try go(f, s, .{ grid, 1, 1 }, 128, 0, a);
     }
 
     /// One grouped launch of `f` over a plan: NVFP4 rows at `rows` (`nrows` of `k`), `n` columns of `columns` a warp.

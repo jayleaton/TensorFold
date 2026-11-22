@@ -346,6 +346,8 @@ fn registered(gpu: check.Gpu, only: []const []const u8, t0: *i96) !g.Tally {
             nlane += 1;
         }
     }
+    const swiglu = try @import("contract_ck_swiglu.zig").Group.create(a, gpu, s, if (ck) |*q| q else null, try cuda.grouped.Router.resolve(mods[6]), &kernels);
+    defer swiglu.destroy();
     var e3_mods = try e3_k.Loaded.init(gpu);
     defer e3_mods.deinit();
     var e3_splits: [std.enums.values(e3_k.Fault).len]e3_k.Split = undefined;

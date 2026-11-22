@@ -73,6 +73,8 @@ pub const Kernels = struct {
     /// Block-FP8 routed experts (the MTP head of NVIDIA's NVFP4 checkpoint; cuda_moe_native.zig).
     fp8: cuda.experts.Fp8Experts,
     expert_tile: ?cuda.experts_tile.Tile = null,
+    /// --precision checkpoint: the routed experts' NVFP4 x NVFP4 kernels (cuda_ck_experts.zig).
+    ck: ?cuda.ck.Ck = null,
     /// The DeltaNet kernels for the whole layer's heads and for a rank's half under the head split (gdnSet).
     gdn: Gdn,
     gdn_h8: Gdn,
@@ -95,7 +97,7 @@ pub const Kernels = struct {
     select: cuda.Function,
     select_lanes: cuda.Function,
 
-    pub fn load(d: *const cuda.Driver) !Kernels {
+    pub fn load(d: *const cuda.Driver, checkpoint: bool) !Kernels {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
         const tile_mode = try cuda.experts_tile.mode(if (std.c.getenv("TF_FLASHNEXT_PROMPT_EXPERT_TILE")) |v| std.mem.span(v) else null);
         var k: Kernels = undefined;
@@ -129,6 +131,8 @@ pub const Kernels = struct {
         errdefer k.fp8.unload();
         if (tile_mode != .off) k.expert_tile = try cuda.experts_tile.Tile.load(d, @intCast(sms), tile_mode);
         errdefer if (k.expert_tile) |*tile| tile.unload();
+        k.ck = if (checkpoint) try cuda.ck.Ck.load(d, @import("cuda_ck_experts.zig").major, @intCast(sms)) else null;
+        errdefer if (k.ck) |*c| c.unload();
         k.sum = try k.batch.function("fn_sum_slices");
         k.moe_sum = try k.batch.function("fn_moe_sum");
         k.copy_cols = try k.batch.function("fn_copy_cols");
@@ -168,6 +172,7 @@ pub const Kernels = struct {
 
     pub fn deinit(k: *Kernels) void {
         if (k.expert_tile) |*tile| tile.unload();
+        if (k.ck) |*c| c.unload();
         k.fp8.unload();
         k.nvfp4.unload();
         k.native_lane.unload();

@@ -131,6 +131,7 @@ pub const all_cuda = @import("qmmf_prompt_records.zig").records ++
     @import("moetile_records.zig").records ++
     @import("gb10_many_records.zig").records ++
     @import("nvfp4_tile_pending.zig").records ++
+    @import("flashnext_ck_records.zig").records ++
     landed_cuda ++
     dsv41_pending ++
     @import("inc4_pending.zig").trees ++
@@ -144,5 +145,6 @@ pub const dsv41_pending = @import("registry_union.zig").extra(
 
 test {
     _ = @import("mla_cuda_records.zig");
+    _ = @import("flashnext_ck_records.zig");
     _ = @import("inkling2_cuda_records.zig");
 }

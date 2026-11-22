@@ -290,7 +290,7 @@ pub fn run(gpu: check.Gpu, dir: []const u8) !void {
     var rng = std.Random.DefaultPrng.init(0x7f17_4ead);
     var r = try rig.Rig.init(gpu, a, rng.random());
     defer r.deinit();
-    var k = try Kernels.load(gpu.d);
+    var k = try Kernels.load(gpu.d, false);
     defer k.deinit();
     try check.expect(k.native_lane.prompt != null and k.native_lane.prompt_sms > 0 and cuda.qmmf.prompt_rows == 512, "the BF16 prompt tile is loaded with the SM count, from 512 rows", .{});
     var g = try flash.Glue.load(gpu.d);

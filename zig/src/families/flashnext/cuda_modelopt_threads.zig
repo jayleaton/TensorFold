@@ -122,60 +122,89 @@ fn scalesOf(v: View, n: usize, k: usize, buf: []u8) ![]const u8 {
     return buf[0 .. n * (k / 16)];
 }
 
-/// Experts [lo, hi) of `views` (gate, up, down each) packed as loadShape's loop packs them, into `up` and `down`.
-const Work = struct {
-    views: []const View,
-    up: []u32,
-    down: []u32,
-    width: usize,
-    dims: usize,
-    lo: usize,
-    hi: usize,
-    failed: ?(error{OutOfMemory} || core.nvfp4_csf.Error) = null,
+/// A projection's FP4 codes and row-major E4M3 scales, as a layout packs them.
+pub const Plane = struct { codes: []const u8, scales: []const u8 };
 
-    fn run(w: *Work) void {
-        w.pack() catch |err| {
-            w.failed = err;
-        };
+/// The W4A16 kernels' layout (nvfp4_experts.cu): gate and up interleaved, then down; `parts` device arrays.
+pub const W4a16 = struct {
+    pub const parts = 2;
+
+    pub fn bytes(width: usize, dims: usize) ![parts]usize {
+        return .{ try experts.packedBytes(width, dims, 2), try experts.packedBytes(dims, width, 1) };
     }
 
-    fn pack(w: *Work) !void {
-        const count = w.views.len / 3;
-        const up_words = w.up.len / count;
-        const down_words = w.down.len / count;
-        const each = @max(w.width * (w.dims / 16), w.dims * (w.width / 16));
-        const bufs = try std.heap.page_allocator.alloc(u8, 3 * each);
-        defer std.heap.page_allocator.free(bufs);
-        for (w.lo..w.hi) |i| {
-            const g = w.views[3 * i];
-            const u = w.views[3 * i + 1];
-            const o = w.views[3 * i + 2];
-            const gs = try scalesOf(g, w.width, w.dims, bufs[0..each]);
-            const us = try scalesOf(u, w.width, w.dims, bufs[each..][0..each]);
-            const os = try scalesOf(o, w.dims, w.width, bufs[2 * each ..][0..each]);
-            ex.packGateUp(w.up[i * up_words ..][0..up_words], .{ g.codes, gs }, .{ u.codes, us }, w.width, w.dims);
-            ex.packOne(w.down[i * down_words ..][0..down_words], o.codes, os, w.dims, w.width);
-        }
+    pub fn pack(out: [parts][]u8, g: Plane, u: Plane, o: Plane, width: usize, dims: usize) void {
+        ex.packGateUp(@alignCast(std.mem.bytesAsSlice(u32, out[0])), .{ g.codes, g.scales }, .{ u.codes, u.scales }, width, dims);
+        ex.packOne(@alignCast(std.mem.bytesAsSlice(u32, out[1])), o.codes, o.scales, dims, width);
     }
 };
 
-/// Every expert's gate / up and down words, split over `n` threads; a thread that cannot start leaves its part here.
-pub fn pack(views: []const View, up: []u32, down: []u32, width: usize, dims: usize, n: usize) !void {
+/// Experts [lo, hi) of `views` (gate, up, down each) packed in layout L, expert i at i * per[p] of out[p].
+fn Work(comptime L: type) type {
+    return struct {
+        views: []const View,
+        out: [L.parts][]u8,
+        per: [L.parts]usize,
+        width: usize,
+        dims: usize,
+        lo: usize,
+        hi: usize,
+        failed: ?(error{OutOfMemory} || core.nvfp4_csf.Error) = null,
+
+        fn run(w: *@This()) void {
+            w.pack() catch |err| {
+                w.failed = err;
+            };
+        }
+
+        fn pack(w: *@This()) !void {
+            const each = @max(w.width * (w.dims / 16), w.dims * (w.width / 16));
+            const bufs = try std.heap.page_allocator.alloc(u8, 3 * each);
+            defer std.heap.page_allocator.free(bufs);
+            for (w.lo..w.hi) |i| {
+                const g = w.views[3 * i];
+                const u = w.views[3 * i + 1];
+                const o = w.views[3 * i + 2];
+                const gs = try scalesOf(g, w.width, w.dims, bufs[0..each]);
+                const us = try scalesOf(u, w.width, w.dims, bufs[each..][0..each]);
+                const os = try scalesOf(o, w.dims, w.width, bufs[2 * each ..][0..each]);
+                var out: [L.parts][]u8 = undefined;
+                for (&out, w.out, w.per) |*d, all, n| d.* = all[i * n ..][0..n];
+                L.pack(out, .{ .codes = g.codes, .scales = gs }, .{ .codes = u.codes, .scales = us }, .{ .codes = o.codes, .scales = os }, w.width, w.dims);
+            }
+        }
+    };
+}
+
+/// Every expert's words in layout L, split over `n` threads; a thread that cannot start leaves its part here.
+pub fn packAs(comptime L: type, views: []const View, out: [L.parts][]u8, width: usize, dims: usize, n: usize) !void {
     const count = views.len / 3;
-    if (count == 0 or views.len != 3 * count or up.len % count != 0 or down.len % count != 0) return error.UnexpectedTensor;
+    if (count == 0 or views.len != 3 * count) return error.UnexpectedTensor;
+    var per: [L.parts]usize = undefined;
+    for (&per, out) |*p, o| {
+        if (o.len % count != 0) return error.UnexpectedTensor;
+        p.* = o.len / count;
+    }
     const t_n = @max(1, @min(n, max_threads, count));
-    const per = (count + t_n - 1) / t_n;
-    var works: [max_threads]Work = undefined;
+    const share = (count + t_n - 1) / t_n;
+    var works: [max_threads]Work(L) = undefined;
     var handles: [max_threads]?std.Thread = @splat(null);
     for (0..t_n) |t| {
-        works[t] = .{ .views = views, .up = up, .down = down, .width = width, .dims = dims, .lo = @min(count, t * per), .hi = @min(count, (t + 1) * per) };
-        handles[t] = std.Thread.spawn(.{}, Work.run, .{&works[t]}) catch blk: {
+        works[t] = .{ .views = views, .out = out, .per = per, .width = width, .dims = dims, .lo = @min(count, t * share), .hi = @min(count, (t + 1) * share) };
+        handles[t] = std.Thread.spawn(.{}, Work(L).run, .{&works[t]}) catch blk: {
             works[t].run();
             break :blk null;
         };
     }
     for (handles[0..t_n]) |h| if (h) |th| th.join();
     for (works[0..t_n]) |w| if (w.failed) |err| return err;
+}
+
+/// Every expert's gate / up and down words in the W4A16 layout.
+pub fn pack(views: []const View, up: []u32, down: []u32, width: usize, dims: usize, n: usize) !void {
+    const count = views.len / 3;
+    if (count == 0 or up.len % count != 0 or down.len % count != 0) return error.UnexpectedTensor;
+    return packAs(W4a16, views, .{ std.mem.sliceAsBytes(up), std.mem.sliceAsBytes(down) }, width, dims, n);
 }
 
 /// A layer's planes borrowed with their pages read ahead, then packed on `n` threads a chunk of experts at a time.
@@ -193,11 +222,29 @@ pub fn loadChunked(a: std.mem.Allocator, d: *const cuda.Driver, store: anytype, 
 
 /// loadChunked with its planes read through the mapping (`direct` false) or gathered past the page cache.
 pub fn loadMode(a: std.mem.Allocator, d: *const cuda.Driver, store: anytype, prefix: []const u8, dims: usize, width: usize, count: usize, n: usize, stage_cap: usize, comptime direct: bool) !experts.Owned {
-    const up_bytes = try experts.packedBytes(width, dims, 2);
-    const down_bytes = try experts.packedBytes(dims, width, 1);
-    const up_total = std.math.mul(usize, count, up_bytes) catch return error.UnexpectedTensor;
-    const down_total = std.math.mul(usize, count, down_bytes) catch return error.UnexpectedTensor;
-    if (count == 0 or up_bytes == 0 or down_bytes == 0) return error.UnexpectedTensor;
+    const up_globals = try a.alloc(f32, 2 * count);
+    defer a.free(up_globals);
+    const down_globals = try a.alloc(f32, count);
+    defer a.free(down_globals);
+    var bufs = try loadLayout(W4a16, a, d, store, prefix, dims, width, count, n, stage_cap, direct, up_globals, down_globals);
+    errdefer for (&bufs) |*b| b.free();
+    var us = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(up_globals));
+    errdefer us.free();
+    const ds = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(down_globals));
+    return .{ .up = bufs[0], .down = bufs[1], .up_scale = us, .down_scale = ds, .width = width, .dims = dims, .count = count };
+}
+
+/// loadChunked's planes and pinned chunks in layout L; globals: gate, up at 2i, 2i + 1 and down at i.
+pub fn loadLayout(comptime L: type, a: std.mem.Allocator, d: *const cuda.Driver, store: anytype, prefix: []const u8, dims: usize, width: usize, count: usize, n: usize, stage_cap: usize, comptime direct: bool, up_globals: []f32, down_globals: []f32) ![L.parts]cuda.DeviceBuffer {
+    if (up_globals.len != 2 * count or down_globals.len != count) return error.UnexpectedTensor;
+    const per = try L.bytes(width, dims);
+    var each: usize = 0;
+    for (per) |b| {
+        if (b == 0) return error.UnexpectedTensor;
+        each += b;
+    }
+    _ = std.math.mul(usize, count, each) catch return error.UnexpectedTensor;
+    if (count == 0) return error.UnexpectedTensor;
     const view_count = std.math.mul(usize, 3, count) catch return error.UnexpectedTensor;
     const views = try a.alloc(View, view_count);
     defer a.free(views);
@@ -224,13 +271,16 @@ pub fn loadMode(a: std.mem.Allocator, d: *const cuda.Driver, store: anytype, pre
         if (sources) |src| try pair.read(src, ptrs[0..view_count]);
         for (views) |*v| try globalOf(v);
     }
-    var up = try cuda.DeviceBuffer.alloc(d, up_total);
-    errdefer up.free();
-    var down = try cuda.DeviceBuffer.alloc(d, down_total);
-    errdefer down.free();
+    var bufs: [L.parts]cuda.DeviceBuffer = undefined;
+    var made: usize = 0;
+    errdefer for (bufs[0..made]) |*b| b.free();
+    for (&bufs, per) |*b, p| {
+        b.* = try cuda.DeviceBuffer.alloc(d, count * p);
+        made += 1;
+    }
     // the store's pinned staging, kept across a load's layers and freed by its dropStaging or deinit on any path
-    const chunk = @max(1, @min(count, stage_cap / (up_bytes + down_bytes)));
-    const stage = try store.pinned(d, chunk * (up_bytes + down_bytes));
+    const chunk = @max(1, @min(count, stage_cap / each));
+    const stage = try store.pinned(d, chunk * each);
     if (sources) |src| {
         mark(store, true, 0);
         try pair.read(src, planes(views[0 .. 3 * @min(chunk, count)], ptrs));
@@ -251,30 +301,26 @@ pub fn loadMode(a: std.mem.Allocator, d: *const cuda.Driver, store: anytype, pre
             const ahead = planes(views[3 * (lo + chunk) ..][0 .. 3 * @min(chunk, count - lo - chunk)], ptrs);
             try pair.start(sources.?, ahead, hook);
         }
-        const up_words = std.mem.bytesAsSlice(u32, stage[0 .. m * up_bytes]);
-        const down_words: []u32 = @alignCast(std.mem.bytesAsSlice(u32, stage[m * up_bytes ..][0 .. m * down_bytes]));
-        try pack(views[3 * lo ..][0 .. 3 * m], up_words, down_words, width, dims, n);
+        var out: [L.parts][]u8 = undefined;
+        var at: usize = 0;
+        for (&out, per) |*o, p| {
+            o.* = stage[at..][0 .. m * p];
+            at += m * p;
+        }
+        try packAs(L, views[3 * lo ..][0 .. 3 * m], out, width, dims, n);
         mark(store, false, k);
         // synchronous from pinned memory, as cuda_pocket.zig's staged: done before return, so the next chunk may refill
-        try d.check(d.api.cuMemcpyHtoD_v2(try up.at(lo * up_bytes), stage.ptr, m * up_bytes), "cuMemcpyHtoD pinned experts");
-        try d.check(d.api.cuMemcpyHtoD_v2(try down.at(lo * down_bytes), stage.ptr + m * up_bytes, m * down_bytes), "cuMemcpyHtoD pinned experts");
+        for (bufs, out, per) |b, o, p| try d.check(d.api.cuMemcpyHtoD_v2(try b.at(lo * p), o.ptr, o.len), "cuMemcpyHtoD pinned experts");
         try pair.wait();
         // the next chunk's gather reuses these views' memory: only their globals are read after this
         for (views[3 * lo ..][0 .. 3 * m]) |*v| v.* = .{ .codes = &.{}, .global = v.global };
     }
-    const up_globals = try a.alloc(f32, 2 * count);
-    defer a.free(up_globals);
-    const down_globals = try a.alloc(f32, count);
-    defer a.free(down_globals);
     for (0..count) |i| {
         up_globals[2 * i] = views[3 * i].global;
         up_globals[2 * i + 1] = views[3 * i + 1].global;
         down_globals[i] = views[3 * i + 2].global;
     }
-    var us = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(up_globals));
-    errdefer us.free();
-    const ds = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(down_globals));
-    return .{ .up = up, .down = down, .up_scale = us, .down_scale = ds, .width = width, .dims = dims, .count = count };
+    return bufs;
 }
 
 test "Flash Next expert loader: TF_FLASHNEXT_LOAD_THREADS takes 1 to 32 and refuses the rest" {

@@ -18,8 +18,8 @@ pub const Owned = struct {
     }
 };
 
-pub fn load(a: std.mem.Allocator, d: *cuda.Driver, store: *wt.Store, prefix: []const u8, world: usize, rank: usize, split: bool) !Owned {
-    var e = try routed.load(a, d, store, prefix, world, rank);
+pub fn load(a: std.mem.Allocator, d: *cuda.Driver, store: *wt.Store, prefix: []const u8, world: usize, rank: usize, split: bool, checkpoint: bool) !Owned {
+    var e = if (checkpoint) try @import("cuda_ck_experts.zig").load(a, d, store, prefix, world, wt.dims, wt.moe_w, wt.experts_n) else try routed.load(a, d, store, prefix, world, rank);
     errdefer e.free();
     var shared: [3]wt.Q4 = @splat(wt.Q4.empty(d));
     errdefer for (&shared) |*p| p.free();

@@ -63,7 +63,9 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
         r.poison();
         r.deinit();
     };
-    own.engine = try prompt.Engine.initRank(gpa, io, driver, &own.stream, dir, o.tp, o.rank);
+    const checkpoint = try @import("cuda_ck_experts.zig").wanted(@intCast((try driver.currentCapability()) / 10), o.precision);
+    if (checkpoint) std.log.info("flashnext: --precision checkpoint: routed experts take NVFP4 rows on the FP4 mma", .{});
+    own.engine = try prompt.Engine.initRank(gpa, io, driver, &own.stream, dir, o.tp, o.rank, checkpoint);
     errdefer own.engine.deinit();
     own.engine.chunk = chunk;
     if (own.ranks) |r| {
